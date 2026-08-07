@@ -2419,9 +2419,11 @@ impl SniffCtl {
 /// denominator is quoted in - declared NZB bytes - and this map is
 /// already consulted once per terminal article. A parallel id→bytes map
 /// would have duplicated every message-id string (~15 MB on a 128k
-/// article job); widening the value costs nothing, a `usize` and a
-/// `(u32, u32)` being the same eight bytes.
-pub(crate) type IdSlots = std::collections::HashMap<String, (u32, u32)>;
+/// article job). Full u64 for the size on purpose: `fetch_plan` sums
+/// the same declarations in u64, and a skewed NZB declaring a segment
+/// past 4 GiB used to truncate here - crediting 1 byte against a 4 GB
+/// denominator, wedging the bar short of 100% for the whole job.
+pub(crate) type IdSlots = std::collections::HashMap<String, (u32, u64)>;
 
 /// The offset-0 article of a payload-classified slot decoded to the
 /// `PAR2\0PKT` magic: reclassify it. Elects (or switches) the bootstrap
@@ -2575,7 +2577,12 @@ fn defer_sniffed_slot(
     if removed.is_empty() {
         return 0.0;
     }
-    let bytes: u64 = removed.iter().filter_map(|id| bytes_of.get(id)).sum();
+    // Saturating fold, not .sum(): these are attacker-typed NZB byte
+    // declarations, and a plain sum panics in debug / wraps in release.
+    let bytes: u64 = removed
+        .iter()
+        .filter_map(|id| bytes_of.get(id))
+        .fold(0u64, |a, b| a.saturating_add(*b));
     slots[sidx]
         .remaining
         .fetch_sub(removed.len(), Ordering::AcqRel);
@@ -2599,7 +2606,7 @@ fn defer_sniffed_slot(
         .entry(sidx)
         .and_modify(|(v, b)| {
             v.extend(removed.iter().cloned());
-            *b += bytes;
+            *b = b.saturating_add(bytes);
         })
         .or_insert_with(|| (removed.clone(), bytes));
     bytes as f64 / 1e6

@@ -20,6 +20,7 @@ struct HomeView: View {
                     .font(.footnote)
                 }
             }
+            throughputSection
             queueSection
             historySection
         }
@@ -49,6 +50,23 @@ struct HomeView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(actionError ?? "")
+        }
+    }
+
+    // Rolling throughput chart above the queue, anchored the way the
+    // web dashboard's is: a known link peak is 100%, drawn as a dashed
+    // rule with ~4% of air above it, so working well reads as a band
+    // riding the rule and a blip past the peak pokes above it without
+    // rescaling the history. No known peak = scale to the window.
+    @ViewBuilder private var throughputSection: some View {
+        if let snap = state.snapshot, !snap.queue.isEmpty, state.speedHistory.count >= 2 {
+            Section {
+                ThroughputChart(
+                    samples: state.speedHistory,
+                    linkPeakMBps: (snap.linkPeak ?? 0) / 1e6,
+                    linkPeakSrc: snap.linkPeakSrc ?? ""
+                )
+            }
         }
     }
 
@@ -120,6 +138,62 @@ struct HomeView: View {
                     ?? "Could not fetch a play link for that job."
             }
         }
+    }
+}
+
+struct ThroughputChart: View {
+    let samples: [Double]
+    let linkPeakMBps: Double
+    let linkPeakSrc: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(String(format: "%.1f MB/s", samples.last ?? 0))
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                if linkPeakMBps > 0 {
+                    let pct = max((samples.last ?? 0) / linkPeakMBps * 100, 0)
+                    Text(String(format: "%.0f%% of %.1f MB/s %@", pct, linkPeakMBps,
+                                linkPeakSrc == "line" ? "line speed" : "peak"))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Canvas { ctx, size in
+                guard samples.count >= 2 else { return }
+                // The anchor pins the scale's lower bound; the window
+                // max can still push past it, so an over-peak blip pokes
+                // above the rule instead of squashing the history.
+                let floor = linkPeakMBps > 0 ? linkPeakMBps * 1.04 : 0
+                let maxV = max(samples.max() ?? 0, floor, 0.001)
+                let pad: CGFloat = 2
+                let stepX = size.width / CGFloat(samples.count - 1)
+                func y(_ v: Double) -> CGFloat {
+                    size.height - pad - CGFloat(v / maxV) * (size.height - pad * 2)
+                }
+                var line = Path()
+                for (i, v) in samples.enumerated() {
+                    let p = CGPoint(x: CGFloat(i) * stepX, y: y(v))
+                    if i == 0 { line.move(to: p) } else { line.addLine(to: p) }
+                }
+                var area = line
+                area.addLine(to: CGPoint(x: size.width, y: size.height))
+                area.addLine(to: CGPoint(x: 0, y: size.height))
+                area.closeSubpath()
+                ctx.fill(area, with: .color(.accentColor.opacity(0.18)))
+                ctx.stroke(line, with: .color(.accentColor), lineWidth: 2)
+                if linkPeakMBps > 0 {
+                    var rule = Path()
+                    rule.move(to: CGPoint(x: 0, y: y(linkPeakMBps)))
+                    rule.addLine(to: CGPoint(x: size.width, y: y(linkPeakMBps)))
+                    ctx.stroke(rule, with: .color(.accentColor.opacity(0.55)),
+                               style: StrokeStyle(lineWidth: 1, dash: [6, 4]))
+                }
+            }
+            .frame(height: 56)
+        }
+        .padding(.vertical, 2)
     }
 }
 

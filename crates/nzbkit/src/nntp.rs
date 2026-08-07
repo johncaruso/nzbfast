@@ -794,6 +794,15 @@ pub struct Connection {
     /// with the dot terminator either inside the stream or trailing it
     /// in plain text (the "TERMINATOR" capability variant).
     header_gzip: bool,
+    /// A multiline body read failed partway (gzip CRC/length mismatch,
+    /// oversized body): the response's remaining bytes - possibly a
+    /// TERMINATOR-variant's plain-text "." line - are still on the
+    /// wire, so every later status read would be attributed to the
+    /// WRONG command. Callers that keep a connection across an `over()`
+    /// error (the scan bisect, nettools probes) would then silently
+    /// file the previous range's rows as the next range's answer. Once
+    /// set, `exec` refuses with `Closed` so the caller reconnects.
+    desynced: bool,
 }
 
 /// Hard bound on the whole connect sequence (DNS + TCP + TLS handshake +
@@ -1717,6 +1726,7 @@ impl Connection {
             line: Vec::with_capacity(512),
             over_supported: None,
             header_gzip: false,
+            desynced: false,
         };
 
         let greeting = conn.read_status().await?;
@@ -1845,6 +1855,13 @@ impl Connection {
 
     /// Send a command and read its (single-line) response.
     pub async fn exec(&mut self, cmd: &str) -> Result<Status, NntpError> {
+        // A desynced conversation cannot attribute responses to
+        // commands any more (see the `desynced` field) - refuse with
+        // the same error a dead socket gives, so callers reconnect
+        // instead of reading the previous body's leftovers as answers.
+        if self.desynced {
+            return Err(NntpError::Closed);
+        }
         self.send(cmd).await?;
         self.read_status().await
     }
@@ -2000,13 +2017,23 @@ where
         reader.consume(consumed);
     }
     if gzip {
-        // RFC 1952 trailer: CRC32 + ISIZE (mod 2^32). Verify the length
-        // - cheap corruption check the raw-deflate path can't give us.
+        // RFC 1952 trailer: CRC32 + ISIZE (mod 2^32). Verify BOTH. The
+        // length check alone let single-bit corruption through: a
+        // damaged STORED deflate block inflates to the right length
+        // with the wrong bytes, and the §123 chip-6 rig fed exactly
+        // that shape straight into the overview parser as clean rows.
+        // The CRC is the only integrity the compressed path has - the
+        // plain-text path gets per-article yEnc CRCs, headers get
+        // nothing else.
         let mut tr = [0u8; 8];
         idle_bounded(reader.read_exact(&mut tr)).await?;
         let isize = u32::from_le_bytes([tr[4], tr[5], tr[6], tr[7]]);
         if isize != ((out.len() - start) as u32) {
             return Err(bad("gzip length mismatch"));
+        }
+        let crc = u32::from_le_bytes([tr[0], tr[1], tr[2], tr[3]]);
+        if crc != crc32fast::hash(&out[start..]) {
+            return Err(bad("gzip crc mismatch"));
         }
     }
     // Terminator: inside the stream ("\n.\r\n" tail, dot-stuffing makes
@@ -2233,6 +2260,7 @@ impl Connection {
             line: self.line,
             over_supported: self.over_supported,
             header_gzip: false,
+            desynced: self.desynced,
         })
     }
 
@@ -2372,10 +2400,19 @@ impl Connection {
             });
         }
         let mut raw = Vec::new();
-        if self.header_gzip {
-            read_gzip_multiline_generic(&mut self.wire, &mut raw).await?;
+        let body = if self.header_gzip {
+            read_gzip_multiline_generic(&mut self.wire, &mut raw).await
         } else {
-            self.read_multiline_into(&mut raw).await?;
+            self.read_multiline_into(&mut raw).await
+        };
+        if let Err(e) = body {
+            // The body read died partway - a CRC/length mismatch or an
+            // oversized block leaves the rest of the response (and for
+            // TERMINATOR-variant servers a plain-text "." line) unread
+            // on the wire. Latch the desync so this connection refuses
+            // further commands rather than mis-attributing responses.
+            self.desynced = true;
+            return Err(e);
         }
 
         let mut entries = Vec::new();

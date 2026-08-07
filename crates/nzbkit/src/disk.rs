@@ -184,7 +184,8 @@ pub fn set_drop_cache_default(on: bool) {
     DROP_CACHE_DEFAULT.store(on, Ordering::Relaxed);
 }
 
-/// Default stride for macOS write pacing - see [`FileWriter`]'s
+/// Default stride for write pacing (macOS, and the Linux daemon
+/// path) - see [`FileWriter`]'s
 /// `maybe_pace_writeback`. 32 MB: small enough that the per-flush pause
 /// hides inside the fetch->decode channel, large enough that a 10 Gbps
 /// decoded stream (~1.2 GB/s) syncs ~40 times a second, not thousands.
@@ -194,17 +195,33 @@ pub fn set_drop_cache_default(on: bool) {
 #[allow(dead_code)]
 const WRITE_PACE_STRIDE_DEFAULT: u64 = 32 << 20;
 
-/// The pacing stride in force, in bytes; 0 = pacing off. ON by default:
-/// the 6 Aug A/B on m1 (87 GB, 10 Gbps) took the job from 25/87 seconds
-/// below 80% of peak to 3/68 and sustained 7.2 -> 9.0 Gbps, with the
-/// per-server write-side blocking erased. Latched on first use;
-/// `NZBFAST_WRITE_PACE_MB` overrides in either direction (0 = off).
-#[cfg(target_os = "macos")]
+/// The pacing stride in force, in bytes; 0 = pacing off. Latched on
+/// first use; `NZBFAST_WRITE_PACE_MB` overrides in either direction
+/// (0 = off).
+///
+/// macOS: ON by default - the 6 Aug A/B on m1 (87 GB, 10 Gbps) took
+/// the job from 25/87 seconds below 80% of peak to 3/68 and sustained
+/// 7.2 -> 9.0 Gbps, with the per-server write-side blocking erased.
+///
+/// Linux: OFF by default. The 7 Aug daemon A/B on the Linux rig
+/// (8-core/31 GB ext4 box, 60 GB loopback mock, 8 legs) found no arm
+/// that beat
+/// no-pacing: fsync per stride read the same or worse (ext4 journal
+/// commit + device flush), sync_file_range arms read within noise, and
+/// drop-behind was clearly worse. Linux's balance_dirty_pages already
+/// bounds the dirty set gradually - the macOS save-up-then-dump
+/// pathology was never observed. The machinery stays compiled and
+/// env-selectable so a real-NAS leg (Synology, TODO 126.1) can test
+/// the shipped binary with NZBFAST_WRITE_PACE_MB=32 alone.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn write_pace_stride() -> u64 {
+    #[cfg(target_os = "macos")]
+    const DEFAULT: u64 = WRITE_PACE_STRIDE_DEFAULT;
+    #[cfg(target_os = "linux")]
+    const DEFAULT: u64 = 0;
     static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        parse_pace_mb(std::env::var("NZBFAST_WRITE_PACE_MB").ok().as_deref())
-            .unwrap_or(WRITE_PACE_STRIDE_DEFAULT)
+        parse_pace_mb(std::env::var("NZBFAST_WRITE_PACE_MB").ok().as_deref()).unwrap_or(DEFAULT)
     })
 }
 
@@ -232,6 +249,46 @@ fn nocache_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("NZBFAST_NOCACHE").is_ok_and(|v| v == "1"))
 }
 
+/// Which flush primitive the Linux pacer uses per stride (see
+/// `FileWriter::maybe_pace_writeback`). Default `Sfr` (async
+/// writeback start, the lightest); `NZBFAST_PACE_MODE=fsync|sfrwait`
+/// select the heavier arms for benching, same policy as
+/// `NZBFAST_NOCACHE`. On the 7 Aug VPS rig all three read within
+/// noise or worse than no pacing - kept for the real-NAS leg.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum PaceMode {
+    Sfr,
+    SfrWait,
+    Fsync,
+}
+
+#[cfg(target_os = "linux")]
+fn pace_mode() -> PaceMode {
+    static V: std::sync::OnceLock<PaceMode> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("NZBFAST_PACE_MODE").as_deref() {
+        Ok("fsync") => PaceMode::Fsync,
+        Ok("sfrwait") => PaceMode::SfrWait,
+        _ => PaceMode::Sfr,
+    })
+}
+
+/// The per-process drop-behind decision, latched on first use (see
+/// `FileWriter::maybe_drop_cache`): `NZBFAST_DROP_CACHE=1/0` overrides,
+/// else the process default (CLI `get` turns it on, the daemon never
+/// does). Shared with `maybe_pace_writeback`, which stands down while
+/// drop-behind is active - the two hooks would otherwise race one
+/// `drop_next` watermark and double-flush every stride.
+#[cfg(target_os = "linux")]
+fn drop_cache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("NZBFAST_DROP_CACHE").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => DROP_CACHE_DEFAULT.load(Ordering::Relaxed),
+    })
+}
+
 /// Apply the bench-gated F_NOCACHE policy to a fresh writer handle.
 /// Best-effort: a filesystem that refuses the fcntl just keeps the
 /// default caching behaviour.
@@ -249,6 +306,90 @@ fn apply_cache_policy(file: &File) {
     {
         let _ = file;
     }
+}
+
+/// Windows write-path fixes (6 Aug line-rate campaign), both latched on
+/// first use like the macOS pacing stride.
+///
+/// `NZBFAST_WIN_SPARSE=0` disables the sparse-output fix (see
+/// [`preallocate_capped`]); anything else, including unset, leaves it on.
+#[cfg(windows)]
+fn win_sparse_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !matches!(std::env::var("NZBFAST_WIN_SPARSE").as_deref(), Ok("0")))
+}
+
+/// How many write lanes (OS handles) a [`FileWriter`] spreads positioned
+/// writes across on Windows - see the `aux` field for why. 1 = the old
+/// single-handle behaviour; `NZBFAST_WIN_WRITERS` overrides.
+#[cfg(windows)]
+fn win_writer_lanes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("NZBFAST_WIN_WRITERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(WIN_WRITER_LANES_DEFAULT)
+            .clamp(1, 16)
+    })
+}
+
+/// Default lane count: 1, i.e. the lane spread stays DARK. Measured on
+/// the mediatvpc loopback A/B (7 Aug, 80 GB mock, 2 reps): 4 lanes
+/// alone moved nothing (135.7/165.6 s wall against a 132.3/173.2 s
+/// baseline, write-side blocking identical), and on top of the sparse
+/// fix they consistently cost ~10% (89.3/90.0 s against 79.3/86.4 s
+/// sparse-alone). File-object lock serialization was not the disease -
+/// VDL zero-fill was. Kept env-gated for hardware this box cannot
+/// represent.
+#[cfg(windows)]
+const WIN_WRITER_LANES_DEFAULT: usize = 1;
+
+/// Flag `file` as sparse (FSCTL_SET_SPARSE). Best-effort: a filesystem
+/// that refuses the ioctl (FAT32, some network shares) just keeps
+/// zero-fill semantics, which is always correct.
+#[cfg(windows)]
+fn mark_sparse(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+    let mut bytes = 0u32;
+    // SAFETY: DeviceIoControl with a null input buffer is the documented
+    // "SetSparse = TRUE" form; the borrow of `file` keeps the handle
+    // open across the call, and `bytes` outlives it on the stack.
+    unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as _,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes,
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+/// Open `lanes - 1` extra read+write handles on `path` for the Windows
+/// write-lane spread. Best-effort: stop at the first failure and run
+/// with what opened (possibly none) - fewer lanes is always correct.
+#[cfg(windows)]
+fn open_aux_handles(path: &Path) -> Vec<File> {
+    let lanes = win_writer_lanes();
+    let mut v = Vec::new();
+    for _ in 1..lanes {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+        {
+            Ok(f) => v.push(f),
+            Err(_) => break,
+        }
+    }
+    v
 }
 
 /// What the output directory is sitting on.
@@ -437,6 +578,14 @@ pub struct FileWriter {
     pub path: PathBuf,
     pub size: u64,
     written: AtomicU64,
+    /// UNIQUE bytes covered (the sum of `note_written`'s fresh counts),
+    /// distinct from `written`, which counts every physical write.
+    /// The pacer's once-only completion flush keys off THIS: duplicate
+    /// article spans and repair rewrites inflate `written` past `size`
+    /// while real gaps remain, and parking the watermark on aggregate
+    /// traffic would leave the genuine tail unpaced - the exact burst
+    /// the pacer exists to prevent.
+    covered: AtomicU64,
     /// Job-wide extracted-byte budget (see [`WriteBudget`]); None = the
     /// writer is not an extraction output and is not charged.
     budget: Option<std::sync::Arc<WriteBudget>>,
@@ -445,10 +594,29 @@ pub struct FileWriter {
     /// arrival keeps this list tiny (≈ number of gaps, not writes).
     intervals: std::sync::Mutex<Vec<(u64, u64)>>,
     /// Next `written` watermark at which the per-stride write hook
-    /// fires (Linux: maybe_drop_cache; macOS: maybe_pace_writeback -
-    /// at most one of which compiles in). Dead on Windows.
+    /// fires. macOS: maybe_pace_writeback. Linux: maybe_drop_cache
+    /// when drop-behind is on (CLI get), else maybe_pace_writeback
+    /// (the daemon) - the pacer stands down while drop-behind is
+    /// active precisely so this one watermark has one consumer.
+    /// Dead on Windows.
     #[allow(dead_code)]
     drop_next: AtomicU64,
+    /// Windows write lanes (line-rate campaign): std's `seek_write`
+    /// issues a synchronous WriteFile, and the kernel serializes
+    /// synchronous I/O per FILE OBJECT - so N decode workers writing
+    /// through one handle queue on its lock. Extra handles on the same
+    /// path are distinct file objects with distinct locks; `write_at`
+    /// spreads across them round-robin. The system cache is per FILE,
+    /// not per handle, so reads through the primary handle and `park`'s
+    /// sync still see and cover every lane's bytes. Emptied on park,
+    /// refilled on unpark. NOTE: measured a non-fix on mediatvpc (see
+    /// `WIN_WRITER_LANES_DEFAULT`) - the pool is empty by default and
+    /// only `NZBFAST_WIN_WRITERS` fills it.
+    #[cfg(windows)]
+    aux: std::sync::RwLock<Vec<File>>,
+    /// Round-robin cursor over `aux` + the primary handle.
+    #[cfg(windows)]
+    next_lane: AtomicU64,
 }
 
 /// Reserve `size` bytes for `file`, really allocating blocks where the
@@ -497,6 +665,28 @@ pub struct FileWriter {
 ///     reserves nothing), and
 ///   * never shrinks a resumed file below the bytes it already holds.
 fn preallocate_capped(file: &File, size: u64, cap: u64) -> io::Result<()> {
+    // Windows line-rate campaign (6 Aug 2026): NTFS tracks a
+    // valid-data-length (VDL) per file, and every positioned write past
+    // VDL makes the filesystem physically zero-fill [VDL, offset) first.
+    // Out-of-order article writes into a set_len file therefore write
+    // large zero runs nobody asked for - measured ~1.6x write
+    // amplification (disk ~455 MB/s against ~283 MB/s of payload) with
+    // the job pinned at a flat 2.1 Gbps plateau. Marking the file SPARSE
+    // turns that zero-fill into a hole: unwritten ranges still read as
+    // zeros (exactly what `covered_intervals` already promises), but the
+    // device only ever sees the bytes we wrote. Measured on the same box
+    // (7 Aug loopback A/B, 80 GB mock, 2 reps): amplification 1.53-1.60
+    // -> 1.00-1.08, wall 132/173 s -> 79/86 s, per-server write-side
+    // blocking 784/1102 s -> 218/289 s. The alternative,
+    // SetFileValidData, is rejected: it needs SE_MANAGE_VOLUME_NAME
+    // (Administrators only - a normal user install cannot hold it), it
+    // is documented not to work on sparse files, and it exposes whatever
+    // stale disk contents sit under the file until we overwrite them.
+    // Must run BEFORE set_len so the preallocation itself never zeroes.
+    #[cfg(windows)]
+    if win_sparse_enabled() {
+        mark_sparse(file);
+    }
     let target = if cap == u64::MAX {
         size
     } else {
@@ -543,9 +733,14 @@ impl FileWriter {
             path: path.to_path_buf(),
             size,
             written: AtomicU64::new(0),
+            covered: AtomicU64::new(0),
             budget: None,
             intervals: std::sync::Mutex::new(Vec::new()),
             drop_next: AtomicU64::new(16 << 20),
+            #[cfg(windows)]
+            aux: std::sync::RwLock::new(open_aux_handles(path)),
+            #[cfg(windows)]
+            next_lane: AtomicU64::new(0),
         })
     }
 
@@ -582,9 +777,14 @@ impl FileWriter {
             path: path.to_path_buf(),
             size,
             written: AtomicU64::new(0),
+            covered: AtomicU64::new(0),
             budget: None,
             intervals: std::sync::Mutex::new(Vec::new()),
             drop_next: AtomicU64::new(16 << 20),
+            #[cfg(windows)]
+            aux: std::sync::RwLock::new(open_aux_handles(path)),
+            #[cfg(windows)]
+            next_lane: AtomicU64::new(0),
         })
     }
 
@@ -597,7 +797,7 @@ impl FileWriter {
     }
 
     pub fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        write_all_at(self.handle()?.as_ref().unwrap(), data, offset)?;
+        self.write_lane(data, offset)?;
         let fresh = self.note_written(offset, data.len() as u64);
         self.maybe_drop_cache();
         self.maybe_pace_writeback();
@@ -609,6 +809,34 @@ impl FileWriter {
             b.charge(fresh)?;
         }
         Ok(())
+    }
+
+    /// The positioned write behind [`FileWriter::write_at`], routed
+    /// through one of the Windows write lanes when the pool has any
+    /// (see the `aux` field). Everywhere else it is exactly the old
+    /// single-handle write.
+    #[cfg(windows)]
+    fn write_lane(&self, data: &[u8], offset: u64) -> io::Result<()> {
+        {
+            let aux = self.aux.read_ok();
+            if !aux.is_empty() {
+                // Lanes are aux[0..n] plus the primary handle as lane n,
+                // so the primary keeps carrying its share of the load.
+                let lane =
+                    (self.next_lane.fetch_add(1, Ordering::Relaxed) as usize) % (aux.len() + 1);
+                if lane < aux.len() {
+                    return write_all_at(&aux[lane], data, offset);
+                }
+            }
+        }
+        // Parked writers have an empty pool, so the parked error still
+        // comes from handle() exactly as before.
+        write_all_at(self.handle()?.as_ref().unwrap(), data, offset)
+    }
+
+    #[cfg(not(windows))]
+    fn write_lane(&self, data: &[u8], offset: u64) -> io::Result<()> {
+        write_all_at(self.handle()?.as_ref().unwrap(), data, offset)
     }
 
     /// M32 perf (loopback-rig measured): under a small memory cgroup
@@ -624,23 +852,27 @@ impl FileWriter {
     /// NZBFAST_DROP_CACHE=1/0 force-overrides for benching.
     #[cfg(target_os = "linux")]
     fn maybe_drop_cache(&self) {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on = *ON.get_or_init(|| match std::env::var("NZBFAST_DROP_CACHE").as_deref() {
-            Ok("1") => true,
-            Ok("0") => false,
-            _ => DROP_CACHE_DEFAULT.load(Ordering::Relaxed),
-        });
-        if !on {
+        if !drop_cache_enabled() {
             return;
         }
         const STRIDE: u64 = 16 << 20;
+        // Same state machine as the pacer, including the once-only
+        // completion action: without it a file smaller than the first
+        // 16 MB watermark never got a single writeback+evict, and every
+        // file kept a sub-stride tail - on the 1 GB-cgroup boxes this
+        // hook exists for, a many-small-file job left its whole page
+        // cache turnover to memcg reclaim, the exact cost drop-behind
+        // was measured to remove (M32).
         let w = self.written.load(Ordering::Relaxed);
+        let c = self.covered.load(Ordering::Relaxed);
         let due = self.drop_next.load(Ordering::Relaxed);
-        if w < due
-            || self
-                .drop_next
-                .compare_exchange(due, w + STRIDE, Ordering::Relaxed, Ordering::Relaxed)
-                .is_err()
+        let Some(next) = pace_step(w, c, due, self.size, STRIDE) else {
+            return;
+        };
+        if self
+            .drop_next
+            .compare_exchange(due, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
         {
             return;
         }
@@ -684,22 +916,41 @@ impl FileWriter {
     /// dirty pages to the device, which is the whole point here).
     ///
     /// `NZBFAST_WRITE_PACE_MB` sets the stride in MB; 0 disables; unset
-    /// = the measured 32 MB default (see `write_pace_stride`). macOS
-    /// only: Linux paces through `maybe_drop_cache`'s sync_file_range,
-    /// and Windows has not shown the sawtooth.
-    #[cfg(target_os = "macos")]
+    /// = the measured 32 MB default (see `write_pace_stride`).
+    ///
+    /// Linux compiles the same hook but defaults OFF (see
+    /// `write_pace_stride` for the 7 Aug measurement): the daemon has
+    /// no drop-behind (a /stream reader can attach and DONTNEED would
+    /// evict pages it wants), yet balance_dirty_pages already throttles
+    /// writers gradually and no pacing arm beat no-pacing on the rig.
+    /// The hook exists so a real-NAS leg can flip it on the shipped
+    /// binary: NZBFAST_WRITE_PACE_MB sets the stride, NZBFAST_PACE_MODE
+    /// picks the flush primitive. It is stream-safe by construction
+    /// (nothing here evicts). While drop-behind IS active the pacer
+    /// stands down - that path already writes back each stride, and
+    /// both hooks share the one `drop_next` watermark. Windows has not
+    /// shown the sawtooth (a different, continuous write-path disease -
+    /// TODO 126.2).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn maybe_pace_writeback(&self) {
+        #[cfg(target_os = "linux")]
+        if drop_cache_enabled() {
+            return;
+        }
         let stride = write_pace_stride();
         if stride == 0 {
             return;
         }
         let w = self.written.load(Ordering::Relaxed);
+        let c = self.covered.load(Ordering::Relaxed);
         let due = self.drop_next.load(Ordering::Relaxed);
-        if w < due
-            || self
-                .drop_next
-                .compare_exchange(due, w + stride, Ordering::Relaxed, Ordering::Relaxed)
-                .is_err()
+        let Some(next) = pace_step(w, c, due, self.size, stride) else {
+            return;
+        };
+        if self
+            .drop_next
+            .compare_exchange(due, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
         {
             return;
         }
@@ -709,18 +960,180 @@ impl FileWriter {
         let Some(fd) = g.as_ref().map(|f| f.as_raw_fd()) else {
             return;
         };
-        // SAFETY: fsync takes only the raw fd; the read guard `g` keeps
-        // the File open across the call. Concurrent pwrites from the
-        // other decode workers proceed under their own read guards -
-        // only park() (write lock) waits, and it wants the sync anyway.
-        unsafe {
-            libc::fsync(fd);
+        // The COMPLETION flush leaves the hot path: inline it cost a
+        // measured ~7% of the m1 loopback ceiling on a big-file corpus
+        // (28 -> 30 s per 80 GB leg, both reps) - forty tail fsyncs
+        // riding decode workers while the disk was the bottleneck.
+        // A background flusher fsyncs a clone of the handle instead;
+        // the clone keeps the fd alive on its own, so a concurrent
+        // park() stays correct (park's own sync_data covers the same
+        // bytes anyway). Stride flushes stay inline on purpose: their
+        // brief writer pause is the measured 6 Aug behaviour, and it is
+        // what keeps the dirty set from outrunning the flusher.
+        if next == u64::MAX
+            && let Ok(clone) = g.as_ref().unwrap().try_clone()
+        {
+            completion_flush_bg(clone);
+            return;
         }
+        // (try_clone can only really fail on fd exhaustion - flush
+        // inline below rather than skip: the parked watermark means
+        // this was the file's one chance.)
+        // SAFETY: both calls take only the raw fd plus integer
+        // arguments; the read guard `g` keeps the File open across the
+        // call. Concurrent pwrites from the other decode workers
+        // proceed under their own read guards - only park() (write
+        // lock) waits, and it wants the sync anyway.
+        pace_flush(fd);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn maybe_pace_writeback(&self) {}
+}
 
+/// The pacer's watermark step ([`FileWriter::maybe_pace_writeback`]),
+/// pure so the completion rule below is testable: given the file's
+/// `written` counter, the current `drop_next` watermark, the declared
+/// size and the stride, decide whether to flush now and what to store
+/// as the next watermark.
+///
+/// The stride alone has a blind spot the 6 Aug measurements never
+/// exercised: the watermark is PER FILE, so a file smaller than the
+/// initial 16 MB watermark never flushes at all, and one just over it
+/// keeps its tail dirty forever. A corpus of many small files (CD-era
+/// 15 MB rar parts, image sets) therefore accumulates dirty pages at
+/// line rate with the pacer nominally ON - the exact unbounded backlog
+/// the stride exists to prevent, rebuilt out of tails. The fix is a
+/// once-only flush when the file completes (`written` reaches the
+/// declared size): small files get their single flush there, large
+/// files get their sub-stride tail cleaned, and the dirty set is
+/// bounded by the files actually in flight instead of the whole job.
+///
+/// `u64::MAX` is the parked sentinel: the completion flush stores it so
+/// neither rule can fire again. `written` counts duplicate/repair spans
+/// too (see `note_written`), so completion can trip a little early on a
+/// duplicate-heavy file - harmless, it is still one flush of whatever
+/// is dirty. `size` 0 means unknown: no completion rule, stride only.
+/// The pacer's one flush primitive, shared by the inline stride path
+/// and the completion flusher. macOS: plain `libc::fsync` (NOT
+/// sync_data - std promotes that to a device-barrier fcntl on Apple
+/// platforms, a durability tax this path does not need). Linux: NOT
+/// fsync by default - measured 7 Aug on ext4 and btrfs daemon rigs, a
+/// per-stride fsync forces a journal/tree commit plus a device cache
+/// flush and read the same or WORSE than no pacing (btrfs worst case
+/// 1230-1317 s blocked). sync_file_range starts writeback with no
+/// metadata commit, no device flush and no eviction;
+/// NZBFAST_PACE_MODE=fsync|sfrwait are the bench arms.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn pace_flush(fd: std::os::unix::io::RawFd) {
+    // SAFETY: both calls take only the raw fd plus integer arguments;
+    // every caller keeps the backing File open across the call.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::fsync(fd);
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        match pace_mode() {
+            PaceMode::Sfr => {
+                libc::sync_file_range(fd, 0, 0, libc::SYNC_FILE_RANGE_WRITE);
+            }
+            PaceMode::SfrWait => {
+                libc::sync_file_range(
+                    fd,
+                    0,
+                    0,
+                    libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                        | libc::SYNC_FILE_RANGE_WRITE
+                        | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+                );
+            }
+            PaceMode::Fsync => {
+                libc::fsync(fd);
+            }
+        }
+    }
+}
+
+/// Hand a completed file's flush to the background flusher thread
+/// (see the completion note in [`FileWriter::maybe_pace_writeback`]).
+///
+/// The channel is bounded and the send never blocks: a full queue means
+/// the flusher is at device pace already - exactly the backpressure
+/// regime where one more inline fsync on a decode worker is the honest
+/// price, so the caller pays it there and then. The thread is detached
+/// on purpose: it owns nothing but cloned handles, and losing queued
+/// flushes at process exit loses nothing `finish()`'s own sync pass
+/// would not redo.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn completion_flush_bg(file: File) {
+    use std::sync::OnceLock;
+    use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+    // Option: the thread is an OPTIMISATION, and spawn can genuinely
+    // fail (RLIMIT_NPROC/pids.max exhausted after the decoders start).
+    // Panicking here would kill a decode worker - and with one decoder,
+    // wedge the bounded outcome channel behind a reader that no longer
+    // exists. No thread = every completion flush runs inline instead.
+    static TX: OnceLock<Option<SyncSender<File>>> = OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = sync_channel::<File>(64);
+        std::thread::Builder::new()
+            .name("pace-flush".into())
+            .spawn(move || {
+                use std::os::unix::io::AsRawFd;
+                for f in rx {
+                    pace_flush(f.as_raw_fd());
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    let file = match tx {
+        Some(tx) => match tx.try_send(file) {
+            Ok(()) => return,
+            // Full = the flusher is at device pace (backpressure) and
+            // Disconnected = the thread died; either way the completion
+            // flush must still happen - it is this file's only one.
+            Err(TrySendError::Full(f) | TrySendError::Disconnected(f)) => f,
+        },
+        None => file,
+    };
+    use std::os::unix::io::AsRawFd;
+    pace_flush(file.as_raw_fd());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn pace_step(written: u64, covered: u64, due: u64, size: u64, stride: u64) -> Option<u64> {
+    const PARKED: u64 = u64::MAX;
+    if due == PARKED {
+        return None;
+    }
+    // Completion keys off UNIQUE coverage, never `written`: duplicate
+    // spans and repair rewrites push `written` past `size` while real
+    // gaps remain, and parking on aggregate traffic would leave the
+    // genuine tail unpaced.
+    let complete = size > 0 && covered >= size;
+    if written >= due {
+        // A stride crossing that is also the completion parks the
+        // watermark, so the completion rule cannot double-flush.
+        // Saturating: parse_pace_mb deliberately saturates an absurd
+        // NZBFAST_WRITE_PACE_MB to u64::MAX, and a plain add would
+        // panic (debug) or wrap to a tiny watermark that fsyncs every
+        // write (release). Saturating to PARKED just stops pacing the
+        // file - the right meaning for a stride that large.
+        return Some(if complete {
+            PARKED
+        } else {
+            written.saturating_add(stride)
+        });
+    }
+    if complete {
+        return Some(PARKED);
+    }
+    None
+}
+
+impl FileWriter {
     /// pread through the writer's own handle - spares callers a fresh
     /// open() per read (the mapped-repair path reads thousands of
     /// blocks back through the volume view).
@@ -764,6 +1177,11 @@ impl FileWriter {
     /// stream picker or a settle reader still holds a clone.
     pub fn park(&self) -> io::Result<()> {
         let mut g = self.file.write_ok();
+        // Write lanes go first: the system cache is per file, so the
+        // primary handle's sync below flushes their bytes too - they
+        // only need to be CLOSED for par2's share-mode-0 open to pass.
+        #[cfg(windows)]
+        self.aux.write_ok().clear();
         if let Some(f) = g.as_ref() {
             f.sync_data()?;
         }
@@ -790,6 +1208,10 @@ impl FileWriter {
         let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         apply_cache_policy(&file);
         *g = Some(file);
+        #[cfg(windows)]
+        {
+            *self.aux.write_ok() = open_aux_handles(&self.path);
+        }
         Ok(())
     }
 
@@ -817,7 +1239,7 @@ impl FileWriter {
         // reaches `s`), and first that starts beyond `e` (can't touch).
         let lo = iv.partition_point(|&(_, fe)| fe < s);
         let hi = iv.partition_point(|&(fs, _)| fs <= e);
-        if lo < hi {
+        let fresh = if lo < hi {
             // Merge the overlapping/adjacent run [lo, hi) into one span.
             // The run's spans are disjoint, so the newly-covered count is
             // the merged length minus what the run already held.
@@ -830,7 +1252,9 @@ impl FileWriter {
         } else {
             iv.insert(lo, (s, e));
             len
-        }
+        };
+        self.covered.fetch_add(fresh, Ordering::Relaxed);
+        fresh
     }
 
     /// True when every byte of [off, off+len) has been written.
@@ -1076,6 +1500,79 @@ mod case_probe_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pacer's watermark step: the stride rule as measured on 6 Aug,
+    /// plus the completion rule that closes the small-file blind spot
+    /// (see `pace_step`). Each row is one write_at's view of the world.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn pace_step_strides_and_flushes_small_files_once() {
+        const MB: u64 = 1 << 20;
+        const PARKED: u64 = u64::MAX;
+        // (written, covered, due, size, stride); covered == written in
+        // the duplicate-free rows.
+        // Big file mid-write: crossing the watermark advances it a stride.
+        assert_eq!(
+            pace_step(16 * MB, 16 * MB, 16 * MB, 500 * MB, 32 * MB),
+            Some(48 * MB)
+        );
+        // Below the watermark, not complete: nothing fires.
+        assert_eq!(
+            pace_step(15 * MB, 15 * MB, 16 * MB, 500 * MB, 32 * MB),
+            None
+        );
+        // The blind spot: an 8 MB file never reaches the 16 MB watermark,
+        // so completion is its ONE flush - and it parks the watermark.
+        assert_eq!(
+            pace_step(8 * MB, 8 * MB, 16 * MB, 8 * MB, 32 * MB),
+            Some(PARKED)
+        );
+        // Parked stays parked: a duplicate article after completion (or
+        // any later write) must not flush again.
+        assert_eq!(pace_step(9 * MB, 8 * MB, PARKED, 8 * MB, 32 * MB), None);
+        // A stride crossing that IS the completion parks in one step
+        // rather than scheduling a watermark nothing will ever cross.
+        assert_eq!(
+            pace_step(48 * MB, 48 * MB, 48 * MB, 48 * MB, 32 * MB),
+            Some(PARKED)
+        );
+        // Codex 7 Aug M3: duplicate/repair spans push `written` past
+        // `size` while unique coverage still has a gap - the watermark
+        // must KEEP STRIDING (never park), or the genuine tail writes
+        // unpaced and the burst the pacer exists to prevent comes back
+        // on exactly the jobs with rewrites.
+        assert_eq!(
+            pace_step(80 * MB, 72 * MB, 80 * MB, 80 * MB, 32 * MB),
+            Some(112 * MB),
+            "aggregate traffic reaching size is not completion"
+        );
+        assert_eq!(
+            pace_step(90 * MB, 79 * MB, 112 * MB, 80 * MB, 32 * MB),
+            None
+        );
+        // ...and the park lands when unique coverage really completes.
+        assert_eq!(
+            pace_step(96 * MB, 80 * MB, 112 * MB, 80 * MB, 32 * MB),
+            Some(PARKED)
+        );
+        // Unknown size (0): no completion rule, the stride still paces.
+        assert_eq!(pace_step(8 * MB, 8 * MB, 16 * MB, 0, 32 * MB), None);
+        assert_eq!(
+            pace_step(16 * MB, 16 * MB, 16 * MB, 0, 32 * MB),
+            Some(48 * MB)
+        );
+        // A saturated stride (parse_pace_mb turns an absurd env value
+        // into u64::MAX) must not overflow the next watermark - it
+        // parks, it does not wrap into a per-write flush storm.
+        assert_eq!(
+            pace_step(16 * MB, 16 * MB, 16 * MB, 0, PARKED),
+            Some(PARKED)
+        );
+        assert_eq!(
+            pace_step(16 * MB, 16 * MB, 16 * MB, 0, PARKED - 16 * MB),
+            Some(PARKED)
+        );
+    }
 
     /// Fault-injecting writer for the disk-full halt rig: forwards to a
     /// real [`FileWriter`] until `budget` bytes have been accepted, then

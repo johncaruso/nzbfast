@@ -8,6 +8,10 @@
 
 mod scratch;
 
+// §123 chip-6 surfaces (bytes-skew and friends) - a sibling-dir child
+// so this file stays inside its size-gate baseline.
+mod e2e_chip6;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;

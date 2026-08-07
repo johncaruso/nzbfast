@@ -85,6 +85,7 @@ Full API key only (queue contents are never add-only). Optional
   "version": "4.5.0", "nzbfast": "1.0.16",
   "paused": false, "pause_int": "0",
   "speed_bps": 0.0, "diskspace_gb": 601.03, "warnings": 0,
+  "link_peak": 0.0, "link_peak_src": "",
   "queue_total": 1, "history_total": 0,
   "queue":   [ <job>, ... ],
   "history": [ <job>, ... ],
@@ -108,6 +109,13 @@ A `<job>`:
 Numbers are NUMBERS here (the SAB payloads quote theirs); `status`
 words and `activity` tokens are the same ones rows 2 and 3 carry.
 `queue_total` / `history_total` count before `limit` cuts the page.
+
+Contract ADDITION (2026-08-06, keys may be added): `link_peak` (bps)
+and `link_peak_src` ("measured" | "line" | "") - the link's learned
+peak, same values the dashboard's queue poll carries. Clients anchor
+their throughput chart's 100% to it (dashed rule); `link_peak` 0 or
+absent means no anchor is known and the chart scales to its window.
+A blip above the peak may draw past the rule without rescaling.
 
 `playback` is per-file readiness - the file `/stream/<id>` would
 actually serve, decided by the same two pickers that serve it:

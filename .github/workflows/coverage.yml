@@ -85,12 +85,61 @@ jobs:
       # runs product code that consults it at the network boundary.
       # Product files only - see the measurement-policy paragraph in the
       # header for why mock/sysbench/benchserve sit outside the metric.
+      # TODO 122.4: every red so far cost someone a bisect to answer
+      # "did coverage fall, or did the file grow?". The cache below
+      # carries the previous run's per-file table; the step after the
+      # measurement diffs against it and names the files whose MISSED
+      # count grew, with the denominator movement beside it. Advisory
+      # only - it never fails the job - and if: always() so the answer
+      # exists exactly when the run is red. Restore-keys prefix match
+      # pulls the most recent table; the per-run key stores this one.
+      - name: previous per-file coverage table
+        if: always()
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: coverage-table
+          key: coverage-table-${{ github.run_id }}
+          restore-keys: coverage-table-
       - name: nzbkit lib coverage (floor 84, product files only)
         env:
           NZBFAST_NO_ENRICH: "1"
         run: >
           cargo llvm-cov --locked -p nzbkit --lib --fail-under-lines 84
           --ignore-filename-regex 'nzbkit/src/(mock|sysbench|benchserve)\.rs$'
+      # Must run HERE, before the bins step: `report` globs every
+      # binary in the llvm-cov target dir, and after the -p nzbfast
+      # --bins run it would charge nzbfast's monomorphized generics to
+      # nzbkit source (the §122.3 reused-worktree trap, same mechanism
+      # on CI).
+      - name: which way did it break (nzbkit per-file drift)
+        if: always()
+        env:
+          NZBFAST_NO_ENRICH: "1"
+        run: |
+          mkdir -p coverage-table
+          cargo llvm-cov report --locked --json \
+            --ignore-filename-regex 'nzbkit/src/(mock|sysbench|benchserve)\.rs$' \
+            | jq -r '.data[0].files[]
+                | [.filename,
+                   .summary.lines.count,
+                   (.summary.lines.count - .summary.lines.covered)]
+                | @tsv' \
+            | sed 's#.*/crates/#crates/#' | grep '^crates/nzbkit/' > coverage-table/new.tsv
+          if [ -s coverage-table/prev.tsv ]; then
+            echo "== nzbkit files whose MISSED lines grew since the previous run =="
+            awk -F'\t' 'NR==FNR { prevmiss[$1]=$3; prevtotal[$1]=$2; next }
+              { pm = ($1 in prevmiss) ? prevmiss[$1] : 0
+                pt = ($1 in prevtotal) ? prevtotal[$1] : 0
+                d = $3 - pm
+                if (d > 0) printf "  %-58s missed +%d (%d -> %d), file lines %d -> %d\n",
+                                  $1, d, pm, $3, pt, $2 }' \
+              coverage-table/prev.tsv coverage-table/new.tsv
+            echo "== (a file appearing only because it grew is drift; a file whose"
+            echo "==  missed grew at the same size is a coverage regression) =="
+          else
+            echo "no previous table cached - baseline stored for the next run"
+          fi
+          mv coverage-table/new.tsv coverage-table/prev.tsv
       # if: always() so a breach of one floor never hides the other
       # crate's measurement - the nightly that caught nzbkit under 84
       # also needed the bins figure, and got neither.

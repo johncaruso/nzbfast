@@ -2431,6 +2431,10 @@ pub(super) fn apply_setting(
         "line_speed" => {
             let b = size()?;
             d.line_speed.store(b, Ordering::Relaxed);
+            // A different declaration gets its own chance: evidence the
+            // learner gathered against the OLD line speed must not
+            // instantly invalidate the new one (linkpeak.rs).
+            d.link_peak.line_changed();
             (true, json!(b))
         }
         "auto_speed" => set_auto_speed(d, name, v)?,

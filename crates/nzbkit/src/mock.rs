@@ -61,6 +61,12 @@ pub struct Chaos {
     /// OVER/XOVER bodies as one gzip stream followed by a plain-text
     /// ".\r\n" terminator (the Highwinds TERMINATOR variant).
     pub gzip_headers: bool,
+    /// With `gzip_headers`: flip one byte in the middle of every gzip
+    /// overview stream after the header magic - a corrupted compressed
+    /// payload from a broken cache node. The client must fail the READ
+    /// cleanly (a session error it can requeue), never accept garbage
+    /// rows or hang the inflater.
+    pub gzip_corrupt: bool,
     /// Reject POST with "440 posting not allowed" - models providers
     /// that only accept peer-fed articles, forcing the IHAVE fallback.
     pub post_rejected: bool,
@@ -127,6 +133,29 @@ pub struct Chaos {
     /// connections), EVERY further BODY request hangs in dead air - the
     /// whole frontend goes mute mid-run and never comes back. 0 = off.
     pub brownout_after: u64,
+    /// Heal instant for the brownout, in ms from server start: from
+    /// this moment NEW requests serve normally again (connections
+    /// already parked in dead air stay parked - a recovered frontend
+    /// does not resurrect the sockets it wedged). 0 = never heals,
+    /// the original permanent shape. The §123 heal-after surface: the
+    /// client's job is to cut the dead air, keep the fleet alive, and
+    /// resume at full width when the frontend returns.
+    pub brownout_heal_ms: u64,
+    /// Takedown mid-job: once this many bodies have been served
+    /// (across all connections), EVERY id answers 430 - including ids
+    /// served moments ago, because a DMCA takedown removes the whole
+    /// post from the spool, not the unread tail. The client's job is
+    /// to drive the remainder to an honest terminal verdict quickly -
+    /// a mid-job vanish must not look like a wedged pool. 0 = off.
+    pub vanish_after: u64,
+    /// AUTH blip window, in ms from server start: AUTHINFO PASS inside
+    /// the window gets the permanent-shaped refusal (or
+    /// `auth_refusal_text`), after it authentication succeeds. One
+    /// 481 reply is indistinguishable from a wrong password, so the
+    /// DESIGNED response is fail-fast-and-surface, not retry - the rig
+    /// exists to pin that the failure is quick and honest, never a
+    /// hang. 0 = off.
+    pub auth_reject_ms: u64,
     /// Jitter: every Nth body (server-wide, deterministic) is preceded
     /// by an extra delay of this many ms - a spiky but perfectly
     /// healthy link (the satellite shape). The SAFETY rig for any
@@ -438,6 +467,34 @@ impl HeaderPlane {
 }
 
 /// Pause before a 430, so a refusal costs a round trip like a real one.
+/// `Chaos::gzip_corrupt`: a broken cache node - valid magic, garbage
+/// middle. The flip lands past the 10-byte gzip header so the client's
+/// framing sniff still says gzip and the fault reaches the inflater,
+/// where a real one would.
+fn maybe_corrupt_gzip(chaos: &Chaos, z: &mut [u8]) {
+    if chaos.gzip_corrupt && z.len() > 16 {
+        let mid = z.len() / 2;
+        z[mid] ^= 0x01;
+    }
+}
+
+/// The takedown arm (`Chaos::vanish_after`): true once the post has
+/// left the spool - every id refuses from that moment, served tail
+/// included.
+fn vanished(chaos: &Chaos, served: &AtomicU64) -> bool {
+    chaos.vanish_after > 0 && served.load(Ordering::Relaxed) >= chaos.vanish_after
+}
+
+/// The brownout arm, with its heal instant (`Chaos::brownout_heal_ms`):
+/// active once `brownout_after` bodies have been served, until the heal
+/// instant (0 = never heals).
+fn browned_out(chaos: &Chaos, served: &AtomicU64, started: std::time::Instant) -> bool {
+    chaos.brownout_after > 0
+        && served.load(Ordering::Relaxed) >= chaos.brownout_after
+        && (chaos.brownout_heal_ms == 0
+            || (started.elapsed().as_millis() as u64) < chaos.brownout_heal_ms)
+}
+
 async fn refuse_delay(chaos: &Chaos) {
     if chaos.missing_delay_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(chaos.missing_delay_ms)).await;
@@ -843,7 +900,10 @@ async fn serve_conn(
         if upper.starts_with("AUTHINFO USER") {
             w.write_all(b"381 password required\r\n").await?;
         } else if upper.starts_with("AUTHINFO PASS") {
-            if chaos.auth_rejected {
+            if chaos.auth_rejected
+                || (chaos.auth_reject_ms > 0
+                    && (throttle.started.elapsed().as_millis() as u64) < chaos.auth_reject_ms)
+            {
                 let line = chaos
                     .auth_refusal_text
                     .as_deref()
@@ -935,7 +995,9 @@ async fn serve_conn(
                     let mut enc =
                         flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
                     enc.write_all(&body)?;
-                    w.write_all(&enc.finish()?).await?;
+                    let mut z = enc.finish()?;
+                    maybe_corrupt_gzip(&chaos, &mut z);
+                    w.write_all(&z).await?;
                 } else {
                     w.write_all(&body).await?;
                 }
@@ -1005,6 +1067,7 @@ async fn serve_conn(
             if nth > chaos.post.stat_miss
                 && articles.lock_ok().contains_key(id)
                 && !chaos.missing.contains(id)
+                && !vanished(&chaos, &served)
             {
                 w.write_all(format!("223 0 {id}\r\n").as_bytes()).await?;
             } else {
@@ -1055,6 +1118,11 @@ async fn serve_conn(
                 w.flush().await?;
                 continue;
             }
+            if vanished(&chaos, &served) {
+                refuse_delay(&chaos).await;
+                w.write_all(b"430 no such article\r\n").await?;
+                continue;
+            }
             if chaos.missing.contains(&id) {
                 refuse_delay(&chaos).await;
                 w.write_all(b"430 no such article\r\n").await?;
@@ -1079,7 +1147,7 @@ async fn serve_conn(
             {
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
             }
-            if chaos.brownout_after > 0 && served.load(Ordering::Relaxed) >= chaos.brownout_after {
+            if browned_out(&chaos, &served, throttle.started) {
                 // The frontend has browned out: dead air for everyone.
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 return Ok(());
@@ -1189,6 +1257,11 @@ async fn serve_conn(
                 w.flush().await?;
                 continue;
             }
+            if vanished(&chaos, &served) {
+                refuse_delay(&chaos).await;
+                w.write_all(b"430 no such article\r\n").await?;
+                continue;
+            }
             if chaos.missing.contains(&id) {
                 refuse_delay(&chaos).await;
                 w.write_all(b"430 no such article\r\n").await?;
@@ -1210,7 +1283,7 @@ async fn serve_conn(
             {
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
             }
-            if chaos.brownout_after > 0 && served.load(Ordering::Relaxed) >= chaos.brownout_after {
+            if browned_out(&chaos, &served, throttle.started) {
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 return Ok(());
             }

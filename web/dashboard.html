@@ -1693,7 +1693,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input class="txt sm" id="s_quota" onchange="setCfg('quota',this.value)"></div>
   <div class="row"><label data-i18n="set.disk.qperiod">Quota period<span class="badge live" data-i18n="badge.live">live</span></label>
     <select class="sel" id="s_quota_period" style="max-width:200px" onchange="setCfg('quota_period',this.value)">
-      <option value="d" data-i18n="set.disk.qperiod.d">daily (UTC midnight)</option><option value="m" data-i18n="set.disk.qperiod.m">monthly (1st, UTC)</option></select></div>
+      <option value="d" data-i18n="set.disk.qperiod.d">daily (local midnight)</option><option value="m" data-i18n="set.disk.qperiod.m">monthly (1st, local time)</option></select></div>
   <div class="row" data-adv="1"><label data-i18n="set.disk.nestdepth">Nested archive depth<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.nestdepth.hint">how many archive-in-archive layers to unpack automatically (default 5); applies to the next download. At the limit the deepest archive is left in place, unpacked no further - the download still completes. Raise only for unusually deep nested releases</span></label>
     <input class="txt sm" type="number" min="1" max="64" id="s_nested_max_depth" onchange="setCfg('nested_max_depth',this.value)"></div>
 </div>
@@ -2716,7 +2716,7 @@ const speedHist = [];                 // MB/s aggregate
 // chart then falls back to scale-to-window. src is "measured" (best
 // sustained rate observed) or "line" (the Settings line speed, seeding
 // until measurement settles it).
-let linkPeak = 0, linkPeakSrc = '';
+let linkPeak = 0, linkPeakSrc = '', lineHint = false;
 // Wall-clock ms per throughput sample, kept in lockstep with speedHist.
 // The chart's x axis is an INDEX, and pool events arrive stamped with a
 // moment, so without this there is no way to put a marker where the dip
@@ -3353,7 +3353,9 @@ function drawSpeed(frac=0){
     ctx.fillStyle=css('--dim');
     // Reuses the Settings label's catalogue key: same concept, no new
     // string for the 27 catalogues to chase.
-    ctx.fillText(`100% · ${fmtRate(peak)}`+(linkPeakSrc==='line'?' · '+t('set.speed.line','Line speed'):''), 4, py+10);
+    ctx.fillText(`100% · ${fmtRate(peak)}`+(linkPeakSrc==='line'
+      ? ' · '+t('set.speed.line','Line speed')+(lineHint?' · '+t('chart.linebits','looks 8x high, check units'):'')
+      : ''), 4, py+10);
   }else{
     // Unanchored: the old visible-window high/low watermarks.
     const hi=Math.max(...speedHist.slice(s0)), lo=Math.min(...speedHist.slice(s0));
@@ -3901,6 +3903,9 @@ async function tick(){
       }
     }
     linkPeak=(+q.link_peak||0)/1e6; linkPeakSrc=q.link_peak_src||'';
+    // The units verdict rides the same poll as the anchor it explains.
+    const lh=!!q.link_line_hint;
+    if(lh!==lineHint){ lineHint=lh; renderTuneHint(); }
     let mbps=(parseFloat(q.kbpersec)||0)/1000;
     // Guard against the daemon's end-of-job rate spike (kbpersec computed
     // over ~zero elapsed): anything past ~40 Gbps isn't a real line, so
@@ -9049,6 +9054,23 @@ async function saveKey(name, el){
     loadSettings();
   }
 }
+// What the note under Line speed says. Two candidates share the slot:
+// the ladder's provider verdict (server-built, from get_config), and the
+// learner's units note (link_line_hint on the queue poll) for a line
+// speed that reads as bytes when the plan was quoted in megabits - the
+// classic "1G" typed for a 1 Gbps line, anchoring the graph 8x high.
+// The units note wins the slot: with the yardstick itself wrong, any
+// verdict scored against it is noise.
+let serverTuneHint='';
+function renderTuneHint(){
+  const thr=document.getElementById('tuneHintRow');
+  if(!thr) return;
+  const msg=lineHint
+    ? t('set.speed.line.bits','Your measured peak is about an eighth of this Line speed. Providers quote megabits: if your line is 1 Gbps, enter 1Gbps, not 1G or 1GB.')
+    : serverTuneHint;
+  thr.style.display=msg?'':'none';
+  document.getElementById('tuneHint').textContent=msg?('⚠ '+msg):'';
+}
 async function loadSettings(){
   // Appearance is browser-local, so it does not wait on the daemon and
   // must still populate if the config call fails below.
@@ -9061,11 +9083,10 @@ async function loadSettings(){
   put('s_speedlimit', sizeStr(c.speedlimit));
   put('s_line_speed', sizeStr(c.line_speed));
   // The tuner's line-speed verdict: server-built text, shown only when
-  // the measured providers fall well short of the stated line.
-  const thr=document.getElementById('tuneHintRow');
-  if(thr){ const msg=(c.tune_hint||'').trim();
-    thr.style.display=msg?'':'none';
-    document.getElementById('tuneHint').textContent=msg?('⚠ '+msg):''; }
+  // the measured providers fall well short of the stated line. The
+  // units note can outrank it (renderTuneHint), so remember it apart.
+  serverTuneHint=(c.tune_hint||'').trim();
+  renderTuneHint();
   const asp=document.getElementById('s_auto_speed');
   if(document.activeElement!==asp) asp.checked=!!c.auto_speed;
   const adf=document.getElementById('s_auto_defer');

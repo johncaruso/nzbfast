@@ -10,6 +10,9 @@ final class AppState: ObservableObject {
     /// The one mode=playback poll: queue, history, per-file readiness
     /// and the byte-serving telemetry, all in a single response.
     @Published var snapshot: PlaybackSnapshot?
+    /// Rolling throughput samples (MB/s), one per poll, for the Home
+    /// chart. ~90 samples at the 2 s cadence = the last three minutes.
+    @Published var speedHistory: [Double] = []
     @Published var lastError: String?
     @Published var offlineSince: Date?
     @Published var selectedTab: MainTab = .home
@@ -52,6 +55,14 @@ final class AppState: ObservableObject {
     }
 
     private func adopt(_ cfg: ServerConfig, version: String?) {
+        // Re-adopting over a live connection (the QA connect path) must
+        // not carry the previous server's state: its snapshot, and the
+        // chart samples that would otherwise be drawn against the new
+        // server's link peak.
+        if client != nil {
+            snapshot = nil
+            speedHistory = []
+        }
         config = cfg
         serverVersion = version
         client = ApiClient(config: cfg)
@@ -65,6 +76,7 @@ final class AppState: ObservableObject {
         config = nil
         client = nil
         snapshot = nil
+        speedHistory = []
         lastError = nil
         offlineSince = nil
     }
@@ -73,18 +85,26 @@ final class AppState: ObservableObject {
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.refresh()
+                await self?.refresh(sample: true)
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
     }
 
-    func refresh() async {
+    /// `sample` is true only from the 2 s poll loop: pull-to-refresh and
+    /// the refresh after every action call this too, and letting those
+    /// append made the chart's timebase lie (extra near-simultaneous
+    /// samples compress the "90 samples = 3 minutes" window).
+    func refresh(sample: Bool = false) async {
         guard let client else { return }
         do {
             // One call for everything: readiness rides the job rows (no
             // per-job probes) and the telemetry feeds the player overlay.
-            snapshot = try await client.playback()
+            let snap = try await client.playback()
+            snapshot = snap
+            if sample {
+                speedHistory = Array((speedHistory + [(snap.speedBps ?? 0) / 1e6]).suffix(90))
+            }
             lastError = nil
             offlineSince = nil
         } catch {

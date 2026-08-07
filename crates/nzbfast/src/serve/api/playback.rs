@@ -114,6 +114,10 @@ fn m_playback(
             })
         })
         .collect();
+    // The link's learned peak (§125), same source the dashboard's queue
+    // poll carries: bps plus "measured"|"line"|"". 0/"" = no anchor
+    // known, and clients keep scale-to-window behaviour.
+    let (peak_bps, peak_src) = d.link_peak.effective(d.line_speed.load(Ordering::Relaxed));
     Some(json!({
         "status": true,
         "contract": 1,
@@ -122,6 +126,8 @@ fn m_playback(
         "paused": d.paused.load(Ordering::Relaxed),
         "pause_int": pause_int(d),
         "speed_bps": d.current_speed_bps(),
+        "link_peak": peak_bps,
+        "link_peak_src": peak_src,
         "diskspace_gb": free_now.unwrap_or(0) as f64 / 1e9,
         "warnings": warns.len(),
         // Totals BEFORE the page cut, so a client showing "3 of 12" does

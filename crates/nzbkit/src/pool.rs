@@ -1099,10 +1099,12 @@ impl QueueControl {
     /// bytes nor the outstanding count while working perfectly. `None`
     /// once the run's pool is gone - there is nothing left to stall.
     pub fn deferred(&self) -> Option<u64> {
+        // lock_ok, like every other accessor of this mutex: this runs
+        // inside the stall watchdog, and a poisoned lock panicking here
+        // would silently kill the exact protection it feeds.
         Some(
             self.shared
-                .lock()
-                .unwrap()
+                .lock_ok()
                 .as_ref()
                 .and_then(std::sync::Weak::upgrade)?
                 .deferred
@@ -1904,14 +1906,16 @@ struct Shared {
     /// channel accepts the body.
     done_ok: std::sync::Mutex<HashSet<String>>,
     start: Instant,
-    /// Monotonic count of responses that advanced an article WITHOUT
-    /// resolving it. The caller's deadlock watchdog treats a run as
-    /// wedged when decoded bytes AND outstanding articles both sit
-    /// frozen; a path that consumes a response and requeues instead of
-    /// emitting Hit/Missing/Failed moves neither, so it reads exactly
-    /// like a wedge (31 Jul's dead-post abort, returning through the
-    /// `soft_430` confirming repeat). Anything that defers a verdict
-    /// this way must tick here, and the watchdog counts it as life.
+    /// Monotonic count of DELIBERATE non-terminal progress. The
+    /// caller's deadlock watchdog treats a run as wedged when decoded
+    /// bytes AND outstanding articles both sit frozen; two kinds of
+    /// healthy work move neither: a path that consumes a response and
+    /// requeues instead of emitting Hit/Missing/Failed (31 Jul's
+    /// dead-post abort, returning through the `soft_430` confirming
+    /// repeat), and the outage prober's paced bounce ladder (whose
+    /// ~10 min horizon the 180 s watchdog was aborting straight
+    /// through). Anything that defers a verdict or paces a recovery
+    /// must tick here, and the watchdog counts it as life.
     deferred: AtomicU64,
     /// Diagnostics: dup dispatches issued, and when the queue first ran dry
     /// with work still pending (start of the tail phase).
@@ -4477,6 +4481,15 @@ async fn park_or_probe(
     // counters. A server capped for good costs one
     // paced dial every ~32 s until the horizon.
     *bounces = bounces.saturating_add(1);
+    // Each paced bounce is DELIBERATE progress along the recovery
+    // ladder, and it must say so on the liveness counter the stall
+    // watchdog reads: during a from-the-start outage nothing decodes
+    // and nothing resolves, so without this tick the watchdog's 180 s
+    // default aborted the job squarely inside the ladder's promised
+    // ~10 min horizon (a provider recovering at 4 min was reported as
+    // a local pool wedge). A prober genuinely frozen mid-dial stops
+    // bouncing, stops ticking, and still trips the watchdog.
+    shared.deferred.fetch_add(1, Ordering::Relaxed);
     if *bounces >= cfg.cap_probe_bounces {
         // The lease outlived any realistic horizon:
         // release the parked yielders to exit so the

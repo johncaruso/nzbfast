@@ -524,6 +524,81 @@ fn civil_dates() {
 }
 
 #[test]
+fn days_from_civil_inverts_civil_from_days() {
+    for z in [-719_468i64, -1, 0, 59, 10_957, 20_653, 1_000_000] {
+        let (y, m, d) = super::civil_from_days(z);
+        assert_eq!(super::days_from_civil(y, m, d), z, "roundtrip of day {z}");
+    }
+    // Leap-year boundary both ways.
+    assert_eq!(
+        super::civil_from_days(super::days_from_civil(2024, 2, 29)),
+        (2024, 2, 29)
+    );
+}
+
+#[test]
+fn quota_period_rolls_on_the_local_calendar() {
+    use super::QuotaLedger as L;
+    // Issue #25: at 2026-07-31T23:30Z a UTC clock is still on Jul 31,
+    // but a UTC+2 clock (Berlin) already reads Aug 1. The period
+    // identity must follow the LOCAL civil date, so the same instant
+    // lands in different periods depending on the timezone.
+    let utc_view = (2026i64, 7u32, 31u32);
+    let berlin_view = (2026i64, 8u32, 1u32);
+    assert_ne!(
+        L::period_start_on('d', utc_view),
+        L::period_start_on('d', berlin_view),
+        "local midnight must open a new daily period"
+    );
+    assert_ne!(
+        L::period_start_on('m', utc_view),
+        L::period_start_on('m', berlin_view),
+        "the local 1st must open a new monthly period"
+    );
+    // Within one local day the token never moves, and a monthly period
+    // is pinned to the 1st of that local month.
+    assert_eq!(
+        L::period_start_on('d', berlin_view),
+        L::period_start_on('d', (2026, 8, 1))
+    );
+    assert_eq!(
+        L::period_start_on('m', (2026, 8, 17)),
+        L::period_start_on('m', (2026, 8, 1))
+    );
+    assert_eq!(
+        L::period_start_on('m', (2026, 8, 17)),
+        super::days_from_civil(2026, 8, 1) as u64 * 86_400
+    );
+    // On a UTC machine the encoding matches the pre-#25 scheme
+    // (days-since-epoch * 86_400), so upgrading does not reset a
+    // half-spent ledger.
+    assert_eq!(L::period_start_on('d', (2026, 7, 19)), 20_653 * 86_400);
+}
+
+/// Codex 7 Aug M2: the UTC-to-local token migration must not discard a
+/// non-UTC user's persisted spend. A LEGACY ledger (no "local" marker)
+/// whose token matches what the old UTC scheme computes right now is
+/// the current window's spend and carries; new-format ledgers demand
+/// exact equality so a stale one cannot ride a coincidental UTC match.
+#[test]
+fn legacy_utc_quota_ledger_carries_across_the_upgrade() {
+    use super::QuotaLedger as L;
+    // UTC+10 at 2026-08-06 23:00Z: local token = Aug 7, legacy = Aug 6.
+    let local = L::period_start_on('d', (2026, 8, 7));
+    let legacy_now = L::period_start_on('d', (2026, 8, 6));
+    // The upgrade moment: a legacy ledger written seconds ago under the
+    // UTC scheme must carry into the local window...
+    assert!(L::carry_persisted(legacy_now, false, local, legacy_now));
+    // ...while a legacy ledger from an EARLIER window still drops...
+    let stale = L::period_start_on('d', (2026, 8, 5));
+    assert!(!L::carry_persisted(stale, false, local, legacy_now));
+    // ...and a NEW-format ledger matching only the legacy token is
+    // yesterday's spend, not today's - strict equality applies.
+    assert!(!L::carry_persisted(legacy_now, true, local, legacy_now));
+    assert!(L::carry_persisted(local, true, local, legacy_now));
+}
+
+#[test]
 fn quota_ledger_persists_and_rolls() {
     let dir = std::env::temp_dir().join(format!("nzbfast-quota-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

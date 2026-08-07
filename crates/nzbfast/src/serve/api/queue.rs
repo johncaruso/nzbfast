@@ -1010,16 +1010,26 @@ fn m_addurl(
         let url = params.get("name").cloned().unwrap_or_default();
         let cat = params.get("cat").cloned().unwrap_or_default();
         let cat = if cat == "*" { String::new() } else { cat };
-        let name = params
+        // An explicit `nzbname` wins. Without one the name has to come
+        // off the fetch itself: a Prowlarr redirect grab (issue #26)
+        // sends only the indexer's download URL, whose last path
+        // segment is an id hash - the release name arrives in the
+        // response's Content-Disposition, so naming from the URL alone
+        // titled the job `chsfsd12das32da90aa3181`.
+        let explicit = params
             .get("nzbname")
-            .cloned()
-            .unwrap_or_else(|| url.rsplit('/').next().unwrap_or("download.nzb").to_string());
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let pw = params.get("password").cloned();
         let stream = params.get("stream").map(String::as_str) == Some("1");
         let prio = if stream { 2 } else { param_priority(params) };
         let origin = api_origin(ctx.ua_hdr, origin_of(params));
         match fetch_url(&url) {
             Ok(f) => {
+                let name = explicit
+                    .or_else(|| name_from_fetch(&f, &url))
+                    .unwrap_or_else(|| "download.nzb".to_string());
                 match d.enqueue_fetched(&f, &name, &cat, prio, pw.as_deref(), 0, &origin, false) {
                     Ok(id) if stream => json!({
                         "status": true, "nzo_ids": [id],

@@ -132,7 +132,7 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
                         pool.give(raw);
                         continue;
                     };
-                    let (sidx, nbytes) = (sidx as usize, nbytes as u64);
+                    let sidx = sidx as usize;
                     let slot = &slots[sidx];
                     let mut out = out_pool.take();
                     // M32 perf: once live verify (full-MD5 mode) has
@@ -479,7 +479,7 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
                         // and leaving it out would hold the
                         // bar short of 100% on every damaged
                         // set while repair ran.
-                        fetch_done.fetch_add(nbytes as u64, Ordering::Relaxed);
+                        fetch_done.fetch_add(nbytes, Ordering::Relaxed);
                         slots[sidx].missing.fetch_add(1, Ordering::Relaxed);
                         if slots[sidx].remaining.fetch_sub(1, Ordering::AcqRel) == 1
                             && (slots[sidx].is_par2_main
@@ -515,7 +515,7 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
                         // and leaving it out would hold the
                         // bar short of 100% on every damaged
                         // set while repair ran.
-                        fetch_done.fetch_add(nbytes as u64, Ordering::Relaxed);
+                        fetch_done.fetch_add(nbytes, Ordering::Relaxed);
                         slots[sidx].missing.fetch_add(1, Ordering::Relaxed);
                         if slots[sidx].remaining.fetch_sub(1, Ordering::AcqRel) == 1
                             && (slots[sidx].is_par2_main

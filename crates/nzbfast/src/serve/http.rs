@@ -296,13 +296,20 @@ fn route_watch(req: tiny_http::Request, d: &Arc<Daemon>, query: &str) {
         let _ = req.respond(tiny_http::Response::from_string("missing url=").with_status_code(400));
         return;
     };
-    let name = sp
+    // Same naming ladder as addurl (issue #26): an explicit name wins,
+    // then the fetched Content-Disposition filename, then the URL tail.
+    let explicit = sp
         .get("name")
-        .cloned()
-        .unwrap_or_else(|| url.rsplit('/').next().unwrap_or("watch.nzb").to_string());
-    let resp = match fetch_url(&url)
-        .and_then(|f| d.enqueue_fetched(&f, &name, "", 2, None, 0, "url", false))
-    {
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let resp = match fetch_url(&url).and_then(|f| {
+        let name = explicit
+            .clone()
+            .or_else(|| name_from_fetch(&f, &url))
+            .unwrap_or_else(|| "watch.nzb".to_string());
+        d.enqueue_fetched(&f, &name, "", 2, None, 0, "url", false)
+    }) {
         Ok(id) => {
             // Reflect the key into the redirect ONLY when it really
             // is a configured key. On a keyless install `ok` above

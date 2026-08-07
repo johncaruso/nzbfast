@@ -57,6 +57,10 @@ class MainActivity : ComponentActivity() {
      *  readiness and the byte-serving telemetry in a single response. */
     private var snapshot by mutableStateOf<PlaybackSnapshot?>(null)
 
+    /** Rolling throughput samples (MB/s), one per poll, for the Home
+     *  chart. ~90 samples at the 2 s cadence = the last three minutes. */
+    private var speedHistory by mutableStateOf(listOf<Double>())
+
     private var pollJob: Job? = null
 
     private val client: NzbfastClient?
@@ -180,6 +184,7 @@ class MainActivity : ComponentActivity() {
                     is Screen.Home -> androidx.compose.foundation.layout.Box(mod) {
                         HomeScreen(
                             snapshot = snapshot,
+                            speedHistory = speedHistory,
                             statusLine = note,
                             onPlay = ::play,
                             onPauseJob = { io { client?.pauseJob(it) } },
@@ -428,6 +433,7 @@ class MainActivity : ComponentActivity() {
                     }
                     if (snap != null) {
                         snapshot = snap
+                        speedHistory = (speedHistory + snap.speedBps / 1e6).takeLast(90)
                         if (note?.startsWith("Could not reach") == true) note = null
                     } else {
                         note = "Could not reach the server."

@@ -1166,6 +1166,125 @@ fn fetch_url_keeps_the_indexer_headers() {
     assert!(super::is_nzb_body(&f.bytes));
 }
 
+/// Issue #26 end to end at the fetch layer: a Prowlarr redirect grab is
+/// `addurl` with an id-hash URL and no `nzbname`; the release name only
+/// exists in the response's Content-Disposition. It has to survive the
+/// fetch, or the job is titled after the hash.
+#[test]
+fn fetch_url_keeps_the_content_disposition_name() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://{}/getnzb/chsfsd12das32da90aa3181?i=1&r=key",
+        listener.local_addr().unwrap()
+    );
+    let t = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf);
+        let body = r#"<?xml version="1.0"?><nzb></nzb>"#;
+        let _ = sock.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+                 Content-Disposition: attachment; filename=\"Some.Release.2026.1080p-GRP.nzb\"\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    });
+    let f = super::fetch_url(&url).expect("loopback fetch");
+    t.join().unwrap();
+    assert_eq!(f.filename, "Some.Release.2026.1080p-GRP.nzb");
+    assert_eq!(
+        super::name_from_fetch(&f, &url).as_deref(),
+        Some("Some.Release.2026.1080p-GRP.nzb")
+    );
+}
+
+/// The three Content-Disposition shapes in the wild, plus the refusals:
+/// path components are shorn (the header is attacker-influenced) and
+/// RFC 5987 `filename*` wins over `filename` when both appear.
+#[test]
+fn content_disposition_filename_shapes() {
+    let cd = super::content_disposition_filename;
+    assert_eq!(
+        cd("attachment; filename=\"A.Release.nzb\"").as_deref(),
+        Some("A.Release.nzb")
+    );
+    assert_eq!(
+        cd("attachment; filename=bare.nzb").as_deref(),
+        Some("bare.nzb")
+    );
+    assert_eq!(
+        cd("attachment; filename*=UTF-8''Sp%C3%A9cial%20Name.nzb").as_deref(),
+        Some("Spécial Name.nzb")
+    );
+    // filename* wins regardless of parameter order, and `+` stays literal.
+    assert_eq!(
+        cd("attachment; filename=\"fallback.nzb\"; filename*=utf-8''Real+One.nzb").as_deref(),
+        Some("Real+One.nzb")
+    );
+    // Path components shorn - a header must not steer names around.
+    assert_eq!(
+        cd("attachment; filename=\"../../etc/evil.nzb\"").as_deref(),
+        Some("evil.nzb")
+    );
+    assert_eq!(
+        cd("attachment; filename=\"C:\\\\spool\\\\evil.nzb\"").as_deref(),
+        Some("evil.nzb")
+    );
+    // Nothing usable: absent, empty, or absurd.
+    assert_eq!(cd("inline"), None);
+    assert_eq!(cd("attachment; filename=\"\""), None);
+    assert_eq!(
+        cd(&format!("attachment; filename=\"{}\"", "x".repeat(300))),
+        None
+    );
+    // Codex 7 Aug L3: a semicolon INSIDE the quoted value is part of
+    // the name, not a parameter boundary - the blind split named the
+    // job "Show" and skewed folder + duplicate identity off it.
+    assert_eq!(
+        cd("attachment; filename=\"Show; Part 2.nzb\"").as_deref(),
+        Some("Show; Part 2.nzb")
+    );
+    // ...and an empty/malformed filename* must not suppress the valid
+    // plain filename beside it.
+    assert_eq!(
+        cd("attachment; filename=\"Good.nzb\"; filename*=UTF-8''").as_deref(),
+        Some("Good.nzb")
+    );
+    // Sweep 7 Aug: control characters out - a percent-encoded CR/LF or
+    // ESC in the header must not reach logs through the job name.
+    assert_eq!(
+        cd("attachment; filename*=UTF-8''evil%0d%0afake%20log%20line.nzb").as_deref(),
+        Some("evilfake log line.nzb")
+    );
+}
+
+/// Without a Content-Disposition the fallback is the URL's last path
+/// segment WITHOUT the query string - the old code kept `?t=get&id=...`
+/// glued onto API-style links.
+#[test]
+fn name_from_fetch_strips_the_query() {
+    let f = super::Fetched {
+        bytes: Vec::new(),
+        failure_link: String::new(),
+        host: String::new(),
+        https: false,
+        category: String::new(),
+        filename: String::new(),
+    };
+    assert_eq!(
+        super::name_from_fetch(&f, "https://x/api?t=get&id=abc").as_deref(),
+        Some("api")
+    );
+    assert_eq!(
+        super::name_from_fetch(&f, "https://x/getnzb/abc123.nzb?r=key#frag").as_deref(),
+        Some("abc123.nzb")
+    );
+    assert_eq!(super::name_from_fetch(&f, "https://x/dir/"), None);
+}
+
 /// SSRF guard: cloud-metadata / link-local is refused; loopback, LAN
 /// and CGNAT stay reachable (self-hosted indexers + Tailscale live
 /// there), as do public hosts.

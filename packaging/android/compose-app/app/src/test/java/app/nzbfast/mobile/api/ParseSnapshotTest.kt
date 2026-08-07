@@ -178,6 +178,30 @@ class ParseSnapshotTest {
     }
 
     /**
+     * §125 anchor fields are a contract ADDITION: a pre-addition daemon
+     * (these 1.0.16 recordings) answers without them and the chart must
+     * fall back to scale-to-window, so absence parses as 0 / "".
+     */
+    @Test
+    fun playbackWithoutLinkPeakMeansNoAnchor() {
+        val p = Parse.playback(snap("playback_live.json"))
+        assertEquals(0.0, p.linkPeakBps, 0.0)
+        assertEquals("", p.linkPeakSrc)
+    }
+
+    /** And a daemon that knows its link carries bps + source. */
+    @Test
+    fun playbackLinkPeakParses() {
+        val body = snap("playback_live.json").replace(
+            "\"paused\": false,",
+            "\"paused\": false, \"link_peak\": 118500000.0, \"link_peak_src\": \"measured\",",
+        )
+        val p = Parse.playback(body)
+        assertEquals(118500000.0, p.linkPeakBps, 0.0)
+        assertEquals("measured", p.linkPeakSrc)
+    }
+
+    /**
      * Mid-download of a file too big to land whole: playable now, but
      * the tail (where the seek index lives) has not arrived - ready
      * WITHOUT seekable. Recorded behind chaos-serve --line so the

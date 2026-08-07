@@ -787,7 +787,7 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
     // whole-job average hid stalls; idle or a fresh window reports 0,
     // never `bytes / ~zero elapsed`.
     let speed_bps = d.current_speed_bps();
-    let (peak_bps, peak_src) = d.link_peak.effective(d.line_speed.load(Ordering::Relaxed));
+    let (peak_bps, peak_src, line_hint) = d.link_peak.chart(d.line_speed.load(Ordering::Relaxed));
     // Prefetch sidecar state, matched by nzo_id per slot below.
     let sc = d
         .sidecar
@@ -1319,8 +1319,8 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         "line_speed": d.line_speed.load(Ordering::Relaxed),
         // §125: the graph's 100% anchor - learned peak bytes/sec (0 =
         // unknown); source "measured" or "line" (see serve/linkpeak.rs).
-        "link_peak": peak_bps,
-        "link_peak_src": peak_src,
+        "link_peak": peak_bps, "link_peak_src": peak_src,
+        "link_line_hint": line_hint,
         "auto_speed": d.auto_speed.load(Ordering::Relaxed),
         "watch_failed": watch_failed,
         "watch_picked": watch_picked,

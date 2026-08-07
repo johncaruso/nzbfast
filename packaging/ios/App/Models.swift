@@ -290,6 +290,11 @@ struct PlaybackSnapshot: Codable {
     let nzbfast: String?
     let paused: Bool?
     let speedBps: Double?
+    /// The link's learned peak (bps) and its source ("measured" |
+    /// "line" | ""), a contract addition. nil or 0 = no anchor known,
+    /// and the throughput chart scales to its window instead.
+    let linkPeak: Double?
+    let linkPeakSrc: String?
     let diskspaceGb: Double?
     let warnings: Int?
     let queueTotal: Int?
@@ -301,6 +306,8 @@ struct PlaybackSnapshot: Codable {
     enum CodingKeys: String, CodingKey {
         case contract, version, nzbfast, paused, warnings, queue, history, stream
         case speedBps = "speed_bps"
+        case linkPeak = "link_peak"
+        case linkPeakSrc = "link_peak_src"
         case diskspaceGb = "diskspace_gb"
         case queueTotal = "queue_total"
         case historyTotal = "history_total"

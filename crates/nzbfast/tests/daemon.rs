@@ -2,6 +2,8 @@
 //! addfile upload, queue polling, history with final storage path - all
 //! against the real binary + mock NNTP servers.
 
+// §123 chip-6 fault x lifecycle cross product (sibling dir, size gate).
+mod daemon_chip6;
 mod playback_contract;
 mod scratch;
 mod stream_chaos;
@@ -1483,8 +1485,12 @@ async fn quota_hold_is_on_the_wire_and_force_still_runs() {
 
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        // The quota period follows the daemon's LOCAL calendar since
+        // issue #25; pin the daemon to UTC so the UTC-midnight `start`
+        // seeded above stays valid on any test machine.
         c.env("NZBFAST_OPEN", "1")
             .env("NZBFAST_NO_ENRICH", "1")
+            .env("TZ", "UTC")
             .arg("--config")
             .arg(&cfg)
             .arg("serve")

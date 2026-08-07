@@ -99,6 +99,8 @@ with any value.
 | `NZBFAST_SCAN_IDLE_SECS` | Indexer header-scan idle deadline before a pass is abandoned | 300 | Debug-only |
 | `NZBFAST_DROP_CACHE` | `1`/`0` force page-cache drop-behind of written data on Linux (benching; the CLI defaults on, the daemon off because a stream reader can attach) | path default | Debug-only |
 | `NZBFAST_WRITE_PACE_MB` | macOS write pacing: fsync every N MB of new bytes per output file so dirty pages never pile up into one line-stalling flush burst; `0` off | 32 (macOS) | Debug-only |
+| `NZBFAST_WIN_SPARSE` | Windows: mark output files sparse (FSCTL_SET_SPARSE) so NTFS stops zero-filling below valid-data-length on out-of-order writes (~1.6x write amplification without it); `0` off | on (Windows) | Debug-only |
+| `NZBFAST_WIN_WRITERS` | Windows: spread positioned writes across N handles per output file (measured no gain on the bench box - see disk.rs) | 1 (Windows) | Debug-only |
 | `NZBFAST_NOCACHE` | `1`: set F_NOCACHE on output writers (macOS) so large sequential output bypasses the page cache (line-rate benching) | unset (cached) | Debug-only |
 | `NZBFAST_CHANNEL_DEPTH` | Override the fetch->decode channel depth (articles), clamped 8-8192 (line-rate benching) | budget-derived | Debug-only |
 | `NZBFAST_TLS_AES256` | Set: force the full TLS cipher list on every host - escape hatch for an untested provider that misbehaves with the trimmed list | unset (per-host list) | Debug-only |

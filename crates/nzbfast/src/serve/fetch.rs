@@ -129,6 +129,121 @@ pub struct Fetched {
     /// has a legitimate use for it.
     #[allow(dead_code)]
     pub category: String,
+    /// Filename from the response's `Content-Disposition`, or empty.
+    /// This is where indexers put the real release name - a grab
+    /// proxied by Prowlarr with its per-indexer Redirect setting
+    /// arrives as `addurl` with no `nzbname` and a download URL whose
+    /// last path segment is the indexer's NZB id hash, so this header
+    /// is the only place the human name exists (issue #26).
+    pub filename: String,
+}
+
+/// The filename out of a `Content-Disposition` header, or None. Handles
+/// the three shapes in the wild: `filename="quoted"`, a bare
+/// `filename=token`, and RFC 5987 `filename*=UTF-8''percent-encoded`
+/// (which wins over `filename` when both appear, per RFC 6266).
+///
+/// The value is attacker-influenced (it comes from whatever answered the
+/// fetch), so any path components are shorn and an outsized value is
+/// refused; the enqueue path re-sanitizes before anything touches the
+/// filesystem, same as `nzbname`.
+pub(crate) fn content_disposition_filename(hdr: &str) -> Option<String> {
+    let mut plain: Option<String> = None;
+    let mut ext: Option<String> = None;
+    for part in split_disposition_params(hdr) {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        let key = k.trim().to_ascii_lowercase();
+        let v = v.trim();
+        if key == "filename*" {
+            // ext-value = charset "'" [language] "'" value-chars. Only
+            // UTF-8 arrives in practice; a mislabelled charset still
+            // decodes lossily rather than dropping the name.
+            if let Some((_, data)) = v.rsplit_once('\'') {
+                ext = Some(percent_decode(data));
+            }
+        } else if key == "filename" {
+            let v = match v.strip_prefix('"') {
+                Some(rest) => rest.split('"').next().unwrap_or(""),
+                None => v,
+            };
+            plain = Some(v.to_string());
+        }
+    }
+    // filename* wins per RFC 6266, but only when it actually carried a
+    // name: a malformed or empty ext-value must not suppress a perfectly
+    // valid plain `filename` beside it.
+    let name = ext.filter(|s| !s.trim().is_empty()).or(plain)?;
+    let name = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    // Control characters out: percent-decoding happily produces CR/LF/
+    // ESC, and while the filesystem paths re-sanitize downstream, the
+    // raw string becomes the job's display name - which reaches logs
+    // and would otherwise carry ANSI escapes or forged log lines from
+    // whatever answered the fetch.
+    let name: String = name.chars().filter(|c| !c.is_control()).collect();
+    let name = name.trim();
+    (!name.is_empty() && name.len() <= 255).then(|| name.to_string())
+}
+
+/// Split a Content-Disposition header into its `;`-separated params,
+/// honouring quoted-string boundaries: `filename="Show; Part 2.nzb"`
+/// is ONE parameter, and splitting it blind named the job `Show` -
+/// wrong output folder, wrong duplicate identity. (Backslash escapes
+/// inside the quoted string are not interpreted: no client emits them
+/// in filenames, and a stray quote merely mis-splits back to the old
+/// behaviour, never past the header.)
+fn split_disposition_params(hdr: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut start, mut quoted) = (0usize, false);
+    for (i, b) in hdr.bytes().enumerate() {
+        match b {
+            b'"' => quoted = !quoted,
+            b';' if !quoted => {
+                parts.push(&hdr[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&hdr[start..]);
+    parts
+}
+
+/// Percent-decode only - NOT `urldecode`, whose `+` → space rule belongs
+/// to form encoding and would corrupt a literal `+` in a filename.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 3 <= b.len()
+            && let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
+        {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The job name for a URL grab that carried no explicit name: the
+/// fetched `Content-Disposition` filename when the server sent one
+/// (that is the name SABnzbd shows for the same grab), else the URL's
+/// last path segment shorn of query and fragment - the old fallback
+/// kept the whole `?t=get&id=...` tail on API-style links.
+pub(super) fn name_from_fetch(f: &Fetched, url: &str) -> Option<String> {
+    if !f.filename.is_empty() {
+        return Some(f.filename.clone());
+    }
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    let tail = path.rsplit('/').next().unwrap_or("").trim();
+    (!tail.is_empty()).then(|| tail.to_string())
 }
 
 /// One `X-DNZB-*` header, trimmed, or empty.
@@ -285,6 +400,10 @@ pub(super) fn fetch_head(url: &str) -> Result<(ureq::Response, String, String)> 
 pub(super) fn fetch_url(url: &str) -> Result<Fetched> {
     use std::io::Read;
     let (resp, failure_link, category) = fetch_head(url)?;
+    let filename = resp
+        .header("Content-Disposition")
+        .and_then(content_disposition_filename)
+        .unwrap_or_default();
     // Refuse an oversized body BEFORE reading it, when the server was
     // honest enough to declare one; the take() below is the backstop for
     // when it wasn't.
@@ -312,6 +431,7 @@ pub(super) fn fetch_url(url: &str) -> Result<Fetched> {
         host: url_host(url),
         https: url.starts_with("https://"),
         category,
+        filename,
     })
 }
 

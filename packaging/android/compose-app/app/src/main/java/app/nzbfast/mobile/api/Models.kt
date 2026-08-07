@@ -104,6 +104,11 @@ data class PlaybackSnapshot(
     val contract: Int,
     val paused: Boolean,
     val speedBps: Double,
+    // §125 anchor: the link's learned peak (bps) and where it came
+    // from ("measured" | "line" | ""). 0 = no anchor known, and the
+    // chart scales to its window instead.
+    val linkPeakBps: Double,
+    val linkPeakSrc: String,
     val diskFreeGb: Double,
     val warnings: Int,
     val queue: List<PlaybackJob>,
@@ -236,6 +241,8 @@ object Parse {
             contract = j.optInt("contract", 0),
             paused = j.optBoolean("paused", false),
             speedBps = j.optDouble("speed_bps", 0.0),
+            linkPeakBps = j.optDouble("link_peak", 0.0),
+            linkPeakSrc = j.optString("link_peak_src", ""),
             diskFreeGb = j.optDouble("diskspace_gb", 0.0),
             warnings = j.optInt("warnings", 0),
             queue = playbackJobs(j.optJSONArray("queue")),

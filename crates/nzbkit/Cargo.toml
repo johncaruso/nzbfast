@@ -86,6 +86,19 @@ md-5 = { version = "0.10", features = ["asm"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 ktls = { version = "6.0", default-features = false, features = ["aws_lc_rs"], optional = true }
 
+# FSCTL_SET_SPARSE for the Windows write path (disk.rs): out-of-order
+# positioned writes into a set_len file make NTFS zero-fill everything
+# between valid-data-length and the write offset - measured ~1.6x write
+# amplification on the 6 Aug line-rate campaign. Marking the output
+# sparse turns that zero-fill into a hole. Same crate and version
+# nzbfast already links.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+
 [features]
 default = ["indexer"]
 # The indexer stack: newsgroup index, Spotnet source, availability

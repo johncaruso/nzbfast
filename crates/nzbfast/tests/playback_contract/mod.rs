@@ -127,6 +127,10 @@ async fn playback_contract_answers_readiness_and_scoped_tokens() {
         // One call, every part: server state, both lists, telemetry.
         assert!(v["nzbfast"].is_string(), "{body}");
         assert!(v["speed_bps"].is_number(), "{body}");
+        // §125 anchor, additive: bps + "measured"|"line"|"" (empty =
+        // no anchor known, clients scale to window).
+        assert!(v["link_peak"].is_number(), "{body}");
+        assert!(v["link_peak_src"].is_string(), "{body}");
         assert!(v["stream"]["readers"].is_number(), "{body}");
         assert!(v["stream"]["runway_wait_ms"].is_number(), "{body}");
         assert_eq!(v["stream"]["zero_filled_bytes"], 0, "{body}");

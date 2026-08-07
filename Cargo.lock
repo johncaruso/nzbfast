@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "nzbfast"
-version = "1.0.18"
+version = "1.0.19"
 dependencies = [
  "anyhow",
  "clap",
@@ -1562,11 +1562,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webpki-roots 1.0.9",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "nzbtray"
-version = "1.0.18"
+version = "1.0.19"
 dependencies = [
  "serde_json",
  "sha2 0.10.9",

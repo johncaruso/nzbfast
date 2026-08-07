@@ -1,6 +1,6 @@
 [package]
 name = "nzbfast"
-version = "1.0.18"
+version = "1.0.19"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -109,6 +109,8 @@ trash = "5.2.6"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    # GetLocalTime, for the quota ledger's local-midnight rollover.
+    "Win32_System_SystemInformation",
 ] }
 
 # Kernel TLS, Linux only and off by default - see nzbkit's `ktls`

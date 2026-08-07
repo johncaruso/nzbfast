@@ -1280,16 +1280,26 @@ fn home_dir() -> Option<String> {
         .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }
 
-/// SAB's `real_path`: absolute stays, `~/` expands, anything else is
-/// relative to `complete_dir`.
+/// SAB's `real_path`: absolute stays, `~` expands, anything else is
+/// relative to `complete_dir`. All three home spellings a sabnzbd.ini
+/// carries in the wild - `~/x`, `~\x` (Windows-authored), and a bare
+/// `~` - expand; leaving one unexpanded lands category downloads in a
+/// directory literally named `~` under complete_dir.
 fn resolve_sab_dir(dir: &str, complete_dir: &str) -> String {
     if is_absolute_path(dir) {
         return dir.to_string();
     }
-    if let Some(rest) = dir.strip_prefix("~/")
+    if let Some(rest) = dir
+        .strip_prefix("~/")
+        .or_else(|| dir.strip_prefix("~\\"))
+        .or_else(|| (dir == "~").then_some(""))
         && let Some(home) = home_dir()
     {
-        return format!("{}/{rest}", home.trim_end_matches('/'));
+        let home = home.trim_end_matches(['/', '\\']);
+        if rest.is_empty() {
+            return home.to_string();
+        }
+        return format!("{home}/{rest}");
     }
     if complete_dir.is_empty() {
         return dir.to_string();
@@ -1470,6 +1480,25 @@ host = news.example.com
             "a resolvable base was reported unresolvable: {:?}",
             c.dropped
         );
+    }
+
+    /// Codex sweep 7 Aug (the 3df076bf residual): the OTHER two home
+    /// spellings a sabnzbd.ini carries - `~\...` from a Windows-authored
+    /// config and a bare `~` - must expand too, or category downloads
+    /// land in a directory literally named `~` under complete_dir.
+    #[test]
+    fn windows_tilde_and_bare_tilde_dirs_expand() {
+        let home = super::home_dir().expect("test needs HOME or USERPROFILE");
+        let home = home.trim_end_matches(['/', '\\']);
+        assert_eq!(
+            super::resolve_sab_dir("~\\Downloads", "/c"),
+            format!("{home}/Downloads")
+        );
+        assert_eq!(super::resolve_sab_dir("~", "/c"), home);
+        // The plain spelling keeps working, and a name merely STARTING
+        // with a tilde is a real directory name, not a home reference.
+        assert_eq!(super::resolve_sab_dir("~/dl", "/c"), format!("{home}/dl"));
+        assert_eq!(super::resolve_sab_dir("~backup", "/c"), "/c/~backup");
     }
 
     /// The parser must not wander into `[servers]` or back out of it.

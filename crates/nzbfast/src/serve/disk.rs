@@ -122,20 +122,63 @@ impl QuotaLedger {
             .unwrap_or(0)
     }
 
-    /// Start of the current period (UTC midnight / 1st of month).
-    pub(super) fn period_start(period: char) -> u64 {
-        let now = Self::now();
-        let day = 86_400;
-        match period {
-            'm' => {
-                // Days since epoch → walk back to day-of-month 1. Epoch
-                // was a Thursday, Jan 1 1970; use civil-from-days math.
-                let days = now / day;
-                let dom = civil_from_days(days as i64).2 as u64; // 1-based
-                (days - (dom - 1)) * day
+    /// Today's civil date (year, month, day) in the machine's LOCAL
+    /// timezone - people budget a quota around their own calendar, and
+    /// SABnzbd and NZBGet both reset on local time (issue #25). Falls
+    /// back to UTC where local time isn't available, same as
+    /// `local_minute_of_week`.
+    fn local_civil_today() -> (i64, u32, u32) {
+        #[cfg(unix)]
+        {
+            let t = Self::now() as libc::time_t;
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            // localtime_r does not imply tzset (POSIX) - without it,
+            // macOS ignores a TZ set on the environment, and TZ is how
+            // Docker users pin their timezone. Not in the libc crate,
+            // so declared here.
+            unsafe extern "C" {
+                fn tzset();
             }
-            _ => now / day * day,
+            unsafe { tzset() };
+            if !unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+                return (
+                    tm.tm_year as i64 + 1900,
+                    tm.tm_mon as u32 + 1,
+                    tm.tm_mday as u32,
+                );
+            }
         }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::SYSTEMTIME;
+            use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+            let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+            unsafe { GetLocalTime(&mut st) };
+            if st.wYear != 0 {
+                return (st.wYear as i64, st.wMonth as u32, st.wDay as u32);
+            }
+        }
+        civil_from_days((Self::now() / 86_400) as i64)
+    }
+
+    /// Identity token for the current quota period: daily quotas roll at
+    /// LOCAL midnight, monthly ones on the local 1st. Encoded as
+    /// days*86_400 of the period's first (local) civil day - a pure
+    /// function of the civil date, so it is stable across DST shifts
+    /// inside a period, and identical to the old UTC-based values on a
+    /// UTC machine, so upgrading doesn't spuriously reset the ledger.
+    pub(super) fn period_start(period: char) -> u64 {
+        Self::period_start_on(period, Self::local_civil_today())
+    }
+
+    /// The pure half of `period_start` - see the timezone-boundary tests.
+    pub(super) fn period_start_on(period: char, (y, m, d): (i64, u32, u32)) -> u64 {
+        let dom = if period == 'm' { 1 } else { d };
+        // A clock set before 1970 gives negative days; the straight
+        // `as u64` cast wrapped huge and the multiply overflowed (debug
+        // panic in the download runner's tick). Clamp to epoch - the
+        // token only has to CHANGE when the period rolls.
+        days_from_civil(y, m, dom).max(0) as u64 * 86_400
     }
 
     pub(super) fn open(spool: &std::path::Path, period: char) -> Self {
@@ -153,11 +196,45 @@ impl QuotaLedger {
             crate::persist::blocking_db(|| crate::persist::load_json_with_backup(&led.path))
         {
             let start = v["start"].as_u64().unwrap_or(0);
-            if start == led.start {
+            // Migration (issue #25 follow-up): pre-local ledgers tokened
+            // the UTC civil date. On a non-UTC machine the local token
+            // differs around the timezone boundary, and refusing the
+            // saved bytes would grant a metered account a second
+            // allowance inside the same billing window. A LEGACY ledger
+            // (no "local" marker) whose token matches what the old
+            // scheme would compute right now is the current period's
+            // spend - carry it into the local window. New-format
+            // ledgers stay strict equality: a stale one from yesterday
+            // must not ride a coincidental UTC-token match.
+            let keep = Self::carry_persisted(
+                start,
+                v["local"].as_bool().unwrap_or(false),
+                led.start,
+                Self::period_start_on(period, civil_from_days((Self::now() / 86_400) as i64)),
+            );
+            if keep {
                 led.bytes = v["bytes"].as_u64().unwrap_or(0);
             }
         }
         led
+    }
+
+    /// Whether a persisted ledger's bytes belong to the CURRENT period.
+    /// `new_start` is today's local-calendar token; `legacy_now_start`
+    /// is the token the pre-#25 UTC scheme would compute right now.
+    /// A new-format ledger (`is_local`) must match exactly - a stale
+    /// one from yesterday must not ride a coincidental UTC match. A
+    /// LEGACY ledger also carries when it matches the legacy scheme's
+    /// current token: same wall-clock window, written by the old code
+    /// moments before the upgrade - dropping it granted a metered
+    /// account a second allowance inside one billing window.
+    pub(super) fn carry_persisted(
+        persisted: u64,
+        is_local: bool,
+        new_start: u64,
+        legacy_now_start: u64,
+    ) -> bool {
+        persisted == new_start || (!is_local && persisted == legacy_now_start)
     }
 
     /// Roll the window if a new period began; returns bytes spent so far.
@@ -178,9 +255,12 @@ impl QuotaLedger {
     }
 
     pub(super) fn save(&self) {
+        // "local": the format marker the migration path in `open` keys
+        // off. A ledger without it predates the local-calendar tokens
+        // (issue #25) and may carry a UTC-day token instead.
         let _ = crate::persist::write_atomic(
             &self.path,
-            json!({"start": self.start, "bytes": self.bytes})
+            json!({"start": self.start, "bytes": self.bytes, "local": true})
                 .to_string()
                 .as_bytes(),
         );
@@ -200,6 +280,18 @@ pub(super) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Days-since-epoch from (year, month, day) - the inverse of
+/// `civil_from_days`, same Hinnant civil-calendar algorithm.
+pub(super) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = y - (m <= 2) as i64;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Mid-download disk full (the fast halt in get/workers.rs): when the

@@ -1334,6 +1334,79 @@ async fn hard_outage_window_parks_the_fleet_then_rejoins() {
     );
 }
 
+/// Codex 7 Aug M1: during a from-the-start outage the prober's paced
+/// bounce ladder decodes nothing and resolves nothing, so none of the
+/// stall watchdog's three signals moved and its 180 s default aborted
+/// jobs squarely inside the ladder's promised ~10 min horizon. Each
+/// bounce now ticks the `deferred` liveness counter - prove it climbs
+/// DURING the refuse window, before anything resolves.
+#[tokio::test(flavor = "multi_thread")]
+async fn outage_prober_bounces_tick_watchdog_liveness() {
+    use crate::mock::{Chaos, MockServer};
+    let data: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+    let mut articles = std::collections::HashMap::new();
+    let segs = crate::mock::make_file_articles("lv.bin", &data, 20_000, "lv", &mut articles);
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            refuse_connect_ms: 2_500,
+            ..Default::default()
+        },
+    )
+    .await;
+    let cfg = PoolConfig {
+        connections: 3,
+        ramp_delay: Duration::ZERO,
+        connect_backoff: Duration::from_millis(50),
+        max_connect_attempts: 3,
+        ..Default::default()
+    };
+    let reqs: Vec<ArticleReq> = segs
+        .iter()
+        .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
+        .collect();
+    let qc = std::sync::Arc::new(QueueControl::default());
+    let (tx, mut rx) = mpsc::channel(64);
+    let run = {
+        let qc = qc.clone();
+        let server = srv.server_config();
+        tokio::spawn(
+            async move { fetch_all_multi_ctl(&[(server, cfg)], reqs, tx, Some(&qc)).await },
+        )
+    };
+    // Sample liveness inside the outage window: the fleet parks within
+    // a few hundred ms, then only the prober moves. Its bounces must
+    // read as life on the counter the watchdog polls.
+    let mut ticked = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if qc.deferred().unwrap_or(0) > 0 {
+            ticked = true;
+            break;
+        }
+    }
+    assert!(
+        ticked,
+        "prober bounces left the watchdog's liveness counter frozen - \
+         a 180 s watchdog would abort inside the recovery ladder"
+    );
+    tokio::time::timeout(Duration::from_secs(30), run)
+        .await
+        .expect("run hung on the outage window")
+        .expect("pool task panicked");
+    let mut done = 0usize;
+    while let Ok(o) = rx.try_recv() {
+        if matches!(o, FetchOutcome::Done { .. }) {
+            done += 1;
+        }
+    }
+    assert_eq!(
+        done,
+        segs.len(),
+        "the job must still complete after recovery"
+    );
+}
+
 #[tokio::test]
 async fn mute_quit_server_cannot_hang_a_finished_run() {
     // Regression (the 190 GB exit-path hang): a provider that swallows
@@ -1892,5 +1965,213 @@ async fn a_bare_430_defers_the_verdict_and_says_so() {
         sh.deferred.load(Ordering::Relaxed),
         before + 1,
         "a resolving response is not a deferral"
+    );
+}
+
+/// §123 chip 6, heal-after: the brownout that ENDS. Every prior
+/// brownout rig models a frontend that never returns and hands the
+/// job to a healthy twin; this one has no twin - the same server
+/// browns out mid-run and recovers 1.5 s later, which is what a
+/// frontend restart looks like from outside. The client must cut the
+/// dead air (TTFB budget), keep the fleet alive through the mute
+/// window, and finish on the recovered server - a heal nobody
+/// retries into is indistinguishable from the permanent shape.
+#[tokio::test(flavor = "multi_thread")]
+async fn brownout_that_heals_resumes_on_the_same_server() {
+    use crate::mock::Throttle;
+    let data: Vec<u8> = (0..1_200_000u32).map(|i| i as u8).collect();
+    let mut articles = std::collections::HashMap::new();
+    let segs = make_file_articles("bh.bin", &data, 20_000, "bh", &mut articles);
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            brownout_after: 20,
+            brownout_heal_ms: 1_500,
+            throttle: Throttle {
+                per_conn_bps: 100_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    let server = srv.server_config();
+    let cfg = PoolConfig {
+        connections: 6,
+        ramp_delay: Duration::ZERO,
+        connect_backoff: Duration::from_millis(100),
+        // Belt for the TTFB braces: even if the adaptive budget never
+        // arms (too few samples), a hung read dies in 3 s, well
+        // inside the assertion bound.
+        read_timeout: Duration::from_secs(3),
+        ..Default::default()
+    };
+    let ids: Vec<String> = segs.iter().map(|(id, _, _)| format!("<{id}>")).collect();
+    let reqs: Vec<ArticleReq> = ids.iter().cloned().map(ArticleReq::fresh).collect();
+    let (tx, mut rx) = mpsc::channel(256);
+    let t0 = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(40),
+        fetch_all_multi(&[(server, cfg)], reqs, tx),
+    )
+    .await
+    .expect("run hung across the brownout heal");
+    let wall = t0.elapsed();
+    let (mut done, mut other) = (0usize, 0usize);
+    while let Ok(o) = rx.try_recv() {
+        match o {
+            FetchOutcome::Done { .. } => done += 1,
+            _ => other += 1,
+        }
+    }
+    assert_eq!(
+        done,
+        ids.len(),
+        "articles failed across a healed brownout ({other} non-Done outcomes)"
+    );
+    // Window 1.5 s + one read_timeout of hung reads + ~2 s full-width
+    // transfer at 100 KB/s x 6. 20 s = that plus generous suite-load
+    // slack; a client that never re-tries the healed server rides
+    // read_timeout cycles to the 40 s hang guard instead.
+    assert!(
+        wall < Duration::from_secs(20),
+        "fleet did not resume after the brownout healed ({wall:?})"
+    );
+}
+
+/// §123 chip 6, vanish-after-serving: a takedown lands mid-job and
+/// the whole post leaves the spool - every id refuses from that
+/// moment, including ones served seconds earlier. The client's job
+/// is an honest, FAST terminal verdict for the remainder (each 430
+/// requeues once for a confirming repeat, then declares Missing) -
+/// a mid-job vanish must never read as a wedged pool, which is
+/// exactly the shape the stall watchdog's third signal (`deferred`)
+/// was added for.
+#[tokio::test(flavor = "multi_thread")]
+async fn mid_job_takedown_declares_the_tail_missing_fast() {
+    let data: Vec<u8> = (0..1_200_000u32).map(|i| i as u8).collect();
+    let mut articles = std::collections::HashMap::new();
+    let segs = make_file_articles("vn.bin", &data, 20_000, "vn", &mut articles);
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            vanish_after: 30,
+            ..Default::default()
+        },
+    )
+    .await;
+    let server = srv.server_config();
+    let cfg = PoolConfig {
+        connections: 4,
+        ramp_delay: Duration::ZERO,
+        ..Default::default()
+    };
+    let ids: Vec<String> = segs.iter().map(|(id, _, _)| format!("<{id}>")).collect();
+    let reqs: Vec<ArticleReq> = ids.iter().cloned().map(ArticleReq::fresh).collect();
+    let (tx, mut rx) = mpsc::channel(256);
+    let t0 = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        fetch_all_multi(&[(server, cfg)], reqs, tx),
+    )
+    .await
+    .expect("run hung on a mid-job takedown");
+    let wall = t0.elapsed();
+    let (mut done, mut missing, mut failed) = (0usize, 0usize, 0usize);
+    while let Ok(o) = rx.try_recv() {
+        match o {
+            FetchOutcome::Done { .. } => done += 1,
+            FetchOutcome::Missing { .. } => missing += 1,
+            FetchOutcome::Failed { .. } => failed += 1,
+        }
+    }
+    assert_eq!(
+        done + missing + failed,
+        ids.len(),
+        "every article must reach a terminal outcome"
+    );
+    assert!(
+        done >= 30 / 2,
+        "the pre-takedown half should mostly land ({done} done)"
+    );
+    assert!(
+        missing > 0 && failed == 0,
+        "the vanished tail is MISSING (a content verdict), not Failed \
+         (a transport verdict) - got {missing} missing / {failed} failed"
+    );
+    // 430s are instant on loopback and the confirming repeat doubles
+    // them; anything near the hang guard means the tail wedged.
+    assert!(
+        wall < Duration::from_secs(10),
+        "takedown tail took {wall:?} to reach a verdict"
+    );
+}
+
+/// §123 chip 6, the auth blip - pinning a DESIGN, not a recovery.
+/// One 481 "authentication failed" is indistinguishable from a wrong
+/// password, and hammering a provider over a bad credential is worse
+/// than failing, so the pool retires the server on the first
+/// permanent-shaped refusal and says so (§35). This rig heals the
+/// auth at 1.5 s to prove the failure is already terminal by then:
+/// FAST and honest, never a hang, and nothing dials the server back
+/// in. If auth blips ever earn an episode/prober treatment like
+/// capacity refusals did, this test is the one that changes sides.
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_blip_fails_fast_and_honest_by_design() {
+    let data: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+    let mut articles = std::collections::HashMap::new();
+    let segs = make_file_articles("ab.bin", &data, 20_000, "ab", &mut articles);
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            auth_reject_ms: 1_500,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut server = srv.server_config();
+    server.username = Some("u".into());
+    server.password = Some("p".into());
+    let cfg = PoolConfig {
+        connections: 4,
+        ramp_delay: Duration::ZERO,
+        connect_backoff: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let ids: Vec<String> = segs.iter().map(|(id, _, _)| format!("<{id}>")).collect();
+    let reqs: Vec<ArticleReq> = ids.iter().cloned().map(ArticleReq::fresh).collect();
+    let (tx, mut rx) = mpsc::channel(256);
+    let t0 = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        fetch_all_multi(&[(server, cfg)], reqs, tx),
+    )
+    .await
+    .expect("run hung on an auth blip");
+    let wall = t0.elapsed();
+    let mut done = 0usize;
+    let mut terminal = 0usize;
+    while let Ok(o) = rx.try_recv() {
+        match o {
+            FetchOutcome::Done { .. } => done += 1,
+            _ => terminal += 1,
+        }
+    }
+    assert_eq!(
+        done, 0,
+        "nothing can download through a refused login ({done} done)"
+    );
+    assert_eq!(
+        terminal,
+        ids.len(),
+        "every article must still reach a terminal outcome"
+    );
+    // The refusal lands on the FIRST dial of each worker; everything
+    // after is bookkeeping. 5 s is an eternity for it - and well
+    // under the 1.5 s heal + any retry ladder, so a client that
+    // secretly redials into the healed server would also trip this.
+    assert!(
+        wall < Duration::from_secs(5),
+        "an auth refusal must fail the job fast, not grind ({wall:?})"
     );
 }

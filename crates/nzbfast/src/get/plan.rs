@@ -127,10 +127,10 @@ pub(super) fn build_fetch_plan(
                 if owner as usize != idx {
                     slots[idx].missing.fetch_add(1, Ordering::Relaxed);
                 }
-                enc_cum += seg.bytes;
+                enc_cum = enc_cum.saturating_add(seg.bytes);
                 continue;
             }
-            id_to_slot.insert(bracketed.clone(), (idx as u32, seg.bytes as u32));
+            id_to_slot.insert(bracketed.clone(), (idx as u32, seg.bytes));
             // Every article with an owner is this run's responsibility -
             // including the ones already satisfied below, which are added
             // to `have_bytes` as well so a resumed job's bar starts where
@@ -139,18 +139,21 @@ pub(super) fn build_fetch_plan(
             // owner and never counted twice; a segment the parser dropped
             // has no entry at all and so cannot hold the bar short of
             // 100%.
-            plan_bytes += seg.bytes;
+            // Saturating sums, like Nzb::total_bytes: `bytes` is an
+            // attacker-typed u64 straight from the NZB, and a plain sum
+            // panics in debug and wraps in release on absurd claims.
+            plan_bytes = plan_bytes.saturating_add(seg.bytes);
             if !is_par2_main {
                 arts.push((enc_cum, bracketed.clone()));
             }
-            enc_cum += seg.bytes;
+            enc_cum = enc_cum.saturating_add(seg.bytes);
             // On resume, journal-completed data articles are skipped -
             // their bytes are on disk and the settle pass verifies them.
             // Par2-main articles always refetch (tiny; activation needs
             // the packets in memory).
             if !is_par2_main && completed.contains(&bracketed) {
                 slots[idx].remaining.fetch_sub(1, Ordering::Relaxed);
-                resume_have_bytes += seg.bytes;
+                resume_have_bytes = resume_have_bytes.saturating_add(seg.bytes);
                 continue;
             }
             // A resume-recognised recovery volume: everything not already
@@ -159,7 +162,7 @@ pub(super) fn build_fetch_plan(
                 slots[idx].remaining.fetch_sub(1, Ordering::Relaxed);
                 slots[idx].deferred.fetch_add(1, Ordering::Relaxed);
                 resume_deferred_arts += 1;
-                resume_deferred_bytes += seg.bytes;
+                resume_deferred_bytes = resume_deferred_bytes.saturating_add(seg.bytes);
                 continue;
             }
             let req = ArticleReq {

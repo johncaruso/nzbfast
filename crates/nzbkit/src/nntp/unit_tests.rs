@@ -70,7 +70,9 @@ fn gzip_wire(payload: &[u8], isize: u32) -> Vec<u8> {
     wire.extend_from_slice(b"comment\0"); // FCOMMENT
     wire.extend_from_slice(&[0xab, 0xcd]); // FHCRC (unchecked)
     wire.extend_from_slice(&deflate(payload));
-    wire.extend_from_slice(&0u32.to_le_bytes()); // CRC32 (unchecked)
+    // Real CRC32: the reader verifies it since the chip-6 fix (a zero
+    // here now fails every test that uses this helper, correctly).
+    wire.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
     wire.extend_from_slice(&isize.to_le_bytes());
     wire
 }
@@ -815,4 +817,83 @@ mod quit_tests {
             "hostname must be resolved by the proxy, not locally"
         );
     }
+}
+
+#[tokio::test]
+async fn corruption_mid_deflate_stream_is_an_error_not_garbage_rows() {
+    // §123 chip 6: a broken cache node hands back a gzip member whose
+    // header is intact but whose deflate payload is damaged. The
+    // inflater must surface an error the session can requeue on -
+    // accepting whatever inflates before the damage would hand the
+    // scan loop silently truncated overview rows.
+    let payload = b"22\tepsilon\r\n.\r\n";
+    let mut wire = gzip_wire(payload, payload.len() as u32);
+    let mid = wire.len() - 12; // inside the deflate body, before the trailer
+    wire[mid] ^= 0x01;
+    // Any of these is a clean session-level error the caller requeues
+    // on (Closed: the inflater consumed the damaged tail hunting for
+    // the deflate stream's end and hit EOF). What must NOT happen is
+    // Ok - rows assembled from whatever inflated before the damage.
+    let err = read_compressed(&wire)
+        .await
+        .expect_err("corrupt deflate must not decode");
+    match err {
+        NntpError::Unexpected { .. } | NntpError::Io(_) | NntpError::Closed => {}
+        other => panic!("expected a clean read error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn gzip_corrupt_overview_fails_the_read_cleanly_end_to_end() {
+    // Same fault through the whole stack: mock accepts XFEATURE, then
+    // serves a gzip overview stream with one bit flipped mid-stream
+    // (Chaos::gzip_corrupt). The OVER call must return Err - not hang
+    // on the missing terminator, not return partial rows.
+    let rows: Vec<crate::mock::OverRow> = (1..=5)
+        .map(|n| crate::mock::OverRow {
+            number: n,
+            subject: format!("post {n}"),
+            from: "a@b".into(),
+            message_id: format!("<g{n}@x>"),
+            bytes: 1000,
+        })
+        .collect();
+    let srv = MockServer::start_full(
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+        rows,
+        Chaos {
+            gzip_headers: true,
+            gzip_corrupt: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (mut conn, _) = Connection::connect(&srv.server_config())
+        .await
+        .expect("connect");
+    conn.group("mock.group").await.expect("group");
+    assert!(conn.enable_header_gzip().await, "290 must enable");
+    let res = tokio::time::timeout(std::time::Duration::from_secs(10), conn.over(1, 5)).await;
+    let inner = res.expect("corrupt stream must not hang the reader");
+    assert!(
+        inner.is_err(),
+        "a damaged compressed stream must not yield rows: {:?}",
+        inner.map(|v| v.len())
+    );
+    // Bug sweep 2026-08-07: the failed body read can leave response
+    // bytes (a TERMINATOR-variant's plain-text "." line) unread on the
+    // wire, so every later status would be attributed to the WRONG
+    // command - callers that keep the conn across an over() error (the
+    // scan bisect, nettools probes) then silently file the previous
+    // range's rows as the next range's answer. The connection must
+    // refuse further commands instead, as a dead socket would.
+    let again = tokio::time::timeout(std::time::Duration::from_secs(10), conn.over(1, 5))
+        .await
+        .expect("a desynced conn must answer immediately, not hang");
+    assert!(
+        matches!(again, Err(super::NntpError::Closed)),
+        "a desynced conversation must refuse, got {:?}",
+        again.map(|v| v.len())
+    );
 }
