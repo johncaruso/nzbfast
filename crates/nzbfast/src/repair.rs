@@ -263,6 +263,7 @@ pub(crate) async fn fetch_volumes(
         out_dir,
         buf_pool,
         volume_prealloc_cap(nzb),
+        None,
     )
     .await
     .map(|_| ())
@@ -307,6 +308,15 @@ pub(crate) fn side_pool_servers(
             // of the download, so they must not move the dashboard's
             // per-server gauges either.
             pc.live = None;
+            // TODO 114: the steer seam defers each Done's completion
+            // until the consumer's note_decoded verdict - and the
+            // side-fetch consumer (consume_volume_articles) never
+            // gives one (it has no QueueControl at all), so a cloned
+            // crc_steer would park every delivery forever and hang
+            // the volume fetch. Damaged side-fetched volumes already
+            // have their own answer: incomplete volumes stay
+            // fetchable and repair proves the bytes.
+            pc.crc_steer = false;
             (sc, pc)
         })
         .collect()
@@ -319,6 +329,7 @@ pub(crate) fn side_pool_servers(
 /// partial one, and only a complete volume may ever enter a whole-file
 /// exclusion list (a partial one must stay fetchable for its missing
 /// articles).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch_volume_articles(
     servers: &[(ServerConfig, nzbkit::pool::PoolConfig)],
     ids: Vec<nzbkit::pool::ArticleReq>,
@@ -328,8 +339,15 @@ pub(crate) async fn fetch_volume_articles(
     // Ceiling on what one volume writer may RESERVE - see
     // [`volume_prealloc_cap`]. u64::MAX = no ceiling.
     prealloc_cap: u64,
+    // Cancellation handle for callers that must be able to stop a
+    // side-fetch mid-volume (Codex 5 Aug M3: the speculative prefetch
+    // could hold Cancel/Pause through a blackholed provider's whole
+    // retry ladder). The handle attaches to each rung's pool; abort()
+    // drops in-flight reads and the run returns promptly. Paths already
+    // written are still harvested and returned.
+    ctl: Option<&nzbkit::pool::QueueControl>,
 ) -> Result<(usize, Vec<PathBuf>)> {
-    use nzbkit::pool::{FetchOutcome, fetch_all_multi};
+    use nzbkit::pool::{FetchOutcome, fetch_all_multi_ctl};
     // Side-fetch: small volume sets, fast disk-writer consumer - a
     // modest fixed depth (≈25 MB) instead of the old 256 (~200 MB of
     // budget-exempt bytes on a box that may only have 256 MB total).
@@ -340,7 +358,7 @@ pub(crate) async fn fetch_volume_articles(
         consume_volume_articles(rx, id_to_file, out_dir2, pool2, prealloc_cap).await
     });
     let t0 = Instant::now();
-    let stats = fetch_all_multi(servers, ids, tx).await;
+    let stats = fetch_all_multi_ctl(servers, ids, tx, ctl).await;
     let (failures, paths) = consumer.await?;
     let raw: u64 = stats.iter().map(|s| s.bytes).sum();
     println!(
@@ -3310,3 +3328,9 @@ mod repair_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// Child module file, not inline: repair.rs sits under a size-gate
+// baseline (TODO 106) and test growth belongs beside it, same pattern
+// as pool/unit_tests.rs.
+#[cfg(test)]
+mod side_fetch_tests;

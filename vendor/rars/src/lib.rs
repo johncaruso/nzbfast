@@ -877,11 +877,17 @@ where
 /// is finished with.
 ///
 /// `consumed(volume_index)` indexes `archives`, arrives in increasing
-/// order, and promises that no read will ever touch that volume again -
-/// so a caller holding the set on disk can delete it there and then.
-/// See [`rar50::extract_volumes_to_with_progress`] for what makes the
+/// order once each, and promises that no read will ever touch that
+/// volume again - so a caller holding the set on disk can delete it
+/// there and then. A split member spanning many volumes releases them
+/// PROGRESSIVELY as its chain advances (RAR 1.5-4 and RAR 5; RAR 1.3
+/// still releases the backlog after the member completes), so the
+/// single-split-member movie shape extracts without ever holding the
+/// whole set and the payload at once. See
+/// [`rar50::extract_volumes_to_with_progress`] for what makes the
 /// promise true (and, for RAR 5, what it costs: the parallel member pool
-/// is off while the watermark is armed).
+/// is off while the watermark is armed). The callback can run on the
+/// decode thread, hence `Send`.
 ///
 /// The volumes are handed to the family extractors in the order given,
 /// which is the order the set is read in, so the index the callback
@@ -894,7 +900,7 @@ pub fn extract_volumes_to_with_progress<F, C>(
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    C: FnMut(usize),
+    C: FnMut(usize) + Send,
 {
     let Some(first) = archives.first() else {
         return Err(Error::InvalidHeader("volume set is empty"));
@@ -3092,10 +3098,13 @@ mod tests {
     }
 
     /// The whole-set consumption watermark: every volume reported once,
-    /// in order, and NOTHING reported while a split member is still
-    /// pending - its Finish fragment reads every volume it spanned, so a
+    /// in order, and nothing reported while a SMALL split member is still
+    /// pending - a member inside the buffered ceiling keeps its filter
+    /// bail retry, whose buffered path reads every fragment back, so a
     /// caller deleting on the watermark would otherwise destroy the
-    /// fragments the decode is about to read back.
+    /// fragments that retry is entitled to. (A member ABOVE the ceiling,
+    /// or a stored one, has no retry and releases progressively instead -
+    /// see the progressive-release tests beside this one.)
     #[test]
     fn extract_volumes_to_with_progress_reports_each_volume_once_and_never_early() {
         let payload = deterministic_squashable(40_000);
@@ -3134,19 +3143,19 @@ mod tests {
             Opened(Vec<u8>),
             Consumed(usize),
         }
-        let log = std::cell::RefCell::new(Vec::new());
+        let log = std::sync::Mutex::new(Vec::new());
         rar50::extract_volumes_to_with_progress(
             &archives,
             ArchiveReadOptions::new(),
             |meta| {
-                log.borrow_mut().push(Event::Opened(meta.name.clone()));
+                log.lock().unwrap().push(Event::Opened(meta.name.clone()));
                 Ok(Box::new(std::io::sink()) as Box<dyn Write>)
             },
-            |index| log.borrow_mut().push(Event::Consumed(index)),
+            |index| log.lock().unwrap().push(Event::Consumed(index)),
         )
         .unwrap();
 
-        let log = log.into_inner();
+        let log = log.into_inner().unwrap();
         let consumed: Vec<usize> = log
             .iter()
             .filter_map(|e| match e {
@@ -3170,6 +3179,228 @@ mod tests {
         assert!(
             split_written < first_consumed,
             "a volume was released while the split member was still pending: {log:?}"
+        );
+    }
+
+    /// A writer whose budget is the disk-eating guard in miniature: it
+    /// starts with `base` bytes of headroom and gains a volume's bytes
+    /// only when `credit` releases that volume. A single split member
+    /// larger than `base` can therefore only extract if the engine
+    /// releases volumes PROGRESSIVELY, while the member is still
+    /// writing - which is exactly the H1 shape (one film split across
+    /// every volume, extracted into a fraction of its size in free
+    /// space).
+    struct VolumeBudgetWriter {
+        budget: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        out: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl Write for VolumeBudgetWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            use std::sync::atomic::Ordering;
+            let need = buf.len() as u64;
+            if self.budget.load(Ordering::SeqCst) < need {
+                return Err(std::io::Error::other(
+                    "budget exhausted - the spent volumes were not released progressively",
+                ));
+            }
+            self.budget.fetch_sub(need, Ordering::SeqCst);
+            self.out.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs the whole-set watermark walk over `parts` under a volume
+    /// budget of `base` bytes, crediting each volume's size as it is
+    /// reported consumed. Returns the extracted bytes and the consumed
+    /// order.
+    fn rar50_extract_under_volume_budget(
+        parts: &[Vec<u8>],
+        options: ArchiveReadOptions<'_>,
+        base: u64,
+    ) -> (Vec<u8>, Vec<usize>) {
+        use std::sync::atomic::Ordering;
+        let archives: Vec<_> = parts
+            .iter()
+            .map(|part| rar50::Archive::parse(part).unwrap())
+            .collect();
+        let volume_sizes: Vec<u64> = parts.iter().map(|part| part.len() as u64).collect();
+        let budget = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(base));
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let consumed_order = std::sync::Mutex::new(Vec::new());
+        let writer_budget = std::sync::Arc::clone(&budget);
+        let writer_out = std::sync::Arc::clone(&out);
+        rar50::extract_volumes_to_with_progress(
+            &archives,
+            options,
+            move |_meta| {
+                Ok(Box::new(VolumeBudgetWriter {
+                    budget: std::sync::Arc::clone(&writer_budget),
+                    out: std::sync::Arc::clone(&writer_out),
+                }) as Box<dyn Write>)
+            },
+            |index| {
+                consumed_order.lock().unwrap().push(index);
+                budget.fetch_add(volume_sizes[index], Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+        let out = out.lock().unwrap().clone();
+        (out, consumed_order.into_inner().unwrap())
+    }
+
+    /// TODO 101's H1 residual, closed: ONE STORED member split across
+    /// every volume - the dominant movie shape - extracts under a budget
+    /// of roughly two volumes, because each fragment's volume is
+    /// released the moment the chain has read it out. Before progressive
+    /// release nothing was reported until the whole member had written,
+    /// so this budget failed at the third volume.
+    #[test]
+    fn whole_set_progress_releases_a_stored_split_member_progressively() {
+        let payload = deterministic_noise(60_000);
+        let entry = rar50::StoredEntry {
+            name: b"film.bin",
+            data: &payload,
+            mtime: None,
+            attributes: 0x20,
+            host_os: 3,
+        };
+        let parts = rar50::Rar50VolumeWriter::new(rar50_options(ArchiveVersion::Rar50))
+            .stored_entry(entry)
+            .max_payload_per_volume(9_000)
+            .finish()
+            .unwrap();
+        assert!(parts.len() >= 4, "the member must span several volumes");
+
+        // Two volumes of headroom, nowhere near the payload.
+        let base: u64 = parts.iter().take(2).map(|part| part.len() as u64).sum();
+        assert!(base < payload.len() as u64 / 2, "budget must be tight");
+        let (out, consumed) =
+            rar50_extract_under_volume_budget(&parts, ArchiveReadOptions::new(), base);
+
+        assert_eq!(out, payload, "extracted bytes must survive the budget");
+        assert_eq!(
+            consumed,
+            (0..parts.len()).collect::<Vec<_>>(),
+            "every volume exactly once, in order"
+        );
+    }
+
+    /// The compressed twin: a member ABOVE the buffered-decode ceiling
+    /// has no filter-bail retry, so its fragments release progressively
+    /// too. The ceiling is forced down so a small test member takes the
+    /// no-retry streaming path a film-sized member takes in production.
+    #[test]
+    fn whole_set_progress_releases_a_compressed_split_member_progressively() {
+        let payload = deterministic_squashable(40_000);
+        let entries = [rar50::CompressedEntry {
+            name: b"film.bin",
+            data: &payload,
+            mtime: None,
+            attributes: 0x20,
+            host_os: 3,
+        }];
+        let parts = rar50::Rar50VolumeWriter::new(rar50_options(ArchiveVersion::Rar50))
+            .compressed_entries(&entries)
+            .max_payload_per_volume(9_000)
+            .finish()
+            .unwrap();
+        assert!(parts.len() >= 3, "the member must span several volumes");
+
+        // The decode pipeline may buffer the whole (small) output before
+        // the writer sees a byte, so unlike the stored test the budget
+        // cannot be a plain two volumes: every early credit can land
+        // before the first write. What it must NOT cover is the payload
+        // on its own - that is what distinguishes progressive release
+        // from the old release-at-finish behavior.
+        let early_credit: u64 = parts
+            .iter()
+            .take(parts.len() - 1)
+            .map(|part| part.len() as u64)
+            .sum();
+        let base = (payload.len() as u64 + 1_024).saturating_sub(early_credit);
+        assert!(
+            base < payload.len() as u64,
+            "budget must not cover the payload up front"
+        );
+        let options = ArchiveReadOptions::new().with_rar50_buffered_decode_limit(4_096);
+        let (out, consumed) = rar50_extract_under_volume_budget(&parts, options, base);
+
+        assert_eq!(out, payload, "extracted bytes must survive the budget");
+        assert_eq!(
+            consumed,
+            (0..parts.len()).collect::<Vec<_>>(),
+            "every volume exactly once, in order"
+        );
+    }
+
+    /// The RAR4 twin over the WinRAR 3.00 stored fixture: volumes free
+    /// while the split member is still writing (RAR4 split decodes never
+    /// re-read a fragment, so both stored and compressed release
+    /// progressively).
+    #[test]
+    fn rar15_40_whole_set_progress_releases_split_volumes_before_the_member_completes() {
+        let names = [
+            "rar300/stored_multivol_rar300.rar",
+            "rar300/stored_multivol_rar300.r00",
+            "rar300/stored_multivol_rar300.r01",
+            "rar300/stored_multivol_rar300.r02",
+        ];
+        let parts: Vec<Vec<u8>> = names
+            .iter()
+            .map(|name| std::fs::read(rar15_40_fixture(name)).unwrap())
+            .collect();
+        let archives: Vec<_> = parts
+            .iter()
+            .map(|part| rar15_40::Archive::parse(part).unwrap())
+            .collect();
+        let reference = collect_rar15_40_volumes(&archives, None).unwrap();
+        let split_len: u64 = reference.iter().map(|entry| entry.data.len() as u64).sum();
+
+        // Interleaved log: how many payload bytes had been written when
+        // each volume was released.
+        let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let consumed_at = std::sync::Mutex::new(Vec::new());
+        struct CountingSink(std::sync::Arc<std::sync::atomic::AtomicU64>);
+        impl Write for CountingSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .fetch_add(buf.len() as u64, std::sync::atomic::Ordering::SeqCst);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let writer_written = std::sync::Arc::clone(&written);
+        rar15_40::extract_volumes_to_with_progress(
+            &archives,
+            ArchiveReadOptions::new(),
+            move |_meta| {
+                Ok(Box::new(CountingSink(std::sync::Arc::clone(&writer_written))) as Box<dyn Write>)
+            },
+            |index| {
+                consumed_at
+                    .lock()
+                    .unwrap()
+                    .push((index, written.load(std::sync::atomic::Ordering::SeqCst)));
+            },
+        )
+        .unwrap();
+
+        let consumed_at = consumed_at.into_inner().unwrap();
+        assert_eq!(
+            consumed_at.iter().map(|&(index, _)| index).collect::<Vec<_>>(),
+            (0..parts.len()).collect::<Vec<_>>(),
+            "every volume exactly once, in order"
+        );
+        assert!(
+            consumed_at[0].1 < split_len,
+            "volume 0 must be released before the split member finishes writing: {consumed_at:?}"
         );
     }
 

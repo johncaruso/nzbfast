@@ -359,7 +359,16 @@ fn m_config(
                     // without knowing which disk. On the success path
                     // it would just be the daemon volunteering its
                     // filesystem layout to every API caller.
+                    //
+                    // #18: the save is accepted, but if it carried a
+                    // rules pattern that will not compile, say so NOW -
+                    // by rule name, with the engine's compile error -
+                    // rather than leaving it to the row annotation the
+                    // user may never scroll back to. Null when there is
+                    // nothing to say, so every other setting's answer is
+                    // unchanged.
                     json!({"status": true, "live": live, "saved": saved,
+                    "warning": rules_save_warning(name, v),
                     "path": if saved { Value::Null } else {
                         json!(d.settings_path.to_string_lossy())
                     }})
@@ -478,6 +487,13 @@ fn m_import_apply(
                 // that too - but only while OUR file is still
                 // empty, so a list the user already curated here is
                 // never abandoned by a re-import.
+                // apply_and_save answers (live, saved), and `saved=false`
+                // means the value works NOW and reverts at restart. The
+                // import used to drop that bool at every site and report
+                // plain success over an unwritable settings dir (Codex
+                // sweep 5 Aug M7) - collect the non-durable adoptions
+                // and say so in the response.
+                let mut unsaved: Vec<&str> = Vec::new();
                 let pw_adopted = {
                     let key_val = if kind == "sabnzbd" || path.ends_with(".ini") {
                         crate::import_sab::sab_ini_value(&text, "password_file")
@@ -488,8 +504,14 @@ fn m_import_apply(
                         .filter(|p| std::path::Path::new(p).is_file())
                         .filter(|_| d.read_unpack_passwords().is_empty())
                         .and_then(|p| match apply_and_save(d, "password_file", &p) {
-                            Ok(_) => {
+                            Ok((_, saved)) => {
                                 info!(target: "import", "adopted archive passwords file {p}");
+                                // Still adopted - the live value is real
+                                // and losing the path would be worse -
+                                // but the revert-at-restart is reported.
+                                if !saved {
+                                    unsaved.push("password_file");
+                                }
                                 Some(p)
                             }
                             Err(e) => {
@@ -518,12 +540,19 @@ fn m_import_apply(
                     if !names.is_empty() {
                         let before = d.cat_list();
                         let merged = crate::serve::merge_cat_list(&before, &names.join(", "));
-                        if merged != before
-                            && let Err(e) = apply_and_save(d, "categories", &merged)
-                        {
-                            warn!(target: "import", "could not merge categories: {e}");
-                        } else {
-                            cats_added = merged.split(',').count() - before.split(',').count();
+                        if merged != before {
+                            match apply_and_save(d, "categories", &merged) {
+                                Err(e) => {
+                                    warn!(target: "import", "could not merge categories: {e}");
+                                }
+                                Ok((_, saved)) => {
+                                    if !saved {
+                                        unsaved.push("categories");
+                                    }
+                                    cats_added =
+                                        merged.split(',').count() - before.split(',').count();
+                                }
+                            }
                         }
                     }
                     // Only the categories whose folder differs from
@@ -558,7 +587,15 @@ fn m_import_apply(
                         }
                         keep.push(format!("{}={dir}", c.name));
                         match apply_and_save(d, "move_completed_cats", &keep.join(", ")) {
-                            Ok(_) => dirs_added += 1,
+                            Ok((_, saved)) => {
+                                dirs_added += 1;
+                                // The override IS live, so it stays in
+                                // `keep` - popping it would desync the
+                                // next apply from the daemon's state.
+                                if !saved && !unsaved.contains(&"folders") {
+                                    unsaved.push("folders");
+                                }
+                            }
                             Err(e) => {
                                 keep.pop();
                                 dirs_failed.push(json!({"name": c.name, "error": e}));
@@ -591,10 +628,22 @@ fn m_import_apply(
                         added += 1;
                     }
                 }
+                // "It worked, but it is not durable": the live daemon
+                // has everything, and the response says exactly what
+                // reverts if the settings file stays unwritable.
+                let warning = (!unsaved.is_empty()).then(|| {
+                    format!(
+                        "imported {} could not be written to {} - they work now \
+                         but revert at the next restart",
+                        unsaved.join(", "),
+                        d.settings_path.display()
+                    )
+                });
                 if added == 0 {
                     json!({"status": true, "added": 0, "skipped": skipped,
                                "password_file": pw_adopted,
-                               "categories": cat_report})
+                               "categories": cat_report,
+                               "warning": warning})
                 } else {
                     match crate::setup::write_servers(ctx.cfg_path, &servers) {
                         Ok(()) => {
@@ -604,7 +653,8 @@ fn m_import_apply(
                             );
                             json!({"status": true, "added": added, "skipped": skipped,
                                        "password_file": pw_adopted,
-                                       "categories": cat_report})
+                                       "categories": cat_report,
+                                       "warning": warning})
                         }
                         Err(e) => json!({"status": false, "error": e.to_string()}),
                     }
@@ -809,4 +859,74 @@ fn credential_mutation_allowed(req: &tiny_http::Request) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::serve::testutil::test_daemon;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// M7 (Codex sweep 5 Aug): `apply_and_save` answers (live, saved),
+    /// and the SAB import dropped `saved` at every site - an unwritable
+    /// settings dir imported "successfully" and then silently reverted
+    /// at restart. The response must say what is live-only.
+    #[test]
+    fn an_import_over_an_unwritable_settings_dir_says_it_reverts() {
+        let scratch = std::env::temp_dir().join(format!("nzbfast-impsave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let cfgdir = scratch.join("cfg");
+        std::fs::create_dir_all(&cfgdir).unwrap();
+        let pw = scratch.join("pw.txt");
+        std::fs::write(&pw, "hunter2\n").unwrap();
+        let dest = scratch.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let ini = scratch.join("sabnzbd.ini");
+        std::fs::write(
+            &ini,
+            format!(
+                "[misc]\npassword_file = {}\n[categories]\n[[sabimports]]\n\
+                 name = sabimports\ndir = {}\n",
+                pw.display(),
+                dest.display()
+            ),
+        )
+        .unwrap();
+
+        let d = test_daemon(&cfgdir);
+        // The daemon's settings.json lives in cfgdir; a read-only dir
+        // fails the atomic temp-file write exactly like a full disk.
+        std::fs::set_permissions(&cfgdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mut req: tiny_http::Request = tiny_http::TestRequest::new().into();
+        let cfg_path = cfgdir.join("nzbfast.toml");
+        let ctx = ApiCtx {
+            cfg_path: &cfg_path,
+            host_hdr: "",
+            base: "",
+            ua_hdr: "",
+            key_q: "",
+            #[cfg(feature = "indexer")]
+            tmdb_key: &None,
+            bootstrap_apikey: false,
+            via_add_only: false,
+        };
+        let mut params = std::collections::HashMap::new();
+        params.insert("value".to_string(), ini.display().to_string());
+        params.insert("value2".to_string(), "sabnzbd".to_string());
+        let v = m_import_apply(&d, &mut req, &params, &ctx, &mut None).unwrap();
+
+        std::fs::set_permissions(&cfgdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        // Live import still worked - that nuance is deliberate...
+        assert_eq!(v["status"], true, "{v}");
+        assert_eq!(v["password_file"], pw.display().to_string(), "{v}");
+        // ...but the response must carry the revert-at-restart warning,
+        // naming what is live-only.
+        let w = v["warning"].as_str().unwrap_or_default();
+        assert!(w.contains("revert"), "no durability warning: {v}");
+        assert!(w.contains("password_file"), "{v}");
+        assert!(w.contains("categories"), "{v}");
+    }
 }

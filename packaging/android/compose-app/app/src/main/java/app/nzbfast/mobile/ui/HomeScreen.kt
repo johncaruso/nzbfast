@@ -2,7 +2,6 @@ package app.nzbfast.mobile.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -23,29 +22,25 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import app.nzbfast.mobile.api.HistorySlot
-import app.nzbfast.mobile.api.ProbeResult
-import app.nzbfast.mobile.api.QueueSlot
-import app.nzbfast.mobile.api.QueueSnapshot
+import app.nzbfast.mobile.api.PlaybackJob
+import app.nzbfast.mobile.api.PlaybackSnapshot
 
 /**
- * The playback-first single list: active jobs with live progress and a
- * Play affordance the moment the daemon says the file is readable,
- * then history. Swipe right to pause or resume, swipe left to delete.
+ * The playback-first single list, fed by the one mode=playback poll:
+ * active jobs with live progress and a Play affordance the moment the
+ * job row's readiness says the file is readable, then history. Swipe
+ * right to pause or resume, swipe left to delete.
  */
 @Composable
 fun HomeScreen(
-    queue: QueueSnapshot?,
-    history: List<HistorySlot>,
-    probes: Map<String, ProbeResult>,
+    snapshot: PlaybackSnapshot?,
     statusLine: String?,
-    onPlay: (nzoId: String, name: String) -> Unit,
+    onPlay: (PlaybackJob) -> Unit,
     onPauseJob: (String) -> Unit,
     onResumeJob: (String) -> Unit,
     onDeleteJob: (String) -> Unit,
@@ -56,12 +51,12 @@ fun HomeScreen(
         verticalArrangement = Arrangement.spacedBy(8.dp),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
     ) {
-        if (queue == null) {
+        if (snapshot == null) {
             item {
                 Text("Connecting...", style = MaterialTheme.typography.bodyLarge)
             }
         } else {
-            if (queue.slots.isEmpty() && history.isEmpty()) {
+            if (snapshot.queue.isEmpty() && snapshot.history.isEmpty()) {
                 item {
                     Text(
                         "Nothing here yet. Tap + to add an NZB.",
@@ -69,36 +64,32 @@ fun HomeScreen(
                     )
                 }
             }
-            items(queue.slots, key = { it.nzoId }) { slot ->
+            items(snapshot.queue, key = { it.nzoId }) { job ->
                 SwipeRow(
-                    key = slot.nzoId,
+                    key = job.nzoId,
                     onSwipeRight = {
-                        if (slot.status == "Paused") onResumeJob(slot.nzoId)
-                        else onPauseJob(slot.nzoId)
+                        if (job.status == "Paused") onResumeJob(job.nzoId)
+                        else onPauseJob(job.nzoId)
                     },
-                    onSwipeLeft = { onDeleteJob(slot.nzoId) },
-                    rightLabel = if (slot.status == "Paused") "Resume" else "Pause",
+                    onSwipeLeft = { onDeleteJob(job.nzoId) },
+                    rightLabel = if (job.status == "Paused") "Resume" else "Pause",
                 ) {
-                    QueueRow(
-                        slot = slot,
-                        probe = probes[slot.nzoId],
-                        onPlay = { onPlay(slot.nzoId, slot.name) },
-                    )
+                    QueueRow(job = job, onPlay = { onPlay(job) })
                 }
             }
-            if (history.isNotEmpty()) {
+            if (snapshot.history.isNotEmpty()) {
                 item {
                     Spacer(Modifier.height(8.dp))
                     Text("History", style = MaterialTheme.typography.titleMedium)
                 }
-                items(history, key = { "h-" + it.nzoId }) { h ->
+                items(snapshot.history, key = { "h-" + it.nzoId }) { job ->
                     SwipeRow(
-                        key = h.nzoId,
+                        key = job.nzoId,
                         onSwipeRight = {},
-                        onSwipeLeft = { onDeleteHistory(h.nzoId) },
+                        onSwipeLeft = { onDeleteHistory(job.nzoId) },
                         rightLabel = null,
                     ) {
-                        HistoryRow(h, onPlay = { onPlay(h.nzoId, h.name) })
+                        HistoryRow(job, onPlay = { onPlay(job) })
                     }
                 }
             }
@@ -161,28 +152,28 @@ private fun SwipeRow(
 }
 
 @Composable
-private fun QueueRow(slot: QueueSlot, probe: ProbeResult?, onPlay: () -> Unit) {
+private fun QueueRow(job: PlaybackJob, onPlay: () -> Unit) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(
-                slot.name,
+                job.name,
                 style = MaterialTheme.typography.titleSmall,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
             LinearProgressIndicator(
-                progress = { (slot.percentage / 100f).coerceIn(0f, 1f) },
+                progress = { (job.percentage / 100f).coerceIn(0f, 1f) },
                 modifier = Modifier.fillMaxWidth(),
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
-                val left = slot.mbLeft
+                val left = job.mbLeft
                 val detail = buildString {
-                    append(slot.status)
-                    if (slot.status == "Downloading" && slot.timeLeft.isNotEmpty() &&
-                        slot.timeLeft != "0:00:00"
+                    append(job.status)
+                    if (job.status == "Downloading" && job.timeLeft.isNotEmpty() &&
+                        job.timeLeft != "0:00:00"
                     ) {
                         append("  ·  ")
-                        append(slot.timeLeft)
+                        append(job.timeLeft)
                         append(" left")
                     }
                     if (left > 0.0) {
@@ -197,7 +188,9 @@ private fun QueueRow(slot: QueueSlot, probe: ProbeResult?, onPlay: () -> Unit) {
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                if (probe?.mediaReady == true) {
+                // playback.ready on the row replaces the per-job probe:
+                // reason "live" (or "disk") means /stream serves it now.
+                if (job.playback.ready) {
                     FilledTonalButton(onClick = onPlay) {
                         Text("Play test preview")
                     }
@@ -208,7 +201,7 @@ private fun QueueRow(slot: QueueSlot, probe: ProbeResult?, onPlay: () -> Unit) {
 }
 
 @Composable
-private fun HistoryRow(h: HistorySlot, onPlay: () -> Unit) {
+private fun HistoryRow(job: PlaybackJob, onPlay: () -> Unit) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Row(
             Modifier.padding(12.dp),
@@ -216,26 +209,29 @@ private fun HistoryRow(h: HistorySlot, onPlay: () -> Unit) {
         ) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(
-                    h.name,
+                    job.name,
                     style = MaterialTheme.typography.titleSmall,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
-                val sub = when (h.status) {
-                    "Completed" -> h.size
-                    "Failed" -> h.failMessage.ifEmpty { "Failed" }
-                    else -> h.status
+                val sub = when (job.status) {
+                    "Completed" ->
+                        if (job.bytes > 0) "%.1f MB".format(job.bytes / 1e6) else "Completed"
+                    "Failed" -> job.failMessage.ifEmpty { "Failed" }
+                    else -> job.status
                 }
                 Text(
                     sub,
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (h.status == "Failed") MaterialTheme.colorScheme.error
+                    color = if (job.status == "Failed") MaterialTheme.colorScheme.error
                     else MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            if (h.status == "Completed") {
+            // reason "disk" = the file is really still there; a row whose
+            // media has been cleaned away ("no_media") gets no Play.
+            if (job.playback.ready) {
                 TextButton(onClick = onPlay) { Text("Play") }
             }
         }

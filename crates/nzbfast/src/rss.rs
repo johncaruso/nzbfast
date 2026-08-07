@@ -188,11 +188,52 @@ pub fn rules_accept(rules: &[String], item: &FeedItem) -> bool {
     !has_accept || accepted
 }
 
+/// Position and as-written name of the next element in `xml` whose
+/// LOCAL name (the part after any `prefix:`) is `local`. A closing tag
+/// never matches: its "name" starts with `/`. Matching the local name
+/// is load-bearing - `<atom:entry>` is as good an entry as `<entry>`,
+/// and literal-substring scans made every fully-prefixed Atom feed
+/// parse to healthy-and-empty (Codex sweep 5 Aug M9).
+pub(crate) fn find_elem<'a>(xml: &'a str, local: &str) -> Option<(usize, &'a str)> {
+    xml.match_indices('<').find_map(|(at, _)| {
+        let name = xml[at + 1..]
+            .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .next()
+            .unwrap_or_default();
+        (name.rsplit(':').next().unwrap_or(name) == local).then_some((at, name))
+    })
+}
+
+/// Raw tag text (`<` up to but excluding `>`) of every element in `xml`
+/// whose local name is `local`, self-closing included.
+fn elem_tags<'a>(xml: &'a str, local: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some((open, _)) = find_elem(&xml[at..], local) {
+        let open = at + open;
+        let end = xml[open..].find('>').map(|e| open + e).unwrap_or(xml.len());
+        out.push(&xml[open..end]);
+        at = end.max(open + 1);
+    }
+    out
+}
+
 pub(crate) fn tag_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let open = xml.find(&format!("<{tag}"))?;
-    let start = xml[open..].find('>')? + open + 1;
-    let end = xml[start..].find(&format!("</{tag}>"))? + start;
-    Some(xml[start..end].trim())
+    // Keep scanning past a matching element with no closing tag: an RSS
+    // item can carry a self-closing `<atom:link rel="self"/>` ahead of
+    // the `<link>` whose text is wanted, and stopping at the first
+    // local-name hit would lose the real one.
+    let mut at = 0;
+    while let Some((open, name)) = find_elem(&xml[at..], tag) {
+        let open = at + open;
+        let gt = xml[open..].find('>')?;
+        let start = open + gt + 1;
+        if let Some(end) = xml[start..].find(&format!("</{name}>")) {
+            return Some(xml[start..start + end].trim());
+        }
+        at = start;
+    }
+    None
 }
 
 pub(crate) fn unescape(s: &str) -> String {
@@ -309,16 +350,14 @@ pub fn parse_feed(xml: &str) -> Vec<FeedItem> {
 fn parse_rss_items(xml: &str) -> Vec<FeedItem> {
     let mut out = Vec::new();
     let mut rest = xml;
-    while let Some(open) = rest.find("<item") {
-        let Some(close) = rest[open..].find("</item>") else {
+    while let Some((open, name)) = find_elem(rest, "item") {
+        let close_pat = format!("</{name}>");
+        let Some(close) = rest[open..].find(&close_pat) else {
             break;
         };
         let item = &rest[open..open + close];
         let title = tag_text(item, "title").map(unescape).unwrap_or_default();
-        let enclosure = item.find("<enclosure").map(|p| {
-            let end = item[p..].find('>').map(|e| p + e).unwrap_or(item.len());
-            &item[p..end]
-        });
+        let enclosure = elem_tags(item, "enclosure").into_iter().next();
         let link = enclosure
             .and_then(|e| attr(e, "url"))
             .map(str::to_string)
@@ -350,7 +389,7 @@ fn parse_rss_items(xml: &str) -> Vec<FeedItem> {
                 guid,
             });
         }
-        rest = &rest[open + close + 7..];
+        rest = &rest[open + close + close_pat.len()..];
     }
     out
 }
@@ -368,20 +407,15 @@ fn parse_rss_items(xml: &str) -> Vec<FeedItem> {
 fn parse_atom_entries(xml: &str) -> Vec<FeedItem> {
     let mut out = Vec::new();
     let mut rest = xml;
-    while let Some(open) = rest.find("<entry") {
-        let Some(close) = rest[open..].find("</entry>") else {
+    while let Some((open, name)) = find_elem(rest, "entry") {
+        let close_pat = format!("</{name}>");
+        let Some(close) = rest[open..].find(&close_pat) else {
             break;
         };
         let entry = &rest[open..open + close];
         let title = tag_text(entry, "title").map(unescape).unwrap_or_default();
         // Every <link .../> in the entry, as its raw tag text.
-        let links: Vec<&str> = entry
-            .match_indices("<link")
-            .map(|(at, _)| {
-                let end = entry[at..].find('>').map(|e| at + e).unwrap_or(entry.len());
-                &entry[at..end]
-            })
-            .collect();
+        let links: Vec<&str> = elem_tags(entry, "link");
         let rel = |l: &str| attr(l, "rel").unwrap_or("alternate").to_ascii_lowercase();
         let download = links
             .iter()
@@ -402,9 +436,8 @@ fn parse_atom_entries(xml: &str) -> Vec<FeedItem> {
             // <enclosure url="…"> bolted in; take it rather than lose
             // the entry.
             .or_else(|| {
-                let p = entry.find("<enclosure")?;
-                let end = entry[p..].find('>').map(|e| p + e).unwrap_or(entry.len());
-                attr(&entry[p..end], "url").map(str::to_string)
+                let tag = elem_tags(entry, "enclosure").into_iter().next()?;
+                attr(tag, "url").map(str::to_string)
             })
             .map(|l| unescape(&l))
             .unwrap_or_default();
@@ -432,7 +465,7 @@ fn parse_atom_entries(xml: &str) -> Vec<FeedItem> {
                 guid,
             });
         }
-        rest = &rest[open + close + 8..];
+        rest = &rest[open + close + close_pat.len()..];
     }
     out
 }
@@ -599,6 +632,41 @@ mod tests {
                 .is_ok(),
             "RSS 1.0 may bind RDF to any prefix"
         );
+        // A fully PREFIXED Atom document: every descendant carries the
+        // prefix too. The root was accepted by local name while the
+        // entry scan matched literal `<entry`, so the feed validated
+        // and then parsed to healthy-and-empty for ever (Codex sweep
+        // 5 Aug M9) - the exact silent failure the checked parser
+        // exists to prevent, one layer further in.
+        let prefixed = "<?xml version=\"1.0\"?>\
+            <atom:feed xmlns:atom=\"http://www.w3.org/2005/Atom\">\
+              <atom:entry>\
+                <atom:title>Prefixed.Release.2160p</atom:title>\
+                <atom:id>urn:uuid:pref-1</atom:id>\
+                <atom:link rel=\"alternate\" href=\"https://x/details/9\"/>\
+                <atom:link rel=\"enclosure\" type=\"application/x-nzb\" \
+                      href=\"https://x/getnzb/9\" length=\"2048\"/>\
+              </atom:entry>\
+            </atom:feed>";
+        let got = parse_feed_checked(prefixed).expect("a prefixed Atom feed is a feed");
+        assert_eq!(got.len(), 1, "the prefixed entry was not parsed: {got:?}");
+        assert_eq!(got[0].title, "Prefixed.Release.2160p");
+        assert_eq!(got[0].link, "https://x/getnzb/9");
+        assert_eq!(got[0].size, 2048);
+        assert_eq!(got[0].guid, "urn:uuid:pref-1");
+
+        // An RSS item with a self-closing <atom:link rel="self"/> ahead
+        // of its real <link>: local-name matching must keep scanning
+        // past the close-less element rather than losing the link.
+        let selflink = "<rss><channel><item>\
+            <title>Rss.With.AtomSelf</title>\
+            <atom:link rel=\"self\" href=\"https://x/feed\"/>\
+            <link>https://x/3</link>\
+            </item></channel></rss>";
+        let got = parse_feed(selflink);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].link, "https://x/3");
+
         // And the refusals must not have loosened with it.
         assert!(
             parse_feed_checked("<!doctype html><html><body>login</body></html>").is_err(),

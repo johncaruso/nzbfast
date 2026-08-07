@@ -90,6 +90,15 @@ final class ApiClient {
                         params: ["limit": String(limit)], what: "history").history
     }
 
+    /// Playback contract v1: the one call this app polls - server
+    /// state, both job lists with per-file readiness, and the
+    /// byte-serving telemetry, in a single response (CONTRACT.md
+    /// row 16). Full API key only.
+    func playback(limit: Int = 60) async throws -> PlaybackSnapshot {
+        try await fetch(PlaybackSnapshot.self, mode: "playback",
+                        params: ["limit": String(limit)], what: "playback readiness")
+    }
+
     func pauseJob(_ id: String) async throws {
         _ = try await fetch(StatusResponse.self, mode: "queue",
                             params: ["name": "pause", "value": id], what: "pause")

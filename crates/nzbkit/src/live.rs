@@ -1458,4 +1458,508 @@ mod tests {
         v.on_data_unverified(2, "c.bin", 8192, 0, &data);
         assert_eq!(v.take_pre_spans(2).1, PreSpanSrc::Backfill);
     }
+
+    // ===== Par2Set fixtures: real serialized packets, parsed by the =====
+    // ===== same code the wire feeds, so activate() is exercised too. =====
+
+    /// Wrap a body in a valid packet (magic, length, body MD5) - the same
+    /// shape par2.rs's own tests build. Header is 64 bytes per spec.
+    fn pkt(set_id: [u8; 16], ptype: &[u8; 16], body: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(crate::par2::MAGIC);
+        p.extend_from_slice(&(64 + body.len() as u64).to_le_bytes());
+        p.extend_from_slice(&[0u8; 16]); // md5 patched below
+        p.extend_from_slice(&set_id);
+        p.extend_from_slice(ptype);
+        p.extend_from_slice(body);
+        let md5: [u8; 16] = Md5::digest(&p[32..]).into();
+        p[16..32].copy_from_slice(&md5);
+        p
+    }
+
+    fn fid(i: usize) -> [u8; 16] {
+        let mut f = [0u8; 16];
+        f[0] = i as u8 + 1;
+        f
+    }
+
+    /// Serialized single-set PAR2 metadata describing `files`. With
+    /// `ifsc` false every file lands on the whole-file-MD5 path.
+    fn par2_meta(
+        set_id: [u8; 16],
+        block_size: usize,
+        files: &[(&str, &[u8])],
+        ifsc: bool,
+    ) -> Vec<u8> {
+        use crate::par2::{TYPE_FILEDESC, TYPE_IFSC, TYPE_MAIN};
+        let mut main = Vec::new();
+        main.extend_from_slice(&(block_size as u64).to_le_bytes());
+        main.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        for i in 0..files.len() {
+            main.extend_from_slice(&fid(i));
+        }
+        let mut out = pkt(set_id, TYPE_MAIN, &main);
+        for (i, (name, data)) in files.iter().enumerate() {
+            let mut desc = Vec::new();
+            desc.extend_from_slice(&fid(i));
+            desc.extend_from_slice(&<[u8; 16]>::from(Md5::digest(data)));
+            let head = &data[..data.len().min(HEAD_LEN)];
+            desc.extend_from_slice(&<[u8; 16]>::from(Md5::digest(head)));
+            desc.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            let mut nb = name.as_bytes().to_vec();
+            while nb.len() % 4 != 0 {
+                nb.push(0);
+            }
+            desc.extend_from_slice(&nb);
+            out.extend(pkt(set_id, TYPE_FILEDESC, &desc));
+            if ifsc {
+                let mut body = fid(i).to_vec();
+                for chunk in data.chunks(block_size) {
+                    let mut md5 = Md5::new();
+                    md5.update(chunk);
+                    pad_to(block_size, chunk.len(), |z| md5.update(z));
+                    body.extend_from_slice(&<[u8; 16]>::from(md5.finalize()));
+                    let mut crc = crc32fast::Hasher::new();
+                    crc.update(chunk);
+                    pad_to(block_size, chunk.len(), |z| crc.update(z));
+                    body.extend_from_slice(&crc.finalize().to_le_bytes());
+                }
+                out.extend(pkt(set_id, TYPE_IFSC, &body));
+            }
+        }
+        out
+    }
+
+    fn data_of(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    fn active_verifier(files: &[(&str, &[u8])], bs: usize) -> (LiveVerifier, Arc<Par2Set>) {
+        let v = LiveVerifier::new(files.len());
+        let meta = par2_meta([9u8; 16], bs, files, true);
+        let set = v.activate(&[meta.as_slice()]).expect("fixture parses");
+        (v, set)
+    }
+
+    /// The happy path: whole-file spans arrive after activation, every
+    /// block hashes from the decode buffer, settle reads back nothing.
+    #[test]
+    fn in_stream_verify_whole_spans() {
+        let data = data_of(2048 + 100, 1); // 3 blocks, short last
+        let (v, set) = active_verifier(&[("a.bin", &data)], 1024);
+        assert_eq!(set.block_size, 1024);
+        assert_eq!(set.files[0].blocks.len(), 3);
+        assert!(v.set().is_some());
+
+        assert!(!v.slot_in_set(0), "unmatched slot is not in the set");
+        v.on_data(0, "a.bin", data.len() as u64, 0, &data);
+        assert!(v.slot_in_set(0));
+        assert!(
+            v.delegates_integrity(0),
+            "matched + full-MD5 mode delegates"
+        );
+        v.set_fast_verify(true);
+        assert!(!v.delegates_integrity(0), "fast mode blocks delegation");
+        v.set_lean(true);
+        assert!(v.delegates_integrity(0), "lean opts back in");
+        v.set_fast_verify(false);
+        v.set_lean(false);
+
+        let (live, bad) = v.live_counts();
+        assert_eq!((live, bad), (3, 0));
+        let r = v.finish_slot(0, None).expect("matched slot reports");
+        assert!(r.all_ok(), "{r:?}");
+        assert_eq!(r.par2_name.as_deref(), Some("a.bin"));
+        assert_eq!(r.total_blocks, 3);
+        assert_eq!(r.live_blocks, 3);
+        assert_eq!(r.readback_blocks, 0);
+        assert_eq!(r.length, data.len() as u64);
+        assert!(v.unclaimed_files().is_empty());
+        let (peak, spilled) = v.partials_stats();
+        assert_eq!((peak, spilled), (0, 0));
+    }
+
+    /// Boundary blocks under full-MD5 mode accumulate byte partials; the
+    /// completing span routes them through the full-MD5 check, and the
+    /// budget accounting returns to zero.
+    #[test]
+    fn boundary_blocks_byte_partials() {
+        let data = data_of(2048, 2);
+        let (v, _set) = active_verifier(&[("a.bin", &data)], 1024);
+        v.on_data(0, "a.bin", 2048, 0, &data[..700]);
+        let (peak, _) = v.partials_stats();
+        assert_eq!(peak, 1024, "one boundary block's bytes are held");
+        v.on_data(0, "a.bin", 2048, 700, &data[700..]);
+        let r = v.finish_slot(0, None).unwrap();
+        assert!(r.all_ok(), "{r:?}");
+        assert_eq!(r.live_blocks, 2, "both blocks claimed in-stream");
+        assert_eq!(r.readback_blocks, 0);
+    }
+
+    /// Fast verify routes boundary fragments through CRC parts (B1): no
+    /// bytes held, the short last block zero-pads via crc32_zeros, and
+    /// out-of-order fragments still compose.
+    #[test]
+    fn fast_verify_crc_parts_compose() {
+        let data = data_of(2048 + 100, 3); // short last block
+        let (v, _set) = active_verifier(&[("a.bin", &data)], 1024);
+        v.set_fast_verify(true);
+        // Out of order, straddling every block boundary.
+        v.on_data(0, "a.bin", 2148, 1100, &data[1100..]);
+        v.on_data(0, "a.bin", 2148, 0, &data[..700]);
+        v.on_data(0, "a.bin", 2148, 700, &data[700..1100]);
+        let (peak, spilled) = v.partials_stats();
+        assert_eq!((peak, spilled), (0, 0), "CRC parts hold no bytes");
+        let r = v.finish_slot(0, None).unwrap();
+        assert!(r.all_ok(), "{r:?}");
+        assert_eq!(r.live_blocks, 3);
+        assert_eq!(r.readback_blocks, 0);
+    }
+
+    /// A corrupted span claims Bad in-stream, and the report names the
+    /// block. summarize_damage folds it into the repair plan's view.
+    #[test]
+    fn corrupt_block_reported() {
+        let data = data_of(3072, 4);
+        let (v, _set) = active_verifier(&[("a.bin", &data)], 1024);
+        let mut wrong = data.clone();
+        wrong[1500] ^= 0xFF; // damage block 1 only
+        v.on_data(0, "a.bin", 3072, 0, &wrong);
+        let (live, bad) = v.live_counts();
+        assert_eq!((live, bad), (3, 1));
+        let r = v.finish_slot(0, None).unwrap();
+        assert!(!r.all_ok());
+        assert_eq!(r.bad_blocks, vec![1]);
+        let d = summarize_damage(std::iter::once(&r));
+        assert_eq!(d.bad_blocks, 1);
+        assert_eq!(d.damaged_files, vec!["a.bin".to_string()]);
+    }
+
+    /// M15 budget: a boundary block bigger than the global cap is never
+    /// allocated - it spills to settle read-back, which full-MD5s it off
+    /// disk. Also the plain finish_slot(path) read-back route.
+    #[test]
+    fn partials_budget_spills_to_readback() {
+        let bs = 2 << 20; // 2 MiB blocks against the 1 MiB cap floor
+        let data = data_of(2 * bs, 5);
+        let v = LiveVerifier::with_partials_cap(1, 1);
+        let meta = par2_meta([9u8; 16], bs, &[("a.bin", &data)], true);
+        v.activate(&[meta.as_slice()]).unwrap();
+        v.on_data(0, "a.bin", data.len() as u64, 0, &data[..1 << 20]);
+        let (peak, spilled) = v.partials_stats();
+        assert_eq!(peak, 0, "over-budget block was never allocated");
+        assert_eq!(spilled, 1);
+
+        let dir = std::env::temp_dir().join(format!("nzbkit-live-spill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.bin");
+        std::fs::write(&path, &data).unwrap();
+        let r = v.finish_slot(0, Some(&path)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(r.all_ok(), "{r:?}");
+        assert_eq!(r.readback_blocks, 2, "both blocks settled off disk");
+        assert_eq!(r.live_blocks, 0);
+    }
+
+    /// A block bigger than the 8 MiB read-back chunk takes the streamed
+    /// path (chunked read, composed CRC padding, then MD5) - and agrees
+    /// with the single-buffer verdict.
+    #[test]
+    fn oversized_block_readback_is_chunked() {
+        let bs = 16 << 20;
+        let data = data_of(9 << 20, 6); // one 9 MiB block, 7 MiB padding
+        let v = LiveVerifier::new(1);
+        let meta = par2_meta([9u8; 16], bs, &[("big.bin", &data)], true);
+        v.activate(&[meta.as_slice()]).unwrap();
+        v.set_name_hint(0, "big.bin");
+        let ok = v
+            .finish_slot_from(
+                0,
+                ReadAt::Reader(&|off, buf| {
+                    let off = off as usize;
+                    buf.copy_from_slice(&data[off..off + buf.len()]);
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        assert!(ok.all_ok(), "{ok:?}");
+        assert_eq!(ok.readback_blocks, 1);
+
+        // The same block with one corrupt byte fails the streamed check.
+        let mut wrong = data.clone();
+        wrong[8 << 20] ^= 1;
+        let v2 = LiveVerifier::new(1);
+        v2.activate(&[meta.as_slice()]).unwrap();
+        v2.set_name_hint(0, "big.bin");
+        let bad = v2
+            .finish_slot_from(
+                0,
+                ReadAt::Reader(&|off, buf| {
+                    let off = off as usize;
+                    buf.copy_from_slice(&wrong[off..off + buf.len()]);
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        assert_eq!(bad.bad_blocks, vec![0]);
+    }
+
+    /// Pre-activation spans: heads are captured while Waiting, the spans
+    /// coalesce (overlaps merged, contained spans dropped), and the
+    /// backfill re-feed verifies them without settle read-back.
+    #[test]
+    fn pre_activation_backfill_roundtrip() {
+        let data = data_of(2048, 7);
+        let v = LiveVerifier::new(1);
+        v.on_data(0, "a.bin", 2048, 0, &data[..800]);
+        v.on_data(0, "a.bin", 2048, 600, &data[600..1400]); // overlap
+        v.on_data(0, "a.bin", 2048, 700, &data[700..900]); // contained
+        v.on_data(0, "a.bin", 2048, 1400, &data[1400..]);
+        let meta = par2_meta([9u8; 16], 1024, &[("a.bin", &data)], true);
+        v.activate(&[meta.as_slice()]).unwrap();
+        let (spans, how) = v.take_pre_spans(0);
+        assert_eq!(how, PreSpanSrc::Backfill);
+        assert_eq!(spans, vec![(0, 2048)], "coalesced to one span");
+        for &(off, len) in &spans {
+            let (off, len) = (off as usize, len as usize);
+            v.on_data_backfill(0, "a.bin", 2048, off as u64, &data[off..off + len]);
+        }
+        let r = v.finish_slot(0, None).unwrap();
+        assert!(r.all_ok(), "{r:?}");
+        assert_eq!(r.readback_blocks, 0, "backfill left nothing to settle");
+    }
+
+    /// Crash-resume seeds split at the u32 boundary and force the whole
+    /// slot onto the Disk backfill route.
+    #[test]
+    fn resume_seeds_split_and_route_to_disk() {
+        let v = LiveVerifier::new(1);
+        let big = (u32::MAX as u64) + 10;
+        v.seed_pre_spans(0, &[(0, big), (big + 100, 50)]);
+        let (spans, how) = v.take_pre_spans(0);
+        assert_eq!(how, PreSpanSrc::Disk);
+        assert_eq!(spans, vec![(0, big), (big + 100, 50)]);
+    }
+
+    /// Obfuscated posts: the yEnc name lies (or is absent), and the slot
+    /// still claims its PAR2 file through the md5-16k of its head.
+    #[test]
+    fn md5_16k_matches_obfuscated_slot() {
+        let data = data_of(3000, 8); // < 16 KiB: head is the whole file
+        let (v, _set) = active_verifier(&[("real-name.bin", &data)], 1024);
+        v.on_data(0, "jibberish123", 3000, 0, &data);
+        assert!(v.slot_in_set(0), "claimed via md5-16k despite the name");
+        let r = v.finish_slot(0, None).unwrap();
+        assert!(r.all_ok(), "{r:?}");
+        assert_eq!(r.par2_name.as_deref(), Some("real-name.bin"));
+    }
+
+    /// A slot whose name AND head both match nothing (nfo/sfv/sample)
+    /// goes unmatchable, stops rescanning, reports None - and its PAR2
+    /// files stay on the unclaimed list.
+    #[test]
+    fn unmatchable_slot_reports_none() {
+        let data = data_of(2048, 9);
+        let stranger = data_of(2048, 10);
+        let (v, _set) = active_verifier(&[("a.bin", &data)], 1024);
+        v.on_data(0, "not-in-set.nfo", 2048, 0, &stranger);
+        assert!(!v.slot_in_set(0));
+        assert!(!v.delegates_integrity(0));
+        v.on_data(0, "not-in-set.nfo", 2048, 0, &stranger); // early-out path
+        assert!(v.finish_slot(0, None).is_none());
+        assert_eq!(v.unclaimed_files(), vec!["a.bin".to_string()]);
+    }
+
+    /// No IFSC packet: the slot settles on the whole-file MD5, engaged
+    /// gates release either way, and a mismatch reads as one bad block.
+    #[test]
+    fn no_ifsc_settles_on_whole_file_md5() {
+        let data = data_of(5000, 11);
+        let v = LiveVerifier::new(2);
+        let g = VerifyGate::new(2);
+        v.set_gate(g.clone());
+        let meta = par2_meta([9u8; 16], 1024, &[("a.bin", &data)], false);
+        v.activate(&[meta.as_slice()]).unwrap();
+        // A span arriving on a matched no-IFSC slot is a no-op (no block
+        // map to claim against), but it does claim the file.
+        v.on_data(0, "a.bin", 5000, 0, &data);
+        assert_eq!(g.watermark(0), 0, "claim engaged the gate");
+        let ok = v
+            .finish_slot_from(
+                0,
+                ReadAt::Reader(&|off, buf| {
+                    let off = off as usize;
+                    buf.copy_from_slice(&data[off..off + buf.len()]);
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        assert!(ok.all_ok(), "{ok:?}");
+        assert_eq!(ok.total_blocks, 0);
+        assert_eq!(g.watermark(0), u64::MAX, "no-IFSC settle releases the gate");
+
+        // Missing source: the whole-file check cannot pass, and the
+        // verdict is damage rather than a hang.
+        let v2 = LiveVerifier::new(1);
+        v2.activate(&[meta.as_slice()]).unwrap();
+        v2.set_name_hint(0, "a.bin");
+        let bad = v2.finish_slot(0, None).unwrap();
+        assert_eq!(bad.bad_blocks, vec![0]);
+        assert!(!bad.all_ok());
+    }
+
+    /// §94 B: the published watermark tracks the contiguous Ok prefix -
+    /// an out-of-order claim publishes nothing until the prefix catches
+    /// up, and a fully verified slot publishes MAX.
+    #[test]
+    fn gate_watermark_tracks_ok_prefix() {
+        let data = data_of(3072, 12);
+        let (v, _set) = active_verifier(&[("a.bin", &data)], 1024);
+        let g = VerifyGate::new(1);
+        v.set_gate(g.clone());
+        v.on_data(0, "a.bin", 3072, 2048, &data[2048..]); // block 2 first
+        assert_eq!(g.watermark(0), 0, "no contiguous prefix yet");
+        v.on_data(0, "a.bin", 3072, 0, &data[..1024]);
+        assert_eq!(g.watermark(0), 1024, "prefix = block 0");
+        v.on_data(0, "a.bin", 3072, 1024, &data[1024..2048]);
+        assert_eq!(g.watermark(0), u64::MAX, "every block verified");
+    }
+
+    /// Mixed trust on a CRC-parts block: a fragment that cannot claim
+    /// CRC-only (settle/disk source) may not lend bytes to someone
+    /// else's CRC-only claim - the block abandons to read-back.
+    #[test]
+    fn mixed_trust_abandons_crc_partial() {
+        let data = data_of(2048, 13);
+        let (v, _set) = active_verifier(&[("a.bin", &data)], 1024);
+        v.set_fast_verify(true);
+        v.on_data(0, "a.bin", 2048, 0, &data[..700]); // CRC fragment
+        v.on_data_from_disk(0, "a.bin", 2048, 700, &data[700..1024]);
+        let (_, spilled) = v.partials_stats();
+        assert_eq!(spilled, 1, "the CRC partial was abandoned");
+        // The rest arrives whole; block 1 claims, block 0 reads back.
+        v.on_data(0, "a.bin", 2048, 1024, &data[1024..]);
+        let dir = std::env::temp_dir().join(format!("nzbkit-live-mixed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.bin");
+        std::fs::write(&path, &data).unwrap();
+        let r = v.finish_slot(0, Some(&path)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(r.all_ok(), "{r:?}");
+        assert_eq!(r.readback_blocks, 1);
+    }
+
+    /// An overlapping re-feed cannot compose CRCs losslessly - the block
+    /// abandons rather than guessing, then a whole-block span claims it.
+    #[test]
+    fn overlapping_crc_refeed_abandons_then_recovers() {
+        let data = data_of(2048, 14);
+        let (v, _set) = active_verifier(&[("a.bin", &data)], 1024);
+        v.set_fast_verify(true);
+        v.on_data(0, "a.bin", 2048, 0, &data[..700]);
+        v.on_data(0, "a.bin", 2048, 0, &data[..700]); // exact overlap
+        let (_, spilled) = v.partials_stats();
+        assert_eq!(spilled, 1);
+        v.on_data(0, "a.bin", 2048, 0, &data[..1024]); // whole block 0
+        v.on_data(0, "a.bin", 2048, 1024, &data[1024..]);
+        let r = v.finish_slot(0, None).unwrap();
+        assert!(r.all_ok(), "{r:?}");
+    }
+
+    /// set_off: spans are dropped, no set, no reports - and Waiting
+    /// (never activated) reports None the same way.
+    #[test]
+    fn off_and_waiting_report_nothing() {
+        let v = LiveVerifier::new(1);
+        assert!(v.finish_slot(0, None).is_none(), "Waiting reports None");
+        assert!(v.set().is_none());
+        v.set_off();
+        v.on_data(0, "a.bin", 100, 0, &[0u8; 100]);
+        assert!(v.finish_slot(0, None).is_none());
+        assert!(!v.slot_in_set(0));
+        assert!(!v.delegates_integrity(0));
+        assert!(v.unclaimed_files().is_empty());
+    }
+
+    /// set_name_hint seeds a name for a slot no article will flow
+    /// through, and finish_slot's last-chance match claims on it.
+    #[test]
+    fn name_hint_enables_last_chance_match() {
+        let data = data_of(2048, 15);
+        let (v, _set) = active_verifier(&[("a.bin", &data)], 1024);
+        v.set_name_hint(0, "a.bin");
+        v.set_name_hint(0, "loser.bin"); // first hint wins
+        let dir = std::env::temp_dir().join(format!("nzbkit-live-hint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.bin");
+        std::fs::write(&path, &data).unwrap();
+        let r = v.finish_slot(0, Some(&path)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(r.all_ok(), "{r:?}");
+        assert_eq!(r.readback_blocks, 2, "every block settled off disk");
+        assert_eq!(r.live_blocks, 0);
+    }
+
+    /// A head restarted by a late-learned file size still md5-16k
+    /// matches: the first article carried no size, the second did.
+    #[test]
+    fn head_restarts_when_size_learned_late() {
+        let data = data_of(1000, 16);
+        let v = LiveVerifier::new(1);
+        v.on_data(0, "", 0, 0, &data[..500]); // size unknown: 16 KiB head
+        v.on_data(0, "", 1000, 0, &data[..500]); // size learned: restart
+        v.on_data(0, "", 1000, 500, &data[500..]);
+        let meta = par2_meta([9u8; 16], 1024, &[("real.bin", &data)], true);
+        v.activate(&[meta.as_slice()]).unwrap();
+        // Backfill re-feed completes the head and matches via md5-16k.
+        let (spans, how) = v.take_pre_spans(0);
+        assert_eq!(how, PreSpanSrc::Backfill);
+        for &(off, len) in &spans {
+            let (off, len) = (off as usize, len as usize);
+            v.on_data_backfill(0, "", 1000, off as u64, &data[off..off + len]);
+        }
+        let r = v.finish_slot(0, None).unwrap();
+        assert!(r.all_ok(), "{r:?}");
+        assert_eq!(r.par2_name.as_deref(), Some("real.bin"));
+    }
+
+    /// pick_set: mixed recovery sets fall back to the input describing
+    /// the most files; pure garbage stays an error.
+    #[test]
+    fn pick_set_prefers_larger_of_mixed() {
+        let a = data_of(1024, 17);
+        let b = data_of(1024, 18);
+        let one = par2_meta([1u8; 16], 1024, &[("solo.bin", &a)], true);
+        let two = par2_meta([2u8; 16], 1024, &[("x.bin", &a), ("y.bin", &b)], true);
+        let set = pick_set(&[one.as_slice(), two.as_slice()]).expect("fallback picks one set");
+        assert_eq!(set.files.len(), 2);
+        assert_eq!(set.recovery_set_id, [2u8; 16]);
+        assert!(matches!(
+            pick_set(&[b"not a par2 at all".as_slice()]),
+            Err(Par2Error::NoMainPacket)
+        ));
+        // activate() surfaces parse failures without adopting a plan.
+        let v = LiveVerifier::new(1);
+        assert!(v.activate(&[b"garbage".as_slice()]).is_err());
+        assert!(v.set().is_none());
+    }
+
+    /// Two slots, two files: claims don't collide, and per-slot verdicts
+    /// stay independent.
+    #[test]
+    fn two_slots_claim_distinct_files() {
+        let a = data_of(2048, 19);
+        let b = data_of(1500, 20);
+        let (v, _set) = active_verifier(&[("a.bin", &a), ("b.bin", &b)], 1024);
+        v.on_data(1, "b.bin", 1500, 0, &b);
+        v.on_data(0, "a.bin", 2048, 0, &a);
+        let ra = v.finish_slot(0, None).unwrap();
+        let rb = v.finish_slot(1, None).unwrap();
+        assert_eq!(ra.par2_name.as_deref(), Some("a.bin"));
+        assert_eq!(rb.par2_name.as_deref(), Some("b.bin"));
+        assert!(ra.all_ok() && rb.all_ok());
+        assert!(v.unclaimed_files().is_empty());
+    }
 }

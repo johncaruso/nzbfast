@@ -1409,9 +1409,10 @@ where
 ///
 /// `consumed(volume_index)` says "no read will ever touch
 /// `volumes[volume_index]` again", and the indices arrive in increasing
-/// order. A caller holding the volumes on DISK uses this to delete each
-/// one the moment it is spent, so a set extracts without ever holding
-/// the volumes and the extracted payload at once.
+/// order, once each. A caller holding the volumes on DISK uses this to
+/// delete each one the moment it is spent, so a set extracts without
+/// ever holding the volumes and the extracted payload at once. The
+/// callback can run on the decode thread, hence `Send`.
 ///
 /// Two things make the report safe to act on destructively:
 ///
@@ -1420,10 +1421,15 @@ where
 ///   declares it. Solid members change nothing: the window carries
 ///   across members in RAM, the packed bytes are still read once, in
 ///   order.
-/// - **A split member is the one thing that reads backwards**, at its
-///   Finish fragment, which pulls every fragment from the volumes it
-///   spanned. So nothing is reported while a split is pending; the
-///   backlog is released once the Finish has run.
+/// - **A split member releases its volumes as its chain advances** - a
+///   middle fragment is the only entry of its volume, so once the chain
+///   has read it out the volume is finished with. The one path that
+///   reads fragments TWICE is the buffered retry behind a streaming
+///   filter bail, so the per-fragment watermark arms only where that
+///   retry is impossible: stored members (which never retry) and
+///   members too big to buffer. Anything else holds its volumes until
+///   the Finish has run, exactly as before - those members fit in the
+///   buffered path's ceiling, so the space they briefly pin is bounded.
 ///
 /// Arming this DISABLES the parallel member pool. That plan decodes
 /// independent members across the whole set concurrently, which is
@@ -1437,7 +1443,7 @@ pub fn extract_volumes_to_with_progress<F, C>(
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    C: FnMut(usize),
+    C: FnMut(usize) + Send,
 {
     extract_volumes_to_impl(
         volumes,
@@ -1468,7 +1474,7 @@ fn extract_volumes_to_impl<F, R>(
     open: &mut F,
     redirect: &mut R,
     emit_redirections: bool,
-    mut consumed: Option<&mut dyn FnMut(usize)>,
+    mut consumed: Option<&mut (dyn FnMut(usize) + Send)>,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1553,12 +1559,36 @@ where
                 }
                 SplitVolumeStep::Continue(current) => {
                     validate_split_continuation_refs(current, file, password)?;
-                    current.append(volume_index, file_index);
+                    current.append(volume_index, file_index)?;
                 }
                 SplitVolumeStep::Finish(mut completed) => {
                     validate_split_continuation_refs(&completed, file, password)?;
-                    completed.append(volume_index, file_index);
-                    completed.write_to(volumes, file, &mut session, &mut *open)?;
+                    completed.append(volume_index, file_index)?;
+                    // Progressive release: as the split member's chain
+                    // finishes with a fragment, its volume (and any
+                    // skipped ones before it) reports consumed - through
+                    // the shared `reported` cursor, so order and
+                    // uniqueness survive the boundary catch-up below.
+                    // The finish volume stays held; the walk is still in
+                    // it.
+                    let reported = &mut reported;
+                    let mut spent = consumed.as_deref_mut().map(|consumed| {
+                        move |spent_volume: usize| {
+                            while *reported <= spent_volume {
+                                consumed(*reported);
+                                *reported += 1;
+                            }
+                        }
+                    });
+                    completed.write_to(
+                        volumes,
+                        file,
+                        &mut session,
+                        &mut *open,
+                        spent
+                            .as_mut()
+                            .map(|spent| spent as &mut (dyn FnMut(usize) + Send)),
+                    )?;
                 }
                 SplitVolumeStep::MissingFirst => {
                     return Err(Error::InvalidHeader(
@@ -1737,12 +1767,34 @@ where
                     }
                     SplitVolumeStep::Continue(current) => {
                         validate_split_continuation_refs(current, file, password)?;
-                        current.append(volume_index, file_index);
+                        current.append(volume_index, file_index)?;
                     }
                     SplitVolumeStep::Finish(mut completed) => {
                         validate_split_continuation_refs(&completed, file, password)?;
-                        completed.append(volume_index, file_index);
-                        completed.write_to(&volumes, file, &mut session, &mut open)?;
+                        completed.append(volume_index, file_index)?;
+                        // The splits that land here are the ones the
+                        // incremental path declined - stored members and
+                        // small ones. Stored fragments still stream
+                        // forward exactly once, so they release their
+                        // volumes as the chain advances (a 400-volume
+                        // stored film must not pin the whole set in the
+                        // caller's retention window); `write_to` keeps
+                        // the watermark off any path that could re-read.
+                        let reported = &mut reported;
+                        let consumed = &consumed;
+                        let mut spent = move |spent_volume: usize| {
+                            while *reported <= spent_volume {
+                                consumed(*reported, u64::MAX);
+                                *reported += 1;
+                            }
+                        };
+                        completed.write_to(
+                            &volumes,
+                            file,
+                            &mut session,
+                            &mut open,
+                            Some(&mut spent),
+                        )?;
                     }
                     SplitVolumeStep::MissingFirst => {
                         return Err(Error::InvalidHeader(
@@ -3157,12 +3209,14 @@ where
                         }
                         SplitVolumeStep::Continue(current) => {
                             validate_split_continuation_refs(current, file, password)?;
-                            current.append(volume_index, file_index);
+                            current.append(volume_index, file_index)?;
                         }
                         SplitVolumeStep::Finish(mut completed) => {
                             validate_split_continuation_refs(&completed, file, password)?;
-                            completed.append(volume_index, file_index);
-                            completed.write_to(volumes, file, &mut session, &mut *open)?;
+                            completed.append(volume_index, file_index)?;
+                            // The pool never runs under a consumption
+                            // watermark, so there is nothing to report.
+                            completed.write_to(volumes, file, &mut session, &mut *open, None)?;
                         }
                         SplitVolumeStep::MissingFirst => {
                             return Err(Error::InvalidHeader(
@@ -3247,8 +3301,22 @@ impl PendingSplitRefs {
         }
     }
 
-    fn append(&mut self, volume_index: usize, file_index: usize) {
+    fn append(&mut self, volume_index: usize, file_index: usize) -> Result<()> {
+        // Strictly increasing volumes only: a crafted archive with two
+        // fragments of one member in the same volume would let the
+        // consumption watermark report that volume spent while a later
+        // fragment still needs to reopen it by path - the caller may
+        // have deleted it on the report. No real archiver splits a
+        // member twice within one volume.
+        if let Some(&(last_volume, _)) = self.fragments.last() {
+            if volume_index <= last_volume {
+                return Err(Error::InvalidHeader(
+                    "RAR 5 split fragment does not advance to a later volume",
+                ));
+            }
+        }
         self.fragments.push((volume_index, file_index));
+        Ok(())
     }
 
     fn write_to<F>(
@@ -3257,6 +3325,7 @@ impl PendingSplitRefs {
         final_file: &FileHeader,
         session: &mut DecoderSession<'_>,
         open: &mut F,
+        mut spent: Option<&mut (dyn FnMut(usize) + Send)>,
     ) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -3271,8 +3340,11 @@ impl PendingSplitRefs {
         };
         let mut writer = open(&meta)?;
         if final_file.is_stored() {
+            // A stored split streams its fragments forward exactly once
+            // (no retry path exists), so the consumption watermark is
+            // safe unconditionally.
             return self
-                .write_stored_to(volumes, final_file, decryptor.as_ref(), &mut writer)
+                .write_stored_to(volumes, final_file, decryptor.as_ref(), &mut writer, spent)
                 .map_err(|error| final_file.entry_error("extracting", error));
         }
 
@@ -3286,8 +3358,20 @@ impl PendingSplitRefs {
                 .map_err(|error| final_file.entry_error("decoding", error))?
                 .solid;
             let keys = decryptor.as_ref().map(|decryptor| &decryptor.keys);
+            // The filter-bail retry below re-reads every fragment, so the
+            // consumption watermark may only arm when that retry is
+            // impossible - a member too big for the buffered path. Smaller
+            // members release their volumes at the next volume boundary,
+            // exactly as before.
+            let watermark = if final_file.unpacked_size > session.buffered_decode_limit {
+                spent.as_deref_mut().map(|f| {
+                    Box::new(move |volume: usize| f(volume)) as Box<dyn FnMut(usize) + Send + '_>
+                })
+            } else {
+                None
+            };
             let mut reader = self
-                .fragment_reader(volumes, decryptor.as_ref())
+                .fragment_reader(volumes, decryptor.as_ref(), watermark)
                 .map_err(|error| final_file.entry_error("reading", error))?;
             let mut counting = CountingWriter {
                 inner: &mut *writer,
@@ -3356,8 +3440,12 @@ impl PendingSplitRefs {
         final_file: &FileHeader,
         decryptor: Option<&SplitDecryptor>,
         writer: &mut dyn Write,
+        spent: Option<&mut (dyn FnMut(usize) + Send)>,
     ) -> Result<()> {
-        let mut reader = self.fragment_reader(volumes, decryptor)?;
+        let spent = spent.map(|f| {
+            Box::new(move |volume: usize| f(volume)) as Box<dyn FnMut(usize) + Send + '_>
+        });
+        let mut reader = self.fragment_reader(volumes, decryptor, spent)?;
         let crc = Crc32::new();
         let hash = streaming_hash_verifier(final_file)?;
         let mut written = 0u64;
@@ -3446,11 +3534,12 @@ impl PendingSplitRefs {
         }))
     }
 
-    fn fragment_reader<'a>(
+    fn fragment_reader<'r>(
         &self,
-        volumes: &'a [Archive],
+        volumes: &'r [Archive],
         decryptor: Option<&SplitDecryptor>,
-    ) -> Result<Box<dyn Read + Send + 'a>> {
+        spent: Option<Box<dyn FnMut(usize) + Send + 'r>>,
+    ) -> Result<Box<dyn Read + Send + 'r>> {
         // Fragment METADATA validates eagerly (a missing volume or entry
         // still surfaces before any output is written), but at most ONE
         // fragment is OPEN at a time: a file-backed range reader holds a
@@ -3474,6 +3563,7 @@ impl PendingSplitRefs {
             fragments,
             next: 0,
             current: None,
+            spent,
         };
         if let Some(decryptor) = decryptor {
             Ok(Box::new(Rar50DecryptingReader::new(
@@ -3498,10 +3588,26 @@ struct LazyChainedReader<'a> {
     fragments: Vec<(usize, std::ops::Range<usize>)>,
     next: usize,
     current: Option<Box<dyn Read + Send + 'a>>,
+    /// Fires with the volume index of each fragment read to its end -
+    /// except the LAST fragment, whose volume carries the members after
+    /// the split one and stays live. A middle fragment is the only file
+    /// entry of its volume, so exhausting it proves the whole volume is
+    /// finished with; the caller arms this only on paths that never read
+    /// a fragment twice (see `PendingSplitRefs::write_to`). Runs on
+    /// whichever thread drives the read, hence `Send`. Boxed because a
+    /// `&mut dyn` hook's trait-object lifetime is invariant and refuses
+    /// to shrink alongside the volumes borrow.
+    spent: Option<Box<dyn FnMut(usize) + Send + 'a>>,
 }
 
 impl Read for LazyChainedReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        // An empty read must not look like fragment EOF: it would advance
+        // the chain past unread bytes - and, with the watermark armed,
+        // report a volume spent that is still needed.
+        if out.is_empty() {
+            return Ok(0);
+        }
         loop {
             if let Some(reader) = self.current.as_mut() {
                 let read = reader.read(out)?;
@@ -3509,6 +3615,13 @@ impl Read for LazyChainedReader<'_> {
                     return Ok(read);
                 }
                 self.current = None;
+                // The fragment just exhausted is `next - 1`; report its
+                // volume unless it is the chain's last.
+                if self.next < self.fragments.len() {
+                    if let Some(spent) = self.spent.as_mut() {
+                        spent(self.fragments[self.next - 1].0);
+                    }
+                }
             }
             let Some((volume_index, range)) = self.fragments.get(self.next) else {
                 return Ok(0);
@@ -3570,7 +3683,7 @@ impl FileHeader {
     ) -> Result<Vec<u8>> {
         if self.is_stored() {
             let mut data = Vec::new();
-            let mut reader = split.fragment_reader(volumes, decryptor)?;
+            let mut reader = split.fragment_reader(volumes, decryptor, None)?;
             reader.read_to_end(&mut data)?;
             if data.len() as u64 != self.unpacked_size {
                 return Err(Error::InvalidHeader(
@@ -3584,7 +3697,7 @@ impl FileHeader {
         let dictionary_size = usize::try_from(info.dictionary_size).map_err(|_| {
             Error::InvalidHeader("RAR 5 dictionary size overflows host address size")
         })?;
-        let mut reader = split.fragment_reader(volumes, decryptor)?;
+        let mut reader = split.fragment_reader(volumes, decryptor, None)?;
         let output_size = checked_unpacked_size(self.unpacked_size)?;
         decoder
             .decode_member_from_reader_with_dictionary(
@@ -3894,7 +4007,7 @@ mod tests {
         second.data_crc32 = crc;
         let final_file = second.clone();
         let mut pending = PendingSplitRefs::new(&first, 0, 0);
-        pending.append(1, 0);
+        pending.append(1, 0).unwrap();
         let volumes = vec![
             archive_with_blocks(vec![Block::File(first)], payload[..half].to_vec()),
             archive_with_blocks(vec![Block::File(second)], payload[half..].to_vec()),
@@ -3926,7 +4039,7 @@ mod tests {
             let (pending, final_file, volumes) =
                 two_fragment_split(&payload, false, payload.len() as u64, None);
             let outcome = pending
-                .write_stored_to(&volumes, &final_file, None, &mut FailingWriter)
+                .write_stored_to(&volumes, &final_file, None, &mut FailingWriter, None)
                 .map_err(|error| error.to_string());
             let _ = done_tx.send(outcome);
         });
@@ -3989,7 +4102,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         pending
-            .write_stored_to(&volumes, &final_file, None, &mut out)
+            .write_stored_to(&volumes, &final_file, None, &mut out, None)
             .expect("non-zero AES padding must extract");
         assert_eq!(out, expected);
     }
@@ -4005,7 +4118,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let err = pending
-            .write_stored_to(&volumes, &final_file, None, &mut out)
+            .write_stored_to(&volumes, &final_file, None, &mut out, None)
             .unwrap_err();
         assert!(
             matches!(err, Error::InvalidHeader(msg) if msg.contains("one block of padding")),
@@ -4028,7 +4141,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         pending
-            .write_stored_to(&volumes, &final_file, None, &mut out)
+            .write_stored_to(&volumes, &final_file, None, &mut out, None)
             .unwrap();
         assert_eq!(out, &padded[..logical]);
     }
@@ -4867,7 +4980,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let err = pending
-            .write_stored_to(&volumes, &final_file, None, &mut out)
+            .write_stored_to(&volumes, &final_file, None, &mut out, None)
             .unwrap_err();
         assert!(
             matches!(err, Error::InvalidHeader(msg) if msg.contains("mismatched packed and unpacked")),
@@ -4892,7 +5005,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let err = pending
-            .write_stored_to(&volumes, &final_file, None, &mut out)
+            .write_stored_to(&volumes, &final_file, None, &mut out, None)
             .unwrap_err();
         assert!(
             matches!(err, Error::Crc32Mismatch { .. }),
@@ -4924,7 +5037,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let err = pending
-            .write_stored_to(&volumes, &final_file, None, &mut out)
+            .write_stored_to(&volumes, &final_file, None, &mut out, None)
             .unwrap_err();
         assert!(
             matches!(err, Error::HashMismatch { hash_type: 0 }),

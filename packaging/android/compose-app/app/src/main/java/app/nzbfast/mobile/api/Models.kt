@@ -34,6 +34,11 @@ data class HistorySlot(
     val size: String,
     val failMessage: String,
     val completedAt: Long,
+    /** The daemon judged this row to hold media: the latched `media`
+     * chip when present, else the stored path's own extension (rows
+     * recorded before the chip existed). Gates the Play action -
+     * ISOs, software and archive-only jobs get none. */
+    val playable: Boolean,
 )
 
 data class AddResult(
@@ -76,6 +81,10 @@ data class PlaybackJob(
     val timeLeft: String,
     val activity: String,
     val failMessage: String,
+    /** History rows: finished size in bytes (queue rows report mb/mbleft). */
+    val bytes: Long,
+    /** History rows: unix seconds of completion. */
+    val completedAt: Long,
     val playback: Playback,
     /** Play URL carrying the job's scoped token, never the API key. */
     val stream: String,
@@ -156,10 +165,29 @@ object Parse {
                     size = s.optString("size"),
                     failMessage = s.optString("fail_message"),
                     completedAt = s.optLong("completed", 0),
+                    playable = looksPlayable(s),
                 )
             )
         }
         return out
+    }
+
+    /** Play gating (Codex sweep 5 Aug L3): the `media` chip the daemon
+     * latched during the download says whether the bytes are media; a
+     * row recorded before the chip existed falls back to the stored
+     * path's extension (mirrors the daemon's MEDIA_EXTS list). */
+    private val MEDIA_EXTS = listOf(".mkv", ".mp4", ".avi", ".m4v", ".ts", ".wmv")
+
+    private fun looksPlayable(s: JSONObject): Boolean {
+        val m = s.optJSONObject("media")
+        if (m != null && (!m.isNull("res") || !m.isNull("vcodec") || !m.isNull("audio"))) {
+            return true
+        }
+        for (key in listOf("storage", "name")) {
+            val p = s.optString(key).lowercase()
+            if (MEDIA_EXTS.any { p.endsWith(it) }) return true
+        }
+        return false
     }
 
     fun addResult(body: String): AddResult {
@@ -189,6 +217,20 @@ object Parse {
      */
     fun playback(body: String): PlaybackSnapshot {
         val j = JSONObject(body)
+        // A pre-contract daemon answers HTTP 200 with
+        // {"status":false,"error":"unimplemented mode playback"} - parsing
+        // that as an empty snapshot made setup save the connection and
+        // left Home silently blank. Refuse anything that is not a
+        // status:true contract-v1 body; the thrown message surfaces
+        // through the existing runCatching paths in setup and polling.
+        if (!j.optBoolean("status", false)) {
+            throw Exception(
+                j.optString("error").ifEmpty { "the daemon refused the playback call" },
+            )
+        }
+        if (j.optInt("contract", 0) < 1) {
+            throw Exception("this daemon does not support the mobile app - upgrade nzbfast")
+        }
         val s = j.optJSONObject("stream")
         return PlaybackSnapshot(
             contract = j.optInt("contract", 0),
@@ -228,6 +270,8 @@ object Parse {
                     timeLeft = j.optString("timeleft", ""),
                     activity = j.optString("activity", ""),
                     failMessage = j.optString("fail_message", ""),
+                    bytes = j.optLong("bytes", 0),
+                    completedAt = j.optLong("completed", 0),
                     playback = Playback(
                         ready = p?.optBoolean("ready", false) ?: false,
                         reason = p?.optString("reason", "unknown") ?: "unknown",

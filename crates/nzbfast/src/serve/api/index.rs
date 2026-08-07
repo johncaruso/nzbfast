@@ -725,9 +725,18 @@ fn m_groups_add_matching(
                 // The clone above releases its guard at the end of
                 // its own statement: holding it across this call
                 // would deadlock on the same Mutex.
-                let _ = apply_and_save(d, "index_groups", &groups.join(","));
-                json!({"status": true, "added": added,
-                               "matched": total, "capped": total > MAX_BULK})
+                match apply_and_save(d, "index_groups", &groups.join(",")) {
+                    Err(e) => json!({"status": false, "error": e}),
+                    // saved=false is "live now, reverts at restart" -
+                    // dropping it reported a durable subscription over
+                    // an unwritable settings dir (Codex sweep 5 Aug L1).
+                    Ok((_, saved)) => json!({"status": true, "added": added,
+                               "matched": total, "capped": total > MAX_BULK,
+                               "warning": (!saved).then(|| format!(
+                                   "the scan list could not be written to {} - the added \
+                                    groups work now but revert at the next restart",
+                                   d.settings_path.display()))}),
+                }
             }
         }
     })
@@ -801,9 +810,19 @@ fn m_index_search(
 ) -> Option<Value> {
     Some({
         let q = params.get("q").cloned().unwrap_or_default();
-        let hits = d
-            .with_index_read(|ix| ix.search(&q, 60).ok())
-            .unwrap_or_default();
+        // index_read_checked, not with_index_read: a saturated read
+        // pool is not "no matches", and the wall already reports the
+        // difference (Codex sweep 5 Aug M10). The UI keeps its list
+        // on `status:false` and the next poll gets the real answer.
+        let hits = match d.index_read_checked(|ix| ix.search(&q, 60).ok()) {
+            Err(_) => {
+                return Some(json!({
+                    "status": false, "busy": true,
+                    "error": "the index is busy - try again in a moment",
+                }));
+            }
+            Ok(hits) => hits.unwrap_or_default(),
+        };
         let hints = corr_hints(
             d,
             hits.iter().filter(|r| r.pre_title.is_empty()).map(|r| r.id),
@@ -1998,4 +2017,69 @@ pub(in crate::serve) fn dispatch(
         "indexer_grab" => return m_indexer_grab(d, _req, params, ctx, _api_body),
         _ => return None,
     })
+}
+
+#[cfg(all(test, unix))]
+mod add_matching_tests {
+    use super::*;
+    use crate::serve::testutil::test_daemon;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// L1 (Codex sweep 5 Aug): the bulk subscribe discarded the whole
+    /// `apply_and_save` result - groups joined the live scan list, the
+    /// UI said "Added N groups", and an unwritable settings dir made
+    /// the entire subscription vanish at the next restart. Live-plus-
+    /// warning is the contract now.
+    #[test]
+    fn a_bulk_subscribe_that_cannot_persist_says_it_reverts() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-gbsave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = test_daemon(&dir);
+        *d.group_catalog.lock_ok() = Some(Arc::new(crate::groups::Catalog {
+            fetched_at: 1,
+            groups: vec![crate::groups::CatGroup {
+                name: "alt.binaries.testers".into(),
+                posts: 10,
+                desc: String::new(),
+                cat: crate::groups::Category::Other,
+                status: 'y',
+                first_seen: 0,
+            }],
+        }));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mut req: tiny_http::Request = tiny_http::TestRequest::new().into();
+        let cfg_path = dir.join("nzbfast.toml");
+        let ctx = ApiCtx {
+            cfg_path: &cfg_path,
+            host_hdr: "",
+            base: "",
+            ua_hdr: "",
+            key_q: "",
+            #[cfg(feature = "indexer")]
+            tmdb_key: &None,
+            bootstrap_apikey: false,
+            via_add_only: false,
+        };
+        let mut params = std::collections::HashMap::new();
+        params.insert("q".to_string(), "testers".to_string());
+        let v = m_groups_add_matching(&d, &mut req, &params, &ctx, &mut None).unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(v["status"], true, "{v}");
+        assert_eq!(v["added"], 1, "{v}");
+        // The group IS live - and the response says it reverts.
+        assert!(
+            d.index_groups
+                .lock_ok()
+                .iter()
+                .any(|g| g == "alt.binaries.testers"),
+            "the live scan list was not updated"
+        );
+        let w = v["warning"].as_str().unwrap_or_default();
+        assert!(w.contains("revert"), "no durability warning: {v}");
+    }
 }

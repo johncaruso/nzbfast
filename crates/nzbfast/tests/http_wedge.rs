@@ -514,6 +514,22 @@ fn a_slow_index_read_cannot_starve_the_http_pool() {
     );
     assert_eq!(w["busy"], true, "wall2 says the index is busy: {w}");
 
+    // And the same honesty for search: a saturated pool used to be
+    // flattened to `results: []`, which the dashboard drew as "nothing
+    // matched" over a list it then threw away (Codex sweep 5 Aug M10).
+    let t = Instant::now();
+    let s = api(port, "mode=index_search&q=wedge");
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "index_search waited {}ms on a saturated pool instead of answering busy",
+        t.elapsed().as_millis()
+    );
+    assert_eq!(s["busy"], true, "search says the index is busy: {s}");
+    assert!(
+        s.get("results").is_none(),
+        "a busy search must not look like an empty one: {s}"
+    );
+
     let answers: Vec<serde_json::Value> = holders
         .into_iter()
         .map(|h| h.join().expect("holder thread"))

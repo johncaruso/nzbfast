@@ -1174,6 +1174,13 @@ pub fn parse_sabnzbd_categories(text: &str) -> SabCategories {
         .unwrap_or("")
         .to_string();
 
+    // Expand the base BEFORE it resolves anyone else: SAB accepts
+    // `complete_dir=~/Downloads/complete`, and joining a relative
+    // category dir onto the verbatim value produced `~/…/movies`,
+    // which the absolute-path check below then rejected - dropping a
+    // perfectly valid destination (Codex sweep 5 Aug L2).
+    let complete_dir = resolve_sab_dir(&complete_dir, "");
+
     let mut out = SabCategories::default();
     let mut saw_star_flag = false;
     let saw = |set: &mut Vec<String>, note: &str| {
@@ -1261,6 +1268,18 @@ pub fn parse_sabnzbd_categories(text: &str) -> SabCategories {
     out
 }
 
+/// The user's home directory. `HOME` is not set on Windows - `USERPROFILE`
+/// is - and a sabnzbd.ini carrying `~/...` is an ordinary thing to import
+/// there, so reading only `HOME` left the tilde unexpanded and the caller
+/// then joined it onto `complete_dir` to make a path with a literal `~`
+/// segment in the middle. Same fallback order the daemon's own path
+/// helper uses.
+fn home_dir() -> Option<String> {
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+}
+
 /// SAB's `real_path`: absolute stays, `~/` expands, anything else is
 /// relative to `complete_dir`.
 fn resolve_sab_dir(dir: &str, complete_dir: &str) -> String {
@@ -1268,8 +1287,7 @@ fn resolve_sab_dir(dir: &str, complete_dir: &str) -> String {
         return dir.to_string();
     }
     if let Some(rest) = dir.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
+        && let Some(home) = home_dir()
     {
         return format!("{}/{rest}", home.trim_end_matches('/'));
     }
@@ -1419,6 +1437,37 @@ host = news.example.com
         assert!(
             c.dropped.iter().any(|d| d.contains("complete_dir")),
             "{:?}",
+            c.dropped
+        );
+    }
+
+    /// A tilde `complete_dir` is a base SAB accepts, so a relative
+    /// category dir must land under `$HOME/...` - joining the verbatim
+    /// `~/...` produced a path the absolute check rejected, and a
+    /// valid destination was dropped with a misleading "no
+    /// complete_dir" note (Codex sweep 5 Aug L2).
+    #[test]
+    fn a_tilde_complete_dir_still_resolves_relative_category_dirs() {
+        // HOME on unix, USERPROFILE on Windows - resolved the same way
+        // the product does, so this asserts the shipped behaviour on
+        // both platforms instead of panicking on one of them.
+        let home = super::home_dir().expect("test needs HOME or USERPROFILE");
+        let c = cats(
+            "[misc]\ncomplete_dir = ~/Downloads/complete\n\
+             [categories]\n[[movies]]\nname = movies\ndir = films\n",
+        );
+        assert_eq!(
+            c.cats[0].dir,
+            Some(format!(
+                "{}/Downloads/complete/films",
+                home.trim_end_matches('/')
+            )),
+            "dropped: {:?}",
+            c.dropped
+        );
+        assert!(
+            !c.dropped.iter().any(|d| d.contains("complete_dir")),
+            "a resolvable base was reported unresolvable: {:?}",
             c.dropped
         );
     }

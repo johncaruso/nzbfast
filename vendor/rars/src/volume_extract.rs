@@ -68,22 +68,61 @@ pub(crate) type FragmentOpener<'a> =
 /// O(1) - the finished fragment is dropped as soon as the next one opens.
 pub(crate) struct LazyChainedReader<'a> {
     openers: Vec<Option<FragmentOpener<'a>>>,
+    /// Volume index reported through `spent` when the matching fragment
+    /// reads to its end; `None` where nothing may be reported (in
+    /// practice: the LAST fragment, whose volume carries the members
+    /// after the split one and stays live).
+    marks: Vec<Option<usize>>,
     index: usize,
     current: Option<Box<dyn Read + Send + 'a>>,
+    /// Consumption watermark: a middle fragment is the only file entry of
+    /// its volume, so exhausting it proves the whole volume is finished
+    /// with. Armed only by paths that never read a fragment twice. Runs
+    /// on whichever thread drives the read, hence `Send`; boxed because a
+    /// `&mut dyn` hook's trait-object lifetime is invariant and refuses
+    /// to shrink alongside the openers borrow.
+    spent: Option<Box<dyn FnMut(usize) + Send + 'a>>,
 }
 
 impl<'a> LazyChainedReader<'a> {
     pub(crate) fn new(openers: Vec<FragmentOpener<'a>>) -> Self {
+        let marks = vec![None; openers.len()];
         Self {
             openers: openers.into_iter().map(Some).collect(),
+            marks,
             index: 0,
             current: None,
+            spent: None,
+        }
+    }
+
+    /// [`Self::new`] with the consumption watermark armed: `marks[i]` is
+    /// the volume index reported when fragment `i` is read out, and the
+    /// two vectors must be the same length.
+    pub(crate) fn with_spent(
+        openers: Vec<FragmentOpener<'a>>,
+        marks: Vec<Option<usize>>,
+        spent: Option<Box<dyn FnMut(usize) + Send + 'a>>,
+    ) -> Self {
+        debug_assert_eq!(openers.len(), marks.len());
+        Self {
+            openers: openers.into_iter().map(Some).collect(),
+            marks,
+            index: 0,
+            current: None,
+            spent,
         }
     }
 }
 
 impl Read for LazyChainedReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> Result<usize> {
+        // An empty read must not look like fragment EOF: it would advance
+        // the chain past unread bytes - and, with the watermark armed,
+        // report a volume spent that is still needed.
+        if out.is_empty() {
+            return Ok(0);
+        }
         loop {
             if self.current.is_none() {
                 let Some(slot) = self.openers.get_mut(self.index) else {
@@ -105,6 +144,12 @@ impl Read for LazyChainedReader<'_> {
             // Drop the fragment BEFORE opening the next one - that is the
             // whole point of the lazy chain.
             self.current = None;
+            if let (Some(mark), Some(spent)) = (
+                self.marks.get(self.index).copied().flatten(),
+                self.spent.as_mut(),
+            ) {
+                spent(mark);
+            }
             self.index += 1;
         }
     }

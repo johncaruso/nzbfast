@@ -583,6 +583,24 @@ async fn newznab_categories_follow_the_standard_tree() {
         let (_, body) = http_get(port, "/api?t=search");
         assert_eq!(items(&body), 3, "{body}");
 
+        // With no cat the OPERATION carries the kind, and the accepted
+        // alias spellings mean the same operation. `t=moviesearch` and
+        // `t=tv-search` used to pass dispatch but miss the kind
+        // fallback, answering unfiltered - a movie search holding TV
+        // (Codex sweep 5 Aug M11).
+        for t in ["movie", "moviesearch"] {
+            let (_, body) = http_get(port, &format!("/api?t={t}"));
+            assert_eq!(items(&body), 1, "t={t} was not movie-filtered: {body}");
+            assert!(body.contains("Cat.Movie.2019"), "t={t}: {body}");
+            assert!(!body.contains("Cat.Show.S04E01"), "t={t}: {body}");
+        }
+        for t in ["tvsearch", "tv-search"] {
+            let (_, body) = http_get(port, &format!("/api?t={t}"));
+            assert_eq!(items(&body), 1, "t={t} was not tv-filtered: {body}");
+            assert!(body.contains("Cat.Show.S04E01"), "t={t}: {body}");
+            assert!(!body.contains("Cat.Movie.2019"), "t={t}: {body}");
+        }
+
         // Caps advertise PC alongside the rest, so a client knows to ask.
         let (_, caps) = http_get(port, "/api?t=caps");
         assert!(

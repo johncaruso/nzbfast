@@ -2238,9 +2238,10 @@ async fn corrupt_article_detected_and_repaired() {
 /// priced END TO END, repair time included. One server corrupts every
 /// 5th body it serves (a broken cache node) beside a clean server.
 /// Off, every corrupt body it delivers is terminal damage and the run
-/// pays verify + PAR2 repair; on (NZBFAST_CRC_RETRY=1) the pool
-/// refetches each bad article from the clean server at delivery time
-/// and the run finishes clean, no repair at all. Wall-clock
+/// pays verify + PAR2 repair; on (NZBFAST_CRC_RETRY=1, an alias for
+/// NZBFAST_CRC_STEER since the TODO 114 graduation moved detection to
+/// the decode consumer) each bad article is refetched from the clean
+/// server and the run finishes clean, no repair at all. Wall-clock
 /// measurement - stays ignored, run with --ignored for the numbers.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "wall-clock payout measurement (corrupt storm incl repair) - run with --ignored"]
@@ -2293,6 +2294,54 @@ async fn payout_crc_retry_prices_corrupt_storm_end_to_end() {
         }
         println!("crc-retry storm, {tag}: wall {wall:.2?}");
     }
+}
+
+/// TODO 114 consumer steer, functional and in the suite (the leg above
+/// is wall-clock and stays ignored): a corrupt storm beside a clean
+/// twin must finish byte-perfect with NO repair, through the real
+/// binary end to end - pool defers the article's terminal accounting,
+/// the decode consumer verdicts through note_decoded, the reject
+/// requeues to the clean server. NZBFAST_CRC_STEER=1 is explicit
+/// because the mock twins share a host, which the default's
+/// different-host elsewhere rule correctly refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn crc_steer_corrupt_storm_finishes_clean_without_repair() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("crcsteer");
+    let data = payload(600_000, 9);
+    fx.add_file("payload.bin", &data, 32_000);
+    assert!(fx.add_par2(20, &["payload.bin"], 32_000));
+    let nzb = fx.write_nzb();
+    let a = MockServer::start(
+        fx.articles.clone(),
+        Chaos {
+            corrupt_every: 3,
+            ..Default::default()
+        },
+    )
+    .await;
+    let b = MockServer::start(fx.articles.clone(), Chaos::default()).await;
+    let cfg = fx.write_config(&[&a, &b]);
+    let out = fx.dir.join("out");
+    let (cfg2, nzb2, out2) = (cfg.clone(), nzb.clone(), out.clone());
+    let (log, ok) = tokio::task::spawn_blocking(move || {
+        run_get(&cfg2, &nzb2, &out2, &[("NZBFAST_CRC_STEER", "1")])
+    })
+    .await
+    .unwrap();
+    assert!(ok, "steer leg failed:\n{log}");
+    assert_eq!(
+        std::fs::read(out.join("payload.bin")).unwrap(),
+        data,
+        "steer leg: output bytes differ"
+    );
+    assert!(
+        !log.contains("repair complete"),
+        "consumer steer leaked damage into repair:\n{log}"
+    );
 }
 
 /// The 2026-07 damaged-post bench scenario: a store-mode RAR set

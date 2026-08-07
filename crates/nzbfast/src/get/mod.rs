@@ -25,6 +25,32 @@ use workers::{
     spawn_par_race, spawn_rate_ticker, spawn_spec_prefetch,
 };
 
+/// Queue-row activity token, advanced at section transitions only
+/// (never per article): the daemon's queue payload reads it to say
+/// what the pipeline is doing right now. No hub (CLI) means no one
+/// is listening; a sidecar's hub is never read by the queue payload.
+/// Lifted out of `get_with_progress` (with `announce_plan` below) for
+/// the size gate.
+fn note_activity_impl(hub: &Option<Arc<StreamHub>>, stream_owner: &str, tok: &'static str) {
+    if let Some(h) = hub {
+        h.activity.lock_ok().insert(stream_owner.to_string(), tok);
+    }
+}
+
+/// The one-line launch banner: file count, eager/total megabytes, and
+/// where the output lands. Lifted out of `get_with_progress` for the
+/// size gate (the §91 rule: the gate forces fixes into helpers).
+fn announce_plan(nzb_path: &Path, files: usize, eager: u64, total: u64, out_dir: &Path) {
+    println!(
+        "{}: {} files ({:.1} MB eager of {:.1} MB total) → {}",
+        nzb_path.display(),
+        files,
+        eager as f64 / 1e6,
+        total as f64 / 1e6,
+        out_dir.display()
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn get_with_progress(
     config: &Path,
@@ -75,14 +101,8 @@ pub(crate) async fn get_with_progress(
     let (connections, window, decoders) = clamp_concurrency(connections, window, decoders, out_dir);
 
     // Queue-row activity token, advanced at section transitions only
-    // (never per article): the daemon's queue payload reads it to say
-    // what the pipeline is doing right now. No hub (CLI) means no one
-    // is listening; a sidecar's hub is never read by the queue payload.
-    let note_activity = |tok: &'static str| {
-        if let Some(h) = &hub {
-            h.activity.lock_ok().insert(stream_owner.to_string(), tok);
-        }
-    };
+    // (never per article): see `note_activity_impl`.
+    let note_activity = |tok: &'static str| note_activity_impl(&hub, stream_owner, tok);
     // Job intake - config, NZB parse, oracle routing, the archive
     // password, the crash-resume journal: see build_intake in
     // get/plan.rs. The destructure keeps downstream reads on the
@@ -171,14 +191,12 @@ pub(crate) async fn get_with_progress(
         &hub,
         stream_owner,
     );
-    let eager_bytes = nzb.eager_bytes();
-    println!(
-        "{}: {} files ({:.1} MB eager of {:.1} MB total) → {}",
-        nzb_path.display(),
+    announce_plan(
+        nzb_path,
         slots.len(),
-        eager_bytes as f64 / 1e6,
-        nzb.total_bytes() as f64 / 1e6,
-        out_dir.display()
+        nzb.eager_bytes(),
+        nzb.total_bytes(),
+        out_dir,
     );
 
     // The buffer pools and the per-server fleet (race knobs, conntune
@@ -214,6 +232,7 @@ pub(crate) async fn get_with_progress(
         transport_failed,
         transport_sample,
         decode_error_sample,
+        disk_full_sample,
         throttle_mbps,
         throttle_t0,
         backfill,
@@ -236,6 +255,7 @@ pub(crate) async fn get_with_progress(
         &transport_failed,
         &transport_sample,
         &decode_error_sample,
+        &disk_full_sample,
         &verifier,
         &extractor,
         &shape_said,
@@ -247,6 +267,7 @@ pub(crate) async fn get_with_progress(
         &rt,
         throttle_mbps,
         throttle_t0,
+        servers.first().is_some_and(|(_, c)| c.crc_steer),
     );
 
     // Live rate ticker: see spawn_rate_ticker.
@@ -350,6 +371,7 @@ pub(crate) async fn get_with_progress(
         watchdog,
         &stalled,
         &abort_flag,
+        &disk_full_sample,
         &queue_ctl,
         &note_activity,
         net_done,

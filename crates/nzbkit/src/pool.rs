@@ -279,6 +279,18 @@ pub struct PoolConfig {
     pub connect_backoff: Duration,
     /// Consecutive connect failures before a worker gives up.
     pub max_connect_attempts: u32,
+    /// Paced dials the elected prober rides before declaring a parked
+    /// server dead (see [`CAP_PROBE_BOUNCES`], the shipped default).
+    /// Configurable for tests only: the ladder is paced off
+    /// `connect_backoff`, so a test that shrinks the backoff to keep
+    /// the suite quick is left paying 75 REAL connect attempts, and
+    /// what one of those costs is the platform's business, not ours -
+    /// a refused loopback connect is microseconds on macOS and ~2 s on
+    /// Windows, where its SYN is retried. 75 x 2 s outlasted the seal
+    /// test's whole budget and read as a pool hang on Windows alone.
+    /// Production never notices: at the default 8 s backoff the ladder
+    /// is backoff-dominated and a slow refusal is noise.
+    pub cap_probe_bounces: u32,
     /// Shared body-buffer pool; None = allocate per article.
     pub buf_pool: Option<Arc<BufPool>>,
     /// Live per-server gauges for dashboards (M14h); None = don't track.
@@ -391,16 +403,36 @@ pub struct PoolConfig {
     /// wall that ties the best competitor while dialling a refusing
     /// provider 6x less than it does.
     pub flap_cap_keepers: bool,
-    /// CRC retry-elsewhere experiment (off by default, env
-    /// NZBFAST_CRC_RETRY=1, TODO 111): validate each body's yEnc
-    /// pcrc32 (and its declared part number against the requested
-    /// segment's) IN THE POOL, and route a bad body through the
-    /// `tried_fail` steering to a DIFFERENT server exactly once before
-    /// accepting the damage. Today a corrupt article is terminal and
-    /// its whole cost rides to PAR2 repair; the same server re-serves
-    /// the same bad copy, so the only retry worth anything is
-    /// cross-server. Costs one extra decode per article while on.
-    pub crc_retry: bool,
+    /// Consumer-triggered CRC retry-elsewhere (TODO 111/114): a body
+    /// that fails its own yEnc pcrc32 - or decodes to a different part
+    /// than the segment asked for (split-brain; its CRC passes) - is
+    /// requeued to a DIFFERENT server exactly once instead of riding
+    /// to PAR2 repair. Detection is the decode consumer's EXISTING
+    /// pass, reported back through [`QueueControl::note_decoded`]: a
+    /// Done outcome defers its `complete_one` and parks its Work in
+    /// `Shared::handed` until the verdict, and a bad body is requeued
+    /// after claim, the clean refetch re-claiming through the normal
+    /// arbitration. (The first cut validation-decoded in the pool -
+    /// ~25% CPU at the loopback ceiling; the consumer seam priced at
+    /// off-parity CPU, which is why the multi-server pricing gate
+    /// could go.) Requires a consumer that actually calls
+    /// `note_decoded` for every Done it receives; the download
+    /// pipeline's decode consumers do, the other pool users (repair,
+    /// nettools, post) leave this off.
+    pub crc_steer: bool,
+    /// TODO 121.4: the consumer acks every Done id (`note_settled`, or
+    /// `note_decoded` under `crc_steer`), so the pool keeps the
+    /// article's `done_ok` liveness entry until the body is DECODED
+    /// AND WRITTEN, not merely accepted by the outcome channel. That
+    /// closes the dead-span verdict's last blind window - a body
+    /// sitting in the channel buffer or a decode worker's in-hand
+    /// batch under disk backpressure - which could outlast the
+    /// grace-plus-votes threshold and let /stream zero-fill bytes it
+    /// already had. Same contract as `crc_steer`: only turn this on
+    /// for pools whose consumer really acks every Done (the download
+    /// pipeline's decode consumers); an ack-less consumer would leak
+    /// the set and pin every span "live" forever.
+    pub arrival_ack: bool,
 }
 
 /// Live per-server gauges, updated by workers with relaxed atomics and
@@ -548,6 +580,13 @@ pub struct ServerLive {
     /// discipline as `last_blocked_note` - a provider gone slow expires
     /// budgets on every worker at once.
     pub last_timeout_note: AtomicU64,
+    /// Session-end causes; see [`SessionEnds`]. Same counters the CLI
+    /// census prints, kept live for the dashboard.
+    pub ends_peer: AtomicU64,
+    pub ends_protocol: AtomicU64,
+    pub ends_prebyte: AtomicU64,
+    pub ends_stall: AtomicU64,
+    pub ends_ours: AtomicU64,
 }
 
 /// A server's refusal to authenticate, as shown to the user.
@@ -581,6 +620,11 @@ impl LiveStats {
                     articles_tried: AtomicU64::new(0),
                     articles_missing: AtomicU64::new(0),
                     reconnects: AtomicU64::new(0),
+                    ends_peer: AtomicU64::new(0),
+                    ends_protocol: AtomicU64::new(0),
+                    ends_prebyte: AtomicU64::new(0),
+                    ends_stall: AtomicU64::new(0),
+                    ends_ours: AtomicU64::new(0),
                     blocked_ms: AtomicU64::new(0),
                     last_blocked_note: AtomicU64::new(0),
                     missing_note_at: AtomicU64::new(0),
@@ -753,6 +797,7 @@ impl Default for PoolConfig {
             adaptive_timeout: false,
             connect_backoff: Duration::from_secs(2),
             max_connect_attempts: 5,
+            cap_probe_bounces: CAP_PROBE_BOUNCES,
             buf_pool: None,
             live: None,
             live_target: None,
@@ -768,8 +813,15 @@ impl Default for PoolConfig {
             hot_spare: false,
             tail_fanout_early: false,
             flap_breaker: true,
-            flap_cap_keepers: true,
-            crc_retry: false,
+            // The env override lives HERE, not only in build_fleet, so
+            // every pool - nettools probes, post_cmd, warm-pool rigs -
+            // honors NZBFAST_FLAP_CAP_KEEPERS=0 (TODO 121.3; before
+            // this, a default-built pool ignored the knob entirely).
+            flap_cap_keepers: std::env::var("NZBFAST_FLAP_CAP_KEEPERS")
+                .ok()
+                .is_none_or(|v| v == "1"),
+            crc_steer: false,
+            arrival_ack: false,
         }
     }
 }
@@ -831,6 +883,32 @@ pub enum MissingCause {
     Retention,
 }
 
+/// The decode consumer's per-article verdict, reported back through
+/// [`QueueControl::note_decoded`] (TODO 114 consumer steer). The
+/// consumer reports only what its own decode saw; the expected part
+/// number stays in the pool (`Shared::parts`), which does the
+/// split-brain identity comparison itself.
+#[derive(Debug, Clone, Copy)]
+pub enum DecodeReport<'a> {
+    /// Decode succeeded; `part` is the body's declared yEnc part
+    /// number (None when it declared none).
+    Clean { part: Option<u32> },
+    /// yEnc decode / pcrc32 failed.
+    Bad { why: &'a str },
+}
+
+/// What [`QueueControl::note_decoded`] decided about a reported body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeAck {
+    /// The consumer owns the outcome exactly as before this seam
+    /// existed - process (or account) the body as usual.
+    Owned,
+    /// The pool took the article back and requeued it to a different
+    /// server. Drop the body silently: no write, no counters, no
+    /// slot bookkeeping - the refetched copy delivers the outcome.
+    Steered,
+}
+
 /// Terminal outcome for one article.
 #[derive(Debug)]
 pub enum FetchOutcome {
@@ -854,6 +932,50 @@ pub struct PoolStats {
     /// summary names such servers; without that, one dead backup silently
     /// turns a single 430 into "missing segments".
     pub ever_connected: bool,
+    /// WHY this server's sessions ended, counted where it happens.
+    ///
+    /// `reconnects` alone says a session died and was redialled; it does
+    /// not say who hung up. That gap cost a whole investigation on 6 Aug
+    /// 2026: a provider churning 148 sessions in one 190 GB job had six
+    /// hypotheses eliminated one at a time (fan-out, hedge, slope
+    /// recycle, connection count, provider idle timeout, the pre-byte
+    /// budget) purely by exclusion, because "session lost, redialled"
+    /// reads identically for a peer FIN, a peer reset, our own read
+    /// timeout, our own quit and a protocol desync. See
+    /// research/PROVIDER-CHURN-2026-08-06.md.
+    pub ends: SessionEnds,
+    /// Milliseconds this server's workers spent parked because the
+    /// fetch->decode channel was FULL - i.e. waiting on decode, verify
+    /// and the disk rather than on the network. The daemon has always
+    /// had this (`ServerLive::blocked_ms`); the CLI did not, so a
+    /// bench leg could not tell a NETWORK dip from a WRITE-SIDE dip -
+    /// which is exactly the question a periodic throughput sawtooth
+    /// asks (6 Aug: full rate for 8-9 s, then a drop to 8-21% of peak,
+    /// repeating, costing ~12-15% of an 87 GB job).
+    pub blocked_ms: u64,
+}
+
+/// Per-server tally of how sessions ENDED, by cause.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SessionEnds {
+    /// The peer closed or reset the connection, or the socket failed
+    /// under us: an I/O-flavoured `NntpError`. THIS is "the provider
+    /// hung up on us".
+    pub peer: u64,
+    /// A well-formed but unusable answer - the response did not parse,
+    /// or the echoed message-id did not match what we asked for.
+    pub protocol: u64,
+    /// Our own pre-first-byte budget expired: the server had not
+    /// started answering in time. Distinguished from `stall` because
+    /// giving up pre-byte is our budget CHOICE, not evidence the peer
+    /// is dead (TODO 121.1).
+    pub prebyte: u64,
+    /// Our own mid-flow deadline expired: bytes were moving and
+    /// stopped. That is a genuine wedge.
+    pub stall: u64,
+    /// We hung up deliberately - shed for promoted work, over the live
+    /// connection target, or a pipeline deeper than a mid-window cap.
+    pub ours: u64,
 }
 
 /// M11 seek re-prioritization: a live handle to a running fetch's pending
@@ -970,6 +1092,24 @@ impl QueueControl {
         n
     }
 
+    /// Responses so far that advanced an article without resolving it
+    /// (see [`Shared::deferred`]). A caller's stall watchdog must count
+    /// a change here as liveness: a refusal-only run can spend a whole
+    /// pass in the `soft_430` confirming repeat, moving neither decoded
+    /// bytes nor the outstanding count while working perfectly. `None`
+    /// once the run's pool is gone - there is nothing left to stall.
+    pub fn deferred(&self) -> Option<u64> {
+        Some(
+            self.shared
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)?
+                .deferred
+                .load(Ordering::Relaxed),
+        )
+    }
+
     /// M11 stream mode: a live /stream reader touched the hub. Workers
     /// cap their pipelines to `stream_window()` while this stays fresh
     /// (see `Shared::stream_until`), so seek promotions preempt instead
@@ -1028,6 +1168,22 @@ impl QueueControl {
         {
             let ok = sh.done_ok.lock_ok();
             if ids.iter().any(|id| ok.contains(id.as_str())) {
+                return Some(true);
+            }
+        }
+        // A bad-body steer parked in the inbox is a refetch WAITING for
+        // a worker's next top-up, not a dead article. That top-up is
+        // usually ms away, but with every worker blocked in long
+        // pipelined body reads it can be tens of seconds out - long
+        // enough for the dead-span verdict to zero-fill the very span
+        // the steer is about to rewrite.
+        {
+            let inbox = sh.steer_inbox.lock_ok();
+            if !inbox.is_empty()
+                && ids
+                    .iter()
+                    .any(|id| inbox.iter().any(|w| w.id.as_str() == id.as_str()))
+            {
                 return Some(true);
             }
         }
@@ -1202,6 +1358,152 @@ impl QueueControl {
         n
     }
 
+    /// TODO 114 consumer steer: the decode consumer's per-article
+    /// verdict for a `FetchOutcome::Done` body, called once per Done
+    /// from the decode OS thread. With `PoolConfig::crc_steer` off (or
+    /// no pool attached, or the id unknown) this is a no-op answering
+    /// [`DecodeAck::Owned`].
+    ///
+    /// In steer mode every Done deferred its `complete_one` into
+    /// `Shared::handed`; this call settles it. A clean verdict (and a
+    /// declared part that matches the requested segment's) finalizes:
+    /// the consumer owns the outcome. A bad body - failed pcrc32, or a
+    /// valid body for the WRONG article (split-brain; its own CRC
+    /// passes, identity is the only tell) - is requeued to a DIFFERENT
+    /// server once (requeue-after-claim): the id is un-claimed from
+    /// `done` and the stashed Work re-enters the queue with the
+    /// deliverer's whole group folded into `tried_fail`, so the
+    /// refetch (or a still-racing dup) re-claims through the normal
+    /// one-outcome-per-id arbitration. Eligibility is the delivery
+    /// rule the shipped gate hardened: `other_can_take` (levels +
+    /// aliveness + group + the fill-server 430 pickup gate), checked
+    /// AFTER the fold, and one steer per id ever
+    /// (`Shared::crc_retried`). Every obstacle - no elsewhere, second
+    /// bad copy, aborted/draining/finished run - finalizes as
+    /// `Owned`: the consumer processes the body exactly as if this
+    /// seam did not exist. The requeue itself goes through
+    /// `Shared::steer_inbox`, never the tokio queue lock.
+    pub fn note_decoded(&self, id: &str, report: DecodeReport) -> DecodeAck {
+        let Some(sh) = self
+            .shared
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            return DecodeAck::Owned;
+        };
+        let Some(h) = sh.handed.lock_ok().remove(id) else {
+            return DecodeAck::Owned;
+        };
+        // The consumer owns the outcome from here unless a steer
+        // completes below; own = the deferred terminal bookkeeping
+        // runs now (mirrors the legacy post-send lines).
+        let finalize = |sh: &Shared| {
+            // Under arrival_ack the consumer's `note_settled` (after
+            // decode AND write) owns the done_ok removal: a clean
+            // verdict here precedes the disk write, and dropping the
+            // liveness entry now would let a slow pwrite outlast the
+            // /stream dead-span verdict and zero-fill bytes that are
+            // about to land (TODO 121.4's promise, re-opened by the
+            // steer seam). Non-ack pools have no later settle call, so
+            // they still clear it here.
+            if !sh.arrival_ack {
+                sh.done_ok.lock_ok().remove(id);
+            }
+            sh.complete_one();
+            DecodeAck::Owned
+        };
+        let why = match report {
+            DecodeReport::Bad { why } => why,
+            DecodeReport::Clean { part } => match (sh.parts.get(id), part) {
+                (Some(&want), Some(got)) if got != want => {
+                    "valid body for the wrong article (part mismatch)"
+                }
+                _ => return finalize(&sh),
+            },
+        };
+        let dbg = std::env::var_os("NZBFAST_POOL_DEBUG").is_some();
+        if sh.aborted.load(Ordering::Acquire)
+            || sh.draining.load(Ordering::Acquire)
+            || *sh.finished.borrow()
+        {
+            if dbg {
+                eprintln!("[crc-steer] {id}: own (run over/draining)");
+            }
+            return finalize(&sh);
+        }
+        let mut w = h.work;
+        // Group siblings fold FIRST so other_can_take skips the whole
+        // backbone serving the same bad copy - and a fill server's
+        // pickup gate (the primary's 430 bit) is enforced inside, so a
+        // primary+fill pair never buys a wasted refetch.
+        w.tried_fail |= h.group_bits;
+        // A dup's bad copy skips the eligibility gate and the once-
+        // per-id budget (see the `dup_copy` doc): it requeues even
+        // with nowhere better to go, because owning it would write
+        // damage a non-dup copy may already have resolved cleanly.
+        // Bounded structurally: each server group dup-races an id at
+        // most once (`dup_servers`), and the fold above stops the
+        // pickers re-racing from this group.
+        let charged = !h.dup_copy;
+        if charged
+            && (!sh.other_can_take(&w, h.server) || !sh.crc_retried.lock_ok().insert(w.id.clone()))
+        {
+            if dbg {
+                eprintln!(
+                    "[crc-steer] {id}: own (elsewhere={} already={})",
+                    sh.other_can_take(&w, h.server),
+                    sh.crc_retried.lock_ok().contains(id)
+                );
+            }
+            return finalize(&sh);
+        }
+        // NO tokio queue lock here (see the `steer_inbox` field doc):
+        // the Work goes into the inbox, which workers drain into the
+        // queue under their own `next_work` lock hold. Inbox FIRST,
+        // un-claim after: from the moment the id leaves `done` a
+        // future claimant is already guaranteed - the drained refetch,
+        // or a dup still racing - and `claim_done` arbitrates exactly
+        // one, as ever.
+        if let Some(l) = &sh.live {
+            l.note(
+                h.server,
+                "crc-retry",
+                format!("{id}: {why} - refetching from another server"),
+            );
+        }
+        if dbg {
+            eprintln!("[crc-steer] {id}: steered (from server {})", h.server);
+        }
+        sh.steer_inbox.lock_ok().push(w);
+        sh.done.lock_ok().remove(id);
+        // The body the consumer holds is dead weight now; the article
+        // stays in any_live's sight through the inbox entry pushed
+        // above until a worker drains it into the queue.
+        sh.done_ok.lock_ok().remove(id);
+        DecodeAck::Steered
+    }
+
+    /// TODO 121.4: the consumer's "this body is decoded and written"
+    /// ack for `arrival_ack` pools. Removes the `done_ok` liveness
+    /// entry that has covered the article since its claim - through
+    /// the outcome channel's buffer and the consumer's in-hand batch -
+    /// so the /stream dead-span verdict can never condemn a span whose
+    /// bytes are anywhere in the pipe. A no-op for ids already settled
+    /// (steer verdicts, non-ack pools) and after the run ends.
+    pub fn note_settled(&self, id: &str) {
+        if let Some(sh) = self
+            .shared
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            sh.done_ok.lock_ok().remove(id);
+        }
+    }
+
     /// Force a pool-state dump (the stall watchdog, on a suspected
     /// deadlock). Same output as NZBFAST_POOL_DEBUG's idle-branch dump,
     /// but on demand - so a hang in the field self-captures the queue /
@@ -1320,6 +1622,37 @@ struct Work {
     /// on a slower server. First completion wins; a dup's own failures
     /// are silently discarded (the original still owns the outcome).
     dup: bool,
+    /// TODO 121.1: attempts of THIS article that expired before a
+    /// status byte arrived. Rides the requeue so the next attempt's
+    /// pre-byte budget escalates per [`article_prebyte_budget`] -
+    /// per-server training alone re-floors between retries.
+    prebyte_expiries: u8,
+    /// Server groups whose 430/423 arrived WITHOUT an echoed
+    /// message-id. Positional attribution can misfile such a miss (a
+    /// frontend that dropped the previous pipelined response leaves
+    /// the next bare "430 no such article" landing on the wrong front
+    /// article), so the first per group is suspect - requeued
+    /// uncharged for one confirming retry - and only a repeat from
+    /// the same group folds into `tried_430`.
+    soft_430: u32,
+}
+
+/// TODO 114 consumer steer: one delivered body awaiting the consumer's
+/// decode verdict (see `Shared::handed`). `work` is the rebuilt Work a
+/// bad verdict requeues - always `dup: false`, whatever copy won the
+/// race - and `server`/`group_bits` identify the deliverer so the
+/// steer can exclude its whole backbone.
+struct Handed {
+    work: Work,
+    server: usize,
+    group_bits: u32,
+    /// The delivered copy was a DUP dispatch that won the claim. A
+    /// dup's bad copy never owns damage and never spends the steer
+    /// budget (mirror of the pool-side gate's silent dup discard) -
+    /// it is requeued unconditionally, because the copy that should
+    /// own the outcome may already have lost the claim race inside
+    /// the verdict window.
+    dup_copy: bool,
 }
 
 /// One article currently being fetched by some worker.
@@ -1337,6 +1670,14 @@ struct Inflight {
     /// group bits) - the endgame fan-out races each backbone at most
     /// once.
     dup_servers: u32,
+    /// Servers whose transport - or, TODO 114, whose delivered BODY -
+    /// already failed this article, seeded from the Work item at
+    /// dispatch. Dup pickers skip these: racing an article back to a
+    /// server that already failed it is wasted work at best, and for
+    /// a CRC-steered refetch it is the misfire that loses the race to
+    /// the same corrupt copy the steer just rejected (the corrupt dup
+    /// claims first and the clean refetch is discarded as the loser).
+    tried_fail: u32,
     /// TTFB-suspicion (TODO 115): the owner's read sat in pre-byte
     /// silence past the suspicion bound. `pick_suspect_dup` races
     /// suspect articles immediately - same server included - instead
@@ -1351,8 +1692,25 @@ struct Inflight {
 /// much slower, idle workers re-dispatch those articles instead of
 /// waiting out the stragglers. `done` arbitrates so exactly one outcome
 /// is emitted (and `pending` decremented once) per article.
+/// Capacity-episode lifecycle (issue #16), broadcast to parked
+/// yielders: Idle = nothing to wait for, Probing = one prober is
+/// riding the bounce ladder, Reopened = a session was granted again
+/// (parked workers redial), Dead = the prober exhausted its horizon
+/// (parked workers exit so the run can reach a truthful terminal).
+/// Hard connect outages (wifi drop, VPN reconnect, router reboot)
+/// ride the SAME lifecycle via `park_or_probe`: a server that refuses
+/// the dial outright is as plausibly transient as one bouncing on a
+/// ghost capacity lease.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum CapEpisode {
+    #[default]
+    Idle,
+    Probing,
+    Reopened,
+    Dead,
+}
+
 /// One server's authentication standing, shared by all its workers.
-#[derive(Default)]
 struct AuthState {
     /// Set once when the server refuses permanently (bad credentials, a
     /// disabled account). Every worker for this server stops trying:
@@ -1368,8 +1726,37 @@ struct AuthState {
     /// sessions is the only response a simultaneous-connection cap
     /// actually accepts.
     yielded: AtomicUsize,
+    /// Exactly ONE worker holds the long capacity-probe role (issue
+    /// #16). `claim_yield` alone cannot elect a single survivor: early
+    /// yielders exit and shrink `alive` while later workers are still
+    /// claiming, so several can each read "I am the last" and all ride
+    /// the probe ladder at once - harmless when the ladder was five
+    /// bounces, a small dial storm now that it is seventy-five.
+    cap_prober: AtomicBool,
+    /// See [`CapEpisode`]. Yielders park on this instead of dying, so
+    /// a cap that clears mid-run gets its fleet back instead of one
+    /// prober crawling the rest of the job alone. The u64 is a publish
+    /// generation: the watch never returns to Idle, so without it a
+    /// LATER episode's parkers would consume the previous episode's
+    /// leftover `Reopened` on entry, skip the prober election, and a
+    /// permanent outage could never reach `Dead` (each worker bounced
+    /// off the stale value forever instead of parking).
+    episode: tokio::sync::watch::Sender<(CapEpisode, u64)>,
     /// The server's own words, kept for the log and the dashboard.
     reason: std::sync::Mutex<Option<String>>,
+}
+
+impl Default for AuthState {
+    fn default() -> Self {
+        AuthState {
+            rejected: Default::default(),
+            capacity_capped: Default::default(),
+            yielded: Default::default(),
+            cap_prober: Default::default(),
+            episode: tokio::sync::watch::channel((CapEpisode::Idle, 0)).0,
+            reason: Default::default(),
+        }
+    }
 }
 
 impl AuthState {
@@ -1415,6 +1802,12 @@ impl AuthState {
     /// fleet still stops the hammering and still asks the provider for
     /// fewer sessions, which is what a simultaneous-connection cap
     /// actually wants; a stranded server is unrecoverable for the run.
+    /// Publish an episode event under a fresh generation, so parkers
+    /// can tell it apart from a previous episode's leftover value.
+    fn publish_episode(&self, ep: CapEpisode) {
+        self.episode.send_modify(|v| *v = (ep, v.1 + 1));
+    }
+
     fn claim_yield(&self, alive: &AtomicUsize) -> bool {
         self.yielded
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |y| {
@@ -1445,6 +1838,16 @@ struct Shared {
     inflight: std::sync::Mutex<HashMap<String, Inflight>>,
     /// Per-server raw byte counters (also the caller-visible stats).
     bytes: Vec<Arc<AtomicU64>>,
+    /// Per-server session-end tally by cause, in [`SessionEnds`] field
+    /// order: peer, protocol, prebyte, stall, ours. Counted where the
+    /// session actually ends, so a redial that never wins cannot hide
+    /// the cause (the same reasoning as `note_flap`).
+    ends: Vec<[AtomicU64; 5]>,
+    /// Per-server write-side wait (see [`PoolStats::blocked_ms`]). Kept
+    /// on Shared as well as LiveStats because the CLI runs without a
+    /// live-stats sink and still needs to tell a network dip from a
+    /// disk one.
+    blocked_ms: Vec<AtomicU64>,
     /// Per-server time-to-status EWMA in ms (adaptive timeout path,
     /// TODO 96.1). 0 = unmeasured, which budgets at the clamp ceiling.
     ttfb_ms: Vec<AtomicU64>,
@@ -1461,6 +1864,29 @@ struct Shared {
     /// second bad copy is delivered as-is and PAR2 owns it, exactly as
     /// with the knob off.
     crc_retried: std::sync::Mutex<HashSet<String>>,
+    /// TODO 114 consumer steer: Done outcomes handed to the consumer
+    /// whose `complete_one` is DEFERRED until the consumer's decode
+    /// verdict arrives via [`QueueControl::note_decoded`]. The stashed
+    /// Work (plus the deliverer's identity) is what a bad-body verdict
+    /// requeues; a clean verdict just finalizes. Keeping these ids in
+    /// `pending` is what keeps the fleet alive to serve a steer even
+    /// when the damaged body was the last article on the wire. Bounded
+    /// by the outcome channel depth plus the consumers' in-hand
+    /// batches. Empty unless `PoolConfig::crc_steer` is on.
+    handed: std::sync::Mutex<HashMap<String, Handed>>,
+    /// TODO 114 consumer steer: requeued-after-claim Work waiting to
+    /// re-enter the queue. The verdict thread must NOT take the tokio
+    /// queue mutex - it is FIFO-fair and worker-hot, and during a
+    /// steer burst a bounded try_lock lost to the worker scans for
+    /// long enough to own real damage (measured: up to a third of a
+    /// storm's steers at a 200 ms budget). Workers drain this into
+    /// the queue at the top of their own `next_work` lock hold. An
+    /// item here counts as live in `any_live` (the top-up is usually
+    /// ms away, but workers all blocked in long pipelined reads can
+    /// hold it back past the dead-span verdict's grace+votes);
+    /// `seal_run` drains it so an exhausted fleet still accounts
+    /// every steered article.
+    steer_inbox: std::sync::Mutex<Vec<Work>>,
     /// Ids whose body ARRIVED and is mid-handoff to the consumer: from
     /// claim to the outcome channel accepting it, the body is out of
     /// `inflight` and out of the queue - invisible to both `any_live`
@@ -1468,12 +1894,25 @@ struct Shared {
     /// under disk backpressure (the `blocked_ms` gauge measures exactly
     /// this window). The /stream dead-span verdict must never condemn
     /// such a span (it would serve zeros for bytes that already
-    /// arrived), so `any_live` counts these as live. Entries leave when
-    /// the channel accepts the body: past that point the residual
-    /// blind window is the channel buffer + decode batch, bounded and
-    /// far shorter than the verdict's grace-plus-votes threshold.
+    /// arrived), so `any_live` counts these as live. Entries leave
+    /// when the body is SETTLED: under `crc_steer` at the consumer's
+    /// `note_decoded` verdict, under `arrival_ack` at the consumer's
+    /// `note_settled` after decode+write (TODO 121.4 - the channel
+    /// buffer and the consumer's in-hand batch were the residual
+    /// blind window, and ~6 s of disk backpressure could outlast the
+    /// verdict's grace-plus-votes threshold), and otherwise when the
+    /// channel accepts the body.
     done_ok: std::sync::Mutex<HashSet<String>>,
     start: Instant,
+    /// Monotonic count of responses that advanced an article WITHOUT
+    /// resolving it. The caller's deadlock watchdog treats a run as
+    /// wedged when decoded bytes AND outstanding articles both sit
+    /// frozen; a path that consumes a response and requeues instead of
+    /// emitting Hit/Missing/Failed moves neither, so it reads exactly
+    /// like a wedge (31 Jul's dead-post abort, returning through the
+    /// `soft_430` confirming repeat). Anything that defers a verdict
+    /// this way must tick here, and the watchdog counts it as life.
+    deferred: AtomicU64,
     /// Diagnostics: dup dispatches issued, and when the queue first ran dry
     /// with work still pending (start of the tail phase).
     dups_issued: AtomicU64,
@@ -1502,6 +1941,12 @@ struct Shared {
     cancelled: std::sync::Mutex<HashMap<String, Work>>,
     /// Tail duplicates that won their race (emitted the outcome).
     dup_wins: AtomicU64,
+    /// The consumer acks decode+write via `note_settled` (see
+    /// [`PoolConfig::arrival_ack`]), uniform like `tail_fanout`. Under
+    /// it a clean `note_decoded` verdict must NOT drop the `done_ok`
+    /// liveness entry - the body is decoded but not yet on disk, and
+    /// the write can outlast the dead-span verdict.
+    arrival_ack: bool,
     /// Opt-in tail fan-out (see [`PoolConfig::tail_fanout`] and
     /// `pick_dup`): in the endgame, idle primaries race healthy
     /// in-flight articles too. Uniform across servers - the daemon sets
@@ -1675,16 +2120,10 @@ const STREAM_LINGER: Duration = Duration::from_secs(60);
 /// the reconnect wins.
 const PROMOTE_SHED_MIN_AGE: Duration = Duration::from_millis(400);
 
-/// Adaptive timeout decomposition (TODO 96.1), all behind
-/// `PoolConfig::adaptive_timeout`. Budget clamps mirror nntppool's
-/// field-tested 2-10 s window; the stall bound is the rolling
-/// no-progress deadline once bytes flow.
-const ADAPTIVE_FIRST_BYTE_MIN: Duration = Duration::from_secs(2);
-const ADAPTIVE_FIRST_BYTE_MAX: Duration = Duration::from_secs(10);
-const ADAPTIVE_STALL: Duration = Duration::from_secs(8);
-/// Floor of the TTFB-suspicion bound (TODO 115): the least pre-byte
-/// silence that may mark an in-flight article suspect for the hedge.
-const TTFB_SUSPECT_MIN: Duration = Duration::from_secs(1);
+// Timeout/backoff arithmetic lives in `pacing` (split under the size
+// gate); the glob keeps every call site and test spelling unchanged.
+mod pacing;
+use pacing::*;
 
 /// Tail fan-out (opt-in, `PoolConfig::tail_fanout`): an idle primary only
 /// races a HEALTHY in-flight article once it has been on the wire this
@@ -1733,40 +2172,6 @@ fn stream_window() -> usize {
 /// How long a server sits out queue scans after one came up empty.
 const SCAN_RETRY_MS: u64 = 100;
 
-/// Ceiling on the session-level backoff (see [`session_backoff_delay`]).
-/// Long enough that a permanently broken account costs a provider a
-/// couple of connects a minute per worker; short enough that a provider
-/// coming back from a maintenance window is picked up again promptly.
-const SESSION_BACKOFF_MAX: Duration = Duration::from_secs(30);
-
-/// Pacing for a session that CONNECTED but then failed without doing any
-/// useful work - a provider that accepts TCP+TLS+AUTHINFO and then
-/// answers every BODY with `502 byte limit exceeded` / `400 idle timeout`,
-/// or RSTs after the first command.
-///
-/// The connect-failure backoff above never covers that shape: the connect
-/// succeeds every time, so `connect_failures` stays 0 and the failure
-/// paths reconnect instantly. One worker then runs connect → AUTH → BODY →
-/// error → reconnect several times a second, and a 50-connection pool
-/// aims that at one account until the whole queue burns through its
-/// retries. On a 250k-segment single-server job that is on the order of a
-/// million connect+AUTH attempts at full rate - the traffic shape
-/// providers ban accounts for.
-///
-/// The counter this feeds is reset by a session that did USEFUL WORK
-/// (any well-formed BODY response), not merely by one that connected: a
-/// connection that has been serving for hours and hits one transient
-/// error is back at step one, while a session that can only ever fail
-/// keeps climbing. Backing off is per-worker sleep, so a bad server's
-/// workers pace themselves without holding anything the rest of the pool
-/// needs - queued work was already released by `requeue_or_fail`.
-fn session_backoff_delay(cfg: &PoolConfig, failures: u32) -> Duration {
-    let step = failures.clamp(1, 16) - 1;
-    // A zero/absurd configured base would defeat the whole point.
-    let base = cfg.connect_backoff.max(Duration::from_millis(50));
-    base.saturating_mul(1u32 << step).min(SESSION_BACKOFF_MAX)
-}
-
 /// Consecutive useless sessions - connected, then failed without one
 /// well-formed BODY response - before a worker bows out of this server
 /// for good. The session-level twin of `max_connect_attempts`.
@@ -1793,6 +2198,15 @@ fn session_backoff_delay(cfg: &PoolConfig, failures: u32) -> Duration {
 /// back. Twelve leaves room for three such ladders and still bows out
 /// after ~4 minutes of default pacing.
 const MAX_SESSION_ATTEMPTS: u32 = 12;
+
+/// How many consecutive capacity bounces the LAST prober rides before
+/// bowing out (issue #16). Its ladder caps at 2^2 x connect_backoff
+/// (~8 s) - a ghost lease can expire at any moment and a 32 s nap
+/// past the reopening is wall time a user watches at 0 MB/s - so 75
+/// bounces is roughly ten minutes of probing at one paced dial per
+/// 8 s, enough for any realistic ghost-session lease and cheap
+/// against an account that is genuinely full for good.
+const CAP_PROBE_BOUNCES: u32 = 75;
 
 /// M2c.4: at or below this many non-terminal articles the pool is in
 /// its ENDGAME - remaining 430-laddering articles are raced across all
@@ -1883,66 +2297,6 @@ fn note_server_dark(shared: &Shared, idx: usize, prev: usize) {
         _ => "out of the run - its connections kept failing; the other servers carry on",
     };
     live.note(idx, "retired", detail);
-}
-
-/// The pre-byte budget an EWMA of `ewma_ms` earns: 4x it, clamped to
-/// [2 s, 10 s], with 0 ("unmeasured") budgeting at the ceiling.
-///
-/// Free function rather than a method so the escalation ladder in
-/// [`Shared::note_ttfb_timeout`] can be walked in a unit test without
-/// standing up a pool and a server.
-fn ttfb_budget_ms(ewma_ms: u64) -> u64 {
-    if ewma_ms == 0 {
-        return adaptive_first_byte_max_ms();
-    }
-    (4 * ewma_ms).clamp(
-        ADAPTIVE_FIRST_BYTE_MIN.as_millis() as u64,
-        adaptive_first_byte_max_ms(),
-    )
-}
-
-/// The adaptive pre-byte ceiling: 10 s, LIFTED (never lowered) by an
-/// explicitly-set `NZBFAST_READ_TIMEOUT_SECS` - the documented
-/// accommodation for slow cold-storage lookups (12-25 s first byte)
-/// must not become a no-op under the adaptive clamp. Lift-only: the
-/// chaos suite sets the env LOW (that means the flat path only).
-fn adaptive_first_byte_max_ms() -> u64 {
-    static M: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *M.get_or_init(|| {
-        let base = ADAPTIVE_FIRST_BYTE_MAX.as_millis() as u64;
-        std::env::var("NZBFAST_READ_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map_or(base, |s| s.saturating_mul(1000).max(base))
-    })
-}
-
-/// TTFB-suspicion bound (TODO 115): pre-byte silence past this makes an
-/// article a hedge candidate. 2x the server's TTFB EWMA, floored at 1 s -
-/// half the adaptive budget's own floor, so on a healthy-history server
-/// suspicion always fires with a full second of budget left to win in.
-/// A server whose honest TTFB is near the second (high-RTT satellite)
-/// pushes the bound out with the EWMA instead of hedging every article.
-/// 0 ("unmeasured") keeps the floor: no history means no reason to wait.
-fn ttfb_suspect_ms(ewma_ms: u64) -> u64 {
-    (2 * ewma_ms).max(TTFB_SUSPECT_MIN.as_millis() as u64)
-}
-
-/// The EWMA a pre-byte timeout leaves behind, given the current one.
-///
-/// See [`Shared::note_ttfb_timeout`] for why this escalates from the
-/// budget that expired rather than from `ewma_ms` itself.
-fn escalated_ttfb_ms(ewma_ms: u64) -> u64 {
-    // The env-lifted ceiling, so the escalation ladder can actually
-    // reach a raised NZBFAST_READ_TIMEOUT_SECS instead of stalling at
-    // the default's quarter.
-    let ceiling = adaptive_first_byte_max_ms() / 4;
-    // The expired budget in EWMA terms - it is 4x the EWMA by
-    // construction, so dividing back out gives the value that WOULD
-    // have produced it had the clamp not intervened. From unmeasured
-    // that is the ceiling already: there is nothing to double.
-    let implied = ttfb_budget_ms(ewma_ms) / 4;
-    (ewma_ms.max(implied) * 2).clamp(1, ceiling)
 }
 
 impl Shared {
@@ -2087,6 +2441,8 @@ impl Shared {
                     tried_430: seed,
                     tried_fail: 0,
                     dup: false,
+                    prebyte_expiries: 0,
+                    soft_430: 0,
                 });
             }
         }
@@ -2106,11 +2462,18 @@ impl Shared {
                 .map(|_| Arc::new(AtomicU64::new(0)))
                 .collect(),
             ttfb_ms: (0..n_servers).map(|_| AtomicU64::new(0)).collect(),
+            ends: (0..n_servers)
+                .map(|_| std::array::from_fn(|_| AtomicU64::new(0)))
+                .collect(),
+            blocked_ms: (0..n_servers).map(|_| AtomicU64::new(0)).collect(),
             ages,
             parts,
             crc_retried: std::sync::Mutex::new(HashSet::new()),
+            handed: std::sync::Mutex::new(HashMap::new()),
+            steer_inbox: std::sync::Mutex::new(Vec::new()),
             done_ok: std::sync::Mutex::new(HashSet::new()),
             start: Instant::now(),
+            deferred: AtomicU64::new(0),
             dups_issued: AtomicU64::new(0),
             tail_started: std::sync::Mutex::new(None),
             finished: tokio::sync::watch::Sender::new(false),
@@ -2119,6 +2482,7 @@ impl Shared {
             drained_at: std::sync::Mutex::new(None),
             cancelled: std::sync::Mutex::new(HashMap::new()),
             dup_wins: AtomicU64::new(0),
+            arrival_ack: servers.iter().any(|(_, c)| c.arrival_ack),
             tail_fanout: servers.iter().any(|(_, c)| c.tail_fanout),
             tail_fanout_early: servers.iter().any(|(_, c)| c.tail_fanout_early),
             hedge: servers.iter().any(|(_, c)| c.hedge),
@@ -2313,6 +2677,48 @@ impl Shared {
     /// [`Self::rate`] divided by the server's live workers: what one of
     /// its connections is actually managing, which is the comparable
     /// quantity across servers with different connection counts.
+    /// Record WHY a session ended. `slot` indexes [`SessionEnds`] in
+    /// field order (0 peer, 1 protocol, 2 prebyte, 3 stall, 4 ours).
+    /// Snapshot this server's session-end tally for [`PoolStats`].
+    fn session_ends(&self, server: usize) -> SessionEnds {
+        let Some(row) = self.ends.get(server) else {
+            return SessionEnds::default();
+        };
+        let g = |i: usize| row[i].load(Ordering::Relaxed);
+        SessionEnds {
+            peer: g(0),
+            protocol: g(1),
+            prebyte: g(2),
+            stall: g(3),
+            ours: g(4),
+        }
+    }
+
+    /// Count a session end by cause - slots 0 peer, 1 protocol, 2
+    /// prebyte, 3 stall, 4 ours - in BOTH the CLI tally (`ends`) and
+    /// the dashboard's live per-server counters, from the one call so
+    /// the two can never diverge (ends_ours used to be initialized and
+    /// never incremented because the live bump was pasted per site).
+    fn note_session_end(&self, server: usize, slot: usize) {
+        if let Some(row) = self.ends.get(server)
+            && let Some(c) = row.get(slot)
+        {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(l) = &self.live
+            && let Some(sl) = l.servers.get(server)
+        {
+            let c = match slot {
+                0 => &sl.ends_peer,
+                1 => &sl.ends_protocol,
+                2 => &sl.ends_prebyte,
+                3 => &sl.ends_stall,
+                _ => &sl.ends_ours,
+            };
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn rate_per_worker(&self, server: usize) -> f64 {
         let alive = self.alive[server].load(Ordering::Relaxed).max(1) as f64;
         self.rate(server) / alive
@@ -2445,6 +2851,60 @@ impl Shared {
         self.done.lock_ok().insert(id.to_string())
     }
 
+    /// TODO 114 consumer steer: park a claimed, about-to-be-delivered
+    /// body's Work in `handed` so [`QueueControl::note_decoded`] can
+    /// requeue it after claim (see the field doc). Always `dup: false`
+    /// - whichever copy won the race, a steer requeues an original;
+    /// `dup_copy` remembers which kind won so a dup's bad copy can be
+    /// discarded rather than owned.
+    fn stash_handed(&self, w: &Work, ctx: ServerCtx) {
+        self.handed.lock_ok().insert(
+            w.id.clone(),
+            Handed {
+                work: Work {
+                    id: w.id.clone(),
+                    attempts: w.attempts,
+                    promoted: w.promoted,
+                    tried_430: w.tried_430,
+                    tried_fail: w.tried_fail,
+                    dup: false,
+                    prebyte_expiries: w.prebyte_expiries,
+                    soft_430: w.soft_430,
+                },
+                server: ctx.idx,
+                group_bits: ctx.group_bits,
+                dup_copy: w.dup,
+            },
+        );
+    }
+
+    /// Post-handoff terminal bookkeeping for a Done delivery. Legacy
+    /// (no consumer verdicts): the channel owns the body now, and a
+    /// lingering `done_ok` entry would keep ±slack neighbors "live"
+    /// forever - clear it and complete. Steer mode: a DELIVERED body
+    /// keeps both its `done_ok` and `handed` entries until the
+    /// consumer's `note_decoded` verdict; an undelivered one (channel
+    /// closed - the consumer is gone) can never be acked, so it
+    /// finalizes here.
+    fn settle_handoff(&self, steer: bool, ack: bool, delivered: bool, arrived: &str) {
+        if steer && delivered {
+            return;
+        }
+        if steer {
+            self.handed.lock_ok().remove(arrived);
+        }
+        // TODO 121.4: an acking consumer owns the done_ok removal
+        // (note_settled after decode+write), so the entry keeps the
+        // article "live" through the channel buffer and the consumer's
+        // in-hand batch - the two windows a handoff-side removal left
+        // dark. An undelivered body (channel closed) has no consumer
+        // left to ack it and settles here as before.
+        if !(ack && delivered) {
+            self.done_ok.lock_ok().remove(arrived);
+        }
+        self.complete_one();
+    }
+
     fn register_inflight(&self, w: &Work, server: usize) {
         if w.dup {
             return; // dups are tracked via the original's entry
@@ -2457,6 +2917,7 @@ impl Shared {
                 dups: 0,
                 tried_430: w.tried_430,
                 dup_servers: 0,
+                tried_fail: w.tried_fail,
                 suspect: false,
             },
         );
@@ -2642,7 +3103,11 @@ impl Shared {
         // straggler, not the same one.
         let mut fan: Option<(&String, u8, Instant)> = None;
         for (id, inf) in inflight.iter() {
-            if inf.tried_430 & my_bit != 0 || inf.dup_servers & my_bit != 0 || done.contains(id) {
+            if inf.tried_430 & my_bit != 0
+                || inf.dup_servers & my_bit != 0
+                || inf.tried_fail & my_bit != 0
+                || done.contains(id)
+            {
                 continue;
             }
             if endgame && inf.tried_430 != 0 {
@@ -2666,10 +3131,22 @@ impl Shared {
             // An article younger than the age floor falls through to the
             // normal rules instead, so switching this on never REMOVES a
             // dup the rate rule would have issued.
+            //
+            // Refetch legs are exempt (`tried_fail != 0`): a CRC-steer
+            // (or plain failure) requeue is already a recovery fetch on
+            // a deliberately chosen server, and the same-server
+            // allowance made the recovering twin race ITS OWN steered
+            // refetches - on a damage leg that dup-storms up to one
+            // lost race per steered article (measured 33-43 dups, 0
+            // won, +15-18% raw transfer on the corrupt/splitbrain/
+            // corruptstorm matrix legs). Such an article still falls
+            // through to the slow-owner/stale rules, which a third
+            // server may legitimately win with.
             if self.tail_fanout
                 && endgame
                 && level == 0
                 && window_used == 0
+                && inf.tried_fail == 0
                 && inf.dispatched.elapsed() >= TAIL_FANOUT_MIN_AGE
             {
                 if fan.is_none_or(|(_, d, t)| (inf.dups, inf.dispatched) < (d, t)) {
@@ -2710,10 +3187,24 @@ impl Shared {
         if let Some((_, _, _, true)) = best {
             self.hedges_issued.fetch_add(1, Ordering::Relaxed);
         }
+        let rule = match best {
+            Some((_, _, p, false)) if p > 0 => "ladder",
+            Some((_, _, _, true)) => "stale",
+            Some(_) => "slow-owner",
+            None => "fanout",
+        };
         let id = best
             .map(|(id, _, _, _)| id.clone())
             .or_else(|| fan.map(|(id, _, _)| id.clone()))?;
         let inf = inflight.get_mut(&id).unwrap();
+        if std::env::var_os("NZBFAST_POOL_DEBUG").is_some() {
+            eprintln!(
+                "[pick-dup] {id}: rule={rule} me={me} owner={} owner_fail={:#b} age={:?}",
+                inf.server,
+                inf.tried_fail,
+                inf.dispatched.elapsed()
+            );
+        }
         inf.dups += 1;
         inf.dup_servers |= group_bits;
         self.dups_issued.fetch_add(1, Ordering::Relaxed);
@@ -2725,6 +3216,8 @@ impl Shared {
             tried_430: 0,
             tried_fail: 0,
             dup: true,
+            prebyte_expiries: 0,
+            soft_430: 0,
         })
     }
 
@@ -2789,6 +3282,7 @@ impl Shared {
                     && inf.dups == 0
                     && inf.tried_430 & my_bit == 0
                     && inf.dup_servers & my_bit == 0
+                    && inf.tried_fail & my_bit == 0
                     && !done.contains(*id)
             })
             .min_by_key(|(_, inf)| inf.dispatched)
@@ -2815,6 +3309,8 @@ impl Shared {
             tried_430: 0,
             tried_fail: 0,
             dup: true,
+            prebyte_expiries: 0,
+            soft_430: 0,
         })
     }
 }
@@ -2942,6 +3438,11 @@ pub async fn fetch_all_multi_ctl(
             connects: c.load(Ordering::Relaxed),
             reconnects: r.load(Ordering::Relaxed),
             ever_connected: shared.connected[si].load(Ordering::Relaxed),
+            ends: shared.session_ends(si),
+            blocked_ms: shared
+                .blocked_ms
+                .get(si)
+                .map_or(0, |c| c.load(Ordering::Relaxed)),
         })
         .collect()
 }
@@ -3030,12 +3531,16 @@ async fn join_fleet(
     seal_run(shared, &out, reason).await;
     let left = shared.pending.load(Ordering::Acquire);
     if left > 0
+        && shared.workers_live.load(Ordering::Acquire) == 0
         && !shared.aborted.load(Ordering::Acquire)
         && !shared.draining.load(Ordering::Acquire)
     {
         // Neither the queue nor the inflight map named these, so the pool
         // cannot report them itself. Loud, because it means an article
-        // went missing from this module's own bookkeeping.
+        // went missing from this module's own bookkeeping. Gated on being
+        // the run-wide last owner (workers_live == 0, the same condition
+        // seal_run uses): on the sharded path an early shard joins its
+        // fleet while other shards still legitimately own pending work.
         error!(
             target: "pool",
             "BUG: fleet joined with {left} article(s) non-terminal and unaccounted \
@@ -3168,6 +3673,22 @@ async fn next_work(
     let mut left_for_faster: Vec<Work> = Vec::new();
     {
         let mut q = shared.queue.lock().await;
+        // TODO 114 consumer steer: adopt any steered requeues parked
+        // in the inbox (the verdict thread never takes this lock -
+        // see the `steer_inbox` field doc). Promoted articles keep
+        // the promoted-front rule the 430 requeue uses.
+        {
+            let mut inbox = shared.steer_inbox.lock_ok();
+            for w in inbox.drain(..) {
+                if w.promoted {
+                    let at = q.iter().take_while(|x| x.promoted).count().min(q.len());
+                    shared.promoted_pending.fetch_add(1, Ordering::AcqRel);
+                    q.insert(at, w);
+                } else {
+                    q.push_back(w);
+                }
+            }
+        }
         for _ in 0..q.len() {
             let Some(w) = q.pop_front() else { break };
             if w.tried_430 & live == live {
@@ -3392,6 +3913,11 @@ pub fn fetch_all_sharded(
             connects: c.load(Ordering::Relaxed),
             reconnects: r.load(Ordering::Relaxed),
             ever_connected: shared.connected[si].load(Ordering::Relaxed),
+            ends: shared.session_ends(si),
+            blocked_ms: shared
+                .blocked_ms
+                .get(si)
+                .map_or(0, |c| c.load(Ordering::Relaxed)),
         })
         .collect()
 }
@@ -3416,6 +3942,7 @@ fn seal_run_blocking(
         q.drain(..).map(|w| w.id).collect()
     };
     orphans.extend(shared.inflight.lock_ok().drain().map(|(id, _)| id));
+    orphans.extend(shared.steer_inbox.lock_ok().drain(..).map(|w| w.id));
     let mut sealed = 0;
     for id in orphans {
         if !shared.claim_done(&id) {
@@ -3448,14 +3975,21 @@ async fn park_or_quit(cfg: &PoolConfig, server: &ServerConfig, conn: Connection)
 #[allow(clippy::too_many_arguments)]
 /// Hot-spare filler: keeps ONE authenticated connection parked for its
 /// server until the run ends, re-dialling whenever a worker claims it.
-/// Ends with the run (`finished`) or on user abort, quitting whatever
-/// it still holds. Connect failures back off 5 s - a provider at its
+/// Ends with the run (`finished`), on user abort, or on graceful drain -
+/// `drain()` deliberately sends no `finished`, so the filler must watch
+/// the flag itself or a paused job leaves it looping forever with an
+/// authenticated provider session (Codex 5 Aug M4). The 500 ms tick
+/// below bounds how late it notices. Quits whatever it still holds on
+/// every exit path. Connect failures back off 5 s - a provider at its
 /// connection cap refuses the spare and that refusal must not become a
 /// dial storm against the very cap the workers depend on.
 async fn spare_filler(shared: Arc<Shared>, server: ServerConfig, idx: usize) {
     let mut finished = shared.finished.subscribe();
     loop {
-        if *finished.borrow() || shared.aborted.load(Ordering::Acquire) {
+        if *finished.borrow()
+            || shared.aborted.load(Ordering::Acquire)
+            || shared.draining.load(Ordering::Acquire)
+        {
             break;
         }
         let empty = shared.spares[idx].lock_ok().is_none();
@@ -3483,102 +4017,6 @@ async fn spare_filler(shared: Arc<Shared>, server: ServerConfig, idx: usize) {
     if let Some(c) = leftover {
         c.quit().await;
     }
-}
-
-/// CRC-retry experiment (see [`PoolConfig::crc_retry`]): why a
-/// delivered body must not be accepted as this article, or None when
-/// it passes. Validation-decodes into the caller's scratch (the
-/// decoder clears it); `expect_part` is the requested segment's part
-/// number when the caller declared one. The two reject reasons are
-/// deliberately distinct: a flipped byte fails its own pcrc32, while a
-/// split-brain server's swapped body is a perfectly valid article
-/// whose pcrc32 PASSES - only its declared identity gives it away.
-fn crc_reject(raw: &[u8], expect_part: Option<u32>, scratch: &mut Vec<u8>) -> Option<&'static str> {
-    match crate::yenc_simd::decode_into_integrity(raw, scratch, true) {
-        Err(_) => Some("yEnc decode/CRC failed"),
-        Ok((meta, _)) => match (expect_part, meta.part) {
-            (Some(want), Some(got)) if got != want => {
-                Some("valid body for the wrong article (part mismatch)")
-            }
-            _ => None,
-        },
-    }
-}
-
-/// What the CRC-retry gate decided about a delivered body.
-enum CrcVerdict {
-    /// Body accepted (clean, second bad copy, or nowhere else to go) -
-    /// proceed to the normal Done path with the Work item back.
-    Accept(Work),
-    /// The gate consumed the item (steered it to another server, or
-    /// discarded a dup's bad copy) - return the buffer and move on.
-    Handled,
-}
-
-/// CRC retry-elsewhere (TODO 111, dark behind NZBFAST_CRC_RETRY=1): a
-/// body that fails its own yEnc CRC - or decodes to a different part
-/// than the segment asked for - is damage that would otherwise ride
-/// all the way to PAR2 repair. The same server re-serves the same bad
-/// copy, so steer the article to a DIFFERENT server via `tried_fail`,
-/// exactly once (bounded by `Shared::crc_retried`). No outcome is
-/// claimed on a steered copy, so the consumer still sees exactly one
-/// outcome per id and the verify/repair accounting (slot.errors is
-/// one counter) never double-counts; a second bad copy, or no other
-/// live server, is delivered as-is, exactly like the knob being off.
-async fn crc_gate(
-    cfg: &PoolConfig,
-    shared: &Shared,
-    ctx: ServerCtx,
-    w: Work,
-    buf: &[u8],
-    scratch: &mut Vec<u8>,
-) -> CrcVerdict {
-    let Some(why) = crc_reject(buf, shared.parts.get(&w.id).copied(), scratch) else {
-        return CrcVerdict::Accept(w);
-    };
-    if w.dup {
-        // A dup's bad copy is silently discarded like any other dup
-        // failure - the original still owns the outcome.
-        return CrcVerdict::Handled;
-    }
-    // "Elsewhere" must mean a server that can actually PICK UP the
-    // steered work, not merely one that is alive: the requeue below
-    // marks tried_fail, and a fill server's pickup gate demands the
-    // primary's 430 bit (required_mask) - which a CRC steer never
-    // sets. A bare live-mask test here steered primary+fill configs
-    // into a queue only the same primary could re-pick: one wasted
-    // refetch of the same corrupt copy, then Accept anyway. Group
-    // siblings are folded into tried_fail FIRST so other_can_take
-    // skips the same-backbone copies too.
-    let mut w = w;
-    w.tried_fail |= ctx.group_bits;
-    if !shared.other_can_take(&w, ctx.idx) || !shared.crc_retried.lock_ok().insert(w.id.clone()) {
-        return CrcVerdict::Accept(w);
-    }
-    if let Some(l) = &cfg.live {
-        l.note(
-            ctx.idx,
-            "crc-retry",
-            format!("{}: {why} - refetching from another server", w.id),
-        );
-    }
-    // Plain deregister: a steered copy is not a completion, so it must
-    // not train the article-time EWMA the hedge reads.
-    shared.deregister_inflight(&w);
-    if w.promoted {
-        // Same rule as the 430 requeue: a promoted (playhead) article
-        // goes back at the promoted FRONT with its counter restored -
-        // push_back parked it behind gigabytes of tail (player stall)
-        // and left promoted_pending under-counted (it was decremented
-        // at pop and would be decremented AGAIN at re-pick).
-        let mut q = shared.queue.lock().await;
-        let at = q.iter().take_while(|x| x.promoted).count().min(q.len());
-        shared.promoted_pending.fetch_add(1, Ordering::AcqRel);
-        q.insert(at, w);
-    } else {
-        shared.queue.lock().await.push_back(w);
-    }
-    CrcVerdict::Handled
 }
 
 async fn worker(
@@ -3670,7 +4108,1130 @@ async fn worker(
     }
 }
 
+/// One dial attempt: the `None` arm of `session_loop`'s warm-claim
+/// match, moved verbatim (TODO 113). Owns the connect, the AUTHINFO
+/// refusal taxonomy (permanent vs capacity, §15e / TODO 115) and the
+/// connect backoff ladder; the counters live in `session_loop` and
+/// cross as `&mut` so the ladder state survives across sessions.
+enum DialStep {
+    /// A connected, validated session - proceed to the pipeline.
+    Conn(Connection),
+    /// Transient refusal or dial error, backoff already served - go
+    /// around for another session.
+    Retry,
+    /// This worker is done (auth settled, attempts exhausted, or the
+    /// run ended while we waited).
+    Quit,
+}
+
 #[allow(clippy::too_many_arguments)]
+async fn dial_session(
+    server: &ServerConfig,
+    cfg: &PoolConfig,
+    ctx: ServerCtx,
+    shared: &Arc<Shared>,
+    connects: &Arc<AtomicU64>,
+    reconnects: &Arc<AtomicU64>,
+    finished: &mut tokio::sync::watch::Receiver<bool>,
+    connect_failures: &mut u32,
+    cap_bounces: &mut u32,
+    ever_connected: &mut bool,
+    am_keeper: bool,
+) -> DialStep {
+    // Settled already: this server has told us the account is
+    // no good. Workers that reach here later must not re-ask -
+    // that is the storm this exists to stop, and it is also
+    // how a wrong password used to cost every worker its full
+    // backoff ladder before anyone bowed out.
+    if shared.auth[ctx.idx].is_rejected() {
+        return DialStep::Quit;
+    }
+    if let Some(w) = &cfg.warm {
+        w.miss();
+    }
+    // §35: the dial is the one blocking call in this loop that
+    // never watched the run. The session backoff above selects
+    // on `finished`, `backoff_or_finish` slices its sleep - but
+    // `connect` ran to its own CONNECT_TIMEOUT (20 s) whatever
+    // had happened to the job meanwhile, so a worker inside a
+    // dial when the last article went terminal kept the WHOLE
+    // run alive until `join_fleet` gave up on it after
+    // EXIT_GRACE.
+    //
+    // That cost a flat 5.0 s and it needed no dead server: 40
+    // of 40 farm runs paid it, the healthy six-server config
+    // included, because a provider bouncing a redundant
+    // connection off its simultaneous-IP cap (`502 max number
+    // of simultaneous IP addresses reached`) leaves a worker
+    // redialling exactly like an unreachable one. A 0.35 GB
+    // job whose bytes were all in at 0.65 s returned at 5.65 s.
+    // Racing the dial: same job, same box, 0.74 s.
+    let dialed = tokio::select! {
+        r = Connection::connect(server) => r,
+        _ = run_over(finished, shared) => return DialStep::Quit,
+    };
+    match dialed {
+        Ok((c, _)) => {
+            connects.fetch_add(1, Ordering::Relaxed);
+            if *ever_connected {
+                reconnects.fetch_add(1, Ordering::Relaxed);
+                // The daemon's copy. `reconnects` above is
+                // the run total and only the CLI prints it;
+                // this is per-server, live, and timestamped,
+                // so a dip can be laid against it.
+                if let Some(live) = &cfg.live {
+                    if let Some(sl) = live.servers.get(ctx.idx) {
+                        sl.reconnects.fetch_add(1, Ordering::Relaxed);
+                    }
+                    live.note(ctx.idx, "reconnect", "session lost, redialled");
+                }
+            }
+            *ever_connected = true;
+            shared.connected[ctx.idx].store(true, Ordering::Relaxed);
+            *connect_failures = 0;
+            *cap_bounces = 0;
+            // The capacity episode (if any) is over: free the probe
+            // role for a future episode and wake the parked yielders -
+            // a session was just GRANTED, so the cap has room again
+            // and the fleet should ease back in (issue #16's second
+            // half: recovering to one connection is not recovering).
+            if shared.auth[ctx.idx]
+                .cap_prober
+                .swap(false, Ordering::AcqRel)
+            {
+                shared.auth[ctx.idx].publish_episode(CapEpisode::Reopened);
+            }
+            DialStep::Conn(c)
+        }
+        // §15e: an AUTHINFO refusal is the server's answer to this
+        // ACCOUNT, so it is settled once for every worker rather than
+        // rediscovered by each of them. The two kinds want opposite
+        // responses, and conflating them is what made a Giganews cap
+        // so expensive.
+        Err(crate::nntp::NntpError::AuthFailed { kind, line }) => {
+            let first = shared.auth[ctx.idx].note(kind, &line);
+            // Out to the dashboard, so the user is told which server
+            // stopped pulling its weight and in whose words.
+            if let Some(live) = &cfg.live
+                && let Some(sl) = live.servers.get(ctx.idx)
+            {
+                *sl.refusal.lock_ok() = Some(Refusal {
+                    permanent: kind == crate::nntp::AuthRefusal::Permanent,
+                    line: line.clone(),
+                });
+            }
+            match kind {
+                crate::nntp::AuthRefusal::Permanent => {
+                    // Retrying cannot fix a credential. Say it once,
+                    // per SERVER, and take every worker off it.
+                    if first {
+                        warn!(
+                            target: "pool",
+                            "{}: authentication rejected, not retrying: {line}",
+                            server.host
+                        );
+                        // A 502 is what a server says for a bad
+                        // password AND, on several providers, for
+                        // "too many addresses on this account" -
+                        // same code, opposite remedies. We must not
+                        // reclassify it (a genuinely wrong password
+                        // has to stay permanent, or every worker
+                        // would retry it forever), but a user
+                        // staring at "authentication rejected" on an
+                        // account they know is fine deserves the
+                        // other possibility spelled out. Especially
+                        // on a multi-WAN link, where this host
+                        // presents several public addresses and can
+                        // exhaust a 2-address allowance by itself.
+                        if server.source_ips_are_tight() {
+                            warn!(
+                                target: "pool",
+                                "{}: this account limits how many addresses \
+                            may connect at once, and that is refused with the \
+                            same code as a bad password. If the credentials \
+                            are known good, something else is using the \
+                            account. Two shapes to check: another machine on \
+                            the same account, or THIS one leaving by more \
+                            than one public address. The second is the one \
+                            that surprises people - a router balancing \
+                            several WAN links makes one host look like \
+                            several, and it cannot be fixed from here, \
+                            because `bind_ip` picks a LOCAL address and the \
+                            balancing happens after the packets leave. That \
+                            needs a policy route on the router pinning this \
+                            traffic to one WAN; bind_ip only helps when this \
+                            machine itself is multi-homed.",
+                                server.host
+                            );
+                        }
+                    }
+                    DialStep::Quit
+                }
+                crate::nntp::AuthRefusal::Capacity => {
+                    // TODO 115: price the refusal in sessions we hold
+                    // right now - that count IS the observed accept
+                    // cap, and it is what widens the flap clamp past
+                    // one keeper.
+                    shared.note_cap_bounce(ctx.idx);
+                    // The account is fine; the server will not give us
+                    // ANOTHER session. Retrying at the same connection
+                    // count re-provokes exactly the limit being hit, so
+                    // this worker permanently yields its slot and the
+                    // survivors carry the job at a count the provider
+                    // will actually accept.
+                    if first {
+                        warn!(
+                            target: "pool",
+                            "{}: at its connection/IP cap, reducing connections: {line}",
+                            server.host
+                        );
+                        // TODO 110: a DECLARED address allowance means
+                        // the bounce is probably not about this fleet's
+                        // size - an address cap counts machines, and
+                        // this host is one however many sockets it
+                        // opens. Name the number so the operator reads
+                        // "the account is in use elsewhere" instead of
+                        // rediscovering the cap from the bounce.
+                        if let Some(n) = server.max_source_ips.filter(|&n| n > 0)
+                            && server.source_ips_are_tight()
+                        {
+                            warn!(
+                                target: "pool",
+                                "{}: this account is declared to allow {n} source \
+                                 address(es) at once; if nothing else is using it, \
+                                 check whether this host reaches the provider over \
+                                 more than one public address (multi-WAN)",
+                                server.host
+                            );
+                        }
+                    }
+                    // The ring gets EVERY bounce, not just the
+                    // first. `if first` is right for the log -
+                    // a flapping provider would drown it - but
+                    // it is why a run that hit the cap at 16 s
+                    // and again fifteen minutes later looked
+                    // like it hit it once. The ring is capped,
+                    // so it can absorb what the log must not.
+                    if let Some(live) = &cfg.live {
+                        live.note(ctx.idx, "cap", line.clone());
+                    }
+                    // TODO 115: a flap KEEPER never yields to a
+                    // capacity bounce and never walks toward
+                    // connect exhaustion on one - it holds one of
+                    // the min(observed cap, budget) slots the
+                    // provider does serve, and a bounce only means
+                    // the cap is momentarily full (a sibling
+                    // keeper mid-redial, or ghosts of sessions
+                    // the server has not reaped). Paced retry,
+                    // never a tight loop: each bounce waits the
+                    // exponential connect backoff before the next
+                    // dial, and the normal redial trigger stays
+                    // "my own session died". Gated on the env
+                    // knob so the shipped path is unchanged.
+                    if cfg.flap_cap_keepers && am_keeper {
+                        // Own counter: via connect_failures a
+                        // few bounces + ONE dial error retired
+                        // the keeper - the exhaustion promised
+                        // above never to happen on a bounce.
+                        *cap_bounces = cap_bounces.saturating_add(1).min(5);
+                        if !backoff_or_finish(
+                            cfg.connect_backoff * 2u32.pow(*cap_bounces - 1),
+                            finished,
+                            shared,
+                        )
+                        .await
+                        {
+                            return DialStep::Quit;
+                        }
+                        return DialStep::Retry;
+                    }
+                    // Keep at least one worker trying, or a cap that
+                    // clears later would leave the server unused for
+                    // the rest of the run.
+                    park_or_probe(cfg, ctx, shared, finished, cap_bounces, connect_failures).await
+                }
+            }
+        }
+        Err(e) => {
+            *connect_failures += 1;
+            // Say WHY, once per worker per run. This was a bare
+            // `Err(_)` and the silence was expensive: a server that
+            // cannot authenticate, cannot resolve, or is refusing
+            // the TLS handshake looks EXACTLY like a server whose
+            // articles are all missing - every article ends up
+            // Failed/Missing with no hint which of the two it was.
+            // First failure only, so a flapping provider cannot
+            // flood the log, and the message names the fix.
+            if *connect_failures == 1 {
+                warn!(target: "pool", "{}: connect failed: {e}", server.host);
+            }
+            if *connect_failures >= cfg.max_connect_attempts {
+                // Outage keeper: this used to be a permanent bow-out,
+                // which turned any transient TOTAL outage (wifi drop,
+                // VPN reconnect, router reboot) into a failed or
+                // stranded job inside ~15-30 s - the exact class the
+                // ghost-capacity fix (issue #16) already survives on
+                // the refusal path. A hard connect failure is just as
+                // transient, so it takes the same machinery: one
+                // elected prober per server rides the paced ladder,
+                // the rest park and rejoin on the first successful
+                // connect, and the ~10 min horizon still guarantees a
+                // truthful terminal for a server that is dead for good.
+                return park_or_probe(cfg, ctx, shared, finished, cap_bounces, connect_failures)
+                    .await;
+            }
+            let backoff = cfg.connect_backoff * 2u32.pow((*connect_failures).min(5) - 1);
+            if !backoff_or_finish(backoff, finished, shared).await {
+                return DialStep::Quit;
+            }
+            DialStep::Retry
+        }
+    }
+}
+
+/// The park-and-probe tail shared by the CAPACITY refusal and the hard
+/// connect outage (issue #16 machinery, generalised): the caller has
+/// decided this server is not granting sessions right now for a reason
+/// that is plausibly transient. Most workers park on the episode watch
+/// (claim_yield keeps someone behind); ONE elected prober rides the
+/// capped bounce ladder (~8 s cadence) up to `CAP_PROBE_BOUNCES`
+/// (~10 min). Any successful connect anywhere sends `Reopened` and the
+/// parked fleet rejoins at full width; the horizon sends `Dead` so the
+/// parked workers exit and `seal_run` can reach a truthful terminal.
+/// Both the park loop and the ladder select on `finished`, so a dead
+/// server never holds a FINISHED run open (§34/A15).
+async fn park_or_probe(
+    cfg: &PoolConfig,
+    ctx: ServerCtx,
+    shared: &Arc<Shared>,
+    finished: &mut tokio::sync::watch::Receiver<bool>,
+    bounces: &mut u32,
+    connect_failures: &mut u32,
+) -> DialStep {
+    // Subscribe BEFORE claiming the yield: an event published between
+    // the claim and the subscription must still wake this parker.
+    let mut sub = shared.auth[ctx.idx].episode.subscribe();
+    let entry_gen = sub.borrow().1;
+    if shared.auth[ctx.idx].claim_yield(&shared.alive[ctx.idx]) {
+        // Park, don't die (issue #16): a ghost-session
+        // lease clears in minutes, and a fleet that
+        // exited leaves the reopened server to one
+        // prober crawling the rest of the job alone.
+        // Wait for the prober's verdict; Reopened =
+        // rejoin the dial loop, Dead (or the run
+        // ending) = the old exit.
+        loop {
+            match *sub.borrow_and_update() {
+                // Only a Reopened published AFTER this park counts:
+                // the watch never returns to Idle, so the previous
+                // episode's Reopened is still sitting in it, and
+                // consuming that here would skip the prober election
+                // for every later episode - a permanent outage then
+                // never reaches Dead and the run never terminates.
+                (CapEpisode::Reopened, g) if g > entry_gen => {
+                    shared.auth[ctx.idx].yielded.fetch_sub(1, Ordering::SeqCst);
+                    // A fresh ladder for the rejoin: the pre-park
+                    // failures were the episode's, not this worker's,
+                    // and carrying them over would bounce a rejoining
+                    // worker straight back into the park on its first
+                    // unlucky dial.
+                    *connect_failures = 0;
+                    return DialStep::Retry;
+                }
+                // A leftover Dead is as final as a fresh one: the
+                // prober exhausted its horizon for this server.
+                (CapEpisode::Dead, _) => return DialStep::Quit,
+                (CapEpisode::Idle | CapEpisode::Probing | CapEpisode::Reopened, _) => {}
+            }
+            tokio::select! {
+                r = sub.changed() => {
+                    if r.is_err() {
+                        return DialStep::Quit;
+                    }
+                }
+                _ = finished.wait_for(|f| *f) => return DialStep::Quit,
+            }
+        }
+    }
+    // Single-prober election: claim_yield's alive-count
+    // race can leave SEVERAL workers thinking they are
+    // the last one - only the holder of this flag rides
+    // the long ladder, the rest stand down (they missed
+    // the yield window, so they exit as every extra
+    // claimant did before parking existed).
+    if shared.auth[ctx.idx].cap_prober.swap(true, Ordering::AcqRel) && *bounces == 0 {
+        return DialStep::Quit;
+    }
+    shared.auth[ctx.idx].publish_episode(CapEpisode::Probing);
+    // Issue #16 (the restart stall): this LAST prober
+    // used to walk the ordinary connect ladder to
+    // permanent death - five capacity bounces in
+    // ~15-30 s and the server was never dialed again,
+    // while a provider that still counts a dead
+    // process's sessions holds its cap for MINUTES.
+    // A capacity refusal is a known-transient (it
+    // clears when the ghosts are reaped), so the
+    // prober paces on its own bounce ladder instead
+    // and gives the lease a realistic horizon to
+    // expire; any successful connect resets both
+    // counters. A server capped for good costs one
+    // paced dial every ~32 s until the horizon.
+    *bounces = bounces.saturating_add(1);
+    if *bounces >= cfg.cap_probe_bounces {
+        // The lease outlived any realistic horizon:
+        // release the parked yielders to exit so the
+        // run can reach a truthful terminal instead of
+        // idling forever.
+        shared.auth[ctx.idx].publish_episode(CapEpisode::Dead);
+        return DialStep::Quit;
+    }
+    if !backoff_or_finish(
+        cfg.connect_backoff * 2u32.pow((*bounces).min(3) - 1),
+        finished,
+        shared,
+    )
+    .await
+    {
+        return DialStep::Quit;
+    }
+    DialStep::Retry
+}
+
+/// One pipelined read: the select over the BODY read, the run-finished
+/// watch, the promote-shed trigger and the TTFB-suspicion timer, moved
+/// verbatim out of `session_loop` (TODO 113).
+struct ReadStep {
+    /// `None`: the run ended or a promote shed abandoned the read.
+    /// `Some(Err(()))` is a read timeout; the inner result is the BODY
+    /// answer (true = 222 with a body in `buf`, false = 430/423).
+    read: Option<Result<Result<bool, crate::nntp::NntpError>, ()>>,
+    /// Promoted work is starving and this pipeline holds none of it -
+    /// shed and reconnect.
+    shed_for_promote: bool,
+    /// The suspicion timer fired and no status line ever arrived: the
+    /// peer is mute, so skip the courtesy QUIT (its 500 ms bound would
+    /// ride the job's wall - the run is over when this matters).
+    mute_suspect: bool,
+    /// TODO 121.1/.2: the adaptive read expired with NO status byte
+    /// seen - the pre-byte budget ran out, as opposed to a mid-body
+    /// no-progress stall. The caller escalates the front article's own
+    /// budget and does NOT count the expiry as a flap death: giving up
+    /// pre-byte was OUR budget choice, and a heavy-tailed but healthy
+    /// provider (cold storage at 2-4 s trained budgets) produces six
+    /// of these a minute without a single session actually dying.
+    prebyte_expired: bool,
+    /// On a miss (`Ok(Ok(false))`): the refusal line echoed a matching
+    /// message-id, making the attribution authoritative rather than
+    /// positional. See `Work::soft_430`.
+    miss_echoed: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_one(
+    conn: &mut Connection,
+    buf: &mut Vec<u8>,
+    cfg: &PoolConfig,
+    ctx: ServerCtx,
+    shared: &Arc<Shared>,
+    inflight: &VecDeque<Work>,
+    finished: &mut tokio::sync::watch::Receiver<bool>,
+    promote_gen: &mut tokio::sync::watch::Receiver<u64>,
+) -> ReadStep {
+    // A worker mid-read must notice global completion: once a tail
+    // duplicate wins somewhere, waiting out a slow original here
+    // would stall the whole pool's return. It must also notice a
+    // PROMOTE while its in-flight article is non-promoted work: a
+    // streaming seek needs the whole line NOW, and 100+ conns
+    // placidly finishing frontier articles hold the promoted wave
+    // to one conn's fair share (measured 4-6 s per 32 MB window).
+    // Abandoning the read (reconnect, uncharged requeue) frees
+    // this conn for promoted work within ~a TLS handshake.
+    let mut shed_for_promote = false;
+    // TTFB-suspicion hedge (TODO 115): while this read is still
+    // pre-byte, a timer at the suspicion bound marks the front
+    // article suspect so other workers can dup-race it without
+    // waiting out the full adaptive budget. `status_seen` is the
+    // read's own report that bytes arrived - after that, silence
+    // is a body pacing question, not a dead connection, and the
+    // timer must not fire.
+    let ttfb_hedge_armed = cfg.ttfb_hedge && cfg.adaptive_timeout;
+    let status_seen = AtomicBool::new(false);
+    let miss_echoed = AtomicBool::new(false);
+    let suspect_front: Option<String> = if ttfb_hedge_armed {
+        inflight.front().map(|w| w.id.clone())
+    } else {
+        None
+    };
+    let suspect_timer = tokio::time::sleep(if ttfb_hedge_armed {
+        shared.ttfb_suspect_after(ctx.idx)
+    } else {
+        Duration::from_secs(0)
+    });
+    tokio::pin!(suspect_timer);
+    let mut suspect_armed = ttfb_hedge_armed;
+    let mut suspect_fired = false;
+    let read = {
+        let read_fut = async {
+            // Echoed-id enforcement: this read is attributed to the
+            // front of the pipeline POSITIONALLY, so when the status
+            // line echoes a plausible message-id it must be the front
+            // article's - anything else means a response was dropped
+            // or reordered and every later body on this socket would
+            // be filed under the wrong article. The mismatch surfaces
+            // as an NntpError and takes the existing protocol-error
+            // exit (drop the session, requeue the pipeline).
+            let expected = inflight.front().map(|w| w.id.as_str());
+            if cfg.adaptive_timeout {
+                // TODO 96.1: two-phase bound. Pre-byte budget
+                // adapts to this server's measured TTFB; once
+                // bytes flow only a genuine no-progress stall
+                // trips. Both expiries land in the same stall
+                // arm as the flat path's timeout (requeue with
+                // uncharged pipeline-mates, reconnect, no
+                // session strike).
+                let budget = article_prebyte_budget(
+                    shared.ttfb_budget(ctx.idx),
+                    inflight.front().map_or(0, |w| w.prebyte_expiries),
+                );
+                match conn
+                    .read_body_into_two_phase_noting(
+                        buf,
+                        expected,
+                        budget,
+                        ADAPTIVE_STALL,
+                        &status_seen,
+                        &miss_echoed,
+                    )
+                    .await
+                {
+                    Ok((hit, ttfb)) => {
+                        shared.note_ttfb(ctx.idx, ttfb);
+                        Ok(Ok(hit))
+                    }
+                    Err(crate::nntp::NntpError::Timeout) => {
+                        // Censored sample: widen, or a budget
+                        // trained to the floor can never recover
+                        // from a provider that got slower (M4).
+                        shared.note_ttfb_timeout(ctx.idx);
+                        // Mark the graph, once a second per
+                        // server at most (a provider gone slow
+                        // expires budgets on every worker at
+                        // once) - same discipline as `blocked`.
+                        if let Some(l) = &cfg.live
+                            && let Some(sl) = l.servers.get(ctx.idx)
+                        {
+                            let now = now_ms();
+                            let prev = sl.last_timeout_note.load(Ordering::Relaxed);
+                            if now.saturating_sub(prev) >= 1000
+                                && sl
+                                    .last_timeout_note
+                                    .compare_exchange(
+                                        prev,
+                                        now,
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                    )
+                                    .is_ok()
+                            {
+                                l.note(
+                                    ctx.idx,
+                                    "timeout",
+                                    "a response ran past its adaptive time budget - \
+                                     widened the budget and retried",
+                                );
+                            }
+                        }
+                        Err(())
+                    }
+                    Err(e) => Ok(Err(e)),
+                }
+            } else {
+                tokio::time::timeout(
+                    cfg.read_timeout,
+                    conn.read_body_into(buf, expected, &miss_echoed),
+                )
+                .await
+                .map_err(|_| ())
+            }
+        };
+        tokio::pin!(read_fut);
+        loop {
+            tokio::select! {
+                r = &mut read_fut => break Some(r),
+                // TTFB-suspicion: fires at most once per read.
+                // Racing the status line's arrival is benign -
+                // a mark on an article that completes a moment
+                // later dies with its inflight entry.
+                _ = &mut suspect_timer, if suspect_armed => {
+                    suspect_armed = false;
+                    suspect_fired = true;
+                    if !status_seen.load(Ordering::Acquire)
+                        && let Some(id) = &suspect_front
+                    {
+                        shared.mark_suspect(id);
+                    }
+                }
+                _ = async {
+                    let _ = finished.wait_for(|f| *f).await;
+                } => break None,
+                _ = promote_gen.changed() => {
+                    // Immune if ANY in-flight article is promoted
+                    // work - by flag (popped after the promote) OR
+                    // by id (dispatched before the promote but
+                    // inside its span; shedding those would just
+                    // refetch the same bytes after a reconnect).
+                    let fetching_promoted = inflight.iter().any(|w| w.promoted) || {
+                        let ids = shared.promoted_ids.lock_ok();
+                        inflight.iter().any(|w| ids.contains(&w.id))
+                    };
+                    // And only abandon a read that has already
+                    // proven slower than a reconnect (see
+                    // PROMOTE_SHED_MIN_AGE).
+                    let old_enough = inflight.front().is_none_or(|w| {
+                        shared
+                            .inflight
+                            .lock()
+                            .unwrap()
+                            .get(&w.id)
+                            .is_none_or(|inf| inf.dispatched.elapsed() >= PROMOTE_SHED_MIN_AGE)
+                    });
+                    if shared.stream_active()
+                        && shared.promoted_pending.load(Ordering::Acquire) > 0
+                        && !fetching_promoted
+                        && old_enough
+                    {
+                        shed_for_promote = true;
+                        break None;
+                    }
+                    // Already fetching promoted work (or no
+                    // promoted work left): keep reading.
+                }
+            }
+        }
+    };
+    let no_status = !status_seen.load(Ordering::Acquire);
+    ReadStep {
+        prebyte_expired: cfg.adaptive_timeout && matches!(read, Some(Err(()))) && no_status,
+        read,
+        shed_for_promote,
+        mute_suspect: suspect_fired && no_status,
+        miss_echoed: miss_echoed.load(Ordering::Acquire),
+    }
+}
+
+/// A 222 body arrived: ownership, dup racing, recycle heuristics - the
+/// `Ok(Ok(true))` arm of `session_loop`'s response match, moved
+/// verbatim (TODO 113). Returns `Recycle` when this session has proven
+/// slow (race losses or a collapsed rate slope) and should be redialled.
+enum BodyStep {
+    Proceed,
+    Recycle,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_body(
+    cfg: &PoolConfig,
+    ctx: ServerCtx,
+    shared: &Arc<Shared>,
+    out: &mpsc::Sender<FetchOutcome>,
+    inflight: &mut VecDeque<Work>,
+    buf: Vec<u8>,
+    race_losses: &mut u32,
+    session_bytes: &mut u64,
+    session_start: Instant,
+) -> BodyStep {
+    let w = inflight.pop_front().expect("response without command");
+    shared.release_wire(1);
+    *session_bytes += buf.len() as u64;
+    shared.bytes[ctx.idx].fetch_add(buf.len() as u64, Ordering::Relaxed);
+    if let Some(l) = &cfg.live {
+        l.servers[ctx.idx]
+            .bytes
+            .fetch_add(buf.len() as u64, Ordering::Relaxed);
+    }
+    // Speed limiter: charge the body and sleep off any debt
+    // BEFORE processing continues (async - the runtime
+    // thread stays free for other workers' I/O).
+    if let Some(rate) = &cfg.rate {
+        rate.throttle(buf.len() as u64).await;
+    }
+    // M29 oracle: a served body is a labeled "this
+    // backbone HAS articles of this age" sample - charged
+    // per 222 regardless of who owns the outcome (dups
+    // included; the response is real evidence either way).
+    if let Some(o) = &cfg.oracle {
+        o.hit(ctx.idx, shared.ages.get(&w.id).copied().unwrap_or(0));
+    }
+    shared.deregister_inflight_done(&w);
+    if shared.claim_done(&w.id) {
+        *race_losses = 0;
+        if w.dup {
+            shared.dup_wins.fetch_add(1, Ordering::Relaxed);
+        }
+        // Handing a body downstream is where a SLOW DISK
+        // becomes visible: when decode/verify/write cannot
+        // keep up the channel fills, this await parks, and
+        // the TCP windows close behind it. That is the
+        // designed response - but it is indistinguishable
+        // from a network dip on the graph unless somebody
+        // measures it, so this does.
+        //
+        // try_send first, so the healthy path costs no
+        // clock read at all: only a body that actually had
+        // to WAIT is timed. Everything else would put an
+        // Instant::now() on the hot path of every article
+        // to observe a number that is almost always zero.
+        // Mark ARRIVED across the (possibly parked)
+        // handoff - see the `done_ok` field doc.
+        let arrived = w.id.clone();
+        shared.done_ok.lock_ok().insert(arrived.clone());
+        // TODO 114 consumer steer - see `stash_handed`.
+        if cfg.crc_steer {
+            shared.stash_handed(&w, ctx);
+        }
+        let done = FetchOutcome::Done { id: w.id, raw: buf };
+        use tokio::sync::mpsc::error::TrySendError;
+        let mut delivered = true;
+        match out.try_send(done) {
+            Ok(()) => {}
+            Err(TrySendError::Closed(_)) => delivered = false,
+            Err(TrySendError::Full(done)) => {
+                let waited = std::time::Instant::now();
+                delivered = out.send(done).await.is_ok();
+                let ms = waited.elapsed().as_millis() as u64;
+                if let Some(c) = shared.blocked_ms.get(ctx.idx) {
+                    c.fetch_add(ms, Ordering::Relaxed);
+                }
+                if let Some(live) = &cfg.live
+                    && let Some(sl) = live.servers.get(ctx.idx)
+                {
+                    sl.blocked_ms.fetch_add(ms, Ordering::Relaxed);
+                    // A pause long enough to bend the graph
+                    // earns a mark on it. Brief parks are
+                    // NORMAL - the channel is meant to fill -
+                    // so only a wait a person could see counts,
+                    // and at most one a second per server.
+                    if ms >= BLOCKED_NOTE_MS {
+                        let now = now_ms();
+                        let prev = sl.last_blocked_note.load(Ordering::Relaxed);
+                        if now.saturating_sub(prev) >= 1000
+                            && sl
+                                .last_blocked_note
+                                .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                        {
+                            live.note(
+                                ctx.idx,
+                                "blocked",
+                                format!("waited {ms} ms for the write side"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Terminal bookkeeping - see `settle_handoff`.
+        shared.settle_handoff(cfg.crc_steer, cfg.arrival_ack, delivered, &arrived);
+    } else {
+        // A duplicate dispatch beat us to it.
+        if let Some(p) = &cfg.buf_pool {
+            p.give(buf);
+        }
+        // Recycle experiment: losing races back to back
+        // means THIS session is the slow one - a fresh
+        // dial to the same host routinely beats a
+        // degraded TCP session. Deliberate reconnect:
+        // no session strike, no backoff (same shape as
+        // the promote shed above); the redial path
+        // counts it into `reconnects`.
+        //
+        // Endgame losses do NOT count (TODO 111 gauntlet):
+        // once the fan-out arms, idle workers race EVERY
+        // straggler, so a healthy-but-jittery session
+        // loses races routinely through no fault of its
+        // own - the gauntlet measured a satellite-shaped
+        // server recycled mid-tail for exactly this.
+        // Normal-phase losses - the rate rule or the
+        // hedge picking on this session's articles
+        // specifically - remain the evidence they were.
+        // Same stance as the slope recycle below, which
+        // has excluded the endgame from day one.
+        let endgame = shared.pending.load(Ordering::Acquire) <= ENDGAME_MAX
+            || (shared.tail_fanout_early && shared.tail_started.lock_ok().is_some());
+        if !endgame {
+            *race_losses += 1;
+        }
+        if cfg.recycle_slow && *race_losses >= RECYCLE_RACE_LOSSES {
+            if let Some(l) = &cfg.live {
+                l.note(
+                    ctx.idx,
+                    "reconnect",
+                    format!(
+                        "recycled a slow session after losing \
+                         {race_losses} article races in a row"
+                    ),
+                );
+            }
+            *race_losses = 0;
+            shed_pipeline(shared, inflight).await;
+            return BodyStep::Recycle;
+        }
+    }
+    // Slope-recycle experiment: this session's own rate
+    // collapsed against the fleet's per-worker average -
+    // redial before it strands anything. Normal phase
+    // only (endgame workers are legitimately idle-ish,
+    // and the tail machinery owns that ground), and only
+    // once the session has had 10 s to prove itself.
+    // Checked ONLY on a completed article, so an idle
+    // worker's decaying average can never trip it.
+    if cfg.recycle_slope
+        && shared.pending.load(Ordering::Acquire) > ENDGAME_MAX
+        && session_start.elapsed() > Duration::from_secs(10)
+    {
+        let mine = *session_bytes as f64 / session_start.elapsed().as_secs_f64();
+        let fleet = shared.rate_per_worker(ctx.idx);
+        if fleet > 0.0 && mine < 0.25 * fleet {
+            if let Some(l) = &cfg.live {
+                l.note(
+                    ctx.idx,
+                    "reconnect",
+                    format!(
+                        "recycled a degraded session ({:.1} MB/s vs the \
+                         fleet's {:.1} MB/s per connection)",
+                        mine / 1e6,
+                        fleet / 1e6
+                    ),
+                );
+            }
+            shed_pipeline(shared, inflight).await;
+            return BodyStep::Recycle;
+        }
+    }
+    BodyStep::Proceed
+}
+
+/// An authoritative 430/423 "no such article": per-server evidence,
+/// dup-mask merging and Missing/requeue routing - the `Ok(Ok(false))`
+/// arm of `session_loop`'s response match, moved verbatim (TODO 113).
+async fn handle_missing(
+    cfg: &PoolConfig,
+    ctx: ServerCtx,
+    shared: &Arc<Shared>,
+    out: &mpsc::Sender<FetchOutcome>,
+    inflight: &mut VecDeque<Work>,
+    buf: Vec<u8>,
+    echoed: bool,
+) {
+    let mut w = inflight.pop_front().expect("response without command");
+    shared.release_wire(1);
+    if let Some(p) = &cfg.buf_pool {
+        p.give(buf);
+    }
+    // Reliability: this server said "no such article" -
+    // charged even for dups (the response is authoritative
+    // for this server regardless of who owns the outcome).
+    if let Some(l) = &cfg.live {
+        l.servers[ctx.idx]
+            .articles_missing
+            .fetch_add(1, Ordering::Relaxed);
+        // Windowed: a take-down or backfill hole answers
+        // 430 by the hundred, and each one lands here.
+        l.note_missing_burst(ctx.idx);
+    }
+    // M29 oracle: the mirror of the hit above - one miss
+    // per actual 430/423 wire response. Derived Missing
+    // verdicts (retention seeding, unanimity) are NOT
+    // recorded; only real answers train the ledger.
+    if let Some(o) = &cfg.oracle {
+        o.miss(ctx.idx, shared.ages.get(&w.id).copied().unwrap_or(0));
+    }
+    if w.dup {
+        // An un-echoed dup miss is positional-only evidence on a
+        // possibly desynced socket - dropping it costs one redundant
+        // attempt (the original walks its own ladder), while merging
+        // it could push the union to a false unanimous Missing.
+        if !echoed {
+            return;
+        }
+        // M2c.4: a duplicate's 430 is real evidence, not a
+        // discard - merge it into the article's
+        // authoritative mask (the inflight entry while the
+        // original is out reading, the queued copy if it
+        // already requeued) and declare Missing the moment
+        // the union goes unanimous, instead of waiting for
+        // the original to walk the rest of the ladder.
+        let live = shared.live_mask();
+        let mut unanimous = false;
+        {
+            let mut m = shared.inflight.lock_ok();
+            if let Some(inf) = m.get_mut(&w.id) {
+                inf.tried_430 |= ctx.group_bits;
+                unanimous = inf.tried_430 & live == live;
+            }
+        }
+        if !unanimous {
+            // Tail queues are tiny (endgame ≤64) - a linear
+            // stamp is cheap, and a miss (article mid-hand-
+            // off) only costs one redundant attempt.
+            let mut q = shared.queue.lock().await;
+            if let Some(qi) = q.iter_mut().find(|x| x.id == w.id) {
+                qi.tried_430 |= ctx.group_bits;
+                unanimous = qi.tried_430 & live == live;
+            }
+        }
+        if unanimous && shared.claim_done(&w.id) {
+            let _ = out
+                .send(FetchOutcome::Missing {
+                    id: w.id,
+                    cause: MissingCause::Gone,
+                })
+                .await;
+            shared.complete_one();
+        }
+        return;
+    }
+    // Fold in any 430s duplicate dispatches accumulated on
+    // the inflight entry while this original was reading.
+    if let Some(inf) = shared.inflight.lock_ok().remove(&w.id) {
+        w.tried_430 |= inf.tried_430;
+    }
+    // A miss whose refusal line carried no echoed id is positional
+    // attribution only: if an upstream frontend dropped the previous
+    // pipelined response, this bare "430 no such article" belongs to
+    // the NEXT article, and folding it would emit a false terminal
+    // Missing for a perfectly valid article on a single-server run.
+    // First per group: remember, requeue uncharged, and require a
+    // confirming repeat (a desynced session dies on its next echoed
+    // or unexpected response, so the recheck lands on a re-aligned
+    // one). Providers that never echo converge one round-trip later.
+    if !echoed && w.soft_430 & ctx.group_bits != ctx.group_bits {
+        w.soft_430 |= ctx.group_bits;
+        // A wholly dead post takes this branch for EVERY article before
+        // any of them can go terminal, so the whole first pass resolves
+        // nothing and decodes nothing - indistinguishable from a wedged
+        // pool to a watchdog reading only bytes and outstanding count.
+        // That is the 31 Jul abort exactly, and this branch reopened it.
+        shared.deferred.fetch_add(1, Ordering::Relaxed);
+        let mut q = shared.queue.lock().await;
+        if w.promoted {
+            let at = q.iter().take_while(|x| x.promoted).count().min(q.len());
+            shared.promoted_pending.fetch_add(1, Ordering::AcqRel);
+            q.insert(at, w);
+        } else {
+            q.push_back(w);
+        }
+        return;
+    }
+    // 430 is authoritative for this server AND its mirror
+    // group; route to untried LIVE servers before declaring
+    // the article missing (dead servers can never answer -
+    // counting them here deadlocked the run pre-fix).
+    w.tried_430 |= ctx.group_bits;
+    let live = shared.live_mask();
+    if w.tried_430 & live == live {
+        if shared.claim_done(&w.id) {
+            let _ = out
+                .send(FetchOutcome::Missing {
+                    id: w.id,
+                    cause: MissingCause::Gone,
+                })
+                .await;
+            shared.complete_one();
+        }
+    } else if w.promoted {
+        // A promoted (playhead) article 430'd here must
+        // retry on another backbone NOW - at the queue
+        // back it sits behind gigabytes while the player
+        // starves (live wedge: DMCA-holed head articles
+        // cycling 430 → back → re-promote → 430).
+        let mut q = shared.queue.lock().await;
+        let at = q.iter().take_while(|x| x.promoted).count().min(q.len());
+        shared.promoted_pending.fetch_add(1, Ordering::AcqRel);
+        q.insert(at, w);
+    } else {
+        shared.queue.lock().await.push_back(w);
+    }
+}
+
+/// The flap-breaker claim at the top of a session: on a flapping
+/// server, one worker (or min(observed cap, budget) workers with
+/// cap-aware keepers, TODO 115) claims a keeper slot and the rest
+/// retire for the run. Moved verbatim out of `session_loop` (TODO
+/// 113). Returns false when this worker lost the claim and must bow
+/// out - the parked connection, if any, has been quit.
+async fn claim_flap_keeper(
+    cfg: &PoolConfig,
+    ctx: ServerCtx,
+    shared: &Arc<Shared>,
+    am_keeper: &mut bool,
+    preclaimed: &mut Option<Connection>,
+) -> bool {
+    // Flap breaker: this server's established sessions keep dying
+    // while other servers are healthy. One worker claims the keeper
+    // slot and keeps retrying - the operator's stated contract is
+    // "retry, but never at the other downloads' expense" - and the
+    // rest of the fleet retires for the run, so their churn (shed
+    // pipelines, redials into a burned IP cap, backoff noise) stops
+    // and the shared queue naturally routes everything to servers
+    // that work.
+    if cfg.flap_breaker && !*am_keeper && shared.is_flapping(ctx.idx) && shared.other_live(ctx.idx)
+    {
+        // TODO 115: the keeper count is 1 unless the provider has
+        // SHOWN us an accept cap wider than that (dials bounced off
+        // a capacity refusal while we held sessions) - then it is
+        // min(observed cap, this server's connection budget), so a
+        // cap of two keeps both slots the provider is willing to
+        // serve instead of leaving one on the table.
+        let target = shared.flap_keeper_target(ctx.idx, cfg);
+        let claimed = shared.flap_keeper[ctx.idx]
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |k| {
+                (k < target).then_some(k + 1)
+            })
+            .is_ok();
+        if !claimed {
+            if !shared.flap_noted[ctx.idx].swap(true, Ordering::AcqRel)
+                && let Some(l) = &cfg.live
+            {
+                let kept = match target {
+                    1 => "one retry connection".to_string(),
+                    n => format!("{n} retry connections (the server's own cap)"),
+                };
+                l.note(
+                    ctx.idx,
+                    "cap",
+                    format!(
+                        "sessions flapping ({FLAP_DEATHS}+ drops in a minute) - \
+                         reduced to {kept}; other servers carry on"
+                    ),
+                );
+            }
+            if let Some(c) = preclaimed.take() {
+                c.quit().await;
+            }
+            return false;
+        }
+        *am_keeper = true;
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+/// The two "this worker is finished before it dials" exits at the top of
+/// `session_loop`: every article is terminal, or the user aborted. They
+/// differ only in what becomes of a connection claimed before the ramp
+/// and never used, and that difference is load-bearing.
+///
+/// Returns true when the caller must return.
+async fn done_before_dial(
+    cfg: &PoolConfig,
+    server: &ServerConfig,
+    shared: &Shared,
+    preclaimed: &mut Option<Connection>,
+) -> bool {
+    if shared.pending.load(Ordering::Acquire) == 0 {
+        // A worker that claimed a parked connection before the ramp and
+        // then found the queue already empty is holding a DRAINED,
+        // freshly validated session - `take` sent its DATE and read the
+        // answer, and nothing has been written since. Dropping it here
+        // closed it, so the pool SHRANK every time a fleet outran its
+        // work: measured over six back-to-back jobs, three parked
+        // connections eroded to two and the fourth job dialled again
+        // despite a hit on every claim. That is the warm pool paying to
+        // destroy exactly what it exists to keep, and it bites hardest
+        // under load, which is when a fleet is most likely to have one
+        // worker finish everything before its siblings start.
+        if let Some(c) = preclaimed.take() {
+            park_or_quit(cfg, server, c).await;
+        }
+        return true; // every article is terminal
+    }
+    if shared.aborted.load(Ordering::Acquire) {
+        // Aborts close, per the module rule every other abort exit
+        // follows - the user is done with this server, not pausing.
+        if let Some(c) = preclaimed.take() {
+            c.quit().await;
+        }
+        return true; // user abort
+    }
+    false
+}
+
+/// The three gates a worker passes at the top of every `session_loop`
+/// pass, before it goes anywhere near a dial: the permanent bow-out, the
+/// live target's park, and the session-level pacing sleep. Lifted out of
+/// the loop to keep `session_loop` inside its size-gate ceiling - the
+/// behaviour, and the ORDER, are unchanged and load-bearing.
+///
+/// Returns false when this worker is done and the caller must return.
+async fn pre_dial_gates(
+    cfg: &PoolConfig,
+    slot: u32,
+    session_failures: u32,
+    pending_backoff: &mut Option<Duration>,
+    finished: &mut tokio::sync::watch::Receiver<bool>,
+    shared: &Shared,
+) -> bool {
+    // A session that can only ever fail bows out for good, exactly as
+    // connect exhaustion does (see `MAX_SESSION_ATTEMPTS`) - this
+    // worker's `alive` count comes down with it, so a multi-server job
+    // steers to the healthy backbone and a single-server one seals a
+    // truthful Failed. Checked before the backoff: a worker that is
+    // leaving anyway must not sit out a 30 s sleep on the way out. Only
+    // the fast-failure paths touch the counter, and any well-formed BODY
+    // response clears it, so a connection that has been serving is never
+    // walked toward this by a rough patch.
+    if session_failures >= MAX_SESSION_ATTEMPTS {
+        return false;
+    }
+    // TODO 112 live target: a slot at or above the target parks here,
+    // holding no connection, until the target rises to admit it again or
+    // the run ends. The quit that routed us here has already returned
+    // the session, so a parked worker costs the provider nothing - and
+    // unlike the capacity yield it has NOT retired, so it can come back.
+    if let Some(t) = &cfg.live_target
+        && !wait_for_slot(t, slot, finished, shared).await
+    {
+        return false;
+    }
+    // Session-level pacing (see `session_backoff_delay`). Armed only by
+    // the fast failure paths - protocol error, failed send, failed flush
+    // - which otherwise reconnect with zero delay. Deliberate reconnects
+    // (pipeline shed, promote shed) never arm it, and the read-stall
+    // path is already paced by `read_timeout`. The session guard has
+    // been dropped by the `continue` that got us here, so a worker
+    // sleeping this off is not counted as connected. Abort sets
+    // `finished`, so that arm covers it; a graceful pause does not, hence
+    // the short slices - a drain must not wait out a 30 s backoff before
+    // this worker retires.
+    //
+    // NOT `backoff_or_finish`, which looks identical and is not: it
+    // treats a drain as "stop", while a drain here breaks the wait and
+    // carries the worker ON into the loop to retire through the normal
+    // path.
+    if let Some(d) = pending_backoff.take() {
+        // Deadline on the runtime's clock, not `std`'s: the slices below
+        // are `tokio::time::sleep`, and mixing the two makes this a
+        // busy-wait under a test clock (the sleeps return, the deadline
+        // never moves). Identical in production, where the two clocks
+        // are the same clock.
+        let until = tokio::time::Instant::now() + d;
+        loop {
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() || shared.draining.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(left.min(Duration::from_millis(250))) => {}
+                // The run finished (or was aborted) while this worker was
+                // sitting out.
+                _ = finished.wait_for(|f| *f) => return false,
+            }
+        }
+    }
+    true
+}
+
 async fn session_loop(
     server: &ServerConfig,
     cfg: &PoolConfig,
@@ -3701,141 +5262,28 @@ async fn session_loop(
     // slot - the keeper never bows out to its own clamp.
     let mut am_keeper = false;
     let mut ever_connected = false;
-    // CRC-retry experiment: one reused decode scratch per worker, so
-    // the gate's validation decode costs no per-article allocation.
-    let mut crc_scratch: Vec<u8> = Vec::new();
     let mut finished = shared.finished.subscribe();
     let mut promote_gen = shared.promote_gen.subscribe();
 
     'session: loop {
-        // A session that can only ever fail bows out for good, exactly as
-        // connect exhaustion does below (see `MAX_SESSION_ATTEMPTS`) -
-        // this worker's `alive` count comes down with it, so a
-        // multi-server job steers to the healthy backbone and a
-        // single-server one seals a truthful Failed. Checked before the
-        // backoff: a worker that is leaving anyway must not sit out a 30 s
-        // sleep on the way out. Only the fast-failure paths touch the
-        // counter, and any well-formed BODY response clears it, so a
-        // connection that has been serving is never walked toward this by
-        // a rough patch.
-        if session_failures >= MAX_SESSION_ATTEMPTS {
-            return;
-        }
-        // TODO 112 live target: a slot at or above the target parks
-        // here, holding no connection, until the target rises to admit
-        // it again or the run ends. The quit that routed us here has
-        // already returned the session, so a parked worker costs the
-        // provider nothing - and unlike the capacity yield it has NOT
-        // retired, so it can come back.
-        if let Some(t) = &cfg.live_target
-            && !wait_for_slot(t, slot, &mut finished, &shared).await
+        if !pre_dial_gates(
+            cfg,
+            slot,
+            session_failures,
+            &mut pending_backoff,
+            &mut finished,
+            &shared,
+        )
+        .await
         {
             return;
         }
-        // Session-level pacing (see `session_backoff_delay`). Armed only
-        // by the fast failure paths - protocol error, failed send, failed
-        // flush - which otherwise reconnect with zero delay. Deliberate
-        // reconnects (pipeline shed, promote shed) never arm it, and the
-        // read-stall path is already paced by `read_timeout`. The session
-        // guard has been dropped by the `continue` that got us here, so a
-        // worker sleeping this off is not counted as connected.
-        // Abort sets `finished`, so that arm covers it; a graceful pause
-        // does not, hence the short slices - a drain must not wait out a
-        // 30 s backoff before this worker retires.
-        if let Some(d) = pending_backoff.take() {
-            // Deadline on the runtime's clock, not `std`'s: the slices
-            // below are `tokio::time::sleep`, and mixing the two makes
-            // this a busy-wait under a test clock (the sleeps return, the
-            // deadline never moves). Identical in production, where the
-            // two clocks are the same clock.
-            let until = tokio::time::Instant::now() + d;
-            loop {
-                let left = until.saturating_duration_since(tokio::time::Instant::now());
-                if left.is_zero() || shared.draining.load(Ordering::Acquire) {
-                    break;
-                }
-                tokio::select! {
-                    _ = tokio::time::sleep(left.min(Duration::from_millis(250))) => {}
-                    // The run finished (or was aborted) while this worker
-                    // was sitting out.
-                    _ = finished.wait_for(|f| *f) => return,
-                }
-            }
-        }
-        if shared.pending.load(Ordering::Acquire) == 0 {
-            // A worker that claimed a parked connection before the ramp and
-            // then found the queue already empty is holding a DRAINED,
-            // freshly validated session - `take` sent its DATE and read the
-            // answer, and nothing has been written since. Dropping it here
-            // closed it, so the pool SHRANK every time a fleet outran its
-            // work: measured over six back-to-back jobs, three parked
-            // connections eroded to two and the fourth job dialled again
-            // despite a hit on every claim. That is the warm pool paying to
-            // destroy exactly what it exists to keep, and it bites hardest
-            // under load, which is when a fleet is most likely to have one
-            // worker finish everything before its siblings start.
-            if let Some(c) = preclaimed.take() {
-                park_or_quit(cfg, server, c).await;
-            }
-            return; // every article is terminal
-        }
-        if shared.aborted.load(Ordering::Acquire) {
-            // Aborts close, per the module rule every other abort exit
-            // follows - the user is done with this server, not pausing.
-            if let Some(c) = preclaimed.take() {
-                c.quit().await;
-            }
-            return; // user abort
+        if done_before_dial(cfg, server, &shared, &mut preclaimed).await {
+            return;
         }
 
-        // Flap breaker: this server's established sessions keep dying
-        // while other servers are healthy. One worker claims the keeper
-        // slot and keeps retrying - the operator's stated contract is
-        // "retry, but never at the other downloads' expense" - and the
-        // rest of the fleet retires for the run, so their churn (shed
-        // pipelines, redials into a burned IP cap, backoff noise) stops
-        // and the shared queue naturally routes everything to servers
-        // that work.
-        if cfg.flap_breaker
-            && !am_keeper
-            && shared.is_flapping(ctx.idx)
-            && shared.other_live(ctx.idx)
-        {
-            // TODO 115: the keeper count is 1 unless the provider has
-            // SHOWN us an accept cap wider than that (dials bounced off
-            // a capacity refusal while we held sessions) - then it is
-            // min(observed cap, this server's connection budget), so a
-            // cap of two keeps both slots the provider is willing to
-            // serve instead of leaving one on the table.
-            let target = shared.flap_keeper_target(ctx.idx, cfg);
-            let claimed = shared.flap_keeper[ctx.idx]
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |k| {
-                    (k < target).then_some(k + 1)
-                })
-                .is_ok();
-            if !claimed {
-                if !shared.flap_noted[ctx.idx].swap(true, Ordering::AcqRel)
-                    && let Some(l) = &cfg.live
-                {
-                    let kept = match target {
-                        1 => "one retry connection".to_string(),
-                        n => format!("{n} retry connections (the server's own cap)"),
-                    };
-                    l.note(
-                        ctx.idx,
-                        "cap",
-                        format!(
-                            "sessions flapping ({FLAP_DEATHS}+ drops in a minute) - \
-                             reduced to {kept}; other servers carry on"
-                        ),
-                    );
-                }
-                if let Some(c) = preclaimed.take() {
-                    c.quit().await;
-                }
-                return;
-            }
-            am_keeper = true;
+        if !claim_flap_keeper(cfg, ctx, &shared, &mut am_keeper, &mut preclaimed).await {
+            return;
         }
 
         // Hot-spare experiment: spawn this server's filler once,
@@ -3855,6 +5303,14 @@ async fn session_loop(
         // birth, so its personal rate can be compared to the fleet's.
         let session_start = Instant::now();
         let mut session_bytes: u64 = 0;
+        // Completed useful responses this session (a well-formed 222 OR
+        // an authoritative 430/423). Session-death attribution keys on
+        // THIS, not on bytes: a connection that validly answered "no
+        // such article" and then died was a working session, and
+        // charging its death to the innocent front article would let a
+        // one-response-per-connection server walk a perfectly valid
+        // article to Failed without ever serving it.
+        let mut session_responses: u32 = 0;
         // A parked connection first. `take` has already validated it with
         // a DATE round-trip, so it is interchangeable with a fresh
         // connect here and none of the error handling below has to know
@@ -3882,233 +5338,25 @@ async fn session_loop(
                 shared.connected[ctx.idx].store(true, Ordering::Relaxed);
                 c
             }
-            None => {
-                // Settled already: this server has told us the account is
-                // no good. Workers that reach here later must not re-ask -
-                // that is the storm this exists to stop, and it is also
-                // how a wrong password used to cost every worker its full
-                // backoff ladder before anyone bowed out.
-                if shared.auth[ctx.idx].is_rejected() {
-                    return;
-                }
-                if let Some(w) = &cfg.warm {
-                    w.miss();
-                }
-                // §35: the dial is the one blocking call in this loop that
-                // never watched the run. The session backoff above selects
-                // on `finished`, `backoff_or_finish` slices its sleep - but
-                // `connect` ran to its own CONNECT_TIMEOUT (20 s) whatever
-                // had happened to the job meanwhile, so a worker inside a
-                // dial when the last article went terminal kept the WHOLE
-                // run alive until `join_fleet` gave up on it after
-                // EXIT_GRACE.
-                //
-                // That cost a flat 5.0 s and it needed no dead server: 40
-                // of 40 farm runs paid it, the healthy six-server config
-                // included, because a provider bouncing a redundant
-                // connection off its simultaneous-IP cap (`502 max number
-                // of simultaneous IP addresses reached`) leaves a worker
-                // redialling exactly like an unreachable one. A 0.35 GB
-                // job whose bytes were all in at 0.65 s returned at 5.65 s.
-                // Racing the dial: same job, same box, 0.74 s.
-                let dialed = tokio::select! {
-                    r = Connection::connect(server) => r,
-                    _ = run_over(&mut finished, &shared) => return,
-                };
-                match dialed {
-                    Ok((c, _)) => {
-                        connects.fetch_add(1, Ordering::Relaxed);
-                        if ever_connected {
-                            reconnects.fetch_add(1, Ordering::Relaxed);
-                            // The daemon's copy. `reconnects` above is
-                            // the run total and only the CLI prints it;
-                            // this is per-server, live, and timestamped,
-                            // so a dip can be laid against it.
-                            if let Some(live) = &cfg.live {
-                                if let Some(sl) = live.servers.get(ctx.idx) {
-                                    sl.reconnects.fetch_add(1, Ordering::Relaxed);
-                                }
-                                live.note(ctx.idx, "reconnect", "session lost, redialled");
-                            }
-                        }
-                        ever_connected = true;
-                        shared.connected[ctx.idx].store(true, Ordering::Relaxed);
-                        connect_failures = 0;
-                        c
-                    }
-                    // §15e: an AUTHINFO refusal is the server's answer to this
-                    // ACCOUNT, so it is settled once for every worker rather than
-                    // rediscovered by each of them. The two kinds want opposite
-                    // responses, and conflating them is what made a Giganews cap
-                    // so expensive.
-                    Err(crate::nntp::NntpError::AuthFailed { kind, line }) => {
-                        let first = shared.auth[ctx.idx].note(kind, &line);
-                        // Out to the dashboard, so the user is told which server
-                        // stopped pulling its weight and in whose words.
-                        if let Some(live) = &cfg.live
-                            && let Some(sl) = live.servers.get(ctx.idx)
-                        {
-                            *sl.refusal.lock_ok() = Some(Refusal {
-                                permanent: kind == crate::nntp::AuthRefusal::Permanent,
-                                line: line.clone(),
-                            });
-                        }
-                        match kind {
-                            crate::nntp::AuthRefusal::Permanent => {
-                                // Retrying cannot fix a credential. Say it once,
-                                // per SERVER, and take every worker off it.
-                                if first {
-                                    warn!(
-                                        target: "pool",
-                                        "{}: authentication rejected, not retrying: {line}",
-                                        server.host
-                                    );
-                                    // A 502 is what a server says for a bad
-                                    // password AND, on several providers, for
-                                    // "too many addresses on this account" -
-                                    // same code, opposite remedies. We must not
-                                    // reclassify it (a genuinely wrong password
-                                    // has to stay permanent, or every worker
-                                    // would retry it forever), but a user
-                                    // staring at "authentication rejected" on an
-                                    // account they know is fine deserves the
-                                    // other possibility spelled out. Especially
-                                    // on a multi-WAN link, where this host
-                                    // presents several public addresses and can
-                                    // exhaust a 2-address allowance by itself.
-                                    if server.source_ips_are_tight() {
-                                        warn!(
-                                            target: "pool",
-                                            "{}: this account limits how many addresses \
-                                        may connect at once, and that is refused with the \
-                                        same code as a bad password. If the credentials \
-                                        are known good, something else is using the \
-                                        account. Two shapes to check: another machine on \
-                                        the same account, or THIS one leaving by more \
-                                        than one public address. The second is the one \
-                                        that surprises people - a router balancing \
-                                        several WAN links makes one host look like \
-                                        several, and it cannot be fixed from here, \
-                                        because `bind_ip` picks a LOCAL address and the \
-                                        balancing happens after the packets leave. That \
-                                        needs a policy route on the router pinning this \
-                                        traffic to one WAN; bind_ip only helps when this \
-                                        machine itself is multi-homed.",
-                                            server.host
-                                        );
-                                    }
-                                }
-                                return;
-                            }
-                            crate::nntp::AuthRefusal::Capacity => {
-                                // TODO 115: price the refusal in sessions we hold
-                                // right now - that count IS the observed accept
-                                // cap, and it is what widens the flap clamp past
-                                // one keeper.
-                                shared.note_cap_bounce(ctx.idx);
-                                // The account is fine; the server will not give us
-                                // ANOTHER session. Retrying at the same connection
-                                // count re-provokes exactly the limit being hit, so
-                                // this worker permanently yields its slot and the
-                                // survivors carry the job at a count the provider
-                                // will actually accept.
-                                if first {
-                                    warn!(
-                                        target: "pool",
-                                        "{}: at its connection/IP cap, reducing connections: {line}",
-                                        server.host
-                                    );
-                                }
-                                // The ring gets EVERY bounce, not just the
-                                // first. `if first` is right for the log -
-                                // a flapping provider would drown it - but
-                                // it is why a run that hit the cap at 16 s
-                                // and again fifteen minutes later looked
-                                // like it hit it once. The ring is capped,
-                                // so it can absorb what the log must not.
-                                if let Some(live) = &cfg.live {
-                                    live.note(ctx.idx, "cap", line.clone());
-                                }
-                                // TODO 115: a flap KEEPER never yields to a
-                                // capacity bounce and never walks toward
-                                // connect exhaustion on one - it holds one of
-                                // the min(observed cap, budget) slots the
-                                // provider does serve, and a bounce only means
-                                // the cap is momentarily full (a sibling
-                                // keeper mid-redial, or ghosts of sessions
-                                // the server has not reaped). Paced retry,
-                                // never a tight loop: each bounce waits the
-                                // exponential connect backoff before the next
-                                // dial, and the normal redial trigger stays
-                                // "my own session died". Gated on the env
-                                // knob so the shipped path is unchanged.
-                                if cfg.flap_cap_keepers && am_keeper {
-                                    // Own counter: via connect_failures a
-                                    // few bounces + ONE dial error retired
-                                    // the keeper - the exhaustion promised
-                                    // above never to happen on a bounce.
-                                    cap_bounces = cap_bounces.saturating_add(1).min(5);
-                                    if !backoff_or_finish(
-                                        cfg.connect_backoff * 2u32.pow(cap_bounces - 1),
-                                        &mut finished,
-                                        &shared,
-                                    )
-                                    .await
-                                    {
-                                        return;
-                                    }
-                                    continue 'session;
-                                }
-                                // Keep at least one worker trying, or a cap that
-                                // clears later would leave the server unused for
-                                // the rest of the run.
-                                if shared.auth[ctx.idx].claim_yield(&shared.alive[ctx.idx]) {
-                                    return;
-                                }
-                                connect_failures += 1;
-                                if connect_failures >= cfg.max_connect_attempts {
-                                    return;
-                                }
-                                if !backoff_or_finish(
-                                    cfg.connect_backoff * 2u32.pow(connect_failures.min(5) - 1),
-                                    &mut finished,
-                                    &shared,
-                                )
-                                .await
-                                {
-                                    return;
-                                }
-                                continue 'session;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        connect_failures += 1;
-                        // Say WHY, once per worker per run. This was a bare
-                        // `Err(_)` and the silence was expensive: a server that
-                        // cannot authenticate, cannot resolve, or is refusing
-                        // the TLS handshake looks EXACTLY like a server whose
-                        // articles are all missing - every article ends up
-                        // Failed/Missing with no hint which of the two it was.
-                        // First failure only, so a flapping provider cannot
-                        // flood the log, and the message names the fix.
-                        if connect_failures == 1 {
-                            warn!(target: "pool", "{}: connect failed: {e}", server.host);
-                        }
-                        if connect_failures >= cfg.max_connect_attempts {
-                            // This worker bows out; remaining work is served by the
-                            // others (or reported Failed when the queue drains at
-                            // exhausted attempts elsewhere).
-                            return;
-                        }
-                        let backoff = cfg.connect_backoff * 2u32.pow(connect_failures.min(5) - 1);
-                        if !backoff_or_finish(backoff, &mut finished, &shared).await {
-                            return;
-                        }
-                        continue 'session;
-                    }
-                }
-            }
+            None => match dial_session(
+                server,
+                cfg,
+                ctx,
+                &shared,
+                &connects,
+                &reconnects,
+                &mut finished,
+                &mut connect_failures,
+                &mut cap_bounces,
+                &mut ever_connected,
+                am_keeper,
+            )
+            .await
+            {
+                DialStep::Conn(c) => c,
+                DialStep::Retry => continue 'session,
+                DialStep::Quit => return,
+            },
         };
 
         // An authenticated session supersedes any earlier refusal note: a
@@ -4157,6 +5405,7 @@ async fn session_loop(
                 .as_ref()
                 .is_some_and(|t| slot as usize >= t.get());
             if over_target && inflight.is_empty() && !shared.draining.load(Ordering::Acquire) {
+                shared.note_session_end(ctx.idx, 4);
                 conn.quit().await;
                 continue 'session;
             }
@@ -4182,6 +5431,7 @@ async fn session_loop(
             // a FRESH session, which is exactly the recovery a sick
             // connection needs.
             if inflight.len() > win && !shared.draining.load(Ordering::Acquire) {
+                shared.note_session_end(ctx.idx, 4);
                 shed_pipeline(&shared, &mut inflight).await;
                 conn.quit().await;
                 continue 'session;
@@ -4220,14 +5470,21 @@ async fn session_loop(
                 // the pool to pipeline depth one.
                 shared.charge_wire();
                 if conn.send_body(&w.id).await.is_err() {
-                    // Charge the failed article by making it the front-of-inflight
-                    // casualty so requeue_or_fail bumps attempts/tried_fail and
-                    // fails it past article_retries. Without this the item requeues
-                    // UNCHARGED (it was popped, never registered in inflight), and a
-                    // server that RSTs right after AUTH loops connect+AUTH forever on
-                    // a single-server job - pending never reaches 0. dup items are
+                    // Make the failed article the front-of-inflight casualty
+                    // so requeue_or_fail sees it (it was popped, never
+                    // registered in inflight). On a ZERO-response session it
+                    // is charged (attempts/tried_fail) - a server that RSTs
+                    // right after AUTH loops connect+AUTH forever on a
+                    // single-server job otherwise. After a completed
+                    // response (a body OR an authoritative 430/423) the
+                    // socket death is the session's fault, not this
+                    // article's, and it requeues uncharged. dup items are
                     // still dropped by requeue_or_fail.
                     inflight.push_front(w);
+                    // A failed send is the peer gone under us (RST/EPIPE)
+                    // - a session end like any read-side death, counted
+                    // so the churn census sees write-side exits too.
+                    shared.note_session_end(ctx.idx, 0);
                     if session_bytes > 0 {
                         // Flap breaker: an ESTABLISHED session (it served bytes)
                         // died - count it where it happens, not at some later
@@ -4235,7 +5492,16 @@ async fn session_loop(
                         // bounces most re-entries, which hid the churn entirely).
                         shared.note_flap(ctx.idx);
                     }
-                    requeue_or_fail(&shared, &out, cfg, ctx, &mut inflight, "send failed").await;
+                    requeue_or_fail(
+                        &shared,
+                        &out,
+                        cfg,
+                        ctx,
+                        &mut inflight,
+                        "send failed",
+                        session_responses == 0,
+                    )
+                    .await;
                     session_failures += 1;
                     pending_backoff = Some(session_backoff_delay(cfg, session_failures));
                     continue 'session;
@@ -4271,6 +5537,8 @@ async fn session_loop(
                 continue;
             }
             if conn.flush().await.is_err() {
+                // Write-side peer death, same as the failed send above.
+                shared.note_session_end(ctx.idx, 0);
                 if session_bytes > 0 {
                     // Flap breaker: an ESTABLISHED session (it served bytes)
                     // died - count it where it happens, not at some later
@@ -4278,7 +5546,16 @@ async fn session_loop(
                     // bounces most re-entries, which hid the churn entirely).
                     shared.note_flap(ctx.idx);
                 }
-                requeue_or_fail(&shared, &out, cfg, ctx, &mut inflight, "flush failed").await;
+                requeue_or_fail(
+                    &shared,
+                    &out,
+                    cfg,
+                    ctx,
+                    &mut inflight,
+                    "flush failed",
+                    session_responses == 0,
+                )
+                .await;
                 session_failures += 1;
                 pending_backoff = Some(session_backoff_delay(cfg, session_failures));
                 continue 'session;
@@ -4288,176 +5565,29 @@ async fn session_loop(
                 Some(p) => p.take(),
                 None => Vec::with_capacity(800 * 1024),
             };
-            // A worker mid-read must notice global completion: once a tail
-            // duplicate wins somewhere, waiting out a slow original here
-            // would stall the whole pool's return. It must also notice a
-            // PROMOTE while its in-flight article is non-promoted work: a
-            // streaming seek needs the whole line NOW, and 100+ conns
-            // placidly finishing frontier articles hold the promoted wave
-            // to one conn's fair share (measured 4-6 s per 32 MB window).
-            // Abandoning the read (reconnect, uncharged requeue) frees
-            // this conn for promoted work within ~a TLS handshake.
-            let mut shed_for_promote = false;
-            // TTFB-suspicion hedge (TODO 115): while this read is still
-            // pre-byte, a timer at the suspicion bound marks the front
-            // article suspect so other workers can dup-race it without
-            // waiting out the full adaptive budget. `status_seen` is the
-            // read's own report that bytes arrived - after that, silence
-            // is a body pacing question, not a dead connection, and the
-            // timer must not fire.
-            let ttfb_hedge_armed = cfg.ttfb_hedge && cfg.adaptive_timeout;
-            let status_seen = AtomicBool::new(false);
-            let suspect_front: Option<String> = if ttfb_hedge_armed {
-                inflight.front().map(|w| w.id.clone())
-            } else {
-                None
-            };
-            let suspect_timer = tokio::time::sleep(if ttfb_hedge_armed {
-                shared.ttfb_suspect_after(ctx.idx)
-            } else {
-                Duration::from_secs(0)
-            });
-            tokio::pin!(suspect_timer);
-            let mut suspect_armed = ttfb_hedge_armed;
-            let mut suspect_fired = false;
-            let read = {
-                let read_fut = async {
-                    if cfg.adaptive_timeout {
-                        // TODO 96.1: two-phase bound. Pre-byte budget
-                        // adapts to this server's measured TTFB; once
-                        // bytes flow only a genuine no-progress stall
-                        // trips. Both expiries land in the same stall
-                        // arm as the flat path's timeout (requeue with
-                        // uncharged pipeline-mates, reconnect, no
-                        // session strike).
-                        let budget = shared.ttfb_budget(ctx.idx);
-                        match conn
-                            .read_body_into_two_phase_noting(
-                                &mut buf,
-                                budget,
-                                ADAPTIVE_STALL,
-                                &status_seen,
-                            )
-                            .await
-                        {
-                            Ok((hit, ttfb)) => {
-                                shared.note_ttfb(ctx.idx, ttfb);
-                                Ok(Ok(hit))
-                            }
-                            Err(crate::nntp::NntpError::Timeout) => {
-                                // Censored sample: widen, or a budget
-                                // trained to the floor can never recover
-                                // from a provider that got slower (M4).
-                                shared.note_ttfb_timeout(ctx.idx);
-                                // Mark the graph, once a second per
-                                // server at most (a provider gone slow
-                                // expires budgets on every worker at
-                                // once) - same discipline as `blocked`.
-                                if let Some(l) = &cfg.live
-                                    && let Some(sl) = l.servers.get(ctx.idx)
-                                {
-                                    let now = now_ms();
-                                    let prev = sl.last_timeout_note.load(Ordering::Relaxed);
-                                    if now.saturating_sub(prev) >= 1000
-                                        && sl
-                                            .last_timeout_note
-                                            .compare_exchange(
-                                                prev,
-                                                now,
-                                                Ordering::Relaxed,
-                                                Ordering::Relaxed,
-                                            )
-                                            .is_ok()
-                                    {
-                                        l.note(
-                                            ctx.idx,
-                                            "timeout",
-                                            "a response ran past its adaptive time budget - \
-                                             widened the budget and retried",
-                                        );
-                                    }
-                                }
-                                Err(())
-                            }
-                            Err(e) => Ok(Err(e)),
-                        }
-                    } else {
-                        tokio::time::timeout(cfg.read_timeout, conn.read_body_into(&mut buf))
-                            .await
-                            .map_err(|_| ())
-                    }
-                };
-                tokio::pin!(read_fut);
-                loop {
-                    tokio::select! {
-                        r = &mut read_fut => break Some(r),
-                        // TTFB-suspicion: fires at most once per read.
-                        // Racing the status line's arrival is benign -
-                        // a mark on an article that completes a moment
-                        // later dies with its inflight entry.
-                        _ = &mut suspect_timer, if suspect_armed => {
-                            suspect_armed = false;
-                            suspect_fired = true;
-                            if !status_seen.load(Ordering::Acquire)
-                                && let Some(id) = &suspect_front
-                            {
-                                shared.mark_suspect(id);
-                            }
-                        }
-                        _ = async {
-                            let _ = finished.wait_for(|f| *f).await;
-                        } => break None,
-                        _ = promote_gen.changed() => {
-                            // Immune if ANY in-flight article is promoted
-                            // work - by flag (popped after the promote) OR
-                            // by id (dispatched before the promote but
-                            // inside its span; shedding those would just
-                            // refetch the same bytes after a reconnect).
-                            let fetching_promoted = inflight.iter().any(|w| w.promoted) || {
-                                let ids = shared.promoted_ids.lock_ok();
-                                inflight.iter().any(|w| ids.contains(&w.id))
-                            };
-                            // And only abandon a read that has already
-                            // proven slower than a reconnect (see
-                            // PROMOTE_SHED_MIN_AGE).
-                            let old_enough = inflight.front().is_none_or(|w| {
-                                shared
-                                    .inflight
-                                    .lock()
-                                    .unwrap()
-                                    .get(&w.id)
-                                    .is_none_or(|inf| inf.dispatched.elapsed() >= PROMOTE_SHED_MIN_AGE)
-                            });
-                            if shared.stream_active()
-                                && shared.promoted_pending.load(Ordering::Acquire) > 0
-                                && !fetching_promoted
-                                && old_enough
-                            {
-                                shed_for_promote = true;
-                                break None;
-                            }
-                            // Already fetching promoted work (or no
-                            // promoted work left): keep reading.
-                        }
-                    }
-                }
-            };
-            let Some(read) = read else {
+            let step = read_one(
+                &mut conn,
+                &mut buf,
+                cfg,
+                ctx,
+                &shared,
+                &inflight,
+                &mut finished,
+                &mut promote_gen,
+            )
+            .await;
+            let Some(read) = step.read else {
                 if let Some(p) = &cfg.buf_pool {
                     p.give(buf);
                 }
-                if shed_for_promote {
+                if step.shed_for_promote {
+                    shared.note_session_end(ctx.idx, 4);
                     shed_pipeline(&shared, &mut inflight).await;
                     conn.quit().await; // internally bounded
                     continue 'session;
                 }
                 shared.release_wire(inflight.len());
-                // A peer that has sat mute past the suspicion bound will
-                // not answer a QUIT either - the politeness is quit()'s
-                // full 500 ms bound added to the JOB's wall (the run is
-                // over; this worker is the last thing joined on). Dropping
-                // the connection closes the socket regardless.
-                if !(suspect_fired && !status_seen.load(Ordering::Acquire)) {
+                if !step.mute_suspect {
                     conn.quit().await; // internally bounded
                 }
                 return;
@@ -4471,292 +5601,61 @@ async fn session_loop(
             // not clear its counter just by connecting again.
             if matches!(&read, Ok(Ok(_))) {
                 session_failures = 0;
+                session_responses += 1;
             }
             match read {
                 Ok(Ok(true)) => {
-                    let mut w = inflight.pop_front().expect("response without command");
-                    shared.release_wire(1);
-                    session_bytes += buf.len() as u64;
-                    shared.bytes[ctx.idx].fetch_add(buf.len() as u64, Ordering::Relaxed);
-                    if let Some(l) = &cfg.live {
-                        l.servers[ctx.idx]
-                            .bytes
-                            .fetch_add(buf.len() as u64, Ordering::Relaxed);
-                    }
-                    // Speed limiter: charge the body and sleep off any debt
-                    // BEFORE processing continues (async - the runtime
-                    // thread stays free for other workers' I/O).
-                    if let Some(rate) = &cfg.rate {
-                        rate.throttle(buf.len() as u64).await;
-                    }
-                    // M29 oracle: a served body is a labeled "this
-                    // backbone HAS articles of this age" sample - charged
-                    // per 222 regardless of who owns the outcome (dups
-                    // included; the response is real evidence either way).
-                    if let Some(o) = &cfg.oracle {
-                        o.hit(ctx.idx, shared.ages.get(&w.id).copied().unwrap_or(0));
-                    }
-                    // CRC retry-elsewhere (TODO 111, dark behind
-                    // NZBFAST_CRC_RETRY=1) - see `crc_gate`.
-                    if cfg.crc_retry {
-                        match crc_gate(cfg, &shared, ctx, w, &buf, &mut crc_scratch).await {
-                            CrcVerdict::Accept(back) => w = back,
-                            CrcVerdict::Handled => {
-                                if let Some(p) = &cfg.buf_pool {
-                                    p.give(buf);
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                    shared.deregister_inflight_done(&w);
-                    if shared.claim_done(&w.id) {
-                        race_losses = 0;
-                        if w.dup {
-                            shared.dup_wins.fetch_add(1, Ordering::Relaxed);
-                        }
-                        // Handing a body downstream is where a SLOW DISK
-                        // becomes visible: when decode/verify/write cannot
-                        // keep up the channel fills, this await parks, and
-                        // the TCP windows close behind it. That is the
-                        // designed response - but it is indistinguishable
-                        // from a network dip on the graph unless somebody
-                        // measures it, so this does.
-                        //
-                        // try_send first, so the healthy path costs no
-                        // clock read at all: only a body that actually had
-                        // to WAIT is timed. Everything else would put an
-                        // Instant::now() on the hot path of every article
-                        // to observe a number that is almost always zero.
-                        // Mark ARRIVED across the (possibly parked)
-                        // handoff - see the `done_ok` field doc.
-                        let arrived = w.id.clone();
-                        shared.done_ok.lock_ok().insert(arrived.clone());
-                        let done = FetchOutcome::Done { id: w.id, raw: buf };
-                        if let Err(tokio::sync::mpsc::error::TrySendError::Full(done)) =
-                            out.try_send(done)
-                        {
-                            let waited = std::time::Instant::now();
-                            let _ = out.send(done).await;
-                            let ms = waited.elapsed().as_millis() as u64;
-                            if let Some(live) = &cfg.live
-                                && let Some(sl) = live.servers.get(ctx.idx)
-                            {
-                                sl.blocked_ms.fetch_add(ms, Ordering::Relaxed);
-                                // A pause long enough to bend the graph
-                                // earns a mark on it. Brief parks are
-                                // NORMAL - the channel is meant to fill -
-                                // so only a wait a person could see counts,
-                                // and at most one a second per server.
-                                if ms >= BLOCKED_NOTE_MS {
-                                    let now = now_ms();
-                                    let prev = sl.last_blocked_note.load(Ordering::Relaxed);
-                                    if now.saturating_sub(prev) >= 1000
-                                        && sl
-                                            .last_blocked_note
-                                            .compare_exchange(
-                                                prev,
-                                                now,
-                                                Ordering::Relaxed,
-                                                Ordering::Relaxed,
-                                            )
-                                            .is_ok()
-                                    {
-                                        live.note(
-                                            ctx.idx,
-                                            "blocked",
-                                            format!("waited {ms} ms for the write side"),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        // The channel owns the body now; a lingering
-                        // entry would keep ±slack neighbors "live"
-                        // forever and no dead-span verdict could fire.
-                        shared.done_ok.lock_ok().remove(&arrived);
-                        shared.complete_one();
-                    } else {
-                        // A duplicate dispatch beat us to it.
-                        if let Some(p) = &cfg.buf_pool {
-                            p.give(buf);
-                        }
-                        // Recycle experiment: losing races back to back
-                        // means THIS session is the slow one - a fresh
-                        // dial to the same host routinely beats a
-                        // degraded TCP session. Deliberate reconnect:
-                        // no session strike, no backoff (same shape as
-                        // the promote shed above); the redial path
-                        // counts it into `reconnects`.
-                        //
-                        // Endgame losses do NOT count (TODO 111 gauntlet):
-                        // once the fan-out arms, idle workers race EVERY
-                        // straggler, so a healthy-but-jittery session
-                        // loses races routinely through no fault of its
-                        // own - the gauntlet measured a satellite-shaped
-                        // server recycled mid-tail for exactly this.
-                        // Normal-phase losses - the rate rule or the
-                        // hedge picking on this session's articles
-                        // specifically - remain the evidence they were.
-                        // Same stance as the slope recycle below, which
-                        // has excluded the endgame from day one.
-                        let endgame = shared.pending.load(Ordering::Acquire) <= ENDGAME_MAX
-                            || (shared.tail_fanout_early
-                                && shared.tail_started.lock_ok().is_some());
-                        if !endgame {
-                            race_losses += 1;
-                        }
-                        if cfg.recycle_slow && race_losses >= RECYCLE_RACE_LOSSES {
-                            if let Some(l) = &cfg.live {
-                                l.note(
-                                    ctx.idx,
-                                    "reconnect",
-                                    format!(
-                                        "recycled a slow session after losing \
-                                         {race_losses} article races in a row"
-                                    ),
-                                );
-                            }
-                            race_losses = 0;
-                            shed_pipeline(&shared, &mut inflight).await;
-                            conn.quit().await; // internally bounded
-                            continue 'session;
-                        }
-                    }
-                    // Slope-recycle experiment: this session's own rate
-                    // collapsed against the fleet's per-worker average -
-                    // redial before it strands anything. Normal phase
-                    // only (endgame workers are legitimately idle-ish,
-                    // and the tail machinery owns that ground), and only
-                    // once the session has had 10 s to prove itself.
-                    // Checked ONLY on a completed article, so an idle
-                    // worker's decaying average can never trip it.
-                    if cfg.recycle_slope
-                        && shared.pending.load(Ordering::Acquire) > ENDGAME_MAX
-                        && session_start.elapsed() > Duration::from_secs(10)
+                    match handle_body(
+                        cfg,
+                        ctx,
+                        &shared,
+                        &out,
+                        &mut inflight,
+                        buf,
+                        &mut race_losses,
+                        &mut session_bytes,
+                        session_start,
+                    )
+                    .await
                     {
-                        let mine = session_bytes as f64 / session_start.elapsed().as_secs_f64();
-                        let fleet = shared.rate_per_worker(ctx.idx);
-                        if fleet > 0.0 && mine < 0.25 * fleet {
-                            if let Some(l) = &cfg.live {
-                                l.note(
-                                    ctx.idx,
-                                    "reconnect",
-                                    format!(
-                                        "recycled a degraded session ({:.1} MB/s vs the \
-                                         fleet's {:.1} MB/s per connection)",
-                                        mine / 1e6,
-                                        fleet / 1e6
-                                    ),
-                                );
-                            }
-                            shed_pipeline(&shared, &mut inflight).await;
+                        BodyStep::Proceed => {}
+                        BodyStep::Recycle => {
+                            // Deliberate hangup (slow-session recycle):
+                            // ours, and the census must say so.
+                            shared.note_session_end(ctx.idx, 4);
                             conn.quit().await; // internally bounded
                             continue 'session;
                         }
                     }
                 }
                 Ok(Ok(false)) => {
-                    let mut w = inflight.pop_front().expect("response without command");
-                    shared.release_wire(1);
-                    if let Some(p) = &cfg.buf_pool {
-                        p.give(buf);
-                    }
-                    // Reliability: this server said "no such article" -
-                    // charged even for dups (the response is authoritative
-                    // for this server regardless of who owns the outcome).
-                    if let Some(l) = &cfg.live {
-                        l.servers[ctx.idx]
-                            .articles_missing
-                            .fetch_add(1, Ordering::Relaxed);
-                        // Windowed: a take-down or backfill hole answers
-                        // 430 by the hundred, and each one lands here.
-                        l.note_missing_burst(ctx.idx);
-                    }
-                    // M29 oracle: the mirror of the hit above - one miss
-                    // per actual 430/423 wire response. Derived Missing
-                    // verdicts (retention seeding, unanimity) are NOT
-                    // recorded; only real answers train the ledger.
-                    if let Some(o) = &cfg.oracle {
-                        o.miss(ctx.idx, shared.ages.get(&w.id).copied().unwrap_or(0));
-                    }
-                    if w.dup {
-                        // M2c.4: a duplicate's 430 is real evidence, not a
-                        // discard - merge it into the article's
-                        // authoritative mask (the inflight entry while the
-                        // original is out reading, the queued copy if it
-                        // already requeued) and declare Missing the moment
-                        // the union goes unanimous, instead of waiting for
-                        // the original to walk the rest of the ladder.
-                        let live = shared.live_mask();
-                        let mut unanimous = false;
-                        {
-                            let mut m = shared.inflight.lock_ok();
-                            if let Some(inf) = m.get_mut(&w.id) {
-                                inf.tried_430 |= ctx.group_bits;
-                                unanimous = inf.tried_430 & live == live;
-                            }
-                        }
-                        if !unanimous {
-                            // Tail queues are tiny (endgame ≤64) - a linear
-                            // stamp is cheap, and a miss (article mid-hand-
-                            // off) only costs one redundant attempt.
-                            let mut q = shared.queue.lock().await;
-                            if let Some(qi) = q.iter_mut().find(|x| x.id == w.id) {
-                                qi.tried_430 |= ctx.group_bits;
-                                unanimous = qi.tried_430 & live == live;
-                            }
-                        }
-                        if unanimous && shared.claim_done(&w.id) {
-                            let _ = out
-                                .send(FetchOutcome::Missing {
-                                    id: w.id,
-                                    cause: MissingCause::Gone,
-                                })
-                                .await;
-                            shared.complete_one();
-                        }
-                        continue;
-                    }
-                    // Fold in any 430s duplicate dispatches accumulated on
-                    // the inflight entry while this original was reading.
-                    if let Some(inf) = shared.inflight.lock_ok().remove(&w.id) {
-                        w.tried_430 |= inf.tried_430;
-                    }
-                    // 430 is authoritative for this server AND its mirror
-                    // group; route to untried LIVE servers before declaring
-                    // the article missing (dead servers can never answer -
-                    // counting them here deadlocked the run pre-fix).
-                    w.tried_430 |= ctx.group_bits;
-                    let live = shared.live_mask();
-                    if w.tried_430 & live == live {
-                        if shared.claim_done(&w.id) {
-                            let _ = out
-                                .send(FetchOutcome::Missing {
-                                    id: w.id,
-                                    cause: MissingCause::Gone,
-                                })
-                                .await;
-                            shared.complete_one();
-                        }
-                    } else if w.promoted {
-                        // A promoted (playhead) article 430'd here must
-                        // retry on another backbone NOW - at the queue
-                        // back it sits behind gigabytes while the player
-                        // starves (live wedge: DMCA-holed head articles
-                        // cycling 430 → back → re-promote → 430).
-                        let mut q = shared.queue.lock().await;
-                        let at = q.iter().take_while(|x| x.promoted).count().min(q.len());
-                        shared.promoted_pending.fetch_add(1, Ordering::AcqRel);
-                        q.insert(at, w);
-                    } else {
-                        shared.queue.lock().await.push_back(w);
-                    }
+                    handle_missing(
+                        cfg,
+                        ctx,
+                        &shared,
+                        &out,
+                        &mut inflight,
+                        buf,
+                        step.miss_echoed,
+                    )
+                    .await;
                 }
                 Ok(Err(e)) => {
                     if let Some(p) = &cfg.buf_pool {
                         p.give(buf);
                     }
+                    // WHO hung up (TODO 121 diagnostics): an I/O-flavoured
+                    // error OR a clean EOF (`Closed` - read_status maps
+                    // n==0 to it, and a between-responses FIN is the
+                    // commonest churn shape of all) is the peer closing
+                    // under us; anything else is an answer we could not
+                    // use. Counted here, at the death, for the same
+                    // reason note_flap is.
+                    let peer_closed = matches!(
+                        e,
+                        crate::nntp::NntpError::Io(_) | crate::nntp::NntpError::Closed
+                    );
+                    shared.note_session_end(ctx.idx, if peer_closed { 0 } else { 1 });
                     conn.quit().await;
                     if session_bytes > 0 {
                         // Flap breaker: an ESTABLISHED session (it served bytes)
@@ -4765,28 +5664,82 @@ async fn session_loop(
                         // bounces most re-entries, which hid the churn entirely).
                         shared.note_flap(ctx.idx);
                     }
-                    requeue_or_fail(&shared, &out, cfg, ctx, &mut inflight, &e.to_string()).await;
+                    requeue_or_fail(
+                        &shared,
+                        &out,
+                        cfg,
+                        ctx,
+                        &mut inflight,
+                        &e.to_string(),
+                        session_responses == 0,
+                    )
+                    .await;
                     session_failures += 1;
                     pending_backoff = Some(session_backoff_delay(cfg, session_failures));
                     continue 'session;
                 }
                 Err(_) => {
                     // Stalled mid-response; connection state unusable.
+                    // Body bytes of the CURRENT response count as flap
+                    // progress: `session_bytes` holds only COMPLETED
+                    // bodies, so a provider that repeatedly serves a
+                    // status plus most of a first body and then wedges
+                    // read as zero-work and never entered the keeper
+                    // clamp, however often it did it.
+                    let partial_bytes = buf.len() as u64;
                     if let Some(p) = &cfg.buf_pool {
                         p.give(buf);
                     }
-                    if session_bytes > 0 {
-                        // Flap breaker: an ESTABLISHED session (it served bytes)
-                        // died - count it where it happens, not at some later
-                        // redial this worker may never win (a capped provider
-                        // bounces most re-entries, which hid the churn entirely).
-                        shared.note_flap(ctx.idx);
-                    }
-                    requeue_or_fail(&shared, &out, cfg, ctx, &mut inflight, "read stall").await;
+                    // OUR deadline ended this session, not the peer. Split
+                    // pre-byte from mid-flow: giving up before the first
+                    // byte is our budget choice, a mid-flow stop is a wedge.
+                    shared.note_session_end(ctx.idx, if step.prebyte_expired { 2 } else { 3 });
+                    note_read_stall(
+                        &shared,
+                        ctx.idx,
+                        session_bytes + partial_bytes,
+                        step.prebyte_expired,
+                        inflight.front_mut(),
+                    );
+                    // The stall implicates the FRONT article - its own
+                    // response budget expired - so the charge stays
+                    // unconditional: a mute-on-one-article server must
+                    // still walk that article to a terminal verdict.
+                    requeue_or_fail(&shared, &out, cfg, ctx, &mut inflight, "read stall", true)
+                        .await;
                     continue 'session;
                 }
             }
         }
+    }
+}
+
+/// The read-stall bookkeeping split by WHY the read ended (TODO
+/// 121.1/.2). A pre-byte adaptive expiry escalates the charged front
+/// article's OWN next-attempt budget (per-server widening alone
+/// re-floors between that article's retries) and is NOT a flap death:
+/// giving up pre-byte was our budget choice, and a heavy-tailed but
+/// healthy provider (cold storage at trained-floor budgets) produces
+/// FLAP_DEATHS of them a minute without a session actually dying -
+/// clamping it to keepers punished the wrong party. A mid-flow stall
+/// on an established session stays a death: bytes were moving and
+/// stopped, which is the wedge the flap breaker exists for.
+fn note_read_stall(
+    shared: &Shared,
+    idx: usize,
+    session_bytes: u64,
+    prebyte_expired: bool,
+    front: Option<&mut Work>,
+) {
+    if prebyte_expired {
+        if let Some(w) = front {
+            w.prebyte_expiries = w.prebyte_expiries.saturating_add(1);
+        }
+    } else if session_bytes > 0 {
+        // Count it where it happens, not at some later redial this
+        // worker may never win (a capped provider bounces most
+        // re-entries, which hid the churn entirely).
+        shared.note_flap(idx);
     }
 }
 
@@ -4835,6 +5788,7 @@ async fn seal_run(shared: &Arc<Shared>, out: &mpsc::Sender<FetchOutcome>, reason
         orphans.extend(q.drain(..).map(|w| w.id));
         let mut inf = shared.inflight.lock_ok();
         orphans.extend(inf.drain().map(|(id, _)| id));
+        orphans.extend(shared.steer_inbox.lock_ok().drain(..).map(|w| w.id));
     }
     let mut sealed = 0usize;
     for id in orphans {
@@ -4957,6 +5911,21 @@ async fn backoff_or_finish(
     }
 }
 
+/// `charge_front`: whether the front-of-pipeline casualty pays for the
+/// death (attempts bump + this server's `tried_fail` bit). Pass true
+/// when the front article is implicated - its own read stalled past
+/// budget, or the session never did any useful work (the RST-after-AUTH
+/// livelock the charge exists to break). Pass false for a clean
+/// connection death AFTER at least one completed body: that is the flap
+/// shape, the next-queued article is innocent, and branding it walked a
+/// whole twin-only backlog into the queue - the flapping server then
+/// sat idle for the entire drain of a bandwidth-saturated sibling
+/// (measured 7.5 s of wasted capacity per 300 MB on the chaos flap
+/// leg) because every queued article carried its bit and
+/// `other_can_take` barred a retake. A session with a completed body
+/// is progress by definition, so the uncharged requeue cannot livelock:
+/// the moment such an article is the FIRST casualty of a zero-work
+/// session, that session charges it.
 async fn requeue_or_fail(
     shared: &Shared,
     out: &mpsc::Sender<FetchOutcome>,
@@ -4964,6 +5933,7 @@ async fn requeue_or_fail(
     ctx: ServerCtx,
     inflight: &mut VecDeque<Work>,
     error: &str,
+    charge_front: bool,
 ) {
     // Failed outcomes are emitted AFTER the queue lock drops: `out` is a
     // bounded channel, and a send that parks on a slow consumer while the
@@ -4975,7 +5945,7 @@ async fn requeue_or_fail(
         let mut q = shared.queue.lock().await;
         let mut first = true;
         while let Some(mut w) = inflight.pop_front() {
-            let charged = first;
+            let charged = first && charge_front;
             first = false;
             if w.dup {
                 continue;
@@ -5353,6 +6323,8 @@ mod tests {
             tried_430: 0,
             tried_fail: 0,
             dup: false,
+            prebyte_expiries: 0,
+            soft_430: 0,
         });
         assert!(next_work(&shared, ctx, &tx, 0).await.is_none(), "throttled");
         assert_eq!(shared.queue.lock().await.len(), 51, "queue untouched");
@@ -5411,6 +6383,8 @@ mod tests {
             tried_430: 0b010,
             tried_fail: 0,
             dup: false,
+            prebyte_expiries: 0,
+            soft_430: 0,
         };
         shared.register_inflight(&lad, 0);
 
@@ -5454,6 +6428,8 @@ mod tests {
             tried_430: 0b010,
             tried_fail: 0,
             dup: false,
+            prebyte_expiries: 0,
+            soft_430: 0,
         };
         big.register_inflight(&lad2, 0);
         assert!(
@@ -5514,6 +6490,8 @@ mod tests {
             tried_430: 0,
             tried_fail: 0,
             dup: false,
+            prebyte_expiries: 0,
+            soft_430: 0,
         };
         shared.register_inflight(&w, 0);
 
@@ -5564,6 +6542,8 @@ mod tests {
             tried_430: 0,
             tried_fail: 0,
             dup: false,
+            prebyte_expiries: 0,
+            soft_430: 0,
         };
         shared.register_inflight(&w2, 0);
         shared
@@ -5605,6 +6585,8 @@ mod tests {
             tried_430: 0,
             tried_fail: 0,
             dup: false,
+            prebyte_expiries: 0,
+            soft_430: 0,
         };
         big.register_inflight(&w3, 0);
         big.inflight.lock_ok().get_mut("<n0>").unwrap().dispatched =
@@ -5612,2894 +6594,6 @@ mod tests {
         assert!(
             big.pick_dup(1, 0b010, 0b010, 0, 0, 0).is_none(),
             "speculated outside the endgame"
-        );
-    }
-
-    /// Payout rig: run one full fetch against mock servers and return
-    /// (elapsed, done-count, reconnect-note ring). Every leg must
-    /// complete every article - a payout that loses data is a loss.
-    async fn payout_leg(
-        servers: Vec<(ServerConfig, PoolConfig)>,
-        ids: Vec<ArticleReq>,
-    ) -> (Duration, usize, Vec<String>) {
-        let live = LiveStats::for_servers(&servers);
-        let servers: Vec<(ServerConfig, PoolConfig)> = servers
-            .into_iter()
-            .map(|(s, mut c)| {
-                c.live = Some(live.clone());
-                (s, c)
-            })
-            .collect();
-        let (tx, mut rx) = mpsc::channel(64);
-        let t0 = Instant::now();
-        let fetch = tokio::spawn(async move { fetch_all_multi(&servers, ids, tx).await });
-        let collect = tokio::spawn(async move {
-            let mut done = 0usize;
-            while let Some(o) = rx.recv().await {
-                if matches!(o, FetchOutcome::Done { .. }) {
-                    done += 1;
-                }
-            }
-            done
-        });
-        tokio::time::timeout(Duration::from_secs(120), fetch)
-            .await
-            .expect("payout leg hung")
-            .unwrap();
-        let elapsed = t0.elapsed();
-        let done = collect.await.unwrap();
-        let notes: Vec<String> = live
-            .events
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|e| format!("{} {}", e.host, e.detail))
-            .collect();
-        (elapsed, done, notes)
-    }
-
-    fn payout_server(
-        srv: &crate::mock::MockServer,
-        conns: usize,
-        cfg: PoolConfig,
-    ) -> (ServerConfig, PoolConfig) {
-        let mut sc = srv.server_config();
-        sc.connections = conns as u32;
-        (
-            sc,
-            PoolConfig {
-                connections: conns,
-                ramp_delay: Duration::from_millis(0),
-                ..cfg
-            },
-        )
-    }
-
-    /// PAYOUT: hedged requests, in the one shape the OLD rules cannot
-    /// see. A single article stalls on a server whose other connection
-    /// stays healthy - so the owner never reads as slow (the 2x rate
-    /// rule stays dark) and the only rescues are the flat 8 s stale
-    /// rule (off) versus the hedge's adaptive bound (on). Both servers
-    /// are throttled to EQUAL per-connection rates for the same reason.
-    /// The first version of this rig stalled ids early on an unthrottled
-    /// server and proved something else entirely: the rate rule rescued
-    /// everything in 500 ms because a hung loopback server's per-worker
-    /// rate collapses instantly. That is worth knowing - the existing
-    /// rules already cover the whole-server-degraded shape - but the
-    /// hedge exists for the single-straggler-on-a-healthy-server shape,
-    /// which is what this rig now builds.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - flaky under suite load, run with --ignored"]
-    async fn payout_hedge_rescues_stalls_in_under_a_second_not_eight() {
-        let data: Vec<u8> = (0..640_000u32).map(|i| i as u8).collect();
-        let mk_maps = || {
-            let mut articles = std::collections::HashMap::new();
-            let segs = crate::mock::make_file_articles("h.bin", &data, 8_000, "hp", &mut articles);
-            (articles, segs)
-        };
-        let (arts_a, segs) = mk_maps();
-        let (arts_b, _) = mk_maps();
-        // Stragglers late in the queue, so the owner has a healthy rate
-        // history when they hit. Several of them, and A gets 3 of the 4
-        // connections below, because the mock's stall triggers on the
-        // FIRST request for an id wherever it lands: a single stalled id
-        // first-requested by healthy B proves nothing, and which server
-        // wins that race is a coin flip. Six ids against a 3:1 fleet
-        // makes "no stall ever bit A" a (1/4)^6 event.
-        let stall: std::collections::HashSet<String> = [55, 59, 63, 67, 71, 75]
-            .into_iter()
-            .map(|i| format!("<{}>", segs[i].0))
-            .collect();
-        let leg = |hedge: bool| {
-            let arts_a = arts_a.clone();
-            let arts_b = arts_b.clone();
-            let stall = stall.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                // 40 KB/s per connection stretches the run to ~4 s of
-                // pre-stall history. That matters: the old rate rule
-                // rescues once the hung server's RUN-AVERAGE decays
-                // past 2x, and that crossing lands at roughly four
-                // times the stall's onset - a fast rig compresses it
-                // right onto the hedge's own timescale and the two
-                // become indistinguishable (measured: 2.2 s vs 1.9 s
-                // at 200 KB/s). At 40 KB/s the old rules answer at
-                // ~11 s (flat-8s stale wins the crossing race), the
-                // hedge at ~5 s, and the gap is the payout.
-                let equal_rate = crate::mock::Throttle {
-                    per_conn_bps: 40_000,
-                    ..Default::default()
-                };
-                let a = crate::mock::MockServer::start(
-                    arts_a,
-                    crate::mock::Chaos {
-                        stall,
-                        throttle: equal_rate.clone(),
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let b = crate::mock::MockServer::start(
-                    arts_b,
-                    crate::mock::Chaos {
-                        throttle: equal_rate,
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    hedge,
-                    window: 2,
-                    read_timeout: Duration::from_secs(12),
-                    ..Default::default()
-                };
-                let servers = vec![payout_server(&a, 3, cfg.clone()), payout_server(&b, 1, cfg)];
-                let r = payout_leg(servers, ids).await;
-                println!(
-                    "  leg: A served {} accepted {} · B served {} accepted {}",
-                    a.served.load(Ordering::Relaxed),
-                    a.accepted.load(Ordering::Relaxed),
-                    b.served.load(Ordering::Relaxed),
-                    b.accepted.load(Ordering::Relaxed),
-                );
-                r
-            }
-        };
-        let (off, done_off, _) = leg(false).await;
-        let (on, done_on, _) = leg(true).await;
-        println!("hedge payout: off {off:?} on {on:?}");
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        // Off: the stragglers wait for whichever old rule answers first
-        // (flat-8s stale, or the run-average crossing).
-        assert!(
-            off > Duration::from_secs(9),
-            "off leg finished too fast for the stalls to have bitten \
-             ({off:?}) - rig broken"
-        );
-        // On: the hedge rescues at the adaptive bound. Measured over
-        // repeated runs: off 11.9-13.0 s, on 6.2-7.9 s - a ratio bound
-        // absorbs the serialization variance through B's single idle
-        // connection where an absolute one flaked.
-        assert!(
-            on.as_secs_f64() < off.as_secs_f64() * 0.75,
-            "hedge paid out nothing ({on:?} vs {off:?})"
-        );
-    }
-
-    /// PAYOUT: slope recycle. One degraded session (8 KB/s against
-    /// healthy 100 KB/s siblings) on a single server. Reactive rules
-    /// cannot dup same-server outside the tail; the slope recycle
-    /// redials the degraded session as soon as it proves itself slow,
-    /// and the replacement is healthy. Slow by construction (~1 min for
-    /// both legs) - run explicitly.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "payout measurement (~1 min) - run with --ignored"]
-    async fn payout_slope_recycle_frees_a_degraded_session() {
-        let data: Vec<u8> = (0..6_000_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("s.bin", &data, 50_000, "sp", &mut articles);
-        let leg = |slope: bool| {
-            let articles = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let srv = crate::mock::MockServer::start(
-                    articles,
-                    crate::mock::Chaos {
-                        slow_conn: Some((1, 8_000)),
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 100_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    recycle_slope: slope,
-                    ..Default::default()
-                };
-                payout_leg(vec![payout_server(&srv, 3, cfg)], ids).await
-            }
-        };
-        let (off, done_off, notes_off) = leg(false).await;
-        let (on, done_on, notes_on) = leg(true).await;
-        println!("slope payout: off {off:?} on {on:?} (notes on: {notes_on:?})");
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        assert!(
-            notes_on.iter().any(|n| n.contains("degraded session")),
-            "slope recycle never fired on the degraded-session rig"
-        );
-        assert!(
-            !notes_off.iter().any(|n| n.contains("degraded session")),
-            "off leg recycled - knob leak"
-        );
-        assert!(
-            on < off,
-            "recycling the degraded session did not pay ({on:?} vs {off:?})"
-        );
-    }
-
-    /// PAYOUT: hot spare. Connections die every 5 bodies and a dial
-    /// costs 250 ms (the mock's greeting delay standing in for
-    /// TCP+TLS+AUTH). The spare pays that cost in the background; the
-    /// workers' critical path skips it.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - flaky under suite load, run with --ignored"]
-    async fn payout_hot_spare_hides_reconnect_latency() {
-        let data: Vec<u8> = (0..1_800_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("k.bin", &data, 20_000, "ks", &mut articles);
-        let leg = |spare: bool| {
-            let articles = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let srv = crate::mock::MockServer::start(
-                    articles,
-                    crate::mock::Chaos {
-                        drop_after: 8,
-                        greet_delay_ms: 250,
-                        // Throttled so deaths arrive slower than the
-                        // spare's refill cycle (poll + greet ~750 ms) -
-                        // the realistic shape; unthrottled loopback
-                        // kills sessions every few ms and no filler
-                        // could keep up (nor would it need to: that
-                        // shape is a dead server, not a flapping one).
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 200_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    hot_spare: spare,
-                    connect_backoff: Duration::from_millis(50),
-                    ..Default::default()
-                };
-                payout_leg(vec![payout_server(&srv, 3, cfg)], ids).await
-            }
-        };
-        let (off, done_off, _) = leg(false).await;
-        let (on, done_on, _) = leg(true).await;
-        println!("spare payout: off {off:?} on {on:?}");
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        // The saving is bounded by the filler's 500 ms refill cycle
-        // against this rig's ~300 ms death spacing (~2-3 of 11 deaths
-        // covered, ~200 ms measured). Real sessions die minutes apart,
-        // where every death is covered; the refill cadence is the
-        // tuning lever if this graduates.
-        assert!(
-            on + Duration::from_millis(100) < off,
-            "the spare hid no reconnect latency ({on:?} vs {off:?})"
-        );
-    }
-
-    /// Flap breaker: six established-session deaths inside the window
-    /// flip a server to flapping (a trickle outside it never does); the
-    /// clamp needs another live server; the keeper slot is claimed
-    /// exactly once.
-    #[tokio::test]
-    async fn flap_breaker_clamps_a_flapping_server_to_one_keeper() {
-        let mk = |host: &str| {
-            (
-                ServerConfig {
-                    host: host.into(),
-                    port: 119,
-                    tls: false,
-                    username: None,
-                    password: None,
-                    connections: 1,
-                    pin_connections: false,
-                    level: 0,
-                    group: None,
-                    retention_days: 0,
-                    rcvbuf: None,
-                    block_bytes: None,
-                    bind_ip: None,
-                    socks5: None,
-                    enabled: true,
-                    warm_pool: false,
-                    idle_release_secs: None,
-                    idle_keep: None,
-                    max_source_ips: None,
-                },
-                PoolConfig::default(),
-            )
-        };
-        let servers = vec![mk("flappy"), mk("steady")];
-        let reqs: Vec<ArticleReq> = (0..4)
-            .map(|i| ArticleReq::fresh(format!("<f{i}>")))
-            .collect();
-        let (shared, _) = Shared::new(reqs, &servers);
-        shared.alive[1].store(1, Ordering::Relaxed);
-
-        for _ in 0..(FLAP_DEATHS - 1) {
-            shared.note_flap(0);
-        }
-        assert!(!shared.is_flapping(0), "one short of the threshold");
-        shared.note_flap(0);
-        assert!(shared.is_flapping(0));
-        assert!(shared.other_live(0), "steady is live");
-
-        // Keeper slot: exactly one claimant wins (the default target is
-        // one, however many capacity bounces were sampled).
-        let claim = |target: usize| {
-            shared.flap_keeper[0]
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |k| {
-                    (k < target).then_some(k + 1)
-                })
-                .is_ok()
-        };
-        let target = shared.flap_keeper_target(0, &servers[0].1);
-        assert_eq!(target, 1, "shipped default: one keeper");
-        assert!(claim(target), "first claim takes the keeper slot");
-        assert!(!claim(target), "second claim must lose");
-
-        // A lone server is never clamped - churn beats zero throughput.
-        shared.alive[1].store(0, Ordering::Relaxed);
-        assert!(!shared.other_live(0), "no other live server");
-    }
-
-    /// Cap-aware keepers (TODO 115): with `flap_cap_keepers` on, the
-    /// keeper target follows the OBSERVED accept cap - sessions held at
-    /// the moment a dial bounced off a capacity refusal - never above
-    /// the connection budget, and stays at the conservative one when no
-    /// bounce was ever sampled or the knob is off.
-    #[tokio::test]
-    async fn flap_keeper_target_follows_observed_cap() {
-        let mk = |host: &str, cap_aware: bool| {
-            (
-                ServerConfig {
-                    host: host.into(),
-                    port: 119,
-                    tls: false,
-                    username: None,
-                    password: None,
-                    connections: 8,
-                    pin_connections: false,
-                    level: 0,
-                    group: None,
-                    retention_days: 0,
-                    rcvbuf: None,
-                    block_bytes: None,
-                    bind_ip: None,
-                    socks5: None,
-                    enabled: true,
-                    warm_pool: false,
-                    idle_release_secs: None,
-                    idle_keep: None,
-                    max_source_ips: None,
-                },
-                PoolConfig {
-                    connections: 8,
-                    flap_cap_keepers: cap_aware,
-                    ..PoolConfig::default()
-                },
-            )
-        };
-        let servers = vec![mk("burned", true), mk("steady", true)];
-        let reqs: Vec<ArticleReq> = (0..4)
-            .map(|i| ArticleReq::fresh(format!("<f{i}>")))
-            .collect();
-        let (shared, _) = Shared::new(reqs, &servers);
-
-        // No bounce ever sampled: the clamp stays at one.
-        assert_eq!(shared.flap_keeper_target(0, &servers[0].1), 1);
-
-        // Two sessions held when the dial bounced: target 2.
-        shared.sessions[0].store(2, Ordering::Release);
-        shared.note_cap_bounce(0);
-        assert_eq!(shared.flap_keeper_target(0, &servers[0].1), 2);
-
-        // A later bounce against ghost-held slots (fewer of OUR
-        // sessions live) must not shrink the estimate.
-        shared.sessions[0].store(0, Ordering::Release);
-        shared.note_cap_bounce(0);
-        assert_eq!(shared.flap_keeper_target(0, &servers[0].1), 2);
-
-        // The connection budget is a hard ceiling - the account's own
-        // limits (and max_source_ips-derived caps) already landed there.
-        shared.sessions[0].store(30, Ordering::Release);
-        shared.note_cap_bounce(0);
-        assert_eq!(shared.flap_keeper_target(0, &servers[0].1), 8);
-
-        // Knob off: shipped behavior, one keeper, whatever was seen.
-        let off = mk("burned", false);
-        assert_eq!(shared.flap_keeper_target(0, &off.1), 1);
-    }
-
-    /// PAYOUT (fault campaign, TODO 111): the IP-cap flap - the
-    /// production eweka shape. Server "burned" allows 2 concurrent
-    /// sessions (the rest bounce off a 502 cap refusal), and the two
-    /// winners die every 2 bodies at a crawl; "steady" is healthy. The
-    /// flap breaker should collapse burned's churn to one keeper and
-    /// leave the wall no worse.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - run with --ignored"]
-    async fn payout_flap_breaker_collapses_ip_cap_churn() {
-        let data: Vec<u8> = (0..8_000_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("c.bin", &data, 50_000, "fc", &mut articles);
-        let leg = |breaker: bool| {
-            let arts_a = articles.clone();
-            let arts_b = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let burned = crate::mock::MockServer::start(
-                    arts_a,
-                    crate::mock::Chaos {
-                        accept_cap: Some(2),
-                        drop_after: 1,
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 60_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let steady = crate::mock::MockServer::start(
-                    arts_b,
-                    crate::mock::Chaos {
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 150_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    flap_breaker: breaker,
-                    connect_backoff: Duration::from_millis(100),
-                    ..Default::default()
-                };
-                // Staggered dials for the capped server (the TODO 111
-                // probes hit this): eight simultaneous dials race the
-                // mock's live count past the cap before any accept task
-                // checks it, so ALL of them can bounce and the
-                // capacity-yield ladder sometimes bows the whole fleet
-                // out before a session ever establishes - a served-0,
-                // clampless leg. 50 ms apart, the first two win their
-                // slots; the rest bounce off a genuinely full cap.
-                let bcfg = PoolConfig {
-                    connections: 8,
-                    ramp_delay: Duration::from_millis(50),
-                    ..cfg.clone()
-                };
-                let mut bsc = burned.server_config();
-                bsc.connections = 8;
-                let servers = vec![(bsc, bcfg), payout_server(&steady, 4, cfg)];
-                payout_leg(servers, ids).await
-            }
-        };
-        let (off, done_off, notes_off) = leg(false).await;
-        let (on, done_on, notes_on) = leg(true).await;
-        let churn = |notes: &[String]| {
-            notes
-                .iter()
-                .filter(|n| n.starts_with("127.0.0.1") && n.contains("session lost"))
-                .count()
-        };
-        // The two mocks share a host string, so count per-leg totals -
-        // steady never drops sessions, so every "session lost" is
-        // burned's.
-        println!(
-            "flap payout: off {off:?} ({} drops) on {on:?} ({} drops) clamp_noted={}",
-            churn(&notes_off),
-            churn(&notes_on),
-            notes_on.iter().any(|n| n.contains("sessions flapping")),
-        );
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        assert!(
-            notes_on.iter().any(|n| n.contains("sessions flapping")),
-            "the breaker never clamped on the flap rig"
-        );
-        // Churn counts are printed, not asserted: the redial-success
-        // notes under-count in cap-world (most re-entries bounce), so
-        // the clamp note plus wall parity are the load-bearing claims.
-        assert!(
-            on.as_secs_f64() < off.as_secs_f64() * 1.15,
-            "the clamp cost wall time ({on:?} vs {off:?})"
-        );
-    }
-
-    /// PAYOUT (TODO 115): cap-aware keepers on the same IP-cap flap.
-    /// The provider accepts TWO sessions; the shipped breaker keeps
-    /// one, leaving the second slot's throughput on the table (NZBGet
-    /// takes it - and pays 217 dials of hammering for it, fault matrix
-    /// 5 Aug). With NZBFAST_FLAP_CAP_KEEPERS the clamp holds
-    /// min(observed cap, budget) = 2 keepers: wall at-or-below the
-    /// single-keeper clamp, dials in the same order (each keeper
-    /// redials on its own session's death, paced on any bounce).
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - run with --ignored"]
-    async fn payout_flap_cap_keepers_hold_the_caps_worth() {
-        let data: Vec<u8> = (0..8_000_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("c.bin", &data, 50_000, "fk", &mut articles);
-        let leg = |cap_keepers: bool| {
-            let arts_a = articles.clone();
-            let arts_b = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let burned = crate::mock::MockServer::start(
-                    arts_a,
-                    crate::mock::Chaos {
-                        accept_cap: Some(2),
-                        drop_after: 1,
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 60_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let steady = crate::mock::MockServer::start(
-                    arts_b,
-                    crate::mock::Chaos {
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 150_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    flap_cap_keepers: cap_keepers,
-                    connect_backoff: Duration::from_millis(100),
-                    ..Default::default()
-                };
-                // Staggered dials, same reason as the flap payout above:
-                // simultaneous dials can all bounce off a genuinely full
-                // cap and bow the whole fleet out before a session
-                // establishes.
-                let bcfg = PoolConfig {
-                    connections: 8,
-                    ramp_delay: Duration::from_millis(50),
-                    ..cfg.clone()
-                };
-                let mut bsc = burned.server_config();
-                bsc.connections = 8;
-                let servers = vec![(bsc, bcfg), payout_server(&steady, 4, cfg)];
-                let dials = burned.accepted.clone();
-                let (wall, done, notes) = payout_leg(servers, ids).await;
-                (wall, done, notes, dials.load(Ordering::Relaxed))
-            }
-        };
-        let (off, done_off, notes_off, dials_off) = leg(false).await;
-        let (on, done_on, notes_on, dials_on) = leg(true).await;
-        println!(
-            "cap-keeper payout: off {off:?} ({dials_off} dials) \
-             on {on:?} ({dials_on} dials)"
-        );
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        assert!(
-            notes_off.iter().any(|n| n.contains("sessions flapping")),
-            "the single-keeper leg never clamped"
-        );
-        assert!(
-            notes_on.iter().any(|n| n.contains("2 retry connections")),
-            "the cap-aware leg never widened to the observed cap"
-        );
-        // The whole point: the second slot must not cost wall time, and
-        // the dials must stay in the single-keeper's order - not
-        // NZBGet's 217-dial hammering (an order of magnitude beyond
-        // either leg on this shape).
-        assert!(
-            on.as_secs_f64() <= off.as_secs_f64() * 1.10,
-            "cap-aware keepers cost wall time ({on:?} vs {off:?})"
-        );
-        assert!(
-            dials_on <= dials_off * 3,
-            "cap-aware keepers multiplied dials ({dials_on} vs {dials_off})"
-        );
-    }
-
-    /// SAFETY (fault campaign, TODO 111): jitter must kill nothing.
-    /// Every 5th body arrives 1.8 s late on an otherwise healthy
-    /// single server - the satellite shape. The adaptive timeout's
-    /// graduation gate: it must complete with no more session churn
-    /// and no more wall time than the flat path. (Its TTFB floor is
-    /// 2 s and its stall bound rolls with progress, so 1.8 s spikes
-    /// sit inside both by design - this pins that design.)
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock safety measurement - run with --ignored"]
-    async fn safety_adaptive_timeout_kills_nothing_on_a_jittery_link() {
-        let data: Vec<u8> = (0..1_600_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("j.bin", &data, 20_000, "jt", &mut articles);
-        let leg = |adaptive: bool| {
-            let articles = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let srv = crate::mock::MockServer::start(
-                    articles,
-                    crate::mock::Chaos {
-                        jitter: Some((5, 1_800)),
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 100_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    adaptive_timeout: adaptive,
-                    read_timeout: Duration::from_secs(12),
-                    ..Default::default()
-                };
-                payout_leg(vec![payout_server(&srv, 3, cfg)], ids).await
-            }
-        };
-        let (flat, done_flat, notes_flat) = leg(false).await;
-        let (adap, done_adap, notes_adap) = leg(true).await;
-        let churn = |notes: &[String]| notes.iter().filter(|n| n.contains("session lost")).count();
-        println!(
-            "jitter safety: flat {flat:?} ({} drops) adaptive {adap:?} ({} drops)",
-            churn(&notes_flat),
-            churn(&notes_adap)
-        );
-        assert_eq!(done_flat, segs.len());
-        assert_eq!(done_adap, segs.len());
-        assert!(
-            churn(&notes_adap) <= churn(&notes_flat),
-            "adaptive killed sessions jitter should not kill ({} vs {})",
-            churn(&notes_adap),
-            churn(&notes_flat)
-        );
-        assert!(
-            adap.as_secs_f64() < flat.as_secs_f64() * 1.15,
-            "adaptive cost wall time on a healthy jittery link ({adap:?} vs {flat:?})"
-        );
-    }
-
-    /// PAYOUT (fault campaign, TODO 111): whole-server brownout - a
-    /// provider's frontend goes mute mid-run and never recovers, while
-    /// a healthy twin carries the group. Three legs: pre-1.0.16
-    /// behaviour (everything off), the shipped defaults (fan-out early
-    /// + hedge + slope recycle + flap breaker), and shipped + adaptive
-    /// timeout.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - run with --ignored"]
-    async fn payout_brownout_recovery_across_config_tiers() {
-        let data: Vec<u8> = (0..2_400_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("b.bin", &data, 20_000, "bo", &mut articles);
-        let leg = |shipped: bool, adaptive: bool| {
-            let arts_a = articles.clone();
-            let arts_b = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let throttle = crate::mock::Throttle {
-                    per_conn_bps: 100_000,
-                    ..Default::default()
-                };
-                let mute = crate::mock::MockServer::start(
-                    arts_a,
-                    crate::mock::Chaos {
-                        brownout_after: 40,
-                        throttle: throttle.clone(),
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let steady = crate::mock::MockServer::start(
-                    arts_b,
-                    crate::mock::Chaos {
-                        throttle,
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    tail_fanout: shipped,
-                    tail_fanout_early: shipped,
-                    hedge: shipped,
-                    recycle_slope: shipped,
-                    flap_breaker: shipped,
-                    adaptive_timeout: adaptive,
-                    read_timeout: Duration::from_secs(12),
-                    ..Default::default()
-                };
-                let servers = vec![
-                    payout_server(&mute, 3, cfg.clone()),
-                    payout_server(&steady, 3, cfg),
-                ];
-                payout_leg(servers, ids).await
-            }
-        };
-        let (old, done_old, _) = leg(false, false).await;
-        let (ship, done_ship, _) = leg(true, false).await;
-        let (adap, done_adap, _) = leg(true, true).await;
-        println!("brownout payout: old {old:?} shipped {ship:?} shipped+adaptive {adap:?}");
-        assert_eq!(done_old, segs.len());
-        assert_eq!(done_ship, segs.len());
-        assert_eq!(done_adap, segs.len());
-        assert!(
-            old > Duration::from_secs(10),
-            "old leg finished too fast for the brownout to have bitten ({old:?})"
-        );
-        assert!(
-            ship.as_secs_f64() < old.as_secs_f64() * 0.7,
-            "the shipped defaults paid out nothing on a brownout ({ship:?} vs {old:?})"
-        );
-        assert!(
-            adap.as_secs_f64() < ship.as_secs_f64() * 1.15,
-            "adaptive regressed the shipped config ({adap:?} vs {ship:?})"
-        );
-    }
-
-    /// NEVER-REGRESS (fault matrix, TODO 115): the brownout wedge.
-    /// In the 5 Aug fault matrix one client NEVER finished this shape
-    /// (a server going mute mid-run with a same-priority healthy twin
-    /// present) - it sat on the mute server forever and reported
-    /// nothing. This fixture pins that nzbfast can never score the
-    /// shape that way: with the shipped tier of defenses the job must
-    /// COMPLETE, fast. Not ignored - a wedge here must scream in CI,
-    /// not print a slow number. Margins are structural: the pass path
-    /// is a few seconds, the wedge is forever (payout_leg's 120 s
-    /// completion bound fires first), so suite load cannot flake it.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn safety_brownout_wedge_never_regresses() {
-        let data: Vec<u8> = (0..1_200_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("nw.bin", &data, 20_000, "nw", &mut articles);
-        let throttle = crate::mock::Throttle {
-            per_conn_bps: 400_000,
-            ..Default::default()
-        };
-        let mute = crate::mock::MockServer::start(
-            articles.clone(),
-            crate::mock::Chaos {
-                brownout_after: 20,
-                throttle: throttle.clone(),
-                ..Default::default()
-            },
-        )
-        .await;
-        let steady = crate::mock::MockServer::start(
-            articles,
-            crate::mock::Chaos {
-                throttle,
-                ..Default::default()
-            },
-        )
-        .await;
-        // The shipped tier (what the daemon runs by default), pinned
-        // explicitly like the payout rigs above.
-        let cfg = PoolConfig {
-            tail_fanout: true,
-            tail_fanout_early: true,
-            hedge: true,
-            recycle_slope: true,
-            flap_breaker: true,
-            adaptive_timeout: true,
-            read_timeout: Duration::from_secs(12),
-            ..Default::default()
-        };
-        let ids: Vec<ArticleReq> = segs
-            .iter()
-            .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-            .collect();
-        let servers = vec![
-            payout_server(&mute, 3, cfg.clone()),
-            payout_server(&steady, 3, cfg),
-        ];
-        let (wall, done, _) = payout_leg(servers, ids).await;
-        assert_eq!(
-            done,
-            segs.len(),
-            "brownout wedge regression: {done}/{} articles after {wall:?}",
-            segs.len()
-        );
-        assert!(
-            wall < Duration::from_secs(60),
-            "brownout took {wall:?} - the mute server is being waited on, \
-             not abandoned; this is the wedge shape, fix it"
-        );
-    }
-
-    /// NEVER-REGRESS (fault matrix, TODO 115): the slowconn
-    /// ride-along. In the 5 Aug fault matrix one client rode a single
-    /// degraded session (50 KB/s against a healthy server) all the way
-    /// to the end - 6x the field's wall - because nothing it shipped
-    /// could see a slow-but-alive connection. This fixture pins that
-    /// nzbfast always frees itself: one crawling session (1 KB/s
-    /// against 400 KB/s siblings, so each article it holds costs 20 s)
-    /// must not set the wall. Ride-along blows past 120 s (payout_leg
-    /// screams); the pass path is seconds.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn safety_slowconn_ride_along_never_regresses() {
-        let data: Vec<u8> = (0..1_200_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("nr.bin", &data, 20_000, "nr", &mut articles);
-        let srv = crate::mock::MockServer::start(
-            articles,
-            crate::mock::Chaos {
-                slow_conn: Some((1, 1_000)),
-                throttle: crate::mock::Throttle {
-                    per_conn_bps: 400_000,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .await;
-        let cfg = PoolConfig {
-            tail_fanout: true,
-            tail_fanout_early: true,
-            hedge: true,
-            recycle_slope: true,
-            flap_breaker: true,
-            adaptive_timeout: true,
-            read_timeout: Duration::from_secs(12),
-            ..Default::default()
-        };
-        let ids: Vec<ArticleReq> = segs
-            .iter()
-            .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-            .collect();
-        let (wall, done, _) = payout_leg(vec![payout_server(&srv, 3, cfg)], ids).await;
-        assert_eq!(
-            done,
-            segs.len(),
-            "slowconn regression: {done}/{} articles after {wall:?}",
-            segs.len()
-        );
-        assert!(
-            wall < Duration::from_secs(45),
-            "slowconn took {wall:?} - the degraded session is setting \
-             the wall; this is the ride-along shape, fix it"
-        );
-    }
-
-    /// PAYOUT (fault campaign, TODO 111): dead-air stalls price the
-    /// adaptive timeout, dark since 96.1. Six ids hang BEFORE the
-    /// status line; the flat path waits the whole read_timeout per hit,
-    /// the adaptive TTFB budget gives up at its 2 s floor.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - run with --ignored"]
-    async fn payout_adaptive_timeout_cuts_dead_air_stalls() {
-        let data: Vec<u8> = (0..640_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("d.bin", &data, 8_000, "at", &mut articles);
-        let stall_pre: std::collections::HashSet<String> = [30, 38, 46, 54, 62, 70]
-            .into_iter()
-            .map(|i| format!("<{}>", segs[i].0))
-            .collect();
-        let leg = |adaptive: bool| {
-            let articles = articles.clone();
-            let stall_pre = stall_pre.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let srv = crate::mock::MockServer::start(
-                    articles,
-                    crate::mock::Chaos {
-                        stall_pre,
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 100_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    adaptive_timeout: adaptive,
-                    read_timeout: Duration::from_secs(12),
-                    ..Default::default()
-                };
-                payout_leg(vec![payout_server(&srv, 3, cfg)], ids).await
-            }
-        };
-        let (off, done_off, _) = leg(false).await;
-        let (on, done_on, _) = leg(true).await;
-        println!("adaptive payout: off {off:?} on {on:?}");
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        assert!(
-            off > Duration::from_secs(12),
-            "off leg finished too fast for the dead air to have bitten ({off:?})"
-        );
-        assert!(
-            on.as_secs_f64() < off.as_secs_f64() * 0.6,
-            "the adaptive budget paid out nothing ({on:?} vs {off:?})"
-        );
-    }
-
-    /// PAYOUT (TODO 115): the TTFB-suspicion hedge prices what the
-    /// adaptive budget leaves on the table, in the shape where dead air
-    /// actually costs WALL time: stalls near the queue's end, where the
-    /// stalled article itself gates completion. BOTH legs run the
-    /// adaptive budget - the A/B is suspicion. Off, a tail stall costs
-    /// the full 2 s pre-byte floor plus a requeue round-trip before the
-    /// run can end; on, a sibling connection dup-races it after ~1 s of
-    /// silence and the answer lands with a second of budget still on
-    /// the clock. `greet` prices the same shape with a per-connection
-    /// dial cost, so the hedge proves it still pays when reconnects
-    /// cost real round trips.
-    ///
-    /// Mid-queue stalls are deliberately NOT the rig: there the run is
-    /// capacity-bound and the budget seconds a stalled connection sits
-    /// out are lost either way ("kill nothing" means the owner waits
-    /// regardless) - measured 6.5 s vs 6.5 s with the dups firing on
-    /// cue. The hedge buys article LATENCY, and latency is wall time
-    /// only when supply is short. Tail fan-out is left off so the legs
-    /// price suspicion itself, not the shipped endgame racer it
-    /// partially overlaps (fan-out needs an IDLE picker and 500 ms on
-    /// the wire; suspicion races from any topping-up worker at ~1 s,
-    /// pre-endgame included, and is the only rule that races a
-    /// same-server stall outside the endgame).
-    async fn ttfb_hedge_deadair_legs(greet_delay_ms: u64) -> (Duration, Duration, usize) {
-        let data: Vec<u8> = (0..640_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("t.bin", &data, 8_000, "th", &mut articles);
-        // ONE stall, on the very last article: the shape is then
-        // deterministic - the stalled read starts once its healthy
-        // pipeline-mates are done, nothing traps behind it, and both
-        // sibling connections are idle pickers when suspicion fires.
-        // Several spread stalls measured bimodal (4-9 s per leg): with
-        // window 4 a second stall lands as a trapped MATE of the first
-        // stalled connection as often as not, and whether the serial
-        // 2 s chains stack on one conn is a per-run coin flip.
-        let stall_pre: std::collections::HashSet<String> =
-            std::iter::once(format!("<{}>", segs[segs.len() - 1].0)).collect();
-        let leg = |ttfb_hedge: bool| {
-            let articles = articles.clone();
-            let stall_pre = stall_pre.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let srv = crate::mock::MockServer::start(
-                    articles,
-                    crate::mock::Chaos {
-                        stall_pre,
-                        greet_delay_ms,
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 100_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    adaptive_timeout: true,
-                    ttfb_hedge,
-                    read_timeout: Duration::from_secs(12),
-                    ..Default::default()
-                };
-                payout_leg(vec![payout_server(&srv, 3, cfg)], ids).await
-            }
-        };
-        let (off, done_off, _) = leg(false).await;
-        let (on, done_on, _) = leg(true).await;
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        (off, on, segs.len())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - flaky under suite load, run with --ignored"]
-    async fn payout_ttfb_hedge_beats_the_budget_on_dead_air() {
-        let (off, on, _) = ttfb_hedge_deadair_legs(0).await;
-        println!("ttfb-hedge payout: off {off:?} on {on:?}");
-        // Off: tail stalls sit out the 2 s budget floor before the run
-        // can end (healthy transfer alone is ~2.1 s).
-        assert!(
-            off > Duration::from_secs(3),
-            "off leg finished too fast for the dead air to have bitten ({off:?}) - rig broken"
-        );
-        // On: suspicion at ~1 s, the dup answers inside the budget. The
-        // payout is per-stall seconds (budget floor minus suspicion
-        // bound, ~1 s), so the bound is absolute, not a ratio.
-        assert!(
-            on.as_secs_f64() + 0.6 < off.as_secs_f64(),
-            "the ttfb hedge paid out nothing ({on:?} vs {off:?})"
-        );
-    }
-
-    /// PAYOUT (TODO 115): the greet-delay gate. Dials cost 250 ms on
-    /// this rig, so the off leg's timeout-and-requeue path pays real
-    /// reconnect round trips - the hedge must still win, not merely tie
-    /// a strategy whose redials happened to be free on loopback.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - flaky under suite load, run with --ignored"]
-    async fn payout_ttfb_hedge_still_pays_when_dials_cost() {
-        let (off, on, _) = ttfb_hedge_deadair_legs(250).await;
-        println!("ttfb-hedge dial-cost payout: off {off:?} on {on:?}");
-        assert!(
-            off > Duration::from_secs(3),
-            "off leg finished too fast for the dead air to have bitten ({off:?}) - rig broken"
-        );
-        assert!(
-            on.as_secs_f64() + 0.6 < off.as_secs_f64(),
-            "the ttfb hedge stopped paying once dials cost real time ({on:?} vs {off:?})"
-        );
-    }
-
-    /// SAFETY (TODO 115): the jitter gate, same shape as
-    /// [`safety_adaptive_timeout_kills_nothing_on_a_jittery_link`].
-    /// Every 5th body arrives 1.8 s late PRE-BYTE on a healthy single
-    /// server, which is exactly what suspicion smells - so this is the
-    /// hedge's worst case: it may spend bounded dup fetches, but it
-    /// must add ZERO reconnects (the owner is never killed) and no
-    /// wall time.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock safety measurement - run with --ignored"]
-    async fn safety_ttfb_hedge_kills_nothing_on_a_jittery_link() {
-        let data: Vec<u8> = (0..1_600_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("j.bin", &data, 20_000, "js", &mut articles);
-        let leg = |ttfb_hedge: bool| {
-            let articles = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let srv = crate::mock::MockServer::start(
-                    articles,
-                    crate::mock::Chaos {
-                        jitter: Some((5, 1_800)),
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 100_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    adaptive_timeout: true,
-                    ttfb_hedge,
-                    read_timeout: Duration::from_secs(12),
-                    ..Default::default()
-                };
-                let r = payout_leg(vec![payout_server(&srv, 3, cfg)], ids).await;
-                (r, srv.accepted.load(Ordering::Relaxed))
-            }
-        };
-        let ((off, done_off, notes_off), accepted_off) = leg(false).await;
-        let ((on, done_on, notes_on), accepted_on) = leg(true).await;
-        let churn = |notes: &[String]| notes.iter().filter(|n| n.contains("session lost")).count();
-        println!(
-            "ttfb-hedge jitter safety: off {off:?} ({} drops, {accepted_off} accepts) \
-             on {on:?} ({} drops, {accepted_on} accepts)",
-            churn(&notes_off),
-            churn(&notes_on),
-        );
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        // THE gate: suspicion may dup, it must never dial. Every accept
-        // beyond the off leg's would be a reconnect the hedge caused.
-        assert!(
-            accepted_on <= accepted_off,
-            "the ttfb hedge added reconnects on a jittery link ({accepted_on} vs {accepted_off})"
-        );
-        assert!(
-            churn(&notes_on) <= churn(&notes_off),
-            "the ttfb hedge killed sessions jitter should not kill ({} vs {})",
-            churn(&notes_on),
-            churn(&notes_off)
-        );
-        assert!(
-            on.as_secs_f64() < off.as_secs_f64() * 1.15,
-            "the ttfb hedge cost wall time on a healthy jittery link ({on:?} vs {off:?})"
-        );
-    }
-
-    /// [`payout_leg`], plus a decode pass over every Done body: counts
-    /// bodies whose own yEnc CRC fails (`bad_crc`) and bodies that are
-    /// valid articles for the WRONG part (`wrong_part`, judged against
-    /// each request's declared `part`). The CRC-retry rigs assert on
-    /// delivered DAMAGE, not on wall clock, which is what lets them
-    /// run un-ignored in the suite.
-    async fn payout_leg_verified(
-        servers: Vec<(ServerConfig, PoolConfig)>,
-        ids: Vec<ArticleReq>,
-    ) -> (Duration, usize, usize, usize, Vec<String>) {
-        let parts: std::collections::HashMap<String, u32> = ids
-            .iter()
-            .filter(|r| r.part > 0)
-            .map(|r| (r.id.clone(), r.part))
-            .collect();
-        let live = LiveStats::for_servers(&servers);
-        let servers: Vec<(ServerConfig, PoolConfig)> = servers
-            .into_iter()
-            .map(|(s, mut c)| {
-                c.live = Some(live.clone());
-                (s, c)
-            })
-            .collect();
-        let (tx, mut rx) = mpsc::channel(64);
-        let t0 = Instant::now();
-        let fetch = tokio::spawn(async move { fetch_all_multi(&servers, ids, tx).await });
-        let collect = tokio::spawn(async move {
-            let (mut done, mut bad_crc, mut wrong_part) = (0usize, 0usize, 0usize);
-            let mut scratch = Vec::new();
-            while let Some(o) = rx.recv().await {
-                if let FetchOutcome::Done { id, raw } = o {
-                    done += 1;
-                    match crate::yenc_simd::decode_into_integrity(&raw, &mut scratch, true) {
-                        Err(_) => bad_crc += 1,
-                        Ok((meta, _)) => {
-                            if let (Some(&want), Some(got)) = (parts.get(&id), meta.part)
-                                && got != want
-                            {
-                                wrong_part += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            (done, bad_crc, wrong_part)
-        });
-        tokio::time::timeout(Duration::from_secs(120), fetch)
-            .await
-            .expect("payout leg hung")
-            .unwrap();
-        let elapsed = t0.elapsed();
-        let (done, bad_crc, wrong_part) = collect.await.unwrap();
-        let notes: Vec<String> = live
-            .events
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|e| format!("{} {}", e.host, e.detail))
-            .collect();
-        (elapsed, done, bad_crc, wrong_part, notes)
-    }
-
-    /// [`payout_leg`] with a PAUSING consumer: reads outcomes for 1 s,
-    /// then stops reading for 2 s, forever - the external-enclosure
-    /// write-side stall (a disk that periodically parks/flushes while
-    /// the network is healthy). Channel depth is the caller's, because
-    /// that IS the experiment: how much outcome buffer it takes to
-    /// smooth a periodic write stall (TODO 108 evidence).
-    async fn payout_leg_pausing(
-        servers: Vec<(ServerConfig, PoolConfig)>,
-        ids: Vec<ArticleReq>,
-        depth: usize,
-    ) -> (Duration, usize) {
-        let (tx, mut rx) = mpsc::channel(depth);
-        let t0 = Instant::now();
-        let fetch = tokio::spawn(async move { fetch_all_multi(&servers, ids, tx).await });
-        let collect = tokio::spawn(async move {
-            let mut done = 0usize;
-            loop {
-                let awake = Instant::now();
-                while awake.elapsed() < Duration::from_secs(1) {
-                    match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
-                        Ok(Some(o)) => {
-                            if matches!(o, FetchOutcome::Done { .. }) {
-                                done += 1;
-                            }
-                        }
-                        Ok(None) => return done,
-                        Err(_) => {}
-                    }
-                }
-                // The stall: 2 s in every 3 during which NOTHING is
-                // read - workers park on `out.send` once the channel
-                // and the kernel's socket buffers are full.
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(120), fetch)
-            .await
-            .expect("payout leg hung")
-            .unwrap();
-        let elapsed = t0.elapsed();
-        (elapsed, collect.await.unwrap())
-    }
-
-    /// TODO 111 experiment 2, write-side stall: the consumer pauses
-    /// reading the outcome channel 2 s in every 3 (the external-
-    /// enclosure shape behind TODO 108) while the line itself is
-    /// healthy. Legs differ ONLY in outcome-channel depth - the
-    /// candidate smoothing knob (MemBudget::channel_depth clamps at 8
-    /// on small boxes, 256 on big ones; 512 models "spend more"). The
-    /// walls are the evidence curve for the slow-disk breaker design:
-    /// how much of the stall a deeper budget actually hides, and where
-    /// it stops paying.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - flaky under suite load, run with --ignored"]
-    async fn payout_channel_depth_smooths_a_stalling_write_side() {
-        let data: Vec<u8> = (0..7_680_000u32).map(|i| (i >> 4) as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("s.bin", &data, 64_000, "ws", &mut articles);
-        let leg = |depth: usize| {
-            let articles = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let srv = crate::mock::MockServer::start(
-                    articles,
-                    crate::mock::Chaos {
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 400_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    window: 2,
-                    ..Default::default()
-                };
-                payout_leg_pausing(vec![payout_server(&srv, 3, cfg)], ids, depth).await
-            }
-        };
-        let mut walls = Vec::new();
-        for depth in [8usize, 64, 256, 512] {
-            let (wall, done) = leg(depth).await;
-            assert_eq!(done, segs.len(), "depth {depth} lost outcomes");
-            println!("write-stall: depth {depth:>3} → wall {wall:.2?}");
-            walls.push((depth, wall));
-        }
-        // The shallow (small-box) budget must pay measurably more wall
-        // than the deep one on the same stall pattern - that gap is
-        // the smoothing a deeper budget buys. Generous ratio: kernel
-        // socket buffers absorb a real share of the stall on loopback
-        // and that share is itself a finding, not noise to assert away.
-        let shallow = walls[0].1.as_secs_f64();
-        let deep = walls[3].1.as_secs_f64();
-        assert!(
-            shallow > deep * 1.1,
-            "channel depth bought nothing: shallow {shallow:.2}s vs deep {deep:.2}s"
-        );
-    }
-
-    /// TODO 111 round 7 (Starlink), SAFETY: single-dish satellite
-    /// handovers - the whole fleet freezes in dead air for 1.2 s every
-    /// 4 s, then fully recovers (the route switch). The shipped
-    /// defaults (fan-out early + hedge + slope recycle + flap breaker)
-    /// and the adaptive-timeout candidate must treat this as weather,
-    /// not damage: no recycle storm, no session churn, wall within the
-    /// freeze tax both ways. The freeze sits under the adaptive
-    /// pre-byte floor (2 s) and the slope window (10 s, and everyone
-    /// freezes TOGETHER so no session ever reads slow against the
-    /// fleet) - this rig pins that reasoning against the code.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - flaky under suite load, run with --ignored"]
-    async fn safety_shipped_defaults_survive_starlink_handovers() {
-        let data: Vec<u8> = (0..3_840_000u32).map(|i| (i >> 6) as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("h.bin", &data, 8_000, "ho", &mut articles);
-        let leg = |shipped: bool, adaptive: bool| {
-            let articles = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let srv = crate::mock::MockServer::start(
-                    articles,
-                    crate::mock::Chaos {
-                        handover: Some((4_000, 1_200, 1)),
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 100_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    tail_fanout: shipped,
-                    tail_fanout_early: shipped,
-                    hedge: shipped,
-                    recycle_slope: shipped,
-                    flap_breaker: shipped,
-                    adaptive_timeout: adaptive,
-                    read_timeout: Duration::from_secs(12),
-                    window: 2,
-                    ..Default::default()
-                };
-                let r = payout_leg(vec![payout_server(&srv, 3, cfg)], ids).await;
-                (r, srv.accepted.load(Ordering::Relaxed))
-            }
-        };
-        let ((old, done_old, _), acc_old) = leg(false, false).await;
-        let ((ship, done_ship, _), acc_ship) = leg(true, false).await;
-        let ((adap, done_adap, _), acc_adap) = leg(true, true).await;
-        println!(
-            "handover safety: old {old:.2?} ({acc_old} conns) · shipped {ship:.2?} \
-             ({acc_ship}) · +adaptive {adap:.2?} ({acc_adap})"
-        );
-        assert_eq!(done_old, segs.len());
-        assert_eq!(done_ship, segs.len());
-        assert_eq!(done_adap, segs.len());
-        // Weather, not damage: no leg may pay a churn tax over the
-        // freeze-schedule floor the off leg establishes.
-        assert!(
-            ship.as_secs_f64() < old.as_secs_f64() * 1.15,
-            "shipped defaults paid a churn tax on handovers ({ship:?} vs {old:?})"
-        );
-        assert!(
-            adap.as_secs_f64() < old.as_secs_f64() * 1.15,
-            "adaptive paid a churn tax on handovers ({adap:?} vs {old:?})"
-        );
-        // And no reconnect storm: the fleet is 3 connections; a recycle
-        // or timeout loop would show up as accepts.
-        assert!(
-            acc_ship <= 5 && acc_adap <= 5,
-            "handover freezes caused session churn (accepts: shipped {acc_ship}, \
-             adaptive {acc_adap})"
-        );
-    }
-
-    /// TODO 111 round 7 (Starlink x multi-WAN): one dish is always
-    /// mid-obstruction - two WANs whose 4 s freeze windows tile the
-    /// whole 8 s period, so at every moment exactly half the fleet is
-    /// in dead air, but NEVER the same half for long. Multi-WAN flips
-    /// the handover question from safety to PAYOUT: with one WAN a
-    /// freeze self-heals before any rule can react, but with two the
-    /// healthy half is an escape path, and the fan-out + hedge dup
-    /// machinery is the only thing that can take it mid-tail - the
-    /// frozen WAN's in-flight articles are otherwise hostages until
-    /// the window ends.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - flaky under suite load, run with --ignored"]
-    async fn payout_multiwan_fanout_rescues_the_frozen_wan() {
-        let data: Vec<u8> = (0..1_280_000u32).map(|i| (i >> 7) as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("m.bin", &data, 8_000, "mw", &mut articles);
-        let leg = |race: bool| {
-            let articles = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let srv = crate::mock::MockServer::start(
-                    articles,
-                    crate::mock::Chaos {
-                        // Complementary windows: WAN 0 frozen [0,4),
-                        // WAN 1 frozen [4,8) of every 8 s.
-                        handover: Some((8_000, 4_000, 2)),
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 40_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    tail_fanout: race,
-                    tail_fanout_early: race,
-                    hedge: race,
-                    read_timeout: Duration::from_secs(12),
-                    window: 2,
-                    ..Default::default()
-                };
-                payout_leg(vec![payout_server(&srv, 4, cfg)], ids).await
-            }
-        };
-        let (off, done_off, _) = leg(false).await;
-        let (on, done_on, _) = leg(true).await;
-        println!("multi-WAN handover: off {off:.2?} on {on:.2?}");
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        // Both legs pay the halved capacity; the payout is the tail,
-        // where off waits out the frozen WAN's window (up to 4 s) and
-        // on dups the hostages onto the healthy WAN within ~1 s.
-        // Measured 20.45 s vs 17.56 s (the ~3 s is exactly one freeze
-        // window) - the ratio bound leaves room for scheduler noise
-        // around a payout that is structurally one window wide.
-        assert!(
-            on.as_secs_f64() < off.as_secs_f64() * 0.92,
-            "the dup machinery rescued nothing across WANs ({on:?} vs {off:?})"
-        );
-    }
-
-    /// TODO 111 round 7 (multi-WAN): asymmetric WANs - three
-    /// connections ride the fast dish (100 KB/s) and every fourth
-    /// lands on the slow fallback line (12 KB/s), round-robin, the
-    /// load-balancer shape. The open question this rig answers: does
-    /// the shipped slope recycle treat the slow-but-HEALTHY path as a
-    /// degraded session (its rate really is under 25% of the fleet
-    /// per-worker average) - and if it fires, is that churn or an
-    /// escape? With round-robin rebalancing a redial usually lands on
-    /// the fast WAN, so firing is probe-and-abandon of the slow path;
-    /// the rig prices exactly that.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - flaky under suite load, run with --ignored"]
-    async fn payout_recycle_slope_probes_an_asymmetric_multiwan() {
-        let data: Vec<u8> = (0..3_840_000u32).map(|i| (i >> 8) as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("a.bin", &data, 8_000, "aw", &mut articles);
-        let leg = |slope: bool| {
-            let articles = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let srv = crate::mock::MockServer::start(
-                    articles,
-                    crate::mock::Chaos {
-                        wan_conn_bps: vec![100_000, 100_000, 100_000, 12_000],
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    recycle_slope: slope,
-                    read_timeout: Duration::from_secs(12),
-                    window: 2,
-                    ..Default::default()
-                };
-                payout_leg(vec![payout_server(&srv, 4, cfg)], ids).await
-            }
-        };
-        let (off, done_off, notes_off) = leg(false).await;
-        let (on, done_on, notes_on) = leg(true).await;
-        let fired = |notes: &[String]| {
-            notes
-                .iter()
-                .filter(|n| n.contains("recycled a degraded session"))
-                .count()
-        };
-        println!(
-            "asymmetric multi-WAN: off {off:.2?} ({} recycles) on {on:.2?} ({} recycles)",
-            fired(&notes_off),
-            fired(&notes_on),
-        );
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        assert_eq!(fired(&notes_off), 0, "slope off must not recycle");
-        // The slow-but-healthy WAN really does read as degraded - the
-        // recycle fires. The assert pins the OUTCOME being an escape,
-        // not a churn loop: bounded firings and no wall regression.
-        assert!(
-            fired(&notes_on) >= 1,
-            "the slow WAN never read as degraded - rig broken: {notes_on:?}"
-        );
-        assert!(
-            fired(&notes_on) <= 6,
-            "slope recycle churned on the asymmetric fleet ({} firings)",
-            fired(&notes_on)
-        );
-        assert!(
-            on.as_secs_f64() < off.as_secs_f64() * 1.05,
-            "the escape regressed the wall ({on:?} vs {off:?})"
-        );
-    }
-
-    /// TODO 111 round 7 (Starlink x multi-WAN): rain fade on ONE of
-    /// two paths. Two server entries (in production: the same provider
-    /// twice, each bound to a WAN via `bind_ip` - the one multi-WAN
-    /// shape nzbfast can actually see, since a load balancer under a
-    /// single entry is invisible to per-server stats). Three seconds
-    /// in, path A's line collapses to 20 KB/s and stays there - rain
-    /// on one dish. The queue self-balances by pull, so the healthy
-    /// path naturally takes more; the priced question is the shipped
-    /// rules' behaviour on the faded-but-alive path: the slope recycle
-    /// reads A's sessions as degraded but a redial lands on the SAME
-    /// faded path (nothing within A to escape to), and the endgame dup
-    /// rules are what actually rescue A's hostage articles via B.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - flaky under suite load, run with --ignored"]
-    async fn payout_rain_fade_drains_to_the_healthy_wan() {
-        let data: Vec<u8> = (0..2_880_000u32).map(|i| (i >> 3) as u8).collect();
-        let mk_maps = || {
-            let mut articles = std::collections::HashMap::new();
-            let segs = crate::mock::make_file_articles("r.bin", &data, 8_000, "rf", &mut articles);
-            (articles, segs)
-        };
-        let (arts_a, segs) = mk_maps();
-        let (arts_b, _) = mk_maps();
-        let leg = |shipped: bool| {
-            let arts_a = arts_a.clone();
-            let arts_b = arts_b.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let per_conn = crate::mock::Throttle {
-                    per_conn_bps: 60_000,
-                    ..Default::default()
-                };
-                let a = crate::mock::MockServer::start(
-                    arts_a,
-                    crate::mock::Chaos {
-                        throttle: per_conn.clone(),
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let b = crate::mock::MockServer::start(
-                    arts_b,
-                    crate::mock::Chaos {
-                        throttle: per_conn,
-                        ..Default::default()
-                    },
-                )
-                .await;
-                // Rain sets in on path A three seconds into the run
-                // and does not lift.
-                let fade = a.line_control();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    fade.set_line_bps(20_000);
-                });
-                let cfg = PoolConfig {
-                    tail_fanout: shipped,
-                    tail_fanout_early: shipped,
-                    hedge: shipped,
-                    recycle_slope: shipped,
-                    flap_breaker: shipped,
-                    read_timeout: Duration::from_secs(12),
-                    window: 2,
-                    ..Default::default()
-                };
-                let servers = vec![payout_server(&a, 3, cfg.clone()), payout_server(&b, 3, cfg)];
-                payout_leg(servers, ids).await
-            }
-        };
-        let (off, done_off, _) = leg(false).await;
-        let (on, done_on, notes_on) = leg(true).await;
-        let recycles = notes_on
-            .iter()
-            .filter(|n| n.contains("recycled a degraded session"))
-            .count();
-        println!("rain fade: off {off:.2?} on {on:.2?} ({recycles} recycles on the faded path)");
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        // The shipped rules must at minimum not make rain WORSE - the
-        // slope recycle's redials land back on the faded path, so any
-        // win has to come from the dup machinery outweighing that
-        // churn. The measured split is the finding either way.
-        assert!(
-            on.as_secs_f64() < off.as_secs_f64() * 1.10,
-            "shipped rules regressed a one-path rain fade ({on:?} vs {off:?}, \
-             {recycles} recycles)"
-        );
-    }
-
-    /// TODO 111 round 7 (Starlink/CGNAT): mid-transfer silent eviction
-    /// - after 20 bodies a connection's NAT entry ages out and it goes
-    /// permanently mute, no close, no RST. The flat read timeout pays
-    /// its full 12 s per eviction; the adaptive TTFB budget gives up
-    /// at its 2 s floor and redials (a fresh accept = a fresh NAT
-    /// entry). This is the recoverable half of the keepalive story -
-    /// the idle-parked-connection half stays unpriceable on loopback.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - flaky under suite load, run with --ignored"]
-    async fn payout_adaptive_timeout_survives_cgnat_evictions() {
-        let data: Vec<u8> = (0..960_000u32).map(|i| (i >> 9) as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("n.bin", &data, 8_000, "ce", &mut articles);
-        let leg = |adaptive: bool| {
-            let articles = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let srv = crate::mock::MockServer::start(
-                    articles,
-                    crate::mock::Chaos {
-                        mute_after_bodies: 20,
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 100_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    adaptive_timeout: adaptive,
-                    read_timeout: Duration::from_secs(12),
-                    window: 2,
-                    ..Default::default()
-                };
-                payout_leg(vec![payout_server(&srv, 3, cfg)], ids).await
-            }
-        };
-        let (off, done_off, _) = leg(false).await;
-        let (on, done_on, _) = leg(true).await;
-        println!("cgnat eviction: off {off:.2?} on {on:.2?}");
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        assert!(
-            off > Duration::from_secs(14),
-            "off leg finished too fast for the evictions to have bitten ({off:?})"
-        );
-        assert!(
-            on.as_secs_f64() < off.as_secs_f64() * 0.5,
-            "the adaptive budget paid out nothing on evictions ({on:?} vs {off:?})"
-        );
-    }
-
-    /// TODO 111 experiment 3, slow-start trickle: every FRESH
-    /// connection crawls for its first 1.2 s (congestion-window /
-    /// middlebox warm-up) and sessions keep dying (drop every 20
-    /// bodies), so a reconnect-heavy run pays the crawl over and over.
-    /// The hot spare is the priced candidate: a parked spare rides its
-    /// crawl window out while idle, so the worker that claims it after
-    /// a death starts at full speed instead of at the trickle. (The
-    /// warm pool shares this shape across RUNS; the spare is the
-    /// in-run version this rig can price.)
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - flaky under suite load, run with --ignored"]
-    async fn payout_hot_spare_skips_the_slow_start_trickle() {
-        let data: Vec<u8> = (0..1_920_000u32).map(|i| (i >> 5) as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("t.bin", &data, 8_000, "ss", &mut articles);
-        let leg = |spare: bool| {
-            let articles = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let srv = crate::mock::MockServer::start(
-                    articles,
-                    crate::mock::Chaos {
-                        drop_after: 20,
-                        slow_start: Some((1200, 10_000)),
-                        // A real dial costs round trips; without this a
-                        // loopback reconnect is free and the spare has
-                        // nothing to hide.
-                        greet_delay_ms: 250,
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 100_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    hot_spare: spare,
-                    window: 2,
-                    ..Default::default()
-                };
-                let mut sv = payout_server(&srv, 3, cfg);
-                // Stagger the fleet's dials so deaths desynchronize
-                // (real sessions never die in lockstep) - otherwise
-                // three simultaneous deaths fight over the one spare.
-                sv.1.ramp_delay = Duration::from_millis(400);
-                payout_leg(vec![sv], ids).await
-            }
-        };
-        let (off, done_off, _) = leg(false).await;
-        let (on, done_on, _) = leg(true).await;
-        println!("slow-start trickle: off {off:.2?} on {on:.2?}");
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        // MEASURED VERDICT (5 Aug, the finding this rig exists for):
-        // the payout is real but SMALL - 19.2 s vs 20.7 s, ~7% - and
-        // structurally bounded, not noise. One spare refilled every
-        // 500 ms against fleet-wide deaths every ~1 s covers about a
-        // third of the reconnects, and a spare claimed young is still
-        // inside its own crawl window. Meanwhile the 2 s session
-        // backoff every organic death (connect_backoff x 2^0) already
-        // hides most of a 1.2 s crawl behind a sleep both legs pay.
-        // Slow-start trickle wants FEWER RECONNECTS (keepalive) or a
-        // spare per dying worker, not one faster spare - the assert
-        // pins "never worse, some payout", which is all this shape
-        // supports.
-        assert!(
-            on.as_secs_f64() < off.as_secs_f64() * 0.97,
-            "the hot spare paid out nothing against slow-start ({on:?} vs {off:?})"
-        );
-    }
-
-    /// TODO 111 experiment 1, corrupt-article storm: one server whose
-    /// cache corrupts a deterministic slice of EVERYTHING it serves
-    /// (every 3rd body), beside a clean server. Off, every corrupt
-    /// body it happens to deliver is terminal damage that rides to
-    /// PAR2 repair; on (`crc_retry`), the pool catches the CRC failure
-    /// at delivery and refetches each bad article from the other
-    /// server once - so ZERO damage reaches the consumer while a clean
-    /// copy exists anywhere. Asserts on delivered damage, not wall
-    /// clock (loopback fetches are fast either way; the repair-time
-    /// half of the pricing lives in the e2e leg, which is wall-clock
-    /// and stays ignored).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn crc_retry_storm_steers_damage_to_the_clean_server() {
-        let data: Vec<u8> = (0..480_000u32).map(|i| (i >> 3) as u8).collect();
-        let mk_maps = || {
-            let mut articles = std::collections::HashMap::new();
-            let segs = crate::mock::make_file_articles("c.bin", &data, 8_000, "cs", &mut articles);
-            (articles, segs)
-        };
-        let (arts_a, segs) = mk_maps();
-        let (arts_b, _) = mk_maps();
-        let leg = |retry: bool| {
-            let arts_a = arts_a.clone();
-            let arts_b = arts_b.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, part)| ArticleReq {
-                    id: format!("<{id}>"),
-                    age_days: 0,
-                    part: *part,
-                })
-                .collect();
-            async move {
-                let a = crate::mock::MockServer::start(
-                    arts_a,
-                    crate::mock::Chaos {
-                        corrupt_every: 3,
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let b = crate::mock::MockServer::start(arts_b, Default::default()).await;
-                let cfg = PoolConfig {
-                    crc_retry: retry,
-                    window: 2,
-                    ..Default::default()
-                };
-                let servers = vec![payout_server(&a, 3, cfg.clone()), payout_server(&b, 1, cfg)];
-                payout_leg_verified(servers, ids).await
-            }
-        };
-        let (_, done_off, bad_off, wrong_off, _) = leg(false).await;
-        let (_, done_on, bad_on, wrong_on, notes) = leg(true).await;
-        println!("corrupt storm: off {bad_off} damaged of {done_off} · on {bad_on} of {done_on}");
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        assert_eq!(wrong_off + wrong_on, 0, "no split-brain in this rig");
-        // Off: the corrupting server serves ~3/4 of the queue with 3 of
-        // the 4 connections and damages every 3rd body - the storm
-        // must actually have bitten or the rig is broken.
-        assert!(
-            bad_off >= 3,
-            "off leg delivered only {bad_off} corrupt bodies - rig broken"
-        );
-        // On: a clean copy exists on the other server for every id, so
-        // not one corrupt body may reach the consumer.
-        assert_eq!(bad_on, 0, "crc_retry accepted corrupt bodies: {notes:?}");
-        assert!(
-            notes
-                .iter()
-                .any(|n| n.contains("refetching from another server")),
-            "no crc-retry steer was ever noted: {notes:?}"
-        );
-    }
-
-    /// TODO 111 experiment 4, wrong-bytes split-brain: a server whose
-    /// storage answers a requested id with a DIFFERENT article's bytes
-    /// - a fully valid yEnc body whose own pcrc32 PASSES. The rig
-    /// proves two things: (a) per-article CRC alone catches NOTHING
-    /// here (off leg: wrong bodies delivered, zero CRC failures), so
-    /// the gate's part-number identity check is load-bearing; (b) with
-    /// the gate on, every swapped article is refetched from the clean
-    /// server - cross-server is the whole cover, because every copy
-    /// the split-brain server holds is the same wrong copy.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn crc_retry_covers_wrong_bytes_split_brain() {
-        let data: Vec<u8> = (0..320_000u32).map(|i| (i >> 2) as u8).collect();
-        let mk_maps = || {
-            let mut articles = std::collections::HashMap::new();
-            let segs = crate::mock::make_file_articles("w.bin", &data, 8_000, "wb", &mut articles);
-            (articles, segs)
-        };
-        let (arts_a, segs) = mk_maps();
-        let (arts_b, _) = mk_maps();
-        // Six ids answered with their neighbour's (valid) article.
-        let swap: std::collections::HashMap<String, String> = [5, 11, 17, 23, 29, 35]
-            .into_iter()
-            .map(|i| (format!("<{}>", segs[i].0), format!("<{}>", segs[i + 1].0)))
-            .collect();
-        let leg = |retry: bool| {
-            let arts_a = arts_a.clone();
-            let arts_b = arts_b.clone();
-            let swap = swap.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, part)| ArticleReq {
-                    id: format!("<{id}>"),
-                    age_days: 0,
-                    part: *part,
-                })
-                .collect();
-            async move {
-                let a = crate::mock::MockServer::start(
-                    arts_a,
-                    crate::mock::Chaos {
-                        swap,
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let b = crate::mock::MockServer::start(arts_b, Default::default()).await;
-                let cfg = PoolConfig {
-                    crc_retry: retry,
-                    window: 2,
-                    ..Default::default()
-                };
-                let servers = vec![payout_server(&a, 3, cfg.clone()), payout_server(&b, 1, cfg)];
-                payout_leg_verified(servers, ids).await
-            }
-        };
-        let (_, done_off, bad_off, wrong_off, _) = leg(false).await;
-        let (_, done_on, bad_on, wrong_on, notes) = leg(true).await;
-        println!("split-brain: off {wrong_off} wrong of {done_off} · on {wrong_on} of {done_on}");
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        // (a) The finding that matters: the wrong bodies sail through
-        // their own CRC - identity, not integrity, is what fails.
-        assert_eq!(bad_off + bad_on, 0, "split-brain bodies must PASS pcrc32");
-        assert!(
-            wrong_off >= 1,
-            "off leg delivered no wrong bodies - the swap never bit (a \
-             (1/4)^6 dispatch fluke, or the rig is broken)"
-        );
-        // (b) The gate covers it, cross-server.
-        assert_eq!(wrong_on, 0, "crc_retry accepted wrong bodies: {notes:?}");
-        assert!(
-            notes.iter().any(|n| n.contains("wrong article")),
-            "no part-mismatch steer was ever noted: {notes:?}"
-        );
-    }
-
-    /// Gauntlet leg: like `payout_leg` but returns the outcome tallies
-    /// AND the LiveStats. The mocks all answer to the host string
-    /// "127.0.0.1", so per-server claims (which server got clamped, who
-    /// suffered session churn) must come from the per-INDEX gauges, not
-    /// the event ring's host field.
-    async fn gauntlet_leg(
-        servers: Vec<(ServerConfig, PoolConfig)>,
-        ids: Vec<ArticleReq>,
-    ) -> (Duration, usize, usize, Arc<LiveStats>) {
-        let live = LiveStats::for_servers(&servers);
-        let servers: Vec<(ServerConfig, PoolConfig)> = servers
-            .into_iter()
-            .map(|(s, mut c)| {
-                c.live = Some(live.clone());
-                (s, c)
-            })
-            .collect();
-        let (tx, mut rx) = mpsc::channel(64);
-        let t0 = Instant::now();
-        let fetch = tokio::spawn(async move { fetch_all_multi(&servers, ids, tx).await });
-        let collect = tokio::spawn(async move {
-            let (mut done, mut missing) = (0usize, 0usize);
-            while let Some(o) = rx.recv().await {
-                match o {
-                    FetchOutcome::Done { .. } => done += 1,
-                    FetchOutcome::Missing { .. } => missing += 1,
-                    FetchOutcome::Failed { .. } => {}
-                }
-            }
-            (done, missing)
-        });
-        tokio::time::timeout(Duration::from_secs(120), fetch)
-            .await
-            .expect("gauntlet leg hung")
-            .unwrap();
-        let elapsed = t0.elapsed();
-        let (done, missing) = collect.await.unwrap();
-        (elapsed, done, missing, live)
-    }
-
-    /// Count of flap-clamp announcements in a leg's event ring. At most
-    /// one per server per run by construction (`flap_noted`), so this is
-    /// also "how many servers were clamped".
-    fn clamp_count(live: &LiveStats) -> usize {
-        live.events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|e| e.detail.contains("sessions flapping"))
-            .count()
-    }
-
-    /// THE GAUNTLET (TODO 111 interaction stage): four servers, four
-    /// SIMULTANEOUS distinct faults in one run - an IP-cap flapper
-    /// (accept_cap + die-every-body), a mid-run brownout, a jittery but
-    /// healthy link, and a clean server - across three config tiers:
-    /// everything off, the shipped defaults, and everything on (shipped
-    /// + adaptive timeout + the dark knobs hot_spare and recycle_slow).
-    /// The prior rounds priced each mitigation ALONE; this run pins the
-    /// safety gates in combination:
-    ///   - every article completes on every tier;
-    ///   - everything-on is never worse than shipped by more than 10%;
-    ///   - the flap clamp fires exactly once, and only the flapper can
-    ///     have earned it: FLAP_DEATHS is 6, the brownout's mute
-    ///     frontend kills at most its 3 initial established sessions
-    ///     (post-brownout sessions never serve a byte, so their deaths
-    ///     do not count), and the jitter/clean servers drop nothing;
-    ///   - the jittery server suffers ZERO session kills on every tier
-    ///     (its reconnects gauge stays 0): the flat timeout, the
-    ///     adaptive budget, the slope recycle and the race-loss recycle
-    ///     all sit above 1.5 s spikes alone, and must stay there when
-    ///     armed together.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - run with --ignored"]
-    async fn gauntlet_four_faults_three_config_tiers() {
-        // Sized so the mitigated legs still run ~8 s: the flap clamp
-        // needs FLAP_DEATHS established-session deaths to accumulate
-        // BEFORE the queue drains, and a 4 s leg raced it (measured:
-        // the shipped tier finished clampless at 2.4 MB).
-        let data: Vec<u8> = (0..4_800_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("g.bin", &data, 20_000, "gl", &mut articles);
-        // tier 0 = everything off, 1 = shipped defaults, 2 = everything on
-        let leg = |tier: u8| {
-            let articles = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let flapper = crate::mock::MockServer::start(
-                    articles.clone(),
-                    crate::mock::Chaos {
-                        accept_cap: Some(2),
-                        drop_after: 1,
-                        // Fast enough that the two cap winners cycle
-                        // (serve one body, die) quickly - the clamp
-                        // needs their deaths on the board early.
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 100_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let brownout = crate::mock::MockServer::start(
-                    articles.clone(),
-                    crate::mock::Chaos {
-                        brownout_after: 30,
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 100_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let jittery = crate::mock::MockServer::start(
-                    articles.clone(),
-                    crate::mock::Chaos {
-                        jitter: Some((5, 1_500)),
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 100_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let clean = crate::mock::MockServer::start(
-                    articles,
-                    crate::mock::Chaos {
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 150_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    flap_breaker: tier >= 1,
-                    tail_fanout: tier >= 1,
-                    tail_fanout_early: tier >= 1,
-                    hedge: tier >= 1,
-                    recycle_slope: tier >= 1,
-                    adaptive_timeout: tier >= 2,
-                    hot_spare: tier >= 2,
-                    recycle_slow: tier >= 2,
-                    read_timeout: Duration::from_secs(12),
-                    connect_backoff: Duration::from_millis(100),
-                    ..Default::default()
-                };
-                // Staggered flapper dials (the other servers keep ramp 0):
-                // six simultaneous dials race the mock's live count to 6
-                // before any accept task checks the cap, so every one of
-                // them can bounce and the capacity-yield ladder may bow
-                // the whole fleet out before a single session
-                // establishes. 50 ms apart, the first two win their
-                // slots and the rest bounce off a genuinely full cap -
-                // the shape the clamp exists for.
-                let fcfg = PoolConfig {
-                    connections: 6,
-                    ramp_delay: Duration::from_millis(50),
-                    ..cfg.clone()
-                };
-                let mut fsc = flapper.server_config();
-                fsc.connections = 6;
-                let servers = vec![
-                    (fsc, fcfg),
-                    payout_server(&brownout, 3, cfg.clone()),
-                    payout_server(&jittery, 3, cfg.clone()),
-                    payout_server(&clean, 3, cfg),
-                ];
-                gauntlet_leg(servers, ids).await
-            }
-        };
-        let (t_off, done_off, miss_off, live_off) = leg(0).await;
-        let (t_ship, done_ship, miss_ship, live_ship) = leg(1).await;
-        let (t_on, done_on, miss_on, live_on) = leg(2).await;
-        let jitter_kills = |l: &LiveStats| l.servers[2].reconnects.load(Ordering::Relaxed);
-        let clean_kills = |l: &LiveStats| l.servers[3].reconnects.load(Ordering::Relaxed);
-        // Mechanism counters, for attributing any unexpected churn: the
-        // ring's host field cannot tell the mocks apart, but the detail
-        // text names the knob that acted.
-        let recycles = |l: &LiveStats, what: &str| {
-            l.events
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|e| e.detail.contains(what))
-                .count()
-        };
-        println!(
-            "gauntlet notes on-tier: slow-recycles {} slope-recycles {}",
-            recycles(&live_on, "recycled a slow session"),
-            recycles(&live_on, "recycled a degraded session"),
-        );
-        println!(
-            "gauntlet: off {t_off:?} shipped {t_ship:?} on {t_on:?} · clamps \
-             off/ship/on {}/{}/{} · jitter kills {}/{}/{} · clean kills {}/{}/{}",
-            clamp_count(&live_off),
-            clamp_count(&live_ship),
-            clamp_count(&live_on),
-            jitter_kills(&live_off),
-            jitter_kills(&live_ship),
-            jitter_kills(&live_on),
-            clean_kills(&live_off),
-            clean_kills(&live_ship),
-            clean_kills(&live_on),
-        );
-        for (name, done, miss) in [
-            ("off", done_off, miss_off),
-            ("shipped", done_ship, miss_ship),
-            ("on", done_on, miss_on),
-        ] {
-            assert_eq!(done, segs.len(), "{name} tier lost articles");
-            assert_eq!(miss, 0, "{name} tier declared healthy articles Missing");
-        }
-        // Rig sanity is ENGAGEMENT, not a wall ordering: on loopback the
-        // flapper's cap churn is free (instant redials), so the clamp
-        // can trade a little wall time for the churn it removes and the
-        // off tier is NOT reliably the slowest. What must be true is
-        // that the faults actually bit - the unmitigated flapper churned
-        // hard enough that a clamp had something to engage on.
-        assert!(
-            live_off.servers[0].reconnects.load(Ordering::Relaxed) >= FLAP_DEATHS as u64,
-            "rig broken - the flapper never churned on the off tier"
-        );
-        assert!(
-            t_on.as_secs_f64() < t_ship.as_secs_f64() * 1.10,
-            "everything-on regressed the shipped defaults ({t_on:?} vs {t_ship:?})"
-        );
-        assert_eq!(
-            clamp_count(&live_off),
-            0,
-            "the clamp fired with the breaker off - knob leak"
-        );
-        assert_eq!(
-            clamp_count(&live_ship),
-            1,
-            "expected exactly the flapper clamped on the shipped tier"
-        );
-        assert_eq!(
-            clamp_count(&live_on),
-            1,
-            "expected exactly the flapper clamped on the everything-on tier"
-        );
-        for (name, l) in [
-            ("off", &live_off),
-            ("shipped", &live_ship),
-            ("on", &live_on),
-        ] {
-            assert_eq!(
-                jitter_kills(l),
-                0,
-                "{name} tier killed sessions on the jittery-but-healthy server"
-            );
-            assert_eq!(
-                clean_kills(l),
-                0,
-                "{name} tier killed sessions on the clean server"
-            );
-        }
-    }
-
-    /// FIGHT PROBE (TODO 111): dup racing + recycle_slow versus the flap
-    /// keeper. After the clamp, the keeper is the flapping server's only
-    /// session and it crawls, so the healthy server's idle workers dup
-    /// its articles via the rate rule and usually win. With recycle_slow
-    /// ON, two consecutive race losses shed the keeper's pipeline and
-    /// redial it - churn the clamp exists to stop, potentially
-    /// reintroduced by another knob. Measured claim: switching
-    /// recycle_slow on must not inflate the flapping server's accepted
-    /// sessions past 2x its knob-off churn, and must not cost wall time.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - run with --ignored"]
-    async fn fight_recycle_slow_must_not_churn_the_flap_keeper() {
-        let data: Vec<u8> = (0..6_000_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("f.bin", &data, 30_000, "fk", &mut articles);
-        let leg = |recycle: bool| {
-            let arts_a = articles.clone();
-            let arts_b = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let flapper = crate::mock::MockServer::start(
-                    arts_a,
-                    crate::mock::Chaos {
-                        accept_cap: Some(2),
-                        drop_after: 2,
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 100_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let steady = crate::mock::MockServer::start(
-                    arts_b,
-                    crate::mock::Chaos {
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 150_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    flap_breaker: true,
-                    tail_fanout: true,
-                    tail_fanout_early: true,
-                    hedge: true,
-                    recycle_slow: recycle,
-                    read_timeout: Duration::from_secs(12),
-                    connect_backoff: Duration::from_millis(100),
-                    ..Default::default()
-                };
-                // The flapper's dials are STAGGERED (unlike payout_server's
-                // ramp 0): six simultaneous dials race the mock's live
-                // count to 6 before any task checks the cap, every one of
-                // them bounces, and the capacity-yield ladder can bow the
-                // whole fleet out before a single session establishes -
-                // measured as a served-0, clampless flapper. Real dials
-                // are never perfectly simultaneous; 50 ms apart, the
-                // first two win their slots and the rest bounce off a
-                // genuinely full cap, which is the shape the clamp is for.
-                let fcfg = PoolConfig {
-                    connections: 6,
-                    ramp_delay: Duration::from_millis(50),
-                    ..cfg.clone()
-                };
-                let mut fsc = flapper.server_config();
-                fsc.connections = 6;
-                let servers = vec![(fsc, fcfg), payout_server(&steady, 3, cfg)];
-                let r = gauntlet_leg(servers, ids).await;
-                (
-                    r,
-                    flapper.accepted.load(Ordering::Relaxed),
-                    flapper.served.load(Ordering::Relaxed),
-                )
-            }
-        };
-        let ((t_off, done_off, _, live_off), acc_off, served_off) = leg(false).await;
-        let ((t_on, done_on, _, live_on), acc_on, served_on) = leg(true).await;
-        let recycles = |l: &LiveStats| {
-            l.events
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|e| e.detail.contains("recycled a slow session"))
-                .count()
-        };
-        println!(
-            "keeper churn: off {t_off:?} accepted {acc_off} served {served_off} · \
-             on {t_on:?} accepted {acc_on} served {served_on} (recycles {})",
-            recycles(&live_on)
-        );
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        assert_eq!(
-            clamp_count(&live_off),
-            1,
-            "rig broken - the clamp never engaged"
-        );
-        assert_eq!(
-            clamp_count(&live_on),
-            1,
-            "rig broken - the clamp never engaged"
-        );
-        assert_eq!(
-            recycles(&live_off),
-            0,
-            "recycle fired with the knob off - knob leak"
-        );
-        assert!(
-            acc_on <= acc_off * 2,
-            "recycle_slow redial-stormed the clamped server \
-             ({acc_on} accepted sessions vs {acc_off} with the knob off)"
-        );
-        assert!(
-            t_on.as_secs_f64() < t_off.as_secs_f64() * 1.15,
-            "recycle_slow cost wall time on the clamped rig ({t_on:?} vs {t_off:?})"
-        );
-    }
-
-    /// FIGHT PROBE (TODO 111): slope recycle + adaptive timeout on the
-    /// same degraded session must not double-punish. The slope rule
-    /// redials a session delivering under a quarter of its siblings'
-    /// rate; the adaptive budget's stall deadline rolls with progress,
-    /// so a slow-but-alive transfer must NOT also be killed as stalled
-    /// (a kill strikes the session and requeues its pipeline - paying
-    /// twice for one diagnosis). Claim: adding adaptive to slope changes
-    /// neither completion nor churn beyond the slope's own deliberate
-    /// redial, and costs no wall time.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement (~1 min) - run with --ignored"]
-    async fn fight_slope_plus_adaptive_must_not_double_punish() {
-        // 120 articles, like payout_slope: the slope rule only runs while
-        // pending > ENDGAME_MAX (64), so a smaller queue leaves the
-        // normal phase before the 10 s proof window opens and the knob
-        // structurally cannot fire (measured: 72 articles, zero slope
-        // recycles in either leg).
-        let data: Vec<u8> = (0..6_000_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("s2.bin", &data, 50_000, "sa", &mut articles);
-        let leg = |adaptive: bool| {
-            let articles = articles.clone();
-            let ids: Vec<ArticleReq> = segs
-                .iter()
-                .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-                .collect();
-            async move {
-                let srv = crate::mock::MockServer::start(
-                    articles,
-                    crate::mock::Chaos {
-                        slow_conn: Some((1, 8_000)),
-                        throttle: crate::mock::Throttle {
-                            per_conn_bps: 100_000,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-                .await;
-                let cfg = PoolConfig {
-                    recycle_slope: true,
-                    adaptive_timeout: adaptive,
-                    read_timeout: Duration::from_secs(12),
-                    ..Default::default()
-                };
-                gauntlet_leg(vec![payout_server(&srv, 3, cfg)], ids).await
-            }
-        };
-        let (t_off, done_off, _, live_off) = leg(false).await;
-        let (t_on, done_on, _, live_on) = leg(true).await;
-        let churn = |l: &LiveStats| l.servers[0].reconnects.load(Ordering::Relaxed);
-        let slopes = |l: &LiveStats| {
-            l.events
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|e| e.detail.contains("recycled a degraded session"))
-                .count()
-        };
-        println!(
-            "slope+adaptive: slope-only {t_off:?} ({} reconnects, {} slope) · \
-             both {t_on:?} ({} reconnects, {} slope)",
-            churn(&live_off),
-            slopes(&live_off),
-            churn(&live_on),
-            slopes(&live_on),
-        );
-        assert_eq!(done_off, segs.len());
-        assert_eq!(done_on, segs.len());
-        assert!(
-            slopes(&live_on) >= 1,
-            "rig broken - the slope recycle never fired with adaptive on"
-        );
-        // The slope's own deliberate redial is the only churn either leg
-        // should show; adaptive piling kills on top would read as extra
-        // reconnects here.
-        assert!(
-            churn(&live_on) <= churn(&live_off) + 1,
-            "adaptive added session kills on top of the slope recycle \
-             ({} vs {})",
-            churn(&live_on),
-            churn(&live_off)
-        );
-        assert!(
-            t_on.as_secs_f64() < t_off.as_secs_f64() * 1.25,
-            "adaptive cost wall time on the degraded-session rig ({t_on:?} vs {t_off:?})"
-        );
-    }
-
-    /// FIGHT PROBE (TODO 111): tail fan-out must not eat the hot spare.
-    /// Racers are never fresh dials - `pick_dup` hands dup work to a
-    /// connection that already exists (idle primaries), and the spare is
-    /// only claimable at session START after a death (`session_loop`
-    /// takes `spares[idx]` before dialling). So on a healthy run with
-    /// both knobs on, the accepted-session count must be exactly the
-    /// workers plus the one parked spare - a fan-out that dialled extra
-    /// sessions, or ate and re-filled the spare, would show up right
-    /// here. Count-based, so it runs in the normal suite.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn fanout_does_not_eat_the_hot_spare() {
-        let data: Vec<u8> = (0..1_200_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("h2.bin", &data, 20_000, "hs", &mut articles);
-        let ids: Vec<ArticleReq> = segs
-            .iter()
-            .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-            .collect();
-        let srv = crate::mock::MockServer::start(
-            articles,
-            crate::mock::Chaos {
-                throttle: crate::mock::Throttle {
-                    per_conn_bps: 400_000,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .await;
-        let cfg = PoolConfig {
-            tail_fanout: true,
-            tail_fanout_early: true,
-            hot_spare: true,
-            ..Default::default()
-        };
-        let (_, done, missing, _) = gauntlet_leg(vec![payout_server(&srv, 3, cfg)], ids).await;
-        assert_eq!(done, segs.len());
-        assert_eq!(missing, 0);
-        let accepted = srv.accepted.load(Ordering::Relaxed);
-        assert!(
-            accepted <= 4,
-            "expected 3 workers + 1 parked spare, got {accepted} accepted \
-             sessions - something dialled beyond the budget"
-        );
-    }
-
-    /// FIGHT PROBE (TODO 111): the flap clamp must not break 430
-    /// unanimity. A clamped server still counts in `live_mask` while its
-    /// keeper lives, so a Missing verdict needs the keeper's own 430
-    /// vote (or the server's full death). Six ids exist on NO server;
-    /// the flapping server clamps early in the run; every one of the six
-    /// must still reach its Missing verdict and the job must terminate -
-    /// a clamp that muted the keeper's vote would hang these forever.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "wall-clock payout measurement - run with --ignored"]
-    async fn fight_flap_clamp_still_reaches_missing_verdicts() {
-        let data: Vec<u8> = (0..3_000_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("m2.bin", &data, 30_000, "mv", &mut articles);
-        let ghosts: Vec<String> = (0..6).map(|i| format!("<ghost-{i}@mv>")).collect();
-        let ids: Vec<ArticleReq> = segs
-            .iter()
-            .map(|(id, _, _)| format!("<{id}>"))
-            .chain(ghosts.iter().cloned())
-            .map(ArticleReq::fresh)
-            .collect();
-        let flapper = crate::mock::MockServer::start(
-            articles.clone(),
-            crate::mock::Chaos {
-                accept_cap: Some(2),
-                drop_after: 1,
-                throttle: crate::mock::Throttle {
-                    per_conn_bps: 60_000,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .await;
-        let steady = crate::mock::MockServer::start(
-            articles,
-            crate::mock::Chaos {
-                throttle: crate::mock::Throttle {
-                    per_conn_bps: 150_000,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .await;
-        let cfg = PoolConfig {
-            flap_breaker: true,
-            tail_fanout: true,
-            tail_fanout_early: true,
-            hedge: true,
-            recycle_slope: true,
-            read_timeout: Duration::from_secs(12),
-            connect_backoff: Duration::from_millis(100),
-            ..Default::default()
-        };
-        // Staggered flapper dials, same reason as the keeper-churn probe:
-        // six simultaneous dials all bounce off the mock's racing live
-        // count and the capacity-yield ladder can kill the server before
-        // it ever flaps.
-        let fcfg = PoolConfig {
-            connections: 6,
-            ramp_delay: Duration::from_millis(50),
-            ..cfg.clone()
-        };
-        let mut fsc = flapper.server_config();
-        fsc.connections = 6;
-        let servers = vec![(fsc, fcfg), payout_server(&steady, 3, cfg)];
-        let (t, done, missing, live) = gauntlet_leg(servers, ids).await;
-        println!(
-            "clamp+unanimity: {t:?}, {done} done, {missing} missing, clamps {}",
-            clamp_count(&live)
-        );
-        assert_eq!(done, segs.len(), "lost real articles");
-        assert_eq!(
-            missing,
-            ghosts.len(),
-            "the poisoned articles never reached their Missing verdicts under the clamp"
-        );
-        assert_eq!(
-            clamp_count(&live),
-            1,
-            "rig broken - the clamp never engaged"
-        );
-    }
-
-    /// Early fan-out (NZBFAST_TAIL_FANOUT=2): the tail latch arms the
-    /// endgame dup rules at queue-dry, well above ENDGAME_MAX pending;
-    /// plain fan-out (=1) still waits for the pending threshold.
-    #[tokio::test]
-    async fn early_fanout_arms_at_the_tail_latch_not_the_pending_floor() {
-        let mk = |host: &str, early: bool| {
-            (
-                ServerConfig {
-                    host: host.into(),
-                    port: 119,
-                    tls: false,
-                    username: None,
-                    password: None,
-                    connections: 1,
-                    pin_connections: false,
-                    level: 0,
-                    group: None,
-                    retention_days: 0,
-                    rcvbuf: None,
-                    block_bytes: None,
-                    bind_ip: None,
-                    socks5: None,
-                    enabled: true,
-                    warm_pool: false,
-                    idle_release_secs: None,
-                    idle_keep: None,
-                    max_source_ips: None,
-                },
-                PoolConfig {
-                    tail_fanout: true,
-                    tail_fanout_early: early,
-                    ..Default::default()
-                },
-            )
-        };
-        let mk_reqs = || -> Vec<ArticleReq> {
-            (0..(ENDGAME_MAX + 40))
-                .map(|i| ArticleReq::fresh(format!("<q{i}>")))
-                .collect()
-        };
-        let w = Work {
-            id: "<q0>".into(),
-            attempts: 0,
-            promoted: false,
-            tried_430: 0,
-            tried_fail: 0,
-            dup: false,
-        };
-
-        // Plain fan-out, tail latched, pending far above the floor: the
-        // endgame rules stay dark.
-        let servers = vec![mk("a", false), mk("b", false)];
-        let (plain, _) = Shared::new(mk_reqs(), &servers);
-        plain
-            .tail_started
-            .lock_ok()
-            .get_or_insert_with(Instant::now);
-        plain.register_inflight(&w, 0);
-        plain.inflight.lock_ok().get_mut("<q0>").unwrap().dispatched =
-            Instant::now() - Duration::from_secs(1);
-        assert!(
-            plain.pick_dup(1, 0b10, 0b10, 0, 0, 0).is_none(),
-            "plain fan-out fired above ENDGAME_MAX"
-        );
-
-        // Early fan-out: same shape, latch armed -> healthy race fires.
-        let servers = vec![mk("a", true), mk("b", true)];
-        let (early, _) = Shared::new(mk_reqs(), &servers);
-        early.register_inflight(&w, 0);
-        early.inflight.lock_ok().get_mut("<q0>").unwrap().dispatched =
-            Instant::now() - Duration::from_secs(1);
-        // ...but not before the latch: no tail, no early rules.
-        assert!(
-            early.pick_dup(1, 0b10, 0b10, 0, 0, 0).is_none(),
-            "early fan-out fired before the queue ever ran dry"
-        );
-        early
-            .tail_started
-            .lock_ok()
-            .get_or_insert_with(Instant::now);
-        let d = early
-            .pick_dup(1, 0b10, 0b10, 0, 0, 0)
-            .expect("early fan-out races at the tail latch");
-        assert_eq!(d.id, "<q0>");
-        assert!(d.dup);
-    }
-
-    /// Tail-prefetch experiment: `QueueControl::tail_pending` answers
-    /// None before the pool's tail latch, Some(pending) after, and None
-    /// again once the run's Shared is gone.
-    #[tokio::test]
-    async fn queue_control_exports_the_tail_latch() {
-        let mk = |host: &str| {
-            (
-                ServerConfig {
-                    host: host.into(),
-                    port: 119,
-                    tls: false,
-                    username: None,
-                    password: None,
-                    connections: 1,
-                    pin_connections: false,
-                    level: 0,
-                    group: None,
-                    retention_days: 0,
-                    rcvbuf: None,
-                    block_bytes: None,
-                    bind_ip: None,
-                    socks5: None,
-                    enabled: true,
-                    warm_pool: false,
-                    idle_release_secs: None,
-                    idle_keep: None,
-                    max_source_ips: None,
-                },
-                PoolConfig::default(),
-            )
-        };
-        let servers = vec![mk("a")];
-        let reqs: Vec<ArticleReq> = (0..3)
-            .map(|i| ArticleReq::fresh(format!("<t{i}>")))
-            .collect();
-        let (shared, _) = Shared::new(reqs, &servers);
-        let ctl = QueueControl::default();
-        ctl.attach(&shared);
-        assert_eq!(ctl.tail_pending(), None, "no tail latched yet");
-        shared
-            .tail_started
-            .lock_ok()
-            .get_or_insert_with(Instant::now);
-        assert_eq!(ctl.tail_pending(), Some(3), "latched tail reports pending");
-        drop(shared);
-        assert_eq!(ctl.tail_pending(), None, "gone run answers None");
-    }
-
-    /// Hedge experiment (opt-in `PoolConfig::hedge`): the dup race's
-    /// staleness bound adapts to the trained article-time EWMA (3x,
-    /// clamped [500 ms, 8 s]) instead of a flat 8 s, the Done path
-    /// trains the EWMA, and stale-only dups respect the issue-rate cap.
-    /// Off keeps the flat bound.
-    #[tokio::test]
-    async fn hedge_races_a_straggler_at_the_adaptive_bound() {
-        let mk = |host: &str, hedge: bool| {
-            (
-                ServerConfig {
-                    host: host.into(),
-                    port: 119,
-                    tls: false,
-                    username: None,
-                    password: None,
-                    connections: 1,
-                    pin_connections: false,
-                    level: 0,
-                    group: None,
-                    retention_days: 0,
-                    rcvbuf: None,
-                    block_bytes: None,
-                    bind_ip: None,
-                    socks5: None,
-                    enabled: true,
-                    warm_pool: false,
-                    idle_release_secs: None,
-                    idle_keep: None,
-                    max_source_ips: None,
-                },
-                PoolConfig {
-                    hedge,
-                    ..Default::default()
-                },
-            )
-        };
-        let servers = vec![mk("a", true), mk("b", true)];
-        // Normal phase: the endgame's own rules must stay out of the way.
-        let reqs: Vec<ArticleReq> = (0..(ENDGAME_MAX + 10))
-            .map(|i| ArticleReq::fresh(format!("<s{i}>")))
-            .collect();
-        let (shared, _) = Shared::new(reqs, &servers);
-
-        // Bound math: untrained keeps the flat 8 s; trained is 3x the
-        // EWMA clamped to [500 ms, 8 s].
-        assert_eq!(shared.hedge_stale_bound(), Duration::from_secs(8));
-        shared.art_ms.store(100, Ordering::Relaxed);
-        assert_eq!(shared.hedge_stale_bound(), Duration::from_millis(500));
-        shared.art_ms.store(400, Ordering::Relaxed);
-        assert_eq!(shared.hedge_stale_bound(), Duration::from_millis(1200));
-        shared.art_ms.store(10_000, Ordering::Relaxed);
-        assert_eq!(shared.hedge_stale_bound(), Duration::from_secs(8));
-
-        // The Done path trains the EWMA (first sample is taken whole).
-        shared.art_ms.store(0, Ordering::Relaxed);
-        let w0 = Work {
-            id: "<s0>".into(),
-            attempts: 0,
-            promoted: false,
-            tried_430: 0,
-            tried_fail: 0,
-            dup: false,
-        };
-        shared.register_inflight(&w0, 0);
-        shared
-            .inflight
-            .lock_ok()
-            .get_mut("<s0>")
-            .unwrap()
-            .dispatched = Instant::now() - Duration::from_secs(1);
-        shared.deregister_inflight_done(&w0);
-        let trained = shared.art_ms.load(Ordering::Relaxed);
-        assert!(
-            (900..=1200).contains(&trained),
-            "one 1 s completion should train the EWMA to ~1000 ms, got {trained}"
-        );
-
-        // A healthy article 2 s in flight, equal rates: the flat rule
-        // keeps waiting, the trained bound (400 ms EWMA -> 1.2 s) races
-        // it and counts a hedge.
-        shared.art_ms.store(400, Ordering::Relaxed);
-        let w1 = Work {
-            id: "<s1>".into(),
-            attempts: 0,
-            promoted: false,
-            tried_430: 0,
-            tried_fail: 0,
-            dup: false,
-        };
-        shared.register_inflight(&w1, 0);
-        shared
-            .inflight
-            .lock_ok()
-            .get_mut("<s1>")
-            .unwrap()
-            .dispatched = Instant::now() - Duration::from_secs(2);
-        let d = shared
-            .pick_dup(1, 0b10, 0b10, 0, 0, 0)
-            .expect("straggler past the adaptive bound should be hedged");
-        assert_eq!(d.id, "<s1>");
-        assert!(d.dup);
-        assert_eq!(shared.hedges_issued.load(Ordering::Relaxed), 1);
-
-        // The issue-rate cap gates stale-only dups.
-        shared.hedges_issued.store(1000, Ordering::Relaxed);
-        let w2 = Work {
-            id: "<s2>".into(),
-            attempts: 0,
-            promoted: false,
-            tried_430: 0,
-            tried_fail: 0,
-            dup: false,
-        };
-        shared.register_inflight(&w2, 0);
-        shared
-            .inflight
-            .lock_ok()
-            .get_mut("<s2>")
-            .unwrap()
-            .dispatched = Instant::now() - Duration::from_secs(2);
-        assert!(
-            shared.pick_dup(1, 0b10, 0b10, 0, 0, 0).is_none(),
-            "a capped hedge still issued"
-        );
-
-        // OFF (the default): 2 s is not stale against the flat 8 s.
-        let servers_off = vec![mk("a", false), mk("b", false)];
-        let reqs: Vec<ArticleReq> = (0..(ENDGAME_MAX + 10))
-            .map(|i| ArticleReq::fresh(format!("<s{i}>")))
-            .collect();
-        let (off, _) = Shared::new(reqs, &servers_off);
-        off.art_ms.store(400, Ordering::Relaxed);
-        off.register_inflight(&w1, 0);
-        off.inflight.lock_ok().get_mut("<s1>").unwrap().dispatched =
-            Instant::now() - Duration::from_secs(2);
-        assert!(
-            off.pick_dup(1, 0b10, 0b10, 0, 0, 0).is_none(),
-            "hedge fired while switched off"
-        );
-    }
-
-    /// TTFB-suspicion hedge (TODO 115, opt-in `PoolConfig::ttfb_hedge`):
-    /// the suspicion bound's math, and every gate on the suspect dup -
-    /// off by default, suspect flag required, one dup per article,
-    /// same-server allowed, each server at most once, fill servers
-    /// never, the hedge issue-rate cap honoured, and the fast-path flag
-    /// cleared once nothing suspect is left unraced.
-    #[tokio::test]
-    async fn suspect_dup_races_a_pre_byte_stall_at_once() {
-        // Bound math: floor 1 s, 2x the EWMA past 500 ms.
-        assert_eq!(ttfb_suspect_ms(0), 1000);
-        assert_eq!(ttfb_suspect_ms(80), 1000);
-        assert_eq!(ttfb_suspect_ms(500), 1000);
-        assert_eq!(ttfb_suspect_ms(800), 1600);
-
-        let mk = |host: &str, on: bool| {
-            (
-                ServerConfig {
-                    host: host.into(),
-                    port: 119,
-                    tls: false,
-                    username: None,
-                    password: None,
-                    connections: 1,
-                    pin_connections: false,
-                    level: 0,
-                    group: None,
-                    retention_days: 0,
-                    rcvbuf: None,
-                    block_bytes: None,
-                    bind_ip: None,
-                    socks5: None,
-                    enabled: true,
-                    warm_pool: false,
-                    idle_release_secs: None,
-                    idle_keep: None,
-                    max_source_ips: None,
-                },
-                PoolConfig {
-                    ttfb_hedge: on,
-                    adaptive_timeout: on,
-                    ..Default::default()
-                },
-            )
-        };
-        let mk_work = |id: &str| Work {
-            id: id.into(),
-            attempts: 0,
-            promoted: false,
-            tried_430: 0,
-            tried_fail: 0,
-            dup: false,
-        };
-        let servers = vec![mk("a", true), mk("b", true)];
-        let reqs: Vec<ArticleReq> = (0..(ENDGAME_MAX + 10))
-            .map(|i| ArticleReq::fresh(format!("<s{i}>")))
-            .collect();
-        let (shared, _) = Shared::new(reqs, &servers);
-
-        // In flight on server 0, healthy: nobody races it.
-        shared.register_inflight(&mk_work("<s0>"), 0);
-        assert!(shared.pick_suspect_dup(0b10, 0b10, 0, 0).is_none());
-
-        // Suspicion fires: a SAME-SERVER sibling may race it, the pick
-        // counts as a hedge, and the second pick finds nothing (one dup
-        // per article) and clears the fast-path flag.
-        shared.mark_suspect("<s0>");
-        assert!(shared.suspect_pending.load(Ordering::Acquire));
-        assert!(
-            shared.pick_suspect_dup(0b1, 0b1, 1, 0).is_none(),
-            "fill server spent block bytes on a suspicion"
-        );
-        assert!(
-            shared.pick_suspect_dup(0b1, 0b1, 0, 2).is_none(),
-            "busy picker displaced queued work with a suspicion dup"
-        );
-        let d = shared
-            .pick_suspect_dup(0b1, 0b1, 0, 0)
-            .expect("suspect article should be raced immediately");
-        assert_eq!(d.id, "<s0>");
-        assert!(d.dup);
-        assert_eq!(shared.hedges_issued.load(Ordering::Relaxed), 1);
-        assert!(shared.pick_suspect_dup(0b10, 0b10, 0, 0).is_none());
-        assert!(
-            !shared.suspect_pending.load(Ordering::Acquire),
-            "an empty scan should clear the fast-path flag"
-        );
-
-        // A server the article already dupped to never re-races it, and
-        // the issue-rate cap gates fresh suspicions.
-        shared.mark_suspect("<s0>");
-        assert!(shared.pick_suspect_dup(0b1, 0b1, 0, 0).is_none());
-        shared.register_inflight(&mk_work("<s1>"), 0);
-        shared.mark_suspect("<s1>");
-        shared.hedges_issued.store(1000, Ordering::Relaxed);
-        assert!(
-            shared.pick_suspect_dup(0b10, 0b10, 0, 0).is_none(),
-            "a capped suspect dup still issued"
-        );
-
-        // OFF (the default): a suspect mark goes nowhere.
-        let servers_off = vec![mk("a", false), mk("b", false)];
-        let reqs: Vec<ArticleReq> = (0..4)
-            .map(|i| ArticleReq::fresh(format!("<s{i}>")))
-            .collect();
-        let (off, _) = Shared::new(reqs, &servers_off);
-        assert!(!off.ttfb_hedge, "dark flag leaked into Shared");
-        off.register_inflight(&mk_work("<s0>"), 0);
-        off.mark_suspect("<s0>");
-        assert!(
-            off.pick_suspect_dup(0b10, 0b10, 0, 0).is_none(),
-            "suspect dup fired while switched off"
         );
     }
 
@@ -8564,6 +6658,8 @@ mod tests {
             tried_430: 0,
             tried_fail: 0,
             dup: false,
+            prebyte_expiries: 0,
+            soft_430: 0,
         };
         shared.register_inflight(&w, 1); // owned by the SMALL server
 
@@ -8638,6 +6734,8 @@ mod tests {
             tried_430: 0,
             tried_fail: 0,
             dup: false,
+            prebyte_expiries: 0,
+            soft_430: 0,
         };
         shared.register_inflight(&w, 0); // owned by the PRIMARY
 
@@ -8950,7 +7048,7 @@ mod tests {
             "every item in a worker's pipeline carries exactly one charge"
         );
 
-        requeue_or_fail(&shared, &tx, &cfg, ctx, &mut inflight, "send failed").await;
+        requeue_or_fail(&shared, &tx, &cfg, ctx, &mut inflight, "send failed", true).await;
         assert_eq!(
             shared.inflight_body_bytes.load(Ordering::Acquire),
             0,
@@ -8959,6 +7057,70 @@ mod tests {
         assert!(
             !shared.wire_over_cap(EST_BODY_BYTES),
             "counter wrapped past zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_productive_sessions_death_charges_no_article() {
+        // The flap harvest recovery (chaos flap leg, 6 Aug): a session
+        // that completed at least one body and THEN died must requeue
+        // its pipeline uncharged - branding the innocent next-in-line
+        // article with tried_fail built a twin-only backlog (~2
+        // articles/s) that idled the flapping server for the whole
+        // drain of its bandwidth-saturated sibling. A zero-work session
+        // keeps the unconditional front charge (the RST-after-AUTH
+        // livelock guard), which is also what eventually walks a
+        // session-killing poison article to its terminal verdict.
+        let servers = one_server();
+        let (shared, _) = Shared::new(
+            vec![
+                ArticleReq::fresh("<p0@x>".into()),
+                ArticleReq::fresh("<p1@x>".into()),
+            ],
+            &servers,
+        );
+        let ctx = ctx_for(&servers, 0);
+        let cfg = PoolConfig::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let _life = WorkerLife::birth(&shared, 0);
+
+        let mut inflight: VecDeque<Work> = VecDeque::new();
+        for slot in 0..2 {
+            let w = next_work(&shared, ctx, &tx, slot).await.expect("queued");
+            shared.charge_wire();
+            shared.register_inflight(&w, 0);
+            inflight.push_back(w);
+        }
+        // Productive session died between responses: nobody is charged.
+        requeue_or_fail(&shared, &tx, &cfg, ctx, &mut inflight, "eof", false).await;
+        {
+            let q = shared.queue.lock().await;
+            assert_eq!(q.len(), 2, "both articles requeue");
+            for w in q.iter() {
+                assert_eq!(w.attempts, 0, "an innocent requeue bumps nothing");
+                assert_eq!(w.tried_fail, 0, "no server brand on a clean death");
+            }
+        }
+        // Zero-work session death: the front casualty still pays, so
+        // the charge-driven terminal path is intact.
+        let mut inflight: VecDeque<Work> = VecDeque::new();
+        for slot in 0..2 {
+            let w = next_work(&shared, ctx, &tx, slot).await.expect("queued");
+            shared.charge_wire();
+            shared.register_inflight(&w, 0);
+            inflight.push_back(w);
+        }
+        let front_id = inflight[0].id.clone();
+        requeue_or_fail(&shared, &tx, &cfg, ctx, &mut inflight, "rst", true).await;
+        let q = shared.queue.lock().await;
+        let front = q.iter().find(|w| w.id == front_id).expect("requeued");
+        assert_eq!(front.attempts, 1, "zero-work death charges the front");
+        assert_eq!(front.tried_fail, ctx.bit, "and brands it with this server");
+        assert!(
+            q.iter()
+                .filter(|w| w.id != front_id)
+                .all(|w| w.attempts == 0 && w.tried_fail == 0),
+            "pipeline mates stay uncharged either way"
         );
     }
 
@@ -9135,6 +7297,8 @@ mod tests {
             tried_430: 0,
             tried_fail: 0,
             dup: true,
+            prebyte_expiries: 0,
+            soft_430: 0,
         });
         // A seek promotes a7 and a3 to the front (in that range order).
         let ids: Vec<String> = ["<a7>", "<a3>"].iter().map(|s| s.to_string()).collect();
@@ -9234,192 +7398,6 @@ mod tests {
         assert!(!dead.is_draining());
     }
 
-    #[tokio::test]
-    async fn rate_limit_paces_charges() {
-        // 1 MB charged in 100 KB chunks at 10 MB/s ≈ 100 ms. Generous
-        // bounds only - CI machines wobble.
-        let rl = RateLimit::new(10_000_000);
-        let t0 = Instant::now();
-        for _ in 0..10 {
-            rl.throttle(100_000).await;
-        }
-        let el = t0.elapsed();
-        assert!(el >= Duration::from_millis(60), "too fast: {el:?}");
-        assert!(el <= Duration::from_secs(2), "too slow: {el:?}");
-    }
-
-    /// The shipped-default bug: with the old byte-window the per-call
-    /// sleep was clamped to 5 s and the debt was never forgiven, so the
-    /// aggregate could not be held below `connections * article / 5 s` -
-    /// ~1.28 MB/s at 8 connections, i.e. every cap under ~10 Mbit/s was
-    /// silently exceeded.
-    ///
-    /// Necessarily slower than a unit test wants: the clamp is 5 s of
-    /// WALL time, so nothing under that can observe it. 8 workers x
-    /// 150 KB at 150 KB/s owes 8 s; the old code answered in ~5.
-    #[tokio::test]
-    async fn rate_limit_holds_a_cap_below_the_old_clamp_floor() {
-        const CAP: u64 = 150_000;
-        const WORKERS: u64 = 8;
-        let rl = RateLimit::new(CAP);
-        let t0 = Instant::now();
-        let mut set = tokio::task::JoinSet::new();
-        for _ in 0..WORKERS {
-            let rl = rl.clone();
-            set.spawn(async move { rl.throttle(CAP).await });
-        }
-        while set.join_next().await.is_some() {}
-        let el = t0.elapsed();
-        // Owed is WORKERS seconds (each charges exactly one second's
-        // worth). Generous lower bound: anything near 5 s is the clamp.
-        assert!(
-            el >= Duration::from_secs_f64(WORKERS as f64 * 0.8),
-            "the cap was exceeded - {el:?} for {WORKERS}s of charged bytes"
-        );
-        assert!(
-            el <= Duration::from_secs(WORKERS * 3),
-            "far too slow: {el:?}"
-        );
-    }
-
-    /// A live cap change must not leave a worker asleep against the old
-    /// one. The virtual clock prices each charge when it is charged, so a
-    /// decrease never re-prices old bytes; the generation bump is what
-    /// releases anyone already waiting.
-    #[tokio::test]
-    async fn a_live_cap_change_releases_a_sleeping_worker() {
-        let rl = RateLimit::new(1_000); // 1 KB/s: 100 KB owes 100 s
-        let t0 = Instant::now();
-        let waiter = {
-            let rl = rl.clone();
-            tokio::spawn(async move { rl.throttle(100_000).await })
-        };
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        rl.set(0); // the user removed the limit
-        waiter.await.unwrap();
-        assert!(
-            t0.elapsed() < Duration::from_secs(5),
-            "stranded against the old cap"
-        );
-    }
-
-    #[tokio::test]
-    async fn rate_limit_zero_is_unlimited() {
-        let rl = RateLimit::new(0);
-        let t0 = Instant::now();
-        for _ in 0..100 {
-            rl.throttle(10_000_000).await;
-        }
-        assert!(t0.elapsed() < Duration::from_millis(100));
-        // And a live set() takes effect.
-        rl.set(1_000_000);
-        assert_eq!(rl.get(), 1_000_000);
-        let t0 = Instant::now();
-        rl.throttle(300_000).await; // fresh window: ~300 ms owed
-        assert!(t0.elapsed() >= Duration::from_millis(100));
-    }
-
-    #[test]
-    fn conn_target_clamps_to_one() {
-        // 0 would park the whole fleet with work pending - the
-        // `connections: 0` hang, reached through the side door.
-        let t = ConnTarget::new(0);
-        assert_eq!(t.get(), 1);
-        t.set(0);
-        assert_eq!(t.get(), 1);
-        t.set(5);
-        assert_eq!(t.get(), 5);
-    }
-
-    /// TODO 112: the live connection target moves BOTH directions
-    /// mid-run. Lowering it must drain the highest slots to their next
-    /// response boundary and park them (connected falls to the target,
-    /// no worker retires); raising it must wake them (connected climbs
-    /// again); and every article still gets its outcome. Assertions are
-    /// on the `connected` gauge, never on rates - socket counts are
-    /// deterministic on loopback, throughput is not.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_live_target_change_parks_and_wakes_workers() {
-        let data: Vec<u8> = (0..3_000_000u32).map(|i| i as u8).collect();
-        let mut articles = std::collections::HashMap::new();
-        let segs = crate::mock::make_file_articles("t.bin", &data, 20_000, "lt", &mut articles);
-        let ids: Vec<ArticleReq> = segs
-            .iter()
-            .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
-            .collect();
-        let srv = crate::mock::MockServer::start(
-            articles,
-            crate::mock::Chaos {
-                // Slow enough that the run comfortably outlives three
-                // target moves, fast enough to finish inside CI bounds.
-                throttle: crate::mock::Throttle {
-                    per_conn_bps: 150_000,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .await;
-        let target = ConnTarget::new(4);
-        let (sc, mut cfg) = payout_server(&srv, 4, PoolConfig::default());
-        cfg.live_target = Some(target.clone());
-        let servers = vec![(sc, cfg)];
-        let live = LiveStats::for_servers(&servers);
-        let servers: Vec<(ServerConfig, PoolConfig)> = servers
-            .into_iter()
-            .map(|(s, mut c)| {
-                c.live = Some(live.clone());
-                (s, c)
-            })
-            .collect();
-        let (tx, mut rx) = mpsc::channel(64);
-        let fetch = tokio::spawn(async move { fetch_all_multi(&servers, ids, tx).await });
-        let collect = tokio::spawn(async move {
-            let mut done = 0usize;
-            while let Some(o) = rx.recv().await {
-                if matches!(o, FetchOutcome::Done { .. }) {
-                    done += 1;
-                }
-            }
-            done
-        });
-        let connected = |live: &LiveStats| live.servers[0].connected.load(Ordering::Relaxed);
-        let wait_conns = |want: usize| {
-            let live = live.clone();
-            async move {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-                loop {
-                    let got = live.servers[0].connected.load(Ordering::Relaxed);
-                    if got == want {
-                        return;
-                    }
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "connected stuck at {got}, wanted {want}"
-                    );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        };
-        // Phase 1: the full fleet authenticates.
-        wait_conns(4).await;
-        // Phase 2: lower the target - the three highest slots drain
-        // (window 3 x 20 KB at 150 KB/s is sub-second) and park.
-        target.set(1);
-        wait_conns(1).await;
-        // Hold a beat: a parked slot must STAY parked, not flap back.
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        assert_eq!(connected(&live), 1, "a parked slot redialled unasked");
-        // Phase 3: raise it again - parked is not retired.
-        target.set(3);
-        wait_conns(3).await;
-        tokio::time::timeout(Duration::from_secs(60), fetch)
-            .await
-            .expect("run hung across live target changes")
-            .unwrap();
-        assert_eq!(collect.await.unwrap(), segs.len());
-    }
-
     /// Drain a finished run's outcome channel into id → outcome-count.
     /// `try_recv` on purpose: anything still missing here was NOT emitted
     /// before the pool returned, which is exactly the contract under test.
@@ -9471,6 +7449,17 @@ mod tests {
             ramp_delay: Duration::ZERO,
             connect_backoff: Duration::from_millis(1),
             max_connect_attempts: 2,
+            // The seal is what this test is about, not the length of
+            // the road to it. At the shipped 75 the prober pays 75 real
+            // connect attempts here, and a refused connect costs
+            // microseconds on macOS but ~2 s on Windows (measured:
+            // 152 s for 75) - so the horizon, not the pool, decided
+            // whether this finished inside the timeout, and it did not
+            // on Windows. Three bounces reach the same Dead episode by
+            // the same path on every platform, and keep the Windows
+            // wall (~2 s per dial, workers and ladder together) at
+            // roughly half the 20 s guard rather than grazing it.
+            cap_probe_bounces: 3,
             ..Default::default()
         };
         let ids: Vec<String> = (0..5).map(|i| format!("<seal{i}@x>")).collect();
@@ -9591,11 +7580,16 @@ mod tests {
         assert_exactly_one_outcome_each(&ids, &seen);
 
         // Each worker gets one look, then yields; the last one standing
-        // spends the retry budget alone. The old behaviour was every
-        // worker spending it: CONNS * ATTEMPTS = 40.
+        // probes alone on the capped 8 s bounce ladder for up to
+        // CAP_PROBE_BOUNCES (issue #16: a restart's ghost sessions can
+        // hold the cap for minutes, and quitting after five bounces was
+        // the reported 0 MB/s stall). The 1 ms test backoff compresses
+        // that whole probe window into the run; the bound is the
+        // fleet's one look each plus the lone prober's budget - the old
+        // failure mode was EVERY worker spending the ladder.
         let accepted = srv.accepted.load(Ordering::Relaxed);
         assert!(
-            accepted < (CONNS as u64 * ATTEMPTS as u64),
+            accepted <= CONNS as u64 + CAP_PROBE_BOUNCES as u64,
             "capacity refusal still hammered the cap: {accepted} connections"
         );
         assert!(
@@ -9897,230 +7891,6 @@ mod tests {
         assert_exactly_one_outcome_each(&ids, &seen);
     }
 
-    #[tokio::test]
-    async fn mute_quit_server_cannot_hang_a_finished_run() {
-        // Regression (the 190 GB exit-path hang): a provider that swallows
-        // QUIT - TCP up, no goodbye - parked the worker's unbounded goodbye
-        // read forever, and the fleet join with it, AFTER every byte was on
-        // disk. quit() is now hard-bounded, so the run must return alone.
-        use crate::mock::{Chaos, MockServer, make_file_articles};
-        let mut articles = std::collections::HashMap::new();
-        let payload: Vec<u8> = (0..40_000u32).map(|i| i as u8).collect();
-        make_file_articles("f.bin", &payload, 8_000, "mq", &mut articles);
-        let n = articles.len();
-        let srv = MockServer::start(
-            articles.clone(),
-            Chaos {
-                mute_quit: true,
-                ..Default::default()
-            },
-        )
-        .await;
-        let cfg = PoolConfig {
-            connections: 3,
-            ramp_delay: Duration::ZERO,
-            ..Default::default()
-        };
-        let reqs: Vec<ArticleReq> = articles
-            .keys()
-            .map(|id| ArticleReq::fresh(id.clone()))
-            .collect();
-        let (tx, mut rx) = mpsc::channel(64);
-        let t0 = Instant::now();
-        tokio::time::timeout(
-            Duration::from_secs(20),
-            fetch_all_multi(&[(srv.server_config(), cfg)], reqs, tx),
-        )
-        .await
-        .expect("run hung on a mute-QUIT server");
-        // Well under EXIT_GRACE: the bounded quit alone frees the join.
-        assert!(
-            t0.elapsed() < Duration::from_secs(4),
-            "took {:?}",
-            t0.elapsed()
-        );
-        let mut done = 0;
-        while let Ok(o) = rx.try_recv() {
-            if matches!(o, FetchOutcome::Done { .. }) {
-                done += 1;
-            }
-        }
-        assert_eq!(done, n);
-    }
-
-    #[tokio::test]
-    async fn mute_greeting_straggler_does_not_hold_a_finished_run() {
-        // §35: a server that accepts and never greets parks its worker
-        // inside the dial. This used to cost the run a full EXIT_GRACE -
-        // join_fleet's backstop was the ONLY thing that ended it, because
-        // the dial itself never watched the run. Measured on the farm at
-        // 5.0 s added to a 1.1 s job, on every job, for as long as the
-        // unreachable entry stayed in the config. The dial now races the
-        // finish, so the straggler leaves with everyone else and the
-        // grace window is never entered.
-        use crate::mock::{Chaos, MockServer, make_file_articles};
-        let mut articles = std::collections::HashMap::new();
-        let payload: Vec<u8> = (0..40_000u32).map(|i| (i * 7) as u8).collect();
-        make_file_articles("g.bin", &payload, 8_000, "mg", &mut articles);
-        let n = articles.len();
-        let healthy = MockServer::start(articles.clone(), Chaos::default()).await;
-        let mute = MockServer::start(
-            std::collections::HashMap::new(),
-            Chaos {
-                mute_greeting: true,
-                ..Default::default()
-            },
-        )
-        .await;
-        let fast = PoolConfig {
-            connections: 2,
-            ramp_delay: Duration::ZERO,
-            ..Default::default()
-        };
-        let one = PoolConfig {
-            connections: 1,
-            ramp_delay: Duration::ZERO,
-            ..Default::default()
-        };
-        let reqs: Vec<ArticleReq> = articles
-            .keys()
-            .map(|id| ArticleReq::fresh(id.clone()))
-            .collect();
-        let (tx, mut rx) = mpsc::channel(64);
-        let t0 = Instant::now();
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            fetch_all_multi(
-                &[(healthy.server_config(), fast), (mute.server_config(), one)],
-                reqs,
-                tx,
-            ),
-        )
-        .await
-        .expect("run hung on a never-greeting server");
-        let el = t0.elapsed();
-        // Comfortably inside the grace window, not at the end of it: the
-        // straggler is released by the finish, not abandoned by the join.
-        assert!(
-            el < EXIT_GRACE,
-            "run waited out the dial of a server nobody needed: {el:?}"
-        );
-        let mut done = 0;
-        while let Ok(o) = rx.try_recv() {
-            if matches!(o, FetchOutcome::Done { .. }) {
-                done += 1;
-            }
-        }
-        assert_eq!(done, n);
-    }
-
-    /// §35, reached through the WARM path instead of the dial.
-    ///
-    /// Claiming a parked connection validates it with a DATE round-trip
-    /// bounded by `warmpool::VALIDATE_TIMEOUT` - 8 s, against EXIT_GRACE's
-    /// 5 s. A worker validating a peer that has gone mute therefore could
-    /// not return before `join_fleet` gave up on it, so the run paid the
-    /// whole grace window exactly as an unanswered SYN used to make it.
-    /// Latent while the warm pool ships off by default, which is the
-    /// reason to pin it now: TODO 36 turns it on per server.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_mute_parked_connection_does_not_hold_a_finished_run() {
-        use crate::mock::{Chaos, MockServer, make_file_articles};
-        // Greets, then never another word, every socket held open with no
-        // RST or FIN - the shape a CGNAT idle eviction leaves behind, and
-        // the one DATE validation exists to catch. Blocking std sockets on
-        // their own thread so the peer keeps working regardless of what
-        // the async runtime is doing.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            use std::io::Write as _;
-            let mut held = Vec::new();
-            while let Ok((mut s, _)) = listener.accept() {
-                let _ = s.write_all(b"200 mock ready\r\n");
-                let _ = s.flush();
-                held.push(s);
-            }
-        });
-        let mute = ServerConfig {
-            host: addr.ip().to_string(),
-            port: addr.port(),
-            tls: false,
-            username: None,
-            password: None,
-            connections: 1,
-            pin_connections: false,
-            rcvbuf: None,
-            level: 0,
-            group: None,
-            retention_days: 0,
-            block_bytes: None,
-            bind_ip: None,
-            socks5: None,
-            enabled: true,
-            warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
-        };
-
-        let mut articles = std::collections::HashMap::new();
-        let payload: Vec<u8> = (0..40_000u32).map(|i| (i * 3) as u8).collect();
-        make_file_articles("w.bin", &payload, 8_000, "wp", &mut articles);
-        let n = articles.len();
-        let healthy = MockServer::start(articles.clone(), Chaos::default()).await;
-
-        // Park a live connection to the mute peer, exactly as the previous
-        // job in a queue would have left one.
-        let warm = crate::warmpool::WarmPool::new(crate::warmpool::DEFAULT_MAX_IDLE, 4);
-        let (c, _) = Connection::connect(&mute).await.expect("greeting");
-        warm.give(&mute, c).await;
-        assert_eq!(
-            warm.idle_count().await,
-            1,
-            "the claim must have something to claim"
-        );
-
-        let fast = PoolConfig {
-            connections: 2,
-            ramp_delay: Duration::ZERO,
-            ..Default::default()
-        };
-        let warmed = PoolConfig {
-            connections: 1,
-            ramp_delay: Duration::ZERO,
-            warm: Some(warm.clone()),
-            ..Default::default()
-        };
-        let reqs: Vec<ArticleReq> = articles
-            .keys()
-            .map(|id| ArticleReq::fresh(id.clone()))
-            .collect();
-        let (tx, mut rx) = mpsc::channel(64);
-        let t0 = Instant::now();
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            fetch_all_multi(&[(healthy.server_config(), fast), (mute, warmed)], reqs, tx),
-        )
-        .await
-        .expect("run hung claiming a parked connection from a mute peer");
-        let el = t0.elapsed();
-        assert!(
-            el < EXIT_GRACE,
-            "run waited out the validation of a connection nobody needed: {el:?}"
-        );
-        let mut done = 0;
-        while let Ok(o) = rx.try_recv() {
-            if matches!(o, FetchOutcome::Done { .. }) {
-                done += 1;
-            }
-        }
-        assert_eq!(
-            done, n,
-            "the healthy server still had to deliver every article"
-        );
-    }
-
     /// Codex sweep 2, 3 Aug M6. A budget trained down to the 2 s floor
     /// by pipelined ~0 ms samples has to be able to climb back out
     /// WITHIN the article retry allowance (four charged attempts by
@@ -10181,22 +7951,66 @@ mod tests {
             connect_backoff: Duration::from_millis(100),
             ..Default::default()
         };
-        assert_eq!(session_backoff_delay(&cfg, 1), Duration::from_millis(100));
-        assert_eq!(session_backoff_delay(&cfg, 2), Duration::from_millis(200));
-        assert_eq!(session_backoff_delay(&cfg, 4), Duration::from_millis(800));
         assert_eq!(
-            session_backoff_delay(&cfg, 9),
+            session_backoff_delay_with(&cfg, 1, false),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            session_backoff_delay_with(&cfg, 2, false),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            session_backoff_delay_with(&cfg, 4, false),
+            Duration::from_millis(800)
+        );
+        assert_eq!(
+            session_backoff_delay_with(&cfg, 9, false),
             Duration::from_millis(25_600)
         );
-        assert_eq!(session_backoff_delay(&cfg, 10), SESSION_BACKOFF_MAX);
+        assert_eq!(
+            session_backoff_delay_with(&cfg, 10, false),
+            SESSION_BACKOFF_MAX
+        );
         // No overflow, no runaway, however deep the failure count goes.
-        assert_eq!(session_backoff_delay(&cfg, u32::MAX), SESSION_BACKOFF_MAX);
+        assert_eq!(
+            session_backoff_delay_with(&cfg, u32::MAX, false),
+            SESSION_BACKOFF_MAX
+        );
         // A configured base of ~0 must not defeat the pacing.
         let zero = PoolConfig {
             connect_backoff: Duration::ZERO,
             ..Default::default()
         };
-        assert!(session_backoff_delay(&zero, 1) >= Duration::from_millis(50));
+        assert!(session_backoff_delay_with(&zero, 2, true) >= Duration::from_millis(50));
+        assert!(session_backoff_delay_with(&zero, 1, false) >= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn session_backoff_immediate_first_retry_shifts_the_ladder() {
+        let cfg = PoolConfig {
+            connect_backoff: Duration::from_millis(100),
+            ..Default::default()
+        };
+        // Immediate mode: 0, base, 2x, 4x... - a transient blip redials
+        // instantly, a persistent refuser meets the full ladder from
+        // its second failure.
+        assert_eq!(session_backoff_delay_with(&cfg, 1, true), Duration::ZERO);
+        assert_eq!(
+            session_backoff_delay_with(&cfg, 2, true),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            session_backoff_delay_with(&cfg, 4, true),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            session_backoff_delay_with(&cfg, u32::MAX, true),
+            SESSION_BACKOFF_MAX
+        );
+        // The shipped default is the immediate shape (env unset).
+        if std::env::var("NZBFAST_BACKOFF_IMMEDIATE").is_err() {
+            assert_eq!(session_backoff_delay(&cfg, 1), Duration::ZERO);
+        }
     }
 
     /// Regression: a broken account must not be reconnect-stormed.
@@ -10609,220 +8423,13 @@ mod tests {
 }
 
 #[cfg(test)]
-mod event_ring_tests {
-    use super::*;
+mod event_ring_tests;
 
-    /// Built directly rather than through `for_servers`: these tests are
-    /// about the ring, and threading a full ServerConfig literal through
-    /// them would make them fail whenever an unrelated field is added.
-    fn live(hosts: &[&str]) -> Arc<LiveStats> {
-        Arc::new(LiveStats {
-            servers: hosts
-                .iter()
-                .map(|h| ServerLive {
-                    host: (*h).to_string(),
-                    budget: AtomicUsize::new(1),
-                    connected: AtomicUsize::new(0),
-                    refusal: std::sync::Mutex::new(None),
-                    bytes: AtomicU64::new(0),
-                    articles_tried: AtomicU64::new(0),
-                    articles_missing: AtomicU64::new(0),
-                    reconnects: AtomicU64::new(0),
-                    blocked_ms: AtomicU64::new(0),
-                    last_blocked_note: AtomicU64::new(0),
-                    missing_note_at: AtomicU64::new(0),
-                    missing_at_note: AtomicU64::new(0),
-                    last_timeout_note: AtomicU64::new(0),
-                })
-                .collect(),
-            events: std::sync::Mutex::new(std::collections::VecDeque::new()),
-        })
-    }
-
-    /// The ring is bounded, and it drops the OLDEST.
-    ///
-    /// A daemon runs for weeks. An unbounded event list would be a slow
-    /// leak in the one place nobody looks, and dropping the newest would
-    /// make it useless precisely when it is busy - which is when a dip
-    /// happens.
-    #[test]
-    fn the_ring_is_capped_and_keeps_the_newest() {
-        let l = live(&["a.example"]);
-        for i in 0..(EVENT_RING + 50) {
-            l.note(0, "reconnect", format!("#{i}"));
-        }
-        assert_eq!(l.events.lock().unwrap().len(), EVENT_RING);
-        let newest = l.recent_events(1);
-        assert_eq!(newest[0].detail, format!("#{}", EVENT_RING + 49));
-    }
-
-    /// Newest first, because that is the order the question is asked in:
-    /// "what just happened", never "what happened first".
-    #[test]
-    fn recent_events_are_newest_first() {
-        let l = live(&["a.example"]);
-        l.note(0, "cap", "one");
-        l.note(0, "cap", "two");
-        l.note(0, "cap", "three");
-        let got: Vec<String> = l.recent_events(2).into_iter().map(|e| e.detail).collect();
-        assert_eq!(got, vec!["three".to_string(), "two".to_string()]);
-    }
-
-    /// Events carry the host, so a dip on a six-provider run can be put
-    /// down to ONE of them. A count with no host would say a reconnect
-    /// happened and leave the user to guess where.
-    #[test]
-    fn an_event_names_the_server_it_happened_to() {
-        let l = live(&["a.example", "b.example"]);
-        l.note(1, "reconnect", "session lost, redialled");
-        let e = l.recent_events(1);
-        assert_eq!(e[0].host, "b.example");
-        assert_eq!(e[0].kind, "reconnect");
-    }
-
-    /// An out-of-range index is a no-op, not a panic. This is called from
-    /// download workers; instrumentation must never be the thing that
-    /// takes a run down.
-    #[test]
-    fn a_bad_index_is_ignored_rather_than_fatal() {
-        let l = live(&["a.example"]);
-        l.note(9, "reconnect", "nowhere");
-        assert!(l.recent_events(10).is_empty());
-    }
-
-    /// Timestamped in wall clock, which is what lets the UI lay an event
-    /// against a throughput sample. A monotonic instant could not cross
-    /// the API, and an index into the ring would not survive the cap.
-    #[test]
-    fn events_carry_a_wall_clock_moment() {
-        let before = now_ms();
-        let l = live(&["a.example"]);
-        l.note(0, "blocked", "waited 800 ms for the write side");
-        let e = l.recent_events(1);
-        assert!(e[0].at_ms >= before, "{} < {before}", e[0].at_ms);
-        assert!(e[0].at_ms <= now_ms());
-    }
-
-    /// Phase boundaries and fleet-wide spikes belong to the RUN, not to
-    /// a server - they ride the same ring with an empty host, which is
-    /// how the dashboard knows not to print one.
-    #[test]
-    fn run_events_ride_the_ring_without_a_host() {
-        let l = live(&["a.example"]);
-        l.note_run("tail", "every article has been handed out");
-        let e = l.recent_events(1);
-        assert_eq!(e[0].kind, "tail");
-        assert_eq!(e[0].host, "");
-    }
-
-    /// The missing-article marker is windowed: the first 430 opens a
-    /// window silently, a window that closes with a burst inside it
-    /// yields exactly one marker, and a window that closes quiet yields
-    /// none. Without the threshold every retry ladder would mark the
-    /// graph; without the window a take-down's hundreds of 430s would
-    /// flush the ring - the same discipline as the blocked note.
-    #[test]
-    fn missing_bursts_mark_once_per_window_and_only_over_threshold() {
-        let l = live(&["a.example"]);
-        let s = &l.servers[0];
-        s.articles_missing.fetch_add(1, Ordering::Relaxed);
-        l.note_missing_burst(0);
-        assert!(
-            l.recent_events(10).is_empty(),
-            "opening the window is silent"
-        );
-        // A burst lands inside the window, and the window closes.
-        s.articles_missing
-            .fetch_add(MISSING_BURST, Ordering::Relaxed);
-        s.missing_note_at
-            .store(now_ms() - BURST_WINDOW_MS - 1, Ordering::Relaxed);
-        l.note_missing_burst(0);
-        let e = l.recent_events(10);
-        assert_eq!(e.len(), 1, "one marker per closed window");
-        assert_eq!(e[0].kind, "missing");
-        // The next window closes with only a scatter inside: no marker.
-        s.articles_missing.fetch_add(3, Ordering::Relaxed);
-        s.missing_note_at
-            .store(now_ms() - BURST_WINDOW_MS - 1, Ordering::Relaxed);
-        l.note_missing_burst(0);
-        assert_eq!(l.recent_events(10).len(), 1, "a quiet window adds nothing");
-    }
-
-    fn shared_with_live(hosts: &[&str]) -> (Arc<Shared>, Arc<LiveStats>) {
-        let servers: Vec<(ServerConfig, PoolConfig)> = hosts
-            .iter()
-            .map(|h| {
-                let sc: ServerConfig =
-                    serde_json::from_value(serde_json::json!({"host": h})).unwrap();
-                (sc, PoolConfig::default())
-            })
-            .collect();
-        let l = LiveStats::for_servers(&servers);
-        let servers: Vec<(ServerConfig, PoolConfig)> = servers
-            .into_iter()
-            .map(|(sc, mut cfg)| {
-                cfg.live = Some(l.clone());
-                (sc, cfg)
-            })
-            .collect();
-        let (shared, _) = Shared::new(vec![ArticleReq::fresh("<a@x>".into())], &servers);
-        (shared, l)
-    }
-
-    /// The racing marker is the run-level twin of the missing one: the
-    /// dups+hedges counters close a window, a spike inside it earns one
-    /// marker, and a second look inside the same window adds nothing.
-    #[test]
-    fn racing_bursts_mark_once_per_window() {
-        let (shared, l) = shared_with_live(&["a.example"]);
-        shared.dups_issued.store(RACE_BURST + 2, Ordering::Relaxed);
-        shared
-            .race_note_at
-            .store(now_ms() - BURST_WINDOW_MS - 1, Ordering::Relaxed);
-        shared.note_race_burst();
-        let e = l.recent_events(10);
-        assert_eq!(e.len(), 1);
-        assert_eq!(e[0].kind, "racing");
-        assert_eq!(e[0].host, "");
-        // Same window, more calls: silent.
-        shared.note_race_burst();
-        assert_eq!(l.recent_events(10).len(), 1);
-    }
-
-    /// A server whose LAST worker leaves mid-run (pending work, no abort,
-    /// no drain) marks the graph once; the same departure during a
-    /// natural wind-down - nothing pending - marks nothing, because every
-    /// worker leaves at the end of every job and none of that is a fault.
-    #[test]
-    fn a_server_going_dark_mid_run_marks_the_graph_once() {
-        let (shared, l) = shared_with_live(&["a.example", "b.example"]);
-        assert!(shared.pending.load(Ordering::Acquire) > 0);
-        note_server_dark(&shared, 0, 2);
-        assert!(l.recent_events(10).is_empty(), "not the last worker");
-        note_server_dark(&shared, 0, 1);
-        let e = l.recent_events(10);
-        assert_eq!(e.len(), 1);
-        assert_eq!(e[0].kind, "retired");
-        assert_eq!(e[0].host, "a.example");
-        // Natural wind-down: queue empty, everyone leaves, no marker.
-        let (shared2, l2) = shared_with_live(&["a.example"]);
-        shared2.pending.store(0, Ordering::Release);
-        note_server_dark(&shared2, 0, 1);
-        assert!(l2.recent_events(10).is_empty());
-    }
-
-    /// The drain latch is also the phase marker that stops the natural
-    /// end-of-job throughput fall from reading as a fault.
-    #[test]
-    fn draining_the_last_article_marks_the_phase() {
-        let (shared, l) = shared_with_live(&["a.example"]);
-        shared.mark_drained();
-        let e = l.recent_events(10);
-        assert_eq!(e.len(), 1);
-        assert_eq!(e[0].kind, "drained");
-        assert!(shared.drained_at.lock_ok().is_some());
-    }
-}
+#[cfg(test)]
+mod ratelimit_tests;
 
 #[cfg(test)]
 mod unit_tests;
+
+#[cfg(test)]
+mod rig_tests;

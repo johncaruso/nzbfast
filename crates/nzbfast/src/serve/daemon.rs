@@ -985,6 +985,9 @@ pub struct Daemon {
     /// measured capability of every enabled provider together falls
     /// well short of it, `tune_hint` says so and suggests the lever.
     pub line_speed: AtomicU64,
+    /// §125: the learned peak the throughput graph anchors 100% to -
+    /// seeded by `line_speed`, overridden by sustained measurement.
+    pub link_peak: super::linkpeak::LinkPeak,
     /// What the connection tuner wants the user to know: a shortfall
     /// against `line_speed` with the likeliest remedy, or empty when
     /// capability is fine (or unjudgeable - line speed unset, or an
@@ -6192,6 +6195,21 @@ impl Daemon {
     }
 
     /// Reload `.spool/queue.json` at startup, re-creating the Job records.
+    /// Wall-clock floor (seconds since the Unix epoch) for the RESTORED
+    /// id allocator. The snapshot's `next_id` can be stale when the run
+    /// that allocated past it could not persist (disk full at enqueue),
+    /// and those already-issued ids carry permanent stream tokens - so
+    /// a restore must never let allocation fall back behind real time.
+    /// Only applied on restore: a fresh daemon with no state keeps its
+    /// small ids (and has no earlier run to collide with unless
+    /// persistence never worked at all, which startup now warns about).
+    fn id_floor() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
     /// A job that was Downloading when the daemon stopped comes back
     /// Queued, so the scheduler restarts it and its journal resumes the
     /// transfer.
@@ -6226,9 +6244,17 @@ impl Daemon {
             self.history.lock_ok().push(Arc::new(Mutex::new(job)));
         }
         if let Some(n) = v.get("next_id").and_then(Value::as_u64) {
-            // Never reuse an id - SABnzbd clients key on nzo_id uniqueness.
+            // Never reuse an id - SABnzbd clients key on nzo_id uniqueness,
+            // and stream tokens are H(secret, nzo_id): a reused id would
+            // hand a previous job's permanent capability URL to a NEW job.
+            // The persisted allocator alone cannot guarantee that (the
+            // snapshot write is best-effort and an enqueue whose snapshot
+            // failed already returned its id and token), so the wall-clock
+            // floor below keeps allocations ahead of any earlier run's
+            // even when its snapshots never landed.
             let cur = self.next_id.load(Ordering::Relaxed);
-            self.next_id.store(n.max(cur), Ordering::Relaxed);
+            self.next_id
+                .store(n.max(cur).max(Self::id_floor()), Ordering::Relaxed);
         }
         if nq + nh > 0 {
             info!(target: "queue", "restored {nq} queued + {nh} history jobs");

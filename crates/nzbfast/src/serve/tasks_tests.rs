@@ -559,3 +559,67 @@ fn instant_arrivals_kicks_complete_hits_and_first_sighting_wins() {
     assert_eq!(d.instant_hint.lock_ok().len(), hints_before);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------
+// sampler_cap_cooldown (TODO 110)
+// ---------------------------------------------------------------------
+
+/// The two slots-full shapes cool a sampler down; everything else keeps
+/// the retry-next-tick behavior. The Permanent leg is the one that
+/// needs the DECLARED cap: eweka is not in the hostname heuristic, so
+/// only `max_source_ips` can mark it tight.
+#[cfg(feature = "indexer")]
+#[test]
+fn sampler_cap_cooldown_needs_a_slots_full_refusal_or_a_declared_tight_cap() {
+    use nzbkit::nntp::{AuthRefusal, NntpError, classify_auth_refusal};
+    let srv = |j: &str| -> nzbkit::config::ServerConfig { serde_json::from_str(j).unwrap() };
+    let auth = |line: &str| NntpError::AuthFailed {
+        kind: classify_auth_refusal(line),
+        line: line.into(),
+    };
+    let lax = srv(r#"{"host":"news.example.com"}"#);
+    let declared = srv(r#"{"host":"news.eweka.example","max_source_ips":2}"#);
+    let generous = srv(r#"{"host":"news.eweka.example","max_source_ips":20}"#);
+
+    // A Capacity-classified refusal cools down ANY server: the account
+    // is fine and the slots are full, whoever the provider is.
+    let cap = auth("502 max number of simultaneous IP addresses reached: 2");
+    assert!(matches!(
+        cap,
+        NntpError::AuthFailed {
+            kind: AuthRefusal::Capacity,
+            ..
+        }
+    ));
+    assert!(super::sampler_cap_cooldown(&cap, &lax).is_some());
+    assert!(super::sampler_cap_cooldown(&cap, &declared).is_some());
+
+    // A Permanent-classified 502 is the address-cap masquerade ONLY on
+    // a tight server - declared (eweka is not in the hostname list) or
+    // recognised by hostname. On a lax one it stays a credential error.
+    let perm = auth("502 Authentication Failed");
+    assert!(matches!(
+        perm,
+        NntpError::AuthFailed {
+            kind: AuthRefusal::Permanent,
+            ..
+        }
+    ));
+    assert!(super::sampler_cap_cooldown(&perm, &declared).is_some());
+    assert!(
+        super::sampler_cap_cooldown(&perm, &srv(r#"{"host":"news.tweaknews.example"}"#)).is_some(),
+        "the hostname heuristic must keep working without a declared cap"
+    );
+    assert!(
+        super::sampler_cap_cooldown(&perm, &lax).is_none(),
+        "a wrong password on a lax server must keep the loud per-tick warn"
+    );
+    assert!(
+        super::sampler_cap_cooldown(&perm, &generous).is_none(),
+        "a generous declared allowance is not tight"
+    );
+
+    // Network-shaped errors are what the next tick may fix: no cooldown.
+    assert!(super::sampler_cap_cooldown(&NntpError::Timeout, &declared).is_none());
+    assert!(super::sampler_cap_cooldown(&NntpError::Closed, &declared).is_none());
+}

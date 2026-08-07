@@ -159,6 +159,32 @@ pub fn pat_verdict(pattern: &str) -> PatternVerdict {
     }
 }
 
+/// WHY a pattern is [`PatternVerdict::Literal`], in the engine's words.
+///
+/// The verdict says what is happening; this says what to fix. regex_lite
+/// keeps its reasons to one plain sentence ("uncounted repetition
+/// operator must be applied to a sub-expression" for `*anime*`), which is
+/// exactly the size a save answer can carry, so the compile error is
+/// reported rather than paraphrased - a hand-written summary would drift
+/// from the engine the moment the dependency moved.
+///
+/// `None` for anything [`pat_match`] will treat as a regex, including an
+/// empty pattern: only the fallback-to-keyword shape has an error to
+/// report. The same builder configuration as `pat_match` on purpose -
+/// judging a different compilation than the one that runs would be worse
+/// than saying nothing.
+pub fn pat_compile_error(pattern: &str) -> Option<String> {
+    let p = pattern.trim();
+    if p.is_empty() {
+        return None;
+    }
+    regex_lite::RegexBuilder::new(p)
+        .case_insensitive(true)
+        .build()
+        .err()
+        .map(|e| e.to_string())
+}
+
 impl CustomCategory {
     /// Does this category claim the release name?
     pub fn matches(&self, name: &str) -> bool {
@@ -656,6 +682,28 @@ mod pattern_verdict_tests {
     fn an_ordinary_rule_says_nothing() {
         for p in ["1080p", "Formula1", ".*anime.*x265", "S01E0[1-9]"] {
             assert_eq!(pat_verdict(p), PatternVerdict::Ok, "{p}");
+        }
+    }
+
+    /// The compile error exists exactly when the verdict is Literal, and
+    /// it is the engine's own sentence, not a paraphrase - the save-time
+    /// warning ships it verbatim (#18).
+    #[test]
+    fn compile_error_tracks_the_literal_verdict() {
+        for p in ["*anime*", "(unclosed", "[a-"] {
+            assert_eq!(pat_verdict(p), PatternVerdict::Literal, "{p}");
+            let err = pat_compile_error(p).unwrap_or_else(|| panic!("{p} must carry an error"));
+            assert!(!err.trim().is_empty(), "{p}: empty error");
+            assert!(
+                !err.contains('\n'),
+                "{p}: a save answer carries one line, got {err:?}"
+            );
+        }
+        // Everything pat_match treats as a regex has nothing to report -
+        // including the dangerous-but-valid catch-all and the deliberate
+        // empty pattern.
+        for p in ["1080p", "!*", ".*", "", "   "] {
+            assert_eq!(pat_compile_error(p), None, "{p:?}");
         }
     }
 

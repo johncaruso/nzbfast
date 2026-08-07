@@ -103,26 +103,32 @@ pub(super) async fn build_fleet(
     let flap_cap_keepers = std::env::var("NZBFAST_FLAP_CAP_KEEPERS")
         .ok()
         .is_none_or(|v| v == "1");
-    // TODO 111/114, priced 5 Aug: on a yEnc CRC failure (or a
-    // wrong-article body) the pool refetches the article from a
-    // DIFFERENT server once, instead of letting the damage ride to
-    // PAR2 repair. Default ON exactly when an "elsewhere" exists (2+
-    // enabled servers): the corrupt-storm matrix leg goes DNF ->
-    // byte-perfect 17 s, and every competitor already does this. The
-    // cost is a second, pool-side decode per article - free in wall
-    // time on any real line, but ~25% CPU at the loopback ceiling
-    // (16 GB: 12.4 -> 15.5 cpu-s; 6.5 -> 4.2 GB/s) - so a
-    // single-server config, where the gate could never steer anywhere
-    // and the decode buys nothing, stays off. Env overrides both ways;
-    // the zero-cost endgame (steer from the consumer's EXISTING
-    // decode) is filed in TODO 114.
-    // "2+ enabled servers" is necessary but not sufficient for an
-    // elsewhere: the steer marks tried_fail, and a fill server's pickup
-    // gate demands the primary's 430 bit - so a primary + fill pair can
-    // never steer, and a same-host (or same explicit group) sibling
-    // serves the same wrong copy. Buy the per-article decode only where
-    // a same-LEVEL peer on a different host/backbone exists; the
-    // delivery-time other_can_take check enforces the same rule live.
+    // TODO 111/114 CRC retry-elsewhere, graduated to the consumer seam
+    // 6 Aug: on a yEnc CRC failure (or a wrong-article body) the
+    // article is refetched from a DIFFERENT server once, instead of
+    // letting the damage ride to PAR2 repair - the corrupt-storm
+    // matrix leg goes DNF -> byte-perfect, and every competitor
+    // already does this. Detection is the decode consumer's EXISTING
+    // pass (QueueControl::note_decoded), so the old pool-side second
+    // decode - ~25% CPU at the loopback ceiling, the reason slow-CPU
+    // boxes were priced out - is gone: the m1 full-rate A/B has the
+    // steer at off-parity user CPU (9.3 vs the pool decode's 14.3
+    // cpu-s per 8 GB) with equal walls, and the only remaining cost
+    // is the forced per-article CRC where M32 delegation would have
+    // skipped it (+4.5% user on a PAR2 full-MD5 job, wall parity).
+    //
+    // Default ON where an elsewhere exists. "2+ enabled servers" is
+    // necessary but not sufficient: the steer marks tried_fail, and a
+    // fill server's pickup gate demands the primary's 430 bit - so a
+    // primary + fill pair can never steer, and a same-host (or same
+    // explicit group) sibling serves the same wrong copy. Pay the
+    // forced CRC only where a same-LEVEL peer on a different
+    // host/backbone exists; the delivery-time other_can_take check
+    // enforces the same rule live. Single-server configs pay nothing
+    // at all. NZBFAST_CRC_STEER overrides both ways (the chaos rig's
+    // same-host twins depend on =1); NZBFAST_CRC_RETRY is honored as
+    // an alias - it named the same feature while the detection lived
+    // in the pool, and the rig drivers still set it.
     let on: Vec<_> = cfg_all.servers.iter().filter(|s| s.enabled).collect();
     let multi_server = on.iter().enumerate().any(|(i, a)| {
         on.iter().enumerate().any(|(j, b)| {
@@ -132,8 +138,8 @@ pub(super) async fn build_fleet(
                 && (a.group.is_none() || b.group.is_none() || a.group != b.group)
         })
     });
-    let crc_retry = std::env::var("NZBFAST_CRC_RETRY")
-        .ok()
+    let crc_steer = std::env::var("NZBFAST_CRC_STEER")
+        .or_else(|_| std::env::var("NZBFAST_CRC_RETRY"))
         .map_or(multi_server, |v| v == "1");
     // Per-server budget: the CLI --connections is a ceiling; a server's
     // config `connections` (its account limit) caps its own pool; a
@@ -242,7 +248,12 @@ pub(super) async fn build_fleet(
                 recycle_slope,
                 hot_spare,
                 flap_cap_keepers,
-                crc_retry,
+                crc_steer,
+                // TODO 121.4: the decode consumers ack every Done id
+                // (note_settled / note_decoded), so the pool holds
+                // each article's liveness entry until its bytes are
+                // written - the dead-span verdict sees the whole pipe.
+                arrival_ack: true,
                 rate: hub.as_ref().map(|h| h.rate.clone()),
                 // B3: wire-side in-flight bytes are budget-exempt (window
                 // × connections × ~800 KB); this cap throttles pipeline

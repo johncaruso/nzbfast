@@ -52,6 +52,19 @@ jobs:
           config: |
             paths-ignore:
               - vendor
+            # hard-coded-cryptographic-value cannot fire usefully in an
+            # archive tool: the first run produced 114 critical alerts
+            # and every one was a format-mandated constant or a test
+            # fixture (RAR4/RAR5/ZIP KDF constants and zero-init IV
+            # buffers in rarcrypt.rs / zipcrypt.rs / extract/crypto.rs,
+            # fixture passwords and RFC 6070 vectors in test code). All
+            # 114 were verified against the source and dismissed on
+            # 5 Aug 2026; this filter stops the refill. There are no
+            # secrets to hard-code here - the update-verification key
+            # baked into the binary is a PUBLIC key by design.
+            query-filters:
+              - exclude:
+                  id: rust/hard-coded-cryptographic-value
       - uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
         with:
           category: "/language:${{ matrix.language }}"

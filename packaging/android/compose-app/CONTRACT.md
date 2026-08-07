@@ -46,6 +46,25 @@ exercised by the JVM unit tests (`app/src/test/`).
 
 ## Playback contract v1 - FROZEN (workstream A2, 2026-08-05)
 
+**Adopted by both shells (B2/C2 first half, 2026-08-05).** Home and
+the player in the Compose app and the SwiftUI shell poll row 16 as
+their ONE call; rows 2, 3 and the probe cadence of row 13 are no
+longer polled (the rows stay frozen - they are still the SAB-compat
+surface and the fallback). What adoption pinned down:
+
+- The Play affordance is `playback.ready` on the job row; the per-job
+  probe is fired ONCE when the user opens a live job, because the
+  probe is what promotes a file index forward (row 13) and
+  `mode=playback` never does.
+- The play URL is the row's `stream` field; `/m3u` (row 14) is the
+  fallback for a row that lacked one.
+- The player's buffer/health overlay reads the `stream` telemetry
+  from the same poll. The counters are process-wide and cumulative,
+  so the overlay anchors at the first sample it sees and shows the
+  movement since the player opened. That was enough - a per-job or
+  per-reader breakdown would be a contract ADDITION (keys may be
+  added) and has deliberately NOT been taken yet.
+
 Everything in this section is frozen for v1: keys keep their name,
 their type and their meaning, and the daemon may only ADD keys.
 `contract: 1` on the payload says which version answered. The three
@@ -147,6 +166,37 @@ never appear in a URL handed to a player, a log or a file.** Row 16's
 `stream` field carries the same token, so a client polling `playback`
 does not need this call at all.
 
+## B2/C2 second half - adoption notes (2026-08-06)
+
+Both shells, in step:
+
+- **Seek discipline**: while a live job answers `playback.seekable:
+  false`, scrubbing and skip are disabled (Android: the fast-forward/
+  rewind buttons hide and the time bar refuses touch via a disabled
+  `DefaultTimeBar`; iOS: slider and skip buttons disable and dim).
+  `source: "history"` rows and ready tails seek freely. The gate is
+  the CONTRACT field, not player state - the player cannot know the
+  tail is a hole before it stalls in it.
+- **PiP (Android)**: leaving the app while the player is up enters a
+  PiP window (`onUserLeaveHint`); in PiP every overlay and the
+  controller hide (the OS draws its own). Activity declares
+  `supportsPictureInPicture`.
+- **PiP/AirPlay (iOS): deliberately NOT built this phase.** VLCKit's
+  drawable is a plain UIView - real PiP needs an
+  AVSampleBufferDisplayLayer/AVPlayerLayer pipeline, which arrives
+  with the A4 remux track (AVPlayer for remuxed files, VLCKit
+  fallback). Building a fake PiP over VLCKit now would be thrown away
+  then. Same for video AirPlay.
+- **Share intake**: Android already had SEND/VIEW filters (.nzb +
+  nzblnk). iOS now declares the `.nzb` document type
+  (`com.nzbfast.nzb`, conforms to `public.xml`) so "Open in nzbfast"
+  appears on share sheets; a shared file routes through the same
+  `addFile` upload the document picker uses, then lands on Home.
+- **Keep-screen-on** was already in both players (B2's list carried
+  it); pause-on-metered stays open - it is on-device-engine work
+  (connectivity callbacks driving the local daemon), not a player
+  change.
+
 ## Not used yet (candidates for the next phase)
 
 - `mode=stats` `files[]` (active job only) - per-file list for a job
@@ -174,3 +224,22 @@ then curl each endpoint above into `app/src/test/resources/snapshots/`
 (strip the host/port and the key from anything recorded). The iOS
 shell has no test target yet; it reads the same fields, and this file
 is the sync point between the two.
+
+`playback_live_partial.json` needs a file too big to land whole, so a
+client test can tell `ready` from `seekable` (the small-file recipe
+above finishes before the poll can catch partial coverage - its `live`
+snapshot shows pct 100 with tail_ok true):
+
+```sh
+ffmpeg -f lavfi -i "testsrc2=size=1280x720:rate=30" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 60 \
+  -c:v libx264 -preset veryfast -b:v 6M -pix_fmt yuv420p \
+  -c:a aac -b:a 128k -shortest movie.mkv          # ~46 MB
+nzbfast chaos-serve --profile clean --port 8899 --files 0 \
+  --media movie.mkv --nzb job.nzb --line 800K
+```
+
+then poll `mode=playback` once a second while the job downloads and
+keep a sample where `reason` is `live`, `tail_ok` is false and
+`coverage.pct` is well under 100 (the committed one has pct 33.8 at
+48% downloaded).

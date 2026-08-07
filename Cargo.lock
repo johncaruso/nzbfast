@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "nzbfast"
-version = "1.0.17"
+version = "1.0.18"
 dependencies = [
  "anyhow",
  "clap",
@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "nzbtray"
-version = "1.0.17"
+version = "1.0.18"
 dependencies = [
  "serde_json",
  "sha2 0.10.9",

@@ -1303,6 +1303,313 @@ mod tests {
         assert_eq!(c.trailing.as_deref(), Some("NEW: [TT: A :B-GRP]"));
     }
 
+    // ===== the IRC client, against a scripted local server =====
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::BufReader as TokioBufReader;
+
+    /// One line off the mock server's read half, CRLF shed.
+    async fn srv_line(r: &mut TokioBufReader<tokio::net::tcp::OwnedReadHalf>) -> String {
+        let mut s = String::new();
+        r.read_line(&mut s).await.unwrap();
+        s.trim_end().to_string()
+    }
+
+    /// Drive `run_once` (plain TCP) against `script`, which plays the
+    /// server side on the accepted socket. Returns the stop reason and
+    /// every (channel, nick, text) the client reported.
+    async fn run_against<F, Fut>(
+        channels: Vec<String>,
+        stop_flag: Arc<AtomicBool>,
+        script: F,
+    ) -> (IrcStop, Vec<(String, String, String)>)
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            script(sock).await;
+        });
+        let cfg = IrcConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            allow_plaintext: false,
+            nick: "t".into(),
+            channels,
+        };
+        let msgs = std::sync::Mutex::new(Vec::new());
+        let stop = move || stop_flag.load(Ordering::Relaxed);
+        let out = run_once(
+            &cfg,
+            |m| {
+                msgs.lock().unwrap().push((
+                    m.channel.to_string(),
+                    m.nick.to_string(),
+                    m.text.to_string(),
+                ));
+            },
+            &stop,
+        )
+        .await;
+        server.await.unwrap();
+        (out, msgs.into_inner().unwrap())
+    }
+
+    /// Registration, PING/PONG, JOIN (with channel-name normalization),
+    /// channel refusal carried past, PRIVMSG/NOTICE filtering, and an
+    /// ordinary ERROR close reading as Transient.
+    #[tokio::test]
+    async fn irc_happy_path_delivers_channel_messages() {
+        let (stop, msgs) = run_against(
+            // One well-formed, one blank (skipped), one missing its '#'.
+            vec!["#pre".into(), "  ".into(), "nzedb".into()],
+            Arc::new(AtomicBool::new(false)),
+            |sock| async move {
+                let (rd, mut wr) = sock.into_split();
+                let mut rd = TokioBufReader::new(rd);
+                let nick_line = srv_line(&mut rd).await;
+                assert!(nick_line.starts_with("NICK t"), "{nick_line}");
+                assert!(srv_line(&mut rd).await.starts_with("USER "));
+                // Keepalive before registration completes.
+                wr.write_all(b"PING :tok123\r\n").await.unwrap();
+                assert_eq!(srv_line(&mut rd).await, "PONG :tok123");
+                // Token-only PING (no trailing form).
+                wr.write_all(b"PING tok456\r\n").await.unwrap();
+                assert_eq!(srv_line(&mut rd).await, "PONG :tok456");
+                wr.write_all(b":srv 001 me :welcome\r\n").await.unwrap();
+                assert_eq!(srv_line(&mut rd).await, "JOIN #pre");
+                assert_eq!(srv_line(&mut rd).await, "JOIN #nzedb");
+                // One channel refuses; the client carries on.
+                wr.write_all(b":srv 473 me #pre :invite only\r\n")
+                    .await
+                    .unwrap();
+                // A PM (non-channel target) must never reach the callback.
+                wr.write_all(b":spy!u@h PRIVMSG me :psst\r\n")
+                    .await
+                    .unwrap();
+                // No trailing text at all: skipped.
+                wr.write_all(b":bot!u@h PRIVMSG #pre\r\n").await.unwrap();
+                // The real thing, plus a NOTICE (same arm).
+                wr.write_all(b":bot!u@h PRIVMSG #pre :NEW: [TT: X-GRP][FN: a]\r\n")
+                    .await
+                    .unwrap();
+                wr.write_all(b":relay!u@h NOTICE &local :pre line two\r\n")
+                    .await
+                    .unwrap();
+                wr.write_all(b"ERROR :closing link\r\n").await.unwrap();
+            },
+        )
+        .await;
+        assert!(
+            matches!(&stop, IrcStop::Transient(m) if m == "closing link"),
+            "{stop:?}"
+        );
+        assert_eq!(format!("{stop}"), "closing link");
+        assert_eq!(
+            msgs,
+            vec![
+                (
+                    "#pre".to_string(),
+                    "bot".to_string(),
+                    "NEW: [TT: X-GRP][FN: a]".to_string()
+                ),
+                (
+                    "&local".to_string(),
+                    "relay".to_string(),
+                    "pre line two".to_string()
+                ),
+            ]
+        );
+    }
+
+    /// 433 nick-in-use re-rolls the suffix instead of giving up, and a
+    /// server close reads as Transient.
+    #[tokio::test]
+    async fn irc_nick_collision_rerolls() {
+        let (stop, msgs) = run_against(
+            vec!["#pre".into()],
+            Arc::new(AtomicBool::new(false)),
+            |sock| async move {
+                let (rd, mut wr) = sock.into_split();
+                let mut rd = TokioBufReader::new(rd);
+                let first = srv_line(&mut rd).await;
+                assert!(srv_line(&mut rd).await.starts_with("USER "));
+                wr.write_all(b":srv 433 * t :nickname in use\r\n")
+                    .await
+                    .unwrap();
+                let second = srv_line(&mut rd).await;
+                assert!(second.starts_with("NICK t"), "{second}");
+                assert_ne!(first, second, "a fresh suffix was rolled");
+                wr.write_all(b":srv 001 me :welcome\r\n").await.unwrap();
+                assert_eq!(srv_line(&mut rd).await, "JOIN #pre");
+                // Post-registration 433 is ignored, then the socket dies.
+                wr.write_all(b":srv 433 me t2 :in use\r\n").await.unwrap();
+            },
+        )
+        .await;
+        assert!(
+            matches!(&stop, IrcStop::Transient(m) if m.contains("closed")),
+            "{stop:?}"
+        );
+        assert!(msgs.is_empty());
+    }
+
+    /// The go-away family: 465 numerics, KILL, and ban-shaped ERROR all
+    /// land in Rejected (hours of backoff), while a mundane ERROR stays
+    /// Transient - the reason text decides.
+    #[tokio::test]
+    async fn irc_rejections_and_ban_classification() {
+        for (line, banned, needle) in [
+            (":srv 465 me :You are banned\r\n", true, "You are banned"),
+            (":srv KILL me :go away\r\n", true, "go away"),
+            ("ERROR :K-lined for abuse\r\n", true, "K-lined"),
+            ("ERROR :ping timeout\r\n", false, "ping timeout"),
+        ] {
+            let (stop, _) = run_against(
+                vec!["#pre".into()],
+                Arc::new(AtomicBool::new(false)),
+                move |sock| async move {
+                    let (rd, mut wr) = sock.into_split();
+                    let mut rd = TokioBufReader::new(rd);
+                    srv_line(&mut rd).await;
+                    srv_line(&mut rd).await;
+                    wr.write_all(line.as_bytes()).await.unwrap();
+                },
+            )
+            .await;
+            match (&stop, banned) {
+                (IrcStop::Rejected(m), true) | (IrcStop::Transient(m), false) => {
+                    assert!(m.contains(needle), "{line:?} -> {stop:?}");
+                }
+                _ => panic!("{line:?} misclassified: {stop:?}"),
+            }
+            if banned {
+                assert!(format!("{stop}").starts_with("rejected: "));
+            }
+        }
+    }
+
+    /// The stop switch: the client says QUIT and reports Cancelled.
+    #[tokio::test]
+    async fn irc_stop_switch_quits() {
+        let (stop, _) = run_against(
+            vec!["#pre".into()],
+            Arc::new(AtomicBool::new(true)),
+            |sock| async move {
+                let (rd, _wr) = sock.into_split();
+                let mut rd = TokioBufReader::new(rd);
+                loop {
+                    let l = srv_line(&mut rd).await;
+                    if l == "QUIT :bye" || l.is_empty() {
+                        break;
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(matches!(stop, IrcStop::Cancelled), "{stop:?}");
+        assert_eq!(format!("{stop}"), "stopped");
+    }
+
+    /// A peer that sends MAX_LINE bytes with no terminator is resynced
+    /// at the next newline instead of buffered without bound - and the
+    /// lines after it still parse.
+    #[tokio::test]
+    async fn irc_oversized_line_resyncs() {
+        let (stop, msgs) = run_against(
+            vec!["#pre".into()],
+            Arc::new(AtomicBool::new(false)),
+            |sock| async move {
+                let (rd, mut wr) = sock.into_split();
+                let mut rd = TokioBufReader::new(rd);
+                srv_line(&mut rd).await;
+                srv_line(&mut rd).await;
+                wr.write_all(b":srv 001 me :welcome\r\n").await.unwrap();
+                assert_eq!(srv_line(&mut rd).await, "JOIN #pre");
+                let mut blob = vec![b'a'; (MAX_LINE + 800) as usize];
+                blob.extend_from_slice(b"\r\n");
+                wr.write_all(&blob).await.unwrap();
+                wr.write_all(b":bot!u@h PRIVMSG #pre :NEW: [TT: Y-GRP]\r\n")
+                    .await
+                    .unwrap();
+                wr.write_all(b"ERROR :done\r\n").await.unwrap();
+            },
+        )
+        .await;
+        assert!(matches!(stop, IrcStop::Transient(_)), "{stop:?}");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].2, "NEW: [TT: Y-GRP]");
+    }
+
+    /// Config guards: an empty host cannot connect, and TLS against a
+    /// non-TLS listener refuses to downgrade unless plaintext was
+    /// explicitly allowed - in which case the plain retry proceeds.
+    #[tokio::test]
+    async fn irc_connect_guards_and_plaintext_fallback() {
+        let cfg = IrcConfig {
+            host: "  ".into(),
+            ..IrcConfig::default()
+        };
+        let stop = run_once(&cfg, |_| {}, &|| false).await;
+        assert!(
+            matches!(&stop, IrcStop::Transient(m) if m.contains("no server configured")),
+            "{stop:?}"
+        );
+
+        // A plain-text listener that answers TLS with garbage.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            // Both runs open with a TLS attempt - feed each a non-TLS
+            // greeting so the handshake dies fast, never reading (a
+            // ClientHello is binary and no line reader may touch it).
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let _ = sock.write_all(b"not tls at all\r\n").await;
+                drop(sock);
+            }
+            // Third connection: the second run's plain-text fallback.
+            if let Ok((sock, _)) = listener.accept().await {
+                let (rd, mut wr) = sock.into_split();
+                let mut rd = TokioBufReader::new(rd);
+                srv_line(&mut rd).await;
+                srv_line(&mut rd).await;
+                wr.write_all(b"ERROR :fallback reached\r\n").await.unwrap();
+            }
+        });
+        let mut cfg = IrcConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: true,
+            allow_plaintext: false,
+            nick: "t".into(),
+            channels: vec!["#pre".into()],
+        };
+        let stop = run_once(&cfg, |_| {}, &|| false).await;
+        assert!(
+            matches!(&stop, IrcStop::Transient(m) if m.contains("refusing to fall back")),
+            "{stop:?}"
+        );
+        cfg.allow_plaintext = true;
+        let stop = run_once(&cfg, |_| {}, &|| false).await;
+        assert!(
+            matches!(&stop, IrcStop::Transient(m) if m == "fallback reached"),
+            "{stop:?}"
+        );
+        server.await.unwrap();
+        // The defaults themselves: TLS on, no plaintext, documented nick.
+        let d = IrcConfig::default();
+        assert!(d.tls && !d.allow_plaintext);
+        assert_eq!(d.nick, DEFAULT_NICK);
+        assert_eq!(d.port, DEFAULT_PORT);
+        assert_eq!(d.channels.len(), DEFAULT_CHANNELS.len());
+    }
+
     #[test]
     fn nick_suffixes_differ() {
         let a = nick_suffix();

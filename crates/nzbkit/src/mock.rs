@@ -103,6 +103,22 @@ pub struct Chaos {
     /// and closed. With `drop_after` this reproduces the flap shape: the
     /// few winners keep dying, the rest keep bouncing off the cap.
     pub accept_cap: Option<u64>,
+    /// Ghost capacity window (issue #16's restart shape): for this many
+    /// ms from server start, EVERY accept is greeted with the capacity
+    /// refusal and closed - the provider is still counting a dead
+    /// process's sessions against the account cap, and no amount of
+    /// dialing helps until the lease expires. Distinct from
+    /// `accept_cap` (which counts live connections): here there is
+    /// nothing to count and nothing the client can shed. 0 = off.
+    pub cap_ghost_ms: u64,
+    /// Hard outage window: for this many ms from server start, every
+    /// ACCEPTED connection is immediately closed with NO refusal line
+    /// at all - the client's connect sees a hard failure (EOF before
+    /// the greeting), exactly what a wifi drop, VPN reconnect, or
+    /// router reboot looks like. Distinct from `cap_ghost_ms`, which
+    /// greets with the 502 capacity text (a refusal the client can
+    /// classify); here there is nothing to classify. 0 = off.
+    pub refuse_connect_ms: u64,
     /// Ids whose FIRST request hangs BEFORE the status line (the
     /// dead-air shape a flat read timeout waits full length on, and the
     /// adaptive TTFB budget cuts short). Retries succeed, like `stall`.
@@ -164,6 +180,25 @@ pub struct Chaos {
     /// nothing until its read bound fires; a reconnect gets a fresh
     /// NAT entry and works. 0 = off.
     pub mute_after_bodies: u64,
+    /// Desync: every Nth BODY/ARTICLE request (server-wide, counted in
+    /// arrival order like `jitter`/`corrupt_every`) has its response
+    /// silently WITHHELD - the command is consumed and logged, nothing
+    /// at all is written back, and the connection stays up. Every
+    /// later response on that connection then answers an EARLIER
+    /// pipeline slot than positional attribution assumes, so a client
+    /// that discards the echoed message-id files every subsequent body
+    /// under the wrong article. A response-stream fault (broken
+    /// frontend/LB dropping one reply), distinct from `stall`/`stall_pre`
+    /// (which stop answering entirely) - here the conversation keeps
+    /// flowing, one slot out of phase. 0 = off.
+    pub skip_nth_response: u64,
+    /// Cold-storage lookups: id → ms of dead air before the STATUS
+    /// line, on EVERY request (unlike `stall_pre`, which hangs only the
+    /// first and answers the retry instantly). The article is healthy
+    /// and always answers - eventually. This is the §121.1 shape: a
+    /// trained-to-floor adaptive budget expires attempt after attempt
+    /// on an article that a wider budget serves fine.
+    pub slow_ttfb: HashMap<String, u64>,
 }
 
 /// Bandwidth shaping for the BODY/ARTICLE path - the model the
@@ -555,6 +590,40 @@ impl MockServer {
                 let ts = throttle_state.clone();
                 ts.active.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
+                    // Hard outage window: the accept succeeds (the TCP
+                    // stack answers before the process does) but the
+                    // connection is torn down before a single byte -
+                    // no greeting, no refusal text. The client's dial
+                    // fails hard, indistinguishable from the network
+                    // going away under it.
+                    if chaos.refuse_connect_ms > 0
+                        && (ts.started.elapsed().as_millis() as u64) < chaos.refuse_connect_ms
+                    {
+                        drop(sock);
+                        ts.active.fetch_sub(1, Ordering::Relaxed);
+                        return;
+                    }
+                    // Ghost capacity window (issue #16's restart shape): the
+                    // provider still counts a DEAD process's sessions against
+                    // the account cap, so for the first `cap_ghost_ms` every
+                    // fresh accept - there are no live ghosts to count - is
+                    // greeted with the capacity refusal and closed. The lease
+                    // then expires and accepts run normally. The client's job
+                    // is to keep paced redials alive through the window and
+                    // ease back in when it clears, not to stall at zero.
+                    if chaos.cap_ghost_ms > 0
+                        && (ts.started.elapsed().as_millis() as u64) < chaos.cap_ghost_ms
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let (_, mut w) = sock.into_split();
+                        let _ = w
+                            .write_all(
+                                b"502 max number of simultaneous IP addresses reached: 0\r\n",
+                            )
+                            .await;
+                        ts.active.fetch_sub(1, Ordering::Relaxed);
+                        return;
+                    }
                     if let Some(cap) = chaos.accept_cap
                         && ts.active.load(Ordering::Relaxed) as u64 > cap
                     {
@@ -952,6 +1021,11 @@ async fn serve_conn(
                 log.push(id.clone());
                 log.len() as u64
             };
+            // Desync: consume the request, answer NOTHING, keep the
+            // connection - later responses shift one slot forward.
+            if chaos.skip_nth_response > 0 && nth.is_multiple_of(chaos.skip_nth_response) {
+                continue;
+            }
             // CGNAT eviction: this connection's NAT entry is gone -
             // dead air forever, no close. A reconnect gets a fresh
             // entry (a fresh accept), which is the recovery path.
@@ -1015,6 +1089,12 @@ async fn serve_conn(
                 // silence until its pre-byte bound fires.
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 return Ok(());
+            }
+            if let Some(ms) = chaos.slow_ttfb.get(&id) {
+                // Cold storage: dead air, then a normal answer - on
+                // every request, so only a wide-enough pre-byte budget
+                // ever sees the status line.
+                tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
             }
             w.write_all(format!("222 0 {id}\r\n").as_bytes()).await?;
             if stall_once.lock_ok().remove(&id) {
@@ -1082,6 +1162,10 @@ async fn serve_conn(
                 log.push(id.clone());
                 log.len() as u64
             };
+            // Desync (see BODY): consumed, unanswered, connection kept.
+            if chaos.skip_nth_response > 0 && nth.is_multiple_of(chaos.skip_nth_response) {
+                continue;
+            }
             // CGNAT eviction (see BODY).
             if chaos.mute_after_bodies > 0 && bodies_served >= chaos.mute_after_bodies {
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
@@ -1133,6 +1217,9 @@ async fn serve_conn(
             if stall_pre_once.lock_ok().remove(&id) {
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 return Ok(());
+            }
+            if let Some(ms) = chaos.slow_ttfb.get(&id) {
+                tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
             }
             w.write_all(format!("220 0 {id}\r\n").as_bytes()).await?;
             if stall_once.lock_ok().remove(&id) {

@@ -324,9 +324,12 @@ where
 /// with - the RAR4 twin of
 /// [`crate::rar50::extract_volumes_to_with_progress`], with the same
 /// contract: `consumed(volume_index)` means "no read will ever touch
-/// that volume again", indices arrive in increasing order, and nothing
-/// is reported while a split member is pending (its Finish reads every
-/// fragment back).
+/// that volume again", and indices arrive in increasing order, once
+/// each. A split member releases its volumes progressively as its chain
+/// streams forward - RAR4 split decodes never re-read a fragment (there
+/// is no buffered filter retry in this family), so every fragment's
+/// volume frees the moment the chain has read it out. The callback can
+/// run on the decode thread, hence `Send`.
 pub fn extract_volumes_to_with_progress<F, C>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
@@ -335,7 +338,7 @@ pub fn extract_volumes_to_with_progress<F, C>(
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    C: FnMut(usize),
+    C: FnMut(usize) + Send,
 {
     extract_volumes_to_impl(volumes, options, &mut open, Some(&mut consumed))
 }
@@ -344,7 +347,7 @@ fn extract_volumes_to_impl<F>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
     open: &mut F,
-    mut consumed: Option<&mut dyn FnMut(usize)>,
+    mut consumed: Option<&mut (dyn FnMut(usize) + Send)>,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -389,12 +392,37 @@ where
                 }
                 SplitVolumeStep::Continue(current) => {
                     validate_split_continuation_refs(current, file, password)?;
-                    current.append(file, volume_index, file_index);
+                    current.append(file, volume_index, file_index)?;
                 }
                 SplitVolumeStep::Finish(mut completed) => {
                     validate_split_continuation_refs(&completed, file, password)?;
-                    completed.append(file, volume_index, file_index);
-                    completed.write_to(volumes, file, password, &mut session, &mut *open)?;
+                    completed.append(file, volume_index, file_index)?;
+                    // Progressive release, exactly as the rar50 twin: a
+                    // fragment the chain has read out frees its volume
+                    // (and any skipped ones before it) through the shared
+                    // `reported` cursor. RAR4 split decodes never re-read
+                    // a fragment, so the watermark is safe on both the
+                    // stored and the compressed path. The finish volume
+                    // stays held; the walk is still in it.
+                    let reported = &mut reported;
+                    let mut spent = consumed.as_deref_mut().map(|consumed| {
+                        move |spent_volume: usize| {
+                            while *reported <= spent_volume {
+                                consumed(*reported);
+                                *reported += 1;
+                            }
+                        }
+                    });
+                    completed.write_to(
+                        volumes,
+                        file,
+                        password,
+                        &mut session,
+                        &mut *open,
+                        spent
+                            .as_mut()
+                            .map(|spent| spent as &mut (dyn FnMut(usize) + Send)),
+                    )?;
                 }
                 SplitVolumeStep::MissingFirst => {
                     return Err(Error::InvalidHeader(
@@ -553,12 +581,33 @@ where
                     }
                     SplitVolumeStep::Continue(current) => {
                         validate_split_continuation_refs(current, file, password)?;
-                        current.append(file, volume_index, file_index);
+                        current.append(file, volume_index, file_index)?;
                     }
                     SplitVolumeStep::Finish(mut completed) => {
                         validate_split_continuation_refs(&completed, file, password)?;
-                        completed.append(file, volume_index, file_index);
-                        completed.write_to(&volumes, file, password, session, &mut open)?;
+                        completed.append(file, volume_index, file_index)?;
+                        // The splits that land here are STORED members
+                        // (the chase takes every compressed one). They
+                        // stream forward exactly once, so each fragment
+                        // frees its volume as the chain advances - the
+                        // caller's retention window must not have to
+                        // hold a 400-volume stored film whole.
+                        let reported = &mut reported;
+                        let consumed = &consumed;
+                        let mut spent = move |spent_volume: usize| {
+                            while *reported <= spent_volume {
+                                consumed(*reported, u64::MAX);
+                                *reported += 1;
+                            }
+                        };
+                        completed.write_to(
+                            &volumes,
+                            file,
+                            password,
+                            session,
+                            &mut open,
+                            Some(&mut spent),
+                        )?;
                     }
                     SplitVolumeStep::MissingFirst => {
                         return Err(Error::InvalidHeader(
@@ -995,8 +1044,22 @@ impl PendingSplitRefs {
         }
     }
 
-    fn append(&mut self, _file: &FileHeader, volume_index: usize, file_index: usize) {
+    fn append(&mut self, _file: &FileHeader, volume_index: usize, file_index: usize) -> Result<()> {
+        // Strictly increasing volumes only: a crafted archive with two
+        // fragments of one member in the same volume would let the
+        // consumption watermark report that volume spent while a later
+        // fragment still needs to reopen it by path - the caller may
+        // have deleted it on the report. No real archiver splits a
+        // member twice within one volume.
+        if let Some(&(last_volume, _)) = self.fragments.last() {
+            if volume_index <= last_volume {
+                return Err(Error::InvalidHeader(
+                    "RAR 1.5 split fragment does not advance to a later volume",
+                ));
+            }
+        }
         self.fragments.push((volume_index, file_index));
+        Ok(())
     }
 
     fn write_to<F>(
@@ -1006,6 +1069,7 @@ impl PendingSplitRefs {
         password: Option<&[u8]>,
         session: &mut DecoderSession,
         open: &mut F,
+        spent: Option<&mut (dyn FnMut(usize) + Send)>,
     ) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1018,7 +1082,14 @@ impl PendingSplitRefs {
             is_directory: false,
         };
         let mut writer = open(&meta)?;
-        let mut reader = self.fragment_reader(volumes, password)?;
+        // Both arms below stream the chain forward exactly once (RAR4 has
+        // no buffered filter retry), so the consumption watermark is safe
+        // on either. Re-boxed so the fresh trait object's lifetime can
+        // shrink to the volumes borrow.
+        let spent = spent.map(|f| {
+            Box::new(move |volume: usize| f(volume)) as Box<dyn FnMut(usize) + Send + '_>
+        });
+        let mut reader = self.fragment_reader(volumes, password, spent)?;
 
         if final_file.is_stored() {
             let expected_len = usize::try_from(final_file.unp_size)
@@ -1085,6 +1156,7 @@ impl PendingSplitRefs {
         &self,
         volumes: &'a [Archive],
         password: Option<&[u8]>,
+        spent: Option<Box<dyn FnMut(usize) + Send + 'a>>,
     ) -> Result<Box<dyn Read + Send + 'a>> {
         // Fragments are RESOLVED here (a missing volume or entry still fails
         // before a byte is read) but opened one at a time as the chain
@@ -1093,7 +1165,11 @@ impl PendingSplitRefs {
         // decryptor below is unchanged: RAR 1.5-4 keys the member, not the
         // fragment.
         let mut openers: Vec<FragmentOpener<'a>> = Vec::with_capacity(self.fragments.len());
-        for &(volume_index, file_index) in &self.fragments {
+        // Consumption marks: each fragment frees its volume when read out,
+        // except the LAST one - its volume carries the members after the
+        // split one and the caller's walk resumes there.
+        let mut marks: Vec<Option<usize>> = Vec::with_capacity(self.fragments.len());
+        for (position, &(volume_index, file_index)) in self.fragments.iter().enumerate() {
             let archive = volumes
                 .get(volume_index)
                 .ok_or(Error::InvalidHeader("RAR 1.5 split volume is missing"))?;
@@ -1105,8 +1181,9 @@ impl PendingSplitRefs {
             openers.push(Box::new(move || {
                 archive.range_reader(range).map_err(std::io::Error::other)
             }));
+            marks.push((position + 1 < self.fragments.len()).then_some(volume_index));
         }
-        let reader = LazyChainedReader::new(openers);
+        let reader = LazyChainedReader::with_spent(openers, marks, spent);
         if !self.encrypted {
             return Ok(Box::new(reader));
         }
@@ -1520,16 +1597,42 @@ mod tests {
         second.packed_range = 0..(encrypted.len() - split);
 
         let mut pending = PendingSplitRefs::new(&first, 0, 0);
-        pending.append(&second, 1, 0);
+        pending.append(&second, 1, 0).unwrap();
         let volumes = vec![
             archive_with_source(vec![Block::File(first)], encrypted[..split].to_vec()),
             archive_with_source(vec![Block::File(second)], encrypted[split..].to_vec()),
         ];
 
-        let reader = pending.fragment_reader(&volumes, Some(b"pw")).unwrap();
+        let reader = pending.fragment_reader(&volumes, Some(b"pw"), None).unwrap();
         let out = read_in_small_chunks(reader);
 
         assert_eq!(out, plain);
+    }
+
+    /// Bug sweep 2026-08-06 (M7): a crafted volume holding two
+    /// fragments of one member would let the consumption watermark
+    /// report the volume spent while the next fragment still needed to
+    /// reopen it by path - after a volume-eating caller hard-deleted
+    /// it. Split fragments must advance strictly by volume.
+    #[test]
+    fn same_volume_split_fragments_are_rejected() {
+        let first = file(b"a.txt", FHD_SPLIT_AFTER);
+        let second = file(b"a.txt", FHD_SPLIT_BEFORE);
+        let mut pending = PendingSplitRefs::new(&first, 0, 0);
+        assert!(
+            matches!(
+                pending.append(&second, 0, 1),
+                Err(Error::InvalidHeader(_))
+            ),
+            "a second fragment inside the same volume must be refused"
+        );
+        assert!(
+            matches!(
+                pending.append(&second, 1, 0),
+                Ok(())
+            ),
+            "the ordinary next-volume fragment must still be accepted"
+        );
     }
 
     fn never_open(_meta: &ExtractedEntryMeta) -> Result<Box<dyn Write>> {
@@ -1772,7 +1875,7 @@ mod tests {
         let pending = PendingSplitRefs::new(&f, 9, 0);
         let no_volumes: Vec<Archive> = Vec::new();
         assert!(matches!(
-            pending.fragment_reader(&no_volumes, None),
+            pending.fragment_reader(&no_volumes, None, None),
             Err(Error::InvalidHeader(_))
         ));
 
@@ -1780,7 +1883,7 @@ mod tests {
         pending.fragments[0] = (0, 7);
         let one_volume = vec![archive_with(vec![Block::File(f)])];
         assert!(matches!(
-            pending.fragment_reader(&one_volume, None),
+            pending.fragment_reader(&one_volume, None, None),
             Err(Error::InvalidHeader(_))
         ));
     }
@@ -1793,7 +1896,7 @@ mod tests {
         let pending = PendingSplitRefs::new(&first, 0, 0);
         let volumes = vec![archive_with_source(vec![Block::File(first)], Vec::new())];
         assert!(matches!(
-            pending.fragment_reader(&volumes, None),
+            pending.fragment_reader(&volumes, None, None),
             Err(Error::NeedPassword)
         ));
     }
@@ -1811,13 +1914,13 @@ mod tests {
         second.packed_range = 0..(plain.len() - split);
 
         let mut pending = PendingSplitRefs::new(&first, 0, 0);
-        pending.append(&second, 1, 0);
+        pending.append(&second, 1, 0).unwrap();
         let volumes = vec![
             archive_with_source(vec![Block::File(first)], plain[..split].to_vec()),
             archive_with_source(vec![Block::File(second)], plain[split..].to_vec()),
         ];
 
-        let reader = pending.fragment_reader(&volumes, None).unwrap();
+        let reader = pending.fragment_reader(&volumes, None, None).unwrap();
         let out = read_in_small_chunks(reader);
         assert_eq!(out, plain);
     }
@@ -1830,7 +1933,7 @@ mod tests {
         second.pack_size = 5;
 
         let mut pending = PendingSplitRefs::new(&first, 0, 0);
-        pending.append(&second, 1, 0);
+        pending.append(&second, 1, 0).unwrap();
         let volumes = vec![
             archive_with(vec![Block::File(first)]),
             archive_with(vec![Block::File(second)]),

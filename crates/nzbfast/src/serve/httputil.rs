@@ -1,0 +1,409 @@
+//! HTTP request plumbing: the wrong-key throttle, key extraction and
+//! constant-time comparison, query/form/multipart parsing, and the JSON
+//! response helper.
+//!
+//! Split out of serve/mod.rs by TODO 106 phase 4 - the code is verbatim,
+//! only visibility changed.
+
+use super::*;
+
+/// Wrong keys tolerated from one address inside [`AUTH_FAIL_WINDOW`] before
+/// it is refused outright. Generous: a misconfigured *arr retries a handful
+/// of times, and locking that out helps nobody.
+pub(super) const AUTH_FAIL_THRESHOLD: u32 = 10;
+/// How long the failure count is remembered. Also the block duration - the
+/// count resets by simply going quiet, so there is no permanent lockout and
+/// no state to unstick.
+pub(super) const AUTH_FAIL_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// Ceiling on tracked addresses, so the map itself cannot be the attack.
+pub(super) const AUTH_FAIL_MAX_TRACKED: usize = 4096;
+
+impl Daemon {
+    /// Record a rejected API key and decide whether this address has had
+    /// enough. `true` = refuse without doing any further work.
+    ///
+    /// Deliberately refuses FAST rather than sleeping. The obvious throttle
+    /// is a delay before answering, but responses are written on the small
+    /// shared worker pool, so a delay is exactly the worker-occupancy problem
+    /// a slowloris exploits - it would harden the key and hand over the
+    /// dashboard. Refusing immediately costs an attacker the same round trip
+    /// and costs us nothing.
+    ///
+    /// Returns false (allow) when the address is unknown or the table is
+    /// full: failing open on *accounting* is fine, the key check itself still
+    /// has to pass.
+    pub(super) fn note_auth_failure(&self, addr: Option<std::net::IpAddr>, what: &str) -> bool {
+        note_auth_failure_in(&self.auth_fails, addr, what)
+    }
+}
+
+/// The accounting itself, split out from `Daemon` so it can be tested
+/// without standing up a whole daemon.
+pub(super) fn note_auth_failure_in(
+    table: &Mutex<std::collections::HashMap<std::net::IpAddr, (u32, Instant)>>,
+    addr: Option<std::net::IpAddr>,
+    what: &str,
+) -> bool {
+    {
+        let Some(ip) = addr else { return false };
+        let now = Instant::now();
+        let mut fails = table.lock_ok();
+        if fails.len() >= AUTH_FAIL_MAX_TRACKED {
+            fails.retain(|_, (_, seen)| now.duration_since(*seen) < AUTH_FAIL_WINDOW);
+            if fails.len() >= AUTH_FAIL_MAX_TRACKED {
+                return false;
+            }
+        }
+        let entry = fails.entry(ip).or_insert((0, now));
+        if now.duration_since(entry.1) >= AUTH_FAIL_WINDOW {
+            *entry = (0, now);
+        }
+        entry.0 += 1;
+        let count = entry.0;
+        // Log the first, then only on crossing, so a flood cannot be used to
+        // fill the disk through the log.
+        if count == 1 {
+            warn!(target: "auth", "rejected key for {what} from {ip}");
+        } else if count == AUTH_FAIL_THRESHOLD {
+            warn!(
+                target: "auth",
+                "{count} rejected keys from {ip} in under {}s - refusing it for {}s",
+                AUTH_FAIL_WINDOW.as_secs(),
+                AUTH_FAIL_WINDOW.as_secs()
+            );
+        }
+        count >= AUTH_FAIL_THRESHOLD
+    }
+}
+
+/// The client address of a request, when the transport knows one.
+pub(super) fn peer_ip(req: &tiny_http::Request) -> Option<std::net::IpAddr> {
+    req.remote_addr().map(|a| a.ip())
+}
+
+/// Constant-time-ish string equality for the stream token - a plain ==
+/// short-circuits on the first differing byte.
+pub(super) fn ct_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
+}
+
+/// Issue #4: the API key may ride a header instead of the query string,
+/// which keeps it out of reverse-proxy access logs, browser history and
+/// outbound Referer headers - the leak paths of a `?apikey=` URL on an
+/// internet-published install. `X-Api-Key: <key>` (the *arr convention)
+/// or `Authorization: Bearer <key>` (what auth proxies inject). The
+/// query string still wins when both are present and stays supported
+/// forever - Sonarr/Radarr and plain links can only do URLs.
+pub(super) fn header_apikey(req: &tiny_http::Request) -> Option<String> {
+    let hv = |name: &'static str| {
+        req.headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str().trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    hv("X-Api-Key").or_else(|| {
+        hv("Authorization").and_then(|v| {
+            // RFC 7235: the scheme token is case-insensitive. Matching
+            // only the two spellings we happened to think of rejected a
+            // compliant `BEARER <key>` from an auth proxy that
+            // normalizes headers.
+            let (scheme, rest) = v.split_once(' ')?;
+            scheme
+                .eq_ignore_ascii_case("bearer")
+                .then(|| rest.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+    })
+}
+
+pub(super) fn parse_query(q: &str) -> std::collections::HashMap<String, String> {
+    q.split('&')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.to_string(), urldecode(v)))
+        })
+        .collect()
+}
+
+/// [`parse_query`] for a REQUEST BODY, bounded the way `multipart_fields`
+/// is and for exactly the same reason.
+///
+/// A query string is bounded by tiny_http's header limit before it ever
+/// reaches `parse_query`. A body is not: the /api pre-drain reads up to
+/// `API_BODY_MAX` (256 MiB) BEFORE authenticating, so a form of that size
+/// full of tiny `k=` pairs turned into tens of millions of live `String`
+/// allocations - several GB of resident set, from an unauthenticated
+/// request, decided long before the 403. The multipart sibling has
+/// carried these two caps since it was written; the form path beside it
+/// never got them.
+///
+/// Same figures as `multipart_fields`: 256 fields, 4096 bytes a value.
+/// Every real caller is far inside both - the largest legitimate body
+/// field is an NZB, which arrives as a multipart FILE part, not here.
+pub(super) fn parse_form_body(q: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for kv in q.split('&') {
+        if out.len() >= 256 {
+            break;
+        }
+        let Some((k, v)) = kv.split_once('=') else {
+            continue;
+        };
+        if k.is_empty() || k.len() > 256 || v.len() > 4096 {
+            continue;
+        }
+        out.push((k.to_string(), urldecode(v)));
+    }
+    out
+}
+
+pub(super) fn urldecode(s: &str) -> String {
+    let mut out = Vec::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 3 <= b.len() => {
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("");
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v);
+                    i += 3;
+                } else {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A multipart part's header block is a handful of short ASCII lines
+/// (Content-Disposition with a name/filename, maybe a Content-Type).
+/// Bounding it BEFORE decoding matters more than usual here: this runs
+/// pre-authentication on a body of up to 256 MiB, and
+/// `String::from_utf8_lossy` expands each invalid byte to a 3-byte
+/// replacement character - so one part whose "header" is the whole body
+/// used to allocate ~3x the body on top of it (Codex H8). 8 KiB is far
+/// past any legitimate filename.
+pub(super) const MAX_PART_HEADER: usize = 8 << 10;
+
+/// Extract (filename, bytes) of the first file part in a multipart body.
+pub(super) fn multipart_file(body: &[u8], boundary: &str) -> Option<(String, Vec<u8>)> {
+    if !valid_boundary(boundary) {
+        return None;
+    }
+    let delim = format!("--{boundary}");
+    let mut found = None;
+    for_each_split(body, delim.as_bytes(), |part| {
+        let Some(hdr_end) = find_bytes(part, b"\r\n\r\n") else {
+            return true; // preamble/epilogue segments have no header block
+        };
+        if hdr_end > MAX_PART_HEADER {
+            return true; // attacker-sized header: never decode it
+        }
+        let headers = String::from_utf8_lossy(&part[..hdr_end]);
+        if let Some(fn_pos) = headers.find("filename=\"") {
+            let rest = &headers[fn_pos + 10..];
+            let fname = rest.split('"').next().unwrap_or("upload.nzb").to_string();
+            let mut content = &part[hdr_end + 4..];
+            // Strip the trailing \r\n before the next boundary.
+            if content.ends_with(b"\r\n") {
+                content = &content[..content.len() - 2];
+            }
+            found = Some((fname, content.to_vec()));
+            return false;
+        }
+        true
+    });
+    found
+}
+
+/// Extract (name, value) of every NON-file field of a multipart body -
+/// the parts carrying no `filename=`. SAB-compat: browser addons send
+/// api parameters (mode, apikey, cat, nzbname) this way on POST. Values
+/// keep multipart's trailing-CRLF strip; anything file-sized is skipped
+/// - a parameter is short, and treating a mis-labelled upload as one
+/// would copy megabytes into a HashMap key nobody reads.
+pub(super) fn multipart_fields(body: &[u8], boundary: &str) -> Vec<(String, String)> {
+    if !valid_boundary(boundary) {
+        return Vec::new();
+    }
+    let delim = format!("--{boundary}");
+    let mut out: Vec<(String, String)> = Vec::new();
+    for_each_split(body, delim.as_bytes(), |part| {
+        // A form carrying thousands of fields is not a form. This runs
+        // before authentication, on a body of up to 256 MiB, so the
+        // parser's own working set has to be bounded by something other
+        // than the attacker's segment count.
+        if out.len() >= 256 {
+            return false;
+        }
+        let Some(hdr_end) = find_bytes(part, b"\r\n\r\n") else {
+            return true; // preamble/epilogue segments have no header block
+        };
+        if hdr_end > MAX_PART_HEADER {
+            return true; // attacker-sized header: never decode it
+        }
+        let headers = String::from_utf8_lossy(&part[..hdr_end]);
+        if headers.contains("filename=\"") {
+            return true; // the file part is multipart_file's business
+        }
+        let Some(np) = headers.find("name=\"") else {
+            return true;
+        };
+        let name = headers[np + 6..]
+            .split('"')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            return true;
+        }
+        let mut content = &part[hdr_end + 4..];
+        if content.ends_with(b"\r\n") {
+            content = &content[..content.len() - 2];
+        }
+        if content.len() > 4096 {
+            return true;
+        }
+        out.push((name, String::from_utf8_lossy(content).into_owned()));
+        true
+    });
+    out
+}
+
+/// Minimal magic-number sniff for user-supplied poster bytes (M21
+/// wall_art): JPEG / PNG / GIF / WebP. Anything else is refused before
+/// it can land in the art cache.
+#[cfg(feature = "indexer")]
+pub(super) fn looks_image(b: &[u8]) -> bool {
+    b.starts_with(&[0xFF, 0xD8, 0xFF])
+        || b.starts_with(&[0x89, b'P', b'N', b'G'])
+        || b.starts_with(b"GIF8")
+        || (b.len() >= 12 && b.starts_with(b"RIFF") && &b[8..12] == b"WEBP")
+}
+
+/// Split `hay` on `needle`, calling `f` with each segment; stops early
+/// when `f` returns false.
+///
+/// Deliberately not the `Vec<&[u8]>` this replaced. That vector was the
+/// multipart parser's amplifier: one fat pointer per delimiter, 16 bytes
+/// on 64-bit, so a body made of nothing but delimiters turned a 256 MiB
+/// read into roughly 2 GiB of Vec on top of it - allocated before
+/// authentication, and outside the body budget that bounds the read
+/// itself. Iterating costs a constant.
+pub(super) fn for_each_split<'a>(
+    hay: &'a [u8],
+    needle: &[u8],
+    mut f: impl FnMut(&'a [u8]) -> bool,
+) {
+    // An empty needle matches everywhere: `find_bytes` returns Some(0)
+    // for every position and the walk never advances. Callers reject
+    // empty boundaries before this, but the primitive must not depend
+    // on that.
+    if needle.is_empty() {
+        f(hay);
+        return;
+    }
+    let mut start = 0;
+    while let Some(pos) = find_bytes(&hay[start..], needle) {
+        if !f(&hay[start..start + pos]) {
+            return;
+        }
+        start += pos + needle.len();
+    }
+    f(&hay[start..]);
+}
+
+/// Is this a multipart boundary we will parse at all?
+///
+/// RFC 2046 puts a boundary at 1-70 characters of a restricted set. The
+/// length bound is what matters here: an EMPTY boundary - which
+/// `Content-Type: multipart/form-data; boundary=` supplies, and which
+/// nothing legitimate sends - makes the delimiter `--`, so a body of
+/// repeated hyphens splits into a segment every two bytes.
+pub(super) fn valid_boundary(b: &str) -> bool {
+    !b.is_empty() && b.len() <= 70 && !b.contains('\r') && !b.contains('\n')
+}
+
+/// The multipart boundary in a `Content-Type`, or None when the header
+/// does not carry a usable one.
+///
+/// ONE copy, because there were three and they disagreed. The parameter
+/// NAME is case-insensitive like the media type around it, but the
+/// VALUE is a literal delimiter that has to keep its case - so the
+/// position is found in a lowercased copy and the text is cut from the
+/// original. The gateway learned that in Codex sweep 2's H1 while the
+/// two handler-side copies stayed case-sensitive, which left `Boundary=`
+/// parsing at the gateway (fields merged, auth decided) and failing in
+/// the handler (no file part at all).
+///
+/// [`valid_boundary`] is applied here rather than by callers: an empty
+/// `boundary=` makes the delimiter `--`, so a body of hyphens splits
+/// once every two bytes. Nothing legitimate sends one, and refusing it
+/// at the source means no caller can forget to.
+pub(super) fn multipart_boundary(ctype: &str) -> Option<String> {
+    let at = ctype.to_ascii_lowercase().find("boundary=")? + "boundary=".len();
+    // The value ends at the parameter separator, not at the end of the
+    // header. Taking the rest of the line swept up whatever followed:
+    // an ordinary `boundary="----abc"; charset=UTF-8` became
+    // `----abc"; charset=UTF-8` (the leading quote trimmed, the trailing
+    // one buried mid-string), which appears nowhere in the body. The
+    // split then found no delimiter, so the upload's file part was
+    // silently dropped as "no nzb file in request" - and a caller whose
+    // apikey travelled in the body had it stop being found at all,
+    // presenting a content-type problem as an authentication failure,
+    // which is the hardest possible thing to support.
+    //
+    // Cut from the ORIGINAL, so the delimiter keeps its case; `at` is
+    // valid there because the needle is ASCII and lowercasing does not
+    // move byte offsets for it.
+    let rest = ctype[at..].trim_start();
+    let value = match rest.strip_prefix('"') {
+        // Quoted: to the closing quote. A quoted value may legally hold
+        // characters that would otherwise end the parameter.
+        Some(q) => q.split('"').next().unwrap_or_default(),
+        None => rest.split(';').next().unwrap_or_default().trim_end(),
+    };
+    Some(value.to_string()).filter(|b| valid_boundary(b))
+}
+
+pub(super) fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+pub(super) fn json_resp(v: Value) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    let data = v.to_string().into_bytes();
+    tiny_http::Response::from_data(data).with_header(
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
+    )
+}
+
+/// May a scan pass that began at `pass_era` hand its freshly-opened
+/// connection to the daemon, given the current `era` and switch state?
+///
+/// Both conditions, because they fail differently. A stale era means the
+/// database itself was replaced (wiped) under the pass, so the
+/// connection points at a file nobody wants back. `!enabled` means no
+/// source wants the database any more - the user switched the last one
+/// off during the pass: the era may well still match - switching off
+/// does bump it, but a pass could equally have started while off - and
+/// "closed" has to stay closed.
+#[cfg(feature = "indexer")]
+pub(super) fn may_publish_index(era: u64, pass_era: u64, enabled: bool) -> bool {
+    era == pass_era && enabled
+}

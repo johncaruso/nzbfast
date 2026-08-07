@@ -22,6 +22,10 @@ pub(in crate::serve) mod wall;
 pub(in crate::serve) struct ApiCtx<'a> {
     pub cfg_path: &'a std::path::Path,
     pub host_hdr: &'a str,
+    /// Scheme + authority for client-facing links (`public_base`):
+    /// honors X-Forwarded-Host/Proto, so capability URLs survive a TLS
+    /// reverse proxy instead of pointing at the backend over http.
+    pub base: &'a str,
     pub ua_hdr: &'a str,
     pub key_q: &'a str,
     #[cfg(feature = "indexer")]

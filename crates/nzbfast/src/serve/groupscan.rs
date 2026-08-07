@@ -1,0 +1,678 @@
+//! Newsgroup discovery and profiling: the ISC description catalogue, the
+//! server's own LIST ACTIVE, per-group sampling and the hourly burst that
+//! makes the content filters useful, plus the one-off system probe.
+//!
+//! Split out of serve/mod.rs by TODO 106 phase 4 - the code is verbatim,
+//! only visibility changed.
+
+use super::*;
+
+/// Where ISC publishes the community's newsgroup descriptions: about
+/// 45,000 of them, refreshed hourly, one `group<TAB>description` per line.
+#[cfg(feature = "indexer")]
+pub(super) const ISC_NEWSGROUPS_URL: &str = "https://ftp.isc.org/pub/usenet/CONFIG/newsgroups";
+
+/// Cap on the descriptions file. It is around 3 MB; this is a ceiling on
+/// a fetch from a host we do not control, not a size estimate.
+#[cfg(feature = "indexer")]
+pub(super) const ISC_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Fetch the ISC newsgroup descriptions.
+///
+/// Opt-in, and off by default, because it is the daemon's only outbound
+/// request to a host that is not the user's news provider. It exists
+/// because most binary providers answer LIST NEWSGROUPS with nothing at
+/// all - measured on a real provider, 0 of 111,330 groups came back with
+/// a description - which leaves the browser's search matching names only.
+///
+/// Goes through the SSRF-guarded agent like every other outbound fetch.
+#[cfg(feature = "indexer")]
+pub(super) fn fetch_isc_descriptions() -> std::result::Result<Vec<(String, String)>, String> {
+    let resp = ssrf_safe_agent(3, 30)
+        .get(ISC_NEWSGROUPS_URL)
+        .call()
+        .map_err(|e| format!("ISC descriptions: {e}"))?;
+    // Bytes, then a lossy decode. The file is decades old and is NOT
+    // valid UTF-8 - read_to_string on it fails outright with "stream did
+    // not contain valid UTF-8", which is how this was found. Group names
+    // are ASCII; only the odd description carries a stray Latin-1 byte,
+    // and a replacement character in one description is a fair trade for
+    // the other 45,000.
+    let mut raw = Vec::new();
+    use std::io::Read as _;
+    resp.into_reader()
+        .take(ISC_MAX_BYTES)
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("ISC descriptions: {e}"))?;
+    let body = String::from_utf8_lossy(&raw);
+    let out: Vec<(String, String)> = body
+        .lines()
+        .filter_map(|l| {
+            // Tab-separated, but the file has historically used runs of
+            // whitespace too, so split on the first whitespace span.
+            let (name, desc) = l.split_once(|c: char| c.is_whitespace())?;
+            let desc = desc.trim();
+            // "?" is the file's placeholder for "no description".
+            if name.is_empty() || desc.is_empty() || desc == "?" {
+                return None;
+            }
+            Some((name.to_string(), desc.to_string()))
+        })
+        .collect();
+    if out.is_empty() {
+        return Err("ISC descriptions: no usable lines".into());
+    }
+    Ok(out)
+}
+
+/// Fetch the full newsgroup catalogue from the primary server: LIST
+/// ACTIVE (mandatory) + LIST NEWSGROUPS (optional descriptions - many
+/// binary providers reject it, which just means blank descriptions).
+#[cfg(feature = "indexer")]
+pub(super) async fn fetch_group_catalog(
+    config: &Path,
+    prev: Option<&crate::groups::Catalog>,
+    isc: bool,
+) -> std::result::Result<crate::groups::Catalog, String> {
+    let server = crate::load_server(config).map_err(|e| e.to_string())?;
+    let (mut conn, _) = nzbkit::nntp::Connection::connect(&server)
+        .await
+        .map_err(|e| e.to_string())?;
+    let active = conn.list_active().await.map_err(|e| e.to_string())?;
+    let mut descs = conn.list_newsgroups().await.unwrap_or_default();
+    conn.quit().await;
+    if active.is_empty() {
+        return Err("server returned an empty group list".into());
+    }
+    if isc {
+        // ISC goes FIRST and the provider's own list is appended on top.
+        // Catalog::build collects these into a HashMap, so the last entry
+        // for a name wins - which has to be the user's own server, since
+        // it is authoritative about what it actually carries.
+        match tokio::task::spawn_blocking(fetch_isc_descriptions).await {
+            Ok(Ok(mut merged)) => {
+                info!(target: "groups", "ISC descriptions: {} fetched", merged.len());
+                // Drop the provider's non-descriptions FIRST. Some servers
+                // answer LIST NEWSGROUPS by echoing each group's own name
+                // back as its description; Catalog::build already discards
+                // those as junk, but because the provider list is applied
+                // last they would first overwrite every real ISC entry.
+                // Measured: without this, 45,006 fetched descriptions
+                // produced a catalogue with zero.
+                descs.retain(|(n, d)| !d.eq_ignore_ascii_case(n));
+                merged.extend(descs);
+                descs = merged;
+            }
+            Ok(Err(e)) => info!(target: "groups", "{e}"),
+            Err(e) => info!(target: "groups", "ISC descriptions: {e}"),
+        }
+    }
+    Ok(crate::groups::Catalog::build(
+        epoch_secs() as i64,
+        active,
+        descs,
+        prev,
+    ))
+}
+
+/// How many of a group's newest articles one sample covers. 200 is
+/// enough for a stable mean and a usable content mix, and small enough
+/// that a sample is one quick OVER rather than a scan.
+#[cfg(feature = "indexer")]
+pub(super) const GROUP_SAMPLE_N: u64 = 200;
+
+/// How far back the rate baseline reaches, widened until it spans at
+/// least an hour. A quiet group is answered by the first step; the
+/// busiest groups on a big provider need the last one.
+#[cfg(feature = "indexer")]
+pub(super) const RATE_BASELINE_STEPS: &[u64] = &[50_000, 1_000_000, 20_000_000];
+
+/// Sample one group: select it, pull OVER across its newest articles,
+/// and reduce that to a profile. One connection, one round trip, closed
+/// immediately - this must never compete with the download pool.
+#[cfg(feature = "indexer")]
+pub(super) async fn sample_one_group(
+    config: &Path,
+    group: &str,
+    posts: u64,
+) -> std::result::Result<crate::groupstats::GroupStats, String> {
+    let server = crate::load_server(config).map_err(|e| e.to_string())?;
+    let (mut conn, _) = nzbkit::nntp::Connection::connect(&server)
+        .await
+        .map_err(|e| e.to_string())?;
+    let info = conn.group(group).await.map_err(|e| e.to_string())?;
+    // An empty group has nothing to sample. Also guards the subtraction
+    // below, where high < GROUP_SAMPLE_N is the common case for a quiet
+    // group and must not wrap.
+    if info.high == 0 || info.high < info.low {
+        conn.quit().await;
+        return Ok(crate::groupstats::GroupStats {
+            sampled_at: epoch_secs() as i64,
+            ..Default::default()
+        });
+    }
+    let from = info.high.saturating_sub(GROUP_SAMPLE_N).max(info.low);
+    let entries = conn
+        .over(from, info.high)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut stats =
+        crate::groupstats::GroupStats::from_sample(epoch_secs() as i64, posts, &entries);
+
+    // Second, tiny probe far back in the article range, purely to date a
+    // wide baseline for the posting rate. The newest-200 window spans
+    // seconds on a busy group, which is unusable as a divisor; this turns
+    // the rate into an honest "N articles between these two dates".
+    //
+    // The step has to ADAPT, because "far back" is a property of the
+    // group, not a constant: 50k articles is weeks on a quiet group and
+    // about a minute on alt.binaries.teevee, which is why a fixed
+    // baseline measured nothing at all on the busiest group tested.
+    // Widen until the baseline spans an hour, or until we run out of
+    // group. Two extra round trips at worst, and only for the fast ones.
+    for step in RATE_BASELINE_STEPS {
+        let back = info.high.saturating_sub(*step).max(info.low);
+        if back >= from {
+            break; // the sample already covers this far back
+        }
+        // A few articles, not one: any individual number may be missing.
+        let Ok(old) = conn.over(back, back.saturating_add(20).min(from)).await else {
+            break;
+        };
+        let Some(oldest) = old.iter().map(|e| e.date).filter(|d| *d > 0).min() else {
+            continue;
+        };
+        stats.set_rate_from_baseline(info.high.saturating_sub(back), oldest);
+        if stats.per_day > 0.0 {
+            break; // the baseline was wide enough to be a measurement
+        }
+        if back == info.low {
+            break; // no more group to reach back into
+        }
+    }
+    conn.quit().await;
+    Ok(stats)
+}
+
+/// Sample `group` in the background unless a sample is already in flight
+/// for it. Returns whether THIS call started one.
+///
+/// Per-group single-flight rather than one global flag: opening two rows
+/// in the browser should sample both, but opening the same row twice
+/// should not go to the provider twice.
+#[cfg(feature = "indexer")]
+pub(super) fn kick_group_sample(
+    d: &Arc<Daemon>,
+    config: PathBuf,
+    group: String,
+    posts: u64,
+) -> bool {
+    {
+        let mut inflight = d.group_sampling.lock_ok();
+        if !inflight.insert(group.clone()) {
+            return false;
+        }
+    }
+    let d = d.clone();
+    tokio::spawn(async move {
+        // Hard ceiling: a black-holed provider must not pin an entry in
+        // the in-flight set forever, which would make that group
+        // permanently unsampleable until a restart.
+        let res = match tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            sample_one_group(&config, &group, posts),
+        )
+        .await
+        {
+            Err(_) => Err("timed out".to_string()),
+            Ok(r) => r,
+        };
+        match res {
+            Ok(stats) => {
+                let next = {
+                    let cur = d.group_stats.lock_ok().clone();
+                    let mut m = (*cur).clone();
+                    m.map.insert(group.clone(), stats);
+                    Arc::new(m)
+                };
+                if let Err(e) = next.save(&d.groupstats_cache_path()) {
+                    info!(target: "groups", "sample cache write failed: {e}");
+                }
+                *d.group_stats.lock_ok() = next;
+            }
+            Err(e) => info!(target: "groups", "sample of {group} failed: {e}"),
+        }
+        d.group_sampling.lock_ok().remove(&group);
+    });
+    true
+}
+
+/// Groups profiled per hourly tick by the background pass.
+///
+/// The content and freshness filters can only see profiled groups, so
+/// this governs how quickly those filters become useful. 150 an hour
+/// covers the ~2000 groups worth profiling inside a day or so, and costs
+/// a few minutes of one sequential connection per hour, only while idle.
+#[cfg(feature = "indexer")]
+pub(super) const SAMPLE_BUDGET_PER_TICK: usize = 150;
+
+/// Below this many profiles the install counts as unprofiled, and the
+/// first-run burst runs. An established install is far above it (the
+/// steady pass alone reaches ~2000 within a day), so it never bursts.
+#[cfg(feature = "indexer")]
+pub(super) const BURST_PROFILE_TARGET: usize = 500;
+
+/// Hard bound 1: samples the burst may start in one process lifetime.
+/// This is a bound on ATTEMPTS, not on successes, so a provider that
+/// fails or times out every sample is contacted a bounded number of
+/// times and then dropped back to the hourly pass. At the >=1s spacing
+/// below, this is also a floor of ~25 minutes on how long it can last.
+#[cfg(feature = "indexer")]
+pub(super) const BURST_MAX_SAMPLES: usize = 1_500;
+
+/// Hard bound 2: wall-clock window from daemon start. Covers the cases
+/// the sample bound cannot - no provider configured, no group catalogue
+/// yet, or a catalogue so small that the burst finishes it and would
+/// otherwise sit in its short tick forever.
+#[cfg(feature = "indexer")]
+pub(super) const BURST_WINDOW_SECS: u64 = 60 * 60;
+
+/// Seconds between burst ticks. Short, because a burst tick that finds
+/// nothing to do (the catalogue has not been fetched yet, which is the
+/// normal state for the first minute of a first run) should retry soon
+/// rather than an hour later.
+#[cfg(feature = "indexer")]
+pub(super) const BURST_TICK_SECS: u64 = 60;
+
+/// Should the fresh-install profile burst run?
+///
+/// All three conditions are load-bearing, and the two bounds exist
+/// because the first one alone would let a permanently-unprofilable
+/// install (bad credentials, a provider that rejects OVER) retry at the
+/// burst cadence forever, which is the ban-shaped traffic the pool's
+/// reconnect pacing was written to stop.
+#[cfg(feature = "indexer")]
+pub(super) fn should_burst_profiles(
+    profiled: usize,
+    burst_samples: usize,
+    since_start_secs: u64,
+) -> bool {
+    profiled < BURST_PROFILE_TARGET
+        && burst_samples < BURST_MAX_SAMPLES
+        && since_start_secs < BURST_WINDOW_SECS
+}
+
+#[cfg(all(test, feature = "indexer"))]
+mod group_burst_tests {
+    use super::{
+        BURST_MAX_SAMPLES, BURST_PROFILE_TARGET, BURST_WINDOW_SECS, should_burst_profiles,
+    };
+
+    /// The gate this whole feature turns on: a fresh install bursts, an
+    /// install that already has profiles never does. The second half is
+    /// the one that matters - bursting on an established install means
+    /// re-profiling groups that are already known, at a cadence the
+    /// provider has no reason to tolerate.
+    #[test]
+    fn bursts_only_while_the_profile_cache_is_empty() {
+        assert!(
+            should_burst_profiles(0, 0, 0),
+            "a brand new install must burst"
+        );
+        assert!(
+            should_burst_profiles(BURST_PROFILE_TARGET - 1, 0, 0),
+            "just under the target still counts as unprofiled"
+        );
+        assert!(
+            !should_burst_profiles(BURST_PROFILE_TARGET, 0, 0),
+            "at the target the steady hourly pass takes over"
+        );
+        assert!(
+            !should_burst_profiles(2_000, 0, 0),
+            "an established install must never burst"
+        );
+    }
+
+    /// Both bounds are hard: an install that stays empty because every
+    /// sample fails must still stop bursting. Without these it would
+    /// retry at the burst cadence for as long as the daemon runs.
+    #[test]
+    fn an_install_that_never_fills_still_stops_bursting() {
+        assert!(
+            !should_burst_profiles(0, BURST_MAX_SAMPLES, 0),
+            "the sample budget must stop a burst that fills nothing"
+        );
+        assert!(
+            !should_burst_profiles(0, 0, BURST_WINDOW_SECS),
+            "the wall-clock window must stop a burst that samples nothing"
+        );
+        assert!(
+            should_burst_profiles(0, BURST_MAX_SAMPLES - 1, BURST_WINDOW_SECS - 1),
+            "one short of either bound is still inside the window"
+        );
+    }
+}
+
+/// Fill in sampled profiles for the groups a user is most likely to look
+/// at: the ones they already scan, then the busiest binary groups.
+/// Returns how many samples this pass started.
+///
+/// Sequential. One connection at a time is gentle, but a provider account
+/// has a hard connection limit and the download pool is entitled to all
+/// of it, so the steady pass stands down entirely while anything is
+/// downloading rather than risking a rejected connection on the hot path.
+///
+/// `burst` lifts only the idle gate, and only for the fresh-install
+/// window (see `should_burst_profiles`). A brand new install whose first
+/// action is to queue something would otherwise profile nothing at all
+/// while it downloads, which is exactly when the user is first looking at
+/// the content and "still active" filters. It stays one sample at a time,
+/// and spaces them further apart while the pool is busy, so the extra
+/// load is a single connection opened every few seconds - not a new
+/// concurrency tier.
+#[cfg(feature = "indexer")]
+pub(super) async fn sample_top_groups(d: &Arc<Daemon>, config: &Path, burst: bool) -> usize {
+    if !burst && d.started_at.lock_ok().is_some() {
+        return 0; // downloading: the pool owns the connections
+    }
+    let Some(cat) = d.group_catalog.lock_ok().clone() else {
+        return 0;
+    };
+    let now = epoch_secs() as i64;
+    let subscribed: std::collections::HashSet<String> =
+        d.index_groups.lock_ok().iter().cloned().collect();
+
+    // Subscribed first, then busiest-binary. `posts` rides along because
+    // it is what turns a mean article size into an estimated group size.
+    let mut want: Vec<(String, u64)> = cat
+        .groups
+        .iter()
+        .filter(|g| subscribed.contains(&g.name))
+        .map(|g| (g.name.clone(), g.posts))
+        .collect();
+    let mut busiest: Vec<&crate::groups::CatGroup> = cat
+        .groups
+        .iter()
+        .filter(|g| crate::groups::is_binary(&g.name) && !subscribed.contains(&g.name))
+        .collect();
+    busiest.sort_by_key(|b| std::cmp::Reverse(b.posts));
+    want.extend(
+        busiest
+            .into_iter()
+            .take(2_000)
+            .map(|g| (g.name.clone(), g.posts)),
+    );
+
+    let mut done = 0usize;
+    for (name, posts) in want {
+        if done >= SAMPLE_BUDGET_PER_TICK {
+            break;
+        }
+        // Re-check per group: a download may have started mid-pass, and
+        // an already-fresh profile costs nothing to skip.
+        let downloading = d.started_at.lock_ok().is_some();
+        if downloading && !burst {
+            return done;
+        }
+        if !d.group_stats.lock_ok().is_stale(&name, now) {
+            continue;
+        }
+        if !kick_group_sample(d, config.to_path_buf(), name, posts) {
+            continue; // already in flight from an on-demand request
+        }
+        done += 1;
+        // Space them out. This is housekeeping, not a job - and when the
+        // pool is downloading through the same account, housekeeping that
+        // yields: five times the gap, so the burst is a trickle beside it.
+        let gap = if downloading { 5 } else { 1 };
+        tokio::time::sleep(std::time::Duration::from_secs(gap)).await;
+    }
+    if done > 0 {
+        info!(target: "groups", "sampling {done} group profiles in the background");
+    }
+    done
+}
+
+/// Turn the user's chosen interests into scanned groups, once.
+///
+/// Called when the setting changes, at startup, and whenever a
+/// catalogue fetch lands - because at first run there is no catalogue
+/// yet: the wizard runs before the daemon has ever spoken to the
+/// provider, so "sport" cannot be resolved to group names at the moment
+/// it is chosen. The choice is recorded either way and applied when the
+/// group list arrives.
+///
+/// Three properties this has to keep, all of them the point of the
+/// feature:
+///  * nothing is subscribed for an empty interest string - there is no
+///    fallback list;
+///  * a group the user removed by hand does not come back (the applied
+///    marker makes this one-shot per change);
+///  * only groups the provider actually carries are subscribed, so a
+///    preset can never point the scan loop at a name that will never
+///    answer.
+#[cfg(feature = "indexer")]
+pub(super) fn apply_interests(d: &Arc<Daemon>) {
+    let want = d.index_interests.lock_ok().clone();
+    if want == *d.index_interests_applied.lock_ok() {
+        return;
+    }
+    let keys = crate::interests::parse(&want);
+    let was = crate::interests::parse(&d.index_interests_applied.lock_ok().clone());
+    // Switching an interest OFF has to stop scanning what switching it on
+    // started, or the only way back would be to edit the group list by
+    // hand - and not having to know newsgroup names is the point.
+    let dropped_keys: Vec<String> = was.iter().filter(|k| !keys.contains(k)).cloned().collect();
+    let stale = crate::interests::groups(&dropped_keys);
+    let still_wanted = crate::interests::groups(&keys);
+    let stale: Vec<String> = stale
+        .into_iter()
+        .filter(|g| !still_wanted.iter().any(|w| w == g))
+        .collect();
+    if keys.is_empty() && stale.is_empty() {
+        // "Nothing" is a real answer, and recording it stops this from
+        // being reconsidered on every catalogue refresh.
+        if save_settings(
+            &d.settings_path,
+            &[("index_interests_applied", json!(&want))],
+        ) {
+            *d.index_interests_applied.lock_ok() = want;
+        }
+        return;
+    }
+    // Removal needs no catalogue - the names are known either way - but
+    // ADDING does, so a still-catalogue-less daemon takes the removal now
+    // and leaves the marker for the fetch to finish.
+    let cat = d.group_catalog.lock_ok().clone();
+    if cat.is_none() && !keys.is_empty() {
+        if !stale.is_empty() {
+            let have = d.index_groups.lock_ok().clone();
+            let owned = d.index_interest_groups.lock_ok().clone();
+            let (groups, next_owned, dropped, _) =
+                crate::interests::reconcile(&have, &owned, &stale, &[]);
+            if dropped > 0
+                && save_settings(
+                    &d.settings_path,
+                    &[
+                        ("index_groups", json!(&groups)),
+                        ("index_interest_groups", json!(&next_owned)),
+                    ],
+                )
+            {
+                *d.index_groups.lock_ok() = groups;
+                *d.index_interest_groups.lock_ok() = next_owned;
+            }
+        }
+        return;
+    }
+    let resolved = match &cat {
+        Some(c) => {
+            let carried: std::collections::HashSet<&str> =
+                c.groups.iter().map(|g| g.name.as_str()).collect();
+            crate::interests::resolve(&keys, |g| carried.contains(g))
+        }
+        None => Vec::new(),
+    };
+    let have = d.index_groups.lock_ok().clone();
+    let owned = d.index_interest_groups.lock_ok().clone();
+    let (groups, next_owned, dropped, added) =
+        crate::interests::reconcile(&have, &owned, &stale, &resolved);
+    // Groups, provenance and completion marker are one persisted state
+    // transition. Writing the marker first used to make a crash or second
+    // write failure suppress this choice forever on restart.
+    if !save_settings(
+        &d.settings_path,
+        &[
+            ("index_groups", json!(&groups)),
+            ("index_interest_groups", json!(&next_owned)),
+            ("index_interests_applied", json!(&want)),
+        ],
+    ) {
+        return;
+    }
+    *d.index_groups.lock_ok() = groups;
+    *d.index_interest_groups.lock_ok() = next_owned;
+    *d.index_interests_applied.lock_ok() = want.clone();
+    if added == 0 && dropped == 0 {
+        return;
+    }
+    info!(
+        target: "groups",
+        "interests ({}): {added} group(s) added, {dropped} removed",
+        if want.is_empty() { "none" } else { &want },
+    );
+    if added > 0 {
+        d.scan_now.notify_one();
+    }
+}
+
+/// Start a background catalogue fetch unless one is already running
+/// (single-flight). Returns whether THIS call started it.
+#[cfg(feature = "indexer")]
+pub(super) fn kick_group_fetch(d: &Arc<Daemon>, config: PathBuf) -> bool {
+    if d.group_fetching.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let d = d.clone();
+    tokio::spawn(async move {
+        let prev = d.group_catalog.lock_ok().clone();
+        let isc = d.group_desc_isc.load(Ordering::Relaxed);
+        match fetch_group_catalog(&config, prev.as_deref(), isc).await {
+            Ok(cat) => {
+                if let Err(e) = cat.save(&d.groups_cache_path()) {
+                    info!(target: "groups", "catalogue cache write failed: {e}");
+                }
+                let new_count = cat
+                    .groups
+                    .iter()
+                    .filter(|g| g.first_seen == cat.fetched_at)
+                    .count();
+                info!(
+                    target: "groups",
+                    "catalogue fetched: {} groups ({} with descriptions, {} newly created)",
+                    cat.groups.len(),
+                    cat.groups.iter().filter(|g| !g.desc.is_empty()).count(),
+                    new_count,
+                );
+                *d.group_fetch_err.lock_ok() = None;
+                *d.group_catalog.lock_ok() = Some(Arc::new(cat));
+                // First run orders these the other way round: the user
+                // picks interests in the wizard, before this daemon has
+                // ever seen a group list. This is where that choice
+                // becomes a scan list.
+                apply_interests(&d);
+            }
+            Err(e) => {
+                info!(target: "groups", "catalogue fetch failed: {e}");
+                *d.group_fetch_err.lock_ok() = Some(e);
+            }
+        }
+        d.group_fetching.store(false, Ordering::SeqCst);
+    });
+    true
+}
+
+/// The newsgroup every diagnostic probe (system bench, connection ladder,
+/// pool burst, diversity sweep) selects to find sample articles with: big,
+/// busy, and carried by every provider.
+///
+/// Deliberately a constant and NOT `ServerConfig.group`. That field is a
+/// MIRROR LABEL - servers sharing it are backbone twins, and the pool uses
+/// it to dedup 430s across them - and the dashboard collects it as freeform
+/// text ("Backbone group"). Sent as an NNTP GROUP argument it answers 411,
+/// which the probes reported as a 0.00 Gbps network or a failed sweep.
+pub(super) const PROBE_GROUP: &str = "alt.binaries.boneless";
+
+/// One full system measurement (compute + disk + live network probe on
+/// the first configured server). Shared by the mode=sysbench handler and
+/// the scheduled-benchmark loop - both run on plain threads, hence the
+/// runtime handle for the async probe. A failed probe must SAY SO -
+/// collapsing errors to 0.0 Gbps used to yield "expected max 0.00,
+/// network is your limit", which is worse than useless.
+pub(super) fn measure_system(
+    d: &Arc<Daemon>,
+    cfg_path: &std::path::Path,
+    rt: &tokio::runtime::Handle,
+) -> std::result::Result<nzbkit::sysbench::SystemReport, String> {
+    let compute = nzbkit::sysbench::compute(128);
+    let disk = nzbkit::sysbench::disk_write(&d.out_dir(), 512).unwrap_or(0.0);
+    // Every enabled server, at the connection counts downloads actually
+    // use - NOT a fixed 8, and NOT just the first server.
+    //
+    // A single Usenet connection is worth tens of Mbps, so eight of them
+    // measure a few hundred Mbps whatever the line is capable of (issue
+    // #12). And one server's figure reads far below what several
+    // accounts deliver together - the reporter's five providers do 3x
+    // what their first one shows alone (issue #12, round 2). SABnzbd's
+    // own test pulls from a CDN over HTTP and measures the line, not the
+    // providers; ours is the number that predicts a real download.
+    let servers: Vec<_> = nzbkit::config::Config::load(cfg_path)
+        .map(|c| c.servers.into_iter().filter(|s| s.enabled).collect())
+        .unwrap_or_default();
+    if servers.is_empty() {
+        return Err("no servers configured".into());
+    }
+    let conns_total: usize = servers
+        .iter()
+        .map(|s| (s.connections as usize).clamp(1, 100))
+        .sum::<usize>()
+        .min(200);
+    // The card names what the figure came from; keep it locale-neutral
+    // (the note around it is translated, this string is substituted in).
+    let hosts = {
+        let names: Vec<&str> = servers.iter().map(|s| s.host.as_str()).take(3).collect();
+        let mut h = names.join(", ");
+        if servers.len() > 3 {
+            h.push_str(", …");
+        }
+        h
+    };
+    let probed = (hosts.clone(), conns_total);
+    // Hard cap: a black-holed connect must not wedge the caller
+    // (it did, via the Run button, on a filtered uplink).
+    let net = rt.block_on(async {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            nzbkit::sysbench::network_probe_multi(&servers, PROBE_GROUP, 8),
+        )
+        .await
+        {
+            Err(_) => Err(format!(
+                "network probe timed out ({hosts}: slow link or filtered port?)"
+            )),
+            Ok(Err(e)) => Err(format!("network probe ({hosts}): {e}")),
+            Ok(Ok((g, per_server))) => {
+                let billed: Vec<(String, u64)> = servers
+                    .iter()
+                    .zip(&per_server)
+                    .map(|(s, &b)| (s.host.clone(), b))
+                    .collect();
+                d.add_usage(&billed);
+                Ok(g)
+            }
+        }
+    })?;
+    let mut v = nzbkit::sysbench::verdict(net, &compute, disk);
+    (v.network_host, v.network_conns) = probed;
+    Ok(v)
+}

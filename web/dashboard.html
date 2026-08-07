@@ -1723,6 +1723,11 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <div class="pathrow"><input class="txt" id="s_password_file" onchange="setCfg('password_file',this.value)"><button class="mini" onclick="browseDir('password_file','file')" data-i18n-title="btn.browsefile.title" title="Browse for a script file" data-i18n="btn.browse">Browse…</button><button class="mini" onclick="openDir('password_file')" data-i18n-title="btn.openfolder.title" title="Open this folder" aria-label="Open this folder">📂</button><span class="dim nowrap" id="s_pwfile_count" style="align-self:center"></span></div></div>
   <div class="row"><label data-i18n="set.watchdir.trash">Deleted files go to the Trash<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.trash.hint">cleanup moves files to the system Trash or Recycle Bin instead of deleting them, so a wrong guess about what was junk can be undone. If the Trash ever refuses a file, it is left where it is rather than deleted outright. On by default on macOS and Windows. Off on Linux, where there is usually no desktop Trash to empty: with it on, files go to a hidden .Trash folder on the same disk as your downloads, and that space stays used until you empty it yourself</span></label>
     <input type="checkbox" id="s_delete_to_trash" onchange="setCfg('delete_to_trash',this.checked?1:0)"></div>
+  <div class="row"><label data-i18n="set.watchdir.cleanupmode">Leftover files after a download<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.cleanupmode.hint">what happens to the leftovers cleanup removes once a download finishes: spent archive parts, recovery files, samples and other junk. Following the setting above keeps one rule for everything; always Trash keeps leftovers recoverable even when your own deletes are permanent; always permanent removes them outright, which keeps a busy Trash from filling up with archive parts. Files you delete yourself always follow the setting above</span></label>
+    <select class="sel" id="s_cleanup_delete_mode" style="max-width:340px" onchange="setCfg('cleanup_delete_mode',this.value)">
+      <option value="follow" data-i18n="set.watchdir.cleanupmode.follow">same as deleted files above</option>
+      <option value="trash" data-i18n="set.watchdir.cleanupmode.trash">always go to the Trash or Recycle Bin</option>
+      <option value="delete" data-i18n="set.watchdir.cleanupmode.delete">always deleted permanently</option></select></div>
   <div class="row" data-adv="1"><label data-i18n="set.watchdir.extunrar">Unpack with external unrar<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.extunrar.hint">use the unrar program installed on this machine instead of nzbfast's built-in extractor. An escape hatch for archives that fail to unpack: the built-in path is faster on every shape we have benchmarked, so leave this off unless one does. Hash-named obfuscated posts always use the built-in path, whose renaming unrar cannot follow. Needs unrar next to the nzbfast binary or on the system PATH</span></label>
     <input type="checkbox" id="s_prefer_external_unrar" onchange="setCfg('prefer_external_unrar',this.checked?1:0)"></div>
   <div class="row"><label data-i18n="set.watchdir.eatvols">When the unpack will not fit<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.eatvols.hint">some archives cannot be unpacked as they arrive: every part is written to disk first and opened afterwards, so the disk holds the parts and the unpacked files at the same time. A password-protected set needs a third copy, because unlocking writes the plain copy beside the encrypted one before swapping them. That is why a download can fail at 96% on a disk that had room for it. With this on, each archive part is deleted outright the moment the unpacker has read the last of it, so the peak is about one part plus the largest file inside. Deleted for real, not moved to the Trash: the point is space back this second. Only ever on a download that has verified. If it stops halfway, the download is fetched again, which is exactly what already happens when the disk fills, so this can only make the good case cheaper</span></label>
@@ -2706,6 +2711,12 @@ const N = 180;                        // minimum VISIBLE samples (~3 min)
 const NMAX = 3600, PXS = 1200/(N-1);
 function visN(w){ return Math.max(N, Math.min(NMAX, Math.floor(w/PXS)+1)); }
 const speedHist = [];                 // MB/s aggregate
+// §125: the link's learned peak (MB/s) - the throughput chart's 100%
+// anchor, served on the queue poll. 0 until the daemon knows one; the
+// chart then falls back to scale-to-window. src is "measured" (best
+// sustained rate observed) or "line" (the Settings line speed, seeding
+// until measurement settles it).
+let linkPeak = 0, linkPeakSrc = '';
 // Wall-clock ms per throughput sample, kept in lockstep with speedHist.
 // The chart's x axis is an INDEX, and pool events arrive stamped with a
 // moment, so without this there is no way to put a marker where the dip
@@ -3243,7 +3254,7 @@ function chartDetail(cv){
 // left by a fraction of a step - the rAF loop feeds it wall-clock time
 // since the last sample, so the chart scrolls continuously instead of
 // jumping once a second. Returns the mapping for overlay drawing.
-function drawArea(cv, data, color, frac=0){
+function drawArea(cv, data, color, frac=0, floorMax=0){
   const {ctx,w,h}=fit(cv); ctx.clearRect(0,0,w,h);
   const n=data.length; if(n<2) return null;
   const vis=visN(w), s0=Math.max(0,n-vis);        // draw the last `vis` samples
@@ -3252,7 +3263,11 @@ function drawArea(cv, data, color, frac=0){
   // new scale once a second reads as judder against the smooth x-glide.
   // VU-meter rule: scale UP instantly (never clip an incoming spike),
   // decay DOWN a little per frame (state rides on the canvas element).
-  const target=Math.max(...data.slice(s0),0.001);
+  // `floorMax` (§125) pins the scale's lower bound: with a known link
+  // peak the chart is anchored to it, so a blip past the peak pokes
+  // above the 100% rule and then the scale settles back to the anchor
+  // instead of the whole history breathing with the window max.
+  const target=Math.max(...data.slice(s0),floorMax,0.001);
   let max=target;
   if(!REDUCED){
     const d0=cv._dispMax;
@@ -3274,20 +3289,33 @@ function drawArea(cv, data, color, frac=0){
 }
 // Throughput chart wrapper: area + moving average + high/low watermarks.
 const emaHist=[];
+// Percent of the link's learned peak, for labels. '' when unanchored.
+function pctOfPeak(mbps){
+  return linkPeak>0 ? Math.round(mbps/linkPeak*100)+'%' : '';
+}
 function drawSpeed(frac=0){
   const cv=document.getElementById('speedChart');
   const det=chartDetail(cv);
-  const m=drawArea(cv, speedHist, css('--acc'), frac);
+  // §125: with a known link peak the chart is anchored - the peak is
+  // 100%, drawn as a rule with ~4% of air above it so the rule reads as
+  // a line, not the ceiling. Working well is a band riding the rule;
+  // a blip past it pokes above and the scale settles back. Without an
+  // anchor the old scale-to-window behaviour stands.
+  const peak=linkPeak>0?linkPeak:0;
+  const m=drawArea(cv, speedHist, css('--acc'), frac, peak*1.04);
   if(!m||speedHist.length<3) return;
   const {ctx,x,y,w,s0}=m;
   ctx.font='9px -apple-system,system-ui,sans-serif';
   if(det==='summary'){
     // Summary form: the trace, plus the two figures the watermarks would
     // have carried. Two dashed rules and their labels need ~14px of clear
-    // run each and turn to mush at this height.
+    // run each and turn to mush at this height. With an anchor, "% of
+    // link" says more than the window peak the label used to carry.
+    const last=speedHist[speedHist.length-1]||0;
     ctx.fillStyle=css('--dim'); ctx.textAlign='right';
-    ctx.fillText(`${fmtRate(speedHist[speedHist.length-1]||0)} · ${t('chart.peak','peak')} `
-      +fmtRate(Math.max(...speedHist.slice(s0))), w-4, 10);
+    ctx.fillText(peak
+      ? `${fmtRate(last)} · ${pctOfPeak(last)}`
+      : `${fmtRate(last)} · ${t('chart.peak','peak')} `+fmtRate(Math.max(...speedHist.slice(s0))), w-4, 10);
     ctx.textAlign='left';
     // The markers still draw at this height - they are the part of the
     // chart that explains the line, and a condensed hero card is not a
@@ -3296,13 +3324,16 @@ function drawSpeed(frac=0){
     return;
   }
   if(det==='rich'){
-    // Earned by height: a real y-axis behind the trace.
-    const max=cv._dispMax||Math.max(...speedHist.slice(s0),0.001);
+    // Earned by height: a real y-axis behind the trace. Anchored, the
+    // gridlines sit at fixed fractions of the PEAK, so they hold still
+    // while the line moves - the axis is the link, not the window.
+    const max=peak?peak:(cv._dispMax||Math.max(...speedHist.slice(s0),0.001));
     ctx.strokeStyle=css('--line'); ctx.lineWidth=1; ctx.fillStyle=css('--dim');
     [.25,.5,.75].forEach(f=>{
       const gy=y(max*f);
+      const lbl=peak ? `${Math.round(f*100)}% · ${fmtRate(max*f)}` : fmtRate(max*f);
       ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(w,gy); ctx.stroke();
-      ctx.fillText(fmtRate(max*f), w-4-ctx.measureText(fmtRate(max*f)).width, gy-2);
+      ctx.fillText(lbl, w-4-ctx.measureText(lbl).width, gy-2);
     });
   }
   // Moving average (EMA) as a calmer read over the spiky series.
@@ -3310,17 +3341,32 @@ function drawSpeed(frac=0){
   for(let i=s0;i<emaHist.length;i++) i>s0?ctx.lineTo(x(i),y(emaHist[i])):ctx.moveTo(x(i),y(emaHist[i]));
   ctx.globalAlpha=.4; ctx.strokeStyle=css('--fg'); ctx.lineWidth=1.2; ctx.stroke();
   ctx.globalAlpha=1;
-  // Visible-window high/low watermarks, subtle and labeled.
-  const hi=Math.max(...speedHist.slice(s0)), lo=Math.min(...speedHist.slice(s0));
-  ctx.setLineDash([3,5]); ctx.strokeStyle=css('--dim'); ctx.lineWidth=1;
-  ctx.font='9px -apple-system,system-ui,sans-serif'; ctx.fillStyle=css('--dim');
-  ctx.beginPath(); ctx.moveTo(0,y(hi)); ctx.lineTo(w,y(hi)); ctx.stroke();
-  ctx.fillText(`${t('chart.high','high')} ${fmtRate(hi)}`, 4, y(hi)+10);
-  if(hi-lo>0.5){
-    ctx.beginPath(); ctx.moveTo(0,y(lo)); ctx.lineTo(w,y(lo)); ctx.stroke();
-    ctx.fillText(`${t('chart.low','low')} ${fmtRate(lo)}`, 4, y(lo)-3);
+  ctx.font='9px -apple-system,system-ui,sans-serif';
+  if(peak){
+    // The 100% rule: what this link has actually sustained. Accent at
+    // half strength - it is the reference the whole chart answers to,
+    // but the live trace stays the loudest thing on the canvas.
+    const py=y(peak);
+    ctx.setLineDash([6,4]); ctx.strokeStyle=css('--acc'); ctx.globalAlpha=.55; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(0,py); ctx.lineTo(w,py); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha=1;
+    ctx.fillStyle=css('--dim');
+    // Reuses the Settings label's catalogue key: same concept, no new
+    // string for the 27 catalogues to chase.
+    ctx.fillText(`100% · ${fmtRate(peak)}`+(linkPeakSrc==='line'?' · '+t('set.speed.line','Line speed'):''), 4, py+10);
+  }else{
+    // Unanchored: the old visible-window high/low watermarks.
+    const hi=Math.max(...speedHist.slice(s0)), lo=Math.min(...speedHist.slice(s0));
+    ctx.setLineDash([3,5]); ctx.strokeStyle=css('--dim'); ctx.lineWidth=1;
+    ctx.fillStyle=css('--dim');
+    ctx.beginPath(); ctx.moveTo(0,y(hi)); ctx.lineTo(w,y(hi)); ctx.stroke();
+    ctx.fillText(`${t('chart.high','high')} ${fmtRate(hi)}`, 4, y(hi)+10);
+    if(hi-lo>0.5){
+      ctx.beginPath(); ctx.moveTo(0,y(lo)); ctx.lineTo(w,y(lo)); ctx.stroke();
+      ctx.fillText(`${t('chart.low','low')} ${fmtRate(lo)}`, 4, y(lo)-3);
+    }
+    ctx.setLineDash([]);
   }
-  ctx.setLineDash([]);
   drawEventMarks(m);
 }
 // What each kind of event looks like on the graph. Colour now names the
@@ -3854,6 +3900,7 @@ async function tick(){
         }
       }
     }
+    linkPeak=(+q.link_peak||0)/1e6; linkPeakSrc=q.link_peak_src||'';
     let mbps=(parseFloat(q.kbpersec)||0)/1000;
     // Guard against the daemon's end-of-job rate spike (kbpersec computed
     // over ~zero elapsed): anything past ~40 Gbps isn't a real line, so
@@ -5107,6 +5154,9 @@ let searchResults=[];
 async function doSearch(btn){ await busy(btn,t('busy.searching','Searching…'), async()=>{
   const q=document.getElementById('q').value;
   const j=await api('index_search',`&q=${encodeURIComponent(q)}`);
+  // A busy index is not an empty answer: keep whatever is on screen,
+  // toast the transient state, and let the next search try again.
+  if(j && j.status===false){ toast(tErr(j.error)||j.error||t('err.rejected','rejected'),true); return; }
   searchResults=j.results||[];
   renderSearch();
 }); }
@@ -6997,6 +7047,7 @@ async function gbAddMatching(btn){
   await busy(btn,t('busy.saving','Saving…'), async()=>{
     const j=await api('groups_add_matching',gbQS());
     if(!j.status){ toast(tErr(j.error)||j.error||t('err.rejected','rejected'),true); return; }
+    if(j.warning) toast(j.warning,true);
     toast(j.capped
       ? t('grp.addall.capped','Added {n} groups (capped; narrow the search and repeat for the rest).',{n:gbNum(j.added)})
       : t('grp.addall.done','Added {n} groups.',{n:gbNum(j.added)}));
@@ -7768,7 +7819,9 @@ function eventsNearSample(i){
     if(i<0||i>=n){ tip.style.opacity=0; return; }
     const v=speedHist[i];
     const ago=(n-1-i)*PERIOD;
-    tip.innerHTML=`${fmtRate(v)}<br><span class="dim">${ago===0?t('chart.now','now'):t('chart.ago','{n}s ago',{n:ago})}</span>`
+    // §125: with a link-peak anchor, name the sample as % of it too.
+    const pk=linkPeak>0?` · ${pctOfPeak(v)}`:'';
+    tip.innerHTML=`${fmtRate(v)}${pk}<br><span class="dim">${ago===0?t('chart.now','now'):t('chart.ago','{n}s ago',{n:ago})}</span>`
       +eventsNearSample(i);
     tip.style.left=(e.clientX+12)+'px'; tip.style.top=(e.clientY-8)+'px'; tip.style.opacity=1;
   });
@@ -8841,7 +8894,15 @@ async function setCfg(name, value){
     toast(t('toast.savedNotDurable','“{n}” is live now, but it could not be written to disk - it reverts when nzbfast restarts.',{n:name}), true);
   } else {
     durNoticeSaved(name);
-    toast(j.live===false?t('toast.savedRestart','Saved: applies after restart.'):t('toast.saved','Saved.'));
+    // #18: the daemon accepted the save but one of the rules carries a
+    // pattern that will not compile. The warning arrives composed, with
+    // the rule's name and the engine's own error - the daemon is the
+    // only party that knows regex_lite's opinion, so it is not
+    // re-derived here. Shown as the toast for THIS save, in place of a
+    // "Saved." the broken rule would hide behind; the amber row mark
+    // appears with the loadSettings() below.
+    if(j.warning) toast(t('toast.savedWarn','Saved, but a rule needs a look - {w}',{w:j.warning}), true);
+    else toast(j.live===false?t('toast.savedRestart','Saved: applies after restart.'):t('toast.saved','Saved.'));
   }
   if(name!=='apikey'&&name!=='nzbkey') loadSettings();
   return true;
@@ -9080,6 +9141,7 @@ async function loadSettings(){
   // Linux), and get_config always reports the live value.
   const dtt=document.getElementById('s_delete_to_trash');
   if(document.activeElement!==dtt) dtt.checked = c.delete_to_trash===true||c.delete_to_trash===1;
+  put('s_cleanup_delete_mode', c.cleanup_delete_mode||'follow');
   put('s_failure_link', c.failure_link||'off');
   put('s_auto_retry_mins', c.auto_retry_mins??20);
   {
@@ -9930,6 +9992,7 @@ async function importServers(btn){ await busy(btn,t('busy.scanning','Scanning…
         {kind:c.kind==='sabnzbd'?'SABnzbd':'NZBGet', path:c.path, n:c.servers.length, names})+catLine)) continue;
     const r=await api('import_apply',`&value=${encodeURIComponent(c.path)}&value2=${c.kind}`);
     if(r.error){ toast(tErr(r.error), true); continue; }
+    if(r.warning) toast(r.warning,true);
     imported+=r.added||0;
     toast(t('toast.imported','Imported {n} server(s){skipped}.',
       {n:r.added, skipped:r.skipped?' '+t('toast.imported.skipped','({n} already present)',{n:r.skipped}):''}));

@@ -73,6 +73,7 @@ struct Plan {
 pub const PROFILES: &[&str] = &[
     "clean",
     "flap",
+    "flap-dial",
     "deadair",
     "deadair-dial",
     "brownout",
@@ -80,8 +81,21 @@ pub const PROFILES: &[&str] = &[
     "jitter-dial",
     "corrupt",
     "corruptstorm",
+    "desync",
     "splitbrain",
     "slowconn",
+    "bodyerror",
+    "authcap",
+    "authbad",
+    "capghost",
+    "outage",
+    "cgnat",
+    "handover",
+    "slowstart",
+    "truncate",
+    "deadpost",
+    "mutequit",
+    "mutegreeting",
 ];
 
 /// The `-dial` profile variants' per-connection greeting delay (TODO
@@ -252,24 +266,37 @@ fn plan(
         },
         // The eweka shape: 2 sessions win, the rest bounce off a 502
         // cap refusal, and each winner dies after one body at a crawl.
-        // Rig ratio 60k:150k burned:steady = 0.4x healthy rate.
-        "flap" => Plan {
-            chaos: Chaos {
-                accept_cap: Some(2),
-                drop_after: 1,
-                throttle: Throttle {
-                    per_conn_bps: (per_conn_bps * 2) / 5,
-                    line_bps,
+        // Rig ratio 60k:150k burned:steady = 0.4x healthy rate. The
+        // -dial variant makes every (re)dial pay the 250 ms greeting,
+        // so redial-heavy flap strategies price honestly on loopback.
+        "flap" | "flap-dial" => {
+            let dial = profile.ends_with("-dial");
+            Plan {
+                chaos: Chaos {
+                    accept_cap: Some(2),
+                    drop_after: 1,
+                    greet_delay_ms: if dial { DIAL_COST_MS } else { 0 },
+                    throttle: Throttle {
+                        per_conn_bps: (per_conn_bps * 2) / 5,
+                        line_bps,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            },
-            twin: Some(clean_twin),
-            onset_note: "flap: accept_cap=2 + drop_after=1 on the faulty server, \
-                         structural from t0; clean twin on port2"
-                .into(),
-            onset_after_bodies: None,
-        },
+                twin: Some(clean_twin),
+                onset_note: format!(
+                    "flap{}: accept_cap=2 + drop_after=1 on the faulty server, \
+                     structural from t0; clean twin on port2{}",
+                    if dial { "-dial" } else { "" },
+                    if dial {
+                        format!("; every new connection pays a {DIAL_COST_MS} ms greeting delay")
+                    } else {
+                        String::new()
+                    }
+                ),
+                onset_after_bodies: None,
+            }
+        }
         "deadair" | "deadair-dial" => {
             let dial = profile.ends_with("-dial");
             let count = fault_count.unwrap_or(12);
@@ -386,6 +413,32 @@ fn plan(
                 onset_after_bodies: None,
             }
         }
+        // Desync: every Nth BODY/ARTICLE response (server-wide arrival
+        // order) is silently withheld while the request is consumed,
+        // so every later response on that connection answers one
+        // pipeline slot ahead of what positional attribution assumes.
+        // A client that discards the echoed message-id files every
+        // subsequent body on that connection under the wrong article
+        // and "completes" corrupt; the echoed-id check must cut the
+        // session and requeue instead. Single server: the recovery
+        // must come from the same host.
+        "desync" => {
+            let every = fault_count.map(|c| c as u64).unwrap_or(60).max(2);
+            Plan {
+                chaos: Chaos {
+                    skip_nth_response: every,
+                    ..base
+                },
+                twin: None,
+                onset_note: format!(
+                    "desync: every {every}th BODY/ARTICLE response silently \
+                     withheld (request consumed, connection kept), structural \
+                     from t0 - later responses on that connection shift one \
+                     slot; only an echoed-id check can attribute them honestly"
+                ),
+                onset_after_bodies: None,
+            }
+        }
         // Split-brain: the faulty server's storage backend is
         // mismatched - a request for one id is answered with ANOTHER
         // article's fully valid bytes, in bidirectional pairs. The yEnc
@@ -432,6 +485,211 @@ fn plan(
                  every other (re)connect is healthy",
                 (per_conn_bps / 40).max(10_000)
             ),
+            onset_after_bodies: None,
+        },
+        // Broken account / 502 storm: connect and AUTH succeed, every
+        // BODY answers "502 byte limit exceeded", forever. The clean
+        // twin carries the group; the race prices per-server circuit
+        // breaking (a client without one grinds the broken account).
+        "bodyerror" => Plan {
+            chaos: Chaos {
+                body_error: Some(u64::MAX),
+                ..base
+            },
+            twin: Some(clean_twin),
+            onset_note: "bodyerror: every BODY on the faulty server answers 502 \
+                         (AUTH fine), forever, structural from t0; clean twin on \
+                         port2"
+                .into(),
+            onset_after_bodies: None,
+        },
+        // Capacity refusal vs bad credential: AUTH on the faulty
+        // server always fails with the REAL capacity wording on reply
+        // code 481 - the same code a wrong password uses. A client
+        // that reads it as a bad credential disables the server; one
+        // that reads it as capacity paces and retries. Either way the
+        // clean twin carries the job; the spread is wall + dial count.
+        "authcap" => Plan {
+            chaos: Chaos {
+                auth_rejected: true,
+                auth_refusal_text: Some("481 max simultaneous IP addresses reached".into()),
+                ..base
+            },
+            twin: Some(clean_twin),
+            onset_note: "authcap: every AUTH on the faulty server refused with \
+                         '481 max simultaneous IP addresses reached', structural \
+                         from t0; clean twin on port2"
+                .into(),
+            onset_after_bodies: None,
+        },
+        // authcap's contrast arm: the SAME 481 code with bad-credential
+        // wording. A wording-aware client keeps pacing on authcap (the
+        // capacity refusal clears when sessions close) but STOPS
+        // dialing here (a wrong password never fixes itself); a client
+        // that only reads the code shows identical dial counts on both.
+        "authbad" => Plan {
+            chaos: Chaos {
+                auth_rejected: true,
+                auth_refusal_text: Some("481 authentication failed".into()),
+                ..base
+            },
+            twin: Some(clean_twin),
+            onset_note: "authbad: every AUTH on the faulty server refused with \
+                         '481 authentication failed', structural from t0; clean \
+                         twin on port2"
+                .into(),
+            onset_after_bodies: None,
+        },
+        // CGNAT eviction: every connection's NAT entry dies after 25
+        // bodies - permanent dead air, no close, no RST. A reconnect
+        // gets a fresh entry. Single server: the only recovery is
+        // noticing the silence and redialing.
+        // Issue #16's restart shape: the provider still counts a dead
+        // process's sessions, so for the first 45 s EVERY dial bounces
+        // off the capacity refusal - then the lease expires and the
+        // account works normally. A resilient client keeps paced
+        // redials alive through the window and eases back in; the
+        // reported bug is stalling at 0 MB/s instead.
+        "capghost" => Plan {
+            chaos: Chaos {
+                cap_ghost_ms: 45_000,
+                ..base
+            },
+            twin: None,
+            onset_note: "capghost: every dial refused with the 502 capacity \
+                         text for the first 45000 ms (ghost sessions hold the \
+                         cap), normal accepts after"
+                .into(),
+            onset_after_bodies: None,
+        },
+        // Hard outage: for the first 45 s every accepted connection is
+        // closed with no greeting and no refusal text - the wifi-drop /
+        // VPN-reconnect / router-reboot shape. Unlike capghost there is
+        // nothing to classify: the dial simply fails. A resilient
+        // client parks its fleet behind one paced prober and comes
+        // back at full width when the window clears; the failure mode
+        // is retiring every worker in ~15-30 s and failing the job.
+        "outage" => Plan {
+            chaos: Chaos {
+                refuse_connect_ms: 45_000,
+                ..base
+            },
+            twin: None,
+            onset_note: "outage: every accepted connection closed with no \
+                         greeting for the first 45000 ms (hard connect \
+                         failure), normal accepts after"
+                .into(),
+            onset_after_bodies: None,
+        },
+        "cgnat" => Plan {
+            chaos: Chaos {
+                mute_after_bodies: 25,
+                ..base
+            },
+            twin: None,
+            onset_note: "cgnat: each connection goes permanently silent after 25 \
+                         bodies (no close); a reconnect gets a fresh NAT entry"
+                .into(),
+            onset_after_bodies: None,
+        },
+        // Satellite handover: three staggered WANs, each frozen 4 s of
+        // every 12 s cycle (connection conn_no % 3 belongs to a WAN).
+        // Brief, recovering dead air - killing sessions here is
+        // mostly wrong, waiting is mostly right.
+        "handover" => Plan {
+            chaos: Chaos {
+                handover: Some((12_000, 4_000, 3)),
+                ..base
+            },
+            twin: None,
+            onset_note: "handover: 3 staggered WANs, each frozen 4000 ms per \
+                         12000 ms cycle, structural from t0"
+                .into(),
+            onset_after_bodies: None,
+        },
+        // Slow-start trickle: every fresh connection crawls at 50 KB/s
+        // for its first 3 s, then runs at the healthy rate. The shape
+        // where a reconnect-happy strategy pays and a parked spare
+        // rides the window out idle.
+        "slowstart" => Plan {
+            chaos: Chaos {
+                slow_start: Some((3_000, 50_000)),
+                ..base
+            },
+            twin: None,
+            onset_note: "slowstart: every new connection paced at 50000 B/s for \
+                         its first 3000 ms, healthy after"
+                .into(),
+            onset_after_bodies: None,
+        },
+        // Truncated bodies: a spread of articles are cut mid-payload
+        // and the connection dropped, EVERY request (a damaged spool
+        // entry). Clean twin holds good copies - partial-write and
+        // requeue correctness, and whether the retry goes elsewhere.
+        "truncate" => {
+            let count = fault_count.unwrap_or(12);
+            let truncate: HashSet<String> = spread_positions(n, count, seed)
+                .into_iter()
+                .map(|i| all_ids[i].clone())
+                .collect();
+            let note = format!(
+                "truncate: {} articles cut mid-payload with the connection \
+                 dropped, every request, structural from t0; clean twin on \
+                 port2 holds good copies",
+                truncate.len()
+            );
+            Plan {
+                chaos: Chaos { truncate, ..base },
+                twin: Some(clean_twin),
+                onset_note: note,
+                onset_after_bodies: None,
+            }
+        }
+        // Wholly-dead post: EVERY article 430s, each refusal costing a
+        // real round trip. Nobody can complete - the metric is wall to
+        // TERMINAL (the gate reads DNF by design; a fast honest
+        // failure beats a slow one).
+        "deadpost" => Plan {
+            chaos: Chaos {
+                missing: all_ids.iter().cloned().collect(),
+                missing_delay_ms: 70,
+                ..base
+            },
+            twin: None,
+            onset_note: "deadpost: every article answers 430 after a 70 ms round \
+                         trip; completion is impossible - the wall to a TERMINAL \
+                         failed state is the measurement"
+                .into(),
+            onset_after_bodies: None,
+        },
+        // Exit-path wedge check: a healthy server that never answers
+        // QUIT (TCP ack, no goodbye). The job completes; the question
+        // is whether the client's exit waits on the goodbye.
+        "mutequit" => Plan {
+            chaos: Chaos {
+                mute_quit: true,
+                ..base
+            },
+            twin: None,
+            onset_note: "mutequit: healthy server that never answers QUIT; the \
+                         measurement is whether completion pays an exit-path hang"
+                .into(),
+            onset_after_bodies: None,
+        },
+        // Connect-path wedge check: the faulty server accepts TCP but
+        // never greets; the clean twin carries the job. Prices how
+        // much a mute frontend costs a client that keeps a session
+        // slot parked in connect().
+        "mutegreeting" => Plan {
+            chaos: Chaos {
+                mute_greeting: true,
+                ..base
+            },
+            twin: Some(clean_twin),
+            onset_note: "mutegreeting: faulty server accepts connections but \
+                         never sends the greeting, structural from t0; clean \
+                         twin on port2"
+                .into(),
             onset_after_bodies: None,
         },
         other => bail!("unknown profile {other:?}; one of {}", PROFILES.join("|")),

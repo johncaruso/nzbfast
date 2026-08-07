@@ -7,7 +7,7 @@
 
 use crate::*;
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Plaintext-once (`D`) journal record parked until its seam bytes are
 /// on disk: (slot, article id, name, size, frags).
@@ -33,6 +33,7 @@ pub(super) struct DecodeCtx {
     pub(super) transport_failed: Arc<AtomicU64>,
     pub(super) transport_sample: Arc<std::sync::Mutex<Option<String>>>,
     pub(super) decode_error_sample: Arc<std::sync::Mutex<Option<String>>>,
+    pub(super) disk_full_sample: Arc<std::sync::Mutex<Option<String>>>,
     pub(super) verifier: Arc<nzbkit::live::LiveVerifier>,
     pub(super) extractor: Arc<nzbkit::extract::Extractor>,
     pub(super) shape_said: Arc<std::sync::atomic::AtomicBool>,
@@ -44,6 +45,13 @@ pub(super) struct DecodeCtx {
     pub(super) rt: tokio::runtime::Handle,
     pub(super) throttle_mbps: Option<f64>,
     pub(super) throttle_t0: Instant,
+    /// TODO 114 consumer steer: report every Done body's decode
+    /// verdict through `queue_ctl.note_decoded`, and force the
+    /// integrity pass even where M32 delegation would skip it - the
+    /// forced CRC is the endgame's entire marginal cost, and without
+    /// it a corrupt body on a delegated slot is invisible until the
+    /// verifier's block hash, past steer time.
+    pub(super) crc_steer: bool,
 }
 
 /// Everything one decode consumer thread does: drain outcome batches
@@ -70,6 +78,7 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
         transport_failed,
         transport_sample,
         decode_error_sample,
+        disk_full_sample,
         verifier,
         extractor,
         shape_said,
@@ -81,6 +90,7 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
         rt,
         throttle_mbps,
         throttle_t0,
+        crc_steer,
     } = ctx;
     loop {
         // Drain a batch per lock hold: the futex wake + context
@@ -107,14 +117,22 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
         for outcome in batch {
             match outcome {
                 FetchOutcome::Done { id, raw } => {
+                    use nzbkit::pool::{DecodeAck, DecodeReport};
                     let Some(&(sidx, nbytes)) = id_to_slot.get(&id) else {
+                        // Not ours to place - but the pool is waiting
+                        // on this id's verdict (steer) AND its settle
+                        // ack (arrival_ack, TODO 121.4): an Owned
+                        // verdict keeps the done_ok liveness entry, so
+                        // settle must follow it. After a Steered ack
+                        // the settle is a no-op.
+                        if crc_steer {
+                            queue_ctl.note_decoded(&id, DecodeReport::Clean { part: None });
+                        }
+                        queue_ctl.note_settled(&id);
                         pool.give(raw);
                         continue;
                     };
                     let (sidx, nbytes) = (sidx as usize, nbytes as u64);
-                    // This article is now accounted for,
-                    // whatever the decode below makes of it.
-                    fetch_done.fetch_add(nbytes, Ordering::Relaxed);
                     let slot = &slots[sidx];
                     let mut out = out_pool.take();
                     // M32 perf: once live verify (full-MD5 mode) has
@@ -123,9 +141,34 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
                     // hashes anyway - skip it and feed the span
                     // untrusted. First article per slot (and every
                     // article under fast verify / no PAR2) keeps it.
-                    let delegated = verifier.delegates_integrity(sidx);
+                    // TODO 114: the consumer steer overrides the skip
+                    // - this decode is now also the pool's damage
+                    // detector, and a corrupt body it waves through
+                    // is not seen again until the verifier's block
+                    // hash, past steer time. The forced CRC is the
+                    // steer's entire marginal cost.
+                    let delegated = verifier.delegates_integrity(sidx) && !crc_steer;
                     match nzbkit::yenc_simd::decode_into_integrity(&raw, &mut out, !delegated) {
                         Ok((dec, integrity)) => {
+                            // TODO 114: report the verdict (the pool
+                            // does the expected-part comparison). A
+                            // steered body is dropped whole: the
+                            // refetched copy owns every counter,
+                            // including fetch_done - crediting here
+                            // would double-count the article when the
+                            // clean copy lands.
+                            if crc_steer
+                                && queue_ctl
+                                    .note_decoded(&id, DecodeReport::Clean { part: dec.part })
+                                    == DecodeAck::Steered
+                            {
+                                out_pool.give(out);
+                                pool.give(raw);
+                                continue;
+                            }
+                            // This article is now accounted for,
+                            // whatever the write below makes of it.
+                            fetch_done.fetch_add(nbytes, Ordering::Relaxed);
                             let crc_checked = integrity.crc_checked;
                             let name = if dec.name.is_empty() {
                                 slot.hint.clone()
@@ -181,6 +224,30 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
                                         .get_or_insert_with(|| format!("write {name}: {e}"));
                                     decode_errors.fetch_add(1, Ordering::Relaxed);
                                     slot.errors.fetch_add(1, Ordering::Relaxed);
+                                    // The storage itself ran out under the
+                                    // write (full volume, spent quota, a
+                                    // share gone read-only). Refetching
+                                    // cannot fix it, and without the halt
+                                    // a filled output volume kept the
+                                    // download running at line rate with
+                                    // EVERY article failing this same way.
+                                    // Stop the fetch now; drain_network
+                                    // turns the sample into the job's
+                                    // out-of-disk-space verdict, and the
+                                    // journal keeps what landed for the
+                                    // resume.
+                                    if note_storage_exhausted_halt(
+                                        &e,
+                                        &name,
+                                        &disk_full_sample,
+                                        &queue_ctl,
+                                    ) {
+                                        eprintln!(
+                                            "⚠ out of disk space - stopping the download; \
+                                             what landed is journaled and a retry resumes \
+                                             without refetching it"
+                                        );
+                                    }
                                 }
                                 Ok(persist) => {
                                     match &persist {
@@ -314,6 +381,22 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
                             }
                         }
                         Err(e) => {
+                            // TODO 114: a failed decode/CRC is exactly
+                            // what the steer exists for - refetched
+                            // elsewhere, it never becomes an error.
+                            if crc_steer
+                                && queue_ctl.note_decoded(
+                                    &id,
+                                    DecodeReport::Bad {
+                                        why: "yEnc decode/CRC failed",
+                                    },
+                                ) == DecodeAck::Steered
+                            {
+                                out_pool.give(out);
+                                pool.give(raw);
+                                continue;
+                            }
+                            fetch_done.fetch_add(nbytes, Ordering::Relaxed);
                             eprintln!("decode error ({id}): {e}");
                             decode_error_sample
                                 .lock_ok()
@@ -322,6 +405,15 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
                             slot.errors.fetch_add(1, Ordering::Relaxed);
                         }
                     }
+                    // TODO 121.4: the body is decoded and (where it
+                    // was going to be) written - release the pool's
+                    // liveness hold. Unconditional: under crc_steer an
+                    // Owned verdict deliberately KEPT the done_ok entry
+                    // (the write above can outlast the /stream
+                    // dead-span verdict), so the release happens here,
+                    // after the write. Steered paths continue'd above
+                    // and never reach this line.
+                    queue_ctl.note_settled(&id);
                     out_pool.give(out);
                     pool.give(raw);
                     if slot.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -489,6 +581,33 @@ pub(super) fn spawn_rate_ticker(
     })
 }
 
+/// A storage-exhaustion write error halts the fetch. Classifies
+/// via [`nzbkit::disk::storage_exhausted`] (kind-first, raw codes
+/// platform-gated - 112 is ERROR_DISK_FULL only on Windows); on the
+/// FIRST detection it records the verbatim sample for the job verdict
+/// and aborts the pool so the line stops promptly. Returns whether this
+/// call was that first detection (callers log the halt once). Later
+/// detections - other decode threads racing through in-flight bodies -
+/// keep the first sample and re-assert the abort harmlessly.
+pub(super) fn note_storage_exhausted_halt(
+    e: &std::io::Error,
+    name: &str,
+    disk_full_sample: &Arc<std::sync::Mutex<Option<String>>>,
+    queue_ctl: &nzbkit::pool::QueueControl,
+) -> bool {
+    if !nzbkit::disk::storage_exhausted(e) {
+        return false;
+    }
+    let first = {
+        let mut s = disk_full_sample.lock_ok();
+        let was_empty = s.is_none();
+        s.get_or_insert_with(|| format!("write {name}: {e}"));
+        was_empty
+    };
+    queue_ctl.abort();
+    first
+}
+
 // Deadlock watchdog. A pool bug that leaves an article non-terminal
 // wedges the whole job AFTER its bytes are downloaded: fetch_all_multi
 // never returns, silently, until something external kills it (seen on
@@ -512,6 +631,15 @@ pub(super) fn spawn_rate_ticker(
 // AND Failed, so it moves whenever the pool resolves anything by any
 // route: it is the liveness signal a refusal-only run still has. A
 // genuine wedge freezes both, and still fires.
+//
+// THIRD signal, `QueueControl::deferred`, because "resolves anything by
+// any route" stopped covering the pool: it now has paths that consume a
+// response and requeue the article for a confirming repeat rather than
+// declaring it (the bare-430 desync guard). A wholly dead post takes
+// that path for EVERY article before any of them can go terminal, so
+// its whole first pass moves neither counter above and 31 Jul's abort
+// came straight back. A future defer-a-verdict path ticks that same
+// counter instead of growing a fourth signal here.
 pub(super) fn spawn_deadlock_watchdog(
     decoded: Arc<AtomicU64>,
     slots: Vec<Arc<FileSlot>>,
@@ -532,6 +660,7 @@ pub(super) fn spawn_deadlock_watchdog(
         };
         let mut last = decoded.load(Ordering::Relaxed);
         let mut last_outstanding = outstanding_now(&slots);
+        let mut last_deferred = qc.deferred().unwrap_or(0);
         let mut frozen = 0u64;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(poll)).await;
@@ -540,9 +669,11 @@ pub(super) fn spawn_deadlock_watchdog(
             }
             let now = decoded.load(Ordering::Relaxed);
             let outstanding = outstanding_now(&slots);
-            if now != last || outstanding != last_outstanding {
+            let deferred = qc.deferred().unwrap_or(last_deferred);
+            if now != last || outstanding != last_outstanding || deferred != last_deferred {
                 last = now;
                 last_outstanding = outstanding;
+                last_deferred = deferred;
                 frozen = 0;
                 continue;
             }
@@ -639,6 +770,28 @@ pub(super) fn spawn_spec_prefetch(
         let pre = prefetched.clone();
         let stop = prefetch_stop.clone();
         tokio::spawn(async move {
+            // Codex 5 Aug M3: a rung used to run with no cancellation
+            // handle, so a blackholed side provider held drain_network's
+            // unconditional await - and with it Cancel/Pause - through
+            // the side pool's whole multi-session retry ladder. The
+            // watcher turns the stop flag into a pool abort, and keeps
+            // aborting every tick while the flag is set so a rung that
+            // attaches a fresh pool just as the flag flips is still
+            // caught on the next tick.
+            let ctl = Arc::new(nzbkit::pool::QueueControl::default());
+            let watcher = {
+                let stop = stop.clone();
+                let ctl = ctl.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if stop.load(Ordering::Acquire) {
+                            ctl.abort();
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                })
+            };
+            let body = async {
             let mut covered = 0usize;
             let mut ladder = ladder;
             loop {
@@ -667,9 +820,22 @@ pub(super) fn spawn_spec_prefetch(
                         "{miss} article(s) terminally missing - prefetching recovery volume ({:.1} MB) alongside the download",
                         bytes as f64 / 1e6
                     );
-                    match fetch_volume_articles(&side_servers, reqs, idm, &out2, &bp, vol_cap)
-                        .await
-                    {
+                    let fetched =
+                        fetch_volume_articles(&side_servers, reqs, idm, &out2, &bp, vol_cap, Some(&ctl))
+                            .await;
+                    if stop.load(Ordering::Acquire) {
+                        // The watcher aborted this rung mid-flight. An
+                        // aborted run's unresolved articles emit NO
+                        // outcome, so the failure count can read 0 over
+                        // a volume that is actually incomplete - credit
+                        // or record it and the whole volume is struck
+                        // off the post-settle fetch list with slices
+                        // missing (the H2 false-shortfall shape). Leave
+                        // the rung unrecorded; unrecorded is always
+                        // safe, the post-settle ladder refetches it.
+                        return;
+                    }
+                    match fetched {
                         Ok((0, paths)) if !paths.is_empty() => {
                             covered += count.max(1);
                             pre.lock_ok().push((fi, paths));
@@ -714,8 +880,104 @@ pub(super) fn spawn_spec_prefetch(
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
+            };
+            body.await;
+            watcher.abort();
         })
     })
+}
+
+/// Par-race candidate selection and damage arithmetic (Codex 5 Aug
+/// M2), held still where a test can reach it.
+pub(super) struct RaceEstimate {
+    /// Cancellable ids: only articles of payload files the recovery
+    /// set COVERS - repair heals nothing else, so abandoning an
+    /// uncovered companion converts a fetchable file into permanent
+    /// damage settle then rightly rejects.
+    pub(super) want: std::collections::HashSet<String>,
+    /// id → (slot index, declared segment bytes).
+    pub(super) bytes_of: std::collections::HashMap<String, (usize, u64)>,
+    /// EXPECTED remaining bytes (per-file average) - the eta
+    /// estimator, where under-racing is the conservative direction.
+    pub(super) out_bytes: u64,
+    /// WORST-CASE damage blocks: which `remaining` segments are still
+    /// unresolved is the pool's knowledge, not ours, so charge each
+    /// file its `remaining` LARGEST declared segments at their exact
+    /// bytes. The old per-file average let one 100 MiB straggler hide
+    /// behind 99 tiny finished segments.
+    pub(super) out_blocks: usize,
+}
+
+pub(super) fn par_race_estimate(
+    set_names: &std::collections::HashSet<String>,
+    block: usize,
+    slots: &[Arc<FileSlot>],
+    slot_file: &[usize],
+    nzb: &Nzb,
+) -> RaceEstimate {
+    let mut est = RaceEstimate {
+        want: std::collections::HashSet::new(),
+        bytes_of: std::collections::HashMap::new(),
+        out_bytes: 0,
+        out_blocks: 0,
+    };
+    for (sidx, s) in slots.iter().enumerate() {
+        let rem = s.remaining.load(Ordering::Relaxed);
+        if s.is_par2() || rem == 0 {
+            continue;
+        }
+        // Same name normalization settle itself uses; an obfuscated
+        // alias not yet reconciled simply stays out of the race.
+        if !set_names.contains(&nzbkit::disk::sanitize_filename(&s.hint).to_lowercase()) {
+            continue;
+        }
+        let f = &nzb.files[slot_file[sidx]];
+        let per = (f.bytes() / f.segments.len().max(1) as u64).max(1);
+        est.out_bytes += rem as u64 * per;
+        let mut sizes: Vec<u64> = f.segments.iter().map(|seg| seg.bytes).collect();
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        est.out_blocks += sizes
+            .iter()
+            .take(rem)
+            .map(|b| (*b as usize).div_ceil(block) + 1)
+            .sum::<usize>();
+        for seg in &f.segments {
+            let b = format!("<{}>", seg.message_id);
+            est.bytes_of.insert(b.clone(), (sidx, seg.bytes));
+            est.want.insert(b);
+        }
+    }
+    est
+}
+
+/// Worst-case block cost of the articles already terminally missing.
+/// WHICH articles went missing is unknown, so bound each slot's share
+/// by its own largest declared segment rather than a cross-file
+/// average that a big-article file dilutes (Codex 5 Aug M2).
+pub(super) fn par_race_missing_blocks(
+    block: usize,
+    slots: &[Arc<FileSlot>],
+    slot_file: &[usize],
+    nzb: &Nzb,
+) -> usize {
+    slots
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.is_par2())
+        .map(|(sidx, s)| {
+            let m = s.missing.load(Ordering::Relaxed);
+            if m == 0 {
+                return 0;
+            }
+            let max_per = nzb.files[slot_file[sidx]]
+                .segments
+                .iter()
+                .map(|seg| seg.bytes)
+                .max()
+                .unwrap_or(0) as usize;
+            m * (max_per.div_ceil(block) + 1)
+        })
+        .sum()
 }
 
 // PAR2-race experiment (dark, NZBFAST_PAR_RACE=1): once the set is
@@ -759,7 +1021,7 @@ pub(super) fn spawn_par_race(
             let slot_file2 = slot_file.to_vec();
             let nzb2 = nzb.clone();
             tokio::spawn(async move {
-                use std::collections::{HashMap, HashSet, VecDeque};
+                use std::collections::{HashSet, VecDeque};
                 let mut win: VecDeque<(std::time::Instant, u64)> = VecDeque::new();
                 loop {
                     if stop.load(Ordering::Acquire) {
@@ -784,27 +1046,19 @@ pub(super) fn spawn_par_race(
                         continue;
                     }
                     let rate = b1.saturating_sub(b0) as f64 / span;
-                    // Candidates: payload slots with unresolved articles.
+                    // Candidates + damage arithmetic live in
+                    // par_race_estimate / par_race_missing_blocks (the
+                    // Codex 5 Aug M2 fixes), where tests can hold them
+                    // still.
+                    let set_names: HashSet<String> = set
+                        .files
+                        .iter()
+                        .map(|f| nzbkit::disk::sanitize_filename(&f.name).to_lowercase())
+                        .collect();
                     let block = set.block_size.max(1) as usize;
-                    let mut want: HashSet<String> = HashSet::new();
-                    let mut bytes_of: HashMap<String, (usize, u64)> = HashMap::new();
-                    let mut out_bytes = 0u64;
-                    let mut out_blocks = 0usize;
-                    for (sidx, s) in slots2.iter().enumerate() {
-                        let rem = s.remaining.load(Ordering::Relaxed);
-                        if s.is_par2() || rem == 0 {
-                            continue;
-                        }
-                        let f = &nzb2.files[slot_file2[sidx]];
-                        let per = (f.bytes() / f.segments.len().max(1) as u64).max(1);
-                        out_bytes += rem as u64 * per;
-                        out_blocks += rem * ((per as usize).div_ceil(block) + 1);
-                        for seg in &f.segments {
-                            let b = format!("<{}>", seg.message_id);
-                            bytes_of.insert(b.clone(), (sidx, seg.bytes));
-                            want.insert(b);
-                        }
-                    }
+                    let est = par_race_estimate(&set_names, block, &slots2, &slot_file2, &nzb2);
+                    let (want, bytes_of) = (est.want, est.bytes_of);
+                    let (out_bytes, out_blocks) = (est.out_bytes, est.out_blocks);
                     if want.is_empty() {
                         continue;
                     }
@@ -823,15 +1077,9 @@ pub(super) fn spawn_par_race(
                     // the queued ones we would cancel plus the already
                     // bad or terminally missing.
                     let (_, live_bad) = verifier2.live_counts();
-                    let missing_arts: usize = slots2
-                        .iter()
-                        .filter(|s| !s.is_par2())
-                        .map(|s| s.missing.load(Ordering::Relaxed))
-                        .sum();
-                    let per_art_blocks =
-                        ((out_bytes / want.len().max(1) as u64) as usize).div_ceil(block) + 1;
-                    let damage_ceiling =
-                        out_blocks + live_bad as usize + missing_arts * per_art_blocks;
+                    let missing_blocks =
+                        par_race_missing_blocks(block, &slots2, &slot_file2, &nzb2);
+                    let damage_ceiling = out_blocks + live_bad as usize + missing_blocks;
                     let mut on_hand = set.recovery_blocks_seen;
                     for (_, paths) in pre.lock_ok().iter() {
                         for p in paths {
@@ -864,6 +1112,36 @@ pub(super) fn spawn_par_race(
                     }
                     if removed.is_empty() {
                         continue; // everything already in flight or done
+                    }
+                    // The cancel is the first moment the EXACT straggler
+                    // set is known - re-run the 2x guard on it with the
+                    // ids' declared bytes and a fresh live_bad (damage
+                    // can grow in the second between estimate and
+                    // cancel). The worst-case estimate above makes a
+                    // failure here rare, not impossible.
+                    let exact_blocks: usize = removed
+                        .iter()
+                        .filter_map(|id| bytes_of.get(id))
+                        .map(|&(_, b)| (b as usize).div_ceil(block) + 1)
+                        .sum();
+                    let (_, live_bad_now) = verifier2.live_counts();
+                    let exact_ceiling = exact_blocks + live_bad_now as usize + missing_blocks;
+                    if on_hand < exact_ceiling.saturating_mul(2) {
+                        if queue_ctl2.requeue(&removed) > 0 {
+                            continue; // rolled back whole - no race this tick
+                        }
+                        // requeue's all-or-nothing rollback found the run
+                        // already winding down, so the cancel is now
+                        // irreversible. Fall through to the abandonment
+                        // accounting so the bar stays truthful - settle
+                        // prices the damage honestly either way.
+                        warn!(
+                            target: "repair",
+                            "par-race: exact damage outgrew the estimate and the rollback \
+                             found the run winding down - proceeding with {} abandoned \
+                             article(s)",
+                            removed.len()
+                        );
                     }
                     let mut freed = 0u64;
                     for id in &removed {
@@ -911,6 +1189,7 @@ pub(super) async fn drain_network(
     watchdog: tokio::task::JoinHandle<()>,
     stalled: &Arc<std::sync::atomic::AtomicBool>,
     abort_flag: &Arc<std::sync::atomic::AtomicBool>,
+    disk_full_sample: &Arc<std::sync::Mutex<Option<String>>>,
     queue_ctl: &Arc<nzbkit::pool::QueueControl>,
     note_activity: &(dyn Fn(&'static str) + Sync),
     net_done: Option<tokio::sync::oneshot::Sender<()>>,
@@ -977,6 +1256,21 @@ pub(super) async fn drain_network(
     if abort_flag.load(Ordering::Relaxed) {
         anyhow::bail!("stopped by user");
     }
+    // A write hit storage exhaustion mid-download and the consumer
+    // halted the fetch (see note_storage_exhausted_halt). Skip
+    // settle/repair/extract - they write to the same full volume - and
+    // fail with the distinct out-of-disk-space verdict. The opening
+    // clause is what `fail_kind`/`disk_full_failure` classify on;
+    // everything after it is appended detail, per the incomplete_reason
+    // contract. The journal is NOT retired, so freeing space and
+    // retrying resumes from what landed without refetching a byte.
+    if let Some(sample) = disk_full_sample.lock_ok().take() {
+        anyhow::bail!(
+            "out of disk space - the output volume filled during the download, \
+             so fetching was stopped early; what landed is journaled and kept \
+             ({sample})"
+        );
+    }
     // Graceful pause: the pool admitted no new work and let every in-flight
     // article finish and journal, so a resume re-fetches only the unstarted
     // queue - nothing here is wasted. Park it like an abort (skip settle),
@@ -1041,6 +1335,7 @@ pub(super) struct Counters {
     pub(super) transport_failed: Arc<AtomicU64>,
     pub(super) transport_sample: Arc<std::sync::Mutex<Option<String>>>,
     pub(super) decode_error_sample: Arc<std::sync::Mutex<Option<String>>>,
+    pub(super) disk_full_sample: Arc<std::sync::Mutex<Option<String>>>,
     pub(super) throttle_mbps: Option<f64>,
     pub(super) throttle_t0: Instant,
     pub(super) backfill: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<u64>>>>,
@@ -1111,6 +1406,10 @@ pub(super) fn build_counters(
     // quote - the counter alone says nothing a bug report can act on.
     let transport_sample: Arc<std::sync::Mutex<Option<String>>> = Default::default();
     let decode_error_sample: Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    // First storage-exhaustion write error, verbatim: its presence IS
+    // the halt signal drain_network turns into the out-of-disk-space
+    // verdict (see note_storage_exhausted_halt).
+    let disk_full_sample: Arc<std::sync::Mutex<Option<String>>> = Default::default();
     // Test knob: cap the consumer (decode+write) stage to N MB/s to
     // simulate a slow disk. The correct systemic response - proven by the
     // backpressure test - is that the bounded channel fills, workers stop
@@ -1145,6 +1444,7 @@ pub(super) fn build_counters(
         transport_failed,
         transport_sample,
         decode_error_sample,
+        disk_full_sample,
         throttle_mbps,
         throttle_t0,
         backfill,
@@ -1175,6 +1475,7 @@ pub(super) fn spawn_decode_consumers(
     transport_failed: &Arc<AtomicU64>,
     transport_sample: &Arc<std::sync::Mutex<Option<String>>>,
     decode_error_sample: &Arc<std::sync::Mutex<Option<String>>>,
+    disk_full_sample: &Arc<std::sync::Mutex<Option<String>>>,
     verifier: &Arc<nzbkit::live::LiveVerifier>,
     extractor: &Arc<nzbkit::extract::Extractor>,
     shape_said: &Arc<std::sync::atomic::AtomicBool>,
@@ -1186,6 +1487,7 @@ pub(super) fn spawn_decode_consumers(
     rt: &tokio::runtime::Handle,
     throttle_mbps: Option<f64>,
     throttle_t0: Instant,
+    crc_steer: bool,
 ) -> (
     Vec<std::thread::JoinHandle<()>>,
     Arc<std::sync::Mutex<Vec<PendingD>>>,
@@ -1218,6 +1520,7 @@ pub(super) fn spawn_decode_consumers(
             transport_failed: transport_failed.clone(),
             transport_sample: transport_sample.clone(),
             decode_error_sample: decode_error_sample.clone(),
+            disk_full_sample: disk_full_sample.clone(),
             verifier: verifier.clone(),
             extractor: extractor.clone(),
             shape_said: shape_said.clone(),
@@ -1229,6 +1532,7 @@ pub(super) fn spawn_decode_consumers(
             rt: rt.clone(),
             throttle_mbps,
             throttle_t0,
+            crc_steer,
         };
         let thread = std::thread::Builder::new()
             .name(format!("decode-{i}"))
@@ -1237,4 +1541,149 @@ pub(super) fn spawn_decode_consumers(
         consumers.push(thread);
     }
     (consumers, pending_d)
+}
+
+#[cfg(test)]
+mod disk_full_halt_tests {
+    use super::*;
+
+    #[test]
+    fn storage_exhaustion_records_once_and_halts() {
+        let sample: Arc<std::sync::Mutex<Option<String>>> = Default::default();
+        let qc = nzbkit::pool::QueueControl::default();
+        let e = std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "No space left on device (os error 28)",
+        );
+        assert!(note_storage_exhausted_halt(&e, "a.r01", &sample, &qc));
+        // A second detection (another decode thread racing through its
+        // in-flight bodies) keeps the FIRST sample and is not the halt.
+        let e2 = std::io::Error::new(std::io::ErrorKind::StorageFull, "No space left on device");
+        assert!(!note_storage_exhausted_halt(&e2, "b.r02", &sample, &qc));
+        assert!(
+            sample
+                .lock_ok()
+                .as_deref()
+                .unwrap()
+                .starts_with("write a.r01:")
+        );
+    }
+
+    #[test]
+    fn ordinary_write_errors_do_not_halt() {
+        let sample: Arc<std::sync::Mutex<Option<String>>> = Default::default();
+        let qc = nzbkit::pool::QueueControl::default();
+        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert!(!note_storage_exhausted_halt(&e, "a.r01", &sample, &qc));
+        assert!(sample.lock_ok().is_none());
+    }
+}
+
+#[cfg(test)]
+mod par_race_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    fn slot(hint: &str, remaining: usize, missing: usize) -> Arc<FileSlot> {
+        Arc::new(FileSlot {
+            hint: hint.into(),
+            is_par2_main: false,
+            par2_sniffed: AtomicBool::new(false),
+            total_segments: 3,
+            remaining: AtomicUsize::new(remaining),
+            missing: AtomicUsize::new(missing),
+            errors: AtomicUsize::new(0),
+            deferred: AtomicUsize::new(0),
+            abandoned: AtomicUsize::new(0),
+            capture: std::sync::Mutex::new(None),
+        })
+    }
+
+    fn nzb() -> Nzb {
+        Nzb::parse(
+            r#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+ <file subject='"a.rar" yEnc (1/3)' date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments>
+   <segment bytes="4000" number="1">a1@t</segment>
+   <segment bytes="4000" number="2">a2@t</segment>
+   <segment bytes="400000" number="3">a3@t</segment>
+  </segments>
+ </file>
+ <file subject='"b.sample.mkv" yEnc (1/2)' date="1700000000">
+  <groups><group>alt.binaries.test</group></groups>
+  <segments>
+   <segment bytes="1000" number="1">b1@t</segment>
+   <segment bytes="50000" number="2">b2@t</segment>
+  </segments>
+ </file>
+</nzb>"#
+                .as_bytes(),
+        )
+        .expect("test NZB parses")
+    }
+
+    /// Codex 5 Aug M2 defect 1: a file the recovery set does not cover
+    /// must never become a cancellation candidate - repair cannot heal
+    /// it, so abandoning its articles is permanent damage.
+    #[test]
+    fn an_uncovered_companion_is_never_a_candidate() {
+        let n = nzb();
+        let slots = vec![slot("a.rar", 2, 0), slot("b.sample.mkv", 2, 0)];
+        let set_names: std::collections::HashSet<String> =
+            [nzbkit::disk::sanitize_filename("a.rar").to_lowercase()]
+                .into_iter()
+                .collect();
+        let est = par_race_estimate(&set_names, 4096, &slots, &[0, 1], &n);
+        assert!(est.want.contains("<a1@t>"));
+        assert!(
+            !est.want.iter().any(|id| id.starts_with("<b")),
+            "uncovered b.sample.mkv articles must stay out of the race: {:?}",
+            est.want
+        );
+    }
+
+    /// Codex 5 Aug M2 defect 2: the damage guard charges the file's
+    /// LARGEST still-possible segments at exact bytes. With 2 tiny
+    /// segments done and one 400 KB straggler queued, the old average
+    /// math advertised ~34 blocks of worst-case damage; the truth is 99.
+    #[test]
+    fn damage_worst_case_uses_exact_largest_segments_not_the_average() {
+        let n = nzb();
+        let block = 4096usize;
+        let slots = vec![slot("a.rar", 1, 0), slot("b.sample.mkv", 0, 0)];
+        let set_names: std::collections::HashSet<String> =
+            [nzbkit::disk::sanitize_filename("a.rar").to_lowercase()]
+                .into_iter()
+                .collect();
+        let est = par_race_estimate(&set_names, block, &slots, &[0, 1], &n);
+        // One unresolved article: worst case is the 400000-byte
+        // segment - ceil(400000/4096)+1 = 99 blocks.
+        assert_eq!(est.out_blocks, 98 + 1);
+        // The average estimator (408000/3 = 136000 -> 35 blocks) must
+        // not be what guards the cancel.
+        assert!(est.out_blocks > 35);
+    }
+
+    /// Missing articles are bounded by their own slot's largest
+    /// declared segment, not a cross-file average.
+    #[test]
+    fn missing_blocks_bound_by_the_slots_own_largest_segment() {
+        let n = nzb();
+        let block = 4096usize;
+        let slots = vec![slot("a.rar", 0, 0), slot("b.sample.mkv", 0, 2)];
+        // b's largest segment is 50000 bytes: ceil(50000/4096)+1 = 14
+        // blocks, twice.
+        assert_eq!(par_race_missing_blocks(block, &slots, &[0, 1], &n), 28);
+    }
+
+    /// The race is an experiment and must stay dark by default.
+    #[test]
+    fn par_race_defaults_off() {
+        assert!(
+            std::env::var("NZBFAST_PAR_RACE").is_err(),
+            "NZBFAST_PAR_RACE leaked into the test environment"
+        );
+    }
 }

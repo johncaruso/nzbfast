@@ -1776,7 +1776,7 @@ pub(crate) fn sweep_spent_obfuscated(
     // reversible. Read once for the whole sweep (remove_user_file's
     // contract), and parked for the deferred worker like the finalize
     // sweeps (§64) so a slow Finder never sits inside the job's tail.
-    let recoverable = crate::smart::delete_to_trash();
+    let recoverable = crate::smart::cleanup_recoverable();
     let staging = crate::smart::trash_staging_dir(dir);
     for path in sources {
         if published.contains(path) {

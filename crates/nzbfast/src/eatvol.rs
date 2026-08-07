@@ -31,9 +31,12 @@
 //!    advanced past its last byte and no back-reference can reach into
 //!    it. rars is ours, so that is knowable rather than guessable:
 //!    `rars::extract_volumes_to_with_progress` reports each volume as the
-//!    walk leaves it, and holds the whole backlog back while a split
-//!    member is pending, because a split member's Finish fragment reads
-//!    every volume it spanned.
+//!    walk leaves it - including, since the H1 residual closed, each
+//!    volume of a SPLIT member as its chain reads the fragment out, so
+//!    the one-film-across-every-volume shape frees space progressively
+//!    too. The engine keeps the report off any path that could read a
+//!    fragment twice (the buffered filter-bail retry), so the promise
+//!    behind the delete is unconditional.
 //! 3. **Consent.** `low_disk` arms only on a job whose forecast says it
 //!    cannot otherwise fit AND whose user said yes in the disk-full
 //!    drawer. `always` is itself the consent.

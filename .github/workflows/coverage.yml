@@ -21,6 +21,20 @@
 # mostly uncovered product code on 5 Aug: the next red is more likely
 # to be honest drift than a regression, and the answer is still tests.
 #
+# Measurement policy (6 Aug, TODO 122.5): the nzbkit lib denominator
+# excludes the crate's test-infrastructure files - mock.rs (the mock
+# NNTP chaos server), sysbench.rs and benchserve.rs (bench tools) -
+# via --ignore-filename-regex on that step. These files exist to test
+# the product; covering a mock's fault-injection arms with tests whose
+# only purpose is covering the mock is test theater, and their growth
+# is exactly what dragged an honest floor red on 6 Aug (82.44 at
+# aa595e96): the §117 round-3 chaos arms put ~900 missed lines into
+# mock.rs that only the chaos-serve BIN ever drives. The metric now
+# reads "how well tested is the product", not "how well tested are the
+# test rigs". The floor stays 84 - never lower it, and never widen the
+# exclusion list to make a run pass: a new entry must BE test
+# infrastructure, argued here, in the commit that adds it.
+#
 # Nightly, not per-push: a full coverage build recompiles the workspace
 # instrumented, which is minutes, and ci-private is deliberately lean.
 name: coverage
@@ -69,10 +83,14 @@ jobs:
       # would let a regression in the weak crate hide behind the strong
       # one. NZBFAST_NO_ENRICH is CLAUDE.md invariant 5 - the bin suite
       # runs product code that consults it at the network boundary.
-      - name: nzbkit lib coverage (floor 84, measured 84.61)
+      # Product files only - see the measurement-policy paragraph in the
+      # header for why mock/sysbench/benchserve sit outside the metric.
+      - name: nzbkit lib coverage (floor 84, product files only)
         env:
           NZBFAST_NO_ENRICH: "1"
-        run: cargo llvm-cov --locked -p nzbkit --lib --fail-under-lines 84
+        run: >
+          cargo llvm-cov --locked -p nzbkit --lib --fail-under-lines 84
+          --ignore-filename-regex 'nzbkit/src/(mock|sysbench|benchserve)\.rs$'
       # if: always() so a breach of one floor never hides the other
       # crate's measurement - the nightly that caught nzbkit under 84
       # also needed the bins figure, and got neither.

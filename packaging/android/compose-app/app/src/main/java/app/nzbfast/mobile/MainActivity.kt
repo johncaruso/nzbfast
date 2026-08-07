@@ -21,9 +21,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
 import app.nzbfast.mobile.api.NzbfastClient
-import app.nzbfast.mobile.api.ProbeResult
-import app.nzbfast.mobile.api.QueueSnapshot
-import app.nzbfast.mobile.api.HistorySlot
+import app.nzbfast.mobile.api.PlaybackJob
+import app.nzbfast.mobile.api.PlaybackSnapshot
 import app.nzbfast.mobile.ui.AddScreen
 import app.nzbfast.mobile.ui.ConnectScreen
 import app.nzbfast.mobile.ui.HomeScreen
@@ -44,7 +43,7 @@ sealed class Screen {
     data object ServerSetup : Screen()
     data object Home : Screen()
     data object Add : Screen()
-    data class Player(val url: String, val title: String) : Screen()
+    data class Player(val nzoId: String, val url: String, val title: String) : Screen()
 }
 
 class MainActivity : ComponentActivity() {
@@ -54,9 +53,9 @@ class MainActivity : ComponentActivity() {
     private var busy by mutableStateOf(false)
     private var note by mutableStateOf<String?>(null)
 
-    private var queue by mutableStateOf<QueueSnapshot?>(null)
-    private var history by mutableStateOf<List<HistorySlot>>(emptyList())
-    private var probes by mutableStateOf<Map<String, ProbeResult>>(emptyMap())
+    /** The one poll: mode=playback carries queue, history, per-file
+     *  readiness and the byte-serving telemetry in a single response. */
+    private var snapshot by mutableStateOf<PlaybackSnapshot?>(null)
 
     private var pollJob: Job? = null
 
@@ -92,6 +91,30 @@ class MainActivity : ComponentActivity() {
         handleIntent(intent)
     }
 
+    /** True while the activity is in a PiP window: the player hides its
+     *  chrome (controller, overlays) - the window is thumbnail-sized and
+     *  the OS draws its own controls over it. */
+    private var inPip by mutableStateOf(false)
+
+    /** Home button while the test preview is up: keep the picture going
+     *  in a PiP window instead of stopping. Only the player earns it -
+     *  minimizing a queue screen should just minimize. */
+    override fun onUserLeaveHint() {
+        if (screen is Screen.Player) {
+            enterPictureInPictureMode(
+                android.app.PictureInPictureParams.Builder().build()
+            )
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: android.content.res.Configuration,
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        inPip = isInPictureInPictureMode
+    }
+
     override fun onDestroy() {
         pollJob?.cancel()
         super.onDestroy()
@@ -105,14 +128,22 @@ class MainActivity : ComponentActivity() {
             screen = Screen.Home
         }
         when (s) {
-            is Screen.Player -> PlayerScreen(s.url, s.title)
+            is Screen.Player -> PlayerScreen(
+                streamUrl = s.url,
+                title = s.title,
+                job = { snapshot?.let { snap ->
+                    (snap.queue + snap.history).firstOrNull { it.nzoId == s.nzoId }
+                } },
+                telemetry = { snapshot?.stream },
+                inPip = { inPip },
+            )
             else -> Scaffold(
                 topBar = {
                     if (s is Screen.Home) {
                         TopAppBar(
                             title = { Text("nzbfast") },
                             actions = {
-                                val paused = queue?.paused == true
+                                val paused = snapshot?.paused == true
                                 TextButton(onClick = { togglePauseAll(paused) }) {
                                     Text(if (paused) "Resume all" else "Pause all")
                                 }
@@ -148,9 +179,7 @@ class MainActivity : ComponentActivity() {
                     }
                     is Screen.Home -> androidx.compose.foundation.layout.Box(mod) {
                         HomeScreen(
-                            queue = queue,
-                            history = history,
-                            probes = probes,
+                            snapshot = snapshot,
                             statusLine = note,
                             onPlay = ::play,
                             onPauseJob = { io { client?.pauseJob(it) } },
@@ -227,8 +256,10 @@ class MainActivity : ComponentActivity() {
         val base = if (url.startsWith("http")) url else "http://$url"
         lifecycleScope.launch {
             val probe = NzbfastClient(base.trimEnd('/'), key)
+            // Validate with the call the app lives on: mode=playback
+            // needs the full key and proves the daemon speaks contract v1.
             val err = withContext(Dispatchers.IO) {
-                runCatching { probe.queue() }.exceptionOrNull()
+                runCatching { probe.playback(limit = 1) }.exceptionOrNull()
             }
             busy = false
             if (err != null) {
@@ -357,13 +388,23 @@ class MainActivity : ComponentActivity() {
 
     // ---- play ----
 
-    private fun play(nzoId: String, name: String) {
+    private fun play(job: PlaybackJob) {
         val cl = client ?: return
         busy = true
         lifecycleScope.launch {
-            val url = withContext(Dispatchers.IO) { cl.streamUrl(nzoId) }
+            // Row 16 already hands over the tokenized play URL; /m3u is
+            // only the fallback for a snapshot that lacked one.
+            val url = withContext(Dispatchers.IO) {
+                job.stream.ifEmpty { cl.streamUrl(job.nzoId) }
+            }
+            // mode=playback is read-only by design; the probe is what
+            // promotes a live job's file index, so fire it once for the
+            // one job the user opened (contract row 13).
+            if (job.playback.source == "live") {
+                io { cl.probe(job.nzoId) }
+            }
             busy = false
-            screen = Screen.Player(url, name)
+            screen = Screen.Player(job.nzoId, url, job.name)
         }
     }
 
@@ -376,37 +417,18 @@ class MainActivity : ComponentActivity() {
     private fun startPolling() {
         pollJob?.cancel()
         pollJob = lifecycleScope.launch {
-            var lastProbe = 0L
             while (isActive) {
                 val cl = client
-                if (cl != null && screen is Screen.Home) {
+                // One poll for everything: readiness rides the job rows
+                // (no per-job probes) and the telemetry feeds the player
+                // overlay, so keep polling while the player is up.
+                if (cl != null && (screen is Screen.Home || screen is Screen.Player)) {
                     val snap = withContext(Dispatchers.IO) {
-                        runCatching {
-                            Triple(cl.queue(), cl.history(), Unit)
-                        }.getOrNull()
+                        runCatching { cl.playback() }.getOrNull()
                     }
                     if (snap != null) {
-                        queue = snap.first
-                        history = snap.second
+                        snapshot = snap
                         if (note?.startsWith("Could not reach") == true) note = null
-                        // Probe downloading jobs for playability every 6 s,
-                        // matching the dashboard's cadence. The probe result
-                        // drives the Play affordance.
-                        val now = System.currentTimeMillis()
-                        if (now - lastProbe > 6_000) {
-                            lastProbe = now
-                            val active = snap.first.slots.filter {
-                                it.status == "Downloading" || it.status == "Queued" ||
-                                    it.status == "Moving"
-                            }
-                            val results = withContext(Dispatchers.IO) {
-                                active.associate { s ->
-                                    s.nzoId to runCatching { cl.probe(s.nzoId) }.getOrNull()
-                                }
-                            }
-                            probes = results.filterValues { it != null }
-                                .mapValues { it.value!! }
-                        }
                     } else {
                         note = "Could not reach the server."
                     }

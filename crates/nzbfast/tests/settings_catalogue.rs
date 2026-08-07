@@ -969,6 +969,72 @@ fn a_rules_pattern_verdict_is_reported_but_never_stored() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #18, the save-time half: the answer to Apply carries the warning.
+///
+/// The row annotation above only surfaces on the next READ of the
+/// settings; the moment the user is actually looking is the save. A rule
+/// whose pattern will not compile is still accepted (the keyword
+/// fallback is documented behaviour and refusing would change matching),
+/// but the answer must name the rule and carry the engine's compile
+/// error so the dashboard can toast it.
+#[test]
+fn saving_an_uncompilable_rule_warns_in_the_answer_without_refusing_the_save() {
+    let dir = scratch("rulesavewarn");
+    let d = serve(&dir);
+
+    // One broken match, one broken "but not" on an unnamed rule, and one
+    // fine rule. The dangerous-but-VALID catch-all must not warn here:
+    // "everything else goes to misc" as a deliberate last rule would
+    // otherwise toast on every re-save, teaching people to ignore it.
+    let rules = r#"[{"name":"animes","match":"*anime*","category":"anime"},
+                    {"match":"1080p","not_match":"[a-","category":"movies"},
+                    {"name":"catchall","match":".*","category":"misc"}]"#;
+    let r = api(
+        d.port,
+        &format!("mode=config&name=smart_folders&value={}", urlenc(rules)),
+    );
+    assert_eq!(
+        r["status"].as_bool(),
+        Some(true),
+        "the save was refused: {r}"
+    );
+    let w = r["warning"].as_str().expect("no warning in the answer");
+    assert!(w.contains("\"animes\""), "rule not named: {w}");
+    assert!(w.contains("*anime*"), "pattern not shown: {w}");
+    // The engine's own reason rides along, not a paraphrase.
+    assert!(w.contains("repetition"), "compile error missing: {w}");
+    // The nameless rule is still findable by its position...
+    assert!(w.contains("rule 2"), "unnamed rule not located: {w}");
+    assert!(w.contains("[a-"), "but-not pattern not shown: {w}");
+    // ...and the valid catch-all said nothing.
+    assert!(!w.contains("catchall"), "a valid pattern warned: {w}");
+
+    // A list whose patterns all compile answers exactly as before.
+    let clean = r#"[{"name":"ok","match":"2160p","category":"movies"}]"#;
+    let r = api(
+        d.port,
+        &format!("mode=config&name=smart_folders&value={}", urlenc(clean)),
+    );
+    assert_eq!(r["status"].as_bool(), Some(true), "{r}");
+    assert!(r["warning"].is_null(), "a clean save warned: {r}");
+
+    // The custom-category editor rides the same engine and gets the same
+    // save-time answer.
+    let cats = r#"[{"slug":"anime","name":"Anime","match":"*anime*","base":"tv"}]"#;
+    let r = api(
+        d.port,
+        &format!("mode=config&name=custom_categories&value={}", urlenc(cats)),
+    );
+    assert_eq!(r["status"].as_bool(), Some(true), "{r}");
+    let w = r["warning"]
+        .as_str()
+        .expect("no warning for custom_categories");
+    assert!(w.contains("\"Anime\"") && w.contains("*anime*"), "{w}");
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// #17: importing a sabnzbd.ini brings its categories over, merged.
 ///
 /// Categories are not cosmetic on this side. `register_cat` exists
@@ -1071,6 +1137,89 @@ fn importing_a_sabnzbd_ini_merges_its_categories_and_says_what_it_could_not_take
     for want in ["order", "indexer-category"] {
         assert!(dropped.contains(want), "{want:?} not reported: {dropped:?}");
     }
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// POST a JSON body and return the response body (headers stripped).
+/// `server_save` is the one endpoint this suite writes through that
+/// takes its payload in the body rather than the query string.
+fn http_post(port: u16, req: &str, body: &str) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    write!(
+        s,
+        "POST {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("send");
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
+}
+
+/// TODO 110: the per-server address allowance (`max_source_ips`) is a
+/// setting in three places - the server_save merge, the dashboard form,
+/// and get_config's servers block - and this pins the round trip through
+/// the two the daemon owns: saved, echoed back with the derived
+/// `tight_ips` verdict (which drives the idle-release defaults and the
+/// samplers' slots-full stand-down), and REMOVED from the config file
+/// when cleared rather than written as a 0 that would pin the old
+/// behavior.
+#[test]
+fn max_source_ips_round_trips_and_clears() {
+    let dir = scratch("maxips");
+    let d = serve(&dir);
+    // The host is deliberately NOT in the caps_source_ips hostname
+    // list, so any tight verdict below can only come from the declared
+    // number - the eweka shape the setting exists for.
+    let saved = http_post(
+        d.port,
+        "/api?mode=server_save&output=json",
+        r#"{"index":-1,"server":{"host":"news.capped.example","port":563,"connections":8,"max_source_ips":2}}"#,
+    );
+    assert!(saved.contains("\"status\":true"), "save failed: {saved}");
+    let srv = |port: u16| -> serde_json::Value {
+        settings_block(port)["servers"]
+            .as_array()
+            .expect("servers array")
+            .iter()
+            .find(|s| s["host"] == "news.capped.example")
+            .expect("saved server echoed")
+            .clone()
+    };
+    let s = srv(d.port);
+    assert_eq!(s["max_source_ips"], 2, "declared cap must echo: {s}");
+    assert_eq!(
+        s["idle_release_effective"]["tight_ips"], true,
+        "a declared 2-address cap must read as tight: {s}"
+    );
+    assert_eq!(
+        s["idle_release_effective"]["keep"], 0,
+        "tight addresses derive an idle keep of zero: {s}"
+    );
+
+    // Clearing the field (the UI sends "" for an emptied box) removes
+    // the key outright - back to the hostname heuristic, which knows
+    // nothing about this host.
+    let cleared = http_post(
+        d.port,
+        "/api?mode=server_save&output=json",
+        r#"{"index":0,"server":{"host":"news.capped.example","port":563,"connections":8,"max_source_ips":""}}"#,
+    );
+    assert!(
+        cleared.contains("\"status\":true"),
+        "clear failed: {cleared}"
+    );
+    let s = srv(d.port);
+    assert_eq!(s["max_source_ips"], serde_json::Value::Null, "cleared: {s}");
+    assert_eq!(s["idle_release_effective"]["tight_ips"], false, "{s}");
+    let disk = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    assert!(
+        !disk.contains("max_source_ips"),
+        "a cleared field must be removed, not stored as 0: {disk}"
+    );
 
     drop(d);
     let _ = std::fs::remove_dir_all(&dir);

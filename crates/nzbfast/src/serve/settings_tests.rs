@@ -62,6 +62,48 @@ fn annotate_patterns_flags_only_bad_rules() {
     assert_eq!(out[4], json!("not an object"));
 }
 
+// ---- rules_save_warning ------------------------------------------------
+
+/// #18 save-time warning: fires only for the two rules settings, only on
+/// patterns that will not compile, and never panics on the shapes the
+/// API can hand it (empty clear, malformed JSON that apply already
+/// rejected, non-object entries).
+#[test]
+fn rules_save_warning_names_the_rule_and_carries_the_engine_error() {
+    let rules = r#"[{"name":"animes","match":"*anime*"},{"match":"1080p","not_match":"[a-"}]"#;
+    let w = rules_save_warning("smart_folders", rules).expect("must warn");
+    assert!(w.contains("\"animes\"") && w.contains("*anime*"), "{w}");
+    assert!(w.contains("rule 2") && w.contains("[a-"), "{w}");
+    assert!(
+        w.contains("repetition"),
+        "the engine's reason must ride along: {w}"
+    );
+
+    // Valid-but-dangerous compiles say nothing at save time; the row
+    // annotation carries those (a deliberate last-rule catch-all would
+    // otherwise toast on every re-save).
+    assert_eq!(
+        rules_save_warning("smart_folders", r#"[{"match":".*"}]"#),
+        None
+    );
+    assert_eq!(
+        rules_save_warning("smart_folders", r#"[{"match":"!*"}]"#),
+        None
+    );
+    // Only the two rules settings are judged, and junk never panics.
+    assert_eq!(rules_save_warning("watchlist", rules), None);
+    assert_eq!(rules_save_warning("smart_folders", ""), None);
+    assert_eq!(rules_save_warning("smart_folders", "not json"), None);
+    assert_eq!(
+        rules_save_warning("smart_folders", r#"["not an object", 7]"#),
+        None
+    );
+    // The custom-category editor rides the same engine.
+    let cats = r#"[{"slug":"a","name":"Anime","match":"*anime*","base":"tv"}]"#;
+    let w = rules_save_warning("custom_categories", cats).expect("cats must warn");
+    assert!(w.contains("\"Anime\""), "{w}");
+}
+
 // ---- shape_only / path_str ---------------------------------------------
 
 #[test]

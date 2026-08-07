@@ -979,8 +979,8 @@ fn m_addfile(
                 match d.enqueue(&bytes, &fname, &cat, prio, pw, &origin, false) {
                     Ok(id) if stream => json!({
                         "status": true, "nzo_ids": [id],
-                        "m3u": format!("http://{}/m3u/{id}{}", ctx.host_hdr, ctx.key_q),
-                        "stream": format!("http://{}/stream/{id}?t={}", ctx.host_hdr, d.stream_token(&id)),
+                        "m3u": format!("{}/m3u/{id}{}", ctx.base, ctx.key_q),
+                        "stream": format!("{}/stream/{id}?t={}", ctx.base, d.stream_token(&id)),
                     }),
                     // Truth-audit I: a job parked as a held
                     // ALTERNATIVE has NOT joined the queue to run,
@@ -1023,8 +1023,8 @@ fn m_addurl(
                 match d.enqueue_fetched(&f, &name, &cat, prio, pw.as_deref(), 0, &origin, false) {
                     Ok(id) if stream => json!({
                         "status": true, "nzo_ids": [id],
-                        "m3u": format!("http://{}/m3u/{id}{}", ctx.host_hdr, ctx.key_q),
-                        "stream": format!("http://{}/stream/{id}?t={}", ctx.host_hdr, d.stream_token(&id)),
+                        "m3u": format!("{}/m3u/{id}{}", ctx.base, ctx.key_q),
+                        "stream": format!("{}/stream/{id}?t={}", ctx.base, d.stream_token(&id)),
                     }),
                     Ok(id) => json!({
                         "status": true, "nzo_ids": [id],

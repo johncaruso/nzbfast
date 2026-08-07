@@ -1,0 +1,48 @@
+{
+    "contract": 1,
+    "diskspace_gb": 540.311400448,
+    "history": [],
+    "history_total": 0,
+    "nzbfast": "1.0.17",
+    "pause_int": "0",
+    "paused": false,
+    "queue": [
+        {
+            "activity": "fetching",
+            "cat": "*",
+            "mb": 45.27,
+            "mbleft": 23.3,
+            "name": "job",
+            "nzo_id": "SABnzbd_nzo_nzbfast1",
+            "percentage": 48.0,
+            "playback": {
+                "coverage": {
+                    "head_bytes": 15540000,
+                    "pct": 33.8,
+                    "tail_ok": false
+                },
+                "file": "movie.mkv",
+                "ready": true,
+                "reason": "live",
+                "seekable": false,
+                "size": 46007777,
+                "source": "live"
+            },
+            "status": "Downloading",
+            "stream": "http://127.0.0.1:8877/stream/SABnzbd_nzo_nzbfast1?t=exampletoken00000000000000000001",
+            "timeleft": "0:00:17"
+        }
+    ],
+    "queue_total": 1,
+    "speed_bps": 1420712.5032041788,
+    "status": true,
+    "stream": {
+        "blocked_reads": 0,
+        "readers": 0,
+        "runway_mb": 16,
+        "runway_wait_ms": 3000,
+        "zero_filled_bytes": 0
+    },
+    "version": "4.5.0",
+    "warnings": 0
+}

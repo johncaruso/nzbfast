@@ -143,6 +143,37 @@ pub fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
     }
 }
 
+/// Is this write-path error the storage itself running out from under
+/// us - a condition no amount of refetching fixes? True for a full
+/// volume (`StorageFull`), an exhausted quota (`QuotaExceeded`), a
+/// filesystem that went read-only mid-run (`ReadOnlyFilesystem` - USB
+/// disks and network shares do this when they hit trouble), and the
+/// `WriteZero` a positioned write reports when the kernel accepts zero
+/// bytes forever (the Windows path above manufactures exactly that on a
+/// full disk).
+///
+/// The raw-code fallback is gated to the platform whose number it is:
+/// 112 is ERROR_DISK_FULL on Windows but EHOSTDOWN on Unix, and an
+/// unguarded match would call a dead host a full disk (the same trap
+/// `disk_full_failure` documents on the message side). Raw codes matter
+/// at all because errors built via `Error::from_raw_os_error` carry the
+/// code without the kind mapping std's syscall wrappers apply.
+pub fn storage_exhausted(e: &io::Error) -> bool {
+    match e.kind() {
+        io::ErrorKind::StorageFull
+        | io::ErrorKind::QuotaExceeded
+        | io::ErrorKind::ReadOnlyFilesystem
+        | io::ErrorKind::WriteZero => true,
+        _ => match e.raw_os_error() {
+            // ENOSPC, EROFS / ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL,
+            // ERROR_WRITE_PROTECT.
+            Some(code) if cfg!(windows) => matches!(code, 112 | 39 | 19),
+            Some(code) => matches!(code, 28 | 30),
+            None => false,
+        },
+    }
+}
+
 /// Process default for [`FileWriter`] cache dropping (see
 /// `maybe_drop_cache`). Set BEFORE the first write of the run - the
 /// per-process decision is latched on first use.
@@ -151,6 +182,73 @@ static DROP_CACHE_DEFAULT: std::sync::atomic::AtomicBool =
 
 pub fn set_drop_cache_default(on: bool) {
     DROP_CACHE_DEFAULT.store(on, Ordering::Relaxed);
+}
+
+/// Default stride for macOS write pacing - see [`FileWriter`]'s
+/// `maybe_pace_writeback`. 32 MB: small enough that the per-flush pause
+/// hides inside the fetch->decode channel, large enough that a 10 Gbps
+/// decoded stream (~1.2 GB/s) syncs ~40 times a second, not thousands.
+/// The m1 stride sweep read the same within noise from 16 to 64 MB
+/// (2/68, 3/68, 4/68 samples below 80% of peak), so the choice is not
+/// delicate.
+#[allow(dead_code)]
+const WRITE_PACE_STRIDE_DEFAULT: u64 = 32 << 20;
+
+/// The pacing stride in force, in bytes; 0 = pacing off. ON by default:
+/// the 6 Aug A/B on m1 (87 GB, 10 Gbps) took the job from 25/87 seconds
+/// below 80% of peak to 3/68 and sustained 7.2 -> 9.0 Gbps, with the
+/// per-server write-side blocking erased. Latched on first use;
+/// `NZBFAST_WRITE_PACE_MB` overrides in either direction (0 = off).
+#[cfg(target_os = "macos")]
+fn write_pace_stride() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        parse_pace_mb(std::env::var("NZBFAST_WRITE_PACE_MB").ok().as_deref())
+            .unwrap_or(WRITE_PACE_STRIDE_DEFAULT)
+    })
+}
+
+/// The `NZBFAST_WRITE_PACE_MB` mapping, split out so it is testable
+/// without mutating process env (same seam as [`storage_override`]).
+/// None = unset/unparsable, defer to the process default.
+#[allow(dead_code)]
+fn parse_pace_mb(raw: Option<&str>) -> Option<u64> {
+    raw?.trim()
+        .parse::<u64>()
+        .ok()
+        .map(|mb| mb.saturating_mul(1 << 20))
+}
+
+/// `NZBFAST_NOCACHE=1`: set F_NOCACHE on every [`FileWriter`] handle
+/// (macOS), so the large sequential output streams to the device at a
+/// steady rate instead of accumulating dirty pages for the kernel to
+/// dump in one burst - fix direction 2 of the line-rate campaign.
+/// Reads through the same handle (mapped repair, settle read-back)
+/// bypass the cache too, which is why this is bench-gated rather than
+/// a default: measure before paying that on real jobs.
+#[cfg(target_os = "macos")]
+fn nocache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NZBFAST_NOCACHE").is_ok_and(|v| v == "1"))
+}
+
+/// Apply the bench-gated F_NOCACHE policy to a fresh writer handle.
+/// Best-effort: a filesystem that refuses the fcntl just keeps the
+/// default caching behaviour.
+fn apply_cache_policy(file: &File) {
+    #[cfg(target_os = "macos")]
+    if nocache_enabled() {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: fcntl takes only the raw fd plus integer arguments;
+        // the borrow of `file` keeps the fd open across the call.
+        unsafe {
+            libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = file;
+    }
 }
 
 /// What the output directory is sitting on.
@@ -346,9 +444,9 @@ pub struct FileWriter {
     /// "are bytes [off, off+len) really on disk yet?". Out-of-order
     /// arrival keeps this list tiny (≈ number of gaps, not writes).
     intervals: std::sync::Mutex<Vec<(u64, u64)>>,
-    /// Next `written` watermark at which maybe_drop_cache fires. Read
-    /// only on platforms where the cache-drop path compiles in, hence
-    /// dead elsewhere.
+    /// Next `written` watermark at which the per-stride write hook
+    /// fires (Linux: maybe_drop_cache; macOS: maybe_pace_writeback -
+    /// at most one of which compiles in). Dead on Windows.
     #[allow(dead_code)]
     drop_next: AtomicU64,
 }
@@ -438,6 +536,7 @@ impl FileWriter {
             .write(true)
             .truncate(true)
             .open(path)?;
+        apply_cache_policy(&file);
         preallocate_capped(&file, size, prealloc_cap)?;
         Ok(FileWriter {
             file: std::sync::RwLock::new(Some(file)),
@@ -476,6 +575,7 @@ impl FileWriter {
             .read(true)
             .write(true)
             .open(path)?;
+        apply_cache_policy(&file);
         preallocate_capped(&file, size, prealloc_cap)?;
         Ok(FileWriter {
             file: std::sync::RwLock::new(Some(file)),
@@ -500,6 +600,7 @@ impl FileWriter {
         write_all_at(self.handle()?.as_ref().unwrap(), data, offset)?;
         let fresh = self.note_written(offset, data.len() as u64);
         self.maybe_drop_cache();
+        self.maybe_pace_writeback();
         // Decompression-bomb budget (extraction outputs only). The bytes
         // are already on disk when this trips, exactly like the disk-path
         // `BombGuardWriter` - the point is to stop the NEXT gigabyte, and
@@ -563,6 +664,62 @@ impl FileWriter {
 
     #[cfg(not(target_os = "linux"))]
     fn maybe_drop_cache(&self) {}
+
+    /// Line-rate campaign (6 Aug 2026): the sawtooth that keeps a
+    /// download from HOLDING line rate is write-side burstiness. At
+    /// 10 Gbps the decoded stream dirties page cache faster than macOS
+    /// writes it back; every ~8 GB the kernel dumps the backlog in one
+    /// multi-GB/s burst (2941-5890 MB/s measured while the wire
+    /// stalled), our writers block behind it, the fetch->decode channel
+    /// fills, and the pool parks for seconds. Pacing the writeback
+    /// ourselves - an fsync every stride of NEW bytes per file - keeps
+    /// the dirty set bounded at about one stride, so the flush the OS
+    /// would have saved up happens as frequent small pauses the channel
+    /// absorbs instead of one rare dump the wire cannot hide.
+    ///
+    /// Plain `libc::fsync`, deliberately NOT `File::sync_data`: on
+    /// Apple platforms std promotes sync_data to a device-barrier
+    /// fcntl, and a barrier per stride would tax the drive for a
+    /// durability promise this path does not need (fsync moves the
+    /// dirty pages to the device, which is the whole point here).
+    ///
+    /// `NZBFAST_WRITE_PACE_MB` sets the stride in MB; 0 disables; unset
+    /// = the measured 32 MB default (see `write_pace_stride`). macOS
+    /// only: Linux paces through `maybe_drop_cache`'s sync_file_range,
+    /// and Windows has not shown the sawtooth.
+    #[cfg(target_os = "macos")]
+    fn maybe_pace_writeback(&self) {
+        let stride = write_pace_stride();
+        if stride == 0 {
+            return;
+        }
+        let w = self.written.load(Ordering::Relaxed);
+        let due = self.drop_next.load(Ordering::Relaxed);
+        if w < due
+            || self
+                .drop_next
+                .compare_exchange(due, w + stride, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        use std::os::unix::io::AsRawFd;
+        // Parked: the handle is gone and park() synced on the way down.
+        let g = self.file.read_ok();
+        let Some(fd) = g.as_ref().map(|f| f.as_raw_fd()) else {
+            return;
+        };
+        // SAFETY: fsync takes only the raw fd; the read guard `g` keeps
+        // the File open across the call. Concurrent pwrites from the
+        // other decode workers proceed under their own read guards -
+        // only park() (write lock) waits, and it wants the sync anyway.
+        unsafe {
+            libc::fsync(fd);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn maybe_pace_writeback(&self) {}
 
     /// pread through the writer's own handle - spares callers a fresh
     /// open() per read (the mapped-repair path reads thousands of
@@ -630,7 +787,9 @@ impl FileWriter {
         if g.is_some() {
             return Ok(());
         }
-        *g = Some(OpenOptions::new().read(true).write(true).open(&self.path)?);
+        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        apply_cache_policy(&file);
+        *g = Some(file);
         Ok(())
     }
 
@@ -918,6 +1077,84 @@ mod case_probe_tests {
 mod tests {
     use super::*;
 
+    /// Fault-injecting writer for the disk-full halt rig: forwards to a
+    /// real [`FileWriter`] until `budget` bytes have been accepted, then
+    /// every write fails with `StorageFull` - the shape of a volume that
+    /// filled mid-download.
+    struct FaultWriter {
+        inner: FileWriter,
+        budget: AtomicU64,
+    }
+
+    impl FaultWriter {
+        fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+            let left = self.budget.load(Ordering::Relaxed);
+            if (data.len() as u64) > left {
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "No space left on device (injected)",
+                ));
+            }
+            self.budget.fetch_sub(data.len() as u64, Ordering::Relaxed);
+            self.inner.write_at(offset, data)
+        }
+    }
+
+    /// The rig itself: writes land until the injected volume fills, the
+    /// failure carries `StorageFull`, and `storage_exhausted` classifies
+    /// it - which is exactly the signal the decode consumers halt on.
+    #[test]
+    fn fault_writer_storage_full_after_n_bytes_classifies() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-faultw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fills.bin");
+        let w = FaultWriter {
+            inner: FileWriter::create(&path, 16).unwrap(),
+            budget: AtomicU64::new(8),
+        };
+        w.write_at(0, b"abcd").unwrap();
+        w.write_at(4, b"efgh").unwrap();
+        let e = w.write_at(8, b"ijkl").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::StorageFull, "{e}");
+        assert!(storage_exhausted(&e), "{e}");
+        // What landed before the fill is intact - the journal's resume
+        // contract rests on that.
+        assert_eq!(&std::fs::read(&path).unwrap()[..8], b"abcdefgh");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn storage_exhausted_kinds_and_raw_codes() {
+        for kind in [
+            io::ErrorKind::StorageFull,
+            io::ErrorKind::QuotaExceeded,
+            io::ErrorKind::ReadOnlyFilesystem,
+            io::ErrorKind::WriteZero,
+        ] {
+            assert!(storage_exhausted(&io::Error::new(kind, "x")), "{kind:?}");
+        }
+        assert!(!storage_exhausted(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "x"
+        )));
+        assert!(!storage_exhausted(&io::Error::other("x")));
+        #[cfg(unix)]
+        {
+            // ENOSPC and EROFS classify; 112 is EHOSTDOWN here, NOT
+            // Windows' ERROR_DISK_FULL - the platform trap this gate
+            // exists for.
+            assert!(storage_exhausted(&io::Error::from_raw_os_error(28)));
+            assert!(storage_exhausted(&io::Error::from_raw_os_error(30)));
+            assert!(!storage_exhausted(&io::Error::from_raw_os_error(112)));
+        }
+        #[cfg(windows)]
+        {
+            assert!(storage_exhausted(&io::Error::from_raw_os_error(112)));
+            assert!(storage_exhausted(&io::Error::from_raw_os_error(39)));
+            assert!(!storage_exhausted(&io::Error::from_raw_os_error(28)));
+        }
+    }
+
     /// A parked writer keeps its bytes and its identity, refuses writes while
     /// it is parked, and comes back usable. The refusal is the point: a write
     /// that landed while an external par2 owned the file would be overwritten
@@ -998,6 +1235,21 @@ mod tests {
             ),
             "{here:?}"
         );
+    }
+
+    /// The pacing-stride mapping: MB in, bytes out, 0 = explicitly off,
+    /// unset/garbage = defer to the process default. Through the pure
+    /// seam so the suite never mutates shared process env.
+    #[test]
+    fn pace_stride_parses_mb_zero_and_garbage() {
+        assert_eq!(parse_pace_mb(Some("32")), Some(32 << 20));
+        assert_eq!(parse_pace_mb(Some(" 8 ")), Some(8 << 20));
+        assert_eq!(parse_pace_mb(Some("0")), Some(0), "0 is OFF, not unset");
+        assert_eq!(parse_pace_mb(Some("lots")), None);
+        assert_eq!(parse_pace_mb(Some("")), None);
+        assert_eq!(parse_pace_mb(None), None);
+        // Absurd values saturate instead of wrapping back under the cap.
+        assert_eq!(parse_pace_mb(Some("18446744073709551615")), Some(u64::MAX));
     }
 
     /// The operator override names a profile in both directions, so a

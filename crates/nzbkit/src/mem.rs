@@ -247,6 +247,19 @@ impl MemBudget {
     /// sooner and the TCP windows close - the systemic response the
     /// slow-disk throttle test already pins.
     pub fn channel_depth(&self) -> usize {
+        // Line-rate A/B (6 Aug 2026): a page-cache flush burst reaches
+        // the sockets through exactly this channel, so the decoupling
+        // candidate is "make it deeper". Bench override only - the
+        // budget-derived depth stays the shipped behaviour.
+        static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        if let Some(d) = OVERRIDE.get_or_init(|| {
+            std::env::var("NZBFAST_CHANNEL_DEPTH")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .map(|d| d.clamp(8, 8192))
+        }) {
+            return *d;
+        }
         ((self.total / 16) / (800 * 1024)).clamp(8, 256) as usize
     }
 

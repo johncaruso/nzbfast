@@ -1,0 +1,1044 @@
+//! serve tests: the API surface, the settings reflection guards, and
+//! the process plumbing (run_capped, the body budget, redaction).//!
+//! Split out of serve/mod.rs's inline `mod tests` by TODO 106 phase 4;
+//! attached to serve as a sibling child module, so `super` still means
+//! `serve` exactly as it did inline.
+
+use super::*;
+
+/// M5 (Codex sweep 5 Aug): a recategorize that physically moved the
+/// payload and then could not write the queue file answered
+/// `status:true` - and the restart restored the OLD record over the
+/// emptied source, orphaning the bytes at the destination. The
+/// caller must hear that the move happened but the record did not
+/// stick, with both paths in hand.
+#[cfg(unix)]
+#[test]
+fn a_recategorize_whose_record_cannot_persist_is_reported() {
+    use crate::serve::job::{JobState, job_from_json};
+    use crate::serve::testutil::test_daemon;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("nzbfast-recatsave-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = test_daemon(&dir);
+    let out = dir.join("out").join("Some.Job");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("payload.bin"), b"bytes").unwrap();
+    let job = Arc::new(Mutex::new(
+        job_from_json(&json!({
+            "nzo_id": "SABnzbd_nzo_recat",
+            "name": "Some.Job",
+            "nzb_path": dir.join("some.nzb").to_string_lossy(),
+            "out_dir": out.to_string_lossy(),
+            "state": "Completed",
+            "category": "tv",
+        }))
+        .unwrap(),
+    ));
+    assert_eq!(job.lock_ok().state, JobState::Completed);
+    d.history.lock_ok().push(job.clone());
+    let spool = dir.join("spool");
+    std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let v = history_change_cat(&d, "SABnzbd_nzo_recat", "movies");
+    std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The move itself happened and the live record follows the bytes...
+    let dest = dir.join("out").join("movies").join("Some.Job");
+    assert!(
+        dest.join("payload.bin").exists(),
+        "the payload did not move: {v}"
+    );
+    assert_eq!(job.lock_ok().out_dir, dest);
+    // ...but the response is a failure that names both paths.
+    assert_eq!(v["status"], false, "{v}");
+    let e = v["error"].as_str().unwrap_or_default();
+    assert!(e.contains("could not be written"), "{v}");
+    assert!(e.contains(&*out.to_string_lossy()), "{v}");
+    assert!(e.contains(&*dest.to_string_lossy()), "{v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A line is advertised in megaBITS everywhere on earth, so "900M"
+/// in the Line speed box is what a person on a 900 Mbps connection
+/// types - and reading it as 900 MB/s made their line eight times
+/// bigger than it is, which is how a healthy 37 MB/s got scored as
+/// "4% of your line".
+#[test]
+fn bit_units_are_bits_and_byte_units_are_bytes() {
+    // 900 Mbps = 112.5 MB/s, however it is spelled.
+    for s in [
+        "900Mb", "900Mbit", "900Mbits", "900Mbps", "900mbps", "900 Mbps", "900Mb/s",
+    ] {
+        assert_eq!(parse_size(s), Some(112_500_000), "{s}");
+    }
+    assert_eq!(parse_size("1Gbps"), Some(125_000_000));
+    // Explicit bytes stay bytes...
+    assert_eq!(parse_size("900MB"), Some(900_000_000));
+    assert_eq!(parse_size("112MB/s"), Some(112_000_000));
+    // ...and so does a bare magnitude. 29 call sites read disk and
+    // cache sizes through this; they are not secretly about bits.
+    assert_eq!(parse_size("900M"), Some(900_000_000));
+    assert_eq!(parse_size("1G"), Some(1_000_000_000));
+    assert_eq!(parse_size("4096"), Some(4096));
+}
+
+/// Nothing that parsed before parses differently now. Every suffixed
+/// form was REJECTED by this function, so the change can only turn a
+/// refusal into a number - which is what made it safe to land
+/// against a parser this widely used.
+#[test]
+fn the_old_accepted_forms_are_untouched() {
+    assert_eq!(parse_size("0"), Some(0));
+    assert_eq!(parse_size("10G"), Some(10_000_000_000));
+    assert_eq!(parse_size("4M"), Some(4_000_000));
+    assert_eq!(parse_size("  2K  "), Some(2_000));
+    assert_eq!(parse_size("who knows"), None);
+    assert_eq!(parse_size(""), None);
+    assert_eq!(parse_size("-5M"), None);
+}
+
+/// SAB's `nzo_ids` selector: named ids bypass the start/limit
+/// window entirely (Sonarr reconciles weeks-old downloads by id -
+/// pagination hiding one reads as "deleted" and wedges it).
+#[test]
+fn nzo_ids_select_directly_and_skip_pagination() {
+    let p = |kv: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    // Absent, empty, or all-blank lists mean "no selection".
+    assert_eq!(nzo_ids_param(&p(&[])), None);
+    assert_eq!(nzo_ids_param(&p(&[("nzo_ids", "")])), None);
+    assert_eq!(nzo_ids_param(&p(&[("nzo_ids", " , ,")])), None);
+    // A comma list parses with whitespace tolerated.
+    let ids = nzo_ids_param(&p(&[(
+        "nzo_ids",
+        "SABnzbd_nzo_nzbfast1, SABnzbd_nzo_nzbfast7",
+    )]))
+    .expect("two ids");
+    assert!(ids.contains("SABnzbd_nzo_nzbfast1"));
+    assert!(ids.contains("SABnzbd_nzo_nzbfast7"));
+    assert_eq!(ids.len(), 2);
+    // The selection path must not paginate: the same params carry a
+    // limit that would hide the row, and the history/queue builders
+    // branch on `ids.is_some()` to skip `paginate`. Guard the
+    // paginate half here: with limit=1 and start=1 the second slot
+    // survives only via the ids branch.
+    let slots = vec![json!({"nzo_id": "a"}), json!({"nzo_id": "b"})];
+    let paged = paginate(
+        slots,
+        &p(&[("start", "0"), ("limit", "1"), ("nzo_ids", "b")]),
+    );
+    assert_eq!(paged.len(), 1, "paginate itself stays id-blind");
+}
+
+/// SAB accepts priorities as numbers or words; unknown words stay
+/// None so the -100 "not given" sentinel logic is untouched.
+#[test]
+fn priority_tokens_parse_like_sab() {
+    use super::sabcompat::parse_priority_token as t;
+    assert_eq!(t("2"), Some(2));
+    assert_eq!(t("-100"), Some(-100));
+    assert_eq!(t("force"), Some(2));
+    assert_eq!(t("Force"), Some(2));
+    assert_eq!(t("HIGH"), Some(1));
+    assert_eq!(t("normal"), Some(0));
+    assert_eq!(t("low"), Some(-1));
+    assert_eq!(t("paused"), Some(-2));
+    assert_eq!(t("urgent"), None);
+    assert_eq!(t(""), None);
+}
+
+/// Going offline pauses; coming back online must unpause ONLY the
+/// pause that going offline created.
+///
+/// The case that matters is the third: an operator pauses by hand,
+/// then goes offline to free the account, then comes back online.
+/// Resuming their download for them is not what "online" was asked
+/// to do, and it would start a transfer they deliberately stopped -
+/// possibly a metered one.
+#[test]
+fn coming_online_does_not_resume_a_download_the_user_paused() {
+    // Running -> offline: offline owns the pause, and gives it back.
+    assert_eq!(offline_pause_transition(true, false, false), (true, true));
+    assert_eq!(offline_pause_transition(false, true, true), (false, false));
+
+    // Already paused by hand -> offline: the pause is not ours...
+    assert_eq!(offline_pause_transition(true, true, false), (true, false));
+    // ...so coming back online leaves it exactly as the user set it.
+    assert_eq!(offline_pause_transition(false, true, false), (true, false));
+
+    // Online while already running is a no-op on both flags.
+    assert_eq!(
+        offline_pause_transition(false, false, false),
+        (false, false)
+    );
+}
+
+/// The daemon's `fast_par` default and the CLI's (the nzbkit flag
+/// initializer) must be the same value. Today that's by re-export;
+/// if someone splits `FAST_PAR_DEFAULT` back into a local const,
+/// this catches the two drifting apart.
+#[test]
+fn fast_par_default_matches_nzbkit() {
+    assert_eq!(FAST_PAR_DEFAULT, nzbkit::par2repair::FAST_PAR_DEFAULT);
+}
+
+/// A post-script that prints without stopping must cost a bounded
+/// amount of memory. The drain used to `read_to_string` into an
+/// unbounded `String`, so the daemon grew until it died - and it did
+/// so BEFORE the deadline could stop it, because the deadline only
+/// ever checked the process, never the pipe.
+#[cfg(unix)]
+#[test]
+fn a_script_that_never_stops_talking_is_bounded_and_still_killed() {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg("while :; do printf 'noise noise noise\\n' >&2; done");
+    let t0 = Instant::now();
+    let (status, err) = run_capped(cmd, 1).unwrap();
+    assert!(status.is_none(), "the deadline must have killed it");
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(10),
+        "returned late"
+    );
+    assert!(
+        err.len() <= SCRIPT_ERR_TAIL + 64,
+        "kept {} bytes of stderr; the ring is {SCRIPT_ERR_TAIL}",
+        err.len()
+    );
+    assert!(err.contains("noise"), "the tail is what a log line quotes");
+    assert!(err.contains("dropped"), "truncation has to be visible");
+}
+
+/// The in-flight body budget (28 Jul sweep: 8 workers x 256 MB could
+/// OOM a clamped container): a second concurrent body must WAIT when
+/// the pool is exhausted, the sole active reader must never be
+/// refused (one huge NZB still uploads on a small box), and a
+/// release must wake the waiter.
+#[test]
+fn body_budget_blocks_others_but_never_a_sole_reader() {
+    let b = std::sync::Arc::new(BodyBudget::new(10));
+    // Sole reader: exceeds the cap outright.
+    let mut a = Hold::default();
+    b.grow(&mut a, 8);
+    b.grow(&mut a, 8);
+    assert_eq!(a.bytes, 16, "the sole reader must always be admitted");
+    // A second body must wait while the first holds the pool...
+    let b2 = b.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = std::thread::spawn(move || {
+        let mut h = Hold::default();
+        b2.grow(&mut h, 4);
+        tx.send(()).unwrap();
+        b2.release(h);
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(200))
+            .is_err(),
+        "a second reader was admitted past the cap"
+    );
+    // ...and proceed the moment the first releases.
+    b.release(a);
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the waiter never woke after the release");
+    t.join().unwrap();
+}
+
+/// The deadlock the shape above hides: BOTH readers hold bytes. Each
+/// is part of the total the other is queued behind and neither
+/// releases until its read loop ends, so an unbounded wait parked the
+/// pair forever - and every later body-reading request behind them,
+/// which is all 8 HTTP workers. Reachable unauthenticated (bodies are
+/// buffered before the auth decision) and by accident on a
+/// memory-clamped box with two concurrent uploads.
+#[test]
+fn two_holders_that_exhaust_the_pool_both_finish() {
+    let b = std::sync::Arc::new(BodyBudget::new(8));
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Both must be HOLDING half before either asks for more -
+    // otherwise one thread simply runs the whole sequence first and
+    // the cycle never forms.
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let hands: Vec<_> = (0..2)
+        .map(|_| {
+            let (b, tx, gate) = (b.clone(), tx.clone(), gate.clone());
+            std::thread::spawn(move || {
+                let mut h = Hold::default();
+                // Each takes half the pool, then asks for more: the
+                // point at which both are holders and neither can
+                // proceed without the other releasing.
+                b.grow(&mut h, 4);
+                gate.wait();
+                b.grow(&mut h, 4);
+                tx.send(()).unwrap();
+                b.release(h);
+            })
+        })
+        .collect();
+    for _ in 0..2 {
+        rx.recv_timeout(BODY_BUDGET_WAIT * 3)
+            .expect("a body-budget holder never woke: the pool deadlocked");
+    }
+    for h in hands {
+        h.join().unwrap();
+    }
+}
+
+/// The escape hatch that used to be here, run for a while. Codex
+/// found this on the 31 Jul sweep and it was real: the timeout
+/// release was granted to EVERY holder, every round, forever, so a
+/// set of stalled uploads ratcheted the pool upward by one chunk each
+/// per wait instead of being held near the cap. Against the old rule
+/// this reached 117 with a cap of 16 - 7x - inside 600 ms, and in
+/// production it walks at 8 MiB per 5 s back toward the
+/// multi-gigabyte figure the budget exists to prevent, on the
+/// add-only tier `addfile` accepts.
+///
+/// The bound that has to hold: at most ONE body over the cap, because
+/// only the oldest holder is let past it. Every holder here asks for
+/// far more than its share and none of them ever releases, which is
+/// the slow-loris fleet; `EXTRA` stands in for the per-request `take`
+/// cap that bounds the single over-runner in production.
+#[test]
+fn stalled_holders_cannot_ratchet_the_pool_upward() {
+    // Eight, because eight is the HTTP worker count - the fleet size
+    // that made the original finding a ~2 GiB one.
+    const HOLDERS: u64 = 8;
+    const SHARE: u64 = 4;
+    const EXTRA: u64 = 16;
+    let cap = HOLDERS * SHARE;
+    let b = std::sync::Arc::new(BodyBudget::with_wait(
+        cap,
+        std::time::Duration::from_millis(5),
+    ));
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(HOLDERS as usize));
+    let peak = std::sync::Arc::new(AtomicU64::new(0));
+    let hands: Vec<_> = (0..HOLDERS)
+        .map(|_| {
+            let (b, gate, peak) = (b.clone(), gate.clone(), peak.clone());
+            std::thread::spawn(move || {
+                let mut h = Hold::default();
+                b.grow(&mut h, SHARE);
+                // Everyone holds its share before anyone asks for
+                // more, or one thread simply runs the whole sequence
+                // alone as the sole reader.
+                gate.wait();
+                for _ in 0..EXTRA {
+                    b.grow(&mut h, 1);
+                    peak.fetch_max(b.cur.lock().unwrap().bytes, Ordering::Relaxed);
+                }
+                b.release(h);
+            })
+        })
+        .collect();
+    for h in hands {
+        h.join().unwrap();
+    }
+    let peak = peak.load(Ordering::Relaxed);
+    assert!(
+        peak <= cap + EXTRA,
+        "the pool peaked at {peak} against a cap of {cap}: more than one \
+         body got past it, so stalled holders are ratcheting it upward"
+    );
+    assert_eq!(
+        b.cur.lock().unwrap().bytes,
+        0,
+        "every hold must be released"
+    );
+}
+
+/// The shape that leaked a blocking-pool worker per completed job: a
+/// script that backgrounds something and exits happily. The
+/// descendant inherits stdout/stderr, so the pipes stay open long
+/// after the direct child is reaped - and the drain threads used to
+/// be JOINED, which parked the caller for the descendant's lifetime
+/// however short the configured deadline was.
+#[cfg(unix)]
+#[test]
+fn a_backgrounded_descendant_cannot_outlive_the_deadline() {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg("sleep 60 & exit 0");
+    let t0 = Instant::now();
+    let (status, _) = run_capped(cmd, 5).unwrap();
+    let took = t0.elapsed();
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the script itself exited fine"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "waited {took:?} on a descendant holding the pipe"
+    );
+}
+
+/// Two workers registering different first-seen categories used to
+/// race: each took a `cat_list()` snapshot after dropping the
+/// category lock, and the later WRITE could carry the earlier
+/// snapshot - so B's category was written and then overwritten away.
+/// Live memory held both, so it only surfaced after a restart, with
+/// an *arr suddenly failing its category test.
+#[test]
+fn registering_a_category_never_drops_one_already_on_disk() {
+    // B landed {tv, movies} while A was still holding {tv, anime}.
+    assert_eq!(
+        merge_cat_list("tv, movies", "tv, anime"),
+        "tv, movies, anime"
+    );
+    // Idempotent: re-registering something already recorded rewrites
+    // the same list.
+    assert_eq!(merge_cat_list("tv, movies", "tv, movies"), "tv, movies");
+    // First category on a fresh install, and the empty-side cases.
+    assert_eq!(merge_cat_list("", "tv"), "tv");
+    assert_eq!(merge_cat_list("tv", ""), "tv");
+    assert_eq!(merge_cat_list("", ""), "");
+    // Whitespace and empty members in a hand-edited file.
+    assert_eq!(
+        merge_cat_list("tv ,, movies", " anime "),
+        "tv, movies, anime"
+    );
+}
+
+/// A scan pass owns a dedicated connection for minutes; the switch
+/// and the wipe button are one click. The pass used to republish
+/// unconditionally when it exited, so switching the indexer OFF
+/// mid-scan got a live shared connection back, and wiping got the
+/// database recreated seconds after the API reported it gone.
+#[cfg(feature = "indexer")]
+#[test]
+fn a_scan_pass_may_only_publish_into_the_index_it_started_in() {
+    // The ordinary case: same era, still on.
+    assert!(may_publish_index(7, 7, true));
+    // Switched off while the pass ran.
+    assert!(!may_publish_index(8, 8, false));
+    // Wiped while the pass ran - the era moved on, and a wipe that
+    // gets its files recreated by an exiting scan was never a wipe.
+    assert!(!may_publish_index(9, 8, true));
+    // Both, which is what switching off actually looks like (the
+    // close bumps the era too).
+    assert!(!may_publish_index(9, 8, false));
+}
+
+/// The ordinary case still has to work: exit status and stderr are
+/// what the caller logs.
+#[cfg(unix)]
+#[test]
+fn a_failing_script_reports_its_status_and_stderr() {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg("echo ignored; echo boom >&2; exit 3");
+    let (status, err) = run_capped(cmd, 30).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(3));
+    assert_eq!(err.trim(), "boom");
+}
+
+/// An indexer transport error carries the URL it failed on, and that
+/// URL carries the user's API key. It reached a rendered error row on
+/// two surfaces before this scrubber existed.
+#[test]
+fn apikey_never_rides_an_error_string() {
+    let msg = "https://idx.example/api?t=search&apikey=SECRET123&q=x: Dns Failed";
+    let got = redact_apikey(msg);
+    assert!(!got.contains("SECRET123"), "{got}");
+    assert_eq!(
+        got,
+        "https://idx.example/api?t=search&apikey=***&q=x: Dns Failed"
+    );
+    // Key last in the query, so the value runs to the end of the URL
+    // rather than to an '&'.
+    let tail = redact_apikey("https://idx/api?t=caps&apikey=abc def");
+    assert_eq!(tail, "https://idx/api?t=caps&apikey=*** def");
+    // Two of them (a message that quotes the URL twice) and a string
+    // with none at all.
+    assert_eq!(
+        redact_apikey("a apikey=1&b apikey=2&c"),
+        "a apikey=***&b apikey=***&c"
+    );
+    assert_eq!(redact_apikey("plain error"), "plain error");
+}
+
+/// The GRAB path needs more than [`redact_apikey`]. That scrubber
+/// knows the credential is spelled `apikey=` because WE built the
+/// search URL. An NZB enclosure link comes out of the indexer's own
+/// XML and can spell it anything, so the whole URL past the host goes.
+///
+/// Regression for a real leak: `fetch_url` names the URL it failed
+/// on, and both `indexer_grab` and the nzblnk ladder put that string
+/// straight into a response the dashboard renders.
+#[test]
+fn a_grab_error_shows_the_host_and_nothing_else() {
+    let got = redact_url_creds(
+        "http://idx.example/getnzb/abc?r=SECRET123&i=42: 999 bytes is too large for an NZB",
+    );
+    assert!(!got.contains("SECRET123"), "{got}");
+    // The `:` that separated the URL from the sentence goes with the
+    // URL - it is attached to it, and telling sentence punctuation
+    // apart from URL punctuation is a rabbit hole with a credential
+    // at the bottom of it. Dropping is the safe direction, and the
+    // message still reads.
+    assert_eq!(
+        got,
+        "http://idx.example/... 999 bytes is too large for an NZB"
+    );
+    // Userinfo is a credential too.
+    assert_eq!(
+        redact_url_creds("https://user:pw@idx.example/x?k=1 failed"),
+        "https://idx.example/... failed"
+    );
+    // A bare origin keeps its shape; two URLs in one sentence both go.
+    assert_eq!(
+        redact_url_creds("https://idx.example refused"),
+        "https://idx.example refused"
+    );
+    assert_eq!(
+        redact_url_creds("http://a/x?k=1 then https://b/y?k=2 done"),
+        "http://a/... then https://b/... done"
+    );
+    assert_eq!(redact_url_creds("plain error"), "plain error");
+    // https must not be matched as http:// + "s..." when both appear
+    // and the https one comes first.
+    assert_eq!(
+        redact_url_creds("https://b/y?k=2 and http://a/x?k=1"),
+        "https://b/... and http://a/..."
+    );
+}
+
+/// §4 C2: the enricher's requests must REUSE a connection.
+///
+/// `ureq::get(...)` builds a throwaway agent per call, and in ureq
+/// the agent is the connection pool, so every request reconnected
+/// and re-did the TLS handshake. The enricher makes several requests
+/// per title across thousands of titles, so this was a handshake per
+/// lookup for nothing.
+///
+/// Counting ACCEPTED TCP connections is the direct evidence: three
+/// requests to one host over a keep-alive server must open exactly
+/// one. (Loopback is deliberately not in `is_forbidden_fetch_ip`,
+/// which is what lets the guarded agent be tested at all.)
+#[test]
+fn the_shared_enrich_agent_reuses_one_connection() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+    let acc = accepted.clone();
+    let done = std::sync::Arc::new(AtomicUsize::new(0));
+    let d2 = done.clone();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            acc.fetch_add(1, Ordering::SeqCst);
+            let d = d2.clone();
+            std::thread::spawn(move || {
+                let peek = stream.try_clone().unwrap();
+                let mut r = BufReader::new(peek);
+                // Serve request after request on this ONE socket for
+                // as long as the client keeps it open.
+                loop {
+                    let mut saw_request = false;
+                    loop {
+                        let mut line = String::new();
+                        match r.read_line(&mut line) {
+                            Ok(0) => return,
+                            Ok(_) => {}
+                            Err(_) => return,
+                        }
+                        if line.starts_with("GET ") {
+                            saw_request = true;
+                        }
+                        if line == "\r\n" || line == "\n" {
+                            break;
+                        }
+                    }
+                    if !saw_request {
+                        return;
+                    }
+                    let body = "ok";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+                         Connection: keep-alive\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if stream.write_all(resp.as_bytes()).is_err() {
+                        return;
+                    }
+                    let _ = stream.flush();
+                    d.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+    });
+
+    for i in 0..3 {
+        // Fetched FRESH each time, exactly as every wall.rs call site
+        // does (`shared_enrich_agent().get(...)`). Hoisting it into a
+        // local would prove only that ureq pools within one agent -
+        // true however this function is written - instead of that the
+        // enricher's call sites share one.
+        let resp = shared_enrich_agent()
+            .get(&format!("http://127.0.0.1:{port}/x{i}"))
+            .timeout(std::time::Duration::from_secs(5))
+            .call()
+            .unwrap_or_else(|e| panic!("request {i} failed: {e}"));
+        // The body MUST be drained, or ureq cannot return the
+        // connection to the pool and the next request opens a new one.
+        let body = resp.into_string().unwrap();
+        assert_eq!(body, "ok");
+    }
+
+    // Give the last handler a moment to finish writing.
+    for _ in 0..50 {
+        if done.load(Ordering::SeqCst) >= 3 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        done.load(Ordering::SeqCst),
+        3,
+        "server should have served 3 requests"
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "three requests opened {} connections - the agent is not pooling",
+        accepted.load(Ordering::SeqCst)
+    );
+}
+
+/// A crash between publish_over_previous's two renames used to leave
+/// the superseded download under a pid-suffixed name that nothing in
+/// the tree ever looked at again, with no canonical directory at all:
+/// the job's history record pointed at a missing path, so the user's
+/// previous download had vanished from everywhere the software looks.
+#[test]
+fn an_interrupted_replace_is_put_back_at_startup() {
+    let root = std::env::temp_dir().join(format!(
+        "nzbfast-replrec-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let cat = root.join("tv");
+    std::fs::create_dir_all(&cat).unwrap();
+
+    // 1. The crash shape: aside exists, canonical is gone.
+    let aside = cat.join(format!("Show.S01E01{REPLACED_SUFFIX}999"));
+    std::fs::create_dir_all(&aside).unwrap();
+    std::fs::write(aside.join("ep.mkv"), b"the user's episode").unwrap();
+
+    // 2. Both present: ambiguous, must be left strictly alone.
+    let keep_canon = cat.join("Other.S01E02");
+    let keep_aside = cat.join(format!("Other.S01E02{REPLACED_SUFFIX}999"));
+    std::fs::create_dir_all(&keep_canon).unwrap();
+    std::fs::create_dir_all(&keep_aside).unwrap();
+    std::fs::write(keep_canon.join("new.mkv"), b"new").unwrap();
+    std::fs::write(keep_aside.join("old.mkv"), b"old").unwrap();
+
+    // 3. An ordinary directory must not be touched.
+    let normal = cat.join("Normal.S01E03");
+    std::fs::create_dir_all(&normal).unwrap();
+
+    // 4. Names that merely CONTAIN the suffix are the user's, not
+    //    ours: an aside is always <name> + suffix + pid and nothing
+    //    else, so a non-numeric tail, an empty tail and an empty stem
+    //    are all somebody else's directory. Renaming one to its stem
+    //    moves a folder of their media out from under them - and can
+    //    collide with a real download of that name.
+    let theirs: Vec<PathBuf> = vec![
+        cat.join(format!("Movie{REPLACED_SUFFIX}Final")),
+        cat.join(format!("Movie{REPLACED_SUFFIX}12ab")),
+        cat.join(format!("Movie{REPLACED_SUFFIX}")),
+        cat.join(format!("Movie{REPLACED_SUFFIX}999.part2")),
+        cat.join(format!("{REPLACED_SUFFIX}999")), // no name in front of it
+    ];
+    for d in &theirs {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(d.join("theirs.mkv"), b"theirs").unwrap();
+    }
+
+    // 5. A canonical name that itself ends in a suffix-shaped string:
+    //    the LAST occurrence is the parking one, so this must be put
+    //    back under the whole leading name, not truncated at the
+    //    first match.
+    let nested = cat.join(format!("Odd{REPLACED_SUFFIX}1a{REPLACED_SUFFIX}777"));
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("odd.mkv"), b"odd").unwrap();
+
+    recover_interrupted_publishes(&root);
+
+    let restored = cat.join("Show.S01E01");
+    assert!(
+        restored.join("ep.mkv").exists(),
+        "the only copy must be put back"
+    );
+    assert!(
+        !aside.exists(),
+        "the aside name should be gone once restored"
+    );
+    assert_eq!(
+        std::fs::read(restored.join("ep.mkv")).unwrap(),
+        b"the user's episode",
+        "restored bytes must be the user's, untouched"
+    );
+
+    // Nothing deleted in the ambiguous case - guessing wrong there
+    // would destroy a directory of somebody's media.
+    assert!(keep_canon.join("new.mkv").exists(), "canonical left alone");
+    assert!(keep_aside.join("old.mkv").exists(), "spare copy left alone");
+    assert!(normal.exists(), "unrelated directories untouched");
+
+    for d in &theirs {
+        assert!(
+            d.join("theirs.mkv").exists(),
+            "{} is not one of our asides and must be left where it is",
+            d.display()
+        );
+    }
+    assert!(
+        !cat.join("Movie").exists(),
+        "a directory that merely contains the suffix was renamed over the user"
+    );
+
+    let nested_canon = cat.join(format!("Odd{REPLACED_SUFFIX}1a"));
+    assert!(
+        nested_canon.join("odd.mkv").exists(),
+        "the aside must be split at the LAST suffix, not the first"
+    );
+    assert!(
+        !cat.join("Odd").exists(),
+        "split at the first suffix instead of the last"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The MB in these APIs is 1048576 bytes, not 1000000. MEASURED on
+/// the bench box against both reference clients: an NZB summing to
+/// exactly 104857600 bytes reported as 100 by SABnzbd 5.0.4
+/// (`mode=queue` -> "mb": "100.00") and by NZBGet (`listgroups` ->
+/// FileSizeMB: 100 with FileSizeLo/Hi giving 104857600).
+///
+/// We divided by 1_000_000, so every size was 4.9% high - Sonarr
+/// multiplies the field back by 1024*1024, which skewed both its
+/// queue sizes and its free-space thresholds.
+#[test]
+fn api_megabytes_are_the_binary_ones_both_clients_use() {
+    const PROBE: u64 = 104_857_600; // exactly 100 MiB, the NZB used
+    assert_eq!(API_MB_U, 1_048_576);
+    assert_eq!(API_MB, 1_048_576.0);
+    assert_eq!(PROBE / API_MB_U, 100, "NZBGet reported 100 for these bytes");
+    assert_eq!(
+        format!("{:.2}", PROBE as f64 / API_MB),
+        "100.00",
+        "SAB reported \"100.00\" for these bytes"
+    );
+
+    // The NZBGet size triple has to agree with itself: Lo/Hi are the
+    // exact bytes clients actually key on, and *SizeMB is derived.
+    let m = size_fields("File", PROBE);
+    let lo = m["FileSizeLo"].as_u64().unwrap();
+    let hi = m["FileSizeHi"].as_u64().unwrap();
+    assert_eq!(hi * (1 << 32) + lo, PROBE, "Lo/Hi must be the exact bytes");
+    assert_eq!(m["FileSizeMB"].as_u64().unwrap(), 100);
+
+    // And the old divisor must not creep back.
+    assert_ne!(
+        PROBE / 1_000_000,
+        PROBE / API_MB_U,
+        "104 vs 100 - the whole bug"
+    );
+}
+
+/// Sonarr parses SAB's `timeleft` as a .NET TimeSpan, and the
+/// `hh:mm:ss` form rejects hours above 23 - so an unbounded hours
+/// field did not just misreport one job, it failed the whole
+/// `mode=queue` payload and took every download's tracking with it.
+/// Past a day the value has to carry a days component.
+#[test]
+fn sab_timeleft_never_emits_an_hours_field_dotnet_will_reject() {
+    // Under a day: unchanged, bare hours.
+    assert_eq!(sab_timeleft(0.0), "0:00:00");
+    assert_eq!(sab_timeleft(59.4), "0:00:59");
+    assert_eq!(sab_timeleft(3600.0), "1:00:00");
+    assert_eq!(sab_timeleft(86_399.0), "23:59:59");
+
+    // The regression: 500 GB on a 40 Mbit line. Was "27:46:12".
+    assert_eq!(sab_timeleft(99_972.0), "1:03:46:12");
+
+    // Exactly a day, and a long one.
+    assert_eq!(sab_timeleft(86_400.0), "1:00:00:00");
+    assert_eq!(sab_timeleft(1_000_000.0), "11:13:46:40");
+
+    // Whatever we emit, the hours field is always parseable.
+    for secs in [0.0, 1.0, 86_399.0, 86_400.0, 500_000.0, 9_999_999.0] {
+        let out = sab_timeleft(secs);
+        let hours: u64 = out.split(':').nth_back(2).unwrap().parse().unwrap();
+        assert!(hours <= 23, "{out} has an hours field .NET will reject");
+    }
+
+    // Garbage in (a stalled or absurd rate) must not panic or emit
+    // something unparseable.
+    assert_eq!(sab_timeleft(f64::INFINITY), "0:00:00");
+    assert_eq!(sab_timeleft(f64::NAN), "0:00:00");
+    assert_eq!(sab_timeleft(-5.0), "0:00:00");
+}
+use serde_json::json;
+
+/// Every match arm in `apply_setting`, read out of our own source.
+///
+/// There is no way to reflect over a `match`, and rewriting a hundred
+/// hand-written validators into table rows would be a far bigger risk
+/// than the drift it prevents - so the source IS the reflection. The
+/// arms are string literals at a fixed indent inside one function, so
+/// this is a two-line scan rather than a parser.
+fn apply_setting_arms() -> std::collections::BTreeSet<String> {
+    // CR stripped because the splits below are byte-exact. A Windows
+    // clone made before `.gitattributes` landed has this source in CRLF
+    // (git's own core.autocrlf default), and `"\n}\n"` cannot match
+    // "\r\n}\r\n" - so the guard failed with "no recognisable end"
+    // rather than reporting drift, which is the one way a guard must
+    // never fail. `.gitattributes` pins LF now; this keeps the scan
+    // working in a checkout that predates it.
+    let src = include_str!("settings.rs").replace('\r', "");
+    let body = src
+        .split_once("\npub(super) fn apply_setting(")
+        .expect("apply_setting moved or was renamed")
+        .1
+        .split_once("\n}\n")
+        .expect("apply_setting has no recognisable end")
+        .0;
+    body.lines()
+        .filter_map(|l| l.strip_prefix("        \""))
+        .filter(|l| l.contains("=> {") || l.contains("=> (") || l.contains("=> set_"))
+        .flat_map(|l| {
+            // One arm can carry several names: `"a" | "b" => {`.
+            l.split("=>")
+                .next()
+                .unwrap_or("")
+                .split('|')
+                .map(|n| n.trim().trim_matches('"').to_string())
+                .filter(|n| !n.is_empty() && !n.contains(' '))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// THE guard this whole table exists for.
+///
+/// Before it, the settings allowlist, the `apply_setting` match and
+/// the `get_config` literal were three hand-maintained lists, and a
+/// setting missing from one of them failed silently - no error, the
+/// setting just did nothing. Now `get_config` and the log rules are
+/// generated from the table, so only this last edge can drift: a new
+/// `apply_setting` arm whose row nobody added (invisible in the UI
+/// and unloggable), or a row whose arm nobody wrote (rejected at the
+/// API with a "this is a bug" message).
+#[test]
+fn apply_arms_match_the_table() {
+    let arms = apply_setting_arms();
+    // The source scan cannot see cfg attributes, so in slim builds
+    // subtract the indexer arms that are compiled out together with
+    // their table rows.
+    #[cfg(not(feature = "indexer"))]
+    let arms: std::collections::BTreeSet<String> = {
+        const INDEXER_ARMS: &[&str] = &[
+            "index_db",
+            "index_gates",
+            "index_enabled",
+            "spot_enabled",
+            "index_interests",
+            "index_evict_order",
+            "index_evict_kinds",
+            "predb_max_rows",
+            "predb_seed_days",
+        ];
+        arms.into_iter()
+            .filter(|a| !INDEXER_ARMS.contains(&a.as_str()))
+            .collect()
+    };
+    assert!(
+        arms.len() > 60,
+        "the source scan found only {} arms - it has stopped matching \
+         apply_setting's shape and is no longer guarding anything",
+        arms.len()
+    );
+    let declared: std::collections::BTreeSet<String> = settings()
+        .filter(|s| s.write == Write::Setting)
+        .map(|s| s.name.to_string())
+        .collect();
+    let missing_row: Vec<_> = arms.difference(&declared).collect();
+    assert!(
+        missing_row.is_empty(),
+        "apply_setting writes these, but they have no row in the settings \
+         table - so get_config never shows them and the config log cannot \
+         classify them: {missing_row:?}"
+    );
+    let missing_arm: Vec<_> = declared.difference(&arms).collect();
+    assert!(
+        missing_arm.is_empty(),
+        "the settings table declares these as writable, but apply_setting \
+         has no arm for them - setting one is rejected: {missing_arm:?}"
+    );
+}
+
+/// The watcher deletes the user's .nzb once it has queued it, so
+/// "looks complete" is the check standing between a half-copied file
+/// and a release that is queued in fragments and then unrecoverable.
+/// It must never say yes to a truncated file.
+#[test]
+fn a_truncated_nzb_never_looks_complete() {
+    let whole = br#"<?xml version="1.0"?><nzb><file subject="x"></file></nzb>"#;
+    assert!(nzb_looks_complete(whole));
+    // Trailing whitespace is how most writers finish a file.
+    assert!(nzb_looks_complete(b"<nzb></nzb>\n"));
+    assert!(nzb_looks_complete(b"<nzb></nzb>\r\n  \t\n"));
+    // Every prefix of a real nzb is what a copy in flight looks like,
+    // and a half-written one still PARSES - which is the whole reason
+    // this function exists rather than trusting the reader.
+    for cut in 0..whole.len() {
+        assert!(
+            !nzb_looks_complete(&whole[..cut]),
+            "a {cut}-byte prefix was accepted as a whole nzb"
+        );
+    }
+    assert!(!nzb_looks_complete(b""));
+    // The closing tag has to be at the END, not merely present.
+    assert!(!nzb_looks_complete(b"<nzb></nzb><file>still writing"));
+}
+
+/// Sub-second resolution is load-bearing now that a pass can follow
+/// another by 250 ms: at one-second granularity two samples that close
+/// together are identical by construction, so "unchanged since I last
+/// looked" would be true of a copy that is still running.
+#[test]
+fn watch_signature_has_sub_second_resolution() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-sig-ms-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("a.nzb");
+    std::fs::write(&f, b"<nzb>").unwrap();
+    let a = watch_sig(&f).unwrap();
+    // A value in seconds would be ~1.7e9; in milliseconds ~1.7e12.
+    assert!(a.0 > 1_000_000_000_000, "mtime {} is not milliseconds", a.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Names are the persisted keys in settings.json. A duplicate row
+/// would make `setting()` resolve to whichever came first, and two
+/// rows exposing the same name would silently drop one value.
+#[test]
+fn setting_names_are_unique() {
+    let mut seen = std::collections::BTreeSet::new();
+    for s in settings() {
+        assert!(seen.insert(s.name), "duplicate settings row: {}", s.name);
+    }
+}
+
+/// Credentials must never reach the log, whatever else changes about
+/// how the table is built.
+#[test]
+fn credentials_are_never_logged() {
+    for name in ["apikey", "nzbkey", "omdb_key"] {
+        assert_eq!(log_value(name, "hunter2"), "•••");
+    }
+    assert!(!log_value("notify_targets", r#"[{"kind":"plex","url":"tok"}]"#).contains("tok"));
+    assert!(!log_value("feeds", r#"[{"url":"x?apikey=tok"}]"#).contains("tok"));
+    assert!(
+        !log_value(
+            "indexers",
+            r#"[{"name":"g","url":"https://x","apikey":"tok"}]"#
+        )
+        .contains("tok")
+    );
+    // A name with no row at all is shape-only, not verbatim.
+    assert_eq!(
+        log_value("brand_new_secret", "hunter2"),
+        "(7 chars, not logged)"
+    );
+}
+
+/// The tray cannot link against this binary, so it greps daemon.log
+/// for KEYLESS_MARKER to tell "deliberately refused to start" from
+/// "crashed" - and shows the user completely different advice for
+/// each. If the two copies of the string ever drift, the tray
+/// silently falls back to "stopped unexpectedly, try Restart", which
+/// is the exact wrong answer: restarting fails identically forever.
+/// Keep this in step with crates/nzbtray/src/main.rs.
+#[test]
+fn keyless_marker_matches_the_trays_copy() {
+    const TRAY_COPY: &str = "nzbfast cannot start: API key file";
+    assert_eq!(
+        KEYLESS_MARKER, TRAY_COPY,
+        "nzbtray greps for this exact string; update both or the tray \
+         shows the wrong advice"
+    );
+    // And the message a user sees must actually begin with it, or the
+    // tray's find() lands mid-sentence and prints a fragment.
+    let msg = keyless_help(std::path::Path::new("C:\\x\\apikey"), "is empty");
+    assert!(
+        msg.starts_with(KEYLESS_MARKER),
+        "message must lead with the marker: {msg}"
+    );
+    // The three remedies are the whole point of the rewrite.
+    for needle in [
+        "Sonarr",
+        "DELETE the file",
+        "NZBFAST_OPEN=1",
+        "C:\\x\\apikey",
+    ] {
+        assert!(msg.contains(needle), "missing {needle} from:\n{msg}");
+    }
+}
+
+#[cfg(feature = "indexer")]
+#[test]
+fn live_tip_policy_applies_custom_categories_to_gate_and_ingest() {
+    let db = std::env::temp_dir().join(format!(
+        "nzbfast-tip-custom-{}-{}.db",
+        std::process::id(),
+        epoch_secs()
+    ));
+    let _ = std::fs::remove_file(&db);
+    let cats = vec![nzbkit::categories::CustomCategory {
+        slug: "formula-1".into(),
+        name: "Formula 1".into(),
+        pattern: r"^formula\.?1\.".into(),
+        not_match: String::new(),
+        base: nzbkit::categories::BaseBehavior::Movie,
+    }];
+    let gates = crate::gates::Gates::from_json(r#"{"kinds":["formula-1"]}"#).unwrap();
+    let mut ix = nzbkit::index::Index::open(&db).unwrap();
+    install_live_ingest_policy(&mut ix, Some(gates), cats);
+    let stem = "Formula1.2026.Round11.Hungary.Qualifying.F1TV.1080p";
+    let entry = nzbkit::nntp::OverEntry {
+        number: 1,
+        subject: format!(r#""{stem}.mkv" yEnc (1/1)"#),
+        from: "poster".into(),
+        message_id: "<tip-custom@test>".into(),
+        bytes: 1024,
+        date: 1_700_000_000,
+    };
+    assert_eq!(
+        ix.ingest("alt.binaries.formula1", &[entry], 1_700_000_001)
+            .unwrap(),
+        1
+    );
+    let q = nzbkit::index::BrowseQuery {
+        kind: Some("formula-1".into()),
+        limit: 10,
+        ..Default::default()
+    };
+    let (rows, _) = ix.browse(&q).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, "formula-1");
+    drop(ix);
+    let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(db.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db.with_extension("db-shm"));
+}

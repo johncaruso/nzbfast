@@ -1,6 +1,6 @@
-// Home: one playback-first list. Active jobs with live progress and a
-// Play affordance the moment the preview probe says a media file is
-// reachable, then history.
+// Home: one playback-first list, fed by the one mode=playback poll.
+// Active jobs with live progress and a Play affordance the moment the
+// job row's readiness says a media file is reachable, then history.
 import SwiftUI
 
 struct HomeView: View {
@@ -26,18 +26,18 @@ struct HomeView: View {
         .navigationTitle("nzbfast")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                if let q = state.queue {
+                if let snap = state.snapshot {
                     Button {
                         Task {
-                            try? await (q.paused == true
+                            try? await (snap.paused == true
                                         ? state.api()?.resumeAll()
                                         : state.api()?.pauseAll())
                             await state.refresh()
                         }
                     } label: {
-                        Image(systemName: q.paused == true ? "play.fill" : "pause.fill")
+                        Image(systemName: snap.paused == true ? "play.fill" : "pause.fill")
                     }
-                    .accessibilityLabel(q.paused == true ? "Resume all" : "Pause all")
+                    .accessibilityLabel(snap.paused == true ? "Resume all" : "Pause all")
                 }
             }
         }
@@ -54,29 +54,27 @@ struct HomeView: View {
 
     @ViewBuilder private var queueSection: some View {
         Section("Active") {
-            if let slots = state.queue?.slots, !slots.isEmpty {
-                ForEach(slots) { slot in
-                    QueueRow(slot: slot,
-                             ready: state.probeReady(slot.id),
-                             onPlay: { play(slot.id) })
+            if let jobs = state.snapshot?.queue, !jobs.isEmpty {
+                ForEach(jobs) { job in
+                    QueueRow(job: job, onPlay: { play(job) })
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         Button(role: .destructive) {
-                            run { try await state.api()?.deleteJob(slot.id, deleteFiles: true) }
+                            run { try await state.api()?.deleteJob(job.id, deleteFiles: true) }
                         } label: { Label("Delete", systemImage: "trash") }
-                        if slot.isPaused {
+                        if job.isPaused {
                             Button {
-                                run { try await state.api()?.resumeJob(slot.id) }
+                                run { try await state.api()?.resumeJob(job.id) }
                             } label: { Label("Resume", systemImage: "play") }
                             .tint(.green)
                         } else {
                             Button {
-                                run { try await state.api()?.pauseJob(slot.id) }
+                                run { try await state.api()?.pauseJob(job.id) }
                             } label: { Label("Pause", systemImage: "pause") }
                             .tint(.orange)
                         }
                     }
                 }
-            } else if state.queue != nil {
+            } else if state.snapshot != nil {
                 Text("Nothing downloading. Add an NZB from the Add tab.")
                     .foregroundStyle(.secondary)
                     .font(.footnote)
@@ -87,13 +85,13 @@ struct HomeView: View {
     }
 
     @ViewBuilder private var historySection: some View {
-        if let slots = state.history?.slots, !slots.isEmpty {
+        if let jobs = state.snapshot?.history, !jobs.isEmpty {
             Section("History") {
-                ForEach(slots) { slot in
-                    HistoryRow(slot: slot, onPlay: { play(slot.id) })
+                ForEach(jobs) { job in
+                    HistoryRow(job: job, onPlay: { play(job) })
                         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                             Button(role: .destructive) {
-                                run { try await state.api()?.deleteHistory(slot.id, deleteFiles: false) }
+                                run { try await state.api()?.deleteHistory(job.id, deleteFiles: false) }
                             } label: { Label("Remove", systemImage: "trash") }
                         }
                 }
@@ -113,10 +111,10 @@ struct HomeView: View {
         }
     }
 
-    private func play(_ id: String) {
+    private func play(_ job: PlaybackJob) {
         Task {
             do {
-                try await state.requestPlay(id: id)
+                try await state.requestPlay(job: job)
             } catch {
                 actionError = (error as? LocalizedError)?.errorDescription
                     ?? "Could not fetch a play link for that job."
@@ -126,31 +124,32 @@ struct HomeView: View {
 }
 
 struct QueueRow: View {
-    let slot: QueueSlot
-    let ready: Bool
+    let job: PlaybackJob
     let onPlay: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(slot.name)
+                Text(job.displayName)
                     .font(.subheadline.weight(.medium))
                     .lineLimit(1)
-                ProgressView(value: min(max(slot.pct / 100, 0), 1))
-                    .tint(slot.isPaused ? .orange : .accentColor)
+                ProgressView(value: min(max(job.pct / 100, 0), 1))
+                    .tint(job.isPaused ? .orange : .accentColor)
                 HStack(spacing: 6) {
-                    Text(slot.status ?? "")
-                    if slot.totalMB > 0 {
-                        Text(String(format: "%.0f%% of %.0f MB", slot.pct, slot.totalMB))
+                    Text(job.status ?? "")
+                    if let mb = job.mb, mb > 0 {
+                        Text(String(format: "%.0f%% of %.0f MB", job.pct, mb))
                     }
-                    if let tl = slot.timeleft, !tl.isEmpty, tl != "0:00:00" {
+                    if let tl = job.timeleft, !tl.isEmpty, tl != "0:00:00" {
                         Text(tl)
                     }
                 }
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             }
-            if ready {
+            // playback.ready on the row replaces the per-job probe:
+            // reason "live" (or "disk") means /stream serves it now.
+            if job.ready {
                 Button(action: onPlay) {
                     Image(systemName: "play.circle.fill")
                         .font(.system(size: 30))
@@ -165,30 +164,36 @@ struct QueueRow: View {
 }
 
 struct HistoryRow: View {
-    let slot: HistorySlot
+    let job: PlaybackJob
     let onPlay: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(slot.name ?? slot.id)
+                Text(job.displayName)
                     .font(.subheadline.weight(.medium))
                     .lineLimit(1)
                 HStack(spacing: 6) {
-                    if slot.isFailed {
-                        Label(slot.failMessage ?? "Failed", systemImage: "xmark.circle")
+                    if job.isFailed {
+                        Label(job.failMessage?.isEmpty == false ? job.failMessage! : "Failed",
+                              systemImage: "xmark.circle")
                             .foregroundStyle(.red)
                             .lineLimit(1)
                     } else {
-                        Text(slot.status ?? "")
-                        if let size = slot.size, !size.isEmpty { Text(size) }
+                        Text(job.status ?? "")
+                        if let b = job.bytes, b > 0 {
+                            Text(String(format: "%.1f MB", Double(b) / 1e6))
+                        }
                     }
                 }
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
-            if slot.looksPlayable {
+            // reason "disk" = the file is really still there; a row
+            // whose media has been cleaned away ("no_media") gets no
+            // Play.
+            if job.ready {
                 Button(action: onPlay) {
                     Image(systemName: "play.circle")
                         .font(.system(size: 26))

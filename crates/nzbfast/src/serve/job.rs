@@ -925,7 +925,30 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
         // history as a clean success. Saved immediately: the flag is
         // worth nothing if it only exists in memory.
         job.lock_ok().finalizing = true;
-        d.save_queue();
+        if !d.save_queue() {
+            // The comment above is literal: the marker is worth nothing
+            // if it only exists in memory. Every step below can move
+            // the payload out from under the recorded out_dir, insured
+            // only by that marker - running them uninsured means a
+            // crash mid-move restores a clean Completed record over a
+            // half-moved payload (Codex sweep 5 Aug M6). Leave the
+            // finished files exactly where the record says they are,
+            // and say why on the row; an unlock/retry re-runs this
+            // whole tail once the disk is writable again.
+            error!(
+                target: "queue",
+                "{name2:?}: the finalize marker could not be written - \
+                 post-processing skipped, the finished files are untouched at {}. \
+                 Check free space and write permission on the data folder, then \
+                 retry the job to unpack and move them",
+                out2.display()
+            );
+            let mut j = job.lock_ok();
+            j.finalizing = false;
+            j.unpack_blocked_by =
+                "post-processing skipped: the queue file could not be written".to_string();
+            return;
+        }
         // Cloned handle for the blocking finalize (the caller still
         // needs its own for park()/script).
         let d3 = d.clone();
@@ -1500,10 +1523,26 @@ pub(crate) fn disk_full_failure(msg: &str) -> bool {
     m.contains("no space left")
         || m.contains("not enough space")
         || m.contains("disk full")
+        // The pipeline's own mid-download verdict (see drain_network in
+        // get/workers.rs): classified at the write by error KIND, so the
+        // quoted OS text may be in any language or carry an odd code.
+        || m.contains("out of disk space")
         // With the closing paren, so "os error 28" cannot match
         // "os error 280" - std's io::Error always prints "(os error N)".
         || (cfg!(windows) && m.contains("os error 112)"))
         || (cfg!(unix) && m.contains("os error 28)"))
+}
+
+/// Did the DOWNLOAD itself halt on storage exhaustion (the fast-halt
+/// verdict from get/workers.rs), as opposed to a disk that filled at
+/// the unpack? Keyed on the message OPENING like every `fail_kind`
+/// clause - appended detail never moves it. The two want different
+/// guidance (the unpack case re-runs only the unpack; this one resumes
+/// the fetch from the journal) and different daemon handling: with the
+/// min-free guard armed, this job goes back to the queue and the guard
+/// holds it until space frees, exactly like the pick-time hold.
+pub(crate) fn disk_full_mid_download(msg: &str) -> bool {
+    msg.starts_with("out of disk space")
 }
 
 /// The classifier as a wire token, for history_json. The dashboard
@@ -2893,3 +2932,57 @@ pub(super) fn job_from_json(v: &Value) -> Option<Job> {
 #[cfg(test)]
 #[path = "job_tests.rs"]
 mod job_tests;
+
+#[cfg(all(test, unix))]
+mod finalize_marker_tests {
+    use super::*;
+    use crate::serve::testutil::test_daemon;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// M6 (Codex sweep 5 Aug): `finalize_completed` wrote the
+    /// finalizing marker, ignored `save_queue()`'s answer, and began
+    /// relocating the payload anyway - so a crash mid-move with an
+    /// unwritable spool restored a clean Completed record over a
+    /// half-moved payload. With the marker unwritable, post-processing
+    /// must not begin: the files stay exactly where the record says.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unwritable_finalize_marker_skips_post_processing() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-finmark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = test_daemon(&dir);
+        let out = dir.join("out").join("Some.Job");
+        std::fs::create_dir_all(&out).unwrap();
+        // A sidecar the default par2 sweep deletes: if post-processing
+        // runs regardless, this file is gone and the assert names it.
+        std::fs::write(out.join("some.job.par2"), b"par2").unwrap();
+        let job = Arc::new(Mutex::new(
+            job_from_json(&json!({
+                "nzo_id": "SABnzbd_nzo_finmark",
+                "name": "Some.Job",
+                "nzb_path": dir.join("some.nzb").to_string_lossy(),
+                "out_dir": out.to_string_lossy(),
+                "state": "Completed",
+            }))
+            .unwrap(),
+        ));
+        let spool = dir.join("spool");
+        std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o555)).unwrap();
+        finalize_completed(&d, &job).await;
+        std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            out.join("some.job.par2").exists(),
+            "post-processing ran with no durable finalize marker"
+        );
+        let j = job.lock_ok();
+        assert!(!j.finalizing, "the in-memory marker must be cleared");
+        assert!(
+            j.unpack_blocked_by.contains("queue file"),
+            "the row does not say why: {:?}",
+            j.unpack_blocked_by
+        );
+        drop(j);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

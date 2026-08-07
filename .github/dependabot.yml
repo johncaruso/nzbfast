@@ -1,0 +1,29 @@
+# Dependabot, on the PUBLIC repo (Scorecard DependencyUpdateToolID).
+# Development happens in the private repo, so PRs opened here are
+# advisories, not merge candidates: apply the bump privately and let the
+# next publish sync close the PR. Weekly + grouped to keep the noise per
+# week to one PR per ecosystem.
+#
+# vendor/ is excluded by its nature: those are forks pinned on purpose
+# (rars, rapidyenc, tiny_http) - updates go through the fork campaigns,
+# not a bot bump.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      cargo-all:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions-all:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3

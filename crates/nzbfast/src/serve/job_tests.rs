@@ -124,6 +124,40 @@ fn disk_full_rejects_unrelated_messages() {
     assert!(!disk_full_failure(""));
 }
 
+// ---- the mid-download out-of-disk-space verdict ----
+
+#[test]
+fn mid_download_disk_full_verdict_classifies_end_to_end() {
+    // The verdict drain_network bails with, kind-classified at the
+    // write - the quoted OS text may be localized or carry an odd code,
+    // so the OPENING must be enough on its own.
+    let msg = "out of disk space - the output volume filled during the download, \
+               so fetching was stopped early; what landed is journaled and kept \
+               (write vol.r01: Speicherplatz reicht nicht aus (os error 999))";
+    assert!(disk_full_mid_download(msg));
+    assert!(disk_full_failure(msg));
+    // Local + disk-full = the SPACE action and the SPACE *arr verdict.
+    assert!(matches!(fail_kind(msg), FailKind::Local));
+    assert_eq!(fail_action(FailKind::Local, "", msg, false), "space");
+    // Appended clauses never move the opening: classification holds.
+    let appended = format!("{msg}; free about 4.2 GB on that disk");
+    assert!(disk_full_mid_download(&appended));
+    assert!(disk_full_failure(&appended));
+}
+
+#[test]
+fn mid_download_verdict_keys_on_the_opening_only() {
+    // An unpack-stage disk-full mentions space but did NOT halt the
+    // fetch - the two want different guidance.
+    assert!(!disk_full_mid_download(
+        "extraction failed: No space left on device (os error 28)"
+    ));
+    // Moved off the opening, it is not the mid-download verdict.
+    assert!(!disk_full_mid_download(
+        "download incomplete; out of disk space"
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn disk_full_unix_numeric_form() {

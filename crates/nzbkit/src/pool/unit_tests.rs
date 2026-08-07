@@ -51,6 +51,8 @@ fn work(id: &str) -> Work {
         tried_430: 0,
         tried_fail: 0,
         dup: false,
+        prebyte_expiries: 0,
+        soft_430: 0,
     }
 }
 
@@ -77,7 +79,10 @@ fn flap_window_trims_old_deaths_before_judging() {
     );
     sh.sessions[0].store(2, Ordering::Release);
     sh.note_cap_bounce(0);
+    // Pinned, not defaulted: Default reads NZBFAST_FLAP_CAP_KEEPERS
+    // (TODO 121.3), and this test is about the target math, not the env.
     let cfg = PoolConfig {
+        flap_cap_keepers: true,
         connections: 8,
         ..Default::default()
     };
@@ -90,6 +95,7 @@ fn flap_window_trims_old_deaths_before_judging() {
         sh.flap_keeper_target(
             0,
             &PoolConfig {
+                flap_cap_keepers: true,
                 connections: 1,
                 ..Default::default()
             }
@@ -735,4 +741,1156 @@ fn sharded_fetch_with_zero_shard_clamp_still_reports() {
         "shards.max(1) and connections.max(1) kept the run alive"
     );
     assert!(stats[0].bytes > 0);
+}
+
+/// Codex 5 Aug M4: `drain()` sets ONLY `draining` - no `finished`, no
+/// abort - so a filler that watches just those two loops forever after a
+/// graceful pause, pinning `Arc<Shared>` and an authenticated provider
+/// session. The filler must notice the flag on its own tick and quit
+/// whatever it parked.
+#[tokio::test]
+async fn spare_filler_exits_on_graceful_drain_and_quits_its_spare() {
+    let mut articles = std::collections::HashMap::new();
+    let payload: Vec<u8> = (0..4_000u32).map(|i| (i * 5) as u8).collect();
+    make_file_articles("d.bin", &payload, 2_000, "drain", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+    let (sh, _) = Shared::new(
+        fresh(&["<a@x>"]),
+        &[(srv.server_config(), PoolConfig::default())],
+    );
+    let task = tokio::spawn(spare_filler(sh.clone(), srv.server_config(), 0));
+    let parked = async {
+        while sh.spares[0].lock_ok().is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), parked)
+        .await
+        .expect("the filler never parked a spare against a live server");
+    sh.draining.store(true, Ordering::Release);
+    // The 500 ms tick is the exit-latency bound; 5 s is generous.
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the filler ignored a graceful drain")
+        .unwrap();
+    assert!(
+        sh.spares[0].lock_ok().is_none(),
+        "the parked spare must be quit, not leaked, on drain"
+    );
+}
+
+/// TODO 121.1: the per-article pre-byte ladder - server budget
+/// untouched at zero expiries, then the adaptive ceiling doubling
+/// upward, capped at the article ceiling; a wider server budget (or
+/// env-lifted ceiling) stays dominant.
+#[test]
+fn prebyte_expiries_escalate_the_articles_own_budget() {
+    let base = Duration::from_secs(2);
+    assert_eq!(article_prebyte_budget(base, 0), base);
+    assert_eq!(article_prebyte_budget(base, 1), Duration::from_secs(10));
+    assert_eq!(article_prebyte_budget(base, 2), Duration::from_secs(20));
+    assert_eq!(article_prebyte_budget(base, 3), Duration::from_secs(30));
+    assert_eq!(
+        article_prebyte_budget(base, 4),
+        Duration::from_secs(30),
+        "the article ceiling holds"
+    );
+    let wide = Duration::from_secs(25);
+    assert_eq!(
+        article_prebyte_budget(wide, 1),
+        wide,
+        "a wider server budget is never narrowed"
+    );
+}
+
+/// TODO 121.2: an adaptive pre-byte expiry is OUR budget choice, not a
+/// session death - FLAP_DEATHS of them must not clamp the server. A
+/// genuine mid-flow stall on an established session still counts, and
+/// a session that never served a byte still counts nothing.
+#[test]
+fn prebyte_expiries_are_not_flap_deaths_but_midflow_stalls_are() {
+    let (sh, _) = Shared::new(fresh(&["<a@x>"]), &[(server("s"), PoolConfig::default())]);
+    let mut w = work("<a@x>");
+    for _ in 0..FLAP_DEATHS {
+        note_read_stall(&sh, 0, 1_000_000, true, Some(&mut w));
+    }
+    assert!(
+        !sh.is_flapping(0),
+        "a heavy-tailed but healthy provider must not be keeper-clamped"
+    );
+    assert_eq!(
+        w.prebyte_expiries, FLAP_DEATHS as u8,
+        "each expiry escalates the article's own next attempt"
+    );
+    for _ in 0..FLAP_DEATHS {
+        note_read_stall(&sh, 0, 1_000_000, false, Some(&mut w));
+    }
+    assert!(sh.is_flapping(0), "mid-flow stalls remain deaths");
+    let (sh2, _) = Shared::new(fresh(&["<a@x>"]), &[(server("s"), PoolConfig::default())]);
+    note_read_stall(&sh2, 0, 0, false, None);
+    assert!(
+        !sh2.is_flapping(0),
+        "a byteless session was never established"
+    );
+}
+
+/// TODO 121.4: with `arrival_ack` the handoff leaves the `done_ok`
+/// liveness entry in place - the article stays visible to the
+/// dead-span verdict through the channel buffer and the consumer's
+/// in-hand batch - until the consumer's note_settled lands after
+/// decode+write. Ack-less pools and undelivered bodies settle at the
+/// handoff exactly as before.
+#[test]
+fn arrival_ack_holds_done_ok_until_the_consumer_settles() {
+    let (sh, _) = Shared::new(
+        fresh(&["<a@x>", "<b@x>", "<c@x>", "<d@x>"]),
+        &[(server("s"), PoolConfig::default())],
+    );
+    let ctl = QueueControl::default();
+    ctl.attach(&sh);
+    // Empty the seeded queue: this test watches the done_ok arm of
+    // any_live, and a queued copy of the id would keep it live for
+    // its own (correct) reason.
+    sh.queue.try_lock().expect("no workers hold it").clear();
+    // Ack-less pool: the handoff settles immediately.
+    sh.done_ok.lock_ok().insert("<a@x>".to_string());
+    sh.settle_handoff(false, false, true, "<a@x>");
+    assert!(!sh.done_ok.lock_ok().contains("<a@x>"));
+    // Acking pool: the entry survives the handoff, keeps the span
+    // live, and leaves only on the consumer's ack.
+    sh.done_ok.lock_ok().insert("<b@x>".to_string());
+    sh.settle_handoff(false, true, true, "<b@x>");
+    assert!(
+        sh.done_ok.lock_ok().contains("<b@x>"),
+        "held through the channel buffer and decode batch"
+    );
+    assert_eq!(ctl.any_live(&["<b@x>".to_string()]), Some(true));
+    ctl.note_settled("<b@x>");
+    assert!(!sh.done_ok.lock_ok().contains("<b@x>"));
+    assert_eq!(ctl.any_live(&["<b@x>".to_string()]), Some(false));
+    // An undelivered body (channel closed) has no consumer left to
+    // ack it - settles at the handoff.
+    sh.done_ok.lock_ok().insert("<c@x>".to_string());
+    sh.settle_handoff(false, true, false, "<c@x>");
+    assert!(!sh.done_ok.lock_ok().contains("<c@x>"));
+}
+
+/// §122 coverage + the flap clamp's own contract: on a flapping server
+/// with a healthy sibling, the keeper slots go to the first claimants
+/// and every later worker loses the claim and bows out - the branch
+/// the ignored wall-clock rigs used to be the only visitors of.
+#[tokio::test]
+async fn flap_keeper_claim_admits_the_target_and_bows_the_rest_out() {
+    let servers = vec![
+        (server("flappy"), PoolConfig::default()),
+        (server("steady"), PoolConfig::default()),
+    ];
+    let (sh, _) = Shared::new(fresh(&["<a@x>"]), &servers);
+    // Six established-session deaths inside the window: flapping.
+    for _ in 0..FLAP_DEATHS {
+        sh.note_flap(0);
+    }
+    // A healthy sibling is what licenses the clamp at all.
+    sh.alive[1].fetch_add(1, Ordering::AcqRel);
+    let cfg = PoolConfig::default();
+    let ctx = ctx_for(&servers, 0);
+    // No observed accept cap: the keeper target is the shipped one.
+    assert_eq!(sh.flap_keeper_target(0, &cfg), 1);
+    let mut first_keeper = false;
+    let mut none = None;
+    assert!(
+        claim_flap_keeper(&cfg, ctx, &sh, &mut first_keeper, &mut none).await,
+        "the first claimant keeps the light on"
+    );
+    assert!(first_keeper);
+    let mut second_keeper = false;
+    assert!(
+        !claim_flap_keeper(&cfg, ctx, &sh, &mut second_keeper, &mut none).await,
+        "a second worker loses the claim and bows out"
+    );
+    assert!(!second_keeper);
+    // An existing keeper re-entering the top of a session is never
+    // re-judged - its own claim stands.
+    let mut still_keeper = true;
+    assert!(claim_flap_keeper(&cfg, ctx, &sh, &mut still_keeper, &mut none).await);
+    // A lone server (no live sibling) is never clamped: churn beats
+    // zero throughput when there is no alternative.
+    sh.alive[1].store(0, Ordering::Release);
+    let mut lone = false;
+    assert!(claim_flap_keeper(&cfg, ctx, &sh, &mut lone, &mut none).await);
+    assert!(!lone, "no clamp means no keeper slot spent");
+}
+
+/// §122.5 recycle arm (reactive): back-to-back race losses in the
+/// normal phase shed the pipeline and ask for a redial; endgame losses
+/// are exempt because the fan-out makes losing routine there.
+#[tokio::test]
+async fn recycle_slow_sheds_after_consecutive_race_losses() {
+    let cfg = PoolConfig {
+        recycle_slow: true,
+        ..Default::default()
+    };
+    let servers = vec![(server("s"), cfg.clone())];
+    // Enough pending to stay clear of the endgame exemption (> 64).
+    let ids: Vec<String> = (0..70).map(|i| format!("<l{i}@x>")).collect();
+    let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+    let (sh, _) = Shared::new(fresh(&id_refs), &servers);
+    let ctx = ctx_for(&servers, 0);
+    let (tx, mut rx) = mpsc::channel(8);
+    // A duplicate dispatch won both of the first two articles already.
+    assert!(sh.claim_done("<l0@x>"));
+    assert!(sh.claim_done("<l1@x>"));
+    let mut inflight: VecDeque<Work> = [work("<l0@x>"), work("<l1@x>"), work("<l2@x>")]
+        .into_iter()
+        .collect();
+    for _ in 0..inflight.len() {
+        sh.charge_wire();
+    }
+    let mut losses = 0u32;
+    let mut bytes = 0u64;
+    let started = Instant::now();
+    // First loss: evidence noted, no recycle yet.
+    let step = handle_body(
+        &cfg,
+        ctx,
+        &sh,
+        &tx,
+        &mut inflight,
+        Vec::new(),
+        &mut losses,
+        &mut bytes,
+        started,
+    )
+    .await;
+    assert!(matches!(step, BodyStep::Proceed));
+    assert_eq!(losses, 1);
+    // Second consecutive loss: the session has proven slow - shed and
+    // redial, counter reset, the innocent in-flight article requeued.
+    let step = handle_body(
+        &cfg,
+        ctx,
+        &sh,
+        &tx,
+        &mut inflight,
+        Vec::new(),
+        &mut losses,
+        &mut bytes,
+        started,
+    )
+    .await;
+    assert!(matches!(step, BodyStep::Recycle));
+    assert_eq!(losses, 0, "a recycle spends the evidence");
+    assert!(inflight.is_empty(), "the shed empties the pipeline");
+    assert_eq!(
+        sh.queue.lock().await.front().map(|w| w.id.as_str()),
+        Some("<l2@x>"),
+        "the shed article requeues at the front, uncharged"
+    );
+    assert!(rx.try_recv().is_err(), "a lost race emits no outcome");
+    // Endgame: same two losses, but with the queue nearly drained the
+    // fan-out makes losing normal - no evidence is charged.
+    let (sh2, _) = Shared::new(fresh(&["<e0@x>", "<e1@x>"]), &servers);
+    assert!(sh2.claim_done("<e0@x>"));
+    let mut inflight2: VecDeque<Work> = [work("<e0@x>")].into_iter().collect();
+    sh2.charge_wire();
+    let mut losses2 = 0u32;
+    let step = handle_body(
+        &cfg,
+        ctx,
+        &sh2,
+        &tx,
+        &mut inflight2,
+        Vec::new(),
+        &mut losses2,
+        &mut bytes,
+        started,
+    )
+    .await;
+    assert!(matches!(step, BodyStep::Proceed));
+    assert_eq!(losses2, 0, "endgame losses are not evidence");
+}
+
+/// §122.5 recycle arm (proactive): a session whose own delivery rate
+/// collapsed against the fleet's per-worker average redials before it
+/// strands a tail article - checked only on a completed article, and
+/// only once the session has had 10 s to prove itself.
+#[tokio::test]
+async fn recycle_slope_redials_a_collapsed_session() {
+    let cfg = PoolConfig {
+        recycle_slope: true,
+        ..Default::default()
+    };
+    let servers = vec![(server("s"), cfg.clone())];
+    let ids: Vec<String> = (0..70).map(|i| format!("<s{i}@x>")).collect();
+    let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+    let (sh, _) = Shared::new(fresh(&id_refs), &servers);
+    let ctx = ctx_for(&servers, 0);
+    // The fleet at large is fast: bytes land against a near-zero run
+    // age (clamped to 0.5 s), one live worker shares them.
+    sh.bytes[0].store(64_000_000, Ordering::Release);
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut inflight: VecDeque<Work> = [work("<s0@x>"), work("<s1@x>")].into_iter().collect();
+    for _ in 0..inflight.len() {
+        sh.charge_wire();
+    }
+    let mut losses = 0u32;
+    // This session: 11 s old, nothing delivered until now.
+    let mut session_bytes = 0u64;
+    let started = Instant::now()
+        .checked_sub(Duration::from_secs(11))
+        .expect("host has been up longer than 11 s");
+    let step = handle_body(
+        &cfg,
+        ctx,
+        &sh,
+        &tx,
+        &mut inflight,
+        Vec::new(),
+        &mut losses,
+        &mut session_bytes,
+        started,
+    )
+    .await;
+    // The article itself was WON and delivered - the slope verdict is
+    // about the session, never the outcome.
+    match rx.try_recv() {
+        Ok(FetchOutcome::Done { id, .. }) => assert_eq!(id, "<s0@x>"),
+        other => panic!("expected the won article delivered, got {other:?}"),
+    }
+    assert!(matches!(step, BodyStep::Recycle));
+    assert!(inflight.is_empty());
+    assert_eq!(
+        sh.queue.lock().await.front().map(|w| w.id.as_str()),
+        Some("<s1@x>"),
+        "the shed sibling requeues"
+    );
+}
+
+/// §122.5 capacity-bounce handling, end to end: a provider that accepts
+/// exactly one session greets every extra dial with the 502 capacity
+/// refusal. The bounced workers yield and park (issue #16), the one
+/// accepted session carries the whole job, and the run still finishes.
+#[tokio::test]
+async fn capacity_bounce_parks_the_extras_and_the_run_finishes() {
+    let mut articles = std::collections::HashMap::new();
+    let payload: Vec<u8> = (0..64_000u32).map(|i| (i * 5) as u8).collect();
+    make_file_articles("cap.bin", &payload, 8_000, "cap", &mut articles);
+    let n = articles.len();
+    let srv = MockServer::start(
+        articles.clone(),
+        Chaos {
+            accept_cap: Some(1),
+            ..Default::default()
+        },
+    )
+    .await;
+    let cfg = PoolConfig {
+        connections: 4,
+        ramp_delay: Duration::ZERO,
+        connect_backoff: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let reqs: Vec<ArticleReq> = articles
+        .keys()
+        .map(|id| ArticleReq::fresh(id.clone()))
+        .collect();
+    let (tx, mut rx) = mpsc::channel(64);
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        fetch_all(&srv.server_config(), &cfg, reqs, tx),
+    )
+    .await
+    .expect("run hung against a capacity-capped server");
+    let mut done = 0;
+    while let Ok(o) = rx.try_recv() {
+        if matches!(o, FetchOutcome::Done { .. }) {
+            done += 1;
+        }
+    }
+    assert_eq!(done, n, "the one admitted session delivers everything");
+    assert!(
+        srv.accepted.load(Ordering::Relaxed) >= 2,
+        "the fleet actually provoked the cap (extra dials were greeted and bounced)"
+    );
+}
+
+/// §122.5 promote shed, end to end: a seek promote mid-run engages
+/// stream mode, the worker's deep pipeline is over the shallow stream
+/// window at the next response boundary, and the whole pipeline is
+/// abandoned for a fresh dial - the redial is the observable.
+#[tokio::test]
+async fn a_promote_mid_pipeline_sheds_to_a_fresh_session() {
+    let mut articles = std::collections::HashMap::new();
+    let payload: Vec<u8> = (0..120_000u32).map(|i| (i * 9) as u8).collect();
+    let segs = make_file_articles("st.bin", &payload, 4_000, "st", &mut articles);
+    let n = segs.len();
+    // Every BODY costs 25 ms server-side, so the run is comfortably
+    // still going when the promote lands ~100 ms in.
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            delay_ms: 25,
+            ..Default::default()
+        },
+    )
+    .await;
+    let cfg = PoolConfig {
+        connections: 1,
+        window: 8,
+        ramp_delay: Duration::ZERO,
+        ..Default::default()
+    };
+    let reqs: Vec<ArticleReq> = segs
+        .iter()
+        .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
+        .collect();
+    // Promote the tail of the file - guaranteed still queued at 100 ms
+    // with only the first window's worth in flight.
+    let seek: Vec<String> = segs[n - 3..]
+        .iter()
+        .map(|(id, _, _)| format!("<{id}>"))
+        .collect();
+    let ctl = std::sync::Arc::new(QueueControl::default());
+    let promoter = {
+        let ctl = ctl.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            ctl.promote(&seek)
+        })
+    };
+    let (tx, mut rx) = mpsc::channel(256);
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        fetch_all_multi_ctl(&[(srv.server_config(), cfg)], reqs, tx, Some(&ctl)),
+    )
+    .await
+    .expect("run hung after the promote shed");
+    assert!(
+        promoter.await.expect("promoter task") >= 1,
+        "the promote landed while the tail was still queued"
+    );
+    let mut done = 0;
+    while let Ok(o) = rx.try_recv() {
+        if matches!(o, FetchOutcome::Done { .. }) {
+            done += 1;
+        }
+    }
+    assert_eq!(
+        done, n,
+        "every article lands despite the abandoned pipeline"
+    );
+    assert!(
+        srv.accepted.load(Ordering::Relaxed) >= 2,
+        "the shed shows up as a redial: the deep pipeline was abandoned, not drained"
+    );
+}
+
+// The five rigs below moved verbatim from pool.rs's inline `tests`
+// mod (6 Aug): the resilience-chip landings regrew pool.rs past its
+// size-gate entry, and the gate's rule is that test code moves into
+// a child module. Self-contained rigs only - they use the mock and
+// `super::*`, none of the inline mod's shared helpers.
+/// Issue #16, both halves: a restart's ghost sessions hold the
+/// account cap for a while (every dial bounces off the capacity
+/// refusal), then the lease expires. The fleet must SURVIVE the
+/// window - the old ladder retired every worker in ~5 bounces and
+/// failed the job inside it - and it must come back at full width
+/// when the window clears, not crawl the rest of the job on the
+/// lone prober. Margins are structural: completion inside the
+/// bound needs the parked fleet back (one connection cannot move
+/// the corpus in time), and the pre-fix behaviour is a hard job
+/// failure, not a slow number.
+#[tokio::test(flavor = "multi_thread")]
+async fn cap_ghost_window_parks_the_fleet_then_rejoins() {
+    use crate::mock::{Chaos, MockServer, Throttle};
+    let data: Vec<u8> = (0..1_200_000u32).map(|i| i as u8).collect();
+    let mut articles = std::collections::HashMap::new();
+    let segs = crate::mock::make_file_articles("gw.bin", &data, 20_000, "gw", &mut articles);
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            cap_ghost_ms: 1_500,
+            throttle: Throttle {
+                per_conn_bps: 100_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut server = srv.server_config();
+    server.username = Some("u".into());
+    server.password = Some("p".into());
+    const CONNS: usize = 6;
+    let cfg = PoolConfig {
+        connections: CONNS,
+        ramp_delay: Duration::ZERO,
+        connect_backoff: Duration::from_millis(100),
+        ..Default::default()
+    };
+    let ids: Vec<String> = segs.iter().map(|(id, _, _)| format!("<{id}>")).collect();
+    let reqs: Vec<ArticleReq> = ids.iter().cloned().map(ArticleReq::fresh).collect();
+    let (tx, mut rx) = mpsc::channel(256);
+    let t0 = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        fetch_all_multi(&[(server, cfg)], reqs, tx),
+    )
+    .await
+    .expect("run hung on the ghost-cap window");
+    let wall = t0.elapsed();
+    let (mut done, mut other) = (0usize, 0usize);
+    while let Ok(o) = rx.try_recv() {
+        match o {
+            FetchOutcome::Done { .. } => done += 1,
+            _ => other += 1,
+        }
+    }
+    assert_eq!(
+        done,
+        ids.len(),
+        "articles failed across a 1.5 s ghost window ({other} non-Done outcomes)"
+    );
+    // 1.2 MB at 100 KB/s per connection: the full fleet clears it
+    // in ~2 s after the window, the lone prober would need ~12 s.
+    // 10 s = window + full-width finish + generous suite-load
+    // slack, still far under the crawl.
+    assert!(
+        wall < Duration::from_secs(10),
+        "fleet did not rejoin after the ghost window cleared ({wall:?})"
+    );
+}
+
+/// The outage keeper: a transient TOTAL outage (wifi drop, VPN
+/// reconnect, router reboot) shows up as hard connect failures -
+/// every accepted connection dies before the greeting, nothing to
+/// classify. The old ladder retired every worker after
+/// `max_connect_attempts` and failed or stranded the whole job
+/// inside the window; the keeper parks the fleet behind one paced
+/// prober (the issue #16 machinery) and rejoins at full width on
+/// the first successful connect. Same margins as the ghost-cap
+/// twin above: completion inside the bound needs the parked fleet
+/// back, and the pre-fix behaviour is a hard job failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn hard_outage_window_parks_the_fleet_then_rejoins() {
+    use crate::mock::{Chaos, MockServer, Throttle};
+    let data: Vec<u8> = (0..1_200_000u32).map(|i| i as u8).collect();
+    let mut articles = std::collections::HashMap::new();
+    let segs = crate::mock::make_file_articles("ow.bin", &data, 20_000, "ow", &mut articles);
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            refuse_connect_ms: 1_500,
+            throttle: Throttle {
+                per_conn_bps: 100_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    let server = srv.server_config();
+    const CONNS: usize = 6;
+    // A tight ladder so the fleet exhausts its connect attempts and
+    // parks WELL INSIDE the 1.5 s window - the pre-fix behaviour
+    // (every worker retired for good) is what this must rule out.
+    let cfg = PoolConfig {
+        connections: CONNS,
+        ramp_delay: Duration::ZERO,
+        connect_backoff: Duration::from_millis(50),
+        max_connect_attempts: 3,
+        ..Default::default()
+    };
+    let ids: Vec<String> = segs.iter().map(|(id, _, _)| format!("<{id}>")).collect();
+    let reqs: Vec<ArticleReq> = ids.iter().cloned().map(ArticleReq::fresh).collect();
+    let (tx, mut rx) = mpsc::channel(256);
+    let t0 = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        fetch_all_multi(&[(server, cfg)], reqs, tx),
+    )
+    .await
+    .expect("run hung on the outage window");
+    let wall = t0.elapsed();
+    let (mut done, mut other) = (0usize, 0usize);
+    while let Ok(o) = rx.try_recv() {
+        match o {
+            FetchOutcome::Done { .. } => done += 1,
+            _ => other += 1,
+        }
+    }
+    assert_eq!(
+        done,
+        ids.len(),
+        "articles failed across a 1.5 s hard outage ({other} non-Done outcomes)"
+    );
+    // 1.2 MB at 100 KB/s per connection: the full fleet clears it
+    // in ~2 s after the window, the lone prober would need ~12 s.
+    // 10 s = window + full-width finish + generous suite-load
+    // slack, still far under the crawl.
+    assert!(
+        wall < Duration::from_secs(10),
+        "fleet did not rejoin after the outage cleared ({wall:?})"
+    );
+}
+
+#[tokio::test]
+async fn mute_quit_server_cannot_hang_a_finished_run() {
+    // Regression (the 190 GB exit-path hang): a provider that swallows
+    // QUIT - TCP up, no goodbye - parked the worker's unbounded goodbye
+    // read forever, and the fleet join with it, AFTER every byte was on
+    // disk. quit() is now hard-bounded, so the run must return alone.
+    use crate::mock::{Chaos, MockServer, make_file_articles};
+    let mut articles = std::collections::HashMap::new();
+    let payload: Vec<u8> = (0..40_000u32).map(|i| i as u8).collect();
+    make_file_articles("f.bin", &payload, 8_000, "mq", &mut articles);
+    let n = articles.len();
+    let srv = MockServer::start(
+        articles.clone(),
+        Chaos {
+            mute_quit: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let cfg = PoolConfig {
+        connections: 3,
+        ramp_delay: Duration::ZERO,
+        ..Default::default()
+    };
+    let reqs: Vec<ArticleReq> = articles
+        .keys()
+        .map(|id| ArticleReq::fresh(id.clone()))
+        .collect();
+    let (tx, mut rx) = mpsc::channel(64);
+    let t0 = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        fetch_all_multi(&[(srv.server_config(), cfg)], reqs, tx),
+    )
+    .await
+    .expect("run hung on a mute-QUIT server");
+    // Well under EXIT_GRACE: the bounded quit alone frees the join.
+    assert!(
+        t0.elapsed() < Duration::from_secs(4),
+        "took {:?}",
+        t0.elapsed()
+    );
+    let mut done = 0;
+    while let Ok(o) = rx.try_recv() {
+        if matches!(o, FetchOutcome::Done { .. }) {
+            done += 1;
+        }
+    }
+    assert_eq!(done, n);
+}
+
+#[tokio::test]
+async fn mute_greeting_straggler_does_not_hold_a_finished_run() {
+    // §35: a server that accepts and never greets parks its worker
+    // inside the dial. This used to cost the run a full EXIT_GRACE -
+    // join_fleet's backstop was the ONLY thing that ended it, because
+    // the dial itself never watched the run. Measured on the farm at
+    // 5.0 s added to a 1.1 s job, on every job, for as long as the
+    // unreachable entry stayed in the config. The dial now races the
+    // finish, so the straggler leaves with everyone else and the
+    // grace window is never entered.
+    use crate::mock::{Chaos, MockServer, make_file_articles};
+    let mut articles = std::collections::HashMap::new();
+    let payload: Vec<u8> = (0..40_000u32).map(|i| (i * 7) as u8).collect();
+    make_file_articles("g.bin", &payload, 8_000, "mg", &mut articles);
+    let n = articles.len();
+    let healthy = MockServer::start(articles.clone(), Chaos::default()).await;
+    let mute = MockServer::start(
+        std::collections::HashMap::new(),
+        Chaos {
+            mute_greeting: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let fast = PoolConfig {
+        connections: 2,
+        ramp_delay: Duration::ZERO,
+        ..Default::default()
+    };
+    let one = PoolConfig {
+        connections: 1,
+        ramp_delay: Duration::ZERO,
+        ..Default::default()
+    };
+    let reqs: Vec<ArticleReq> = articles
+        .keys()
+        .map(|id| ArticleReq::fresh(id.clone()))
+        .collect();
+    let (tx, mut rx) = mpsc::channel(64);
+    let t0 = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        fetch_all_multi(
+            &[(healthy.server_config(), fast), (mute.server_config(), one)],
+            reqs,
+            tx,
+        ),
+    )
+    .await
+    .expect("run hung on a never-greeting server");
+    let el = t0.elapsed();
+    // Comfortably inside the grace window, not at the end of it: the
+    // straggler is released by the finish, not abandoned by the join.
+    assert!(
+        el < EXIT_GRACE,
+        "run waited out the dial of a server nobody needed: {el:?}"
+    );
+    let mut done = 0;
+    while let Ok(o) = rx.try_recv() {
+        if matches!(o, FetchOutcome::Done { .. }) {
+            done += 1;
+        }
+    }
+    assert_eq!(done, n);
+}
+
+/// §35, reached through the WARM path instead of the dial.
+///
+/// Claiming a parked connection validates it with a DATE round-trip
+/// bounded by `warmpool::VALIDATE_TIMEOUT` - 8 s, against EXIT_GRACE's
+/// 5 s. A worker validating a peer that has gone mute therefore could
+/// not return before `join_fleet` gave up on it, so the run paid the
+/// whole grace window exactly as an unanswered SYN used to make it.
+/// Latent while the warm pool ships off by default, which is the
+/// reason to pin it now: TODO 36 turns it on per server.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mute_parked_connection_does_not_hold_a_finished_run() {
+    use crate::mock::{Chaos, MockServer, make_file_articles};
+    // Greets, then never another word, every socket held open with no
+    // RST or FIN - the shape a CGNAT idle eviction leaves behind, and
+    // the one DATE validation exists to catch. Blocking std sockets on
+    // their own thread so the peer keeps working regardless of what
+    // the async runtime is doing.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        use std::io::Write as _;
+        let mut held = Vec::new();
+        while let Ok((mut s, _)) = listener.accept() {
+            let _ = s.write_all(b"200 mock ready\r\n");
+            let _ = s.flush();
+            held.push(s);
+        }
+    });
+    let mute = ServerConfig {
+        host: addr.ip().to_string(),
+        port: addr.port(),
+        tls: false,
+        username: None,
+        password: None,
+        connections: 1,
+        pin_connections: false,
+        rcvbuf: None,
+        level: 0,
+        group: None,
+        retention_days: 0,
+        block_bytes: None,
+        bind_ip: None,
+        socks5: None,
+        enabled: true,
+        warm_pool: false,
+        idle_release_secs: None,
+        idle_keep: None,
+        max_source_ips: None,
+    };
+
+    let mut articles = std::collections::HashMap::new();
+    let payload: Vec<u8> = (0..40_000u32).map(|i| (i * 3) as u8).collect();
+    make_file_articles("w.bin", &payload, 8_000, "wp", &mut articles);
+    let n = articles.len();
+    let healthy = MockServer::start(articles.clone(), Chaos::default()).await;
+
+    // Park a live connection to the mute peer, exactly as the previous
+    // job in a queue would have left one.
+    let warm = crate::warmpool::WarmPool::new(crate::warmpool::DEFAULT_MAX_IDLE, 4);
+    let (c, _) = Connection::connect(&mute).await.expect("greeting");
+    warm.give(&mute, c).await;
+    assert_eq!(
+        warm.idle_count().await,
+        1,
+        "the claim must have something to claim"
+    );
+
+    let fast = PoolConfig {
+        connections: 2,
+        ramp_delay: Duration::ZERO,
+        ..Default::default()
+    };
+    let warmed = PoolConfig {
+        connections: 1,
+        ramp_delay: Duration::ZERO,
+        warm: Some(warm.clone()),
+        ..Default::default()
+    };
+    let reqs: Vec<ArticleReq> = articles
+        .keys()
+        .map(|id| ArticleReq::fresh(id.clone()))
+        .collect();
+    let (tx, mut rx) = mpsc::channel(64);
+    let t0 = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        fetch_all_multi(&[(healthy.server_config(), fast), (mute, warmed)], reqs, tx),
+    )
+    .await
+    .expect("run hung claiming a parked connection from a mute peer");
+    let el = t0.elapsed();
+    assert!(
+        el < EXIT_GRACE,
+        "run waited out the validation of a connection nobody needed: {el:?}"
+    );
+    let mut done = 0;
+    while let Ok(o) = rx.try_recv() {
+        if matches!(o, FetchOutcome::Done { .. }) {
+            done += 1;
+        }
+    }
+    assert_eq!(
+        done, n,
+        "the healthy server still had to deliver every article"
+    );
+}
+
+// Moved verbatim from pool/rig_tests.rs (6 Aug, size-gate): its own
+// baseline had no room for the desync rig. Deterministic, not a
+// wall-clock payout leg, so it belongs with the unit rigs anyway.
+/// Desync (echoed-id verification): the mock silently withholds every
+/// Nth BODY response while consuming the request, so every later
+/// response on that connection answers one pipeline slot ahead of
+/// what positional attribution assumes. Without the echoed-id check
+/// each shifted 222 is filed under the FRONT article - a fully valid
+/// body for the wrong id, whose own pcrc32 passes - and the job
+/// "completes" corrupt, with the skipped article's real bytes never
+/// delivered by anyone. With the check, the first shifted response
+/// reads as a session-level protocol error (IdMismatch): the session
+/// is dropped and the pipeline requeued (front charged, mates
+/// uncharged - the same requeue_or_fail exit every protocol error
+/// takes), and the job completes byte-perfect via the refetch. Both
+/// read paths are covered: flat (read_timeout) and adaptive.
+#[tokio::test(flavor = "multi_thread")]
+async fn desync_echoed_id_cuts_the_session_and_completes_byte_perfect() {
+    for adaptive in [false, true] {
+        let data: Vec<u8> = (0..400_000u32).map(|i| (i >> 2) as u8).collect();
+        let mut articles = std::collections::HashMap::new();
+        let segs = crate::mock::make_file_articles("d.bin", &data, 8_000, "dsy", &mut articles);
+        let parts: std::collections::HashMap<String, u32> = segs
+            .iter()
+            .map(|(id, _, part)| (format!("<{id}>"), *part))
+            .collect();
+        let ids: Vec<ArticleReq> = segs
+            .iter()
+            .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
+            .collect();
+        let n = ids.len();
+        let srv = crate::mock::MockServer::start(
+            articles,
+            crate::mock::Chaos {
+                skip_nth_response: 10,
+                ..Default::default()
+            },
+        )
+        .await;
+        let cfg = PoolConfig {
+            window: 4,
+            read_timeout: Duration::from_secs(5),
+            adaptive_timeout: adaptive,
+            ..Default::default()
+        };
+        // payout_server(&srv, 2, cfg) inlined: rig_tests' helpers
+        // cannot cross into this module.
+        let servers = vec![{
+            let mut sc = srv.server_config();
+            sc.connections = 2;
+            (
+                sc,
+                PoolConfig {
+                    connections: 2,
+                    ramp_delay: Duration::from_millis(0),
+                    ..cfg
+                },
+            )
+        }];
+        let (tx, mut rx) = mpsc::channel(64);
+        let fetch = tokio::spawn(async move { fetch_all_multi(&servers, ids, tx).await });
+        // Collect and DECODE every owned body: the desync damage is a
+        // valid article under the wrong id, so identity (declared part
+        // number) and full-payload reassembly are the only honest
+        // verdicts - done-counting alone would pass the broken build.
+        let want = data.clone();
+        let collect = tokio::spawn(async move {
+            let mut rebuilt = vec![0u8; want.len()];
+            let mut covered = vec![false; want.len()];
+            let (mut done, mut wrong_part) = (0usize, 0usize);
+            let mut scratch = Vec::new();
+            while let Some(o) = rx.recv().await {
+                if let FetchOutcome::Done { id, raw } = o {
+                    done += 1;
+                    let (meta, _) =
+                        crate::yenc_simd::decode_into_integrity(&raw, &mut scratch, true)
+                            .expect("desync leg delivered an undecodable body");
+                    if meta.part != parts.get(&id).copied() {
+                        wrong_part += 1;
+                        continue;
+                    }
+                    let at = (meta.begin - 1) as usize;
+                    rebuilt[at..at + scratch.len()].copy_from_slice(&scratch);
+                    covered[at..at + scratch.len()]
+                        .iter_mut()
+                        .for_each(|c| *c = true);
+                }
+            }
+            let holes = covered.iter().filter(|c| !**c).count();
+            (done, wrong_part, holes, rebuilt)
+        });
+        tokio::time::timeout(Duration::from_secs(120), fetch)
+            .await
+            .expect("desync leg hung")
+            .unwrap();
+        let (done, wrong_part, holes, rebuilt) = collect.await.unwrap();
+        let accepted = srv.accepted.load(Ordering::Relaxed);
+        println!(
+            "desync leg (adaptive={adaptive}): {done}/{n} done, {wrong_part} wrong-part, \
+             {holes} uncovered bytes, {accepted} sessions accepted"
+        );
+        assert_eq!(done, n, "every article must reach a Done outcome");
+        assert_eq!(
+            wrong_part, 0,
+            "a shifted response was filed under the wrong article"
+        );
+        assert_eq!(holes, 0, "a skipped article's real bytes never arrived");
+        assert_eq!(rebuilt, data, "reassembled payload must be byte-perfect");
+        // The whole point: a desynced connection must be CUT, not
+        // ridden - 2 workers on a clean run accept exactly 2 sessions,
+        // so any reconnect proves the cut happened.
+        assert!(
+            accepted > 2,
+            "no session was ever cut on a desyncing server ({accepted} accepts)"
+        );
+    }
+}
+
+// §122.5 round 2 (6 Aug): the next_work scan ladder, driven directly.
+// Every branch here is a queue-shape decision the e2e rigs only reach
+// probabilistically: the all-live-430 terminal report, the tail latch,
+// the futile-scan throttle, the steer-inbox adoption order, the fill
+// gate, the endgame hold-back, and the promoted leave-for-faster hop.
+
+#[tokio::test]
+async fn next_work_reports_a_dead_article_and_latches_the_tail() {
+    let servers = vec![(server("s"), PoolConfig::default())];
+    let (sh, _) = Shared::new(fresh(&["<dead@x>", "<ok@x>"]), &servers);
+    let ctx = ctx_for(&servers, 0);
+    sh.alive[0].fetch_add(1, Ordering::AcqRel);
+    // Every LIVE server has already 430'd the head article: it is
+    // terminal, and waiting on it would rotate it forever.
+    sh.queue.lock().await.front_mut().unwrap().tried_430 = sh.live_mask();
+    let (tx, mut rx) = mpsc::channel(4);
+    let w = next_work(&sh, ctx, &tx, 0)
+        .await
+        .expect("the healthy article is picked");
+    assert_eq!(w.id, "<ok@x>");
+    match rx.try_recv() {
+        Ok(FetchOutcome::Missing { id, cause }) => {
+            assert_eq!(id, "<dead@x>");
+            assert!(matches!(cause, MissingCause::Gone), "{cause:?}");
+        }
+        other => panic!("expected the dead article's Missing report, got {other:?}"),
+    }
+    // The queue is dry with work still pending: this scan finds nothing,
+    // latches the tail phase exactly once, and arms the futile throttle.
+    assert!(sh.tail_started.lock_ok().is_none());
+    assert!(next_work(&sh, ctx, &tx, 0).await.is_none());
+    assert!(
+        sh.tail_started.lock_ok().is_some(),
+        "a primary finding the queue dry latches the tail"
+    );
+    assert_ne!(sh.scan_futile[0].load(Ordering::Relaxed), u64::MAX);
+    // An immediate rescan takes the throttled path (dup pick only).
+    assert!(next_work(&sh, ctx, &tx, 0).await.is_none());
+}
+
+#[tokio::test]
+async fn steer_inbox_requeues_are_adopted_in_promoted_first_order() {
+    let servers = vec![(server("s"), PoolConfig::default())];
+    let (sh, _) = Shared::new(fresh(&["<q@x>"]), &servers);
+    let ctx = ctx_for(&servers, 0);
+    sh.alive[0].fetch_add(1, Ordering::AcqRel);
+    {
+        let mut inbox = sh.steer_inbox.lock_ok();
+        let mut p = work("<p@x>");
+        p.promoted = true;
+        inbox.push(p);
+        inbox.push(work("<n@x>"));
+    }
+    let (tx, _rx) = mpsc::channel(4);
+    let w = next_work(&sh, ctx, &tx, 0)
+        .await
+        .expect("work is available");
+    assert_eq!(w.id, "<p@x>", "the promoted steer lands at the front");
+    assert_eq!(
+        sh.promoted_pending.load(Ordering::Acquire),
+        0,
+        "the adopt charged promoted_pending and the pick spent it"
+    );
+    let q = sh.queue.lock().await;
+    let ids: Vec<&str> = q.iter().map(|w| w.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["<q@x>", "<n@x>"],
+        "the plain steer queued at the back"
+    );
+}
+
+#[tokio::test]
+async fn a_fill_server_waits_for_every_live_primary_miss() {
+    let mut fill = server("fill");
+    fill.level = 1;
+    let servers = vec![
+        (server("prime"), PoolConfig::default()),
+        (fill, PoolConfig::default()),
+    ];
+    let (sh, _) = Shared::new(fresh(&["<a@x>"]), &servers);
+    let ctx1 = ctx_for(&servers, 1);
+    sh.alive[0].fetch_add(1, Ordering::AcqRel);
+    sh.alive[1].fetch_add(1, Ordering::AcqRel);
+    let (tx, _rx) = mpsc::channel(4);
+    // The primary is live and has not missed: the fill server sits out.
+    assert!(next_work(&sh, ctx1, &tx, 0).await.is_none());
+    sh.scan_futile[1].store(u64::MAX, Ordering::Relaxed);
+    // The primary 430'd it: the gate opens.
+    sh.queue.lock().await.front_mut().unwrap().tried_430 = server_bit(0);
+    let w = next_work(&sh, ctx1, &tx, 0).await.expect("gate satisfied");
+    assert_eq!(w.id, "<a@x>");
+}
+
+#[tokio::test]
+async fn endgame_ladder_articles_ride_empty_pipelines_only() {
+    let servers = vec![
+        (server("a"), PoolConfig::default()),
+        (server("b"), PoolConfig::default()),
+    ];
+    let (sh, _) = Shared::new(fresh(&["<l@x>"]), &servers);
+    let ctx0 = ctx_for(&servers, 0);
+    sh.alive[0].fetch_add(1, Ordering::AcqRel);
+    sh.alive[1].fetch_add(1, Ordering::AcqRel);
+    // One pending article 430'd by the sibling: an endgame ladder probe.
+    sh.queue.lock().await.front_mut().unwrap().tried_430 = server_bit(1);
+    let (tx, _rx) = mpsc::channel(4);
+    // A busy pipeline holds it back (head-of-line blocking on the last
+    // windows was the measured straggler tail).
+    assert!(next_work(&sh, ctx0, &tx, 3).await.is_none());
+    sh.scan_futile[0].store(u64::MAX, Ordering::Relaxed);
+    // An idle worker answers the probe in one RTT.
+    let w = next_work(&sh, ctx0, &tx, 0)
+        .await
+        .expect("idle takes the probe");
+    assert_eq!(w.id, "<l@x>");
+}
+
+#[tokio::test]
+async fn untried_promoted_work_is_left_for_a_faster_server() {
+    let servers = vec![
+        (server("slow"), PoolConfig::default()),
+        (server("fast"), PoolConfig::default()),
+    ];
+    let (sh, _) = Shared::new(fresh(&["<s@x>"]), &servers);
+    let ctx0 = ctx_for(&servers, 0);
+    sh.alive[0].fetch_add(1, Ordering::AcqRel);
+    sh.alive[1].fetch_add(1, Ordering::AcqRel);
+    // A stream reader is attached and the sibling is measurably faster.
+    sh.note_stream();
+    sh.bytes[1].store(64_000_000, Ordering::Release);
+    {
+        let mut q = sh.queue.lock().await;
+        q.front_mut().unwrap().promoted = true;
+        sh.promoted_pending.fetch_add(1, Ordering::AcqRel);
+    }
+    let (tx, _rx) = mpsc::channel(4);
+    // The slow server steps past it - and puts it back at the FRONT.
+    assert!(next_work(&sh, ctx0, &tx, 0).await.is_none());
+    {
+        let q = sh.queue.lock().await;
+        assert_eq!(q.front().map(|w| w.id.as_str()), Some("<s@x>"));
+        assert!(q.front().unwrap().promoted);
+    }
+    assert_eq!(
+        sh.promoted_pending.load(Ordering::Acquire),
+        1,
+        "stepping past is not a pick - the promise stays charged"
+    );
+    // Once ANY backbone has 430'd it, latency beats speed-matching:
+    // whoever can serve it, serves it.
+    sh.scan_futile[0].store(u64::MAX, Ordering::Relaxed);
+    sh.queue.lock().await.front_mut().unwrap().tried_430 = server_bit(1);
+    let w = next_work(&sh, ctx0, &tx, 0)
+        .await
+        .expect("a missed promote goes to whoever is standing");
+    assert_eq!(w.id, "<s@x>");
+    assert_eq!(sh.promoted_pending.load(Ordering::Acquire), 0);
+}
+
+/// A bare 430 (no echoed message-id) defers the verdict instead of
+/// declaring the article missing, and MUST tick `deferred` on its way
+/// out. The caller's stall watchdog reads decoded bytes, outstanding
+/// articles and this counter; a deferral moves neither of the first
+/// two, so without the tick a wholly dead post - which takes this
+/// branch for every one of its articles before any can go terminal -
+/// looks exactly like a wedged pool and gets aborted mid-ladder, then
+/// blamed on the user's machine. That abort shipped once already
+/// (31 Jul) and this branch reopened it; the e2e guard is
+/// `dead_post_is_driven_to_missing_not_abandoned_as_a_stall`.
+#[tokio::test]
+async fn a_bare_430_defers_the_verdict_and_says_so() {
+    let servers = vec![(server("s"), PoolConfig::default())];
+    let (sh, _) = Shared::new(fresh(&["<a@x>"]), &servers);
+    let cfg = PoolConfig::default();
+    let ctx = ctx_for(&servers, 0);
+    let (tx, mut rx) = mpsc::channel(8);
+    // Dispatch it the way a worker would, so the queue below counts the
+    // requeue and not the seeded entry.
+    let dispatched = sh.queue.lock().await.pop_front().expect("the seeded work");
+    let mut inflight: VecDeque<Work> = [dispatched].into_iter().collect();
+    sh.charge_wire();
+
+    let before = sh.deferred.load(Ordering::Relaxed);
+    handle_missing(&cfg, ctx, &sh, &tx, &mut inflight, Vec::new(), false).await;
+    assert_eq!(
+        sh.deferred.load(Ordering::Relaxed),
+        before + 1,
+        "a deferred verdict is forward progress and must be visible as such"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the first bare 430 requeues - it does not resolve the article"
+    );
+    assert_eq!(sh.queue.lock().await.len(), 1, "requeued for the recheck");
+
+    // The confirming repeat lands on the re-aligned session and is
+    // authoritative: the article goes terminally Missing, and THAT
+    // resolution is the outstanding-count movement the watchdog sees.
+    let w = sh
+        .queue
+        .lock()
+        .await
+        .pop_front()
+        .expect("the requeued work");
+    let mut inflight: VecDeque<Work> = [w].into_iter().collect();
+    sh.charge_wire();
+    handle_missing(&cfg, ctx, &sh, &tx, &mut inflight, Vec::new(), false).await;
+    assert!(
+        matches!(rx.try_recv(), Ok(FetchOutcome::Missing { id, .. }) if id == "<a@x>"),
+        "the second bare 430 confirms the first and declares the article"
+    );
+    assert_eq!(
+        sh.deferred.load(Ordering::Relaxed),
+        before + 1,
+        "a resolving response is not a deferral"
+    );
 }

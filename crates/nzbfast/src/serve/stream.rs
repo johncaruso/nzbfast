@@ -880,15 +880,53 @@ pub(super) fn stream_runway_wait_ms() -> u64 {
 /// Grace before a blocked read even starts asking whether its span is
 /// terminally undeliverable, and the spacing of the consecutive
 /// verdicts it requires. The check itself is authoritative (pool item
-/// state), so the grace only has to outlive decode/write latency and
-/// the pop-to-registration blind spot `QueueControl::any_live`
-/// documents - not any network timeout.
-const DEAD_SPAN_GRACE_MS: u64 = 5_000;
-const DEAD_SPAN_VOTE_MS: u64 = 1_000;
+/// state), so the grace only has to outlive the blind windows
+/// `QueueControl::any_live` documents - not any network timeout.
+///
+/// Round 3 of the stream hardening rig
+/// (research/STREAM-HARDENING-2026-08.md) A/B'd a tightened window
+/// (2000/500, earliest verdict 6.0 s -> 2.5 s of blocked wait - safe
+/// in principle since `arrival_ack` closed the channel/consumer blind
+/// window) and measured the true hole's rebuffer dominated by the
+/// retry ladder keeping the missing articles LIVE, not by this window:
+/// the tightening bought ~0.3-0.6 s inside a ~4 s bimodal noise band.
+/// Kept at 5000/1000/2 - the margin costs almost nothing and the
+/// verdict must never condemn bytes the pool still means to retry.
+/// Env overrides exist so the next round's A/B needs no rebuild.
+fn dead_span_grace_ms() -> u64 {
+    static G: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("NZBFAST_STREAM_DEAD_SPAN_GRACE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5_000)
+    })
+}
+fn dead_span_vote_ms() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("NZBFAST_STREAM_DEAD_SPAN_VOTE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(1_000)
+    })
+}
 /// Consecutive "nothing live can deliver this" verdicts required
 /// before the reader zero-fills; see `QueueControl::any_live` for the
-/// race this papers over.
-const DEAD_SPAN_VOTES: u32 = 2;
+/// race this papers over. Two votes spaced `dead_span_vote_ms` apart
+/// means a false verdict needs the span invisible at two instants that
+/// far apart - the ms-scale blind windows cannot span both.
+fn dead_span_votes() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("NZBFAST_STREAM_DEAD_SPAN_VOTES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(2)
+    })
+}
 
 /// How long a blocked read waits once NO fetch run is attached (the
 /// run drained or the job parked) before it concludes the hole under
@@ -1061,8 +1099,8 @@ impl std::io::Read for LiveRangeReader {
                 // this read with real bytes. Consecutive votes per
                 // any_live's blind spot.
                 if stream_zerofill()
-                    && waited >= DEAD_SPAN_GRACE_MS
-                    && waited.is_multiple_of(DEAD_SPAN_VOTE_MS)
+                    && waited >= dead_span_grace_ms()
+                    && waited.is_multiple_of(dead_span_vote_ms())
                     && !self.covered(self.pos, n as u64)
                     && let Some(sc) = &self.seek
                 {
@@ -1076,7 +1114,7 @@ impl std::io::Read for LiveRangeReader {
                         None => waited >= stream_dead_grace_ms(),
                     };
                     dead_votes = if dead { dead_votes + 1 } else { 0 };
-                    if dead_votes >= DEAD_SPAN_VOTES && !self.covered(self.pos, n as u64) {
+                    if dead_votes >= dead_span_votes() && !self.covered(self.pos, n as u64) {
                         let gap = (self.uncovered_hole_len(runway, n as u64) as usize).min(n);
                         self.dead_until = self.pos + hole;
                         buf[..gap].fill(0);

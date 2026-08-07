@@ -53,13 +53,18 @@ on:
         type: boolean
         default: false
 
+# Job-level permissions only (Scorecard TokenPermissionsID): a top-level
+# write grant leaks into every job added later; each job names what it
+# needs.
 permissions:
-  id-token: write       # Sigstore keyless signing (OIDC identity token)
-  attestations: write   # write the attestation to the GH attestations API
-  contents: write       # attach artifacts to the release
+  contents: read
 
 jobs:
   binaries:
+    permissions:
+      id-token: write       # Sigstore keyless signing (OIDC identity token)
+      attestations: write   # write the attestation to the GH attestations API
+      contents: write       # attach artifacts to the release
     strategy:
       fail-fast: false
       matrix:

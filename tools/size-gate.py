@@ -44,23 +44,31 @@ SLACK = 1.02  # ordinary feature work must not trip an allow-listed entry
 # split - the gate refuses stale entries, so deletion is enforced, not hoped.
 BASELINE_FILES = {
     # path (relative to repo root): raw lines measured
-    # 13837 when first measured; the phase 2.3 cuts ratchet it down
-    # as serve() moves to http.rs and friends.
-    "crates/nzbfast/src/serve/mod.rs": 12988,
+    # serve/mod.rs was here at 13,837, then 12,988, then 13,310. Phase 4
+    # moved its flat free functions out to sibling modules and dispersed
+    # its 4,800-line inline `mod tests`; it is 852 lines now, so its entry
+    # is GONE. Nothing is left to grandfather.
     "crates/nzbfast/tests/daemon.rs": 11803,
     # 7471 when first measured; two concurrent 5 Aug sessions landed
     # test growth (one-pass rigs + the round-6 crc-retry pricing leg).
     "crates/nzbfast/tests/e2e.rs": 7641,
     # 7165 when first measured; pre-gate concurrent work landed 7375.
     "crates/nzbfast/src/smart.rs": 7375,
-    # 7081 when first measured; the tail-optimization campaign is actively
-    # landing here (7253 -> 7566 -> 7816 -> 9762 as the round-6/7 rigs
-    # and the live-tuner merged; growth dominated by payout-rig tests).
-    # Keep grandfathering its merges until the campaign settles, then
-    # ratchet - TODO 113 tracks that. 10,125 after the 5 Aug pool round
-    # merged (+331, session_loop 988 -> 1037); 10,618 after the TTFB
-    # hedge round (session_loop -> 1084).
-    "crates/nzbkit/src/pool.rs": 10618,
+    # 7081 when first measured; peaked at 10,828 during the fault/tuner
+    # campaign. TODO 113 ratchet: the payout/safety rigs moved to
+    # pool/rig_tests.rs (their own child module), 10,828 -> 7,855, then
+    # the session_loop split (1,084 -> 461, its fn entry deleted) paid
+    # ~170 lines of extraction overhead (signatures + docs): 8,011.
+    # 8,282 after the §114 consumer-steer graduation merged over the
+    # split (note_decoded seam + handed/steer-inbox plumbing; its rigs
+    # live in rig_tests.rs, which absorbs the test growth).
+    "crates/nzbkit/src/pool.rs": 8282,
+    # Born 2,988 in the TODO 113 split (the pool's payout/safety rigs,
+    # one file because sibling cfg(test) mods cannot share helpers);
+    # 3,125 when the §114 consumer-steer rigs replaced the pool-gate
+    # ones. All test code - grandfathered like pool.rs's rig growth
+    # was, ratchet when the campaign settles.
+    "crates/nzbkit/src/pool/rig_tests.rs": 3125,
     "crates/nzbkit/src/extract/mod.rs": 6192,
     # 6056 when first measured; pre-gate concurrent work landed 6213, and
     "crates/nzbfast/src/serve/tasks.rs": 6400,
@@ -78,11 +86,6 @@ BASELINE_FILES = {
 
 BASELINE_FNS = {
     # "path::fn_name": lines measured
-    # 816 when first measured; grows with the tail-optimization campaign
-    # (853 -> 880 -> 912 -> 960 -> 988 -> 1037 -> 1084 merged) - see
-    # the file entry above.
-    "crates/nzbkit/src/pool.rs::session_loop": 1084,
-    "crates/nzbfast/src/serve/mod.rs::watchlist_pass": 732,
     # 688 when first measured; pre-gate concurrent work landed 719, then 770.
     "crates/nzbfast/src/serve/tasks.rs::spawn_download_worker": 770,
     "crates/nzbfast/src/serve/sabcompat.rs::queue_json": 652,
@@ -90,8 +93,14 @@ BASELINE_FNS = {
 }
 
 CFG_TEST = re.compile(r"\s*#\[cfg\(test\)\]")
+# The `#[path = "x_tests.rs"] mod x_tests;` hook puts an attribute between
+# the cfg and the mod, and the old pattern stopped dead at it - every file
+# attached that way was scored as PRODUCTION code, so a long table-driven
+# test in one would have tripped the fn ceiling for no reason. Tolerate any
+# run of attributes in between.
 CFG_TEST_MOD = re.compile(
-    r"\s*#\[cfg\(test\)\]\s*(?:\n\s*)?(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;"
+    r"\s*#\[cfg\(test\)\]\s*(?:\n\s*)?(?:#\[[^\]]*\]\s*(?:\n\s*)?)*"
+    r"(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;"
 )
 FN_START = re.compile(
     r"(?:^|[\s{}();])(?:pub(?:\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?"

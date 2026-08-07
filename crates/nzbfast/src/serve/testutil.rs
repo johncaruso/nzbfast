@@ -190,6 +190,7 @@ pub(crate) fn test_daemon(dir: &Path) -> Arc<Daemon> {
         #[cfg(feature = "indexer")]
         index_gates: seed_index_gates(&settings_path, None),
         line_speed: seed_line_speed(&settings_path),
+        link_peak: super::linkpeak::LinkPeak::load(spool.join("linkpeak.json")),
         tune_hint: Mutex::new(String::new()),
         cpu_sample: Mutex::new(None),
         speed_win: Mutex::new(VecDeque::new()),

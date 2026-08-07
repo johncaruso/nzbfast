@@ -1297,7 +1297,7 @@ pub fn cleanup(dir: &Path, exts: &[String]) -> (usize, usize) {
     let mut removed = 0;
     let mut par2 = 0;
     // Read once, for the whole sweep: see `remove_user_file`.
-    let recoverable = delete_to_trash();
+    let recoverable = cleanup_recoverable();
     let staging = trash_staging_dir(dir);
     let mut sweep = |d: &Path| {
         let Ok(rd) = std::fs::read_dir(d) else { return };
@@ -2131,7 +2131,11 @@ mod deferred_trash {
                         // so only its disposition (Trash vs gone) is at
                         // stake here - and under cfg(test) the default-off
                         // global keeps the suite out of the developer's
-                        // real Trash, exactly like every sweep.
+                        // real Trash, exactly like every sweep. Read
+                        // through cleanup_recoverable: everything staged
+                        // here came from a GARBAGE sweep, so its
+                        // disposition follows the garbage setting, not
+                        // the download-delete one.
                         // NotFound is Ok here (a double-enqueue after a
                         // leftover drain, or Finder finishing behind us).
                         //
@@ -2142,7 +2146,7 @@ mod deferred_trash {
                         // missing. Staged is still recoverable - a visible
                         // file on the same volume - and the next drain of
                         // this root retries it.
-                        if let Err(e) = super::remove_user_file(&p, super::delete_to_trash()) {
+                        if let Err(e) = super::remove_user_file(&p, super::cleanup_recoverable()) {
                             warn!(target: "cleanup", "deferred trash {}: {e}", p.display());
                         }
                         // Leave nothing behind when the queue drains: an
@@ -2230,6 +2234,72 @@ pub fn delete_to_trash() -> bool {
     TRASH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Where CLEANUP deletes go - the garbage class: spent archive volumes
+/// after a successful unpack, consumed adoption sources, sniffed
+/// recovery files, and the junk sweep. Separate from `delete_to_trash`
+/// (which keeps governing deletes of the downloads THEMSELVES - queue
+/// and history deletes, watchlist upgrades, library episode drops)
+/// because the two classes pull opposite ways: garbage is high-volume
+/// and worthless-by-verdict (50 GB of spent volumes fills a Trash
+/// nobody empties), while a deleted download is the user's own data.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CleanupMode {
+    /// Ride `delete_to_trash`, exactly the pre-setting behavior.
+    Follow,
+    /// Always recoverable, even when download deletes are permanent.
+    Trash,
+    /// Always permanent, even when download deletes go to the Trash.
+    Delete,
+}
+
+impl CleanupMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CleanupMode::Follow => "follow",
+            CleanupMode::Trash => "trash",
+            CleanupMode::Delete => "delete",
+        }
+    }
+    pub fn parse(v: &str) -> Option<CleanupMode> {
+        match v {
+            "follow" => Some(CleanupMode::Follow),
+            "trash" => Some(CleanupMode::Trash),
+            "delete" => Some(CleanupMode::Delete),
+            _ => None,
+        }
+    }
+}
+
+/// Process-global like `TRASH`, for the same reason. 0=follow 1=trash
+/// 2=delete; default `follow` so an upgrade changes nobody's behavior.
+static CLEANUP_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub fn set_cleanup_mode(m: CleanupMode) {
+    let v = match m {
+        CleanupMode::Follow => 0,
+        CleanupMode::Trash => 1,
+        CleanupMode::Delete => 2,
+    };
+    CLEANUP_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn cleanup_mode() -> CleanupMode {
+    match CLEANUP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => CleanupMode::Trash,
+        2 => CleanupMode::Delete,
+        _ => CleanupMode::Follow,
+    }
+}
+
+/// The `recoverable` flag a GARBAGE sweep should pass to
+/// [`remove_user_file`] / [`remove_swept_file`]. Read once at a sweep's
+/// entry, same contract as `delete_to_trash`.
+pub fn cleanup_recoverable() -> bool {
+    match cleanup_mode() {
+        CleanupMode::Follow => delete_to_trash(),
+        CleanupMode::Trash => true,
+        CleanupMode::Delete => false,
+    }
+}
+
 /// A scrap left inside an archive: no extension at all, and far too small
 /// to be anything a user asked for, sitting next to an identified feature.
 ///
@@ -2293,7 +2363,7 @@ fn is_nameless_scrap(p: &Path, ext: &str, feature_len: u64, recoverable: bool) -
 }
 
 pub fn sweep_junk(dir: &Path) -> usize {
-    let recoverable = delete_to_trash();
+    let recoverable = cleanup_recoverable();
     let staging = trash_staging_dir(dir);
     let keep = largest_video(dir);
     let keep_len = keep
@@ -2352,7 +2422,7 @@ pub fn sweep_junk(dir: &Path) -> usize {
 pub fn keep_media_only(dir: &Path) -> usize {
     let mut removed = 0;
     // Read once, for the whole sweep: see `remove_user_file`.
-    let recoverable = delete_to_trash();
+    let recoverable = cleanup_recoverable();
     let staging = trash_staging_dir(dir);
     // The feature size gates sample deletion: a same-size episode in a
     // "Proof"/"Sample" season pack is kept, only a small teaser is dropped.
@@ -3708,6 +3778,7 @@ pub fn unlock(dir: &Path, password: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     /// The move-I/O demotion must RESTORE the thread's policy on drop:
@@ -7428,3 +7499,9 @@ mod out_umask_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+// Child module file, not inline: smart.rs sits under a size-gate
+// baseline (TODO 106) and test growth belongs beside it, same pattern
+// as pool/unit_tests.rs.
+#[cfg(test)]
+mod cleanup_mode_tests;

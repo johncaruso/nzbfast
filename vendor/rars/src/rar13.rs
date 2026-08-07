@@ -962,6 +962,17 @@ impl PendingSplitRefs {
                 "RAR 1.3 split entry encryption flag changed",
             ));
         }
+        // Strictly increasing volumes only - two fragments of one member
+        // inside one volume is a crafted shape (see the rar15/rar50
+        // twins), and downstream consumption accounting relies on a
+        // fragment never revisiting an earlier volume.
+        if let Some(&(last_volume, _)) = self.fragments.last() {
+            if volume_index <= last_volume {
+                return Err(Error::InvalidHeader(
+                    "RAR 1.3 split fragment does not advance to a later volume",
+                ));
+            }
+        }
         self.fragments.push((volume_index, entry_index));
         Ok(())
     }

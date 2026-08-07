@@ -430,7 +430,7 @@ pub(super) fn sweep_sniffed_leftovers(
         // recovery files ride the setting that governs named `.par2`,
         // and since §64 that is a recoverable, parked delete. Flag read
         // once at the sweep's entry.
-        let recoverable = crate::smart::delete_to_trash();
+        let recoverable = crate::smart::cleanup_recoverable();
         let staging = crate::smart::trash_staging_dir(out_dir);
         for p in nzbkit::par2repair::sniffed_packet_files(out_dir).unwrap_or_default() {
             let is_payload = p

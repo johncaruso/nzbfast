@@ -7,9 +7,9 @@ import SwiftUI
 final class AppState: ObservableObject {
     @Published var config: ServerConfig?
     @Published var serverVersion: String?
-    @Published var queue: QueueBody?
-    @Published var history: HistoryBody?
-    @Published var probes: [String: ProbeResponse] = [:]
+    /// The one mode=playback poll: queue, history, per-file readiness
+    /// and the byte-serving telemetry, all in a single response.
+    @Published var snapshot: PlaybackSnapshot?
     @Published var lastError: String?
     @Published var offlineSince: Date?
     @Published var selectedTab: MainTab = .home
@@ -34,7 +34,8 @@ final class AppState: ObservableObject {
 
     /// Validate URL + key against the daemon, then persist and start
     /// polling. mode=version answers without a key, so the key itself
-    /// is proven with an authenticated mode=queue call.
+    /// is proven with the call the app lives on: mode=playback needs
+    /// the full key and proves the daemon speaks contract v1.
     func connect(urlString: String, apiKey: String) async throws {
         var s = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         if !s.contains("://") { s = "http://" + s }
@@ -43,7 +44,7 @@ final class AppState: ObservableObject {
         let cfg = ServerConfig(baseURL: url, apiKey: apiKey.trimmingCharacters(in: .whitespacesAndNewlines))
         let probe = ApiClient(config: cfg)
         let ver = try await probe.version()
-        _ = try await probe.queue(limit: 1)
+        _ = try await probe.playback(limit: 1)
         if let data = try? JSONEncoder().encode(cfg) {
             UserDefaults.standard.set(data, forKey: Self.configKey)
         }
@@ -63,9 +64,7 @@ final class AppState: ObservableObject {
         UserDefaults.standard.removeObject(forKey: Self.configKey)
         config = nil
         client = nil
-        queue = nil
-        history = nil
-        probes = [:]
+        snapshot = nil
         lastError = nil
         offlineSince = nil
     }
@@ -83,13 +82,11 @@ final class AppState: ObservableObject {
     func refresh() async {
         guard let client else { return }
         do {
-            let q = try await client.queue()
-            let h = try await client.history()
-            queue = q
-            history = h
+            // One call for everything: readiness rides the job rows (no
+            // per-job probes) and the telemetry feeds the player overlay.
+            snapshot = try await client.playback()
             lastError = nil
             offlineSince = nil
-            await refreshProbes(for: q.slots)
         } catch {
             // Keep the last good snapshot on screen; show a banner and
             // keep trying. A fault profile must never wedge the app.
@@ -98,23 +95,26 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Probe playback readiness for jobs that are actively moving.
-    private func refreshProbes(for slots: [QueueSlot]) async {
-        guard let client else { return }
-        for slot in slots.prefix(6) where slot.status == "Downloading" {
-            if let p = try? await client.probe(slot.nzoId) {
-                probes[slot.nzoId] = p
-            }
+    /// Present the player for a job row. Row 16 already hands over the
+    /// tokenized play URL; /m3u is only the fallback for a row that
+    /// lacked one. mode=playback is read-only by design; the probe is
+    /// what promotes a live job's file index, so fire it once for the
+    /// one job the user opened (contract row 13).
+    func requestPlay(job: PlaybackJob) async throws {
+        guard let client else { throw ApiError.daemon("Not connected.") }
+        let url: URL
+        if let s = job.stream, let u = URL(string: s) {
+            url = u
+        } else {
+            url = try await client.playURL(for: job.nzoId)
         }
-        let live = Set(slots.map(\.id))
-        probes = probes.filter { live.contains($0.key) }
+        if job.playback?.source == "live" {
+            Task { _ = try? await client.probe(job.nzoId) }
+        }
+        playRequest = PlayerTarget(jobId: job.nzoId, url: url)
     }
 
-    func probeReady(_ id: String) -> Bool {
-        probes[id]?.ready ?? false
-    }
-
-    /// Resolve a tokenized play URL and present the player.
+    /// Resolve a tokenized play URL by id (the QA deep-link path).
     func requestPlay(id: String) async throws {
         guard let client else { throw ApiError.daemon("Not connected.") }
         let url = try await client.playURL(for: id)
@@ -128,7 +128,45 @@ final class AppState: ObservableObject {
     /// same code paths the buttons call.
     func handleOpenURL(_ url: URL) {
         if url.scheme == "nzblnk" {
-            Task { _ = try? await client?.addNzblnk(url.absoluteString); await refresh() }
+            Task {
+                do {
+                    guard let client else { throw ApiError.daemon("Not connected.") }
+                    let resp = try await client.addNzblnk(url.absoluteString)
+                    guard resp.status else {
+                        throw ApiError.daemon(resp.error ?? "The server refused that link.")
+                    }
+                    await refresh()
+                } catch {
+                    lastError = (error as? LocalizedError)?.errorDescription
+                        ?? "Could not add that link."
+                }
+            }
+            return
+        }
+        // A .nzb shared from another app ("Open in nzbfast" on the
+        // share sheet) arrives as a file URL - same upload path the
+        // document picker uses, security scope included. Every failure
+        // class is surfaced: an OS share that silently does nothing is
+        // indistinguishable from success, and the user's NZB just
+        // vanishes. Navigation to Home happens only on a real add.
+        if url.isFileURL {
+            Task {
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                do {
+                    guard let client else { throw ApiError.daemon("Not connected.") }
+                    let data = try Data(contentsOf: url)
+                    let resp = try await client.addFile(data: data, filename: url.lastPathComponent)
+                    guard resp.status else {
+                        throw ApiError.daemon(resp.error ?? "The server refused that NZB.")
+                    }
+                    await refresh()
+                    selectedTab = .home
+                } catch {
+                    lastError = (error as? LocalizedError)?.errorDescription
+                        ?? "Could not add \(url.lastPathComponent)."
+                }
+            }
             return
         }
         #if DEBUG

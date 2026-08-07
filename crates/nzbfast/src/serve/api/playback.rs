@@ -51,8 +51,8 @@ fn num(v: &Value) -> f64 {
 /// Never the API key: this string is handed to players, written into
 /// `.strm` files, and printed in logs. The token starts THIS job and
 /// nothing else (see `Daemon::stream_token`).
-fn stream_url(d: &Daemon, host: &str, id: &str) -> String {
-    format!("http://{host}/stream/{id}?t={}", d.stream_token(id))
+fn stream_url(d: &Daemon, base: &str, id: &str) -> String {
+    format!("{base}/stream/{id}?t={}", d.stream_token(id))
 }
 
 fn m_playback(
@@ -89,7 +89,7 @@ fn m_playback(
                 "timeleft": s["timeleft"],
                 "activity": s["activity"],
                 "playback": playback_readiness(d, id),
-                "stream": stream_url(d, ctx.host_hdr, id),
+                "stream": stream_url(d, ctx.base, id),
             })
         })
         .collect();
@@ -110,7 +110,7 @@ fn m_playback(
                 "fail_message": s["fail_message"],
                 "completed": s["completed"],
                 "playback": playback_readiness(d, id),
-                "stream": stream_url(d, ctx.host_hdr, id),
+                "stream": stream_url(d, ctx.base, id),
             })
         })
         .collect();
@@ -126,8 +126,8 @@ fn m_playback(
         "warnings": warns.len(),
         // Totals BEFORE the page cut, so a client showing "3 of 12" does
         // not have to page the whole list to know there are twelve.
-        "queue_total": queue["queue"]["slots"].as_array().map(|s| s.len()).unwrap_or(0),
-        "history_total": history["history"]["slots"].as_array().map(|s| s.len()).unwrap_or(0),
+        "queue_total": num(&queue["queue"]["noofslots"]) as u64,
+        "history_total": num(&history["history"]["noofslots"]) as u64,
         "queue": jobs,
         "history": done,
         "stream": stream_telemetry(d),
@@ -179,7 +179,7 @@ fn m_stream_token(
             "status": true,
             "nzo_id": id,
             "token": d.stream_token(&id),
-            "stream": stream_url(d, ctx.host_hdr, &id),
+            "stream": stream_url(d, ctx.base, &id),
             // Derived from the install's secret and the job id, so it
             // stays valid as long as the install does: a .strm written
             // into a Jellyfin library may first be played months later.

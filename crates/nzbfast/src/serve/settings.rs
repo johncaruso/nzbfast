@@ -139,6 +139,57 @@ fn annotate_patterns(v: Value) -> Value {
     )
 }
 
+/// The save-time half of the #18 diagnostic: a warning for the answer to
+/// `mode=config`, when the rules just saved contain a pattern that will
+/// not compile.
+///
+/// `annotate_patterns` above marks the row - but only on the next READ of
+/// the settings, and only for eyes that are on that card. The moment the
+/// user actually acts is Apply, and the answer to Apply said only
+/// "status: true", which is true (the save is accepted, the fallback to a
+/// keyword search is documented behaviour) and still the wrong moment to
+/// stay quiet: a rule that quietly does nothing looks exactly like a rule
+/// that has not fired yet. So the answer carries the rule's name and the
+/// engine's own compile error, and the dashboard toasts it.
+///
+/// Only the did-not-compile shape warns here, deliberately. A pattern
+/// that compiles to "matches everything" is marked in the row too, but a
+/// catch-all as the LAST rule ("everything else goes to misc") is a
+/// legitimate configuration, and a toast that nagged on every re-save of
+/// a deliberate setup would teach people to ignore it. A compile failure
+/// is never deliberate.
+///
+/// A warning, not an Err: refusing the save would change semantics the
+/// issue explicitly asks to keep (plain keywords are documented to work,
+/// and they arrive down this same code path as uncompilable patterns).
+pub(super) fn rules_save_warning(name: &str, v: &str) -> Option<String> {
+    use nzbkit::categories::pat_compile_error;
+    if !matches!(name, "smart_folders" | "custom_categories") {
+        return None;
+    }
+    let rules: Vec<Value> = serde_json::from_str(v.trim()).ok()?;
+    let mut parts: Vec<String> = Vec::new();
+    for (i, rule) in rules.iter().enumerate() {
+        let label = rule
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("\"{s}\""))
+            .unwrap_or_else(|| format!("rule {}", i + 1));
+        for (field, what) in [("match", "pattern"), ("not_match", "\"but not\" pattern")] {
+            let pat = rule.get(field).and_then(Value::as_str).unwrap_or("");
+            if let Some(err) = pat_compile_error(pat) {
+                parts.push(format!(
+                    "{label}: {what} \"{pat}\" does not compile ({err}), so it is \
+                     searched for as plain text and will almost never match"
+                ));
+            }
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
 pub(super) const fn rw_opaque(name: &'static str, read: fn(&ConfigCtx) -> Value) -> Setting {
     Setting {
         name,
@@ -184,6 +235,9 @@ pub(super) const PATHS: &[Setting] = &[
         "delete_to_trash",
         |_| json!(crate::smart::delete_to_trash()),
     ),
+    rw("cleanup_delete_mode", |_| {
+        json!(crate::smart::cleanup_mode().as_str())
+    }),
     rw("script", |c| json!(path_str(&c.d.script.lock_ok()))),
     rw("script_timeout_secs", |c| {
         json!(c.d.script_timeout.load(Ordering::Relaxed))
@@ -1273,15 +1327,36 @@ fn set_delete_to_trash(
 ) -> std::result::Result<(bool, Value), String> {
     let flag = || v == "1" || v.eq_ignore_ascii_case("true");
     Ok({
-        // Cleanup deletes go to the Trash so a wrong guess by the
-        // junk heuristics is recoverable. On by default on macOS and
+        // Deletes of the downloads themselves go to the Trash so a
+        // wrong click is recoverable. On by default on macOS and
         // Windows, where the Trash is a place the user can see and
         // empty; off by default on Linux, where it is not - see
         // `trash_suits_this_platform`. Off means a permanent delete.
+        // Garbage cleanup follows this too unless `cleanup_delete_mode`
+        // says otherwise.
         let on = flag();
         crate::smart::set_delete_to_trash(on);
         (true, json!(on))
     })
+}
+
+fn set_cleanup_delete_mode(
+    _d: &Arc<Daemon>,
+    _name: &str,
+    v: &str,
+) -> std::result::Result<(bool, Value), String> {
+    // Garbage-class deletes only (spent volumes, repair files, junk
+    // sweeps): "follow" rides delete_to_trash, "trash" is always
+    // recoverable, "delete" is always permanent. An unknown value is
+    // refused rather than defaulted - a typo silently becoming
+    // permanent deletes is the one wrong answer here.
+    let Some(mode) = crate::smart::CleanupMode::parse(&v.to_ascii_lowercase()) else {
+        return Err(format!(
+            "unknown cleanup_delete_mode {v:?} - use follow, trash or delete"
+        ));
+    };
+    crate::smart::set_cleanup_mode(mode);
+    Ok((true, json!(mode.as_str())))
 }
 
 fn set_watch_interval_secs(
@@ -2335,6 +2410,10 @@ fn set_categories(
     })
 }
 
+/// Apply one settings-UI change to the running daemon. Returns
+/// `(applied_live, persist_value)` - `persist_value` is what lands in
+/// settings.json under `name`. `applied_live = false` marks the few
+/// settings that only take effect on the next launch.
 pub(super) fn apply_setting(
     d: &Arc<Daemon>,
     name: &str,
@@ -2580,6 +2659,7 @@ pub(super) fn apply_setting(
             (true, json!(n))
         }
         "delete_to_trash" => set_delete_to_trash(d, name, v)?,
+        "cleanup_delete_mode" => set_cleanup_delete_mode(d, name, v)?,
         "watch_interval_secs" => set_watch_interval_secs(d, name, v)?,
         "index_tip_secs" => set_index_tip_secs(d, name, v)?,
         "nested_max_depth" => set_nested_max_depth(d, name, v)?,

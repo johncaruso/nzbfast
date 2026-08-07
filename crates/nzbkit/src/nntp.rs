@@ -26,6 +26,17 @@ pub enum NntpError {
     AuthFailed { kind: AuthRefusal, line: String },
     #[error("unexpected response to {cmd}: {line}")]
     Unexpected { cmd: String, line: String },
+    /// The response echoed a message-id, and it is not the one the
+    /// caller asked for. On a pipelined connection responses are
+    /// attributed POSITIONALLY, so one dropped or reordered response
+    /// desyncs the whole conversation and silently files every later
+    /// body under the wrong article - this is the only check that can
+    /// see it. A session-level failure, same as [`Unexpected`]: the
+    /// socket's remaining responses cannot be trusted.
+    ///
+    /// [`Unexpected`]: NntpError::Unexpected
+    #[error("response echoed a different message-id (asked for {expected}): {line}")]
+    IdMismatch { expected: String, line: String },
     #[error("multiline response exceeded {0} bytes")]
     TooLarge(usize),
     #[error("timed out waiting for a server response")]
@@ -107,6 +118,38 @@ pub const MAX_STATUS_BYTES: usize = 64 * 1024;
 pub struct Status {
     pub code: u16,
     pub line: String,
+}
+
+/// The message-id a status line echoes, when a plausible one is
+/// present. RFC 3977 responses to BODY/ARTICLE/STAT echo the id
+/// ("222 0 <id> body follows", "220 0 <id> article follows", and some
+/// servers echo it on 430/423 refusals too) - but plenty of real
+/// providers echo a bare `0` or omit the field entirely, so absence
+/// means "no evidence", never "mismatch". Plausible = an
+/// angle-bracketed token; anything else on the line is ignored.
+pub fn echoed_message_id(line: &str) -> Option<&str> {
+    line.split_ascii_whitespace()
+        .find(|t| t.len() > 2 && t.starts_with('<') && t.ends_with('>'))
+}
+
+/// Enforce the echoed message-id against the id the caller asked for,
+/// when the caller supplied one AND the line carries a plausible id
+/// (see [`echoed_message_id`]). Case-insensitive: message-ids are
+/// compared byte-wise everywhere else, but a server canonicalizing
+/// case must not read as a desync. Applies to any status shape that
+/// echoes an id - 222 (BODY), 220 (ARTICLE), and refusals (430/423,
+/// Giganews's 451) alike.
+fn check_echoed_id(st: &Status, expected: Option<&str>) -> Result<(), NntpError> {
+    if let Some(exp) = expected
+        && let Some(got) = echoed_message_id(&st.line)
+        && !got.eq_ignore_ascii_case(exp)
+    {
+        return Err(NntpError::IdMismatch {
+            expected: exp.to_string(),
+            line: st.line.clone(),
+        });
+    }
+    Ok(())
 }
 
 pub struct GroupInfo {
@@ -773,6 +816,25 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// only ever trips a stalled or hostile peer. The download pool bounds its
 /// bulk body reads separately (`read_timeout`, per fill).
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long [`Connection::quit`] stays polite waiting for the goodbye.
+/// The QUIT itself is already sent by then - the wait only avoids
+/// closing with the server's `205` still in flight (an unread byte at
+/// close can turn a graceful FIN into an RST on some stacks). 150 ms
+/// covers any realistic goodbye RTT; the fault matrix's mutequit
+/// profile showed mid-run courtesy quits to a never-answering peer
+/// each eating the old 500 ms bound (+2 s on a 22 s job).
+/// `NZBFAST_QUIT_BOUND_MS` overrides for A/B.
+fn quit_bound() -> std::time::Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("NZBFAST_QUIT_BOUND_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&m| m > 0)
+            .unwrap_or(150)
+    }))
+}
 
 /// Idle (no-progress) bound on a multiline body read. `MAX_MULTILINE_BYTES`
 /// only bites when bytes KEEP ARRIVING; a peer that emits "224 overview
@@ -2345,14 +2407,42 @@ impl Connection {
     /// the give-up ceiling - turning "one removed file fails" into "the
     /// whole job fails" on a single-server setup. A removed article is a
     /// miss, not a broken conversation.
-    pub async fn read_body_into(&mut self, out: &mut Vec<u8>) -> Result<bool, NntpError> {
+    ///
+    /// `expected`: the message-id this response is being attributed to
+    /// (with angle brackets). On the pipelined path attribution is
+    /// positional, so when the status line echoes a DIFFERENT id the
+    /// conversation has desynced and this errors ([`NntpError::IdMismatch`],
+    /// a session-level failure). `None` skips the check (serial
+    /// callers that own the whole conversation).
+    ///
+    /// `miss_echoed`: set on a miss to whether the refusal line echoed
+    /// a (matching) message-id. An un-echoed miss is positional-only
+    /// evidence - if an upstream frontend dropped the previous
+    /// pipelined response, this "430 no such article" belongs to the
+    /// NEXT article - and the pool treats it as suspect rather than
+    /// authoritative (see `handle_missing`).
+    pub async fn read_body_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        expected: Option<&str>,
+        miss_echoed: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool, NntpError> {
         let st = self.read_status().await?;
+        check_echoed_id(&st, expected)?;
         match st.code {
             222 => {
                 self.read_multiline_into(out).await?;
                 Ok(true)
             }
-            423 | 430 | 451 => Ok(false),
+            423 | 430 | 451 => {
+                // A plausible id on the line already passed
+                // check_echoed_id, so presence = confirmed echo.
+                miss_echoed.store(
+                    echoed_message_id(&st.line).is_some(),
+                    std::sync::atomic::Ordering::Release,
+                );
+                Ok(false)
+            }
             _ => Err(NntpError::Unexpected {
                 cmd: "BODY".into(),
                 line: st.line,
@@ -2379,12 +2469,21 @@ impl Connection {
     pub async fn read_body_into_two_phase(
         &mut self,
         out: &mut Vec<u8>,
+        expected: Option<&str>,
         first_byte: std::time::Duration,
         stall: std::time::Duration,
     ) -> Result<(bool, std::time::Duration), NntpError> {
         let status_seen = std::sync::atomic::AtomicBool::new(false);
-        self.read_body_into_two_phase_noting(out, first_byte, stall, &status_seen)
-            .await
+        let miss_echoed = std::sync::atomic::AtomicBool::new(false);
+        self.read_body_into_two_phase_noting(
+            out,
+            expected,
+            first_byte,
+            stall,
+            &status_seen,
+            &miss_echoed,
+        )
+        .await
     }
 
     /// [`read_body_into_two_phase`], additionally flipping `status_seen`
@@ -2395,9 +2494,11 @@ impl Connection {
     pub async fn read_body_into_two_phase_noting(
         &mut self,
         out: &mut Vec<u8>,
+        expected: Option<&str>,
         first_byte: std::time::Duration,
         stall: std::time::Duration,
         status_seen: &std::sync::atomic::AtomicBool,
+        miss_echoed: &std::sync::atomic::AtomicBool,
     ) -> Result<(bool, std::time::Duration), NntpError> {
         let t0 = std::time::Instant::now();
         let st = match tokio::time::timeout(first_byte, self.read_status()).await {
@@ -2406,12 +2507,21 @@ impl Connection {
         };
         status_seen.store(true, std::sync::atomic::Ordering::Release);
         let ttfb = t0.elapsed();
+        check_echoed_id(&st, expected)?;
         match st.code {
             222 => {
                 read_multiline_paced(&mut self.wire, out, stall).await?;
                 Ok((true, ttfb))
             }
-            423 | 430 | 451 => Ok((false, ttfb)),
+            423 | 430 | 451 => {
+                // See `read_body_into`: presence of a plausible id
+                // means it matched `expected` above.
+                miss_echoed.store(
+                    echoed_message_id(&st.line).is_some(),
+                    std::sync::atomic::Ordering::Release,
+                );
+                Ok((false, ttfb))
+            }
             _ => Err(NntpError::Unexpected {
                 cmd: "BODY".into(),
                 line: st.line,
@@ -2469,9 +2579,14 @@ impl Connection {
 
     /// Read one BODY response. `Ok(Some(raw))` on 222 (raw dot-stuffed body,
     /// ready for `yenc::decode`), `Ok(None)` if the article is missing.
+    /// Serial path (one command in flight): no echoed-id enforcement.
     pub async fn read_body(&mut self) -> Result<Option<Vec<u8>>, NntpError> {
         let mut raw = Vec::with_capacity(800 * 1024);
-        Ok(self.read_body_into(&mut raw).await?.then_some(raw))
+        let miss_echoed = std::sync::atomic::AtomicBool::new(false);
+        Ok(self
+            .read_body_into(&mut raw, None, &miss_echoed)
+            .await?
+            .then_some(raw))
     }
 
     /// Polite disconnect - lets the server release the session immediately
@@ -2482,7 +2597,7 @@ impl Connection {
     /// discarded and dropping `self` closes the socket regardless, so the
     /// bound only caps how long we stay polite.
     pub async fn quit(mut self) {
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        let _ = tokio::time::timeout(quit_bound(), async {
             let _ = self.send("QUIT").await;
             let _ = self.read_status().await;
         })
@@ -2761,565 +2876,6 @@ mod over_tests {
             "411 must not be mistaken for an empty range"
         );
         conn.quit().await;
-    }
-}
-
-#[cfg(test)]
-mod quit_tests {
-    use super::Connection;
-    use crate::mock::{Chaos, MockServer};
-    use std::collections::HashMap;
-
-    #[tokio::test]
-    async fn quit_is_bounded_when_the_server_never_answers() {
-        // Regression (the 190 GB exit-path hang): quit()'s goodbye read
-        // must not wait forever on a peer that takes the QUIT silently.
-        let srv = MockServer::start(
-            HashMap::new(),
-            Chaos {
-                mute_quit: true,
-                ..Default::default()
-            },
-        )
-        .await;
-        let (conn, _) = Connection::connect(&srv.server_config())
-            .await
-            .expect("connect");
-        let t0 = std::time::Instant::now();
-        conn.quit().await;
-        assert!(
-            t0.elapsed() < std::time::Duration::from_secs(3),
-            "quit not bounded: {:?}",
-            t0.elapsed()
-        );
-    }
-
-    // Paused clock: the greeting read parks on IO, tokio auto-advances to
-    // the CONNECT_TIMEOUT deadline, and the test finishes in milliseconds.
-    #[tokio::test(start_paused = true)]
-    async fn connect_is_bounded_when_the_server_never_greets() {
-        // A listener that accepts and then says nothing - connect() must
-        // time out instead of waiting forever on the greeting.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().unwrap().port();
-        let _keep = std::thread::spawn(move || {
-            let mut held = Vec::new();
-            while let Ok((s, _)) = listener.accept() {
-                held.push(s); // hold the socket open, never write
-            }
-        });
-        let server = crate::config::ServerConfig {
-            host: "127.0.0.1".into(),
-            port,
-            tls: false,
-            username: None,
-            password: None,
-            connections: 1,
-            pin_connections: false,
-            rcvbuf: None,
-            level: 0,
-            group: None,
-            retention_days: 0,
-            block_bytes: None,
-            bind_ip: None,
-            socks5: None,
-            enabled: true,
-            warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
-        };
-        let r = Connection::connect(&server).await;
-        assert!(r.is_err(), "connect to a mute server must error, got Ok");
-    }
-
-    /// Providers reject over-cap connections in the GREETING as often as
-    /// at AUTHINFO. That must reach the pool as AuthFailed(Capacity) -
-    /// the one-at-a-time yield path - while a non-capacity greeting
-    /// refusal stays Unexpected (guessing Permanent would blacklist a
-    /// server over transient wording).
-    #[tokio::test]
-    async fn capacity_greeting_takes_the_yield_path() {
-        use super::{AuthRefusal, NntpError};
-        use std::io::Write as _;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for greet in [
-                "502 too many connections for your account\r\n",
-                "502 access denied\r\n",
-            ] {
-                if let Ok((mut s, _)) = listener.accept() {
-                    let _ = s.write_all(greet.as_bytes());
-                    let _ = s.flush();
-                    // Hold briefly so the client reads before FIN races it.
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-            }
-        });
-        let server = crate::config::ServerConfig {
-            host: "127.0.0.1".into(),
-            port,
-            tls: false,
-            username: None,
-            password: None,
-            connections: 1,
-            pin_connections: false,
-            rcvbuf: None,
-            level: 0,
-            group: None,
-            retention_days: 0,
-            block_bytes: None,
-            bind_ip: None,
-            socks5: None,
-            enabled: true,
-            warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
-        };
-        match Connection::connect(&server).await {
-            Err(NntpError::AuthFailed { kind, .. }) => assert_eq!(kind, AuthRefusal::Capacity),
-            Err(e) => panic!("capacity greeting must classify as AuthFailed, got {e:?}"),
-            Ok(_) => panic!("capacity greeting must classify as AuthFailed, got Ok"),
-        }
-        match Connection::connect(&server).await {
-            Err(NntpError::Unexpected { cmd, .. }) => assert_eq!(cmd, "<greeting>"),
-            Err(e) => panic!("non-capacity greeting must stay Unexpected, got {e:?}"),
-            Ok(_) => panic!("non-capacity greeting must stay Unexpected, got Ok"),
-        }
-    }
-
-    /// A pair of connected loopback sockets with `preload` already sitting
-    /// in the client's receive buffer and the server end held open and
-    /// silent forever. Set up with blocking std sockets so the handshake
-    /// cannot race tokio's auto-advancing paused clock; the server half is
-    /// returned so the caller keeps it alive (dropping it would send FIN
-    /// and turn the hang into a clean `Closed`).
-    fn mute_after(preload: &[u8]) -> (tokio::net::TcpStream, std::net::TcpStream) {
-        use std::io::Write as _;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
-        let (mut server, _) = listener.accept().expect("accept");
-        server.write_all(preload).expect("preload");
-        server.flush().expect("flush");
-        client.set_nonblocking(true).expect("nonblocking");
-        (
-            tokio::net::TcpStream::from_std(client).expect("from_std"),
-            server,
-        )
-    }
-
-    /// Regression (the index-scan hang): a peer that answers "224 overview
-    /// follows", dribbles part of the body and then goes silent - process
-    /// death without an RST, an LB failover, a NAT idle-timer eviction -
-    /// used to park the multiline reader forever. `MAX_MULTILINE_BYTES`
-    /// never bit because no more bytes ever arrived. A wedged scan worker
-    /// then held its channel sender for the process lifetime and no
-    /// further scan pass could ever start.
-    ///
-    /// Paused clock: the reader parks on IO, tokio auto-advances to the
-    /// STREAM_IDLE_TIMEOUT deadline, and the test finishes in milliseconds.
-    #[tokio::test(start_paused = true)]
-    async fn multiline_read_is_bounded_when_the_peer_goes_mute_mid_stream() {
-        let (client, _server) = mute_after(b"1\tsubject one\tposter\r\n2\tsubject t");
-        let mut reader = tokio::io::BufReader::new(client);
-        {
-            // Pull the dribbled bytes into the BufReader first, while no
-            // timer is armed: with a paused clock the runtime auto-advances
-            // whenever it would otherwise block, including on IO readiness,
-            // so a read racing a timer can jump the deadline before the
-            // socket ever reports ready. With nothing to advance TO, this
-            // await parks on IO for real and the body read below starts
-            // from buffered data.
-            use tokio::io::AsyncBufReadExt as _;
-            let n = reader.fill_buf().await.expect("preload").len();
-            assert_eq!(n, 33, "preload should be buffered whole");
-        }
-        let mut out = Vec::new();
-        let t0 = tokio::time::Instant::now();
-        let err = super::read_multiline_generic(&mut reader, &mut out)
-            .await
-            .expect_err("a mute peer must not read successfully");
-        assert!(
-            matches!(err, super::NntpError::Timeout),
-            "expected Timeout, got {err:?}"
-        );
-        // Progress made before the silence is still accounted for, proving
-        // the deadline fired on the *idle* read and not on total duration.
-        assert_eq!(out, b"1\tsubject one\tposter\r\n2\tsubject t");
-        assert!(
-            t0.elapsed() >= super::STREAM_IDLE_TIMEOUT,
-            "fired early: {:?}",
-            t0.elapsed()
-        );
-    }
-
-    /// A reader that hands over one chunk per `gap` of (virtual) time and
-    /// parks in between - a slow-but-alive provider.
-    struct Dribble {
-        chunks: std::collections::VecDeque<Vec<u8>>,
-        cur: Vec<u8>,
-        pos: usize,
-        gap: std::time::Duration,
-        sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
-    }
-
-    impl tokio::io::AsyncBufRead for Dribble {
-        fn poll_fill_buf(
-            self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<&[u8]>> {
-            let me = self.get_mut();
-            if me.pos >= me.cur.len() {
-                if me.chunks.is_empty() {
-                    return std::task::Poll::Ready(Ok(&[]));
-                }
-                let s = me
-                    .sleep
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(me.gap)));
-                std::task::ready!(s.as_mut().poll(cx));
-                me.sleep = None;
-                me.cur = me.chunks.pop_front().unwrap();
-                me.pos = 0;
-            }
-            std::task::Poll::Ready(Ok(&me.cur[me.pos..]))
-        }
-        fn consume(self: std::pin::Pin<&mut Self>, amt: usize) {
-            self.get_mut().pos += amt;
-        }
-    }
-
-    impl tokio::io::AsyncRead for Dribble {
-        fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            use tokio::io::AsyncBufRead as _;
-            let n = {
-                let avail = std::task::ready!(self.as_mut().poll_fill_buf(cx))?;
-                let n = avail.len().min(buf.remaining());
-                buf.put_slice(&avail[..n]);
-                n
-            };
-            self.consume(n);
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
-
-    /// The deadline must be an IDLE one, not a total-duration one. A real
-    /// header scan asks for up to 100k articles at a time and a slow link
-    /// can legitimately spend many minutes streaming that body. Here the
-    /// stream takes 10x STREAM_IDLE_TIMEOUT end to end but never pauses
-    /// for more than a fraction of it - a total-duration bound would kill
-    /// a perfectly healthy download.
-    #[tokio::test(start_paused = true)]
-    async fn a_slow_but_never_silent_stream_is_not_cut_off() {
-        let gap = super::STREAM_IDLE_TIMEOUT / 2;
-        let mut chunks: std::collections::VecDeque<Vec<u8>> = (0..20)
-            .map(|i| format!("{i}\tsubject {i}\tposter\r\n").into_bytes())
-            .collect();
-        chunks.push_back(b".\r\n".to_vec());
-        let mut reader = Dribble {
-            chunks,
-            cur: Vec::new(),
-            pos: 0,
-            gap,
-            sleep: None,
-        };
-        let mut out = Vec::new();
-        let t0 = tokio::time::Instant::now();
-        super::read_multiline_generic(&mut reader, &mut out)
-            .await
-            .expect("a slow but live stream must complete");
-        assert!(out.starts_with(b"0\tsubject 0\tposter\r\n"));
-        assert!(out.ends_with(b"19\tsubject 19\tposter\r\n"));
-        assert!(
-            t0.elapsed() > super::STREAM_IDLE_TIMEOUT * 5,
-            "test did not actually outlast the idle deadline: {:?}",
-            t0.elapsed()
-        );
-    }
-
-    /// The paced reader's stall bound is the parameter, not the 120 s
-    /// default: a peer that goes mute mid-body trips at the caller's
-    /// deadline (the adaptive fetch path runs 8 s, not 120).
-    #[tokio::test(start_paused = true)]
-    async fn paced_multiline_stalls_at_the_callers_bound() {
-        let (client, _server) = mute_after(b"1\tsubject one\tposter\r\n2\tsubject t");
-        let mut reader = tokio::io::BufReader::new(client);
-        {
-            use tokio::io::AsyncBufReadExt as _;
-            let n = reader.fill_buf().await.expect("preload").len();
-            assert_eq!(n, 33, "preload should be buffered whole");
-        }
-        let stall = std::time::Duration::from_secs(8);
-        let mut out = Vec::new();
-        let t0 = tokio::time::Instant::now();
-        let err = super::read_multiline_paced(&mut reader, &mut out, stall)
-            .await
-            .expect_err("a mute peer must not read successfully");
-        assert!(matches!(err, super::NntpError::Timeout), "got {err:?}");
-        assert!(t0.elapsed() >= stall, "fired early: {:?}", t0.elapsed());
-        assert!(
-            t0.elapsed() < super::STREAM_IDLE_TIMEOUT,
-            "the caller's bound was ignored: {:?}",
-            t0.elapsed()
-        );
-    }
-
-    /// The tight stall bound is still an IDLE deadline: a body that
-    /// dribbles a chunk every 4 s under an 8 s stall bound completes no
-    /// matter how long it takes end to end. This is the property that
-    /// lets the adaptive path drop the flat whole-response cap without
-    /// killing slow-but-healthy transfers.
-    #[tokio::test(start_paused = true)]
-    async fn paced_slow_but_alive_survives_a_tight_stall_bound() {
-        let stall = std::time::Duration::from_secs(8);
-        let gap = std::time::Duration::from_secs(4);
-        let mut chunks: std::collections::VecDeque<Vec<u8>> = (0..20)
-            .map(|i| format!("{i}\tsubject {i}\tposter\r\n").into_bytes())
-            .collect();
-        chunks.push_back(b".\r\n".to_vec());
-        let mut reader = Dribble {
-            chunks,
-            cur: Vec::new(),
-            pos: 0,
-            gap,
-            sleep: None,
-        };
-        let mut out = Vec::new();
-        let t0 = tokio::time::Instant::now();
-        super::read_multiline_paced(&mut reader, &mut out, stall)
-            .await
-            .expect("a slow but live stream must complete");
-        assert!(out.ends_with(b"19\tsubject 19\tposter\r\n"));
-        assert!(
-            t0.elapsed() > stall * 5,
-            "test did not outlast the stall bound: {:?}",
-            t0.elapsed()
-        );
-    }
-
-    /// Two-phase body read, pre-byte half: a connection whose status
-    /// line never arrives dies at the caller's first-byte budget - the
-    /// adaptive path's seconds, not the flat timeout's 30.
-    #[tokio::test]
-    async fn two_phase_first_byte_budget_bounds_a_dead_connection() {
-        use std::io::{Read as _, Write as _};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            if let Ok((mut s, _)) = listener.accept() {
-                let _ = s.write_all(b"200 ok\r\n");
-                let _ = s.flush();
-                // Swallow the BODY command and go mute, holding the
-                // socket open - the dead-connection shape.
-                let mut sink = [0u8; 512];
-                loop {
-                    match s.read(&mut sink) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
-                }
-            }
-        });
-        let server = crate::config::ServerConfig {
-            host: "127.0.0.1".into(),
-            port,
-            tls: false,
-            username: None,
-            password: None,
-            connections: 1,
-            pin_connections: false,
-            rcvbuf: None,
-            level: 0,
-            group: None,
-            retention_days: 0,
-            block_bytes: None,
-            bind_ip: None,
-            socks5: None,
-            enabled: true,
-            warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
-        };
-        let (mut conn, _) = Connection::connect(&server).await.expect("connect");
-        conn.send("BODY <x@test>").await.expect("send");
-        let budget = std::time::Duration::from_millis(300);
-        let mut out = Vec::new();
-        let t0 = std::time::Instant::now();
-        let err = conn
-            .read_body_into_two_phase(&mut out, budget, std::time::Duration::from_secs(8))
-            .await
-            .expect_err("a statusless connection must time out");
-        assert!(matches!(err, super::NntpError::Timeout), "got {err:?}");
-        assert!(t0.elapsed() >= budget, "fired early: {:?}", t0.elapsed());
-        assert!(
-            t0.elapsed() < std::time::Duration::from_secs(5),
-            "budget not honored: {:?}",
-            t0.elapsed()
-        );
-    }
-
-    /// Same silence, compressed-header path (`XFEATURE COMPRESS GZIP`):
-    /// the gzip framing reads are `read_exact`/`read_until`, which park
-    /// just as hard as `fill_buf` on a peer that stops mid-header.
-    #[tokio::test(start_paused = true)]
-    async fn gzip_multiline_read_is_bounded_when_the_peer_goes_mute() {
-        let (client, _server) = mute_after(&[0x1f, 0x8b, 0x08]); // gzip header, cut short
-        let mut reader = tokio::io::BufReader::new(client);
-        let mut out = Vec::new();
-        let err = super::read_gzip_multiline_generic(&mut reader, &mut out)
-            .await
-            .expect_err("a mute peer must not read successfully");
-        assert!(
-            matches!(err, super::NntpError::Timeout),
-            "expected Timeout, got {err:?}"
-        );
-    }
-
-    /// Differential test for the bulk multiline reader: the OLD
-    /// line-at-a-time implementation is the oracle, and every buffer
-    /// capacity from 1 byte up forces the terminator across every
-    /// possible chunk boundary. Also asserts pipelined bytes AFTER the
-    /// terminator are left unconsumed.
-    #[tokio::test]
-    async fn bulk_multiline_matches_line_oracle_at_every_boundary() {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-
-        async fn oracle(wire: &[u8]) -> (Vec<u8>, Vec<u8>) {
-            let mut r = BufReader::new(wire);
-            let (mut out, mut line) = (Vec::new(), Vec::new());
-            loop {
-                line.clear();
-                let n = r.read_until(b'\n', &mut line).await.unwrap();
-                assert!(n > 0, "oracle hit EOF before terminator");
-                if line == b".\r\n" || line == b".\n" {
-                    break;
-                }
-                out.extend_from_slice(&line);
-            }
-            let mut rest = Vec::new();
-            r.read_to_end(&mut rest).await.unwrap();
-            (out, rest)
-        }
-
-        let cases: &[&[u8]] = &[
-            b"hello\r\nworld\r\n.\r\nNEXT",
-            b".\r\nNEXT",                         // empty block
-            b"..stuffed\r\n...also\r\n.\r\nNEXT", // dot-stuffing preserved raw
-            b"bare\nlf lines\n.\nNEXT",           // bare-LF form
-            b"mixed\r\nbare\n.\r\nNEXT",
-            b"trailing dot data.\r\n.here\r\n.\r\nNEXT", // '.' mid/odd positions (stuffed-ish)
-            b"a\r\n\r\n.\r\nNEXT",                       // empty line before terminator
-            b"x.\r\n.y\r\n.\r\n",                        // no pipelined rest
-            b"=ybegin part=1\r\n\x01\x02.\x03\r\n.\r\n220 0 <x>\r\nmore",
-        ];
-        for wire in cases {
-            let (want_out, want_rest) = oracle(wire).await;
-            for cap in 1..=16usize {
-                let mut r = BufReader::with_capacity(cap, *wire);
-                let mut out = Vec::new();
-                super::read_multiline_generic(&mut r, &mut out)
-                    .await
-                    .unwrap_or_else(|e| panic!("cap {cap} on {wire:?}: {e:?}"));
-                assert_eq!(out, want_out, "content, cap {cap}, wire {wire:?}");
-                let mut rest = Vec::new();
-                r.read_to_end(&mut rest).await.unwrap();
-                assert_eq!(rest, want_rest, "unconsumed tail, cap {cap}, wire {wire:?}");
-            }
-        }
-
-        // EOF before terminator errors instead of hanging.
-        let mut r = BufReader::with_capacity(4, &b"no terminator here\r\n"[..]);
-        let mut out = Vec::new();
-        assert!(
-            super::read_multiline_generic(&mut r, &mut out)
-                .await
-                .is_err()
-        );
-    }
-
-    /// M32: Connection::connect rides a SOCKS5 proxy when the server
-    /// carries one, sending the HOSTNAME to the proxy (ATYP=DOMAIN, no
-    /// local DNS) and speaking NNTP through the tunnel afterwards.
-    #[tokio::test]
-    async fn connects_through_socks5_proxy() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        // Target: greets like an NNTP server.
-        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let taddr = target.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut s, _) = target.accept().await.unwrap();
-            s.write_all(b"200 tunnel ok\r\n").await.unwrap();
-            let mut buf = [0u8; 256];
-            let _ = s.read(&mut buf).await;
-        });
-        // Proxy: minimal SOCKS5 server side, records the requested domain.
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let paddr = proxy.local_addr().unwrap();
-        let (dom_tx, dom_rx) = std::sync::mpsc::channel::<String>();
-        tokio::spawn(async move {
-            let (mut c, _) = proxy.accept().await.unwrap();
-            let mut hello = [0u8; 2];
-            c.read_exact(&mut hello).await.unwrap();
-            let mut methods = vec![0u8; hello[1] as usize];
-            c.read_exact(&mut methods).await.unwrap();
-            c.write_all(&[0x05, 0x00]).await.unwrap(); // no-auth
-            let mut head = [0u8; 5];
-            c.read_exact(&mut head).await.unwrap();
-            assert_eq!(
-                &head[..4],
-                &[0x05, 0x01, 0x00, 0x03],
-                "domain CONNECT expected"
-            );
-            let mut dom = vec![0u8; head[4] as usize];
-            c.read_exact(&mut dom).await.unwrap();
-            let mut port = [0u8; 2];
-            c.read_exact(&mut port).await.unwrap();
-            dom_tx.send(String::from_utf8(dom).unwrap()).unwrap();
-            c.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                .await
-                .unwrap();
-            let mut t = tokio::net::TcpStream::connect(taddr).await.unwrap();
-            let _ = tokio::io::copy_bidirectional(&mut c, &mut t).await;
-        });
-        let server = crate::config::ServerConfig {
-            // Deliberately unresolvable: only the proxy sees this name.
-            host: "nntp.behind-the-proxy.invalid".into(),
-            port: taddr.port(),
-            tls: false,
-            username: None,
-            password: None,
-            connections: 1,
-            pin_connections: false,
-            rcvbuf: None,
-            level: 0,
-            group: None,
-            retention_days: 0,
-            block_bytes: None,
-            bind_ip: None,
-            socks5: Some(format!("127.0.0.1:{}", paddr.port())),
-            enabled: true,
-            warm_pool: false,
-            idle_release_secs: None,
-            idle_keep: None,
-            max_source_ips: None,
-        };
-        let (_conn, greeting) = Connection::connect(&server)
-            .await
-            .expect("connect through proxy");
-        assert_eq!(greeting.code, 200);
-        assert_eq!(
-            dom_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap(),
-            "nntp.behind-the-proxy.invalid",
-            "hostname must be resolved by the proxy, not locally"
-        );
     }
 }
 
@@ -3633,10 +3189,19 @@ mod compress_tests {
         let (mut conn, _) = Connection::connect(&cfg).await.expect("connect");
         conn.send_body("<gone@example>").await.expect("send BODY");
         let mut raw = Vec::new();
-        let got = conn.read_body_into(&mut raw).await;
+        // Expected id supplied: the 451 echoes the SAME id, so the
+        // echoed-id check must stay quiet and the miss must stand.
+        let miss_echoed = std::sync::atomic::AtomicBool::new(false);
+        let got = conn
+            .read_body_into(&mut raw, Some("<gone@example>"), &miss_echoed)
+            .await;
         assert!(
             matches!(got, Ok(false)),
             "451 must read as a missing article, got {got:?}"
+        );
+        assert!(
+            miss_echoed.load(std::sync::atomic::Ordering::Acquire),
+            "an id-echoing refusal must report a confirmed echo"
         );
         assert!(raw.is_empty(), "a miss must append no body bytes");
         // The session survives: that is the whole point, since dropping it
@@ -3645,7 +3210,13 @@ mod compress_tests {
             .await
             .expect("reuse session");
         let mut raw2 = Vec::new();
-        assert!(matches!(conn.read_body_into(&mut raw2).await, Ok(false)));
+        // This rigged server echoes <gone@example> whatever was asked;
+        // the serial caller passes None, so no enforcement applies.
+        let miss_echoed2 = std::sync::atomic::AtomicBool::new(false);
+        assert!(matches!(
+            conn.read_body_into(&mut raw2, None, &miss_echoed2).await,
+            Ok(false)
+        ));
         conn.quit().await;
     }
 
@@ -3672,39 +3243,8 @@ mod compress_tests {
     }
 }
 
+// Read-ladder unit tests (coverage §122.5) - a child module, the
+// pool/unit_tests.rs pattern, so nntp.rs stays inside its size-gate
+// entry while `super::*` keeps the private internals reachable.
 #[cfg(test)]
-mod date_tests {
-    use super::parse_nntp_date;
-
-    #[test]
-    fn rfc5322_variants() {
-        // RFC 2822's own example date.
-        assert_eq!(
-            parse_nntp_date("Fri, 21 Nov 1997 09:55:06 -0600"),
-            Some(880127706)
-        );
-        // Trailing zone comment; weekday optional; single-digit day.
-        assert_eq!(
-            parse_nntp_date("Fri, 21 Nov 1997 09:55:06 -0600 (CST)"),
-            Some(880127706)
-        );
-        assert_eq!(parse_nntp_date("2 May 2024 12:34:56 GMT"), Some(1714653296));
-        assert_eq!(
-            parse_nntp_date("Thu, 02 May 2024 12:34:56 +0000"),
-            Some(1714653296)
-        );
-        assert_eq!(
-            parse_nntp_date("Thu, 1 Jan 2026 00:00:00 GMT"),
-            Some(1767225600)
-        );
-        // Obsolete two-digit year; missing seconds.
-        assert_eq!(parse_nntp_date("01 Jan 70 00:00 GMT"), Some(0));
-        // Non-ASCII 5-BYTE zone: z[1..3] used to slice mid-char and
-        // panic the OVER consumer (Usenet-controlled text). "+€x" is 5
-        // bytes. Must parse (zone ignored) or reject - never panic.
-        let _ = parse_nntp_date("Thu, 02 May 2024 12:34:56 +\u{20ac}x");
-        // Garbage → None, never a bogus epoch.
-        assert_eq!(parse_nntp_date(""), None);
-        assert_eq!(parse_nntp_date("not a date"), None);
-    }
-}
+mod unit_tests;

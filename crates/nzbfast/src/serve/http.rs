@@ -752,9 +752,14 @@ fn handle_api(
         .map(|h| h.value.as_str().to_string())
         .unwrap_or_default();
     let key_q = given.map(|k| format!("?apikey={k}")).unwrap_or_default();
+    // Client-facing scheme+authority for handed-off links (stream/m3u):
+    // forwarded headers win over the raw Host so a reverse-proxied
+    // HTTPS deployment gets links its players can actually reach.
+    let base = public_base(&req, d.port);
     let ctx = api::ApiCtx {
         cfg_path,
         host_hdr: &host_hdr,
+        base: &base,
         ua_hdr: &ua_hdr,
         key_q: &key_q,
         #[cfg(feature = "indexer")]
@@ -790,6 +795,11 @@ pub(super) fn spawn_http_workers(
         #[cfg(feature = "indexer")]
         let tmdb_key = tmdb_key.clone();
         tokio::task::spawn_blocking(move || {
+            // Snapshot this run's stop baseline at spawn: the epoch is
+            // monotonic, so a stop for THIS run stays visible even after
+            // an embedded host re-arms and starts the next run while
+            // these workers are still winding up.
+            let stop_baseline = super::STOP_BASELINE.load(std::sync::atomic::Ordering::SeqCst);
             loop {
                 // The socket has been listening since partway through
                 // startup (see the bind note beside spool_dir), and
@@ -802,7 +812,9 @@ pub(super) fn spawn_http_workers(
                     // Timed out: check for an embedded stop (see
                     // `super::request_stop`), then back to waiting.
                     Ok(None) => {
-                        if super::STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+                        if super::STOP_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+                            > stop_baseline
+                        {
                             break;
                         }
                         continue;

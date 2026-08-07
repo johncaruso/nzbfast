@@ -58,12 +58,49 @@ pub(super) fn take_census(
     let mut dead_servers: Vec<String> = Vec::new();
     for ((s, _), st) in servers.iter().zip(stats) {
         if st.ever_connected {
+            // Session-end breakdown, printed only when something died:
+            // "12 reconnects" alone never said WHO hung up, which is what
+            // made the 6 Aug churn investigation eliminate six hypotheses
+            // by exclusion (research/PROVIDER-CHURN-2026-08-06.md).
+            let e = st.ends;
+            let why = if e.peer + e.protocol + e.prebyte + e.stall + e.ours == 0 {
+                String::new()
+            } else {
+                let mut parts: Vec<String> = Vec::new();
+                for (n, label) in [
+                    (e.peer, "peer closed"),
+                    (e.protocol, "protocol"),
+                    (e.prebyte, "our pre-byte budget"),
+                    (e.stall, "our stall deadline"),
+                    (e.ours, "we hung up"),
+                ] {
+                    if n > 0 {
+                        parts.push(format!("{n} {label}"));
+                    }
+                }
+                format!(" [{}]", parts.join(", "))
+            };
+            // Write-side wait: time this server's workers spent parked
+            // because decode/verify/disk could not keep up. Printed when
+            // it is a visible slice of the run, because it is what tells
+            // a NETWORK dip from a DISK one - the question a periodic
+            // throughput sawtooth asks.
+            let blocked = if st.blocked_ms >= 500 {
+                format!(
+                    " · {:.1}s blocked on the write side",
+                    st.blocked_ms as f64 / 1000.0
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "  {:<28} {:>8.1} MB · {} conns, {} reconnects",
+                "  {:<28} {:>8.1} MB · {} conns, {} reconnects{}{}",
                 s.host,
                 st.bytes as f64 / 1e6,
                 st.connects,
-                st.reconnects
+                st.reconnects,
+                why,
+                blocked
             );
         } else {
             println!(
@@ -405,6 +442,8 @@ mod tests {
             connects: 1,
             reconnects: 0,
             ever_connected,
+            ends: Default::default(),
+            blocked_ms: 0,
         }
     }
 

@@ -200,7 +200,11 @@ pub(super) fn newznab_category(kind: &str, stem: &str) -> u32 {
 /// a comma list when the request crossed more than one hop, of which the
 /// first entry is the client-facing one. An unrecognised scheme falls
 /// back to http rather than being echoed into a URL.
-#[cfg(feature = "indexer")]
+///
+/// Not indexer-gated: playback/stream capability URLs (mobile contract,
+/// m3u handoffs) need the same client-facing authority in every build,
+/// or a TLS reverse proxy gets loopback links and permanent tokens ride
+/// cleartext http.
 pub(super) fn public_base(req: &tiny_http::Request, port: u16) -> String {
     let hdr = |name: &'static str| {
         req.headers()
@@ -233,6 +237,16 @@ pub(super) fn newznab_xml(
     apikey: &str,
 ) -> String {
     let t = params.get("t").map(String::as_str).unwrap_or("");
+    // Canonicalize the accepted spellings BEFORE anything reads `t`.
+    // Dispatch took `t=tv-search` and `t=moviesearch`, but the
+    // no-cat kind fallback below matched only the canonical names, so
+    // the alias forms lost their implicit TV/movie filter and a movie
+    // search could come back holding TV (Codex sweep 5 Aug M11).
+    let t = match t {
+        "tv-search" => "tvsearch",
+        "moviesearch" => "movie",
+        other => other,
+    };
     // The facade IS the index, published over newznab, so the master
     // switch closes it too - otherwise an *arr keeps a healthy indexer
     // entry pointed at something that can only ever answer zero results.
@@ -274,7 +288,7 @@ pub(super) fn newznab_xml(
     // body, which is the newznab convention (only bad credentials, which
     // the caller handles, answer with a status code).
     match t {
-        "" | "search" | "tvsearch" | "tv-search" | "movie" | "moviesearch" => {}
+        "" | "search" | "tvsearch" | "movie" => {}
         "music" | "audio" | "book" | "bookssearch" | "booksearch" => {
             return newznab_error(203, "Function not available");
         }
@@ -773,6 +787,7 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
     // whole-job average hid stalls; idle or a fresh window reports 0,
     // never `bytes / ~zero elapsed`.
     let speed_bps = d.current_speed_bps();
+    let (peak_bps, peak_src) = d.link_peak.effective(d.line_speed.load(Ordering::Relaxed));
     // Prefetch sidecar state, matched by nzo_id per slot below.
     let sc = d
         .sidecar
@@ -1302,6 +1317,10 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         // percentage without it - a menu entry that can only error is
         // worse than no menu entry.
         "line_speed": d.line_speed.load(Ordering::Relaxed),
+        // §125: the graph's 100% anchor - learned peak bytes/sec (0 =
+        // unknown); source "measured" or "line" (see serve/linkpeak.rs).
+        "link_peak": peak_bps,
+        "link_peak_src": peak_src,
         "auto_speed": d.auto_speed.load(Ordering::Relaxed),
         "watch_failed": watch_failed,
         "watch_picked": watch_picked,

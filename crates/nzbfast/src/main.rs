@@ -322,11 +322,14 @@ enum Command {
     /// two-server profiles bind a clean twin on --port2.
     #[command(hide = true)]
     ChaosServe {
-        /// One of: clean, flap, deadair, deadair-dial, brownout,
-        /// jitter, jitter-dial, corrupt, corruptstorm, splitbrain,
-        /// slowconn (the -dial variants add a 250 ms greeting delay
-        /// per connection, so reconnect strategies pay their real
-        /// dial cost on loopback).
+        /// One of chaos_serve::PROFILES: clean, flap, flap-dial,
+        /// deadair, deadair-dial, brownout, jitter, jitter-dial,
+        /// corrupt, corruptstorm, splitbrain, slowconn, bodyerror,
+        /// authcap, authbad, capghost, outage, cgnat, handover,
+        /// slowstart, truncate, deadpost, mutequit, mutegreeting
+        /// (the -dial variants add a 250 ms greeting delay per
+        /// connection, so reconnect strategies pay their real dial
+        /// cost on loopback).
         #[arg(long, default_value = "clean")]
         profile: String,
         #[arg(long, default_value = "127.0.0.1")]
@@ -365,7 +368,8 @@ enum Command {
         #[arg(long)]
         par2_redundancy: Option<u32>,
         /// Override the profile's faulted-article count
-        /// (deadair/corrupt/splitbrain) or every-N (corruptstorm).
+        /// (deadair/corrupt/splitbrain) or every-N (corruptstorm,
+        /// desync).
         #[arg(long)]
         fault_count: Option<usize>,
         /// Article-ize real files from disk into the corpus (repeatable).

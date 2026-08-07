@@ -1135,6 +1135,15 @@ pub(crate) fn write_archives_to_spending(
 
     let staging = ExtractStaging::new(dir)?;
     let stage_dir = staging.path().to_path_buf();
+    // The vendored extractor drops each entry writer AFTER deciding
+    // success on the decoded bytes, and BufWriter's Drop swallows its
+    // flush error - so an ENOSPC/EIO on the final buffered tail would
+    // publish a short file as a verified extraction (with the source
+    // volumes possibly already eaten). DeferredFlushWriter records the
+    // swallowed error here; checked below before publish.
+    let flush_err: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let entry_flush_err = flush_err.clone();
     let open = move |meta: &rars::ExtractedEntryMeta| {
         let target = sanitized_entry_path(&stage_dir, &meta.name_lossy()).ok_or_else(|| {
             rars::Error::from(std::io::Error::new(
@@ -1150,10 +1159,13 @@ pub(crate) fn write_archives_to_spending(
             std::fs::create_dir_all(parent)?;
         }
         let file = std::io::BufWriter::new(std::fs::File::create(target)?);
-        Ok(Box::new(BombGuardWriter {
-            inner: file,
-            written: written.clone(),
-            budget: budget.clone(),
+        Ok(Box::new(DeferredFlushWriter {
+            inner: BombGuardWriter {
+                inner: file,
+                written: written.clone(),
+                budget: budget.clone(),
+            },
+            failed: entry_flush_err.clone(),
         }) as Box<dyn std::io::Write>)
     };
     if eating {
@@ -1171,7 +1183,17 @@ pub(crate) fn write_archives_to_spending(
         // `extract_volumes_to_with_progress`.
         let consumed = |i: usize| {
             let Some(path) = sources.get(i) else { return };
-            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            // symlink_metadata, and only single-link regular files
+            // count: unlinking a symlink or one name of a hardlinked
+            // file releases no data blocks, so crediting the target's
+            // length would let the guard spend space the disk never
+            // gave back - and meet real ENOSPC mid-extraction after
+            // the source names are gone.
+            let meta = std::fs::symlink_metadata(path).ok();
+            let size = match &meta {
+                Some(m) if m.is_file() && sole_link(m) => m.len(),
+                _ => 0,
+            };
             match std::fs::remove_file(path) {
                 Ok(()) => {
                     eaten += 1;
@@ -1204,7 +1226,26 @@ pub(crate) fn write_archives_to_spending(
         rars::extract_volumes_to(archives, password.map(str::as_bytes), open)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
+    if let Some(e) = flush_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        anyhow::bail!("extracted file could not be fully written to disk: {e}");
+    }
     staging.publish_into(dir)
+}
+
+/// True when the file has exactly one directory entry, so unlinking it
+/// actually releases its blocks. Non-unix hosts cannot cheaply ask, and
+/// hardlinked volume sets are a unix habit - treat single-link as true
+/// there.
+fn sole_link(m: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::MetadataExt::nlink(m) == 1
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = m;
+        true
+    }
 }
 
 /// If `name` is a split 7-Zip part (`<base>.7z.<NNN>`), return the shared
@@ -1497,20 +1538,25 @@ pub(crate) struct BombGuardWriter<W: std::io::Write> {
 ///
 /// That "actually" is the whole point. The eating path used to add
 /// `volume_bytes(sources)` to the budget UP FRONT, on the grounds that
-/// the volumes were about to be handed back one at a time. For a set of
-/// many members that is nearly true; for the dominant movie shape - ONE
-/// member split across every volume - it is not true at all. The RAR
-/// engine holds every consumption callback while a split member is
-/// pending and releases the backlog only after the finish fragment has
-/// written the WHOLE payload, so nothing is freed until everything is
-/// written. A 13.85 GB film with 1.75 GB free sailed past a guard that
-/// believed it had 15.6 GB, and met the real disk instead: ENOSPC, a
-/// half-written payload, and a filesystem with nothing left on it - the
-/// exact outcome the guard exists to prevent, caused by the guard.
+/// the volumes were about to be handed back one at a time. At the time
+/// that was not true for the dominant movie shape - ONE member split
+/// across every volume - because the RAR engine held every consumption
+/// callback while a split member was pending and released the backlog
+/// only after the finish fragment had written the WHOLE payload. A
+/// 13.85 GB film with 1.75 GB free sailed past a guard that believed it
+/// had 15.6 GB, and met the real disk instead: ENOSPC, a half-written
+/// payload, and a filesystem with nothing left on it - the exact
+/// outcome the guard exists to prevent, caused by the guard.
 ///
-/// Crediting only what came back keeps the mode working where it really
-/// does free space progressively, and turns the case where it cannot
-/// back into a clean refusal before a byte is written.
+/// rars has since closed that gap (the H1 residual): a split member now
+/// releases each volume as its chain reads it out, wherever a re-read
+/// is provably impossible - stored members always, compressed ones
+/// above the buffered-retry ceiling - so the single-split-member film
+/// extracts in a couple of volumes' headroom. The delivery-only credit
+/// stays exactly as it is: it is what makes that claim safe to act on
+/// (a volume that failed to delete credits nothing), and it still
+/// refuses cleanly on the residue of shapes that hold their volumes
+/// (small compressed splits, which by definition fit the buffer).
 #[derive(Clone)]
 pub(crate) struct BombBudget {
     base: u64,
@@ -1533,6 +1579,38 @@ impl BombBudget {
     fn limit(&self) -> u64 {
         self.base
             .saturating_add(self.credit.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Catches the flush error BufWriter's Drop swallows. The vendored RAR
+/// extractor verifies the DECODED bytes, then drops the entry writer and
+/// returns success - so a failed write-back of the final buffered tail
+/// (ENOSPC, quota, EIO) would otherwise publish a short file as a
+/// verified extraction. Any error caught here (or in an explicit flush)
+/// is recorded once in `failed`; the extraction caller turns it into a
+/// failure before publishing.
+struct DeferredFlushWriter<W: std::io::Write> {
+    inner: W,
+    failed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl<W: std::io::Write> std::io::Write for DeferredFlushWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: std::io::Write> Drop for DeferredFlushWriter<W> {
+    fn drop(&mut self) {
+        if let Err(e) = self.inner.flush() {
+            self.failed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_or_insert_with(|| e.to_string());
+        }
     }
 }
 
@@ -2077,6 +2155,41 @@ mod native_unrar_tests {
             assert!(!v.exists(), "{} outlived the extraction", v.display());
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bug sweep 2026-08-06 (H1): the vendored extractor decides
+    /// success on the DECODED bytes and drops the entry writer
+    /// afterwards, and BufWriter's Drop swallows its flush error - so
+    /// an ENOSPC/EIO on the final buffered tail used to publish a
+    /// short file as a verified extraction. The deferred-flush wrapper
+    /// must catch what Drop would have swallowed.
+    #[test]
+    fn a_swallowed_flush_failure_is_recorded_not_lost() {
+        use std::io::Write as _;
+        struct FailingFlush;
+        impl std::io::Write for FailingFlush {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("no space left on device"))
+            }
+        }
+        let failed: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        {
+            let mut w = DeferredFlushWriter {
+                inner: std::io::BufWriter::new(FailingFlush),
+                failed: failed.clone(),
+            };
+            assert!(w.write_all(b"the final sub-8k tail").is_ok());
+            // Dropped without an explicit flush - exactly what the
+            // extractor does once the member's checksum has verified.
+        }
+        assert!(
+            failed.lock().unwrap().is_some(),
+            "the flush error vanished in Drop"
+        );
     }
 
     /// The bomb guard may only spend space that has actually come back.

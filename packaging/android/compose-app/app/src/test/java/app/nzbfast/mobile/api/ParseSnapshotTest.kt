@@ -54,6 +54,22 @@ class ParseSnapshotTest {
         assertEquals("Completed", h[0].status)
         assertEquals("91.5 MB", h[0].size)
         assertTrue(h[0].completedAt > 0)
+        // The recorded row carries the §76 media chip (720p H.264), so
+        // it earns the Play action.
+        assertTrue(h[0].playable)
+    }
+
+    /** Codex sweep 5 Aug L3: Play used to render for EVERY Completed
+     * row - ISOs, software, archive-only jobs got a dead button. No
+     * media chip and no media extension means no Play. */
+    @Test
+    fun historyNonMediaGetsNoPlay() {
+        val body = """{"history":{"noofslots":1,"slots":[{"nzo_id":"x",""" +
+            """"name":"Some.App.v2","status":"Completed","size":"1 GB",""" +
+            """"fail_message":"","completed":1,"media":null,""" +
+            """"storage":"/out/Some.App.v2"}]}}"""
+        val h = Parse.history(body)
+        assertFalse(h[0].playable)
     }
 
     @Test
@@ -161,6 +177,27 @@ class ParseSnapshotTest {
         assertFalse(j.stream.contains("apikey"))
     }
 
+    /**
+     * Mid-download of a file too big to land whole: playable now, but
+     * the tail (where the seek index lives) has not arrived - ready
+     * WITHOUT seekable. Recorded behind chaos-serve --line so the
+     * coverage is genuinely partial, unlike playback_live.json whose
+     * small file landed whole.
+     */
+    @Test
+    fun playbackLivePartialIsReadyButNotSeekable() {
+        val p = Parse.playback(snap("playback_live_partial.json"))
+        val j = p.queue[0]
+        assertTrue(j.playback.ready)
+        assertEquals("live", j.playback.reason)
+        assertEquals("movie.mkv", j.playback.file)
+        // The distinction this fixture exists for: ready and seekable
+        // are different answers mid-download.
+        assertFalse(j.playback.seekable)
+        assertEquals(33.8, j.playback.pct, 0.01)
+        assertTrue(j.playback.headBytes in 1 until j.playback.size)
+    }
+
     /** Finished: the answer moves to disk and stays ready. */
     @Test
     fun playbackDoneReadsFromDisk() {
@@ -172,6 +209,8 @@ class ParseSnapshotTest {
         assertEquals("disk", j.playback.reason)
         assertTrue(j.playback.size > 0)
         assertEquals(100.0, j.playback.pct, 0.01)
+        assertEquals(2994402L, j.bytes)
+        assertTrue(j.completedAt > 0)
         // The overlay's telemetry rides the same response.
         assertEquals(3000L, p.stream.runwayWaitMs)
         assertEquals(0L, p.stream.zeroFilledBytes)

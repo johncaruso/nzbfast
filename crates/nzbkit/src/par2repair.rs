@@ -5147,3 +5147,10 @@ mod tests {
         assert!(matches!(invert(sing), Err(RepairError::SingularMatrix)));
     }
 }
+
+// Directory-path unit tests (coverage §122.5) - a child module, the
+// pool/unit_tests.rs pattern, so par2repair.rs stays inside its
+// size-gate entry while `super::*` keeps the private internals
+// reachable.
+#[cfg(test)]
+mod unit_tests;

@@ -66,6 +66,13 @@ pub unsafe extern "C" fn nzbfast_start(
     }
 
     nzbfast::embedded_init();
+    // Arm the stop seam BEFORE spawning, under the ENGINE lock: a
+    // request_stop() issued any time after this start() returns then
+    // lands above this run's baseline and can never be erased. The old
+    // design reset a global flag at serve() entry, so a stop that raced
+    // the engine thread's bootstrap was wiped and nzbfast_stop() hung
+    // forever in join().
+    nzbfast::serve::arm_embedded_stop();
     let config = dir.join("config.local.json");
     let out_root = dir.join("downloads");
     let thread = std::thread::Builder::new()
@@ -109,13 +116,12 @@ pub unsafe extern "C" fn nzbfast_start(
 #[unsafe(no_mangle)]
 pub extern "C" fn nzbfast_stop() -> i32 {
     // The ENGINE lock is held through request_stop AND the join: the
-    // stop flag and its Notify are process-global, and serve() RESETS
-    // the flag on entry - so a start() interleaved here could revive
-    // engine A (which then parks forever while we join it), be stopped
-    // itself by the notify meant for A, or race A for the port. Holding
-    // the lock makes a concurrent start/stop/is_up park until the old
-    // engine is provably gone; the serve loop's own wind-up bounds the
-    // join.
+    // stop epoch and its Notify are process-global - a start()
+    // interleaved here could re-arm the baseline under engine A (which
+    // then parks forever while we join it) or race A for the port.
+    // Holding the lock makes a concurrent start/stop/is_up park until
+    // the old engine is provably gone; the serve loop's own wind-up
+    // bounds the join.
     let mut engine = ENGINE.lock().unwrap_or_else(|p| p.into_inner());
     let e = match engine.take() {
         Some(e) => e,

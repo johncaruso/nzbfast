@@ -2793,6 +2793,60 @@ pub(super) fn instant_arrivals(
     }
 }
 
+/// TODO 110: how long a background sampler stands down from a host
+/// whose connect was refused because the account's slots are full.
+///
+/// The samplers redial on their own tick - the tip watcher's default is
+/// 20 s - so without this a provider at its cap was asked again three
+/// times a minute, all night. The slots in question clear on another
+/// machine's schedule (a laptop shutting down, a seedbox finishing, a
+/// multi-WAN route settling), never on the next tick. Fifteen minutes
+/// matches the full scan interval, whose passes cover the same groups
+/// the cooled-down watcher is skipping, so the cost is latency only.
+#[cfg(feature = "indexer")]
+const SAMPLER_CAP_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Should a background sampler stop redialling this server for a while
+/// after this connect error, and if so for how long?
+///
+/// Two refusal shapes qualify:
+///
+/// * a Capacity-classified AUTHINFO refusal ("too many connections",
+///   "max simultaneous IP addresses") on ANY server - the account is
+///   fine, its slots are simply full, and a retry every tick is
+///   exactly the hammering providers punish;
+/// * a Permanent-classified refusal against a server whose source
+///   addresses are declared (or known) tight - the shape where an
+///   address cap answers with the same 502 wording as a bad password
+///   (`max_source_ips` set low, or the [`caps_source_ips`] hostname
+///   list). On a lax server that stays a credential error and keeps
+///   the loud per-tick warn, because cooling it down would hide a
+///   typo for fifteen minutes at a time.
+///
+/// Everything else (unreachable, TLS, timeout) keeps the existing
+/// retry-next-tick behavior: those are what a flaky network produces,
+/// and the next tick genuinely may succeed.
+///
+/// [`caps_source_ips`]: nzbkit::config::caps_source_ips
+#[cfg(feature = "indexer")]
+fn sampler_cap_cooldown(
+    err: &nzbkit::nntp::NntpError,
+    server: &nzbkit::config::ServerConfig,
+) -> Option<std::time::Duration> {
+    use nzbkit::nntp::{AuthRefusal, NntpError};
+    match err {
+        NntpError::AuthFailed {
+            kind: AuthRefusal::Capacity,
+            ..
+        } => Some(SAMPLER_CAP_COOLDOWN),
+        NntpError::AuthFailed {
+            kind: AuthRefusal::Permanent,
+            ..
+        } if server.source_ips_are_tight() => Some(SAMPLER_CAP_COOLDOWN),
+        _ => None,
+    }
+}
+
 /// Tip watcher: the short loop that tracks only what is NEW at the
 /// head of each group.
 ///
@@ -2844,6 +2898,9 @@ pub(super) fn spawn_tip_watcher(
         // always was.
         let mut conns: std::collections::HashMap<String, nzbkit::nntp::Connection> =
             Default::default();
+        // TODO 110: hosts cooling down after a slots-full refusal -
+        // see `sampler_cap_cooldown`. Keyed like `conns`.
+        let mut cooldown: std::collections::HashMap<String, Instant> = Default::default();
         let mut group_cursor = 0usize;
         loop {
             let every = daemon2.index_tip_secs.load(Ordering::Relaxed);
@@ -2925,6 +2982,11 @@ pub(super) fn spawn_tip_watcher(
                     continue;
                 }
                 if !conns.contains_key(&pkey) {
+                    // TODO 110: still cooling down from a slots-full
+                    // refusal - skip quietly, the full pass covers it.
+                    if cooldown.get(&pkey).is_some_and(|&t| Instant::now() < t) {
+                        continue;
+                    }
                     // The key names a server the config may have
                     // dropped since the pass; skip until the next
                     // pass re-chooses.
@@ -2933,12 +2995,27 @@ pub(super) fn spawn_tip_watcher(
                     };
                     match nzbkit::nntp::Connection::connect(&server).await {
                         Ok((c, _)) => {
+                            cooldown.remove(&pkey);
                             conns.insert(pkey.clone(), c);
                         }
-                        Err(e) => {
-                            warn!(target: "tip", "{}: connect: {e}", server.host);
-                            continue;
-                        }
+                        Err(e) => match sampler_cap_cooldown(&e, &server) {
+                            Some(cd) => {
+                                cooldown.insert(pkey.clone(), Instant::now() + cd);
+                                warn!(
+                                    target: "tip",
+                                    "{}: {e} - the account's slots are in use \
+                                     elsewhere; tip watch resumes in {} min \
+                                     (full scan passes still cover the group)",
+                                    server.host,
+                                    cd.as_secs() / 60
+                                );
+                                continue;
+                            }
+                            None => {
+                                warn!(target: "tip", "{}: connect: {e}", server.host);
+                                continue;
+                            }
+                        },
                     }
                 }
                 let c = conns.get_mut(&pkey).expect("connected above");
@@ -3097,6 +3174,8 @@ pub(super) fn spawn_oracle_sampler(daemon: &Arc<Daemon>, config: &std::path::Pat
     tokio::spawn(async move {
         let mut conns: std::collections::HashMap<String, nzbkit::nntp::Connection> =
             Default::default();
+        // TODO 110: same stand-down as the tip watcher's, same reason.
+        let mut cooldown: std::collections::HashMap<String, Instant> = Default::default();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let rate = d.oracle_sample.load(Ordering::Relaxed);
@@ -3153,12 +3232,29 @@ pub(super) fn spawn_oracle_sampler(daemon: &Arc<Daemon>, config: &std::path::Pat
             let mut samples: Vec<nzbkit::oracle::Sample> = Vec::new();
             for s in &servers {
                 if !conns.contains_key(&s.host) {
+                    if cooldown.get(&s.host).is_some_and(|&t| Instant::now() < t) {
+                        continue;
+                    }
                     match nzbkit::nntp::Connection::connect(s).await {
                         Ok((c, _)) => {
+                            cooldown.remove(&s.host);
                             conns.insert(s.host.clone(), c);
                         }
                         Err(e) => {
-                            warn!(target: "oracle", "{}: connect: {e}", s.host);
+                            match sampler_cap_cooldown(&e, s) {
+                                Some(cd) => {
+                                    cooldown.insert(s.host.clone(), Instant::now() + cd);
+                                    warn!(
+                                        target: "oracle",
+                                        "{}: {e} - the account's slots are in \
+                                         use elsewhere; sampling this server \
+                                         resumes in {} min",
+                                        s.host,
+                                        cd.as_secs() / 60
+                                    );
+                                }
+                                None => warn!(target: "oracle", "{}: connect: {e}", s.host),
+                            }
                             continue;
                         }
                     }
@@ -4579,6 +4675,11 @@ pub(super) fn spawn_download_worker(
                     return;
                 }
                 job2.lock_ok().suspended = false;
+                // Mid-download disk full: park under the min-free hold
+                // instead of failing - see `park_on_full_disk`.
+                if park_on_full_disk(&d2, &job2, res.as_ref().err(), on_disk_bytes).await {
+                    return;
+                }
                 let demoted = {
                     let mut j = job2.lock_ok();
                     match &res {
@@ -4619,7 +4720,13 @@ pub(super) fn spawn_download_worker(
                             // the extracted payload is roughly the size
                             // of the set. APPENDED, same rule as the
                             // health clause above.
-                            if crate::serve::disk_full_failure(&j.fail_message) {
+                            // Not for the mid-download halt: its verdict
+                            // already says the fetch resumes from the
+                            // journal, and "only the unpack re-runs"
+                            // would be flatly wrong for it.
+                            if crate::serve::disk_full_failure(&j.fail_message)
+                                && !crate::serve::disk_full_mid_download(&j.fail_message)
+                            {
                                 let clause = format!(
                                     "; free about {:.1} GB on that disk and hit Retry - the downloaded archive parts are kept, so nothing is re-downloaded and only the unpack re-runs",
                                     j.total_bytes as f64 / 1e9

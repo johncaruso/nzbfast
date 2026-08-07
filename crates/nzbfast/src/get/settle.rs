@@ -335,14 +335,21 @@ async fn settle_with_set(
         // landed leaves its missing slices unreachable by both the
         // exact-fit fetch and the final escalation - a repairable job
         // then reports a false shortfall. Where the name declares a
-        // slice count, use it to tell complete from partial; a
+        // slice count, use it to tell complete from partial; an
+        // obfuscated name declares nothing, so there the proof of
+        // completeness is the plan itself - a slot with deferred
+        // (unjournaled, unfetched) articles is not provably whole. A
         // partial volume is treated as wholly unfetched (no credit,
         // no exclusion - the refetch simply rewrites it).
         let declared = pth
             .file_name()
             .and_then(|n| n.to_str())
             .and_then(nzbkit::nzb::par2_vol_count);
-        if declared.is_some_and(|d| counted < d) {
+        let partial = match declared {
+            Some(d) => counted < d,
+            None => slots[s].deferred.load(Ordering::Relaxed) > 0,
+        };
+        if partial {
             continue;
         }
         already.push(slot_file[s]);
@@ -1105,7 +1112,7 @@ async fn settle_without_set(
                 // a job's tail, and the flag read once here at
                 // the sweep's entry (remove_user_file's
                 // contract).
-                let recoverable = crate::smart::delete_to_trash();
+                let recoverable = crate::smart::cleanup_recoverable();
                 let staging = crate::smart::trash_staging_dir(out_dir);
                 let mut remove = |p: &std::path::Path| {
                     let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);

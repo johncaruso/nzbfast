@@ -36,7 +36,13 @@ CFG_TEST = re.compile(r"\s*#\[cfg\(test\)\]")
 # `#[cfg(test)] mod foo;` makes the WHOLE of foo.rs test code. Missing this is
 # how a naive version of this script reported crates/nzbkit/src/extract/
 # testutil.rs - 2 sites of pure test scaffolding - as a production regression.
-CFG_TEST_MOD = re.compile(r"\s*#\[cfg\(test\)\]\s*(?:\n\s*)?(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;")
+# The `#[path = "x_tests.rs"] mod x_tests;` hook puts an attribute between the
+# cfg and the mod; without tolerating it, every file attached that way reads as
+# production and its honest test `.lock().unwrap()`s report as regressions.
+CFG_TEST_MOD = re.compile(
+    r"\s*#\[cfg\(test\)\]\s*(?:\n\s*)?(?:#\[[^\]]*\]\s*(?:\n\s*)?)*"
+    r"(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;"
+)
 
 
 def strip_noise(line):

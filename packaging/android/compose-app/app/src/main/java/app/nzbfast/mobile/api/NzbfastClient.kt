@@ -23,6 +23,14 @@ class NzbfastClient(private val baseUrl: String, private val apiKey: String) {
 
     fun history(): List<HistorySlot> = Parse.history(api("mode=history"))
 
+    /**
+     * Playback contract v1: the one call this app polls on Home and in
+     * the player - server state, both job lists with per-file
+     * readiness, and the byte-serving telemetry, in one response.
+     */
+    fun playback(limit: Int = 60): PlaybackSnapshot =
+        Parse.playback(api("mode=playback&limit=$limit"))
+
     fun addFile(fileName: String, bytes: ByteArray, category: String? = null): AddResult {
         val fields = buildMap {
             put("apikey", apiKey)

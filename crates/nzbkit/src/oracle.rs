@@ -779,6 +779,47 @@ mod tests {
         assert!(!snap.backbone_gone("omicron", "moovee", 3));
     }
 
+    /// carry_rate is the A8 ranking signal: exact-cell only, None on a
+    /// blind spot (it must rank, never skip), the plain hit fraction
+    /// once a cell holds enough samples.
+    #[test]
+    fn carry_rate_is_exact_cell_only() {
+        let mut snap = Snapshot::default();
+        assert!(snap.is_empty());
+        assert_eq!(snap.carry_rate("omicron", "teevee", 1), None);
+        snap.insert("omicron", "teevee", 1, 3, 1); // < MIN_SAMPLES
+        assert!(!snap.is_empty());
+        assert_eq!(snap.carry_rate("omicron", "teevee", 1), None);
+        snap.insert("omicron", "teevee", 1, 75, 25);
+        assert_eq!(snap.carry_rate("omicron", "teevee", 1), Some(0.75));
+        // No cross-family or cross-bucket leakage.
+        assert_eq!(snap.carry_rate("omicron", "moovee", 1), None);
+        assert_eq!(snap.carry_rate("omicron", "teevee", 2), None);
+        assert_eq!(snap.carry_rate("abavia", "teevee", 1), None);
+    }
+
+    /// The wall's JSON vocabulary is a stable three-word contract.
+    #[test]
+    fn verdict_api_strings() {
+        assert_eq!(Verdict::Ok.as_str(), "ok");
+        assert_eq!(Verdict::Maybe.as_str(), "maybe");
+        assert_eq!(Verdict::Gone.as_str(), "gone");
+    }
+
+    /// An empty family string normalizes to "misc" on both verdict
+    /// paths, so blank newsgroup metadata still keys a real cell.
+    #[test]
+    fn blank_family_reads_as_misc() {
+        let mut snap = Snapshot::default();
+        snap.insert("omicron", "misc", 1, 200, 0);
+        assert_eq!(
+            snap.verdict(&["omicron".to_string()], "  ", 3),
+            Some(Verdict::Ok)
+        );
+        snap.insert("omicron", "misc", 0, 2, 98);
+        assert!(snap.backbone_gone("omicron", "", 0));
+    }
+
     #[test]
     fn wilson_sanity() {
         let (lo, hi) = wilson(0, 0);
