@@ -13,6 +13,113 @@ use tracing::{info, warn};
 /// on disk: (slot, article id, name, size, frags).
 pub(super) type PendingD = (usize, String, String, u64, Vec<nzbkit::extract::Frag>);
 
+/// Article parked on a [`nzbkit::extract::Persist::Held`] return: some
+/// of its bytes were parked in the extractor for a later re-feed
+/// (typically it arrived before the offset-0 sniff established the
+/// store mapper). Kept until the drained placements cover its whole
+/// span, at which point it journals like any placed article - without
+/// this, a mid-volume payload article that was fully written by the
+/// drain never got an `R` record and every crash/ENOSPC resume
+/// refetched it for no reason.
+pub(super) struct ParkedR {
+    pub(super) sidx: usize,
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) size: u64,
+    /// The article's span in volume address space.
+    pub(super) off: u64,
+    pub(super) len: u64,
+    /// Plain fragments already on disk when the article arrived (the
+    /// partially-held case; empty for a whole-span hold).
+    pub(super) frags: Vec<nzbkit::extract::Frag>,
+    /// Journals as a bare `record(id)` like the Placed arm does for the
+    /// par2 main, instead of an `R` placement.
+    pub(super) par2_main: bool,
+}
+
+/// Held-article journal state shared by the decode consumers and the
+/// drain pass: parked articles plus the late placements drained from
+/// the extractor so far, per slot.
+#[derive(Default)]
+pub(super) struct PendingR {
+    pub(super) parked: Vec<ParkedR>,
+    pub(super) late: std::collections::HashMap<usize, Vec<nzbkit::extract::Frag>>,
+}
+
+/// Join freshly drained late placements against the parked held
+/// articles and journal every article whose span the plain fragments
+/// now fully cover. A hold is always a subrange of exactly one
+/// article's span, so containment in `[off, off+len)` is the join key.
+/// Cheap when nothing is parked (one uncontended lock).
+pub(super) fn flush_pending_r(
+    pending_r: &std::sync::Mutex<PendingR>,
+    extractor: &nzbkit::extract::Extractor,
+    journal: &nzbkit::journal::Journal,
+) {
+    let mut st = pending_r.lock_ok();
+    if st.parked.is_empty() {
+        return;
+    }
+    for (slot, frag) in extractor.drain_late_placements() {
+        st.late.entry(slot).or_default().push(frag);
+    }
+    let PendingR { parked, late } = &mut *st;
+    let mut done: Vec<(usize, u64, u64)> = Vec::new();
+    parked.retain(|p| {
+        let end = p.off + p.len;
+        let mut frags = p.frags.clone();
+        if let Some(slot_late) = late.get(&p.sidx) {
+            frags.extend(
+                slot_late
+                    .iter()
+                    .filter(|f| f.vol_off >= p.off && f.vol_off + f.len <= end)
+                    .cloned(),
+            );
+        }
+        frags.sort_by_key(|f| f.vol_off);
+        let mut covered_to = p.off;
+        for f in &frags {
+            if f.vol_off > covered_to {
+                return true; // gap - stays parked
+            }
+            covered_to = covered_to.max(f.vol_off + f.len);
+        }
+        if frags.is_empty() || covered_to < end {
+            return true;
+        }
+        // Every byte of the span is durably on disk (the re-feed writes
+        // ran under the extractor's routing lock, before the placements
+        // were surfaced) - journal it exactly like a directly-Placed
+        // article.
+        if p.par2_main {
+            journal.record(&p.id);
+        } else {
+            journal.record_placed(
+                p.sidx,
+                &p.id,
+                extractor.slot_file_info(p.sidx),
+                &p.name,
+                p.size,
+                &frags,
+            );
+        }
+        done.push((p.sidx, p.off, end));
+        false
+    });
+    // The late fragments a journaled article consumed can never match
+    // another article (spans are disjoint) - drop them so the map does
+    // not grow for the life of the job.
+    if !done.is_empty() {
+        for (slot, v) in late.iter_mut() {
+            v.retain(|f| {
+                !done
+                    .iter()
+                    .any(|(s, o, e)| s == slot && f.vol_off >= *o && f.vol_off + f.len <= *e)
+            });
+        }
+    }
+}
+
 /// One decode consumer's dependency set - exactly the clone list its
 /// spawn site builds (TODO 106 phase 2.1, cut 1). The destructure at
 /// the top of [`decode_consumer_loop`] keeps the body identical to its
@@ -20,6 +127,7 @@ pub(super) type PendingD = (usize, String, String, u64, Vec<nzbkit::extract::Fra
 pub(super) struct DecodeCtx {
     pub(super) rx: Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<nzbkit::pool::FetchOutcome>>>,
     pub(super) pending_d: Arc<std::sync::Mutex<Vec<PendingD>>>,
+    pub(super) pending_r: Arc<std::sync::Mutex<PendingR>>,
     pub(super) pool: Arc<nzbkit::pool::BufPool>,
     pub(super) out_pool: Arc<nzbkit::pool::BufPool>,
     pub(super) slots: Vec<Arc<FileSlot>>,
@@ -54,6 +162,93 @@ pub(super) struct DecodeCtx {
     pub(super) crc_steer: bool,
 }
 
+/// The PAR2 activation race's dependency set (TODO 106 phase 2.1, cut
+/// 2). Borrowed, not cloned: it is assembled once per consumer thread
+/// from the same locals the loop already holds.
+struct Par2Race<'a> {
+    slots: &'a [Arc<FileSlot>],
+    verifier: &'a Arc<nzbkit::live::LiveVerifier>,
+    extractor: &'a Arc<nzbkit::extract::Extractor>,
+    par2_outstanding: &'a Arc<std::sync::atomic::AtomicUsize>,
+    sniff: &'a Arc<SniffCtl>,
+    queue_ctl: &'a Arc<nzbkit::pool::QueueControl>,
+    backfill: &'a Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<u64>>>>,
+    rt: &'a tokio::runtime::Handle,
+}
+
+impl Par2Race<'_> {
+    /// A slot just ran out of outstanding articles. If it was PAR2 -
+    /// a static main, or a sniffed bootstrap that owes the counter a
+    /// completion the same way (a DEFERRED sniffed slot does not) -
+    /// activate the set when this is the one that completes it, and
+    /// hand the pre-activation backfill to a blocking thread rather
+    /// than running it on the decoder.
+    fn slot_drained(&self, sidx: usize) {
+        let slot = &self.slots[sidx];
+        if !(slot.is_par2_main || (slot.is_par2() && self.sniff.note_completed(sidx)))
+            || !maybe_activate_par2(
+                self.slots,
+                self.verifier,
+                self.par2_outstanding,
+                self.sniff,
+                self.queue_ctl,
+                self.extractor,
+            )
+        {
+            return;
+        }
+        let v = self.verifier.clone();
+        let ex = self.extractor.clone();
+        let sl = self.slots.to_vec();
+        let n = self.slots.len();
+        *self.backfill.lock_ok() = Some(self.rt.spawn_blocking(move || {
+            let flags: Vec<bool> = sl.iter().map(|s| s.is_par2()).collect();
+            backfill_pre_activation(&v, &ex, n, &flags)
+        }));
+    }
+
+    /// An article that will never arrive - a 430, a retention hole, a
+    /// transport failure. Terminal is terminal: it still ends the
+    /// fetch's responsibility for those bytes, and leaving them out
+    /// would hold the progress bar short of 100% on every damaged set
+    /// while repair ran.
+    fn article_lost(&self, id: &str, id_to_slot: &crate::unpack::IdSlots, done: &AtomicU64) {
+        let Some(&(sidx, nbytes)) = id_to_slot.get(id) else {
+            return;
+        };
+        let sidx = sidx as usize;
+        done.fetch_add(nbytes, Ordering::Relaxed);
+        self.slots[sidx].missing.fetch_add(1, Ordering::Relaxed);
+        if self.slots[sidx].remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.slot_drained(sidx);
+        }
+    }
+}
+
+/// Take up to eight fetch outcomes in one lock hold.
+///
+/// A batch per lock hold, not one outcome per hold: the futex wake +
+/// context switch of a `blocking_recv` handoff is per-batch, not
+/// per-article - at loopback article rates (8k+/s) the per-article
+/// version tripled sys time on 2 CPUs. At NAS rates the batch is 1 and
+/// behavior is identical. Empty means the channel closed and drained.
+fn drain_outcome_batch(
+    rx: &Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<nzbkit::pool::FetchOutcome>>>,
+) -> Vec<nzbkit::pool::FetchOutcome> {
+    let mut batch = Vec::with_capacity(8);
+    let mut rx = rx.lock_ok();
+    if let Some(first) = rx.blocking_recv() {
+        batch.push(first);
+        while batch.len() < 8 {
+            match rx.try_recv() {
+                Ok(o) => batch.push(o),
+                Err(_) => break,
+            }
+        }
+    }
+    batch
+}
+
 /// Everything one decode consumer thread does: drain outcome batches
 /// off the shared channel, yEnc-decode, write through the extractor,
 /// feed the verifier, keep the journal and the PAR2 activation race
@@ -65,6 +260,7 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
     let DecodeCtx {
         rx,
         pending_d,
+        pending_r,
         pool,
         out_pool,
         slots,
@@ -92,25 +288,18 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
         throttle_t0,
         crc_steer,
     } = ctx;
+    let par2 = Par2Race {
+        slots: &slots,
+        verifier: &verifier,
+        extractor: &extractor,
+        par2_outstanding: &par2_outstanding,
+        sniff: &sniff,
+        queue_ctl: &queue_ctl,
+        backfill: &backfill,
+        rt: &rt,
+    };
     loop {
-        // Drain a batch per lock hold: the futex wake + context
-        // switch of a blocking_recv handoff is per-batch, not
-        // per-article - at loopback article rates (8k+/s) the
-        // per-article version tripled sys time on 2 CPUs. At NAS
-        // rates the batch is 1 and behavior is identical.
-        let mut batch: Vec<FetchOutcome> = Vec::with_capacity(8);
-        {
-            let mut rx = rx.lock_ok();
-            if let Some(first) = rx.blocking_recv() {
-                batch.push(first);
-                while batch.len() < 8 {
-                    match rx.try_recv() {
-                        Ok(o) => batch.push(o),
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
+        let batch = drain_outcome_batch(&rx);
         if batch.is_empty() {
             break; // channel closed and drained
         }
@@ -280,8 +469,29 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
                                                 frags.clone(),
                                             ));
                                         }
+                                        // Bytes of this span were parked
+                                        // for a later re-feed: keep the
+                                        // article's identity and finish
+                                        // its record when the drained
+                                        // placements cover the span (see
+                                        // flush_pending_r).
+                                        nzbkit::extract::Persist::Held(frags) => {
+                                            if !out.is_empty() {
+                                                pending_r.lock_ok().parked.push(ParkedR {
+                                                    sidx,
+                                                    id: id.clone(),
+                                                    name: name.clone(),
+                                                    size: dec.file_size,
+                                                    off: dec.offset(),
+                                                    len: out.len() as u64,
+                                                    frags: frags.clone(),
+                                                    par2_main: slot.is_par2_main,
+                                                });
+                                            }
+                                        }
                                         nzbkit::extract::Persist::No => {}
                                     }
+                                    flush_pending_r(&pending_r, &extractor, &journal);
                                     // Flush every parked D whose bytes
                                     // have settled; E/K/T facts go first
                                     // so the records they support are
@@ -437,29 +647,7 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
                                 p.file_name().unwrap_or_default().to_string_lossy()
                             );
                         }
-                        // A sniffed bootstrap volume owes the
-                        // activation counter a completion just
-                        // like a static par2-main slot does;
-                        // deferred sniffed slots do not.
-                        if (slot.is_par2_main || (slot.is_par2() && sniff.note_completed(sidx)))
-                            && maybe_activate_par2(
-                                &slots,
-                                &verifier,
-                                &par2_outstanding,
-                                &sniff,
-                                &queue_ctl,
-                                &extractor,
-                            )
-                        {
-                            let v = verifier.clone();
-                            let ex = extractor.clone();
-                            let sl = slots.clone();
-                            let n = slots.len();
-                            *backfill.lock_ok() = Some(rt.spawn_blocking(move || {
-                                let flags: Vec<bool> = sl.iter().map(|s| s.is_par2()).collect();
-                                backfill_pre_activation(&v, &ex, n, &flags)
-                            }));
-                        }
+                        par2.slot_drained(sidx);
                     }
                 }
                 FetchOutcome::Missing { id, cause } => {
@@ -471,74 +659,12 @@ pub(super) fn decode_consumer_loop(ctx: DecodeCtx) {
                             missing_430.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    if let Some(&(sidx, nbytes)) = id_to_slot.get(&id) {
-                        let sidx = sidx as usize;
-                        // Terminal is terminal: an article
-                        // that will never arrive still ends
-                        // the fetch's responsibility for it,
-                        // and leaving it out would hold the
-                        // bar short of 100% on every damaged
-                        // set while repair ran.
-                        fetch_done.fetch_add(nbytes, Ordering::Relaxed);
-                        slots[sidx].missing.fetch_add(1, Ordering::Relaxed);
-                        if slots[sidx].remaining.fetch_sub(1, Ordering::AcqRel) == 1
-                            && (slots[sidx].is_par2_main
-                                || (slots[sidx].is_par2() && sniff.note_completed(sidx)))
-                            && maybe_activate_par2(
-                                &slots,
-                                &verifier,
-                                &par2_outstanding,
-                                &sniff,
-                                &queue_ctl,
-                                &extractor,
-                            )
-                        {
-                            let v = verifier.clone();
-                            let ex = extractor.clone();
-                            let sl = slots.clone();
-                            let n = slots.len();
-                            *backfill.lock_ok() = Some(rt.spawn_blocking(move || {
-                                let flags: Vec<bool> = sl.iter().map(|s| s.is_par2()).collect();
-                                backfill_pre_activation(&v, &ex, n, &flags)
-                            }));
-                        }
-                    }
+                    par2.article_lost(&id, &id_to_slot, &fetch_done);
                 }
                 FetchOutcome::Failed { id, error } => {
                     transport_failed.fetch_add(1, Ordering::Relaxed);
                     transport_sample.lock_ok().get_or_insert(error);
-                    if let Some(&(sidx, nbytes)) = id_to_slot.get(&id) {
-                        let sidx = sidx as usize;
-                        // Terminal is terminal: an article
-                        // that will never arrive still ends
-                        // the fetch's responsibility for it,
-                        // and leaving it out would hold the
-                        // bar short of 100% on every damaged
-                        // set while repair ran.
-                        fetch_done.fetch_add(nbytes, Ordering::Relaxed);
-                        slots[sidx].missing.fetch_add(1, Ordering::Relaxed);
-                        if slots[sidx].remaining.fetch_sub(1, Ordering::AcqRel) == 1
-                            && (slots[sidx].is_par2_main
-                                || (slots[sidx].is_par2() && sniff.note_completed(sidx)))
-                            && maybe_activate_par2(
-                                &slots,
-                                &verifier,
-                                &par2_outstanding,
-                                &sniff,
-                                &queue_ctl,
-                                &extractor,
-                            )
-                        {
-                            let v = verifier.clone();
-                            let ex = extractor.clone();
-                            let sl = slots.clone();
-                            let n = slots.len();
-                            *backfill.lock_ok() = Some(rt.spawn_blocking(move || {
-                                let flags: Vec<bool> = sl.iter().map(|s| s.is_par2()).collect();
-                                backfill_pre_activation(&v, &ex, n, &flags)
-                            }));
-                        }
-                    }
+                    par2.article_lost(&id, &id_to_slot, &fetch_done);
                 }
             }
         }
@@ -774,23 +900,13 @@ pub(super) fn spawn_spec_prefetch(
             // handle, so a blackholed side provider held drain_network's
             // unconditional await - and with it Cancel/Pause - through
             // the side pool's whole multi-session retry ladder. The
-            // watcher turns the stop flag into a pool abort, and keeps
-            // aborting every tick while the flag is set so a rung that
-            // attaches a fresh pool just as the flag flips is still
-            // caught on the next tick.
-            let ctl = Arc::new(nzbkit::pool::QueueControl::default());
-            let watcher = {
-                let stop = stop.clone();
-                let ctl = ctl.clone();
-                tokio::spawn(async move {
-                    loop {
-                        if stop.load(Ordering::Acquire) {
-                            ctl.abort();
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    }
-                })
-            };
+            // latch-plus-re-abort watcher that fixed it now lives in
+            // `SideCancel`, inside the one driver every side-fetch goes
+            // through (§129 residue 2 needed the same wire for the
+            // lane's repair fetches). `over` shares THIS ladder's own
+            // stop flag, so the loop below still reads it directly and
+            // there is only ever one latch.
+            let cancel = crate::repair::SideCancel::over(stop.clone());
             let body = async {
             let mut covered = 0usize;
             let mut ladder = ladder;
@@ -820,11 +936,18 @@ pub(super) fn spawn_spec_prefetch(
                         "{miss} article(s) terminally missing - prefetching recovery volume ({:.1} MB) alongside the download",
                         bytes as f64 / 1e6
                     );
-                    let fetched =
-                        fetch_volume_articles(&side_servers, reqs, idm, &out2, &bp, vol_cap, Some(&ctl))
-                            .await;
+                    let fetched = fetch_volume_articles(
+                        &side_servers,
+                        reqs,
+                        idm,
+                        &out2,
+                        &bp,
+                        vol_cap,
+                        Some(&cancel),
+                    )
+                    .await;
                     if stop.load(Ordering::Acquire) {
-                        // The watcher aborted this rung mid-flight. An
+                        // The handle aborted this rung mid-flight. An
                         // aborted run's unresolved articles emit NO
                         // outcome, so the failure count can read 0 over
                         // a volume that is actually incomplete - credit
@@ -882,7 +1005,6 @@ pub(super) fn spawn_spec_prefetch(
             }
             };
             body.await;
-            watcher.abort();
         })
     })
 }
@@ -1182,6 +1304,7 @@ pub(super) async fn drain_network(
     par_race_task: Option<tokio::task::JoinHandle<()>>,
     consumers: Vec<std::thread::JoinHandle<()>>,
     pending_d: &Arc<std::sync::Mutex<Vec<PendingD>>>,
+    pending_r: &Arc<std::sync::Mutex<PendingR>>,
     extractor: &Arc<nzbkit::extract::Extractor>,
     journal: &Arc<nzbkit::journal::Journal>,
     t0: Instant,
@@ -1215,6 +1338,11 @@ pub(super) async fn drain_network(
         }
     })
     .await;
+    // Final held-article flush: holds that drained after the last
+    // article's own flush pass (settle-triggered reresolves, the tail
+    // of an out-of-order set) journal now; anything still parked
+    // refetches on resume, which is exactly the truthful record.
+    flush_pending_r(pending_r, extractor, journal);
     // Final D-record flush: seams that closed after the last article's
     // own flush pass settle now; anything still RAM-held refetches on
     // resume, which is exactly the truthful record.
@@ -1491,12 +1619,16 @@ pub(super) fn spawn_decode_consumers(
 ) -> (
     Vec<std::thread::JoinHandle<()>>,
     Arc<std::sync::Mutex<Vec<PendingD>>>,
+    Arc<std::sync::Mutex<PendingR>>,
 ) {
     let mut consumers = Vec::new();
     // Plaintext-once D records parked until their seam bytes settle on
     // disk (see the PlacedCrypto arm below). Shared across the decode
     // threads; leftovers at join time simply refetch on resume.
     let pending_d: Arc<std::sync::Mutex<Vec<PendingD>>> = Default::default();
+    // Held articles parked until their drained placements cover the
+    // span (see ParkedR). Leftovers at drain time refetch on resume.
+    let pending_r: Arc<std::sync::Mutex<PendingR>> = Default::default();
     // More decode threads than cores is pure scheduler churn (measured on
     // the 2-CPU cgroup rig): the default 4 stands on big metal, small
     // boxes get one per core.
@@ -1507,6 +1639,7 @@ pub(super) fn spawn_decode_consumers(
         let ctx = DecodeCtx {
             rx: rx.clone(),
             pending_d: pending_d.clone(),
+            pending_r: pending_r.clone(),
             pool: buf_pool.clone(),
             out_pool: out_pool.clone(),
             slots: slots.to_vec(),
@@ -1540,7 +1673,92 @@ pub(super) fn spawn_decode_consumers(
             .expect("spawn decode thread");
         consumers.push(thread);
     }
-    (consumers, pending_d)
+    (consumers, pending_d, pending_r)
+}
+
+#[cfg(test)]
+mod pending_r_tests {
+    use super::*;
+
+    /// TODO 100 follow-up: articles that arrive before the offset-0
+    /// sniff establishes the store mapper park as `Persist::Held`; once
+    /// the sniff lands and the extractor drains them into the inner
+    /// file, `flush_pending_r` must complete their journal records -
+    /// and the records must be RESTORABLE, not merely written. Without
+    /// the join, the first run's journal nondeterministically lacked
+    /// `R` records for early/mid payload articles of a mapped store
+    /// set, and every crash/ENOSPC resume refetched them for no
+    /// reason.
+    #[test]
+    fn held_articles_journal_after_their_holds_drain() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-pending-r-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data: Vec<u8> = (0..600_000u32)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+        let vol =
+            nzbkit::rar::fixtures::rar5_volume(&[("movie.mkv", 600_000, &data, false, false)]);
+        let (journal, _) = nzbkit::journal::Journal::open(&dir, b"nzb-held").unwrap();
+        let ex = nzbkit::extract::Extractor::new(&dir, 1, true);
+        let pending_r = std::sync::Mutex::new(PendingR::default());
+        let art = 100_000usize;
+        let n = vol.len().div_ceil(art);
+        // Every article except offset-0, in reverse: all park.
+        for i in (1..n).rev() {
+            let s = i * art;
+            let e = ((i + 1) * art).min(vol.len());
+            match ex
+                .write(0, "v.rar", vol.len() as u64, s as u64, &vol[s..e])
+                .unwrap()
+            {
+                nzbkit::extract::Persist::Held(frags) => {
+                    pending_r.lock_ok().parked.push(ParkedR {
+                        sidx: 0,
+                        id: format!("<er-{i}@t>"),
+                        name: "v.rar".into(),
+                        size: vol.len() as u64,
+                        off: s as u64,
+                        len: (e - s) as u64,
+                        frags,
+                        par2_main: false,
+                    });
+                }
+                _ => panic!("article {i} arrived pre-sniff and must park as Held"),
+            }
+            flush_pending_r(&pending_r, &ex, &journal);
+        }
+        assert_eq!(
+            pending_r.lock_ok().parked.len(),
+            n - 1,
+            "nothing may journal before its bytes drain"
+        );
+        // The offset-0 sniff maps the volume and the drain writes every
+        // held payload byte; the next flush completes their records.
+        ex.write(0, "v.rar", vol.len() as u64, 0, &vol[..art])
+            .unwrap();
+        flush_pending_r(&pending_r, &ex, &journal);
+        let left: Vec<u64> = pending_r.lock_ok().parked.iter().map(|p| p.off).collect();
+        // Only the final article may stay parked (it carries the
+        // end-of-archive block, which never lands in an output file).
+        assert!(
+            left.iter().all(|&o| o as usize + art >= vol.len()),
+            "payload articles still parked at offsets {left:?}"
+        );
+        // The records restore on a resume: reopen the journal cold and
+        // rebuild - every journaled article's fragments must read back.
+        drop(journal);
+        drop(ex);
+        let (_j2, resume) = nzbkit::journal::Journal::open(&dir, b"nzb-held").unwrap();
+        let restored = nzbkit::journal::restore(&dir, &resume, None);
+        for i in 1..n - 1 {
+            assert!(
+                restored.ids.contains(&format!("<er-{i}@t>")),
+                "er-{i} journaled but did not restore"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

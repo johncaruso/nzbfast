@@ -29,6 +29,17 @@ pub const STALE_SECS: u64 = 7 * 86_400;
 /// time shouldn't survive corroboration).
 pub const SUSPECT_STALE_SECS: u64 = 6 * 3600;
 
+/// A live-tuner bucket expires after this long unread by fresh
+/// evidence (conn-tuning design §4). Expired buckets are ignored for
+/// seeding - they fall through to an adjacent bucket, then the ladder
+/// knee, then the configured count - but retained for history.
+pub const BUCKET_STALE_SECS: u64 = 14 * 86_400;
+
+/// Clean epochs a bucket needs before its target outranks the ladder
+/// knee at seed time. Below this the bucket is a hint, not evidence -
+/// the seed logic prefers a corroborated knee over a 2-epoch bucket.
+pub const BUCKET_MIN_EPOCHS: u64 = 10;
+
 /// Stamped on every entry this build writes.
 ///
 /// v0 = written before the `suspect` guard existed, so a low knee in a
@@ -39,7 +50,17 @@ pub const SUSPECT_STALE_SECS: u64 = 6 * 3600;
 /// it until the 7-day stale clock expires. The version lets
 /// [`reopen_low_knees`] tell "measured under the old rules" from
 /// "measured and corroborated under the new ones" exactly once.
-pub const SCHEMA: u32 = 1;
+///
+/// v1 = measured on the SYNTHETIC PROBE GROUP. The 8 Aug three-layer
+/// gap round showed that group undermeasuring a provider 17x (xsnews:
+/// 0.20 Gbps on the probe group vs 3.52 on real articles, same minute)
+/// because per-group backends differ - a deterministic false low that
+/// suspect, corroboration and jagged all wave through, since a re-probe
+/// of the same wrong population reproduces it exactly. v2 entries are
+/// measured on real-content articles from the install's own downloads
+/// (design doc 12.1); every pre-v2 knee is retired for re-measurement
+/// by the same one-time sweep.
+pub const SCHEMA: u32 = 2;
 
 /// The slowest ladder peak worth believing, in Gbps.
 ///
@@ -297,6 +318,56 @@ pub fn enabled(config: &Path) -> bool {
         .unwrap_or(true)
 }
 
+/// One time-of-day bucket of live-tuner evidence (design §4): where
+/// the epoch controller settled during real downloads in this window
+/// recently, and what one socket was actually delivering then. Four
+/// per host, 6 h of LOCAL time each - the coarsest split that
+/// separates night from evening peak without starving for samples on
+/// a box that downloads a few times a week.
+///
+/// None of these numbers is a cap. A bucket SEEDS the live controller
+/// at job start; the only numbers that cap are typed by the user.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Bucket {
+    /// Bucket index: local hour / 6 (0 = 00-06 ... 3 = 18-24).
+    pub b: u8,
+    /// The controller's kept connection count last time it ran clean
+    /// in this window.
+    pub target: usize,
+    /// Delivered rate / connected sockets, median over the bucket's
+    /// recent clean epochs - the decay reference (design §6). An
+    /// envelope observation, not a promise.
+    pub per_conn_bps: f64,
+    /// Median delivered rate over the same epochs, for the dashboard.
+    pub rate_bps: f64,
+    /// Clean-epoch evidence weight; see [`BUCKET_MIN_EPOCHS`].
+    pub epochs: u64,
+    /// Unix time of the last write; 0 or older than
+    /// [`BUCKET_STALE_SECS`] means expired-for-seeding.
+    pub checked: u64,
+    /// The ceiling in force when written - the boot sweep invalidates
+    /// any bucket whose target is under half a RAISED ceiling, the
+    /// James rule applied to the new store from day one.
+    pub limit: usize,
+    /// "live" (epoch write-back) | "ladder" | "manual" (a ladder run
+    /// refreshing the current bucket's seed).
+    #[serde(default)]
+    pub source: String,
+}
+
+/// The decay flag (design §6): this host's live per-connection rate
+/// fell below half of its bucket reference for a sustained, multi-
+/// stretch quorum. "Recently fell", not "worse than the best week
+/// ever" - a fresh ladder reference clears it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Shaped {
+    /// Unix time the flag was raised.
+    pub since: u64,
+    /// The per-connection rate it fell FROM - the recovery bar (80% of
+    /// this) and the dashboard's "it managed ~X on <date>" figure.
+    pub ref_per_conn_bps: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tuned {
     /// Recommended connection count (smallest reaching ≥90% of the
@@ -358,6 +429,14 @@ pub struct Tuned {
     /// while the candidate waits for a second opinion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<usize>,
+    /// Live-tuner evidence by time-of-day bucket (design §4). Serde-
+    /// defaulted both ways so builds before this field parse files
+    /// carrying it and vice versa; the knee half above is untouched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buckets: Vec<Bucket>,
+    /// The decay flag; see [`Shaped`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shaped: Option<Shaped>,
 }
 
 /// The connection ceiling a job would actually hand this server: the
@@ -393,11 +472,13 @@ pub fn effective_limit(global: usize, server_connections: u32) -> usize {
     global.max(1).min((server_connections.max(1)) as usize)
 }
 
-/// TODO 112: the live epoch controller's master gate. Dark until the
-/// three loopback rigs (nzbkit tests/live_tune.rs) have earned it a
-/// default. Independent of `auto_connections` on purpose: that toggle
-/// governs the OFFLINE prober; the per-server escape from live tuning
-/// is `pin_connections`, exactly as it is for applied knees.
+/// TODO 112: the live epoch controller's dev override. The real gate
+/// is the `live_tune` setting (default OFF until the §129 real-line
+/// gate passes); this env var force-enables it for rigs and bench
+/// legs regardless of settings. Callers OR the two. Independent of
+/// `auto_connections` on purpose: that toggle governs the OFFLINE
+/// prober; the per-server escape from live tuning is
+/// `pin_connections`, exactly as it is for applied knees.
 pub fn live_tune_on() -> bool {
     std::env::var("NZBFAST_LIVE_TUNE").is_ok_and(|v| v == "1")
 }
@@ -467,17 +548,218 @@ fn save(config: &Path, map: &HashMap<String, Tuned>) {
 /// re-rejected forever.
 pub fn corroborates(prev: Option<&Tuned>, best: usize) -> bool {
     prev.is_some_and(|p| {
-        let a = p.pending.unwrap_or(p.connections).max(1) as f64;
+        // A retired entry carries no yardstick at all (the sweep zeroes
+        // `connections` precisely so it cannot serve as one), and
+        // `max(1)` would otherwise turn that absence into a knee of 1
+        // that a 1-connection ladder agrees with.
+        let a = p.pending.unwrap_or(p.connections);
+        if a == 0 {
+            return false;
+        }
+        let a = a as f64;
         let b = best.max(1) as f64;
         (a - b).abs() <= a.max(b) * 0.25
     })
 }
 
 pub fn record(config: &Path, host: &str, t: Tuned) {
+    record_at(config, host, t, bucket_of(local_hour()));
+}
+
+/// [`record`] with the time-of-day bucket made explicit, so tests can
+/// pin the refresh without depending on the wall clock.
+pub fn record_at(config: &Path, host: &str, t: Tuned, bucket: u8) {
     let _g = LOCK.lock_ok();
     let mut map = load(config);
-    let t = reconcile(map.get(host), t);
+    let was_shaped = map.get(host).is_some_and(|p| p.shaped.is_some());
+    let mut t = reconcile(map.get(host), t);
+    // A trusted ladder result also refreshes the current bucket's SEED
+    // (design §4, `source`): a user-run Test must never be ignored by
+    // the live layer, which would otherwise keep seeding from a bucket
+    // the user has just measured to be wrong. Evidence weight is left
+    // alone - a ladder measures a curve, not an epoch stream.
+    if !t.suspect && t.connections > 0 {
+        let seed = t.connections;
+        let (checked, limit) = (t.checked, t.limit);
+        let source = if t.source == "manual" {
+            "manual"
+        } else {
+            "ladder"
+        };
+        let b = bucket_entry(&mut t.buckets, bucket);
+        b.target = seed;
+        b.checked = checked;
+        b.limit = limit;
+        b.source = source.to_string();
+        // A trusted ladder on a SHAPED host is the confirmation run:
+        // besides clearing the flag (reconcile), it retires the old
+        // per-connection reference so the live layer re-learns one at
+        // the confirmed rate - "the decayed rate, once confirmed,
+        // BECOMES the reference" (design §6). Routine ladders on a
+        // healthy host leave the reference alone.
+        if was_shaped {
+            b.per_conn_bps = 0.0;
+        }
+    }
     map.insert(host.to_string(), t);
+    save(config, &map);
+}
+
+/// The bucket for `idx`, created empty in place if absent. Keeps the
+/// vec sorted by index so the file diffs stay readable.
+fn bucket_entry(buckets: &mut Vec<Bucket>, idx: u8) -> &mut Bucket {
+    if !buckets.iter().any(|b| b.b == idx) {
+        buckets.push(Bucket {
+            b: idx,
+            ..Default::default()
+        });
+        buckets.sort_by_key(|b| b.b);
+    }
+    buckets.iter_mut().find(|b| b.b == idx).unwrap()
+}
+
+/// The machine's local hour (0-23); UTC where localtime is not
+/// available. Local on purpose: diurnal provider load follows the
+/// clock the install's traffic follows (same choice as the
+/// scheduler's `local_minute_of_week`).
+pub fn local_hour() -> u8 {
+    #[cfg(unix)]
+    {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if !unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+            return tm.tm_hour as u8;
+        }
+    }
+    (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        % 86_400
+        / 3600) as u8
+}
+
+/// Which of the four 6 h buckets a local hour falls in.
+pub fn bucket_of(hour: u8) -> u8 {
+    (hour / 6).min(3)
+}
+
+/// Unexpired, per [`BUCKET_STALE_SECS`].
+pub fn bucket_fresh(b: &Bucket, now: u64) -> bool {
+    b.checked > 0 && now.saturating_sub(b.checked) < BUCKET_STALE_SECS
+}
+
+/// Where the live controller starts for a host (design §5.1): the
+/// current bucket's target when it is unexpired and carries real
+/// evidence, an adjacent unexpired bucket next (the evening is better
+/// predicted by the afternoon than by nothing), then the trusted
+/// ladder knee, then the configured count. Always clamped to
+/// `configured` - a seed is a starting belief, never a licence to
+/// exceed the ceiling the user typed.
+pub fn seed_connections(tuned: Option<&Tuned>, bucket: u8, now: u64, configured: usize) -> usize {
+    let configured = configured.max(1);
+    if let Some(t) = tuned {
+        for bi in [bucket, (bucket + 3) % 4, (bucket + 1) % 4] {
+            if let Some(b) = t.buckets.iter().find(|b| b.b == bi)
+                && bucket_fresh(b, now)
+                && b.epochs >= BUCKET_MIN_EPOCHS
+                && b.target > 0
+            {
+                return b.target.clamp(1, configured);
+            }
+        }
+        if t.connections > 0 && !t.suspect {
+            return t.connections.clamp(1, configured);
+        }
+    }
+    configured
+}
+
+/// One throttled write-back from the live controller's epoch loop
+/// (design §5.2): the kept target and this window's clean-epoch
+/// medians, folded into the host's bucket under the same LOCK +
+/// write_atomic path every other conntune writer uses.
+pub struct BucketUpdate {
+    pub target: usize,
+    pub per_conn_bps: f64,
+    pub rate_bps: f64,
+    /// Clean epochs observed since the last write-back.
+    pub epochs_add: u64,
+    pub limit: usize,
+    pub now: u64,
+}
+
+pub fn update_bucket(config: &Path, host: &str, idx: u8, u: BucketUpdate) {
+    let _g = LOCK.lock_ok();
+    let mut map = load(config);
+    // A host with no ladder entry still learns buckets: the entry's
+    // knee half stays zeroed (connections 0 = no knee), which every
+    // knee consumer already treats as "nothing recorded".
+    let t = map.entry(host.to_string()).or_insert_with(|| Tuned {
+        connections: 0,
+        granted: 0,
+        asked: 0,
+        gbps: 0.0,
+        checked: 0,
+        source: "live".into(),
+        suspect: false,
+        limit: 0,
+        v: SCHEMA,
+        pending: None,
+        buckets: Vec::new(),
+        shaped: None,
+    });
+    let b = bucket_entry(&mut t.buckets, idx);
+    // Evidence does not accumulate across an expiry gap: a bucket
+    // coming back from the dead restarts its count rather than
+    // borrowing weight from a fortnight-old regime.
+    if !bucket_fresh(b, u.now) {
+        b.epochs = 0;
+        b.per_conn_bps = 0.0;
+    }
+    b.target = u.target;
+    // The per-connection figure doubles as the decay REFERENCE (design
+    // §6), so a median that would itself trip the raise bar must not
+    // become the reference: it is evidence FOR the detector, not a new
+    // normal. Without this, a long decayed stretch quietly walks the
+    // reference down to the live value before the two-stretch quorum
+    // can fill, and the flag never raises. Falls above the bar (the
+    // 20% dip, a genuine gradual slowdown) still track; the decayed
+    // rate becomes the reference only through the confirmation ladder
+    // ([`record_at`]) - which is the design's own rule.
+    if u.per_conn_bps > 0.0
+        && !(b.per_conn_bps > 0.0
+            && u.per_conn_bps < b.per_conn_bps * nzbkit::shaping::SHAPE_RAISE_FRAC)
+    {
+        b.per_conn_bps = u.per_conn_bps;
+    }
+    if u.rate_bps > 0.0 {
+        b.rate_bps = u.rate_bps;
+    }
+    b.epochs = b.epochs.saturating_add(u.epochs_add);
+    b.checked = u.now;
+    b.limit = u.limit;
+    b.source = "live".into();
+    save(config, &map);
+}
+
+/// Raise or clear the decay flag (design §6). `reprobe` on a raise
+/// zeroes the knee's clock so the idle prober runs ONE confirmation
+/// ladder at its next window - the curve answers whether more sockets
+/// recover the aggregate or the shaping is per-account. The caller
+/// passes `reprobe: false` for block accounts, where an unasked-for
+/// ladder would spend the user's own bytes (rule §7.7).
+pub fn set_shaped(config: &Path, host: &str, shaped: Option<Shaped>, reprobe: bool) {
+    let _g = LOCK.lock_ok();
+    let mut map = load(config);
+    let Some(t) = map.get_mut(host) else { return };
+    if shaped.is_some() && reprobe && t.connections > 0 {
+        t.checked = 0;
+    }
+    t.shaped = shaped;
     save(config, &map);
 }
 
@@ -514,9 +796,41 @@ fn reconcile(prev: Option<&Tuned>, new: Tuned) -> Tuned {
             checked: new.checked,
             source: new.source,
             v: SCHEMA,
+            // The live half rides along untouched: a ladder verdict on
+            // the knee says nothing about the buckets' live evidence.
+            buckets: p.buckets.clone(),
+            shaped: p.shaped.clone(),
         },
-        _ => new,
+        _ => {
+            let mut t = new;
+            if let Some(p) = prev {
+                // Ladder writers construct entries without the live
+                // half; replacing the entry must not wipe what the
+                // epoch controller has learned.
+                if t.buckets.is_empty() {
+                    t.buckets = p.buckets.clone();
+                }
+                // A TRUSTED ladder is a fresh reference, which clears
+                // the decay flag (design §6) - the decayed rate, once
+                // confirmed by a ladder, becomes the new normal. A
+                // suspect one decided nothing and clears nothing.
+                t.shaped = if t.suspect { p.shaped.clone() } else { None };
+            }
+            t
+        }
     }
+}
+
+/// What a [`reopen_low_knees`] sweep changed, so the caller can log
+/// each host with the reason that actually applies to it.
+#[derive(Debug, Default, PartialEq)]
+pub struct Reopened {
+    /// (host, stored knee, new ceiling): the user's raised ceiling
+    /// outgrew the knee, so the knee stopped applying and re-measures.
+    pub raised: Vec<(String, usize, usize)>,
+    /// Hosts whose pre-v2 knee was retired because it was measured on
+    /// the synthetic probe group (see [`SCHEMA`]).
+    pub retired: Vec<String>,
 }
 
 /// Put low knees back up for corroboration, and report which hosts moved.
@@ -543,22 +857,45 @@ fn reconcile(prev: Option<&Tuned>, new: Tuned) -> Tuned {
 /// which is the only thing that unsticks an install like James's.
 /// Every entry seen is stamped to the current [`SCHEMA`], so the sweep
 /// is once per entry, not once per call.
-pub fn reopen_low_knees(
-    config: &Path,
-    limit_for: impl Fn(&str) -> Option<usize>,
-) -> Vec<(String, usize, usize)> {
+///
+/// The v2 half: every pre-v2 entry with a recorded knee is RETIRED -
+/// marked suspect with `checked: 0` and its parked `pending` cleared
+/// (that reading was probe-group data too, and it must not become the
+/// corroboration yardstick for the first real-article probe). Jobs stop
+/// applying the old knee at once, the prober re-measures on the short
+/// clock, and corroboration decides: a knee that was right (the
+/// account-level-shaping case, where probe group and real articles
+/// agree) comes back in one probe. Unconfigured hosts are left
+/// unstamped on purpose, so a server that is re-added later still gets
+/// its retirement sweep then.
+pub fn reopen_low_knees(config: &Path, limit_for: impl Fn(&str) -> Option<usize>) -> Reopened {
     let _g = LOCK.lock_ok();
     let mut map = load(config);
-    let mut moved = Vec::new();
+    let mut out = Reopened::default();
     let mut dirty = false;
     for (host, t) in map.iter_mut() {
         let Some(limit) = limit_for(host) else {
             continue; // not a server this install has configured
         };
-        if limit > t.limit && t.connections * 2 <= limit && !t.suspect {
+        if t.v < 2 && t.connections > 0 {
             t.suspect = true;
             t.checked = 0;
-            moved.push((host.clone(), t.connections, limit));
+            t.pending = None;
+            // The retired knee must not survive as a yardstick either:
+            // `corroborates` falls back to `connections` when `pending`
+            // is None, so a probe-group number left here would agree
+            // with the first low real-article ladder and promote it on
+            // the spot - the exact corroboration this retirement exists
+            // to withhold. Zero is safe: reconcile's parking arm needs
+            // `p.connections > 0`, and jobs already skip suspect
+            // entries, so nothing applies it in the meantime.
+            t.connections = 0;
+            out.retired.push(host.clone());
+            dirty = true;
+        } else if limit > t.limit && t.connections > 0 && t.connections * 2 <= limit && !t.suspect {
+            t.suspect = true;
+            t.checked = 0;
+            out.raised.push((host.clone(), t.connections, limit));
             dirty = true;
         }
         // Record the ceiling this entry has now been judged against,
@@ -568,11 +905,30 @@ pub fn reopen_low_knees(
             t.v = SCHEMA;
             dirty = true;
         }
+        // The same James rule for the live half (design §4 `limit`): a
+        // bucket learned under a lower ceiling stops seeding once the
+        // user raises it well past the stored target. Invalidated, not
+        // deleted - `checked: 0` drops it from seeding (the controller
+        // starts from the knee or the configured count and re-learns
+        // within one download) while the row stays for history.
+        for b in t.buckets.iter_mut() {
+            if limit > b.limit && b.target > 0 && b.target * 2 <= limit && b.checked != 0 {
+                b.checked = 0;
+                b.epochs = 0;
+                dirty = true;
+            }
+            if b.limit != limit {
+                b.limit = limit;
+                dirty = true;
+            }
+        }
     }
     if dirty {
         save(config, &map);
     }
-    moved
+    out.retired.sort();
+    out.raised.sort();
+    out
 }
 
 /// [`reopen_low_knees`] for a whole install: reads the server list off
@@ -589,11 +945,20 @@ pub fn reopen_for_install(config: &Path, global: usize) {
         .iter()
         .map(|s| (s.host.as_str(), effective_limit(global, s.connections)))
         .collect();
-    for (host, knee, limit) in reopen_low_knees(config, |h| limits.get(h).copied()) {
+    let swept = reopen_low_knees(config, |h| limits.get(h).copied());
+    for (host, knee, limit) in swept.raised {
         println!(
             "[tune] {host}: your connection setting is now {limit}, well above the \
              measured {knee} - jobs will use {limit} while that measurement is \
              re-taken"
+        );
+    }
+    for host in swept.retired {
+        println!(
+            "[tune] {host}: the stored connection measurement was taken on a \
+             synthetic article group, which can misread a provider badly - jobs \
+             use your configured count while it is re-measured on articles from \
+             your own downloads"
         );
     }
 }
@@ -601,6 +966,285 @@ pub fn reopen_for_install(config: &Path, global: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bucket(b: u8, target: usize, epochs: u64, checked: u64) -> Bucket {
+        Bucket {
+            b,
+            target,
+            per_conn_bps: 10e6,
+            rate_bps: 100e6,
+            epochs,
+            checked,
+            limit: 24,
+            source: "live".into(),
+        }
+    }
+
+    const NOW: u64 = 1_754_600_000;
+
+    /// The seed order of design §5.1: an evidenced unexpired bucket
+    /// outranks the knee, a thin or expired one does not, and with
+    /// nothing usable the configured count stands.
+    #[test]
+    fn seeding_prefers_evidence_in_the_designed_order() {
+        // No entry at all: configured.
+        assert_eq!(seed_connections(None, 2, NOW, 16), 16);
+        // Trusted knee, no buckets: the knee.
+        let t = entry(8, false);
+        assert_eq!(seed_connections(Some(&t), 2, NOW, 16), 8);
+        // A SUSPECT knee is a low reading awaiting corroboration and
+        // must not seed - the configured count stands.
+        let t = entry(8, true);
+        assert_eq!(seed_connections(Some(&t), 2, NOW, 16), 16);
+        // An evidenced bucket beats the knee.
+        let mut t = entry(8, false);
+        t.buckets = vec![bucket(2, 14, 40, NOW - 3600)];
+        assert_eq!(seed_connections(Some(&t), 2, NOW, 16), 14);
+        // ...but a 2-epoch bucket is a hint, and the knee wins.
+        t.buckets = vec![bucket(2, 14, 2, NOW - 3600)];
+        assert_eq!(seed_connections(Some(&t), 2, NOW, 16), 8);
+        // An expired bucket falls through to an adjacent unexpired one.
+        t.buckets = vec![
+            bucket(2, 14, 40, NOW - BUCKET_STALE_SECS - 1),
+            bucket(1, 11, 40, NOW - 3600),
+        ];
+        assert_eq!(seed_connections(Some(&t), 2, NOW, 16), 11);
+        // The seed never exceeds the ceiling the user typed.
+        t.buckets = vec![bucket(2, 14, 40, NOW - 3600)];
+        assert_eq!(seed_connections(Some(&t), 2, NOW, 6), 6);
+    }
+
+    /// The live half writes back through the same file, accumulates
+    /// evidence, and never manufactures a knee: a host that has only
+    /// ever been live-tuned must not start capping jobs.
+    #[test]
+    fn bucket_write_back_learns_without_capping() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-buckets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.local.json");
+        let upd = |target, epochs_add, now| BucketUpdate {
+            target,
+            per_conn_bps: 12e6,
+            rate_bps: 120e6,
+            epochs_add,
+            limit: 20,
+            now,
+        };
+        update_bucket(&cfg, "live.example.com", 1, upd(10, 6, NOW));
+        update_bucket(&cfg, "live.example.com", 1, upd(12, 6, NOW + 60));
+        let m = load(&cfg);
+        let t = &m["live.example.com"];
+        let b = t.buckets.iter().find(|b| b.b == 1).unwrap();
+        assert_eq!(b.target, 12, "latest kept target wins");
+        assert_eq!(b.epochs, 12, "evidence accumulates");
+        assert_eq!(b.checked, NOW + 60);
+        // The knee half stays empty, so nothing here can cap a job.
+        assert_eq!(t.connections, 0);
+        assert_eq!(applied_connections(20, false, Some(t)), 20);
+        // ...and the ceiling sweep has nothing to reopen on it.
+        assert_eq!(reopen_low_knees(&cfg, |_| Some(40)), Reopened::default());
+        // Evidence does not survive an expiry gap: a bucket coming
+        // back after a fortnight restarts its count.
+        update_bucket(
+            &cfg,
+            "live.example.com",
+            1,
+            upd(9, 3, NOW + 60 + BUCKET_STALE_SECS + 1),
+        );
+        let m = load(&cfg);
+        let b = m["live.example.com"]
+            .buckets
+            .iter()
+            .find(|b| b.b == 1)
+            .unwrap();
+        assert_eq!(b.epochs, 3, "expired evidence must not carry weight");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A trusted ladder refreshes the current bucket's seed (a user-run
+    /// Test must never be ignored by the live layer) and clears the
+    /// decay flag (a fresh reference). A parked suspect reading does
+    /// neither, and the live half survives every ladder verdict.
+    #[test]
+    fn a_ladder_refreshes_the_seed_and_clears_the_flag() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.local.json");
+        // Live evidence first: an evidenced bucket 14 and a raised flag.
+        update_bucket(
+            &cfg,
+            "h.example.com",
+            2,
+            BucketUpdate {
+                target: 14,
+                per_conn_bps: 10e6,
+                rate_bps: 100e6,
+                epochs_add: 40,
+                limit: 24,
+                now: NOW,
+            },
+        );
+        set_shaped(
+            &cfg,
+            "h.example.com",
+            Some(Shaped {
+                since: NOW,
+                ref_per_conn_bps: 140e6,
+            }),
+            false,
+        );
+        assert!(load(&cfg)["h.example.com"].shaped.is_some());
+        // A SUSPECT ladder result parks and touches neither half.
+        let mut sus = entry(4, true);
+        sus.checked = NOW + 100;
+        record_at(&cfg, "h.example.com", sus, 2);
+        let t = &load(&cfg)["h.example.com"];
+        assert!(t.shaped.is_some(), "a suspect ladder is not a reference");
+        let b = t.buckets.iter().find(|b| b.b == 2).unwrap();
+        assert_eq!(b.target, 14, "a suspect ladder must not touch the seed");
+        assert_eq!(b.epochs, 40, "live evidence survives");
+        // A TRUSTED ladder refreshes the bucket seed and clears shaped.
+        let mut ok = entry(9, false);
+        ok.checked = NOW + 200;
+        ok.source = "manual".into();
+        record_at(&cfg, "h.example.com", ok, 2);
+        let t = &load(&cfg)["h.example.com"];
+        assert!(t.shaped.is_none(), "a trusted ladder is a fresh reference");
+        let b = t.buckets.iter().find(|b| b.b == 2).unwrap();
+        assert_eq!(b.target, 9, "the user-run Test seeds the live layer");
+        assert_eq!(b.source, "manual");
+        assert_eq!(b.epochs, 40, "a ladder measures a curve, not epochs");
+        assert_eq!(
+            b.per_conn_bps, 0.0,
+            "a confirmation ladder retires the fallen-from reference"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The decay reference must not erode into the decayed rate it is
+    /// supposed to expose: a write-back median that would itself trip
+    /// the raise bar is evidence for the detector, not a new normal.
+    /// Milder falls (the 20% dip, gradual slowdowns) still track.
+    #[test]
+    fn a_decayed_median_never_becomes_the_reference() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-refkeep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.local.json");
+        let upd = |per_conn: f64, now: u64| BucketUpdate {
+            target: 12,
+            per_conn_bps: per_conn,
+            rate_bps: per_conn * 12.0,
+            epochs_add: 10,
+            limit: 20,
+            now,
+        };
+        update_bucket(&cfg, "h.example.com", 1, upd(100e6, NOW));
+        // A decayed stretch writes back a 12% median: frozen out.
+        update_bucket(&cfg, "h.example.com", 1, upd(12e6, NOW + 600));
+        let per = |cfg: &Path| {
+            load(cfg)["h.example.com"]
+                .buckets
+                .iter()
+                .find(|b| b.b == 1)
+                .unwrap()
+                .per_conn_bps
+        };
+        assert_eq!(
+            per(&cfg),
+            100e6,
+            "the reference must survive the decay it measures"
+        );
+        // An 80% median is ordinary weather and tracks.
+        update_bucket(&cfg, "h.example.com", 1, upd(80e6, NOW + 1200));
+        assert_eq!(per(&cfg), 80e6);
+        // Recovery above the old figure tracks freely too.
+        update_bucket(&cfg, "h.example.com", 1, upd(110e6, NOW + 1800));
+        assert_eq!(per(&cfg), 110e6);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The James rule generalized to the live half: raising the ceiling
+    /// well past a stored bucket target invalidates that bucket for
+    /// seeding - once, not on every sweep.
+    #[test]
+    fn a_raised_ceiling_invalidates_low_buckets_once() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-bsweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.local.json");
+        update_bucket(
+            &cfg,
+            "h.example.com",
+            0,
+            BucketUpdate {
+                target: 6,
+                per_conn_bps: 10e6,
+                rate_bps: 60e6,
+                epochs_add: 30,
+                limit: 12,
+                now: NOW,
+            },
+        );
+        reopen_low_knees(&cfg, |_| Some(24));
+        let t = &load(&cfg)["h.example.com"];
+        let b = t.buckets.iter().find(|b| b.b == 0).unwrap();
+        assert_eq!(
+            b.checked, 0,
+            "a low bucket under a raised ceiling stops seeding"
+        );
+        assert_eq!(b.epochs, 0);
+        assert_eq!(b.limit, 24, "judged against the ceiling now in force");
+        assert_eq!(b.target, 6, "retained for history");
+        assert_eq!(
+            seed_connections(Some(t), 0, NOW, 24),
+            24,
+            "the invalidated bucket must not seed"
+        );
+        // Write fresh evidence under the new ceiling: the same ceiling
+        // must not invalidate it again.
+        update_bucket(
+            &cfg,
+            "h.example.com",
+            0,
+            BucketUpdate {
+                target: 6,
+                per_conn_bps: 10e6,
+                rate_bps: 60e6,
+                epochs_add: 15,
+                limit: 24,
+                now: NOW + 60,
+            },
+        );
+        reopen_low_knees(&cfg, |_| Some(24));
+        let t = &load(&cfg)["h.example.com"];
+        let b = t.buckets.iter().find(|b| b.b == 0).unwrap();
+        assert_eq!(b.checked, NOW + 60, "same ceiling, no second sweep");
+        assert_eq!(b.epochs, 15);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Files written before the live half existed still parse, and the
+    /// new fields stay off the wire while empty (an old build reading a
+    /// new file must see the shape it knows).
+    #[test]
+    fn bucketless_files_round_trip() {
+        let t: Tuned = serde_json::from_str(
+            r#"{"connections":6,"granted":6,"asked":6,"gbps":0.2,
+                "checked":1754000000,"source":"auto"}"#,
+        )
+        .unwrap();
+        assert!(t.buckets.is_empty());
+        assert!(t.shaped.is_none());
+        let s = serde_json::to_string(&t).unwrap();
+        assert!(
+            !s.contains("buckets"),
+            "empty live half stays off the wire: {s}"
+        );
+        assert!(!s.contains("shaped"));
+    }
 
     fn entry(n: usize, suspect: bool) -> Tuned {
         Tuned {
@@ -612,6 +1256,8 @@ mod tests {
             source: "auto".into(),
             suspect,
             pending: None,
+            buckets: Vec::new(),
+            shaped: None,
             limit: 24,
             v: SCHEMA,
         }
@@ -718,6 +1364,8 @@ mod tests {
             limit: 50,
             v: SCHEMA,
             pending: None,
+            buckets: Vec::new(),
+            shaped: None,
         }
     }
 
@@ -1020,6 +1668,8 @@ mod tests {
                 limit: 20,
                 v: SCHEMA,
                 pending: None,
+                buckets: Vec::new(),
+                shaped: None,
             },
         );
         record(
@@ -1036,6 +1686,8 @@ mod tests {
                 limit: 8,
                 v: SCHEMA,
                 pending: None,
+                buckets: Vec::new(),
+                shaped: None,
             },
         );
         let m = load(&cfg);
@@ -1058,9 +1710,11 @@ mod tests {
     /// The v1.0.14 field case, end to end on the file.
     ///
     /// A pre-guard entry (v0, no `suspect`, no `limit`) holding a knee
-    /// of 6 must stop capping the moment the install's ceiling is read
-    /// as 24, and must be queued for a re-probe rather than deleted -
-    /// if 6 really is this provider's knee, one probe puts it back.
+    /// of 6 must stop capping the moment the sweep sees it, and must be
+    /// queued for a re-probe rather than deleted - if 6 really is this
+    /// provider's knee, one probe puts it back. Since SCHEMA 2 the v0
+    /// entry retires under the probe-group rule (it was measured there
+    /// too), which subsumes the old ceiling-raise reason.
     #[test]
     fn a_raised_ceiling_reopens_a_low_pre_guard_knee() {
         let dir = std::env::temp_dir().join(format!("nzbfast-reopen-{}", std::process::id()));
@@ -1079,21 +1733,151 @@ mod tests {
         assert_eq!(before["news.newsdemon.com"].v, 0);
 
         let moved = reopen_low_knees(&cfg, |_| Some(24));
-        assert_eq!(moved, vec![("news.newsdemon.com".into(), 6, 24)]);
+        assert_eq!(moved.retired, vec!["news.newsdemon.com".to_string()]);
+        assert!(moved.raised.is_empty(), "retirement, not a ceiling raise");
         let after = load(&cfg);
         let t = &after["news.newsdemon.com"];
         assert!(t.suspect, "a reopened knee must stop capping jobs");
         assert_eq!(t.checked, 0, "and must be eligible for an immediate probe");
         assert_eq!(t.limit, 24, "judged against the ceiling now in force");
         assert_eq!(t.v, SCHEMA);
-        // The knee itself survives, so the re-probe has something to
-        // corroborate against - deleting it would throw that away.
-        assert_eq!(t.connections, 6);
+        // And the retired number is gone rather than left as the
+        // yardstick the next probe would be measured against - see
+        // `corroborates`, which falls back to `connections`.
+        assert_eq!(t.connections, 0);
 
         // Idempotent: the same ceiling must not reopen it a second time
         // (a settings save, or every daemon restart, would otherwise
         // re-arm a knee the probe loop had just cleared).
-        assert!(reopen_low_knees(&cfg, |_| Some(24)).is_empty());
+        assert_eq!(reopen_low_knees(&cfg, |_| Some(24)), Reopened::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The SCHEMA 2 sweep, end to end on the file: a v1 entry - healthy
+    /// knee, corroborated, applied, exactly what a v1.0.15+ build wrote
+    /// after the James fixes - was still measured on the synthetic probe
+    /// group, which is known to misread a provider 17x. It must be
+    /// retired ONCE: suspect (jobs stop applying it), checked zeroed
+    /// (the prober re-measures on the short clock), and BOTH readings
+    /// dropped - parked pending and applied knee alike, because
+    /// `corroborates` falls back to `connections` when `pending` is
+    /// None, so a surviving probe-group number would agree with the
+    /// first low real-article ladder and promote it on the spot. The
+    /// retirement exists to withhold exactly that agreement.
+    #[test]
+    fn a_probe_group_knee_is_retired_once_for_real_articles() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-retire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.local.json");
+        // The exact shape a v1 build persisted: applied knee, a parked
+        // pending reading, judged limit, v:1.
+        std::fs::write(
+            path_for(&cfg),
+            br#"{"reader.xsnews.nl":{"connections":8,"granted":8,"asked":8,
+                 "gbps":0.20,"checked":1754600000,"source":"auto",
+                 "suspect":false,"limit":24,"v":1,"pending":21},
+                "news.eweka.nl":{"connections":20,"granted":20,"asked":20,
+                 "gbps":2.2,"checked":1754600000,"source":"manual",
+                 "suspect":false,"limit":24,"v":1}}"#,
+        )
+        .unwrap();
+
+        let moved = reopen_low_knees(&cfg, |_| Some(24));
+        assert_eq!(
+            moved.retired,
+            vec!["news.eweka.nl".to_string(), "reader.xsnews.nl".to_string()],
+            "EVERY pre-v2 knee retires, healthy-looking ones included - \
+             the 17x error is invisible from the stored numbers"
+        );
+        assert!(moved.raised.is_empty());
+        let after = load(&cfg);
+        for host in ["reader.xsnews.nl", "news.eweka.nl"] {
+            let t = &after[host];
+            assert!(t.suspect, "{host}: jobs must stop applying the old knee");
+            assert_eq!(t.checked, 0, "{host}: re-probe on the short clock");
+            assert_eq!(t.pending, None, "{host}: probe-group pending cleared");
+            assert_eq!(t.v, SCHEMA, "{host}: stamped, so the sweep is one-time");
+            assert_eq!(
+                t.connections, 0,
+                "{host}: the probe-group knee must not stay as a yardstick"
+            );
+            assert!(
+                !corroborates(Some(t), 8),
+                "{host}: a retired entry corroborates nothing"
+            );
+        }
+
+        // One-time means one-time: nothing moves on the next call.
+        assert_eq!(reopen_low_knees(&cfg, |_| Some(24)), Reopened::default());
+
+        // A v2 entry the prober has since written back is never touched
+        // again, even by a later restart.
+        record(&cfg, "reader.xsnews.nl", entry(20, false));
+        assert_eq!(reopen_low_knees(&cfg, |_| Some(24)), Reopened::default());
+        assert!(!load(&cfg)["reader.xsnews.nl"].suspect);
+
+        // An UNCONFIGURED host is left alone AND unstamped, so a server
+        // that is re-added later still gets its retirement then.
+        std::fs::write(
+            path_for(&cfg),
+            br#"{"news.oldfill.com":{"connections":4,"granted":4,"gbps":0.1,
+                 "checked":1754600000,"source":"auto","suspect":false,
+                 "limit":8,"v":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(reopen_low_knees(&cfg, |_| None), Reopened::default());
+        assert_eq!(load(&cfg)["news.oldfill.com"].v, 1, "unstamped while gone");
+        let back = reopen_low_knees(&cfg, |_| Some(8));
+        assert_eq!(back.retired, vec!["news.oldfill.com".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The retirement has to survive the very next ladder: a retired
+    /// entry is not evidence, so a real-article knee that happens to
+    /// land on the same low number as the retired probe-group one is
+    /// still the FIRST reading and must be parked for a second opinion.
+    /// While `connections` survived the sweep, `corroborates` compared
+    /// against it (its fallback when `pending` is None) and promoted
+    /// that first reading immediately - the 17x probe-group error
+    /// laundering itself into a trusted knee in one step.
+    #[test]
+    fn a_retired_entry_does_not_corroborate_the_next_low_ladder() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-retire-corr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.local.json");
+        std::fs::write(
+            path_for(&cfg),
+            br#"{"news.eweka.nl":{"connections":6,"granted":6,"asked":6,
+                 "gbps":0.2,"checked":1754600000,"source":"auto",
+                 "suspect":false,"limit":24,"v":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            reopen_low_knees(&cfg, |_| Some(24)).retired,
+            vec!["news.eweka.nl".to_string()]
+        );
+
+        let retired = load(&cfg);
+        let prior = retired.get("news.eweka.nl");
+        assert!(
+            !corroborates(prior, 6),
+            "the retired number must not agree with a knee that matches it"
+        );
+        // ...so the ladder result is unproven and parks, exactly as it
+        // would on a host with no history at all.
+        assert!(is_suspect(6, 24, false, prior));
+
+        let mut fresh = entry(6, true);
+        fresh.checked = 1754700000;
+        record(&cfg, "news.eweka.nl", fresh);
+        let after = &load(&cfg)["news.eweka.nl"];
+        assert!(
+            after.suspect,
+            "the first real-article reading must wait for a second one, \
+             and stays out of jobs until it lands"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1118,12 +1902,14 @@ mod tests {
             limit,
             v: SCHEMA,
             pending: None,
+            buckets: Vec::new(),
+            shaped: None,
         };
         record(&cfg, "near.example.com", mk(20, 24)); // 20 of 24: agrees
         record(&cfg, "low.example.com", mk(6, 24)); // already judged at 24
         record(&cfg, "gone.example.com", mk(2, 24)); // no longer configured
         let moved = reopen_low_knees(&cfg, |h| (h != "gone.example.com").then_some(24));
-        assert!(moved.is_empty(), "nothing should have moved: {moved:?}");
+        assert_eq!(moved, Reopened::default(), "nothing should have moved");
         let m = load(&cfg);
         assert!(m.values().all(|t| !t.suspect));
         assert_eq!(m["gone.example.com"].checked, 9);
@@ -1132,7 +1918,8 @@ mod tests {
         // low knee - and only the low knee - reopens: 20 of 26 is still
         // the tuner agreeing with the user, 6 of 26 is not.
         let moved = reopen_low_knees(&cfg, |h| (h != "gone.example.com").then_some(26));
-        assert_eq!(moved, vec![("low.example.com".into(), 6, 26)]);
+        assert_eq!(moved.raised, vec![("low.example.com".into(), 6, 26)]);
+        assert!(moved.retired.is_empty(), "v2 entries never retire");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

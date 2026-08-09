@@ -217,7 +217,15 @@ pub(crate) fn forecast(dir: &Path, volume_bytes: u64, encrypted: bool) -> Foreca
         // No answer from the platform means no forecast, and a `low_disk`
         // job then reads as "fits" and is left alone. Refusing to eat is
         // the safe direction for an unknown.
-        free: crate::serve::free_bytes(dir).unwrap_or(u64::MAX),
+        //
+        // §129 lane: two tails can unpack at once now, and each one's
+        // free-bytes read would count the same space. Subtract what the
+        // OTHER finishing jobs have registered they still need on this
+        // filesystem (`lanegate`); a job's own registration is excluded,
+        // so the single-tail arithmetic is unchanged.
+        free: crate::serve::free_bytes(dir)
+            .map(|f| f.saturating_sub(crate::lanegate::other_need(dir)))
+            .unwrap_or(u64::MAX),
         volumes: volume_bytes,
         encrypted,
     }

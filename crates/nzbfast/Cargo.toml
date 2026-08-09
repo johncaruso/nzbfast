@@ -1,6 +1,6 @@
 [package]
 name = "nzbfast"
-version = "1.0.19"
+version = "1.0.20"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -29,8 +29,21 @@ clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 # Vendored + hardened: upstream 0.12.0 (the newest release) has two
 # unauthenticated one-request permanent kills and no way to set a socket
-# timeout. See vendor/tiny_http/VENDORING.md.
-tiny_http = { path = "../../vendor/tiny_http" }
+# timeout. See vendor/tiny_http/VENDORING.md. `ssl-rustls` is the daemon's
+# opt-in native HTTPS (§129 2a): a rustls acceptor on tiny_http's own accept
+# loop, fed a prebuilt rustls::ServerConfig from take_listener.
+tiny_http = { path = "../../vendor/tiny_http", features = ["ssl-rustls"] }
+# Two consumers, one entry: §129 2a builds the daemon's HTTPS server config
+# (--tls-cert/--tls-key, fed prebuilt into tiny_http), and §129 2e is the
+# native SMTP sender's client TLS (whose ClientConfig is nzbkit's shared
+# one, so the trust anchors + NZBFAST_EXTRA_CA match the NNTP path). Both
+# name the aws-lc-rs provider explicitly, because the tree links both
+# aws-lc-rs and ring and a bare builder() panics at run time.
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+# Startup-time certificate sanity for --tls-cert: an expired or not-yet-valid
+# cert fails fast with the file named, instead of every browser refusing with
+# its own wording while the daemon log shows nothing.
+x509-parser = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.150"
 ureq = "2"
@@ -45,9 +58,11 @@ hex = "0.4"
 # come from the platform CSPRNG - not from RandomState (see fresh_secret,
 # which is fine for a capability URL and is NOT used here).
 getrandom = "0.2"
-# IMDb datasets ratings file is gzip'd TSV (keyless nightly download).
-# Indexer-only: nothing outside the enrichment path inflates gzip.
-flate2 = { version = "1", optional = true }
+# IMDb datasets ratings file is gzip'd TSV (keyless nightly download),
+# and serve/webasset.rs gzips the embedded pages at respond time - so
+# this is unconditional now (nzbkit already depends on it regardless,
+# so slim builds gain no new crate).
+flate2 = "1"
 # M28 wall thumbnails: decode cached posters (jpeg/png/webp sources),
 # resize, re-encode jpeg. No default features - just the codecs.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
@@ -122,7 +137,7 @@ default = ["indexer"]
 # oracle, wall/browse, and the metadata enrichment workers. Slim builds
 # (phones, small boxes) disable it; queue/history/download pipeline are
 # untouched and sqlite drops out of the binary entirely.
-indexer = ["nzbkit/indexer", "dep:flate2", "dep:image"]
+indexer = ["nzbkit/indexer", "dep:image"]
 ktls = ["nzbkit/ktls"]
 # Embedded/in-process hosting (the iOS staticlib via crates/nzbfast-ffi).
 # Off by default: src/lib.rs compiles to EMPTY without it, so the lib
@@ -134,6 +149,11 @@ ffi = []
 # the exact same ed25519 implementation. getrandom seeds keygen.
 [dev-dependencies]
 getrandom = "0.2"
+# TLS daemon tests (§129 2a): rcgen mints the test certificate (end-entity,
+# basicConstraints CA:FALSE by construction - the CaUsedAsEndEntity trap a
+# hand-run `openssl req -x509` falls into), and rustls is the verifying
+# client that fetches / and /api over https trusting exactly that cert.
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 # The 7z ENCODER, for building container fixtures in the extraction tests.
 # Dev-only on purpose: resolver 2 does not unify dev-dependency features
 # into a normal build, so `cargo build` still links the decode-only

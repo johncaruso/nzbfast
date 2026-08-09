@@ -358,6 +358,30 @@ body.compact #dashview th,body.compact #dashview td,
 .filterbar{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:9px}
 .filterbar button{padding:2px 9px;font-size:11.5px;line-height:1.6;margin:0}
 .filterbar button.on{border-color:var(--acc);color:var(--acc)}
+/* §129 2f: multi-select. The wall's proven checkbox column, brought to
+   Queue and History, plus the bulk bar that appears once something is
+   selected. The bar is static markup (never re-rendered), so open
+   selects survive the 1 Hz tick. */
+#queue .selcol,#hist .selcol{width:26px;padding-inline-end:0}
+.bulkbar{display:none;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;font-size:12.5px}
+.bulkbar.on{display:flex}
+.bulkbar .count{color:var(--dim);white-space:nowrap}
+.bulkbar select.ctl{font-size:12px;padding:2px 6px}
+/* '?' shortcut sheet - same shell as the directory browser. */
+#shov{position:fixed;inset:0;z-index:70;display:none;place-items:center;
+  background:color-mix(in srgb,#000 55%,transparent);backdrop-filter:blur(2px);padding:16px}
+#shov.on{display:grid}
+#shmodal{background:var(--surface);border:1px solid var(--line);border-radius:14px;
+  width:min(420px,96vw);max-height:88vh;display:flex;flex-direction:column;
+  box-shadow:0 24px 70px rgba(0,0,0,.5);overflow:hidden}
+.shbody{padding:12px 16px 16px;overflow-y:auto}
+.shbody table{width:100%;border-collapse:collapse}
+.shbody td{padding:5px 6px;border-bottom:1px solid var(--line);font-size:13px}
+.shbody tr:last-child td{border-bottom:0}
+.shbody td:first-child{white-space:nowrap;width:1%}
+.shbody kbd{display:inline-block;min-width:18px;text-align:center;padding:1px 6px;
+  border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;
+  background:var(--bg);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 /* One slim strip, not four boxes: the session stats are glanceable
    numbers, and a full card each cost ~100px of the fold for three
    short lines apiece. Baseline-aligned inline groups wrap on narrow
@@ -418,6 +442,21 @@ tr.drawer:hover{background:transparent}
 table{width:100%;border-collapse:collapse;font-size:13px}
 td,th{padding:7px 8px;text-align:start;border-top:1px solid var(--line)}
 th{color:var(--dim);font-weight:500;border-top:none;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+/* Movable columns (queue / history / browse): the heading itself is the
+   move handle, the strip on its trailing edge is the resize handle.
+   Desktop-only - initCols runs under the same LAYOUT_EDIT gate as the
+   card tools, so phones never see any of it. */
+th.colgrab{cursor:grab;user-select:none;-webkit-user-select:none;position:relative}
+th.colgrab:focus-visible{outline:1px solid var(--acc);outline-offset:-1px}
+th.colgrab.coldrag{opacity:.45;cursor:grabbing}
+th.coldrop{box-shadow:inset 3px 0 0 var(--acc)}
+[dir=rtl] th.coldrop{box-shadow:inset -3px 0 0 var(--acc)}
+th.coldropend{box-shadow:inset -3px 0 0 var(--acc)}
+[dir=rtl] th.coldropend{box-shadow:inset 3px 0 0 var(--acc)}
+th .colrs{position:absolute;top:0;inset-inline-end:-5px;width:11px;height:100%;cursor:col-resize;z-index:2}
+th .colrs::after{content:"";position:absolute;inset-inline-start:5px;top:20%;height:60%;width:1px;background:var(--line)}
+th .colrs:hover::after,th .colrs.on::after{background:var(--acc);width:2px}
+th.colgrab:last-child .colrs{display:none}
 tbody tr:hover{background:var(--surface-2)}
 .ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.dim{color:var(--dim)}
 /* Screen-reader-only text: for status that sighted users get from
@@ -535,6 +574,21 @@ button.hlp{background:transparent;padding:0;font-weight:600;transition:filter .1
 #fsov{position:fixed;inset:0;z-index:70;display:none;place-items:center;
   background:color-mix(in srgb,#000 55%,transparent);backdrop-filter:blur(2px);padding:16px}
 #fsov.on{display:grid}
+/* API-key entry modal - the same shell as the directory browser. Above
+   everything else (z-index): nothing on a locked dashboard outranks the
+   way in. */
+#keyov{position:fixed;inset:0;z-index:75;display:none;place-items:center;
+  background:color-mix(in srgb,#000 55%,transparent);backdrop-filter:blur(2px);padding:16px}
+#keyov.on{display:grid}
+#keymodal{background:var(--surface);border:1px solid var(--line);border-radius:14px;
+  width:min(460px,96vw);box-shadow:0 24px 70px rgba(0,0,0,.5);overflow:hidden}
+.keybody{padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+.keybody p{margin:0}
+.keyrow{display:flex;gap:6px}
+/* The key is an LTR token even in an RTL UI, like a filesystem path. */
+.keyrow>input.txt{flex:1;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:12.5px;direction:ltr}
+.keyerr{color:var(--bad);font-size:12.5px;min-height:1.2em}
 #fsmodal{background:var(--surface);border:1px solid var(--line);border-radius:14px;
   width:min(760px,96vw);max-height:88vh;display:flex;flex-direction:column;
   box-shadow:0 24px 70px rgba(0,0,0,.5);overflow:hidden}
@@ -803,6 +857,16 @@ body.histcolor #hist tbody tr.fail .nmtxt{color:var(--bad)}
    spans every group, so it must not fight the rail's selection - clearing
    the box restores whatever group you were in. */
 #settingsview .set.sghide,#settingsview .set.sqhide,#settingsview .row.sqhide{display:none!important}
+/* §129 1c: settings cards render lazily. ~27 cards / ~1100 nodes exist
+   from first parse whether Settings is ever opened; content-visibility
+   lets the browser skip their layout/paint until a card is actually on
+   screen, while every control stays in the DOM - loadSettings()'s ~100
+   writes, setCfg init and the a11y labelRows pass (0d) all keep working
+   untouched. contain-intrinsic-size stops the scrollbar jumping as
+   cards materialize. (Full template-hydration was considered and
+   rejected: ~150 document-wide getElementById consumers assume these
+   controls exist.) */
+#settingsview .card.set{content-visibility:auto;contain-intrinsic-size:auto 340px}
 /* A match always shows, even one Essential would otherwise have hidden:
    finding a setting and then not being shown it is the worst outcome. */
 body.setess:not(.setsearching) #settingsview .set .row[data-adv]{display:none}
@@ -812,10 +876,13 @@ body.setsearching .setmore{display:none}
   font-size:12px;padding:4px 11px;border-radius:99px;margin-top:4px}
 .setmore:hover{color:var(--fg);border-color:var(--acc);background:transparent}
 @media(max-width:900px){
-  /* The rail becomes a scrolling strip above the cards. */
+  /* The rail becomes a scrolling strip above the cards. A THIN scrollbar
+     stays visible on purpose (§129 phase 0d): with it hidden, nothing
+     said more categories sat off-screen, and the strip read as "these
+     five are all there is". */
   .setshell{grid-template-columns:1fr;gap:12px}
   .setmain{max-width:none}
-  .setrail{position:static;flex-direction:row;overflow-x:auto;scrollbar-width:none;
+  .setrail{position:static;flex-direction:row;overflow-x:auto;scrollbar-width:thin;
     padding:6px;gap:4px}
   .setrail button{width:auto;white-space:nowrap}
   .setrail button .n{display:none}
@@ -1094,7 +1161,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
   /* Long release names wrap instead of pushing the % / ETA off-screen. */
   #active>div{flex-wrap:wrap;gap:2px 10px}
   #active span{min-width:0;overflow-wrap:anywhere}
-  #queue td:first-child,#hist td:first-child,#idx td:first-child{overflow-wrap:anywhere}
+  #queue td:nth-child(2),#hist td:nth-child(2),#idx td:first-child{overflow-wrap:anywhere}
   .card{padding:14px 13px;margin:12px 0}
   .tile .val{font-size:19px}
   table{font-size:12.5px}
@@ -1106,13 +1173,16 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
   #queue tbody tr,#hist tbody tr,#idx tbody tr{display:block;padding:10px 2px;border-top:1px solid var(--line)}
   #queue tbody tr:hover,#hist tbody tr:hover,#idx tbody tr:hover{background:none}
   #queue td,#hist td,#idx td{display:inline-block;border:none;padding:1px 12px 1px 0;vertical-align:middle}
-  #queue td:first-child,#hist td:first-child,#idx td:first-child{display:block;padding:0 0 3px;font-size:13.5px}
-  #queue td:nth-child(2)::before{content:"size ";color:var(--dim)}
-  #queue td:nth-child(3)::before{content:"left "}
-  #queue td:nth-child(4)::before{content:"eta ";color:var(--dim)}
-  #queue td:nth-child(5){display:block;padding:7px 0 3px}
-  #queue td:nth-child(6),#hist td:last-child,#idx td:last-child{display:block;text-align:right;padding:6px 0 0}
-  #hist td:nth-child(4){display:none}   /* Location: long path, low value on a phone */
+  /* §129 2f: queue/history cells sit one over from before - the select
+     checkbox is the new first column. It floats at the row's start so
+     the name flows beside it rather than under it. */
+  #queue td.selcol,#hist td.selcol{display:inline-block;float:inline-start;padding:2px 8px 0 0}
+  #queue td:nth-child(2),#hist td:nth-child(2),#idx td:first-child{display:block;padding:0 0 3px;font-size:13.5px}
+  #queue td:nth-child(3)::before{content:"size ";color:var(--dim)}
+  #queue td:nth-child(4)::before{content:"left "}
+  #queue td:nth-child(5)::before{content:"eta ";color:var(--dim)}
+  #queue td:nth-child(6){display:block;padding:7px 0 3px}
+  #queue td:nth-child(7),#hist td:last-child,#idx td:last-child{display:block;text-align:right;padding:6px 0 0}
   #idx td:nth-child(3)::before{content:"files ";color:var(--dim)}
   #queue td[colspan],#hist td[colspan],#idx td[colspan]{display:block;padding:2px 0}
   .srv .gb,.srv .mono{text-align:right}
@@ -1157,7 +1227,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
   <span class="grow"></span>
   <span class="selwrap"><svg class="ic selic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-gauge"/></svg>
   <svg class="ic selcaret" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-caret"/></svg>
-  <select class="ctl" id="limitSel" data-i18n-title="hdr.limit.title" title="Speed limit" onchange="setLimit(this.value)">
+  <select class="ctl" id="limitSel" data-i18n-title="hdr.limit.title" title="Speed limit" aria-label="Speed limit" onchange="setLimit(this.value)">
     <option value="0" data-i18n="hdr.limit.none">no limit</option>
     <option value="auto" data-i18n="hdr.limit.auto">auto · yield to LAN</option>
     <option value="50000000">50 MB/s</option>
@@ -1172,7 +1242,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
   <span class="dim" id="limitSrc" style="display:none;font-size:12px"></span>
   <span class="selwrap"><svg class="ic selic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-clock"/></svg>
   <svg class="ic selcaret" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-caret"/></svg>
-  <select class="ctl" id="pauseSel" data-i18n-title="hdr.pausefor.title" title="Pause for…" onchange="pauseFor(this.value)">
+  <select class="ctl" id="pauseSel" data-i18n-title="hdr.pausefor.title" title="Pause for…" aria-label="Pause for…" onchange="pauseFor(this.value)">
     <option value="" data-i18n="hdr.pausefor">pause for…</option>
     <option value="15" data-i18n="hdr.pausefor.15">15 min</option>
     <option value="30" data-i18n="hdr.pausefor.30">30 min</option>
@@ -1240,6 +1310,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
   <div id="evLegend" class="dim" style="display:none;font-size:10px;margin-top:4px;text-align:right"
        data-i18n-title="ev.leg.title" title="Ticks on the chart mark moments that shaped the speed line - hover the chart for what happened in plain words">
     <span style="color:var(--bad)">●</span> <span data-i18n="ev.leg.fault">fault</span>&ensp;
+    <span style="color:var(--warn)">○</span> <span data-i18n="ev.leg.tuning">tuning</span>&ensp;
     <span style="color:var(--ok)">●</span> <span data-i18n="ev.leg.recovery">recovery</span>&ensp;
     <span style="color:var(--acc2)">●</span> <span data-i18n="ev.leg.phase">phase</span>&ensp;
     <span style="color:var(--acc)">●</span> <span data-i18n="ev.leg.user">your action</span>
@@ -1297,7 +1368,20 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
   <div class="chartwrap" style="height:52px;margin-bottom:8px;display:none"><canvas id="burnChart" data-i18n-title="queue.burn.title" title="What is still to download across the whole queue - the burn-down to zero"></canvas></div>
   <div id="qspace" class="warn" style="display:none;font-size:12.5px;margin-bottom:8px"></div>
   <div id="watchFailed" class="dim" style="display:none;font-size:12.5px;margin-bottom:8px"></div>
-  <div class="cardscroll"><table id="queue"><thead><tr><th data-i18n="col.name">Name</th><th data-i18n="col.size">Size</th><th data-i18n="col.left">Left</th><th data-i18n="col.eta">ETA</th><th style="width:120px" data-i18n="col.progress">Progress</th><th style="width:110px"></th></tr></thead><tbody></tbody></table></div>
+<!-- §129 2f: bulk actions for the checked rows. Appears only while
+     something is selected. Pause/resume/priority/delete ride the API's
+     own comma-separated value= (SAB's convention, already honoured by
+     those arms); category loops the single-item op per row. -->
+<div class="bulkbar" id="qselbar" role="toolbar" data-i18n-title="sel.q.bar" title="Actions for the selected downloads" aria-label="Actions for the selected downloads">
+  <span class="count" id="qselcount"></span>
+  <button class="ghost mini" onclick="qBulk('pause')" data-i18n-title="sel.pause.title" title="Pause the selected downloads" data-i18n="sel.pause">⏸ Pause</button>
+  <button class="ghost mini" onclick="qBulk('resume')" data-i18n-title="sel.resume.title" title="Resume the selected downloads" data-i18n="sel.resume">▶ Resume</button>
+  <select class="ctl" id="qselPrio" onchange="qBulkPrio(this)" data-i18n-title="sel.prio.title" title="Set the priority of the selected downloads" aria-label="Set the priority of the selected downloads"></select>
+  <select class="ctl" id="qselCat" onchange="qBulkCat(this)" data-i18n-title="sel.cat.title" title="Move the selected downloads to a category" aria-label="Move the selected downloads to a category"></select>
+  <button class="ghost mini" onclick="qBulkDelete()" data-i18n-title="sel.qdel.title" title="Remove the selected downloads from the queue. Nothing is deleted from disk." data-i18n="sel.remove">✕ Remove</button>
+  <button class="ghost mini" onclick="selClear('q')" data-i18n="sel.clear">Clear selection</button>
+</div>
+  <div class="cardscroll"><table id="queue"><thead><tr><th class="selcol"><input type="checkbox" id="qSelAll" onclick="selAllClick(this,'q')" data-i18n-title="sel.q.all" title="Select every download listed" aria-label="Select every download listed"></th><th data-i18n="col.name">Name</th><th data-i18n="col.size">Size</th><th data-i18n="col.left">Left</th><th data-i18n="col.eta">ETA</th><th style="width:120px" data-i18n="col.progress">Progress</th><th style="width:110px"></th></tr></thead><tbody></tbody></table></div>
   <div class="cardgrip" data-card="queueCard" tabindex="0" role="separator" aria-orientation="horizontal"></div>
 </div>
 
@@ -1309,7 +1393,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
          rather than written here: a hard-coded aria-label stays English on
          every other locale, and it must not carry the "( / )" hint. -->
     <input class="search" id="q" data-i18n-placeholder="browse.q.ph2" placeholder="search releases…  ( / )" onkeydown="if(event.key==='Enter')doSearch()">
-    <select class="sel" id="qfilter" onchange="renderSearch()" data-i18n-title="browse.qf.title" title="quality filter">
+    <select class="sel" id="qfilter" onchange="renderSearch()" data-i18n-title="browse.qf.title" title="quality filter" aria-label="quality filter">
       <option value="" data-i18n="browse.qf.any">any quality</option><option>2160p</option><option>1080p</option>
       <option>720p</option><option value="REMUX">remux</option>
     </select>
@@ -1363,7 +1447,17 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
        with it. -->
   <div id="deleteKept" class="warn" style="display:none;font-size:12.5px;margin-bottom:8px;overflow-wrap:anywhere"></div>
   <div class="filterbar" id="histFilter"></div>
-  <div class="cardscroll"><table id="hist"><thead><tr><th data-i18n="col.name">Name</th><th data-i18n="col.size">Size</th><th style="width:90px"></th></tr></thead><tbody></tbody></table>
+<!-- §129 2f: bulk actions for the checked history rows. Delete rides the
+     API's comma-separated value= in one call (trash-aware server-side,
+     same as the per-row ✕); retry loops the single-item op per row. -->
+<div class="bulkbar" id="hselbar" role="toolbar" data-i18n-title="sel.h.bar" title="Actions for the selected history entries" aria-label="Actions for the selected history entries">
+  <span class="count" id="hselcount"></span>
+  <button class="ghost mini" onclick="hBulkRetry()" data-i18n-title="sel.retry.title" title="Retry the selected downloads: each resumes from what already arrived" data-i18n="sel.retry">↻ Retry</button>
+  <button class="ghost mini" onclick="hBulkDelete()" data-i18n-title="sel.hdel.title" title="Remove the selected entries from history (files stay on disk)" data-i18n="sel.remove">✕ Remove</button>
+  <button class="ghost mini" onclick="hBulkDeleteFiles()" data-i18n-title="sel.hfiles.title" title="Remove the selected entries AND delete their downloaded files from disk" data-i18n="sel.delfiles">Remove + delete files</button>
+  <button class="ghost mini" onclick="selClear('h')" data-i18n="sel.clear">Clear selection</button>
+</div>
+  <div class="cardscroll"><table id="hist"><thead><tr><th class="selcol"><input type="checkbox" id="hSelAll" onclick="selAllClick(this,'h')" data-i18n-title="sel.h.all" title="Select every history entry listed" aria-label="Select every history entry listed"></th><th data-i18n="col.name">Name</th><th data-i18n="col.size">Size</th><th style="width:90px"></th></tr></thead><tbody></tbody></table>
   <div id="histMore" style="margin-top:6px"></div></div>
   <div class="cardgrip" id="histGrip" data-card="histCard" tabindex="0" role="separator" aria-orientation="horizontal"></div>
 </div>
@@ -1383,7 +1477,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
 <div class="card" id="benchCard">
   <h3 data-i18n="bench.title">System benchmark
     <span class="h3tools">
-      <select class="ctl" id="benchSched" data-i18n-title="bench.sched.title" title="run the benchmark automatically when the queue is idle"
+      <select class="ctl" id="benchSched" data-i18n-title="bench.sched.title" title="run the benchmark automatically when the queue is idle" aria-label="run the benchmark automatically when the queue is idle"
         onchange="api('config',`&name=bench_interval&value=${this.value}`).then(j=>toast(j.error?tErr(j.error):t('bench.schedSaved','Benchmark schedule saved.'),!!j.error))">
         <option value="0" data-i18n="bench.sched.none">no schedule</option>
         <option value="6" data-i18n="bench.sched.6">every 6 h</option>
@@ -1548,13 +1642,16 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <div class="row"><label data-i18n="set.srv.pin">Use exactly this many<span class="hint" data-i18n="set.srv.pin.hint">auto-tuning still measures this server and still reports what it found, but the number above wins. Turn this on when you have timed real downloads yourself and the tuner disagrees with you</span></label>
       <input type="checkbox" id="sv_pin"></div>
     <div class="row"><label data-i18n="set.srv.level">Tier / level<span class="hint" data-i18n="set.srv.level.hint">0 = primary; a level-N server only fetches articles every lower level missed: fill/backup economics</span></label>
-      <input class="txt sm" type="number" min="0" max="99" id="sv_level" value="0"></div>
+      <input class="txt sm" type="number" min="0" max="99" id="sv_level" value="0" oninput="paidSuggest()"></div>
     <div class="row"><label data-i18n="set.srv.group">Backbone group<span class="hint" data-i18n="set.srv.group.hint">servers sharing a name are mirrors of one backbone (optional)</span></label>
       <input class="txt" id="sv_group"></div>
     <div class="row"><label data-i18n="set.srv.ret">Retention (days)<span class="hint" data-i18n="set.srv.ret.hint">0 = unlimited; older articles route to deeper servers</span></label>
       <input class="txt sm" type="number" min="0" id="sv_ret" value="0"></div>
     <div class="row"><label data-i18n="set.srv.block">Block size (GB)<span class="hint" data-i18n="set.srv.block.hint">prepaid block account: nzbfast tracks lifetime usage and stops using the server when the block is spent. 0 = flatrate. Pair with a tier ≥1 so the block only fills what primaries miss</span></label>
       <input class="txt sm" type="number" min="0" id="sv_block" value="0"></div>
+    <div class="row"><label data-i18n="set.srv.paid">Every byte is billed<span class="hint" data-i18n="set.srv.paid.hint">turn this on for a metered account, where you pay for what you download. Your files still come from this server exactly as before; what stops is nzbfast spending bytes here for its own benefit, such as automatic connection tests, benchmark traffic and header scans for the index. Leave it off for an unlimited plan</span></label>
+      <span><input type="checkbox" id="sv_paid" onchange="paidSuggest()">
+      <span class="hint" id="sv_paidsug"></span></span></div>
     <div class="row"><label data-i18n="set.srv.warm">Keep connections open<span class="hint" data-i18n="set.srv.warm.hint">reuse this server's connections between downloads instead of opening new ones, so the next one starts sooner. Whether it helps depends on your link, so it is off until you measure it: Measure runs a short paired test and tells you what it found</span></label>
       <span><input type="checkbox" id="sv_warm">
       <button class="ghost sm" onclick="benchWarm(this)" data-i18n="set.srv.warm.bench">Measure</button>
@@ -1679,6 +1776,12 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <div class="pathrow"><input class="txt" id="s_out_dir" onchange="setCfg('out_dir',this.value)"><button class="mini" onclick="browseDir('out_dir','dir')" data-i18n-title="btn.browse.title" title="Browse for a folder - including other drives" data-i18n="btn.browse">Browse…</button><button class="mini" onclick="openDir('out_dir')" data-i18n-title="btn.openfolder.title" title="Open this folder" aria-label="Open this folder">📂</button></div></div>
   <div class="row"><label data-i18n="set.disk.move">Move completed to<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.move.hint">after unpack and renaming, finished downloads move here - a NAS share, media drive etc. Category subfolders are kept. Empty = leave them in the download folder. If the destination is unreachable the files stay put</span></label>
     <div class="pathrow"><input class="txt" id="s_move_completed" data-i18n-placeholder="set.disk.move.ph" placeholder="e.g. /Volumes/Media - empty = off" onchange="setCfg('move_completed',this.value)"><button class="mini" onclick="browseDir('move_completed','dir')" data-i18n-title="btn.browse.title" title="Browse for a folder - including other drives" data-i18n="btn.browse">Browse…</button><button class="mini" onclick="openDir('move_completed')" data-i18n-title="btn.openfolder.title" title="Open this folder" aria-label="Open this folder">📂</button></div></div>
+  <div class="row"><label data-i18n="set.disk.pace">File moves<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.pace.hint">how moves to the completed folder share the machine with downloads. "Yield to downloads" slows the move while anything is downloading and goes full speed when the queue is idle. Pick a speed to give moves a fixed share of the line, alongside the download speed limit. "Full speed" never slows the move - for setups where the two paths don't share a bottleneck</span></label>
+    <div class="pathrow"><select id="s_move_pace_mode" onchange="movePaceChanged()">
+      <option value="yield" data-i18n="set.disk.pace.yield">Yield to downloads</option>
+      <option value="fixed" data-i18n="set.disk.pace.fixed">Limit to a speed (MB/s)</option>
+      <option value="full" data-i18n="set.disk.pace.full">Full speed</option>
+    </select><input class="txt" id="s_move_pace_mbs" type="number" min="1" max="100000" style="width:8ch;display:none" onchange="movePaceChanged()" aria-label="MB/s"></div></div>
   <div class="row" style="grid-template-columns:1fr"><label data-i18n="set.disk.cats">Categories<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.cats.hint">the categories offered to Sonarr, Radarr and other clients, and where each one's finished downloads go. tv, movies, music and books are always available; add any others your apps are set to use - a client whose category is missing here refuses to connect. Leave a folder blank and that category lands in its own subfolder of the download root, which is what most setups want. Rows are listed alphabetically, and a category an app sends that is not here yet adds itself</span></label></div>
   <div id="catfilerows"></div>
   <div class="savebar">
@@ -1689,11 +1792,13 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input class="txt sm" id="s_out_umask" data-i18n-placeholder="set.disk.outperm.ph" placeholder="off" onchange="setCfg('out_umask',this.value)"></div>
   <div class="row"><label data-i18n="set.disk.minfree">Minimum free space<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.minfree.hint">pause new jobs below this, e.g. 25G. Defaults to 2G so the disk never fills completely; 0 = off</span></label>
     <input class="txt sm" id="s_min_free" onchange="setCfg('min_free',this.value)"></div>
+  <div class="row"><label>Pause when the disk cannot keep up<span class="badge live" data-i18n="badge.live">live</span><span class="hint">a drive that has started to fail often still accepts writes - it just takes minutes over them. The download then crawls, the graph sawtooths, and it all looks like a network problem. With this on, several minutes of stalled writes pause the queue with the reason and the folder named, keeping everything downloaded so far, and downloads start again by themselves once the drive answers normally. A brief busy spell never triggers it</span></label>
+    <input type="checkbox" id="s_slow_storage_pause" onchange="setCfg('slow_storage_pause',this.checked?1:0)"></div>
   <div class="row"><label data-i18n="set.disk.quota">Download quota<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.quota.hint">byte budget per period, e.g. 500G; 0 = off. Force-priority jobs bypass it</span></label>
     <input class="txt sm" id="s_quota" onchange="setCfg('quota',this.value)"></div>
   <div class="row"><label data-i18n="set.disk.qperiod">Quota period<span class="badge live" data-i18n="badge.live">live</span></label>
     <select class="sel" id="s_quota_period" style="max-width:200px" onchange="setCfg('quota_period',this.value)">
-      <option value="d" data-i18n="set.disk.qperiod.d">daily (local midnight)</option><option value="m" data-i18n="set.disk.qperiod.m">monthly (1st, local time)</option></select></div>
+      <option value="d" data-i18n="set.disk.qperiod.d">daily (local midnight)</option><option value="w" data-i18n="set.disk.qperiod.w">weekly (Monday, local time)</option><option value="m" data-i18n="set.disk.qperiod.m">monthly (1st, local time)</option></select></div>
   <div class="row" data-adv="1"><label data-i18n="set.disk.nestdepth">Nested archive depth<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.nestdepth.hint">how many archive-in-archive layers to unpack automatically (default 5); applies to the next download. At the limit the deepest archive is left in place, unpacked no further - the download still completes. Raise only for unusually deep nested releases</span></label>
     <input class="txt sm" type="number" min="1" max="64" id="s_nested_max_depth" onchange="setCfg('nested_max_depth',this.value)"></div>
 </div>
@@ -1706,6 +1811,10 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input class="txt sm" type="number" min="1" max="3600" id="s_watch_interval_secs" onchange="setCfg('watch_interval_secs',this.value)"></div>
   <div class="row"><label data-i18n="set.watchdir.keep">Keep .nzb files after pickup<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.keep.hint">leave the original .nzb in the watch folder after it is queued, instead of moving it to the Trash. For collectors, and for handing the file to someone when a download misbehaves. A kept file is remembered and not queued again; re-save it to download it again. Whatever you choose, every job's drawer can save you a copy of its .nzb</span></label>
     <input type="checkbox" id="s_watch_keep" onchange="setCfg('watch_keep_nzb',this.checked?1:0)"></div>
+  <div class="row"><label data-i18n="set.watchdir.recursive">Also scan subfolders<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.recursive.hint">files in subfolders are picked up too, and the first subfolder's name becomes the download's category: a file dropped in watch/tv joins the tv category. A folder named "rejected" is left alone; it is where unusable files go when the switch below is on</span></label>
+    <input type="checkbox" id="s_watch_recursive" onchange="setCfg('watch_recursive',this.checked?1:0)"></div>
+  <div class="row"><label data-i18n="set.watchdir.rejected">Move unusable files aside<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.rejected.hint">a file that is not a usable NZB is moved into a "rejected" folder inside the watch folder, with a small text file beside it saying what was wrong. Off: the file stays where you put it and the reason is shown above the queue. A file that merely looks incomplete is always left in place, because it may still be arriving</span></label>
+    <input type="checkbox" id="s_watch_move_rejected" onchange="setCfg('watch_move_rejected',this.checked?1:0)"></div>
   <div class="row"><label data-i18n="set.watchdir.script">Post-processing script<span class="hint" data-i18n="set.watchdir.script.hint">runs after every job with SABnzbd's args + SAB_* env vars; empty = off</span></label>
     <div class="pathrow"><input class="txt" id="s_script" onchange="setCfg('script',this.value)"><button class="mini" onclick="browseDir('script','file')" data-i18n-title="btn.browsefile.title" title="Browse for a script file" data-i18n="btn.browse">Browse…</button><button class="mini" onclick="openDir('script')" data-i18n-title="set.watchdir.openscript.title" title="Open the folder containing this script" aria-label="Open the folder containing this script">📂</button></div></div>
   <div class="row" data-adv="1"><label data-i18n="set.watchdir.scripttimeout">Give the script at most<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.scripttimeout.hint">a script still running after this is killed, and a line saying so goes in the log; the download itself is unaffected either way. Seconds; 0 = wait as long as it takes, which is what a long transcode wants. Default 3600. With no limit, one script that hangs holds a thread for as long as nzbfast runs, and every job that finishes after it holds another</span></label>
@@ -1821,12 +1930,17 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
 
 <div class="card set" data-sg="organise" data-sk="rss">
   <h3 data-i18n="set.rss.title">RSS auto-grab <span class="badge live" data-i18n="badge.live">live</span></h3>
-  <div class="row" style="grid-template-columns:1fr"><label data-i18n="set.rss.feeds">Feeds<span class="hint" data-i18n="set.rss.feeds.hint">each feed is polled on its own interval; items passing the rules are queued automatically. Rules (one per line): Require: size&gt;200M · Reject: *480p* · Accept: *1080p*</span></label></div>
+  <div class="row" style="grid-template-columns:1fr"><label data-i18n="set.rss.feeds">Feeds<span class="hint" data-i18n="set.rss.feeds.hint">each feed is polled on its own interval; items passing the rules are queued automatically. Rules (one per line): Require: size&gt;200M · Reject: *480p* · Accept: *1080p*. An Accept rule can file its matches itself: Accept(category=tv, priority=high): *1080p*. Preview shows what the rules would do without grabbing anything</span></label></div>
   <div id="feedrows"></div>
   <div class="savebar">
     <button class="ghost" onclick="addFeedRow()" data-i18n="set.rss.addfeed">+ Add feed</button>
     <button onclick="saveFeeds(this)" data-i18n="set.rss.apply">Apply feeds</button>
   </div>
+  <div class="row"><label data-i18n="set.rss.dupe">When a duplicate is added<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.rss.dupe.hint">what happens when a new download has the same identity (show, season and episode, or title and year) as one already queued or downloaded. "Hold it paused" keeps it as a backup that starts automatically if the original fails. "Refuse it" turns the add away with an error. "Fail it into History" records it as a failed download right away, which is what Sonarr and Radarr expect so they can pick a different release themselves. Applies everywhere downloads are added, not just RSS</span></label>
+    <select class="sel" id="s_dupe_action" style="max-width:280px" onchange="setCfg('dupe_action',this.value)">
+      <option value="pause" data-i18n="set.rss.dupe.pause">hold it paused as a backup</option>
+      <option value="discard" data-i18n="set.rss.dupe.discard">refuse it</option>
+      <option value="fail" data-i18n="set.rss.dupe.fail">fail it into History</option></select></div>
 </div>
 
 <div class="card set" data-sg="organise" data-sk="pullsearch">
@@ -2183,6 +2297,10 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     </span></div>
   <div class="row"><label data-i18n="set.sec.port">Port<span class="badge restart" id="s_portbadge" data-i18n="badge.restart">applies after restart</span></label>
     <input class="txt sm" type="number" min="1" max="65535" id="s_port" onchange="setCfg('port',this.value)"></div>
+  <div class="row"><label data-i18n="set.sec.tlscert">HTTPS certificate<span class="badge restart" data-i18n="badge.restart">applies after restart</span><span class="hint" data-i18n="set.sec.tlscert.hint">serve the dashboard and API over HTTPS: point this at a PEM certificate file (a chain works too) and the row below at its private key, then restart. Leave both empty for plain HTTP. A reverse proxy or a VPN like Tailscale also works and needs nothing here - the manual's security section compares the options</span></label>
+    <input class="txt" id="s_tls_cert" spellcheck="false" onchange="setCfg('tls_cert',this.value)"></div>
+  <div class="row"><label data-i18n="set.sec.tlskey">HTTPS private key<span class="badge restart" data-i18n="badge.restart">applies after restart</span><span class="hint" data-i18n="set.sec.tlskey.hint">the PEM private key that belongs to the certificate above. With both rows set, the next restart answers on https instead of http</span></label>
+    <input class="txt" id="s_tls_key" spellcheck="false" onchange="setCfg('tls_key',this.value)"></div>
 </div>
 
 <div class="card set" data-sg="system" data-sk="log" id="logCard">
@@ -2228,7 +2346,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <button class="ghost mini" id="fsup" onclick="fsUp()" data-i18n-title="fs.up.title" title="Go up to the folder above" aria-label="Go up to the folder above">↑</button>
     <input class="txt" id="fspath" spellcheck="false"
       onkeydown="if(event.key==='Enter'){event.preventDefault();fsGo(this.value)}"
-      data-i18n-title="fs.path.title" title="Type or paste a path, then Enter">
+      data-i18n-title="fs.path.title" title="Type or paste a path, then Enter" aria-label="Type or paste a path, then Enter">
     <button class="ghost mini" onclick="fsNewFolder()" data-i18n-title="fs.newfolder.title" title="Create a new folder here" data-i18n="fs.newfolder">+ New folder</button>
   </div>
   <div class="fsbody">
@@ -2240,6 +2358,51 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <button class="ghost" onclick="fsClose()" data-i18n="btn.cancel">Cancel</button>
     <button id="fschoose" onclick="fsChoose()" data-i18n="fs.choose">Choose this folder</button>
   </div>
+</div></div>
+<!-- API-key entry (TODO §129 phase 0b). This used to be a bare
+     window.prompt(), which embedded webviews and kiosk browsers refuse
+     outright - the page then sat on "connecting" with twelve empty
+     cards and no way in. A real form can also SAY what it needs, where
+     the key lives, and what went wrong, none of which prompt() could.
+     Backdrop click and Escape both count as "not now" - the keynotice
+     strip is the way back in, so declining is reversible. -->
+<div id="keyov" onclick="if(event.target===this)keyCancel()"><div id="keymodal" role="dialog" aria-modal="true" aria-labelledby="keytitle">
+  <div class="fshead"><b id="keytitle" data-i18n="key.title">This nzbfast asks for its API key</b></div>
+  <div class="keybody">
+    <p id="keywhy" class="dim"></p>
+    <div class="keyrow">
+      <input class="txt" id="keyin" type="password" autocomplete="off" spellcheck="false"
+        data-i18n-placeholder="key.field" placeholder="Paste the API key" aria-label="Paste the API key"
+        onkeydown="if(event.key==='Enter'){event.preventDefault();keySubmit()}else if(event.key==='Escape'){event.preventDefault();keyCancel()}">
+      <button class="ghost mini" id="keyshow" onclick="keyToggleShow()" data-i18n="set.sec.apikey.show"
+        aria-pressed="false">Show</button>
+    </div>
+    <p id="keyerr" class="keyerr" role="alert" aria-live="assertive"></p>
+    <p class="dim" data-i18n="key.where">Find it on the machine running nzbfast: Settings &gt; Security &gt; API key (Show), or in the daemon's startup log. Once it checks out it is remembered in this browser only.</p>
+  </div>
+  <div class="fsfoot">
+    <span class="grow"></span>
+    <button class="ghost" onclick="keyCancel()" data-i18n="key.notnow">Not now</button>
+    <button id="keygo" onclick="keySubmit()" data-i18n="key.unlock">Unlock</button>
+  </div>
+</div></div>
+<!-- §129 2f: keyboard shortcut sheet, opened with '?'. Same shell as the
+     directory browser; Escape, backdrop and ✕ all close it. -->
+<div id="shov" onclick="if(event.target===this)shClose()"><div id="shmodal" role="dialog" aria-modal="true" aria-labelledby="shtitle">
+  <div class="fshead"><b id="shtitle" data-i18n="sh.title">Keyboard shortcuts</b><span class="grow"></span>
+    <button class="ghost mini" onclick="shClose()" data-i18n-title="btn.close.title"
+      title="Close this panel" aria-label="Close this panel">✕</button></div>
+  <div class="shbody"><table>
+    <tr><td><kbd>Space</kbd></td><td data-i18n="sh.space">Pause or resume everything</td></tr>
+    <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td data-i18n="sh.jk">Move between queue and history rows</td></tr>
+    <tr><td><kbd>x</kbd></td><td data-i18n="sh.x">Select or unselect the current row</td></tr>
+    <tr><td><kbd>Delete</kbd></td><td data-i18n="sh.del">Remove the selected rows (asks first)</td></tr>
+    <tr><td><kbd>Shift</kbd>+<span data-i18n="sh.clickword">click</span></td><td data-i18n="sh.shift">Select a whole range of checkboxes</td></tr>
+    <tr><td><kbd>/</kbd></td><td data-i18n="sh.search">Jump to the search box</td></tr>
+    <tr><td><kbd>Enter</kbd></td><td data-i18n="sh.enter">Open or close the focused row's details</td></tr>
+    <tr><td><kbd>Esc</kbd></td><td data-i18n="sh.esc">Close menus and panels like this one</td></tr>
+    <tr><td><kbd>?</kbd></td><td data-i18n="sh.help">Show or hide this sheet</td></tr>
+  </table></div>
 </div></div>
 <!-- Container update recipe. A container cannot replace its own binary,
      so "download the new version" is the wrong advice inside one: the
@@ -2560,7 +2723,36 @@ function applyI18n(){
     const was=openBarShown; openBarShown=null; openApiNotice(was);
   }
   stripKbdHint();   // the catalogue just restored the "( / )" hint
+  labelRows();      // re-derive control names in the new language
 }
+// Programmatic names for the settings-style rows (TODO §129 phase 0d).
+// Every row is "<label>Name<span class=hint>…</span></label><control>",
+// but the label was never wired to its control - no for=, no wrapping -
+// so a screen reader announced ~150 settings as unnamed edit fields.
+// One walk names them all, current and future rows alike, from the
+// label's own leading text (not the hint - a name is a name, not a
+// paragraph). Runs at boot and again after every locale switch so the
+// names follow the language. Controls that already carry an explicit
+// name (aria-label, or a wrapping <label> like the group-browser
+// checkboxes) are left alone.
+function labelRows(){
+  document.querySelectorAll('.row').forEach(row=>{
+    const lab=row.querySelector('label'); if(!lab || lab.querySelector('input,select,textarea')) return;
+    const n=lab.firstChild;
+    const name=((n && n.nodeType===3) ? n.nodeValue : lab.textContent).trim();
+    if(!name) return;
+    row.querySelectorAll('input,select,textarea').forEach(el=>{
+      if(el.type==='hidden' || el.closest('label')) return;
+      if(el.hasAttribute('aria-labelledby')) return;
+      // Overwrite only names WE stamped (data-lr): a hand-written
+      // aria-label is someone's deliberate choice and stays.
+      if(el.hasAttribute('aria-label') && !el.dataset.lr) return;
+      el.dataset.lr='1';
+      el.setAttribute('aria-label', name);
+    });
+  });
+}
+labelRows();
 // The "/" shortcut had no visible affordance at all - the wall says so in
 // its own search placeholder, and this is the same pattern: name the key
 // in the placeholder, and drop it on a touch device, where there is no
@@ -2918,23 +3110,87 @@ function openApiDone(){
   openBarLatched = false; openBarShown = null;
   openApiNotice(false);
 }
+// The key modal (TODO §129 phase 0b). One modal serves every concurrent
+// auth-failed call: the first opener creates keyPrompt, everyone else
+// awaits the same promise (the old prompt() popped one dialog PER
+// in-flight call - the "12 dialogs to get in" bug - and embedded
+// webviews refuse prompt() entirely, which left the page permanently
+// "connecting" with no way in at all).
+let keyResolve = null;
 function ensureKey(failedKey){
   if (key !== failedKey) return Promise.resolve(true);   // another call already rotated it - just retry
   if (keyDeclined) return Promise.resolve(false);        // asked once, told no - the strip is the way back
   if (!keyPrompt){
     keyPrompt = new Promise(resolve => {
-      // Defer so every concurrent auth-fail handler registers its await
-      // before the blocking prompt() runs and clears the gate.
-      setTimeout(() => {
-        const v = prompt(t('prompt.apikey','API key:')) || '';
-        if (v){ key = v; localStorage.nzbfastKey = v; keyNotice(false); }   // never clobber a good key on cancel
-        else { keyDeclined = true; keyNotice(true); }
-        keyPrompt = null;
-        resolve(!!v);
-      }, 0);
+      keyResolve = resolve;
+      // Missing and wrong are different situations and say so: a fresh
+      // browser has never had the key; a refused one means the daemon's
+      // key CHANGED (rotated, or the .app attached to a different
+      // daemon) and "enter it again" is the wrong instruction without
+      // saying why the saved one stopped working.
+      // Stamp the KEY as well as the text: the first 403 can beat the
+      // catalogue fetch, and a t() call that ran too early leaves this
+      // one paragraph English inside an otherwise-translated modal.
+      // With data-i18n set, applyI18n retranslates it when the
+      // catalogue lands (and again on a locale switch).
+      const why = document.getElementById('keywhy');
+      why.dataset.i18n = failedKey ? 'key.why.wrong' : 'key.why.missing';
+      why.textContent = failedKey
+        ? t('key.why.wrong','The key saved in this browser was refused - the daemon has a different one now (it was changed, or this address now serves a different nzbfast).')
+        : t('key.why.missing','This browser has not connected to this nzbfast before. Its API key proves you are allowed in.');
+      document.getElementById('keyerr').textContent = '';
+      const inp = document.getElementById('keyin');
+      inp.value = '';
+      document.getElementById('keyov').classList.add('on');
+      modalOpen(document.getElementById('keymodal'), inp);
     });
   }
   return keyPrompt;
+}
+function keyFinish(ok){
+  modalClose(document.getElementById('keymodal'));
+  document.getElementById('keyov').classList.remove('on');
+  const r = keyResolve; keyResolve = null; keyPrompt = null;
+  if (r) r(ok);
+}
+function keyCancel(){
+  if (!keyPrompt) return;
+  keyDeclined = true; keyNotice(true);   // reversible via the strip
+  keyFinish(false);
+}
+function keyToggleShow(){
+  const inp = document.getElementById('keyin'), btn = document.getElementById('keyshow');
+  const show = inp.type === 'password';
+  inp.type = show ? 'text' : 'password';
+  btn.setAttribute('aria-pressed', String(show));
+  setHtml(btn, show ? t('set.sec.apikey.hide','Hide') : t('set.sec.apikey.show','Show'));
+  inp.focus();
+}
+async function keySubmit(){
+  const inp = document.getElementById('keyin'), err = document.getElementById('keyerr');
+  const v = (inp.value || '').trim();
+  if (!v){ err.textContent = t('key.err.empty','Paste or type the key first.'); inp.focus(); return; }
+  await busy(document.getElementById('keygo'), t('key.checking','Checking…'), async () => {
+    // Prove the key against a mode that REQUIRES it before adopting it -
+    // mode=version answers without auth, so it proves nothing. Passing
+    // it as the explicit one-shot credential means a wrong guess can
+    // never recurse back into this modal.
+    let j;
+    try { j = await api('queue', '&output=json', v); }
+    catch(e){ j = null; }
+    if (j == null || j.error === 'HTTP 502' || j.error === 'HTTP 503' || j.error === 'HTTP 504'){
+      err.textContent = t('key.err.unreachable','The daemon did not answer - is nzbfast still running at this address?');
+      return;
+    }
+    if (authFail(j)){
+      err.textContent = t('key.err.wrong','That key was refused. Settings > Security on the machine running nzbfast shows the current one.');
+      inp.select();
+      return;
+    }
+    if (j.status === false){ err.textContent = tErr(j.error) || String(j.error); return; }
+    key = v; localStorage.nzbfastKey = v; keyNotice(false);
+    keyFinish(true);
+  });
 }
 // Every failure the daemon can answer with is a JSON {status:false,error}
 // body, so callers all test j.status. A failure it CANNOT answer that way -
@@ -2956,6 +3212,13 @@ async function readJson(r){
 // irreversible (shutdown) require it, so a page you merely visit cannot
 // fire them with an <img> or a link prefetch.
 async function api(mode, extra, authKey, post){
+  // While the key modal is up, later callers (the 1 Hz poll keeps
+  // ticking) wait on its outcome instead of racing more 403s past it -
+  // the daemon rate-limits bad keys per IP, and a minute of open modal
+  // must not spend that budget. Explicit one-shot credentials (the
+  // modal's own probe, the apikey bootstrap) go straight through.
+  if (authKey == null && keyPrompt && !(await keyPrompt))
+    return {status:false, error:'API Key Required'};
   const sent = authKey != null ? authKey : key;
   // Issue #4: the key rides the X-Api-Key header, not the query string,
   // so it stays out of reverse-proxy access logs, browser history and
@@ -3380,9 +3643,16 @@ function drawSpeed(frac=0){
 // hand. The per-kind distinction the first three colours carried
 // (network vs write side) moved into the hover text, which names the
 // kind and quotes the detail sentence.
-const EVENT_CLASS={fault:'--bad',recovery:'--ok',phase:'--acc2',user:'--acc'};
+//
+// 'tuning' (amber, hollow marker) is the daemon's OWN deliberate moves:
+// sessions it rotated on purpose (pre-byte budget, rebalancing, slow-
+// session recycles). Red is reserved for things that are actually wrong
+// and may need the user's hand - a flawless 3.3 Gbps run once showed 38
+// red dots that were all our own rotations, and read as an incident.
+const EVENT_CLASS={fault:'--bad',tuning:'--warn',recovery:'--ok',phase:'--acc2',user:'--acc'};
 const EVENT_STYLE = {
   reconnect: {cls:'fault',    label:()=>t('ev.reconnect','reconnected')},
+  rotate:    {cls:'tuning',   label:()=>t('ev.rotate','connection rotated')},
   cap:       {cls:'fault',    label:()=>t('ev.cap','connection cap')},
   blocked:   {cls:'fault',    label:()=>t('ev.blocked','waiting on the write side')},
   retired:   {cls:'fault',    label:()=>t('ev.retired','server out of the run')},
@@ -3454,10 +3724,17 @@ function drawEventMarks(m){
     if(e.at_ms<t0-slack || e.at_ms>t1+slack) return;
     const st=EVENT_STYLE[e.kind]; if(!st) return;
     const col=css(EVENT_CLASS[st.cls]||'--dim'), px=nearestX(e.at_ms);
-    ctx.globalAlpha=.55; ctx.strokeStyle=col; ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(px,0); ctx.lineTo(px,h); ctx.stroke();
-    ctx.globalAlpha=1; ctx.fillStyle=col;
-    ctx.beginPath(); ctx.arc(px,4,2.5,0,Math.PI*2); ctx.fill();
+    // Tuning marks are visually quieter on purpose: a fainter line and
+    // a hollow ring instead of the filled dot, so a run full of our own
+    // rotations cannot read as a run full of faults.
+    const tune=st.cls==='tuning';
+    ctx.globalAlpha=tune?.3:.55; ctx.strokeStyle=col; ctx.lineWidth=1;
+    // The line starts under a hollow ring so it cannot fill it in.
+    ctx.beginPath(); ctx.moveTo(px,tune?7:0); ctx.lineTo(px,h); ctx.stroke();
+    ctx.globalAlpha=1;
+    ctx.beginPath(); ctx.arc(px,4,tune?2:2.5,0,Math.PI*2);
+    if(tune){ ctx.lineWidth=1.2; ctx.stroke(); }
+    else { ctx.fillStyle=col; ctx.fill(); }
   });
   ctx.restore();
 }
@@ -3767,13 +4044,69 @@ function updateIdleCompact(downloading){
   }
   if(changed) redrawCanvases();
 }
+// §129 1b: the revision handles the poll rides on. Zero = "send me
+// everything"; the server's answer updates them, and anything that
+// changes the history WINDOW this client wants (filter, search, page
+// size) zeroes dashHRev so the next tick refetches. lastQFull/lastHist
+// are the cached copies repainted on unchanged ticks - setHtml's
+// memoization makes that repaint nearly free.
+let dashQRev=0, dashHRev=0, dashESeq=0, dashEHave=false, lastQFull=null, lastHist=null;
+let histSearch='', histLimitOverride=0, histFull={};
+// The window `lastHist` was fetched FOR. When the wanted window
+// differs (filter click, search, expand - even one landing while a
+// poll was already in flight), the next tick sends rev 0 and refetches
+// regardless of what revision the in-flight poll adopted.
+let histAppliedWin=null;
+function histWindowExtra(){
+  const cur=histFilter();
+  const lim=histExpanded()?Math.max(200,histLimitOverride):histRows();
+  let x='&hist_limit='+lim;
+  if(cur!=='all') x+='&hist_filter='+cur;
+  if(histSearch) x+='&hist_search='+encodeURIComponent(histSearch);
+  return x;
+}
 async function tick(){
   if(ticking) return;                 // never stack overlapping polls
   ticking=true;
   try{
-    // One parallel round-trip for everything the page shows.
-    const [qr,hr,st]=await Promise.all([api('queue'),api('history'),api('stats')]);
-    const q=qr.queue;
+    // One revisioned round-trip for everything the page shows: an
+    // unchanged queue/history comes back null (stats always ride), and
+    // discrete lifecycle events replace the old snapshot diffing - so
+    // an idle refresh costs the same however large history grows.
+    const win=histWindowExtra();
+    const hrevSent=(win===histAppliedWin)?dashHRev:0;
+    // The events param is OMITTED on the very first poll: that primes
+    // the cursor server-side (no replay of old toasts). From then on
+    // the adopted cursor - zero included - is always sent, so a
+    // daemon's first-ever event still reaches a page already watching.
+    const r=await api('dashboard',
+      `&queue_rev=${dashQRev}&history_rev=${hrevSent}`
+      +(dashEHave?`&events=${dashESeq}`:'')+win);
+    // A declined key is not an outage. While key entry is turned down
+    // the daemon answers every poll with a 403 body, but the payload
+    // fields are missing, the throw below fires, and the catch painted
+    // "daemon unreachable" - and rang the connection-lost sound - for a
+    // daemon that is up. Say what is actually missing, and offer the
+    // same way back in as the strip. The daemon answering also settles
+    // any earlier real outage.
+    if(authFail(r)){
+      const kp=document.getElementById('statusPill');
+      kp.textContent=t('status.keyneeded','API key needed');
+      kp.className='pill stale';
+      setHtml('active',
+        `<span class="bad">${esc(t('status.keyneeded','API key needed'))}</span> `
+        +`<span class="dim">${esc(t('key.needed','This daemon needs its API key before the dashboard can show anything. Settings > Security has it on the machine running nzbfast.'))}</span> `
+        +`<button class="ghost mini" onclick="reenterKey()">${esc(t('key.enter','Enter key'))}</button>`);
+      if(wasOffline){ wasOffline=false; snd('conn', true); say('conn',t('say.connBack','Connection restored.')); }
+      return;
+    }
+    if(r.queue) lastQFull=r.queue;
+    if(r.history){ lastHist=r.history; histFull={}; histAppliedWin=win; }
+    dashQRev=r.queue_revision||0;
+    dashHRev=r.history_revision||0;
+    const st=r.stats;
+    const q=lastQFull;
+    if(!q||!st) throw new Error('empty dashboard payload');
     paused=q.paused;
     // Server state wins. The daemon persists offline across restarts and
     // a second browser tab can flip it, so the optimistic paint in
@@ -3806,8 +4139,17 @@ async function tick(){
     // source and, when it can promise one, the time it comes back.
     const psched = paused && q.pause_source==='schedule';
     const pwhen = psched && q.resume_at ? fmtClock(q.resume_at) : '';
+    // §129 3e: the same reasoning as the schedule case, for the pause
+    // nobody made at all. A queue that stopped because the output drive
+    // stopped keeping up looks exactly like a deliberate pause, and the
+    // one thing the user needs is the sentence that sends them to the
+    // drive instead of to their ISP. The evidence hangs off the tooltip
+    // and the drawer; the pill carries the claim.
+    const pstore = paused && q.pause_source==='storage' && q.storage_pause;
+    pill.title = pstore ? q.storage_pause.evidence : '';
     pill.textContent = paused? t('status.paused','paused')+(
-        pwhen? ` · ${t('status.paused.sched','by your schedule until {t}',{t:pwhen})}`
+        pstore? ` · output storage is not keeping up`
+        : pwhen? ` · ${t('status.paused.sched','by your schedule until {t}',{t:pwhen})}`
         : psched? ` · ${t('status.paused.sched.open','by your schedule')}`
         : pmin? ` · ${t('status.minleft','{n}m left',{n:pmin})}` : '')
       : (q.hold && !busy ? t('status.held','held')
@@ -4004,14 +4346,16 @@ async function tick(){
     // number moves - and the Retry button appears - without the user
     // reopening the drawer.
     for(const el of document.querySelectorAll('[data-dspace]')){
-      const hs=(lastHistSlots||[]).find(x=>x.nzo_id===el.dataset.dspace);
+      // The drawer that rendered this span cached the row's full record
+      // (summaries no longer carry the space fields).
+      const hs=histFull[el.dataset.dspace];
       if(hs) setHtml(el, histSpaceHtml(hs));
     }
     // "Ask at once" (password_prompt=now): the moment a running
     // download raises password_needed, prompt - once per job, so a
     // Cancel is respected and the 🔑 row badge and drawer button carry
     // on from there. Other modes get the badge only; "done" asks at
-    // completion (watchHistory), "never" not at all.
+    // completion (handleLifeEvents), "never" not at all.
     pwPromptMode=q.password_prompt||'done';
     eatVolMode=q.unpack_eat_volumes||'off';
     if(pwPromptMode==='now') for(const s of q.slots){
@@ -4091,15 +4435,19 @@ async function tick(){
     }
     dkSeen=new Set(dk.map(dkKey));
 
-    const h=hr.history;
-    watchHistory(h.slots);
-    // After watchHistory so a just-landed completion is visible to the
+    const h=lastHist||{slots:[],noofslots:0,counts:{}};
+    // §129 1b: toasts/sounds/notifications come from the daemon's own
+    // lifecycle events now (seq-cursored, no replay on a fresh page) -
+    // watchHistory's snapshot diffing is gone.
+    handleLifeEvents(r);
+    // After the events so a just-landed completion is visible to the
     // queue-drained "all done" check.
     sndQueueEvents(q);
     if(wasOffline){ wasOffline=false; snd('conn', true); say('conn',t('say.connBack','Connection restored.')); }
     drawVerifyHealth(h.slots);
-    const done=h.slots.filter(s=>s.status==='Completed').length;
-    const failed=h.slots.filter(s=>s.status!=='Completed').length;
+    const c=h.counts||{};
+    const done=c.done||0;
+    const failed=c.failed||0;
     renderHistory(h.slots);
 
     pipeline(st,mbps,q.slots.length,done,failed);
@@ -4135,7 +4483,23 @@ function histFilter(){
   const v=localStorage.histFilter;
   return HIST_BUCKETS.some(([k])=>k===v) ? v : 'all';
 }
-function setHistFilter(v){ localStorage.histFilter=v; renderHistory(); }
+function setHistFilter(v){
+  localStorage.histFilter=v;
+  // §129 1a: the buckets filter at the STORE now - refetch the window.
+  dashHRev=0; renderHistory(); tick();
+}
+// The history search box (new with server-side paging): a debounced
+// substring query the daemon applies at the store, so it reaches rows
+// far past whatever page is showing.
+let histSearchT=0;
+function setHistSearch(v){
+  clearTimeout(histSearchT);
+  histSearchT=setTimeout(()=>{
+    const q=(v||'').trim();
+    if(q===histSearch) return;
+    histSearch=q; dashHRev=0; tick();
+  },300);
+}
 
 // ---- Archive shape badge -------------------------------------------
 //
@@ -4246,6 +4610,25 @@ function mediaWhy(m){
 // The contradiction, spelled out. The row chip is glanceable and easy to
 // miss; a user who opens the drawer is asking "should I keep this?" and
 // deserves the sentences rather than a tooltip they have to hover for.
+// §129 3e: the drawer's account of a chronic slow-storage pause, shown
+// only on the job it actually stopped. English-only for now; the §129
+// phase 3 locale pass picks these up with the rest.
+//
+// The recovery line is the load-bearing half. A paused row with an
+// unexplained stop is exactly what has users deleting a job whose
+// journal is intact - so the block says what was measured, which folder
+// it was measured on, that nothing has been lost, and that the queue
+// starts itself again.
+function storagePauseBlock(s){
+  const sp=lastQ&&lastQ.storage_pause;
+  if(!sp||sp.nzo_id!==s.nzo_id) return '';
+  const n=sp.healthy_probes|0, need=sp.probes_needed|0;
+  return `<div class="warn" style="font-size:12px;margin-top:7px">Paused: output storage is not keeping up.<br>
+    <span class="dim">${esc(sp.evidence||'')}<br>
+    Everything downloaded so far is kept. nzbfast is re-checking the folder
+    ${need?`and resumes after ${need} clean write checks in a row (${n} so far)`:'and resumes on its own'}.
+    ${sp.probe_ms?`Last check took ${Math.round(sp.probe_ms/100)/10} s.`:''}</span></div>`;
+}
 function mediaWarnBlock(m){
   const why=m?mediaWhy(m):[];
   if(!why.length) return '';
@@ -4349,28 +4732,45 @@ function histWhen(s, full){
 }
 function renderHistory(slots){
   if(slots) lastHistSlots=slots;
-  const all=lastHistSlots, cur=histFilter();
-  const count=k=>all.filter(histBucket(k)).length;
+  const cur=histFilter();
+  // §129 1a: the daemon filters, searches and windows at the store, and
+  // sends the facet counts with the page - the chips no longer need the
+  // whole payload to count themselves (there is no whole payload).
+  const counts=(lastHist&&lastHist.counts)||{};
+  const total=lastHist?lastHist.noofslots:0;
+  const count=k=>counts[k]||0;
   const labels={all:t('hist.f.all','All'), done:t('hist.f.done','Completed'),
     failed:t('hist.f.failed','Failed'), locked:t('hist.f.locked','Needs password')};
   // An empty bucket stays out of the way - but never hide the one in
   // force, or the active chip vanishes and the empty list reads as a bug.
+  // Never while the search box has focus: rewriting the bar recreates
+  // the input and takes the caret with it (same guard the queue uses
+  // for its focused controls).
+  const hsFocused=document.activeElement&&document.activeElement.id==='histSearch';
+  if(!hsFocused)
   setHtml('histFilter', HIST_BUCKETS.filter(([k])=>k==='all'||k===cur||count(k)>0)
     .map(([k])=>`<button class="ghost${k===cur?' on':''}" aria-pressed="${k===cur}"`
-      +` onclick="setHistFilter('${k}')">${labels[k]} <span class="dim">${count(k)}</span></button>`).join(''));
+      +` onclick="setHistFilter('${k}')">${labels[k]} <span class="dim">${count(k)}</span></button>`).join('')
+    +`<input id="histSearch" class="mini" type="search" value="${escA(histSearch)}"`
+    +` placeholder="${escA(t('hist.search','search history…'))}"`
+    +` aria-label="${escA(t('hist.search','search history…'))}"`
+    +` oninput="setHistSearch(this.value)" style="margin-inline-start:auto;max-width:180px">`);
   // The header's one-click clear appears only when it has work to do -
   // and counts exactly what the daemon's value=completed sweep will take,
   // which is NOT the Completed chip's count: that chip includes the
   // password-locked rows, and those stay (see clearHistDone).
-  const clearable=all.filter(s=>s.status==='Completed'&&!s.password_required).length;
+  const clearable=count('clearable');
   const cb=document.getElementById('histClear');
   if(cb) cb.style.display=clearable?'':'none';
-  const shown=all.filter(histBucket(cur));
-  // Collapsed shows HIST_ROWS; the ▤ button expands to the lot. Even
-  // expanded keeps a ceiling: someone with 500 finished downloads does
-  // not want all of them laid out, and the DOM does not want it either.
-  const lim=histExpanded()?200:histRows();
-  const rows=shown.slice(0,lim);
+  // Already filtered and windowed by the daemon.
+  const rows=lastHistSlots;
+  // §129 2f: same shape of guard as the queue's - never yank a checkbox
+  // (or the bulk bar) out from under the keyboard mid-use; and the
+  // selection tracks the rendered window, so a bulk op can only touch
+  // rows the user can see.
+  const selGuard=document.querySelector('#hist tbody input:focus, #hselbar :focus');
+  if(!selGuard) for(const id of [...hSel]) if(!rows.some(s=>s.nzo_id===id)) hSel.delete(id);
+  if(!selGuard)
   setHtml(document.querySelector('#hist tbody'), rows.map(s=>{
       const failed=s.status!=='Completed';
       // The daemon says what would actually help this row (fail_action).
@@ -4415,6 +4815,18 @@ function renderHistory(slots){
       // silently vanish and re-queue minutes later.
       if(failed&&s.auto_retry_at&&s.auto_retry_at*1000>Date.now())
         sub.push(`<span class="warn">${esc(t('hist.autoretry','retrying automatically in {m} min',{m:Math.max(1,Math.ceil((s.auto_retry_at*1000-Date.now())/60000))}))}</span>`);
+      // The same courtesy for a move that could not reach its
+      // destination. That row is amber rather than red, so before this
+      // the ONLY sign of a job the daemon was still retrying - or had
+      // stopped retrying - was inside the drawer, and a job blocked on
+      // an unmounted volume sat there for 15 hours (8 Aug 2026) saying
+      // nothing at all on the row.
+      else if(!failed&&s.move_failed){
+        const nextTry=s.auto_retry_at&&s.auto_retry_at*1000>Date.now();
+        sub.push(`<span class="warn">${esc(nextTry
+          ?t('hist.moveretry','not moved yet - trying again in {m} min',{m:Math.max(1,Math.ceil((s.auto_retry_at*1000-Date.now())/60000))})
+          :t('hist.movestopped','not moved - automatic retries have stopped'))}</span>`);
+      }
       const st=sub.length?`<br><span class="dim">${sub.join(' · ')}</span>`:'';
       // Completed, but something in it is still packed (no unpacker for
       // the format). Not a failure - every byte arrived - but the folder
@@ -4434,7 +4846,17 @@ function renderHistory(slots){
       // release - the same "succeeded with a caveat" the amber above is
       // for.
       const split=!failed&&s.move_split;
-      const cls=failed?'fail':((stillPacked||needsPw||split)?'warnrow':'done');
+      // The move to the completed folder failed outright: every byte is
+      // safe in the download folder, but a plain green row said the
+      // opposite of the truth for hours on 7 Aug - five finished jobs
+      // "in" a folder they never reached.
+      const moveFail=!failed&&s.move_failed;
+      // C: the move to the completed folder runs on its own worker
+      // now, so a freshly finished row can be green while its files
+      // are still travelling - say so instead of naming a folder the
+      // payload has not reached yet.
+      const movingNow=!failed&&!moveFail&&s.move_pending;
+      const cls=failed?'fail':((stillPacked||needsPw||split||moveFail)?'warnrow':'done');
       // role=img + aria-label on the dot: the pass/fail verdict was
       // colour alone (green/red/amber CSS on .sdot), invisible to a
       // screen reader and to colour-blind users' AT alike.
@@ -4445,27 +4867,47 @@ function renderHistory(slots){
       const dotLabel=failed?t('status.Failed','Failed')
         :needsPw?t('hist.needpw','needs a password')
         :split?t('hist.split','part of it did not move')
+        :moveFail?t('hist.movefail','not moved to its destination')
         :stillPacked?t('hist.packed','still packed: {name}',{name:s.unpack_blocked_by})
         :t('status.Completed','Completed');
+      // §129 2f: keydown fires only when the row ITSELF is the target -
+      // Space on the row's checkbox (or Enter on a row button) must not
+      // also fold the details open with a preventDefault that swallows
+      // the control's own activation.
       return `<tr class="item ${cls}" data-id="${escA(s.nzo_id)}" onclick="toggleHistRow(this)" tabindex="0"
-        onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleHistRow(this);}"
+        onkeydown="if((event.key==='Enter'||event.key===' ')&&event.target===this){event.preventDefault();toggleHistRow(this);}"
         ondblclick="openItem('${s.nzo_id}','file')" oncontextmenu="return histMenu(event,'${s.nzo_id}',${retryable})"
         title="${escA(t('hist.row.title3','Click the row for details. Every action is on the row itself: ⋯ opens the rest. Double-click plays, right-click opens the same menu.'))}">
-        <td><span class="nm"><span class="caret">▶</span><span class="sdot" role="img" aria-label="${escA(dotLabel)}"></span><span class="nmtxt">${esc(s.name)}${identName(s)}${mediaBadge(s.media)}${shapeBadge(s.archive_shape)}${originGlyph(s.origin)}${needsPw?` <span class="warn">· ${t('hist.needpw','needs a password')}</span>`:''}${split?` <span class="warn">· ${t('hist.split','part of it did not move')}</span>`:''}</span></span></td>
+        <td class="selcol"><input type="checkbox" class="rowsel" data-sel="${escA(s.nzo_id)}"${hSel.has(s.nzo_id)?' checked':''} onclick="selClick(event,'h',this)" aria-label="${escA(t('sel.row','Select {name}',{name:s.name}))}"></td>
+        <td><span class="nm"><span class="caret">▶</span><span class="sdot" role="img" aria-label="${escA(dotLabel)}"></span><span class="nmtxt">${esc(s.name)}${identName(s)}${mediaBadge(s.media)}${shapeBadge(s.archive_shape)}${originGlyph(s.origin)}${needsPw?` <span class="warn">· ${t('hist.needpw','needs a password')}</span>`:''}${split?` <span class="warn">· ${t('hist.split','part of it did not move')}</span>`:''}${moveFail?` <span class="warn">· ${t('hist.movefail','not moved to its destination')}</span>`:''}${movingNow?` <span class="dim">· ${t('hist.moving','moving to its destination…')}</span>`:''}</span></span></td>
         <td class="nowrap">${s.bytes!=null?fmtSize(s.bytes):esc(s.size||'')}${st}</td>
         <td class="nowrap" style="text-align:end">${ctl}</td></tr>`;
     }).join('')
-      ||`<tr><td colspan="3" class="dim">${all.length
+      ||`<tr><td colspan="4" class="dim">${(count('all')||histSearch||cur!=='all')
           ? t('hist.noneFilter','nothing with this status')
           : t('hist.none.new','Finished downloads are listed here, newest first.')}</td></tr>`);
+  updateSelBar('h');
+  restoreKbdFocus();
   // Say what is being withheld rather than just stopping - a list that
-  // ends silently at 10 of 17 reads as lost downloads.
-  const more=shown.length-rows.length;
+  // ends silently at 10 of 17 reads as lost downloads. `total` is the
+  // daemon's filtered count, so the pager reaches a history far past
+  // what this page holds (the 200-row cliff is gone).
+  const more=total-rows.length;
   setHtml('histMore', more>0
-    ? `<button class="ghost mini" onclick="setHistExpanded(true)">${esc(t('hist.more','show all {n}',{n:shown.length}))}</button>`
-    : (histExpanded()&&shown.length>histRows()
+    ? `<button class="ghost mini" onclick="histShowMore()">${esc(
+        histExpanded()
+          ? t('hist.morepage','show {n} more of {total}',{n:Math.min(200,more),total})
+          : t('hist.more','show all {n}',{n:total}))}</button>`
+    : (histExpanded()&&total>histRows()
         ? `<button class="ghost mini" onclick="setHistExpanded(false)">${esc(t('hist.less','show fewer'))}</button>`:''));
   applyAllCardCaps();
+}
+// Expand first; every press after that raises the window by 200 rows -
+// real paging against the store, not a slice of a capped payload.
+function histShowMore(){
+  if(!histExpanded()){ setHistExpanded(true); return; }
+  histLimitOverride=Math.max(200,histLimitOverride)+200;
+  dashHRev=0; tick();
 }
 
 // §73 phase 1: what the file actually IS, read out of the container
@@ -4595,6 +5037,17 @@ function findAnother(id){
   if(!s) return;
   location.href='/wall#q='+encodeURIComponent(s.identity_name||s.name||'');
 }
+// One full history record, fetched on demand and cached until the
+// history revision moves (tick clears histFull on every fresh page).
+async function histFullRow(id){
+  if(histFull[id]) return histFull[id];
+  try{
+    const r=await api('history','&nzo_ids='+encodeURIComponent(id));
+    const s=r&&r.history&&r.history.slots&&r.history.slots[0];
+    if(s) histFull[s.nzo_id]=s;
+    return s||null;
+  }catch(e){ return null; }
+}
 // The ONE action that can help this failure, chosen daemon-side
 // (fail_action) so the rule is testable and the page only has to draw
 // it. `space` is deliberately absent: a full disk has its own richer row
@@ -4640,11 +5093,15 @@ function firstClause(msg){
 }
 // Row detail: status in words, the failure message in full, and the path
 // - the three things the dropped columns used to carry.
-function toggleHistRow(tr){
+async function toggleHistRow(tr){
   const next=tr.nextElementSibling;
   if(next&&next.classList.contains('drawer')){ next.remove(); tr.classList.remove('open'); return; }
-  const s=(lastHistSlots||[]).find(x=>x.nzo_id===tr.dataset.id);
+  // §129 1a: the list rows are compact summaries; the drawer's detail
+  // (fail hints, space math, cleanup lines, identify) is fetched per
+  // row on demand and cached until the history revision moves.
+  const s=await histFullRow(tr.dataset.id);
   if(!s) return;
+  if(!tr.isConnected) return;         // the list re-rendered mid-fetch
   const failed=s.status!=='Completed';
   const rows=[[t('col.status','Status'),
     `<span class="${failed?'bad':'ok'}">${esc(tStatus(s.status))}</span>`
@@ -4661,6 +5118,11 @@ function toggleHistRow(tr){
     // The rule that decided it says everything in three words.
     +(s.smart_rule?` <span class="dim">${esc(t('hist.cat.byrule','set by rule {name}',{name:s.smart_rule}))}</span>`:'')
     +` <button class="ghost mini" onclick="event.stopPropagation();changeCat('${s.nzo_id}')">${esc(t('hist.cat.change','change…'))}</button>`]);
+  // §129 2d: the identity duplicate detection derived - the answer to
+  // "why was this held / failed as a duplicate", inspectable instead
+  // of inferred. Shown only when there is one.
+  if(s.duplicate_key) rows.push([t('hist.dupekey','Duplicate identity'),
+    `<span class="dim" title="${escA(t('hist.dupekey.title','Two downloads with the same identity are treated as copies of the same thing. Derived from the name (show, season and episode, or title and year).'))}">${esc(s.duplicate_key)}</span>`]);
   // Where the job came from (Gary's report: a watch-folder pickup left
   // no trace of WHY it downloaded). Empty for records that predate the
   // origin field, or carry a token this page does not know - no row then.
@@ -4800,6 +5262,29 @@ function toggleHistRow(tr){
     rows.push([t('hist.split.head','Also here'),
       `<span class="warn">${esc(t('hist.split.body','Moving this download to its destination failed part way, so the files are in two places. Check both before deleting either.'))}</span><br>`
       +`<span class="mono" style="word-break:break-all">${esc(s.move_split)}</span>`]);
+  // The nothing-moved sibling of the split row above, same placement
+  // logic: it corrects Location, so it sits beside it. Names the
+  // destination and the OS error (only this record still has them once
+  // the log line rolls out), and offers the files-only retry - the
+  // ordinary retry button re-downloads, which is exactly wrong here.
+  if(!failed&&s.move_failed){
+    // Armed or given up. The daemon backs the retry off and stops after
+    // a day of failures, so "the move is retried on its own" stopped
+    // being true for every case and the drawer has to say WHICH - a
+    // job nobody is going to move is exactly the one the user has to
+    // hear about.
+    const nextTry=s.auto_retry_at&&s.auto_retry_at*1000>Date.now();
+    const tries=s.move_attempts||0;
+    rows.push([t('hist.movefail.head','Not moved'),
+      `<span class="warn">${esc(nextTry
+        ?t('hist.movefail.body','Moving this download to its destination failed. The files are safe in the download folder, and the move is retried on its own.')
+        :t('hist.movefail.gaveup','Moving this download to its destination failed {n} times, so nzbfast has stopped trying. The files are safe in the download folder. Fix the destination, then use the button below.',{n:tries}))}</span><br>`
+      +`<span class="mono" style="word-break:break-all">${esc(s.move_failed)}</span>`
+      +(nextTry&&tries>1
+        ?`<br><span class="dim">${esc(t('hist.movefail.tries','Tried {n} times; next try in {m} min.',{n:tries,m:Math.max(1,Math.ceil((s.auto_retry_at*1000-Date.now())/60000))}))}</span>`
+        :'')
+      +`<div style="margin-top:6px"><button class="ghost mini" onclick="event.stopPropagation();retryMove('${escA(s.nzo_id)}')">↻ ${esc(t('hist.movefail.retry','Try the move now'))}</button></div>`]);
+  }
 
   // Truth-audit I: a de-obfuscation rename left history saying "a4f9c2e1"
   // and the disk saying "Example.Movie.2019.1080p-GRP", with nothing
@@ -4858,7 +5343,7 @@ function toggleHistRow(tr){
   }
   const d=document.createElement('tr');
   d.className='drawer';
-  d.innerHTML=`<td colspan="3"><dl class="histdet">${
+  d.innerHTML=`<td colspan="4"><dl class="histdet">${
     rows.map(([k,v])=>`<dt>${esc(k)}</dt><dd>${v}</dd>`).join('')}</dl></td>`;
   tr.classList.add('open');
   tr.after(d);
@@ -5304,7 +5789,77 @@ function actLine(s){
 }
 function actSub(s){
   const txt=actLine(s);
-  return txt?`<div class="dim actline" title="${escA(txt)}">${txt}</div>`:'';
+  // §129 4b: when the attribution engine has a shortfall verdict for
+  // THIS job, say so in one clause right where the eye already is.
+  // "line" and "unknown" stay silent here - a row running at line
+  // speed needs no caveat, and a verdict still forming is not news.
+  const w=lastQ&&lastQ.whyslow;
+  const why=(s.status==='Downloading'&&w&&w.nzo_id===s.nzo_id
+    &&['provider','cpu','client','disk','limit'].includes(w.layer))
+    ?`<span class="dim"> · ${whyPhrase(w)}</span>`:'';
+  return (txt||why)?`<div class="dim actline" title="${escA(txt)}">${txt}${why}</div>`:'';
+}
+// §129 4b: the verdict phrase for a whyslow payload. Tokens and
+// numbers come from the daemon (serve/whyslow.rs); every sentence is
+// composed here so it is translatable. The detail is only ever a
+// server name, language-neutral by construction.
+function whyPhrase(w){
+  const d=w.detail?esc(String(w.detail).replace(/^(news|reader)\./,'')):'';
+  switch(w.layer){
+    case 'limit':return t('diag.layer.limit','held at your speed limit');
+    case 'line':return t('diag.layer.line','running at line speed');
+    case 'disk':return t('diag.layer.disk','storage is not keeping up');
+    case 'cpu':return t('diag.layer.cpu','this machine is at its CPU limit');
+    case 'client':return t('diag.layer.client','held up inside nzbfast (decode, verify or disk writes)');
+    case 'provider':return d?t('diag.layer.provider.host','{s} is the limit',{s:d})
+      :t('diag.layer.provider','your providers are the limit');
+  }
+  return t('diag.layer.unknown','still gathering evidence');
+}
+// The panel itself: the verdict WITH its receipts. The three-layer gap
+// (line ceiling / what the providers delivered / right now), the
+// per-provider table where shaping is visible by inspection, and the
+// verdict timeline for this job. A bar is only drawn when its number
+// exists - absence renders as absence, never as a guess.
+function whyslowBlock(s){
+  const w=lastQ&&lastQ.whyslow;
+  if(!w||w.nzo_id!==s.nzo_id) return '';
+  const srcLbl={measured:t('diag.src.measured','measured'),
+    line:t('diag.src.line','your line speed setting'),
+    bench:t('diag.src.bench','probed')}[w.hardware_src]||'';
+  const bars=[
+    [t('diag.bar.now','right now'), +w.achieved_bps||0, ''],
+    [t('diag.bar.envelope','providers delivered'), +w.envelope_bps||0, ''],
+    [t('diag.bar.hardware','line ceiling'), +w.hardware_bps||0, srcLbl],
+  ].filter(b=>b[1]>0);
+  const mx=bars.reduce((a,b)=>Math.max(a,b[1]),1);
+  const barHtml=bars.length>=2?bars.map(([lbl,v,src])=>
+    `<div class="drow"><span class="dname dim" style="flex:0 0 150px">${lbl}</span>
+      <div class="bar"><i style="width:${(100*v/mx).toFixed(1)}%"></i></div>
+      <span class="dim mono nowrap">${fmtRate(v/1e6)}${src?` <span style="opacity:.7">(${src})</span>`:''}</span></div>`).join(''):'';
+  // Per-provider evidence: the per-connection rate is the column that
+  // makes shaping visible (one host at 2 MB/s per connection beside
+  // another at 40 needs no further argument).
+  const srv=(w.servers||[]).filter(x=>(x.budget||0)>0||(x.conns||0)>0);
+  const srvHtml=srv.length?`<div class="dsrv" style="margin-top:6px">`+srv.map(x=>{
+    const marks=[];
+    if(x.refused) marks.push(t('diag.srv.refused','refused'));
+    if((x.missing_pct||0)>=0.5) marks.push(t('diag.srv.missing','{p}% missing',{p:(+x.missing_pct).toFixed(1)}));
+    if((x.reconnects||0)>0) marks.push(t('diag.srv.reconnects','{n} reconnects',{n:x.reconnects}));
+    return `<span>${esc(String(x.host).replace(/^(news|reader)\./,''))} <b>${x.conns}/${x.budget}</b> · ${
+      t('diag.srv.perconn','{r} per connection',{r:fmtRate((+x.per_conn_bps||0)/1e6)})}${
+      marks.length?` · <span class="bad">${marks.join(' · ')}</span>`:''}</span>`;
+  }).join('')+`</div>`:'';
+  const tl=(w.timeline||[]).slice(0,5);
+  const tlHtml=tl.length>1?`<div class="dim" style="font-size:11.5px;margin-top:5px">${
+    tl.map(e=>`${new Date(e.at_ms).toLocaleTimeString()} ${whyPhrase(e)}`).join(' · ')}</div>`:'';
+  return `<div style="font-size:12px;margin-top:9px;padding-top:7px;border-top:1px dashed var(--line)">
+    <div><b>${t('diag.title','Why is this slow?')}</b> <span class="dim">${whyPhrase(w)}${
+      w.secs>5?` <span style="opacity:.7">(${t('diag.held','for {n}s',{n:w.secs})})</span>`:''}</span></div>
+    ${barHtml}${srvHtml}${tlHtml}
+    <div class="dim" style="font-size:11px;margin-top:4px;opacity:.8">${
+      t('diag.receipts','waiting on decode or disk {b}% of the time · CPU {c}%',{b:(+w.blocked_pct||0).toFixed(0),c:(+w.cpu_pct||0).toFixed(0)})}</div>
+  </div>`;
 }
 // Queue table renderer (runs each tick AND on drawer toggles). The
 // re-render is suppressed while a row is mid-drag or a drawer control has
@@ -5348,6 +5903,8 @@ function renderQueue(){
       qs.style.display='';
       qs.textContent='⚠ '+(hold.kind==='disk'
         ? t('queue.hold.disk','Queue held: {free} GB free is below your {min} GB minimum. Downloads start again as soon as space is freed.',{free:(+hold.a).toFixed(1),min:(+hold.b).toFixed(1)})
+        : hold.kind==='postproc'
+        ? t('queue.hold.postproc','Queue held: {n} download(s) are still finishing (verify, repair, unpack). The next download starts as soon as one completes.',{n:(+hold.a).toFixed(0)})
         : t('queue.hold.quota','Quota spent: {used} of {cap} GB this period. Only Force items download until it rolls over.',{used:(+hold.a).toFixed(1),cap:(+hold.b).toFixed(1)}));
       // The control that answers the sentence, beside the sentence. The
       // setting that decided this is two cards deep in Settings, and a
@@ -5355,22 +5912,26 @@ function renderQueue(){
       // the reader go hunting for the row we already know the id of.
       // Built as a node, not markup, so the sentence above stays
       // textContent.
-      const gb=document.createElement('button');
-      gb.className='ghost mini'; gb.style.marginInlineStart='8px';
-      if(hold.kind==='disk'){
-        gb.textContent=t('queue.hold.disk.btn','Change the minimum');
-        gb.title=t('queue.hold.disk.btn.title','Open the Minimum free space setting.');
-        gb.onclick=()=>landOnRow('s_min_free');
-      }else{
-        gb.textContent=t('queue.hold.quota.btn','Change the quota');
-        gb.title=t('queue.hold.quota.btn.title','Open the Download quota setting.');
-        gb.onclick=()=>landOnRow('s_quota');
+      // A postproc hold has no setting behind it - it clears on its
+      // own the moment a finishing job parks, so it gets no button.
+      if(hold.kind!=='postproc'){
+        const gb=document.createElement('button');
+        gb.className='ghost mini'; gb.style.marginInlineStart='8px';
+        if(hold.kind==='disk'){
+          gb.textContent=t('queue.hold.disk.btn','Change the minimum');
+          gb.title=t('queue.hold.disk.btn.title','Open the Minimum free space setting.');
+          gb.onclick=()=>landOnRow('s_min_free');
+        }else{
+          gb.textContent=t('queue.hold.quota.btn','Change the quota');
+          gb.title=t('queue.hold.quota.btn.title','Open the Download quota setting.');
+          gb.onclick=()=>landOnRow('s_quota');
+        }
+        qs.appendChild(gb);
       }
-      qs.appendChild(gb);
       // Force is the way past a spent quota (a full disk it cannot
       // help - the bytes have nowhere to land either way), and the row
       // button that does it is right there once you know to look.
-      if(hold.kind!=='disk' && slots.length){
+      if(hold.kind==='quota' && slots.length){
         const fb=document.createElement('span');
         fb.className='dim'; fb.style.marginInlineStart='8px';
         fb.textContent=t('queue.hold.quota.force','Use ⏫ on a row to run it anyway.');
@@ -5386,7 +5947,11 @@ function renderQueue(){
   // Guard only the controls a re-render would actually yank mid-use:
   // guarding ANY focus froze all live queue updates for keyboard users
   // whose focus naturally rests on a row or button between actions.
-  if(qDragging||document.querySelector('#queue tbody select:focus, #queue tbody input:focus')) return;
+  if(qDragging||document.querySelector('#queue tbody select:focus, #queue tbody input:focus, #qselbar :focus')) return;
+  // §129 2f: selection tracks the queue - a row that left (finished,
+  // deleted elsewhere) leaves the Set too, so a later bulk op cannot
+  // act on ids the user can no longer see.
+  for(const id of [...qSel]) if(!slots.some(s=>s.nzo_id===id)) qSel.delete(id);
   // Cumulative ETA: each item finishes once everything downloading BEFORE
   // it has drained the line. Download order is NOT visual row order -
   // pick_job runs Force/High first, then queue order within a priority,
@@ -5430,6 +5995,10 @@ function renderQueue(){
         `<button class="ghost mini" title="${escA(t('queue.up.title','Move up the queue'))}" aria-label="${escA(t('queue.up.title','Move up the queue'))}" onclick="qMove('${s.nzo_id}',-1)">↑</button>`+
         `<button class="ghost mini" title="${escA(t('queue.down.title','Move down the queue'))}" aria-label="${escA(t('queue.down.title','Move down the queue'))}" onclick="qMove('${s.nzo_id}',1)">↓</button>`+
         `<button class="ghost mini" title="${escA(t('queue.remove.title','Remove from the queue'))}" aria-label="${escA(t('queue.remove.title','Remove from the queue'))}" onclick="qOp('delete','${s.nzo_id}')">✕</button>`;
+    // §129 3e: the live storage pause, if one is holding. Read off the
+    // whole-queue payload rather than the slot, because the pause is the
+    // queue's and only names the job it happened to.
+    const sp=lastQ&&lastQ.storage_pause;
     // The 🔑 badge looked exactly like a button and was not one: the only
     // way in was to open the row and find "Set password" in the drawer.
     // It is the button it looks like now - same unlockJob the drawer and
@@ -5437,6 +6006,11 @@ function renderQueue(){
     // row open instead.
     const defer=(s.password_needed?` <button class="ghost mini warn" title="${escA(t('queue.pwneeded.title2','This archive is password-protected. Enter the password here - the download keeps running, and with the password it unpacks in one pass.'))}" onclick="event.stopPropagation();unlockJob('${escA(s.nzo_id)}')">🔑 ${t('queue.pwneeded','needs a password')}</button>`:'')+
       (s.deferred?` <span class="dim" title="${escA(s.defer_reason||'')}">· ${t('queue.deferred','deferred (slow)')}</span>`:'')+
+      // §129 3e: this is the row the storage stall happened to. The
+      // header pill says the queue is paused; only this line says which
+      // download it stopped, and the tooltip carries the numbers behind
+      // the claim.
+      (sp&&sp.nzo_id===s.nzo_id?` <span class="warn" title="${escA(sp.evidence||'')}">· paused: output storage is not keeping up</span>`:'')+
       // Spotted in the NZB's file list at add time: this post is packed
       // in a format we have no unpacker for, so it will arrive complete
       // and still packed. Better said now than after the download.
@@ -5452,7 +6026,7 @@ function renderQueue(){
       // the job back on its own.
       healthBadge(s.health);
     const pzLabel=s.priority==='Duplicate'
-      ? `<span class="dim" title="${escA(t('queue.dup.title2','An equivalent release is already downloaded or queued: this copy is held, not stuck. Download it anyway with ⏫, or open the row and give it a priority - either one releases the hold.'))}">· ${t('queue.dup','held (duplicate)')}</span>`
+      ? `<span class="dim" title="${escA(t('queue.dup.title2','An equivalent release is already downloaded or queued: this copy is held, not stuck. Download it anyway with ⏫, or open the row and give it a priority - either one releases the hold.')+(s.duplicate_key?` [${s.duplicate_key}]`:''))}">· ${t('queue.dup','held (duplicate)')}</span>`
       : `<span class="dim">· ${t('status.paused','paused')}</span>`;
     // Truth-audit I: identName() and the Smart Folder rule badge on the
     // QUEUE row, not just in history. A retried obfuscated job already
@@ -5466,15 +6040,23 @@ function renderQueue(){
     // rate, so the cumulative-ETA arithmetic above skips it entirely -
     // and "-" there said nothing about why a row at 100% was still on
     // the page.
-    const tailWord=tail?esc(tStatus(s.status)):'';
-    return `<tr class="qrow${open?' open':''}" data-id="${s.nzo_id}" data-i="${i}" draggable="${dl||tail?'false':'true'}" tabindex="0" role="button" aria-expanded="${open}"><td>${esc(s.filename||s.name)}${identName(s)}${mediaBadge(s.media)}${shapeBadge(s.archive_shape)}${originGlyph(s.origin)}${ruleBadge(s)}${pz?' '+pzLabel:''}${tail?` <span class="dim">· ${tailWord}</span>`:''}${defer}</td><td class="nowrap">${fmtMB(s.mb)}</td>
+    // §129: a lane row's word is "Finishing" - the activity sub-line
+    // already carries the localized stage token, so the status chip
+    // says what the ROW is rather than repeating the stage twice.
+    const tailWord=tail?esc(s.finishing?t('queue.state.finishing','Finishing'):tStatus(s.status)):'';
+    // §129 2f: the checkbox renders its state straight from the Set, so
+    // selection survives every setHtml tbody re-render by construction.
+    const selBox=`<td class="selcol"><input type="checkbox" class="rowsel" data-sel="${s.nzo_id}"${qSel.has(s.nzo_id)?' checked':''} onclick="selClick(event,'q',this)" aria-label="${escA(t('sel.row','Select {name}',{name:s.filename||s.name}))}"></td>`;
+    return `<tr class="qrow${open?' open':''}" data-id="${s.nzo_id}" data-i="${i}" draggable="${dl||tail?'false':'true'}" tabindex="0" role="button" aria-expanded="${open}">${selBox}<td>${esc(s.filename||s.name)}${identName(s)}${mediaBadge(s.media)}${shapeBadge(s.archive_shape)}${originGlyph(s.origin)}${ruleBadge(s)}${pz?' '+pzLabel:''}${tail?` <span class="dim">· ${tailWord}</span>`:''}${defer}</td><td class="nowrap">${fmtMB(s.mb)}</td>
       <td class="nowrap dim">${fmtMB(s.mbleft)}</td><td class="nowrap mono" title="${escA(tail?t('queue.eta.finishing','the download is done - this is the work that follows it'):dl?t('queue.eta.active','time to finish this download'):t('queue.eta.queued','estimated finish, once the items ahead complete'))}">${tail?`<span class="dim">${tailWord}</span>`:pz?'-':fmtEta(eta)}</td>
       <td><div class="bar"><i style="width:${s.percentage}%"></i></div>${actSub(s)}</td>
       <td class="nowrap" style="text-align:end">${ctl}</td></tr>`+
-      (open?`<tr class="drawer"><td colspan="6">${drawerHtml(s)}</td></tr>`:'');
-  }).join('')||`<tr><td colspan="6" class="dim"><button type="button" class="idlepick">${
+      (open?`<tr class="drawer"><td colspan="7">${drawerHtml(s)}</td></tr>`:'');
+  }).join('')||`<tr><td colspan="7" class="dim"><button type="button" class="idlepick">${
       t('queue.empty.drop','Nothing downloading. Drop a .nzb anywhere, or click here to choose one.')}</button><br><span class="dim">${
       t('queue.empty.nzblnk','An nzblnk link works too: paste it anywhere on this page.')}</span></td></tr>`);
+  updateSelBar('q');
+  restoreKbdFocus();
 }
 // Detail drawer body: live per-file progress + verify + per-server
 // contribution for the ACTIVE download; identity + priority control for
@@ -5866,7 +6448,7 @@ function drawerHtml(s){
     // user opens to ask "why is this here?" was exactly the one branch
     // that never said.
     const oline=dol?`<div class="dim" style="font-size:12px;margin-top:7px">${t('drawer.origin','added by')} ${esc(dol)}</div>`:'';
-    return files+vline+sline+oline+mediaWarnBlock(s.media)+pwBlock(s)
+    return files+vline+sline+oline+whyslowBlock(s)+mediaWarnBlock(s.media)+pwBlock(s)
       +`<div style="font-size:12px;margin-top:7px">${nzbBlock(s)}</div>`+probeHtml(s.nzo_id);
   }
   // Finishing: neither of the two branches around this one fits. The
@@ -5905,6 +6487,10 @@ function drawerHtml(s){
           ? `<br><span class="dim" style="font-size:11.5px">${t('drawer.dup.hint','Picking a priority downloads this copy anyway: it releases the hold as well as setting the priority. ⏫ does both in one click.')}</span>`
           : ''}</span>
       <span class="dim">${t('drawer.category','category')}</span><span>${esc(s.cat==='*'?t('drawer.nocat','none'):s.cat)}</span>
+      ${s.sab_pp!=null?`<span class="dim">${t('drawer.pp','post-processing')}</span><span style="font-size:12px">${esc(s.sab_pp<=1
+        ?t('drawer.pp.skip','pp={n} was requested (skip repair or unpack). Repair and unpack are part of the one-pass download itself, so the request is recorded here and the download runs normally.',{n:s.sab_pp})
+        :t('drawer.pp.normal','pp={n} was requested, which matches normal behavior: repair and unpack happen during the download, and sample cleanup follows your cleanup settings.',{n:s.sab_pp}))}</span>`:''}
+      ${s.script_override?`<span class="dim">${t('drawer.script','script')}</span><span class="mono" style="font-size:11.5px">${esc(s.script_override)}</span>`:''}
       ${dol?`<span class="dim">${t('drawer.origin','added by')}</span><span>${esc(dol)}</span>`:''}
       ${s.nzb_path?`<span class="dim">${t('drawer.nzbfile','NZB file')}</span><span class="mono" style="word-break:break-all;font-size:11.5px">${esc(s.nzb_path)} ${nzbBlock(s)}</span>`:''}
     </div>`+
@@ -5914,6 +6500,11 @@ function drawerHtml(s){
     mediaWarnBlock(s.media)+
     (s.deferred?`<div class="warn" style="font-size:12px;margin-top:7px">${t('drawer.deferred','Deferred as slow:')} ${esc(s.defer_reason||'')}<br>
       <span class="dim">${t('drawer.deferred.hint','Runs when nothing faster is queued; change its priority or drag it up to override.')}</span></div>`:'')+
+    // §129 3e: the evidence behind the pause, where a user who wants to
+    // check the claim will look for it. Nothing here is a button - the
+    // queue comes back on its own, and saying so is what stops someone
+    // deleting a job whose data is entirely intact.
+    storagePauseBlock(s)+
     healthDetail(s.health)+
     (s.prefetching?`<div class="ok" style="font-size:12px;margin-top:7px">${t('drawer.prefetch2','Prefetching on idle servers: {s} landed while the active download runs.',{s:fmtMB(s.prefetched_mb||0)})}
       <span class="dim">${t('drawer.prefetch.hint',"If it can't finish there, the progress is kept and the normal download resumes from it.")}</span></div>`:'')+
@@ -6464,6 +7055,36 @@ async function retryJob(id){
   else toast(t('toast.retryfail','Retry failed: item not found.'), true);
   tick();
 }
+// C: the "File moves" pacing setting - one value, three modes:
+// "yield", "full", or an integer MB/s. The select and the number box
+// compose it; only the fixed mode shows the box.
+function initMovePace(v){
+  const sel=document.getElementById('s_move_pace_mode');
+  const num=document.getElementById('s_move_pace_mbs');
+  if(!sel||!num) return;
+  if(v==='yield'||v==='full'){ sel.value=v; num.style.display='none'; }
+  else { sel.value='fixed'; num.value=parseInt(v,10)||50; num.style.display=''; }
+}
+async function movePaceChanged(){
+  const sel=document.getElementById('s_move_pace_mode');
+  const num=document.getElementById('s_move_pace_mbs');
+  if(sel.value==='fixed'){
+    num.style.display='';
+    if(!num.value) { num.value=50; }
+    await setCfg('move_pace', String(parseInt(num.value,10)||50));
+  } else {
+    num.style.display='none';
+    await setCfg('move_pace', sel.value);
+  }
+}
+// Files-only retry for a completed job whose move to the completed
+// folder failed (the drawer's "Not moved" row). Nothing is downloaded.
+async function retryMove(id){
+  const j=await api('retry_move',`&value=${encodeURIComponent(id)}`);
+  if(j.status) toast(t('toast.moveretry','Moving the files again…'));
+  else toast(t('toast.moveretryfail','The move could not start: the files may already be moving.'), true);
+  tick();
+}
 // M24: passworded archive - send the password, daemon unpacks the
 // verified volumes in the background (badge clears on the next poll).
 async function unlockJob(id){
@@ -6645,6 +7266,263 @@ async function delHistFiles(id){
   toast(t('toast.delfiles','Removed: files deleted.'));
   tick();
 }
+
+// ---- §129 2f: multi-select + bulk operations ---------------------------
+// The wall's proven pattern (24C): a Set of ids is the one source of
+// truth, the checkboxes render their state FROM it, so selection
+// survives every setHtml tbody re-render by construction. 'q' = queue,
+// 'h' = history throughout.
+const qSel=new Set(), hSel=new Set();
+const selAnchor={q:null,h:null};        // last-clicked id, for shift ranges
+function selIds(list){ return list==='q'?qSel:hSel; }
+function selRows(list){
+  return [...document.querySelectorAll(list==='q'?'#queue tbody input.rowsel':'#hist tbody input.rowsel')];
+}
+function selCount(n){ return tn('sel.n',n,'{n} selected','{n} selected'); }
+function selAnnounce(list){
+  const n=selIds(list).size;
+  announce(n?selCount(n):t('sel.none','Selection cleared.'));
+}
+// The bar's two selects re-fill on every show (skipped while focused,
+// so an open dropdown is never rebuilt under the pointer): that keeps
+// them in the current locale, and the category list fresh.
+let selCats=null;
+function qselFillSelects(){
+  const pr=document.getElementById('qselPrio');
+  if(pr&&document.activeElement!==pr){
+    pr.innerHTML=`<option value="" selected disabled>${esc(t('sel.prio','Priority…'))}</option>`
+      +[[2,t('prio.force','Force')],[1,t('prio.high','High')],[0,t('prio.normal','Normal')],[-1,t('prio.low','Low')]]
+        .map(([v,l])=>`<option value="${v}">${esc(l)}</option>`).join('');
+  }
+  const cs=document.getElementById('qselCat');
+  if(cs&&document.activeElement!==cs){
+    cs.innerHTML=`<option value="" selected disabled>${esc(t('sel.cat','Category…'))}</option>`
+      +`<option value="//none">${esc(t('drawer.nocat','none'))}</option>`
+      +(selCats||[]).map(c=>`<option value="${escA(c)}">${esc(c)}</option>`).join('');
+    if(selCats===null){
+      selCats=[];
+      api('get_cats').then(j=>{ selCats=(j.categories||[]).filter(c=>c!=='*'); qselFillSelects(); })
+        .catch(()=>{ selCats=null; });
+    }
+  }
+}
+function updateSelBar(list){
+  const sel=selIds(list), n=sel.size;
+  const bar=document.getElementById(list==='q'?'qselbar':'hselbar');
+  if(bar) bar.classList.toggle('on', n>0);
+  const c=document.getElementById(list==='q'?'qselcount':'hselcount');
+  if(c) c.textContent=n?selCount(n):'';
+  if(list==='q'&&n>0) qselFillSelects();
+  const boxes=selRows(list);
+  const all=boxes.length>0&&boxes.every(b=>sel.has(b.dataset.sel));
+  const some=boxes.some(b=>sel.has(b.dataset.sel));
+  const h=document.getElementById(list==='q'?'qSelAll':'hSelAll');
+  if(h){ h.checked=all; h.indeterminate=!all&&some; }
+}
+// Row checkbox click (inline handler: it must stop the event BEFORE the
+// row's own onclick folds a drawer open). Shift extends from the anchor
+// across the current visual order, wall-style.
+function selClick(e,list,c){
+  e.stopPropagation();
+  const s=selIds(list), boxes=selRows(list), i=boxes.indexOf(c);
+  const a=selAnchor[list]!=null?boxes.findIndex(b=>b.dataset.sel===selAnchor[list]):-1;
+  if(e.shiftKey&&a>=0&&i>=0){
+    const lo=Math.min(a,i), hi=Math.max(a,i);
+    for(let k=lo;k<=hi;k++){
+      boxes[k].checked=c.checked;
+      if(c.checked) s.add(boxes[k].dataset.sel); else s.delete(boxes[k].dataset.sel);
+    }
+  } else if(c.checked) s.add(c.dataset.sel); else s.delete(c.dataset.sel);
+  selAnchor[list]=c.dataset.sel;
+  updateSelBar(list); selAnnounce(list);
+}
+// Header box: covers every listed row (the queue is served whole; for
+// history that is the rendered window - exactly what the eye can check).
+function selAllClick(box,list){
+  const s=selIds(list);
+  selRows(list).forEach(b=>{
+    b.checked=box.checked;
+    if(box.checked) s.add(b.dataset.sel); else s.delete(b.dataset.sel);
+  });
+  updateSelBar(list); selAnnounce(list);
+}
+function selClear(list){
+  selIds(list).clear();
+  selRows(list).forEach(b=>{ b.checked=false; });
+  updateSelBar(list); selAnnounce(list);
+}
+// Bulk pause/resume: ONE call - the daemon's queue arms already honour
+// SAB's comma-separated value= convention.
+async function qBulk(op){
+  const ids=[...qSel]; if(!ids.length) return;
+  const j=await api('queue',`&name=${op}&value=${ids.join(',')}`);
+  if(!j.status) toast(tErr(j.error)||t('toast.nochange','Nothing to change. The item may have just finished.'), true);
+  else toast(op==='pause'?tn('sel.paused',ids.length,'{n} download paused.','{n} downloads paused.')
+                         :tn('sel.resumed',ids.length,'{n} download resumed.','{n} downloads resumed.'));
+  tick();
+}
+async function qBulkPrio(sel){
+  const v=sel.value; sel.value='';
+  if(v==='') return;
+  sel.blur();                       // release the :focus render guard
+  const ids=[...qSel]; if(!ids.length) return;
+  const j=await api('queue',`&name=priority&value=${ids.join(',')}&value2=${v}`);
+  if(j.status) toast(t('toast.prio','Priority updated.'));
+  else toast(t('toast.nochange','Nothing to change. The item may have just finished.'), true);
+  tick();
+}
+// Category has no comma-separated arm (mode=change_cat is single-id),
+// so it loops the same per-row op the drawer uses - same path, same
+// protections - and counts what it managed.
+async function qBulkCat(sel){
+  const v=sel.value; sel.value='';
+  if(v==='') return;
+  sel.blur();
+  const cat=v==='//none'?'':v;
+  const ids=[...qSel]; if(!ids.length) return;
+  let ok=0, fail=0;
+  for(const id of ids){
+    try{ const j=await api('change_cat',`&value=${encodeURIComponent(id)}&value2=${encodeURIComponent(cat)}`);
+      if(j.status) ok++; else fail++;
+    }catch(_){ fail++; }
+  }
+  toast(tn('sel.cated',ok,'Category changed on {n} download.','Category changed on {n} downloads.')
+    +(fail?' · '+tn('sel.fail',fail,'{n} failed','{n} failed'):''), fail>0&&!ok);
+  tick();
+}
+// Bulk removes go through the SAME daemon delete arms as the per-row ✕
+// (no del_files) - so the trash setting, the deferred removal and the
+// kept-files notice are all inherited, never reimplemented (UI truth
+// audit bundle A: a delete path that skips them is a correctness bug).
+async function qBulkDelete(){
+  const ids=[...qSel]; if(!ids.length) return;
+  if(!confirm(tn('confirm.sel.qdel',ids.length,
+      'Remove the selected download from the queue?\n\nNo files are deleted: whatever has already arrived stays on disk. Nothing is filed to history, and this cannot be undone.',
+      'Remove {n} selected downloads from the queue?\n\nNo files are deleted: whatever has already arrived stays on disk. Nothing is filed to history, and this cannot be undone.'))) return;
+  const j=await api('queue',`&name=delete&value=${ids.join(',')}`);
+  if(j.status===false&&j.error) toast(tErr(j.error), true);
+  else toast(t('toast.qCleared','Removed {n} from the queue.',{n:num(j.removed||0,0)}));
+  qSel.clear(); updateSelBar('q');
+  tick();
+}
+async function hBulkDelete(){
+  const ids=[...hSel]; if(!ids.length) return;
+  if(!confirm(tn('confirm.sel.hdel',ids.length,
+      'Remove the selected entry from history?\nFiles stay on disk.',
+      'Remove {n} selected entries from history?\nFiles stay on disk.'))) return;
+  const j=await api('history',`&name=delete&value=${ids.join(',')}`);
+  // The daemon refuses the WHOLE batch when one row is mid-move - say
+  // its reason rather than a false "cleared".
+  if(j.status===false&&j.error) toast(tErr(j.error), true);
+  else{ toast(t('toast.histCleared','Cleared {n} from the list.',{n:num(j.removed||0,0)})); hSel.clear(); updateSelBar('h'); }
+  tick();
+}
+// Remove + delete files: same comma-separated arm with del_files=1 -
+// the daemon's own trash-aware removal, per id, nothing reimplemented.
+async function hBulkDeleteFiles(){
+  const ids=[...hSel]; if(!ids.length) return;
+  if(!confirm(tn('confirm.sel.hfiles',ids.length,
+      'Remove the selected entry AND delete its downloaded files from disk?\nThis cannot be undone.',
+      'Remove {n} selected entries AND delete their downloaded files from disk?\nThis cannot be undone.'))) return;
+  const j=await api('history',`&name=delete&value=${ids.join(',')}&del_files=1`);
+  if(j.status===false&&j.error) toast(tErr(j.error), true);
+  else{ toast(t('toast.delfiles','Removed: files deleted.')); hSel.clear(); updateSelBar('h'); }
+  tick();
+}
+// Retry has no multi-id arm (mode=retry is single-id) - loop it.
+async function hBulkRetry(){
+  const ids=[...hSel]; if(!ids.length) return;
+  let ok=0, fail=0;
+  for(const id of ids){
+    try{ const j=await api('retry',`&value=${encodeURIComponent(id)}`);
+      if(j.status) ok++; else fail++;
+    }catch(_){ fail++; }
+  }
+  toast(tn('sel.retried',ok,'{n} download requeued.','{n} downloads requeued.')
+    +(fail?' · '+tn('sel.fail',fail,'{n} failed','{n} failed'):''), fail>0&&!ok);
+  hSel.clear(); updateSelBar('h');
+  tick();
+}
+
+// ---- §129 2f: keyboard shortcuts ---------------------------------------
+// j/k walk the queue + history rows as one list; x toggles the focused
+// row's checkbox; Space pauses/resumes everything; Delete removes the
+// selection (behind the same confirms as the buttons); ? is the sheet.
+// None of it fires while typing, while a modal is up, or in Settings.
+let kbdFocusId=null;       // row j/k parked on - refocused after a re-render
+function shortcutRows(){
+  return [...document.querySelectorAll('#queue tbody tr.qrow, #hist tbody tr.item')];
+}
+// A 1 Hz tbody re-render replaces the row the keyboard was standing on;
+// focus falls to <body>. Both render paths call this at the end to put
+// it back on the same id - and only then, so a click elsewhere wins.
+function restoreKbdFocus(){
+  if(kbdFocusId==null||document.activeElement!==document.body) return;
+  const r=shortcutRows().find(x=>x.dataset.id===kbdFocusId);
+  if(r) r.focus({preventScroll:true});
+}
+function kbdMove(dir){
+  const rows=shortcutRows(); if(!rows.length) return;
+  const cur=document.activeElement&&document.activeElement.closest
+    ? document.activeElement.closest('#queue tbody tr.qrow, #hist tbody tr.item'):null;
+  let i=rows.indexOf(cur);
+  i = i<0 ? (dir>0?0:rows.length-1) : Math.min(rows.length-1,Math.max(0,i+dir));
+  rows[i].focus(); kbdFocusId=rows[i].dataset.id;
+}
+function kbdToggleSel(){
+  const cur=document.activeElement&&document.activeElement.closest
+    ? document.activeElement.closest('#queue tbody tr.qrow, #hist tbody tr.item'):null;
+  if(!cur) return;
+  const list=cur.classList.contains('qrow')?'q':'h';
+  const s=selIds(list), id=cur.dataset.id, on=!s.has(id);
+  if(on) s.add(id); else s.delete(id);
+  selAnchor[list]=id; kbdFocusId=id;
+  const box=cur.querySelector('input.rowsel'); if(box) box.checked=on;
+  updateSelBar(list); selAnnounce(list);
+}
+function kbdDelete(){
+  const cur=document.activeElement&&document.activeElement.closest
+    ? document.activeElement.closest('#queue tbody tr.qrow, #hist tbody tr.item'):null;
+  const list=cur?(cur.classList.contains('qrow')?'q':'h'):(qSel.size?'q':(hSel.size?'h':null));
+  if(list==='q'&&qSel.size) qBulkDelete();
+  else if(list==='h'&&hSel.size) hBulkDelete();
+}
+function shOpenSheet(){
+  const b=document.getElementById('shov'); if(!b) return;
+  b.classList.add('on');
+  modalOpen(document.getElementById('shmodal'));
+}
+function shClose(){
+  const b=document.getElementById('shov');
+  if(!b||!b.classList.contains('on')) return;
+  b.classList.remove('on');
+  modalClose(document.getElementById('shmodal'));
+}
+addEventListener('keydown', e=>{
+  if(e.defaultPrevented||e.ctrlKey||e.metaKey||e.altKey) return;
+  const el=e.target;
+  // Never inside a field or on a control: Space belongs to the button
+  // under focus, letters belong to the text being typed.
+  if(el&&(el.isContentEditable||/^(INPUT|TEXTAREA|SELECT|BUTTON|A)$/.test(el.tagName))) return;
+  const sh=document.getElementById('shov');
+  if(sh&&sh.classList.contains('on')){
+    if(e.key==='?'||e.key==='Escape'){ e.preventDefault(); shClose(); }
+    return;
+  }
+  const hd=document.getElementById('helpDrawer');
+  if(inSettings
+    ||document.querySelector('#fsov.on,#keyov.on,#gbov.on,#cuov.on,#stopped.on')
+    ||(hd&&hd.classList.contains('open'))
+    ||document.getElementById('ctxmenu')) return;
+  switch(e.key){
+    case '?': e.preventDefault(); shOpenSheet(); break;
+    case ' ': e.preventDefault(); togglePause(); break;
+    case 'j': kbdMove(1); break;
+    case 'k': kbdMove(-1); break;
+    case 'x': kbdToggleSel(); break;
+    case 'Delete': kbdDelete(); break;
+  }
+});
 // Open on the machine running the daemon (the normal local setup):
 // 'file' = largest media file in the OS player, 'folder' = the dir.
 async function openItem(id, what){
@@ -7141,7 +8019,7 @@ function closeMenu(restore){
   if(o && (restore===true || inside) && document.contains(o)) o.focus();
 }
 addEventListener('click', ()=>closeMenu());
-addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeMenu(true); fsClose(); gbClose(); cuClose(); } });
+addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeMenu(true); fsClose(); gbClose(); cuClose(); keyCancel(); shClose(); } });
 // Arrow-walk the open menu. Wraps at both ends, the way a menu should.
 function menuKey(e){
   const m=document.getElementById('ctxmenu'); if(!m) return;
@@ -7548,6 +8426,13 @@ function ladderChartHover(ev){
 // M18 connection tuning: ladder one server through rising socket counts.
 async function runLadder(btn){ await busy(btn,t('busy.testing','Testing…'), async()=>{
   const idx=document.getElementById('ladderSrv').value||0;
+  // A block account pays per byte, and this test downloads real
+  // articles on purpose. The auto prober never touches such a server;
+  // the manual button stays available because it is the user choosing
+  // to spend - but it has to say so before it does.
+  const bs=srvList[+idx]||{};
+  if((bs.block_account||bs.block_bytes) &&
+     !confirm(t('ladder.blockconfirm','{host} is a block account, so this test will spend paid bytes from it. The test downloads real articles for up to a few minutes. Run it anyway?',{host:bs.host||''}))) return;
   const fixed=parseInt(document.getElementById('ladderN').value)||0;
   const o=document.getElementById('ladderOut'), tbl=document.getElementById('ladderTbl');
   o.textContent=fixed?t('ladder.fixed','Testing exactly {n} connections…',{n:fixed}):t('ladder.running','Downloading test articles at each connection count…');
@@ -7556,6 +8441,9 @@ async function runLadder(btn){ await busy(btn,t('busy.testing','Testing…'), as
   if(!fixed) startLadderLive();
   const j=await api('connladder',`&value=${idx}`+(fixed?`&value2=${fixed}`:''));
   stopLadderLive();
+  // A fresh install has nothing representative to measure with, and a
+  // wrong ladder is worse than none - say what to do, not just "error".
+  if(j.no_real_articles){ o.innerHTML=`<span class="bad">${esc(t('ladder.noarticles','Nothing has been downloaded on this install yet, so there are no real articles to measure this server with. Complete a download first, then test again.'))}</span>`; return; }
   if(j.error){ o.innerHTML=`<span class="bad">${esc(tErr(j.error))}</span>`; return; }
   // Cancelled: say what was measured and that nothing was applied. A
   // truncated climb has no knee in it, so printing a recommendation
@@ -7636,6 +8524,10 @@ async function runLadderAll(btn){ await busy(btn,t('busy.testing','Testing…'),
   const sel=document.getElementById('ladderSrv');
   const hosts=[...sel.options].map(o=>o.textContent);
   if(!hosts.length){ toast(t('toast.nosrvs','No servers configured.'), true); return; }
+  // Same warning the single Test gives: paid bytes are paid bytes.
+  const flagged=(srvList||[]).filter(s=>s.block_account||s.block_bytes).map(s=>s.host);
+  if(flagged.length &&
+     !confirm(t('ladder.blockconfirm.all','{hosts}: these are block accounts, so testing them will spend paid bytes. The tests download real articles for up to a few minutes per server. Run them anyway?',{hosts:flagged.join(', ')}))) return;
   const o=document.getElementById('ladderOut'), tbl=document.getElementById('ladderTbl');
   const ALL=t('ladder.all','ALL TOGETHER'), WAIT=t('ladder.waiting','waiting…');
   tbl.style.display='';
@@ -7655,7 +8547,7 @@ async function runLadderAll(btn){ await busy(btn,t('busy.testing','Testing…'),
     const j=await api('connladder',`&value=${i}`);
     stopLadderLive();
     const row=document.getElementById('lad'+i);
-    if(j.error){ row.innerHTML=`<td>${esc(hosts[i])}</td><td class="bad" colspan="3">${esc(tErr(j.error))}</td>`; window._ladderAll.push({idx:i,peak:0}); continue; }
+    if(j.error){ row.innerHTML=`<td>${esc(hosts[i])}</td><td class="bad" colspan="3">${esc(j.no_real_articles?t('ladder.noarticles.short','no downloaded articles to measure with yet'):tErr(j.error))}</td>`; window._ladderAll.push({idx:i,peak:0}); continue; }
     const peak=j.peak_gbps*1000/8;
     window._ladderAll.push({idx:i,peak});
     if(peak>peakBest){ peakBest=peak; peakHost=hosts[i]; }
@@ -7808,7 +8700,8 @@ function eventsNearSample(i){
     const host=esc((e.host||'').replace(/^(news|reader)\./,''));
     const what=st?esc(st.label()):esc(e.kind);
     const col=st?css(EVENT_CLASS[st.cls]||'--dim'):'inherit';
-    return `<span style="color:${col}">●</span> ${host?host+' · ':''}${what}`
+    const glyph=st&&st.cls==='tuning'?'○':'●';
+    return `<span style="color:${col}">${glyph}</span> ${host?host+' · ':''}${what}`
       +(e.detail?`<br><span class="dim" style="font-size:11px">${esc(e.detail)}</span>`:'');
   }).join('<br>');
 }
@@ -7859,9 +8752,11 @@ addEventListener('keydown', e=>{
 });
 // Completion/failure alerts: a toast the moment a job lands in history
 // (red with the failure reason on errors), plus an opt-in desktop
-// notification (Settings → Interface). The first poll only primes the
-// map, so a page load never replays old history.
-let histSeen=null, pwSeen=new Set(), notifyOn=localStorage.nzbfastNotify==='on';
+// notification (Settings → Interface). §129 1b: driven by the daemon's
+// own lifecycle events (job.completed / job.failed with a seq cursor)
+// instead of diffing history snapshots - the server sends nothing
+// before our cursor, so a page load never replays old history.
+let notifyOn=localStorage.nzbfastNotify==='on';
 // Prompt-behavior mode (password_prompt: now|done|never), refreshed off
 // every queue poll; and the running jobs already asked mid-download, so
 // a Cancel is never re-prompted.
@@ -7873,36 +8768,24 @@ function maybeNotify(title, body){
   if(!notifyOn || typeof Notification==='undefined' || Notification.permission!=='granted') return;
   try{ new Notification(title, {body}); }catch(e){}
 }
-function watchHistory(slots){
-  if(histSeen===null){
-    histSeen=new Map(slots.map(s=>[s.nzo_id,s.status]));
-    slots.forEach(s=>{ if(s.password_required) pwSeen.add(s.nzo_id); });
-    return;
-  }
-  for(const s of slots){
-    // A job asking for an archive password is its own event - it can
-    // happen on an otherwise unchanged Failed status. Silent in "never
-    // ask" mode: the row still carries the 🔑 and the still-packed
-    // note, it just stops being an announcement. Also silent when the
-    // live mid-download ask already covered this job.
-    if(s.password_required && !pwSeen.has(s.nzo_id)){
-      pwSeen.add(s.nzo_id);
-      if(pwPromptMode!=='never' && !pwLiveAsked.has(s.nzo_id)){
-        snd('password');
-        say('password', t('say.password','Password needed for {name}.',{name:sayShort(s.name)}));
-      }
-    }
-    if(histSeen.get(s.nzo_id)===s.status) continue;
-    histSeen.set(s.nzo_id, s.status);
-    if(s.status==='Completed'){
+function handleLifeEvents(r){
+  const evs=r.events||[];
+  for(const e of evs){
+    if(e.kind==='job.completed'){
       // A locked archive is not a success to celebrate: the chime and
       // the green "complete" notification told sound-off users the
-      // folder was ready when it holds a packed archive. The password
-      // sound above already covers the audible ask; this covers the
-      // visible record. "never" mode keeps the quiet contract.
-      if(s.password_required && pwPromptMode!=='never'){
-        toast(t('toast.needpw','Downloaded, but locked: {name} needs a password to unpack.',{name:s.name}), true);
-        maybeNotify(t('notify.needpw','Needs a password to unpack'), s.name);
+      // folder was ready when it holds a packed archive. Silent in
+      // "never ask" mode, and the audible ask is skipped when the live
+      // mid-download prompt already covered this job.
+      if(e.locked){
+        if(pwPromptMode!=='never'){
+          if(!pwLiveAsked.has(e.nzo_id)){
+            snd('password');
+            say('password', t('say.password','Password needed for {name}.',{name:sayShort(e.name)}));
+          }
+          toast(t('toast.needpw','Downloaded, but locked: {name} needs a password to unpack.',{name:e.name}), true);
+          maybeNotify(t('notify.needpw','Needs a password to unpack'), e.name);
+        }
       } else {
         // Truth-audit I: `move_completed` can put the payload somewhere
         // the download folder does not contain - a NAS share, usually -
@@ -7910,35 +8793,45 @@ function watchHistory(slots){
         // a word about where the files had gone. `moved_to` is empty for
         // everything still under the download root, so the suffix
         // appears only when there is somewhere else to name.
-        toast(s.moved_to
-          ? t('toast.completedMoved','Completed: {name} - moved to {dest}',{name:s.name,dest:s.moved_to})
-          : t('toast.completed','Completed: {name}',{name:s.name}));
+        toast(e.moved_to
+          ? t('toast.completedMoved','Completed: {name} - moved to {dest}',{name:e.name,dest:e.moved_to})
+          : t('toast.completed','Completed: {name}',{name:e.name}));
         lastCompleteAt=performance.now();
         playChime();
-        say('complete', t('say.complete','Download complete: {name}.',{name:sayShort(s.name)}));
-        maybeNotify(t('notify.done','Download complete'), s.name);
+        say('complete', t('say.complete','Download complete: {name}.',{name:sayShort(e.name)}));
+        maybeNotify(t('notify.done','Download complete'), e.name);
       }
-    } else if(s.status==='Failed'){
+    } else if(e.kind==='job.failed'){
+      // A Failed row can be asking for a password too (the in-stream
+      // probe saw an encrypted set) - the audible ask keeps its old
+      // suppression rules.
+      if(e.locked && pwPromptMode!=='never' && !pwLiveAsked.has(e.nzo_id)){
+        snd('password');
+        say('password', t('say.password','Password needed for {name}.',{name:sayShort(e.name)}));
+      }
       // When the daemon has already armed its own retry, this is not a
       // verdict - announcing "FAILED" with the failure sound for
       // something the engine plans to fix itself sent users to grab a
       // replacement that was never needed.
-      if(s.auto_retry_at&&s.auto_retry_at*1000>Date.now()){
-        toast(t('toast.willretry','{name} hit missing pieces - retrying automatically in {m} min.',{name:s.name,m:Math.max(1,Math.ceil((s.auto_retry_at*1000-Date.now())/60000))}));
+      if(e.auto_retry_at&&e.auto_retry_at*1000>Date.now()){
+        toast(t('toast.willretry','{name} hit missing pieces - retrying automatically in {m} min.',{name:e.name,m:Math.max(1,Math.ceil((e.auto_retry_at*1000-Date.now())/60000))}));
       } else {
         // The FIRST clause only. The engine's diagnostic is 250-400
         // characters with every cause appended after a semicolon, and a
         // 3.5 s box was the worst possible place to read it - so the
         // verdict goes here and the box opens the drawer that holds the
         // rest.
-        toast(t('toast.failed','Failed: {name} - {err}',{name:s.name, err:firstClause(s.fail_message)||t('err.unknown','unknown error')}),
-          true, ()=>openHistDrawer(s.nzo_id));
+        toast(t('toast.failed','Failed: {name} - {err}',{name:e.name, err:firstClause(e.fail_message)||t('err.unknown','unknown error')}),
+          true, ()=>openHistDrawer(e.nzo_id));
         snd('failed');
-        say('failed', t('say.failed','Download failed: {name}.',{name:sayShort(s.name)}));
-        maybeNotify(t('notify.failed','Download FAILED'), `${s.name}\n${s.fail_message||''}`);
+        say('failed', t('say.failed','Download failed: {name}.',{name:sayShort(e.name)}));
+        maybeNotify(t('notify.failed','Download FAILED'), `${e.name}\n${e.fail_message||''}`);
       }
     }
   }
+  // Adopt the cursor last, whatever arrived - including the reseed
+  // signal (events_reset) after this tab slept past the ring's tail.
+  if(typeof r.events_seq==='number'){ dashESeq=r.events_seq; dashEHave=true; }
 }
 async function setNotify(cb){
   if(cb.checked){
@@ -9137,8 +10030,10 @@ async function loadSettings(){
   const peu=document.getElementById('s_prefer_external_unrar');
   if(document.activeElement!==peu) peu.checked=c.prefer_external_unrar===true||c.prefer_external_unrar===1;
   put('s_mem_limit', sizeStr(c.mem_limit));
-  put('s_out_dir', c.out_dir); put('s_move_completed', c.move_completed||''); renderCatFiles(c.categories||'', c.move_completed_cats||''); put('s_out_umask', c.out_umask||''); put('s_min_free', sizeStr(c.min_free)); put('s_quota', sizeStr(c.quota));
+  put('s_out_dir', c.out_dir); put('s_move_completed', c.move_completed||'');
+  initMovePace(c.move_pace||'yield'); renderCatFiles(c.categories||'', c.move_completed_cats||'', c.cat_meta||{}); put('s_out_umask', c.out_umask||''); put('s_min_free', sizeStr(c.min_free)); put('s_quota', sizeStr(c.quota));
   put('s_quota_period', c.quota_period||'d');
+  put('s_dupe_action', c.dupe_action||'pause');
   put('s_nested_max_depth', c.nested_max_depth??5);
   put('s_watch', c.watch); put('s_script', c.script);
   put('s_watch_interval_secs', c.watch_interval_secs??5);
@@ -9158,6 +10053,14 @@ async function loadSettings(){
   if(document.activeElement!==pcl) pcl.checked = c.par_cleanup!==false;
   const wkn=document.getElementById('s_watch_keep');
   if(wkn && document.activeElement!==wkn) wkn.checked = c.watch_keep_nzb===true;
+  const wrc=document.getElementById('s_watch_recursive');
+  if(wrc && document.activeElement!==wrc) wrc.checked = c.watch_recursive===true;
+  const wmr=document.getElementById('s_watch_move_rejected');
+  if(wmr && document.activeElement!==wmr) wmr.checked = c.watch_move_rejected===true;
+  // §129 3e. Defaults ON in the daemon, so an absent key must not read
+  // as off - !==false, like par_cleanup above.
+  const ssp=document.getElementById('s_slow_storage_pause');
+  if(ssp && document.activeElement!==ssp) ssp.checked = c.slow_storage_pause!==false;
   // No default assumed: the daemon's default is per platform (off on
   // Linux), and get_config always reports the live value.
   const dtt=document.getElementById('s_delete_to_trash');
@@ -9240,6 +10143,8 @@ async function loadSettings(){
   put('s_library_cats', (c.library_cats||[]).join(', '));
   put('s_library_recheck_secs', c.library_recheck_secs);
   put('s_port', c.port);
+  put('s_tls_cert', c.tls_cert||'');
+  put('s_tls_key', c.tls_key||'');
   put('s_ui_locale', c.ui_locale||'');
   const hr=document.getElementById('s_history_rows');
   if(hr && document.activeElement!==hr && c.history_rows) hr.value=c.history_rows;
@@ -9368,15 +10273,27 @@ function renderPending(pending){
 function parseSchedText(t){
   try{ const a=JSON.parse(t||'[]'); return Array.isArray(a)?a:[]; }catch(e){ return []; }
 }
+// Which schedule actions carry a value, and what to suggest in it.
+// speedlimit takes a rate; the server toggles take the server's host,
+// exactly as the server card shows it.
+function schedValuePh(act){
+  return act==='speedlimit' ? t('sched.value.ph','e.g. 4M · 0') : 'news.example.com';
+}
+function schedActValue(act){ return act==='speedlimit'||act==='server_enable'||act==='server_disable'; }
+function schedActChanged(sel){
+  const v=sel.closest('.schedrow').querySelector('[data-k=value]');
+  v.style.visibility=schedActValue(sel.value)?'visible':'hidden';
+  v.placeholder=schedValuePh(sel.value);
+}
 function schedRowHtml(e){
   const act=e.action||'pause';
-  const opt=(v,l)=>`<option value="${v}"${act===v?' selected':''}>${l}</option>`;
+  const opt=(v,l)=>`<option value="${v}"${act===v?' selected':''}>${esc(l)}</option>`;
   return `<div class="schedrow">
     <input class="txt" data-k="days" value="${escA(e.days||'all')}" placeholder="${escA(t('sched.days.ph','all · mon-fri · sat,sun'))}" title="${escA(t('sched.days.title','days'))}">
     <input class="txt" data-k="time" type="time" value="${escA(e.time||'08:00')}" title="${escA(t('sched.time.title','time (local)'))}">
-    <select class="sel" data-k="action" onchange="this.closest('.schedrow').querySelector('[data-k=value]').style.visibility=this.value==='speedlimit'?'visible':'hidden'">
-      ${opt('pause',t('sched.pause','pause'))}${opt('resume',t('sched.resume','resume'))}${opt('speedlimit',t('sched.limit','speed limit'))}</select>
-    <input class="txt" data-k="value" value="${e.value!=null?escA(String(e.value)):''}" placeholder="${escA(t('sched.value.ph','e.g. 4M · 0'))}" style="visibility:${act==='speedlimit'?'visible':'hidden'}" title="${escA(t('sched.value.title','limit'))}">
+    <select class="sel" data-k="action" onchange="schedActChanged(this)">
+      ${opt('pause',t('sched.pause','pause'))}${opt('resume',t('sched.resume','resume'))}${opt('speedlimit',t('sched.limit','speed limit'))}${opt('server_enable',t('sched.srvon','enable a server'))}${opt('server_disable',t('sched.srvoff','disable a server'))}${opt('quota_reset',t('sched.quotareset','reset the quota'))}</select>
+    <input class="txt" data-k="value" value="${e.value!=null?escA(String(e.value)):''}" placeholder="${escA(schedValuePh(act))}" style="visibility:${schedActValue(act)?'visible':'hidden'}" title="${escA(t('sched.value.title','value'))}">
     <button class="ghost" onclick="this.closest('.schedrow').remove()" title="${escA(t('sched.remove.title','Delete this scheduled action'))}" aria-label="${escA(t('sched.remove.title','Delete this scheduled action'))}">×</button></div>`;
 }
 function renderSched(list){ document.getElementById('schedrows').innerHTML=list.map(schedRowHtml).join(''); }
@@ -9386,6 +10303,7 @@ async function saveSchedule(btn){ await busy(btn,t('busy.applying','Applying…'
     const g=k=>r.querySelector(`[data-k=${k}]`).value.trim();
     const e={days:g('days')||'all', time:g('time'), action:g('action')};
     if(e.action==='speedlimit') e.value=g('value')||'0';
+    else if(schedActValue(e.action)) e.value=g('value');
     return e;
   }).filter(e=>e.time);
   await setCfg('schedule', rows.length?JSON.stringify(rows):'');
@@ -9408,7 +10326,8 @@ function shortWhen(sec){
 // failed, polled and saw N items (N may be 0, which is a rules question,
 // not a broken feed).
 function feedHealthHtml(f){
-  const test=`<button class="ghost mini" onclick="testFeed(this)" title="${escA(t('feed.test.title','Fetch this feed now and report what came back'))}">${t('feed.test','Test')}</button>`;
+  const test=`<button class="ghost mini" onclick="testFeed(this)" title="${escA(t('feed.test.title','Fetch this feed now and report what came back'))}">${t('feed.test','Test')}</button>`
+    +`<button class="ghost mini" onclick="previewFeed(this)" title="${escA(t('feed.prev.title','Fetch this feed now and show, item by item, what the rules in the editor would grab or skip - without downloading anything'))}">${t('feed.prev','Preview')}</button>`;
   let s;
   if(f.last_error) s=`<span class="bad">${t('feed.h.failed','last check failed: {e}',{e:esc(f.last_error)})}</span>`;
   else if(!f.last_poll) s=`<span class="dim">${t('feed.h.never','not checked yet')}</span>`;
@@ -9442,6 +10361,42 @@ async function testFeed(btn){
     out.innerHTML = j.status
       ? `<span class="ok">✓ ${tn('feed.h.items',j.items||0,'{n} item in the feed','{n} items in the feed')}</span>`
       : `<span class="bad">✗ ${esc(tErr(j.error)||t('err.failed','failed'))}</span>`;
+  });
+}
+// §129 2d: dry-run the rules currently IN THE EDITOR against the live
+// feed - unsaved edits included, so rules can be tuned before applying.
+// Nothing is grabbed; "seen" mirrors the poller's own memory.
+// The preview's per-item "why" is written by rules_judge in rss.rs and,
+// like every other daemon string, crosses the wire in English (§5: the
+// API contract is English; only the display edge translates). Two of the
+// four are stock phrases; the other two quote the deciding rule VERBATIM
+// - the rule is what the user typed, so only the verb around it is
+// translatable. Anything unrecognised passes through unchanged.
+function tWhy(w){
+  if(w==null) return w;
+  if(w==='no Accept rule matched') return t('feed.why.norule','no Accept rule matched');
+  if(w==='accepted (no Accept rules)') return t('feed.why.noaccept','accepted (no Accept rules)');
+  if(w.startsWith('matched ')) return t('feed.why.matched','matched {r}',{r:w.slice(8)});
+  if(w.startsWith('did not satisfy ')) return t('feed.why.notsat','did not satisfy {r}',{r:w.slice(16)});
+  return w;
+}
+async function previewFeed(btn){
+  const row=btn.closest('.feedrow'), out=row.querySelector('.fhstat');
+  const url=row.querySelector('[data-k=url]').value.trim();
+  if(!url){ toast(t('feed.test.nourl','add the feed URL first'), true); return; }
+  const rules=row.querySelector('[data-k=rules]').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  const category=row.querySelector('[data-k=category]').value.trim();
+  await busy(btn, t('busy.testing','Testing…'), async()=>{
+    const j=await apiPost('feed_preview',{url,rules,category});
+    if(!out) return;
+    if(!j.status){ out.innerHTML=`<span class="bad">✗ ${esc(tErr(j.error)||t('err.failed','failed'))}</span>`; return; }
+    const items=j.items||[];
+    const mark={grab:'✓',skip:'✗',seen:'·'};
+    const lines=items.slice(0,60).map(i=>
+      `<div>${mark[i.verdict]||'?'} ${esc(i.title)} <span class="dim">${i.size?esc(fmtSize(i.size)):''} · ${esc(i.verdict==='seen'?t('feed.prev.seen','already seen, would not grab again'):tWhy(i.why))}${i.verdict==='grab'&&i.category?` → ${esc(i.category)}`:''}</span></div>`).join('');
+    const n=items.filter(i=>i.verdict==='grab').length;
+    out.innerHTML=`<span class="ok">${t('feed.prev.head','{n} of {m} would be grabbed',{n,m:j.total||0})}</span>`
+      +`<div style="max-height:220px;overflow:auto;font-size:12px;margin-top:4px">${lines}${items.length>60?`<div class="dim">…</div>`:''}</div>`;
   });
 }
 function renderFeeds(list){ setHtml('feedrows', list.map(feedRowHtml).join('')||`<div class="dim">${t('feed.none','no feeds: add your indexer’s RSS URL below')}</div>`); }
@@ -9548,12 +10503,18 @@ const patCls = v => v ? ' patbad' : '';
 // letting someone discover it: name read-only, delete disabled, folder
 // still editable, because WHERE a built-in lands is genuinely yours.
 const BUILTIN_CATS = ['tv', 'movies', 'music', 'books'];
-function catFileRowHtml(name, dir){
+function catFileRowHtml(name, dir, meta){
   const fixed = BUILTIN_CATS.includes((name||'').toLowerCase());
+  const m = meta||{};
   const why = escA(t('set.disk.cats.builtin.title','always available, so it cannot be renamed or removed - its folder is still yours to set'));
+  const prio = m.priority==null ? '' : String(m.priority);
+  const popt=(v,l)=>`<option value="${v}"${prio===v?' selected':''}>${esc(l)}</option>`;
   return `<div class="catfilerow">
     <input class="txt" data-k="name" value="${escA(name||'')}"${fixed?` readonly title="${why}"`:''} placeholder="${escA(t('set.disk.cats.name.ph','category'))}" ${fixed?'':`title="${escA(t('set.disk.cats.name.title','the name Sonarr, Radarr or your app is configured with'))}"`} oninput="catFileCheck(this)">
-    <div class="pathrow"><input class="txt" data-k="dir" value="${escA(dir||'')}" placeholder="${escA(t('set.disk.cats.dir.ph','a subfolder of the download root'))}" title="${escA(t('set.disk.cats.dir.title','where this category lands. Blank = its own subfolder of the download root'))}" oninput="catFileCheck(this)"><button class="mini" onclick="browseDir(this.previousElementSibling,'dir')" data-i18n-title="btn.browse.title" title="Browse for a folder - including other drives" data-i18n="btn.browse">Browse…</button></div>
+    <div class="pathrow"><input class="txt" data-k="dir" value="${escA(dir||m.dir||'')}" placeholder="${escA(t('set.disk.cats.dir.ph','a subfolder of the download root'))}" title="${escA(t('set.disk.cats.dir.title','where this category lands. Blank = its own subfolder of the download root; a plain name = that subfolder instead; a full path = downloads land in the root as usual and finished jobs move there'))}" oninput="catFileCheck(this)"><button class="mini" onclick="browseDir(this.previousElementSibling,'dir')" data-i18n-title="btn.browse.title" title="Browse for a folder - including other drives" data-i18n="btn.browse">Browse…</button></div>
+    <select class="sel" data-k="prio" title="${escA(t('set.disk.cats.prio.title','default priority for downloads added in this category; an add that names its own priority wins'))}">
+      ${popt('',t('set.disk.cats.prio.def','priority: default'))}${popt('2',t('set.disk.cats.prio.force','force'))}${popt('1',t('set.disk.cats.prio.high','high'))}${popt('0',t('set.disk.cats.prio.normal','normal'))}${popt('-1',t('set.disk.cats.prio.low','low'))}${popt('-2',t('set.disk.cats.prio.paused','add paused'))}</select>
+    <input class="txt" data-k="script" value="${escA(m.script||'')}" placeholder="${escA(t('set.disk.cats.script.ph','script'))}" title="${escA(t('set.disk.cats.script.title','post-processing script for this category, instead of the global one; blank = the global script'))}">
     <button class="ghost" onclick="this.closest('.catfilerow').remove()"${fixed?' disabled':''} title="${fixed?why:escA(t('set.disk.cats.remove.title','Delete this category'))}" aria-label="${fixed?why:escA(t('set.disk.cats.remove.title','Delete this category'))}">×</button>
     <div class="rulewarn" style="display:none"></div></div>`;
 }
@@ -9582,7 +10543,7 @@ function catFileCheck(el){
 // `categories` is a comma list; `move_completed_cats` is `name=path`
 // pairs. Joined here into one row per category - which is the pairing
 // the two strings never showed.
-function renderCatFiles(cats, dests){
+function renderCatFiles(cats, dests, meta){
   const dir={};
   for(const item of String(dests||'').split(/[,;]/)){
     const i=item.indexOf('='); if(i<0) continue;
@@ -9593,29 +10554,40 @@ function renderCatFiles(cats, dests){
   // the next Apply, so show it rather than silently drop it.
   for(const k of Object.keys(dir)) if(!names.includes(k)) names.push(k);
   setHtml('catfilerows', names.length
-    ? names.map(n=>catFileRowHtml(n, dir[n])).join('')
+    ? names.map(n=>catFileRowHtml(n, dir[n], (meta||{})[n])).join('')
     : `<div class="dim">${t('set.disk.cats.none','no categories yet')}</div>`);
 }
 function addCatFileRow(){
   const cr=document.getElementById('catfilerows');
   if(cr.firstElementChild&&!cr.firstElementChild.classList.contains('catfilerow')) cr.innerHTML='';
   cr.__h=null;
-  cr.insertAdjacentHTML('beforeend', catFileRowHtml('',''));
+  cr.insertAdjacentHTML('beforeend', catFileRowHtml('','',null));
   cr.lastElementChild.querySelector('[data-k=name]').focus();
 }
+// An absolute path is a MOVE destination (the mover's contract needs
+// one); a plain name is the category's subfolder under the download
+// root (cat_meta.dir). Windows drives and UNC shares count as absolute.
+function catDirIsAbsolute(p){ return /^([\/\\]|[A-Za-z]:[\/\\])/.test(p); }
 async function saveCatFiles(btn){ await busy(btn,t('busy.applying','Applying…'), async()=>{
   const rows=[...document.querySelectorAll('#catfilerows .catfilerow')];
-  const names=[], dests=[];
+  const names=[], dests=[], meta={};
   for(const r of rows){
     const g=k=>((r.querySelector(`[data-k=${k}]`)||{}).value||'').trim();
     const name=g('name'); if(!name) continue;
     names.push(name);
-    const dir=g('dir'); if(dir) dests.push(`${name}=${dir}`);
+    const m={};
+    const dir=g('dir');
+    if(dir && catDirIsAbsolute(dir)) dests.push(`${name}=${dir}`);
+    else if(dir) m.dir=dir;
+    const prio=g('prio'); if(prio!=='') m.priority=+prio;
+    const script=g('script'); if(script) m.script=script;
+    if(Object.keys(m).length) meta[name]=m;
   }
   // Both settings, in this order: a destination naming a category the
   // list does not carry yet would be refused.
   if(await setCfg('categories', names.join(', ')) === false) return;
-  await setCfg('move_completed_cats', dests.join(', '));
+  if(await setCfg('move_completed_cats', dests.join(', ')) === false) return;
+  await setCfg('cat_meta', Object.keys(meta).length?JSON.stringify(meta):'');
 }); }
 
 // M23 Smart Folders editor: rows ↔ the daemon's smart_folders JSON.
@@ -9687,7 +10659,13 @@ async function saveCats(btn){ await busy(btn,t('busy.applying','Applying…'), a
   wlCats=rows; loadWatchlist();
 }); }
 // Notification targets editor: rows ↔ the daemon's notify_targets JSON.
-const NOTIFY_KINDS=[['kodi','Kodi'],['plex','Plex'],['jellyfin','Jellyfin / Emby'],['webhook','Webhook']];
+const NOTIFY_KINDS=[['kodi','Kodi'],['plex','Plex'],['jellyfin','Jellyfin / Emby'],['webhook','Webhook'],
+  ['discord','Discord'],['slack','Slack'],['telegram','Telegram'],['pushover','Pushover'],
+  ['ntfy','ntfy'],['gotify','Gotify'],['apprise','Apprise API server'],['email','Email (SMTP)']];
+// Kinds where the body field is the MESSAGE TEXT template (the preset
+// wraps it in the service's own JSON); webhook keeps its raw-body
+// meaning; the three media servers have no body at all.
+const NOTIFY_TEXT_KINDS=['discord','slack','telegram','pushover','ntfy','gotify','apprise','email'];
 // Per-kind placeholders: the URL and token mean something different for
 // each, and "http://host:port" alone leaves people guessing the port.
 // Built per call, not once at load - the catalogue arrives after this
@@ -9699,6 +10677,14 @@ function notifyHints(kind){
     plex:['http://192.168.1.40:32400', t('set.notify.tok.plex','X-Plex-Token')],
     jellyfin:['http://192.168.1.40:8096', t('set.notify.tok.jelly','API key')],
     webhook:['https://…', t('set.notify.tok.none','not used')],
+    discord:['https://discord.com/api/webhooks/…', t('set.notify.tok.none','not used')],
+    slack:['https://hooks.slack.com/services/…', t('set.notify.tok.none','not used')],
+    telegram:[t('set.notify.url.tg','(empty = api.telegram.org)'), 'bot_token/chat_id'],
+    pushover:[t('set.notify.url.po','(empty = api.pushover.net)'), 'app_token/user_key'],
+    ntfy:['https://ntfy.sh/your-topic', t('set.notify.tok.ntfy','access token (if the topic needs one)')],
+    gotify:['http://192.168.1.40:8070', t('set.notify.tok.gotify','application token')],
+    apprise:['http://192.168.1.40:8000/notify/key', t('set.notify.tok.none','not used')],
+    email:['smtps://smtp.example.com:465', t('set.notify.tok.email','user:password (empty for a local relay)')],
   }[kind]||['https://…', t('set.notify.tok.none','not used')];
 }
 // §G: how this target's last delivery went, under its row and beside
@@ -9739,9 +10725,19 @@ function notifyRowHtml(n){
     <label title="${escA(t('set.notify.fail.title','also send when a download fails - useful for a chat webhook, noise for a library scan'))}"><input type="checkbox" data-k="on_failure"${n.on_failure?' checked':''}><span data-i18n="set.notify.fail">fails</span></label>
     <button class="ghost" onclick="testNotify(this)" data-i18n="set.notify.test">Test</button>
     <button class="ghost" onclick="this.closest('.notifyrow').remove()" title="${escA(t('set.notify.remove.title','Stop notifying this target'))}" aria-label="${escA(t('set.notify.remove.title','Stop notifying this target'))}">×</button>
-    <input class="txt nbody" data-k="body" value="${escA(n.body||'')}" placeholder="${escA(t('set.notify.body.ph','webhook body, e.g. {"content":"{name} finished"} - empty sends our own JSON. Placeholders: {name} {status} {category} {dir} {bytes} {error} {id}'))}"${kind==='webhook'?'':' hidden'}>
+    <input class="txt nbody" data-k="body" value="${escA(n.body||'')}" placeholder="${escA(notifyBodyPh(kind))}"${kind==='webhook'||NOTIFY_TEXT_KINDS.includes(kind)?'':' hidden'}>
+    <input class="txt" data-k="email_to" value="${escA(n.email_to||'')}" placeholder="to@example.com"${kind==='email'?'':' hidden'}>
+    <input class="txt" data-k="email_from" value="${escA(n.email_from||'')}" placeholder="${escA(t('set.notify.emailfrom.ph','from (empty = nzbfast@localhost)'))}"${kind==='email'?'':' hidden'}>
+    <input class="txt" data-k="events" value="${escA((n.events||[]).join(', '))}" placeholder="${escA(t('set.notify.events.ph','events: completed, failed, repaired, disk, quota - empty = finished downloads (plus fails, if ticked)'))}" title="${escA(t('set.notify.events.title','route this target onto specific events. Leave empty for the classic behavior: every finished download, plus failures when the box is ticked. Naming events replaces both: only what is listed fires. repaired = a finished download that needed repair; disk / quota = the matching guard pausing the queue'))}">
     ${notifyHealthHtml(n)}
   </div>`;
+}
+// The body field's meaning depends on the kind: raw JSON for a webhook,
+// plain message text for the chat/push presets and email.
+function notifyBodyPh(kind){
+  return kind==='webhook'
+    ? t('set.notify.body.ph','webhook body, e.g. {"content":"{name} finished"} - empty sends our own JSON. Placeholders: {name} {status} {category} {dir} {bytes} {error} {id}')
+    : t('set.notify.body.ph.text','message text, e.g. {name} is {status} - empty sends a stock line. Placeholders: {name} {status} {category} {dir} {bytes} {error} {id}');
 }
 function notifyKindChanged(sel){
   const row=sel.closest('.notifyrow'), kind=sel.value, ph=notifyHints(kind);
@@ -9752,7 +10748,11 @@ function notifyKindChanged(sel){
   // format example would read as "this row has no token".
   const tok=row.querySelector('[data-k=token]');
   if(!tok.dataset.stored) tok.placeholder=ph[1];
-  row.querySelector('[data-k=body]').hidden = kind!=='webhook';
+  const body=row.querySelector('[data-k=body]');
+  body.hidden = !(kind==='webhook'||NOTIFY_TEXT_KINDS.includes(kind));
+  body.placeholder=notifyBodyPh(kind);
+  row.querySelector('[data-k=email_to]').hidden = kind!=='email';
+  row.querySelector('[data-k=email_from]').hidden = kind!=='email';
 }
 function renderNotify(list){ setHtml('notifyrows', list.map(notifyRowHtml).join('')||`<div class="dim">${t('set.notify.none','no targets: nothing is notified when a download finishes')}</div>`); }
 function addNotifyRow(){
@@ -9766,7 +10766,9 @@ function addNotifyRow(){
 function notifyRowData(r){
   const g=k=>{const el=r.querySelector(`[data-k=${k}]`); return el.type==='checkbox'?el.checked:el.value.trim();};
   return { name:g('name'), kind:g('kind'), url:g('url'), token:g('token'),
-    body:g('body'), category:g('category'), on_failure:g('on_failure'), enabled:true };
+    body:g('body'), category:g('category'), on_failure:g('on_failure'), enabled:true,
+    events:g('events').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean),
+    email_to:g('email_to'), email_from:g('email_from') };
 }
 async function testNotify(btn){ await busy(btn,t('busy.testing','Testing…'), async()=>{
   const el=btn.closest('.notifyrow'), row=notifyRowData(el);
@@ -9932,7 +10934,7 @@ function renderServers(){
     const tuneNote=(tv&&tv<s.connections)?` · <span class="dim" title="${escA(t('set.srv.tuned.title','auto-connections measured this provider is fastest at {n} sockets: more were slower. Turn off auto-connections (Connection tuning) to use your set value.',{n:tv}))}">${t('set.srv.tuned','auto-tuned to {n}',{n:tv})}</span>`:'';
     return `
     <div class="srvrow" id="srvrow${i}"${en?'':' style="opacity:.45"'}>
-      <span>${esc(s.host)}:${s.port}${s.tls?` <span class="dim" title="${escA(t('set.srv.tls.title','Encrypted connection to this server'))}"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-lock"/></svg></span>`:''}${en?'':` <span class="warn">· ${t('set.srv.disabled','disabled')}</span>`}${s.level>0?` <span class="dim">· ${t('set.srv.fill','fill level {n}',{n:s.level})}</span>`:''}${s.group?` <span class="dim">· ${esc(s.group)}</span>`:''}${block}${comp}
+      <span>${esc(s.host)}:${s.port}${s.tls?` <span class="dim" title="${escA(t('set.srv.tls.title','Encrypted connection to this server'))}"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-lock"/></svg></span>`:''}${en?'':` <span class="warn">· ${t('set.srv.disabled','disabled')}</span>`}${s.level>0?` <span class="dim">· ${t('set.srv.fill','fill level {n}',{n:s.level})}</span>`:''}${s.block_account?` <span class="dim" title="${escA(t('set.srv.paid.chip.title','every byte from this server is billed, so nzbfast never sends it traffic of its own: no automatic connection tests, no benchmark traffic, no header scans'))}">· ${t('set.srv.paid.chip','billed per byte')}</span>`:''}${s.group?` <span class="dim">· ${esc(s.group)}</span>`:''}${block}${comp}
         <span class="hint">${tn('set.srv.connsN',s.connections,'{n} connection','{n} connections')}${tuneNote}${s.username?' · '+esc(s.username):''}${s.retention_days>0?' · '+t('set.srv.retention','{n}d retention',{n:s.retention_days}):''}</span><span class="hint" id="srvtest${i}"></span></span>
       <label class="srvon" title="${escA(en?t('set.srv.disable.title','Take this server out of the pool without removing it'):t('set.srv.enable.title','Put this server back in the pool'))}"><input type="checkbox"${en?' checked':''} aria-label="${escA(t('set.srv.enable','Enable'))}" onchange="toggleServer(${i},this.checked?1:0,this)"></label>
       <button class="ghost" title="${escA(t('set.srv.test.title','Connect and authenticate to check this server is reachable'))}" onclick="testServerRow(${i},this)">${t('set.srv.test','Test')}</button>
@@ -10051,6 +11053,8 @@ function editServer(i){
   document.getElementById('sv_pin').checked=!!s.pin_connections;
   put('sv_group',s.group||''); put('sv_ret',s.retention_days||0);
   put('sv_block',Math.round((s.block_bytes||0)/1e9));
+  document.getElementById('sv_paid').checked=!!s.block_account;
+  paidSuggest();
   document.getElementById('sv_warm').checked=!!s.warm_pool;
   document.getElementById('sv_warmres').textContent='';
   // All three are optional and blank means "derive it". Careful with
@@ -10063,6 +11067,22 @@ function editServer(i){
   showIdleEffective(s.idle_release_effective);
   document.getElementById('srvform').style.display='';
   document.getElementById('sv_host').focus();
+}
+// Suggest the block-account flag on a fill tier, never set it. Level > 0
+// is the strongest signal in the config that a server is a paid block -
+// that is what tiers are FOR - but it is only a signal: plenty of people
+// run a second unlimited backbone at level 1 for completion, and ticking
+// this for them would quietly stop nzbfast measuring a server it is free
+// to measure. So the editor says what it suspects and leaves the answer
+// to the person who reads the bill.
+function paidSuggest(){
+  const el=document.getElementById('sv_paidsug');
+  if(!el) return;
+  const lvl=+document.getElementById('sv_level').value||0;
+  const on=document.getElementById('sv_paid').checked;
+  el.textContent=(lvl>0&&!on)
+    ? t('set.srv.paid.sug','fill tiers are usually paid blocks: turn this on if you pay for this server by the byte')
+    : '';
 }
 // What the blank ("choose for me") fields currently resolve to. Shown
 // rather than pre-filled, so the boxes keep meaning "derive it" and a
@@ -10100,6 +11120,7 @@ function srvFormData(){
     pin_connections:document.getElementById('sv_pin').checked,
     group:g('sv_group'), retention_days:+g('sv_ret')||0,
     block_bytes:(+g('sv_block')||0)*1e9,
+    block_account:document.getElementById('sv_paid').checked,
     warm_pool:document.getElementById('sv_warm').checked,
     // Send the empty box AS an empty string, which the daemon reads as
     // "unset, derive it". NOT `||0` like the fields above: on these,
@@ -10505,7 +11526,7 @@ function renderSetupSteps(c){
               : t('setup.s4.hint','optional, and everything works without it: it is what connection tuning scores against, and what percentage speed limits are a percentage OF. Your provider quotes it in megabits.'),
       ctl:`<span class="lsrow">`
         +`<input type="number" min="1" step="1" id="setupLine" placeholder="900" aria-label="${escA(t('setup.s4','Tell nzbfast your line speed'))}">`
-        +`<select id="setupLineUnit"><option value="Mbps">Mbps</option><option value="Gbps">Gbps</option><option value="MB/s">MB/s</option></select>`
+        +`<select id="setupLineUnit" aria-label="${escA(t('setup.s4.unit','Line speed unit'))}"><option value="Mbps">Mbps</option><option value="Gbps">Gbps</option><option value="MB/s">MB/s</option></select>`
         +`<button class="ghost act" onclick="saveSetupLine()">${esc(t('setup.s4.save','Save'))}</button>`
         +`<button class="ghost act" onclick="skipSetupLine()">${esc(t('setup.s4.skip',"I don't know"))}</button>`
         +`</span>`,
@@ -10736,7 +11757,13 @@ if(!REDUCED){
 // Background tabs drop to a 5 s trickle (not zero - embedded webviews can
 // report hidden while actually shown); foregrounding catches up instantly.
 let slowTick=0;
-tick(); setInterval(()=>{
+// Microtask, not a direct call: tick() now touches history-window state
+// (HIST_ROWS, layoutPrefs) SYNCHRONOUSLY before its fetch, and some of
+// those declarations sit below this line - a direct first call dies on
+// the temporal dead zone, and its catch paints "daemon unreachable"
+// over a healthy daemon on every load. The microtask runs after the
+// whole script has initialized.
+queueMicrotask(tick); setInterval(()=>{
   if(!document.hidden) tick();
   else if(++slowTick>=5){ slowTick=0; tick(); }
 }, PERIOD*1000);
@@ -10761,9 +11788,12 @@ function layoutPrefs(){
     // throwing away a layout someone arranged by hand is a worse failure
     // than carrying an old blob forward with one field defaulted.
     if(p && p.v===1){ p.v=2; p.density={}; saveLayoutPrefs(p); }
-    if(p && p.v===2){ p.density=p.density||{}; return p; }
+    // v2 → v3 adds per-table column order/widths. Same migrate-don't-
+    // discard rule as v1 → v2.
+    if(p && p.v===2){ p.v=3; p.cols={}; saveLayoutPrefs(p); }
+    if(p && p.v===3){ p.density=p.density||{}; p.cols=p.cols||{}; return p; }
   }catch(e){}
-  return {v:2, order:[], hidden:[], chartH:{}, density:{}};
+  return {v:3, order:[], hidden:[], chartH:{}, density:{}, cols:{}};
 }
 function saveLayoutPrefs(p){ localStorage.layoutPrefs=JSON.stringify(p); }
 function resetLayout(){ delete localStorage.layoutPrefs; toast(t('toast.layoutReset','Layout reset.')); setTimeout(()=>location.reload(), 300); }
@@ -10929,7 +11959,9 @@ function setHistExpanded(on){
   const p=layoutPrefs(); p.histExpanded=!!on; saveLayoutPrefs(p);
   const b=document.querySelector('#histCard .carddense');
   if(b){ b.classList.toggle('on',!on); b.setAttribute('aria-pressed', on?'false':'true'); }
-  renderHistory();
+  // The window size changed - refetch it from the store.
+  histLimitOverride=0;
+  dashHRev=0; renderHistory(); tick();
   dismissLayoutTip();
 }
 function applyHistColor(on){
@@ -11075,6 +12107,256 @@ function persistChartH(){
   });
   saveLayoutPrefs(p);
 }
+// ---- movable columns on the entry lists ------------------------------
+// The queue, history and browse tables: drag a heading to move the
+// column, drag its trailing edge to resize it, and the arrangement
+// persists in layoutPrefs beside the card order - so export, import and
+// Reset layout carry it for free. The renderers keep emitting cells in
+// their natural order; a MutationObserver re-applies the saved
+// permutation to whatever a render just produced, so none of the three
+// renderers know any of this exists. Name (original column 0) stays the
+// flexible column: once the user resizes anything every OTHER column is
+// pinned in pixels and Name absorbs the remainder, which keeps the
+// table exactly as wide as its card (the capped-card wrapper clips
+// overflow-x, so a wider table would lose its action buttons).
+// The ≤640px stacked layout labels cells by nth-child and has no
+// headers, so the permutation is UNDONE while that media query holds.
+const COL_TABLES=['queue','hist','idx'];
+const COL_STACKED=matchMedia('(max-width:640px)');
+function colPrefs(id){
+  const c=layoutPrefs().cols[id]||{};
+  return {ord:Array.isArray(c.ord)?c.ord.slice():[], w:(c.w&&typeof c.w==='object')?Object.assign({},c.w):{}};
+}
+function saveColPrefs(id, cp){
+  const p=layoutPrefs();
+  if(!cp.ord.length && !Object.keys(cp.w).length) delete p.cols[id];
+  else p.cols[id]=cp;
+  saveLayoutPrefs(p);
+  dismissLayoutTip();
+}
+// The saved order is a permutation of ORIGINAL indexes (data-ci, stamped
+// at init). Sanitised on every read: a column added in a later version
+// keeps its natural spot rather than vanishing, and a corrupt blob
+// degrades to the natural order.
+function colOrder(id, n){
+  const seen=new Set();
+  const ord=colPrefs(id).ord.filter(ci=>Number.isInteger(ci)&&ci>=0&&ci<n&&!seen.has(ci)&&seen.add(ci));
+  for(let i=0;i<n;i++) if(!seen.has(i)) ord.push(i);
+  return ord;
+}
+function colTable(id){
+  const tb=document.getElementById(id);
+  const hr=tb&&tb.tHead&&tb.tHead.rows[0];
+  return hr?{tb, hr, n:hr.cells.length}:null;
+}
+// Paint order + widths. `wOver` lets a live drag paint straight from an
+// in-memory object so localStorage is written once, on release - the
+// same rule the card-cap drag follows.
+function applyCols(id, wOver){
+  const s=colTable(id); if(!s) return;
+  const ord=colOrder(id, s.n), w=wOver||colPrefs(id).w;
+  const stacked=COL_STACKED.matches;
+  // Headers travel physically (they are display:none while stacked, so
+  // they can stay permuted); handles and listeners move with them.
+  const ths=[...s.hr.cells];
+  for(const ci of ord) s.hr.appendChild(ths.find(th=>+th.dataset.ci===ci));
+  // Widths ride a colgroup in VISUAL order. fixed layout starts only
+  // once a width exists: until then the table keeps the auto layout it
+  // shipped with, untouched.
+  let cg=s.tb.querySelector(':scope>colgroup.usercols');
+  if(Object.keys(w).length && !stacked){
+    if(!cg){ cg=document.createElement('colgroup'); cg.className='usercols'; s.tb.insertBefore(cg, s.tb.firstChild); }
+    while(cg.children.length>s.n) cg.lastChild.remove();
+    while(cg.children.length<s.n) cg.appendChild(document.createElement('col'));
+    ord.forEach((ci,vi)=>{ cg.children[vi].style.width = (ci!==0&&w[ci]) ? Math.round(w[ci])+'px' : ''; });
+    s.tb.style.tableLayout='fixed';
+  } else { if(cg) cg.remove(); s.tb.style.tableLayout=''; }
+  colApplyRows(id);
+}
+// Re-apply the permutation to the body rows. Runs from the observer
+// after every render; a row is touched once per arrangement (__cord),
+// so the steady state costs a string compare per row per tick.
+function colApplyRows(id){
+  const s=colTable(id); if(!s||!s.tb.tBodies[0]) return;
+  const ord=colOrder(id, s.n);
+  const ident=ord.every((ci,i)=>ci===i);
+  const key=(COL_STACKED.matches||ident)?'':ord.join(',');
+  for(const tr of s.tb.tBodies[0].rows){
+    if(tr.__cord===key) continue;
+    if(!tr.__c0){
+      if(!key) { tr.__cord=key; continue; }        // natural order already
+      const cells=[...tr.cells];
+      // Drawer and empty-state rows span the full width: leave them be.
+      if(cells.length!==s.n||cells.some(td=>td.colSpan>1)) continue;
+      tr.__c0=cells;
+    }
+    for(const ci of (key?ord:tr.__c0.map((_,i)=>i))) tr.appendChild(tr.__c0[ci]);
+    tr.__cord=key;
+  }
+}
+function colReorder(id, from, ins){
+  const s=colTable(id); if(!s) return;
+  const ord=colOrder(id, s.n);
+  if(from<0||from>=ord.length||ins<0||ins>ord.length) return;
+  const [ci]=ord.splice(from,1);
+  ord.splice(ins>from?ins-1:ins, 0, ci);
+  const cp=colPrefs(id);
+  cp.ord=ord.every((c,i)=>c===i)?[]:ord;
+  saveColPrefs(id, cp);
+  applyCols(id);
+}
+// First resize pins EVERY fixed column at its currently rendered width,
+// so the switch to fixed layout moves nothing on screen.
+function colSnapshotW(id){
+  const s=colTable(id), cp=colPrefs(id);
+  if(!Object.keys(cp.w).length)
+    for(const th of s.hr.cells){
+      const ci=+th.dataset.ci;
+      // The 36 floor also covers a header measured while it is not
+      // rendered (width 0), which would otherwise pin real columns at
+      // nothing.
+      if(ci!==0) cp.w[ci]=Math.max(36, Math.round(th.getBoundingClientRect().width));
+    }
+  return cp;
+}
+// Clamp a candidate width: the column keeps a usable minimum, and the
+// flexible Name column keeps at least 80px of the table, so no drag can
+// push the action buttons out of the clipped wrapper.
+function colClampW(id, cp, ci, px){
+  const s=colTable(id);
+  let others=0;
+  for(const [k,v] of Object.entries(cp.w)) if(+k!==ci) others+=v;
+  return Math.max(36, Math.min(px, s.tb.clientWidth-80-others));
+}
+// Which column a resize handle actually drives: its own for a fixed
+// column; for the flexible Name column the next visual one, inverted -
+// widening Name IS shrinking its neighbour.
+function colResizeTarget(id, th){
+  const ci=+th.dataset.ci;
+  if(ci!==0) return {ci, inv:1};
+  const nx=th.nextElementSibling;
+  return nx?{ci:+nx.dataset.ci, inv:-1}:null;
+}
+function colHeadCtl(id, th){
+  th.classList.add('colgrab');
+  const lbl=t('cols.move.title','Drag this heading to move the column. Arrow keys move it too; Shift with an arrow resizes it.');
+  if(!th.title) th.title=lbl;
+  th.tabIndex=0;
+  th.setAttribute('aria-label',(th.textContent.trim()||t('col.name','Name'))+': '+lbl);
+  const rtl=()=>document.documentElement.dir==='rtl';
+  // Move: pointer capture so the drag survives leaving the header, and
+  // a 6px threshold so a plain click still just focuses.
+  let pid=null, x0=0, moved=false;
+  const clearMarks=()=>{ for(const c of th.parentElement.cells) c.classList.remove('coldrop','coldropend'); };
+  // Insertion point = how many columns the pointer has logically
+  // passed. Counting midpoints is direction-agnostic and behaves at
+  // both ends of the row, where the pointer is over no cell at all.
+  const insAt=x=>{
+    let ins=0;
+    for(const c of th.parentElement.cells){
+      const r=c.getBoundingClientRect();
+      if(rtl() ? x<(r.left+r.right)/2 : x>(r.left+r.right)/2) ins++;
+    }
+    return ins;
+  };
+  th.addEventListener('pointerdown',e=>{
+    if(e.button!==0||e.target.closest('.colrs')||COL_STACKED.matches) return;
+    pid=e.pointerId; x0=e.clientX; moved=false;
+    th.setPointerCapture(pid);
+  });
+  th.addEventListener('pointermove',e=>{
+    if(pid===null) return;
+    if(!moved){ if(Math.abs(e.clientX-x0)<6) return; moved=true; th.classList.add('coldrag'); }
+    clearMarks();
+    const cells=[...th.parentElement.cells], ins=insAt(e.clientX);
+    if(ins>=cells.length) cells[cells.length-1].classList.add('coldropend');
+    else cells[ins].classList.add('coldrop');
+  });
+  const up=()=>{
+    if(pid===null) return;
+    try{ th.releasePointerCapture(pid); }catch(_){}
+    pid=null;
+    if(!moved) return;
+    th.classList.remove('coldrag');
+    const cells=[...th.parentElement.cells];
+    let ins=-1;
+    cells.forEach((c,vi)=>{
+      if(c.classList.contains('coldrop')) ins=vi;
+      if(c.classList.contains('coldropend')) ins=cells.length;
+    });
+    clearMarks();
+    if(ins>=0) colReorder(id, cells.indexOf(th), ins);
+  };
+  th.addEventListener('pointerup',up);
+  th.addEventListener('pointercancel',()=>{
+    if(pid!==null){ try{ th.releasePointerCapture(pid); }catch(_){} pid=null; }
+    th.classList.remove('coldrag'); clearMarks();
+  });
+  // Keyboard: same convention as the card and chart grips - the
+  // affordance cannot be drag-only.
+  th.addEventListener('keydown',e=>{
+    if(e.key!=='ArrowLeft'&&e.key!=='ArrowRight') return;
+    e.preventDefault();
+    const dir=(e.key==='ArrowRight')!==rtl()?1:-1;
+    if(e.shiftKey){
+      const tgt=colResizeTarget(id, th); if(!tgt) return;
+      const cp=colSnapshotW(id);
+      cp.w[tgt.ci]=colClampW(id, cp, tgt.ci, cp.w[tgt.ci]+dir*16*tgt.inv);
+      saveColPrefs(id, cp); applyCols(id);
+      return;
+    }
+    const vi=[...th.parentElement.cells].indexOf(th);
+    const ins=dir>0?vi+2:vi-1;
+    if(ins<0||ins>th.parentElement.cells.length) return;
+    colReorder(id, vi, ins);
+    th.focus();
+  });
+  // Resize: the strip on the trailing edge. Double-click puts every
+  // width in this table back to automatic.
+  const h=document.createElement('span');
+  h.className='colrs';
+  h.title=t('cols.resize.title','Drag to resize this column. Double-click puts the widths back.');
+  let rid=null, rx=0, rcp=null, rt=null, rw0=0;
+  h.addEventListener('pointerdown',e=>{
+    if(e.button!==0) return;
+    e.preventDefault(); e.stopPropagation();
+    rt=colResizeTarget(id, th); if(!rt) return;
+    rcp=colSnapshotW(id); rw0=rcp.w[rt.ci]; rx=e.clientX;
+    rid=e.pointerId; h.setPointerCapture(rid); h.classList.add('on');
+  });
+  h.addEventListener('pointermove',e=>{
+    if(rid===null) return;
+    const dx=(e.clientX-rx)*(rtl()?-1:1)*rt.inv;
+    rcp.w[rt.ci]=colClampW(id, rcp, rt.ci, rw0+dx);
+    applyCols(id, rcp.w);
+  });
+  const rend=()=>{
+    if(rid===null) return;
+    try{ h.releasePointerCapture(rid); }catch(_){}
+    rid=null; h.classList.remove('on');
+    saveColPrefs(id, rcp); applyCols(id);
+  };
+  h.addEventListener('pointerup',rend);
+  h.addEventListener('pointercancel',rend);
+  h.addEventListener('dblclick',e=>{
+    e.stopPropagation();
+    const cp=colPrefs(id); cp.w={};
+    saveColPrefs(id, cp); applyCols(id);
+  });
+  th.appendChild(h);
+}
+function initCols(){
+  for(const id of COL_TABLES){
+    const s=colTable(id); if(!s) continue;
+    [...s.hr.cells].forEach((th,i)=>{ th.dataset.ci=i; colHeadCtl(id, th); });
+    // Every render rewrites the tbody in natural order; re-permute what
+    // just appeared. Moving tds does not touch the tbody's OWN child
+    // list, so the observer cannot feed itself.
+    new MutationObserver(()=>colApplyRows(id)).observe(s.tb.tBodies[0],{childList:true});
+    applyCols(id);
+  }
+  COL_STACKED.addEventListener('change',()=>COL_TABLES.forEach(id=>applyCols(id)));
+}
 function initLayout(){
   if(!LAYOUT_EDIT) return;
   const p=layoutPrefs(), dash=document.getElementById('dashview');
@@ -11150,6 +12432,7 @@ function initLayout(){
   }
   addChartGrips();
   addCardGrips();
+  initCols();
   applyAllCardCaps();
   const ro=new ResizeObserver(()=>{
     clearTimeout(chartHT);

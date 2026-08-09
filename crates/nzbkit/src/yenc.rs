@@ -218,10 +218,26 @@ pub(crate) fn check_part_geometry(
 ) -> Result<(), YencError> {
     // No `=ypart`: `end` came from the (untrusted, unchecked) `=ybegin size`
     // field rather than a range declaration, so there is nothing to
-    // contradict. `end == 0` means the part declared no end at all - a
-    // malformed header the two decoders already agree on, and one an empty
-    // part legitimately produces; leave both as they were.
-    if !seen_ypart || end == 0 {
+    // contradict.
+    if !seen_ypart {
+        return Ok(());
+    }
+    // `=ypart` carrying no `end=` at all: both decoders default it to 0.
+    // "Nothing to check the range against" must not collapse into
+    // "anything goes" - `begin` ALONE still positions the write
+    // (`Meta::offset()` is `begin - 1`), so returning Ok here handed back
+    // exactly the write-anywhere primitive described above, with the
+    // article no longer even having to make its range self-consistent to
+    // get it. A zero-length part legitimately produces `end == 0`, and a
+    // part beginning at the top of the file has nowhere to go: both stay
+    // accepted. A non-empty part claiming a nonzero offset while
+    // declining to declare its range does not - the spec requires `end=`
+    // on `=ypart`, so that shape is malformed by construction rather
+    // than a poster quirk we have to tolerate.
+    if end == 0 {
+        if len > 0 && begin > 1 {
+            return Err(YencError::PartGeometry { begin, end, len });
+        }
         return Ok(());
     }
     if begin > end || end - begin + 1 != len {
@@ -531,6 +547,57 @@ mod tests {
         let good = encode("f.bin", 8192, Some((2, 2)), 4097, &payload);
         assert_eq!(decode(&good).unwrap().data, payload);
         assert_eq!(crate::yenc_simd::decode(&good).unwrap().data, payload);
+    }
+
+    /// The same write-anywhere primitive, reached by simply OMITTING
+    /// `end=` instead of lying about it.
+    ///
+    /// Both decoders default a missing `end` to 0, and the geometry
+    /// check used to return Ok on `end == 0` - so an article that
+    /// declined to declare its range got the arbitrary offset without
+    /// even having to make the range self-consistent, which is a strictly
+    /// easier bypass than the one the test above pins.
+    #[test]
+    fn a_part_that_declares_no_end_may_not_claim_an_offset() {
+        let payload = test_data(4096);
+        let article = |ypart: &str| -> Vec<u8> {
+            let mut body = format!(
+                "=ybegin part=1 total=2 line=128 size=1099511631872 name=g.bin\r\n\
+                 {ypart}\r\n"
+            )
+            .into_bytes();
+            let single = encode("g.bin", payload.len() as u64, None, 1, &payload);
+            let starts = single.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
+            body.extend_from_slice(&single[starts..]);
+            body
+        };
+
+        let no_end = article("=ypart begin=1099511627777");
+        assert!(matches!(
+            decode(&no_end),
+            Err(YencError::PartGeometry { len: 4096, .. })
+        ));
+        assert!(matches!(
+            crate::yenc_simd::decode(&no_end),
+            Err(YencError::PartGeometry { len: 4096, .. })
+        ));
+
+        // `end=0` spelled out reaches the same default and is the same
+        // article.
+        let zero_end = article("=ypart begin=1099511627777 end=0");
+        assert!(decode(&zero_end).is_err());
+        assert!(crate::yenc_simd::decode(&zero_end).is_err());
+
+        // A part at the top of the file has nowhere to place itself, so
+        // an absent `end` costs nothing and stays accepted - this is the
+        // shape real single-part posts take.
+        let at_one = article("=ypart begin=1");
+        assert_eq!(decode(&at_one).unwrap().data, payload);
+        assert_eq!(crate::yenc_simd::decode(&at_one).unwrap().data, payload);
+
+        // And the empty part that legitimately produces `end == 0` is
+        // still legal wherever it sits.
+        assert!(check_part_geometry(true, 4097, 0, 0).is_ok());
     }
 
     #[test]

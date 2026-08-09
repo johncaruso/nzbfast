@@ -85,6 +85,39 @@ pub fn bracket_id(id: &str) -> String {
     format!("<{t}>")
 }
 
+/// Per-id presence on ONE server: pipelined STATs over a single
+/// connection, ~50 bytes per id, so a few hundred ids cost well under a
+/// second. This is the gate that makes a real-article ladder supply
+/// safe: retention differs per provider, and an article a fast primary
+/// holds may not exist on a low-retention fill - laddering 430s
+/// measures nothing (see conntune::MIN_LADDER_GBPS).
+///
+/// Output is in input order. Errors out rather than guessing when the
+/// connection dies mid-sweep - a partial verdict on a broken session is
+/// not a sample.
+pub async fn stat_presence(
+    server: &ServerConfig,
+    ids: &[String],
+) -> Result<Vec<bool>, Box<dyn std::error::Error + Send + Sync>> {
+    let (mut conn, _) = Connection::connect(server).await?;
+    let mut out = Vec::with_capacity(ids.len());
+    let window = 32usize;
+    let mut sent = 0usize;
+    while out.len() < ids.len() {
+        while sent < ids.len() && sent - out.len() < window {
+            conn.send_stat(&ids[sent]).await?;
+            sent += 1;
+        }
+        conn.flush().await?;
+        let have = tokio::time::timeout(Duration::from_secs(20), conn.read_stat())
+            .await
+            .map_err(|_| Box::<dyn std::error::Error + Send + Sync>::from("STAT timed out"))??;
+        out.push(have);
+    }
+    conn.quit().await;
+    Ok(out)
+}
+
 /// GB/s of a compute stage, single-core and all-core.
 #[derive(Clone, Copy, serde::Serialize)]
 pub struct StageRate {
@@ -671,15 +704,22 @@ fn ladder_supply_for(peak_gbps: f64, conns: usize, secs_per_step: u64) -> usize 
 /// be sized for the rate these rungs are ALREADY known to reach, or a
 /// re-measure starves where the climb did not and reads low, which on
 /// this path would manufacture the very dip it was sent to check.
+///
+/// `ids` is the caller's article supply - REAL-CONTENT articles the
+/// target provider is known to hold (design doc 12.1). The synthetic
+/// probe group undermeasured a provider 17x, so this function no longer
+/// discovers its own.
 pub async fn remeasure(
     server: &ServerConfig,
-    group: &str,
+    mut ids: Vec<String>,
     rungs: &[usize],
     peak_gbps: f64,
     secs_per_step: u64,
 ) -> Result<Vec<LadderStep>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::pool::PoolConfig;
-    let mut ids = discover_ids(server, group, 8_000).await?;
+    if ids.is_empty() {
+        return Err("no articles to measure with".into());
+    }
     let mut out: Vec<LadderStep> = Vec::new();
     for &c in rungs {
         let c = c.clamp(1, 150);
@@ -732,16 +772,26 @@ pub async fn remeasure(
 /// sight of the reasoning behind the number it eventually prints. Phases
 /// are TOKENS, not sentences: the translation belongs to whoever is
 /// displaying them.
+///
+/// `ids` is the caller's article supply. It must be REAL-CONTENT
+/// articles the target provider is known to hold (STAT-checked - see
+/// design doc 12.1): the synthetic probe group undermeasured a provider
+/// 17x because per-group backends differ, and a supply of missing
+/// articles ladders 430s and measures nothing. The rotation below still
+/// hands every rung a distinct slice, which is what excludes
+/// provider-side caching from the comparison.
 pub async fn conn_ladder(
     server: &ServerConfig,
-    group: &str,
+    mut ids: Vec<String>,
     max_conns: usize,
     ceiling: usize,
     secs_per_step: u64,
     mut on_progress: impl FnMut(&str, usize, &[LadderStep]) -> bool,
 ) -> Result<Vec<LadderStep>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::pool::PoolConfig;
-    let mut ids = discover_ids(server, group, 8_000).await?;
+    if ids.is_empty() {
+        return Err("no articles to measure with".into());
+    }
     let mut out: Vec<LadderStep> = Vec::new();
     let mut c = 2usize;
     let mut stopped_flat = false;

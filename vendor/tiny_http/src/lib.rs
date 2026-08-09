@@ -91,7 +91,7 @@
 #![deny(rust_2018_idioms)]
 #![allow(clippy::match_like_matches_macro)]
 
-#[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+#[cfg(feature = "ssl-openssl")]
 use zeroize::Zeroizing;
 
 use std::error::Error;
@@ -296,6 +296,23 @@ impl Default for ServerLimits {
 }
 
 /// Configuration of the server for SSL.
+///
+/// nzbfast patch 13 (see VENDORING.md): under `ssl-rustls` this carries a
+/// PREBUILT `rustls::ServerConfig` instead of upstream's raw PEM byte
+/// vectors. The caller owns certificate parsing, validation and its error
+/// messages (which can then name the offending file), and this crate stays
+/// out of the PEM business entirely - no rustls-pemfile, no zeroize, and no
+/// provider choice made here (the workspace links both aws-lc-rs and ring,
+/// so a bare `rustls::ServerConfig::builder()` would panic at run time).
+#[cfg(feature = "ssl-rustls")]
+#[derive(Debug, Clone)]
+pub struct SslConfig {
+    /// The fully built server-side TLS configuration to accept with.
+    pub server_config: std::sync::Arc<rustls::ServerConfig>,
+}
+
+/// Configuration of the server for SSL (upstream shape: raw PEM bytes).
+#[cfg(not(feature = "ssl-rustls"))]
 #[derive(Debug, Clone)]
 pub struct SslConfig {
     /// Contains the public certificate to send to clients.
@@ -402,7 +419,9 @@ impl Server {
         type SslContext = crate::ssl::SslContextImpl;
         let ssl: Option<SslContext> = {
             match ssl_config {
-                #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+                #[cfg(feature = "ssl-rustls")]
+                Some(config) => Some(SslContext::from_config(config)),
+                #[cfg(all(feature = "ssl-openssl", not(feature = "ssl-rustls")))]
                 Some(config) => Some(SslContext::from_pem(
                     config.certificate,
                     Zeroizing::new(config.private_key),

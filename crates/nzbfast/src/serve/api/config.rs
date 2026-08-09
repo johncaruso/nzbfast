@@ -147,9 +147,33 @@ fn m_get_config(
     _api_body: &mut Option<Vec<u8>>,
 ) -> Option<Value> {
     Some({
-        let cats: Vec<Value> = d.cats.lock_ok().iter()
-                        .map(|c| json!({"name": c, "dir": if c == "*" { "" } else { c.as_str() }, "priority": -100, "pp": "", "script": "None"}))
-                        .collect();
+        // §129 2b: real values, not the static placeholders this used
+        // to answer with. pp stays "" - repair+unpack are integral to
+        // the one-pass download, so there is no per-category pp level
+        // to report (decision 5's documented mapping).
+        let cats: Vec<Value> = {
+            let meta = d.cat_meta.lock_ok();
+            d.cats
+                .lock_ok()
+                .iter()
+                .map(|c| {
+                    let m = meta.get(c).cloned().unwrap_or_default();
+                    json!({
+                        "name": c,
+                        "dir": if !m.dir.is_empty() {
+                            m.dir
+                        } else if c == "*" {
+                            String::new()
+                        } else {
+                            c.clone()
+                        },
+                        "priority": m.priority.unwrap_or(-100),
+                        "pp": "",
+                        "script": if m.script.is_empty() { "None".to_string() } else { m.script },
+                    })
+                })
+                .collect()
+        };
         // Usenet servers with SECRETS MASKED: the UI only ever
         // learns whether a password exists, never its value.
         let servers: Vec<Value> = nzbkit::config::Config::load(ctx.cfg_path)
@@ -169,10 +193,18 @@ fn m_get_config(
                             "username": s.username.clone().unwrap_or_default(),
                             "has_password": s.password.is_some(),
                             "connections": s.connections,
+                            // Echoed because the editor round-trips the
+                            // whole form: unechoed, the box loaded
+                            // unticked on a pinned server and the next
+                            // Save silently dropped the pin. Found while
+                            // adding block_account beside it, which
+                            // would have inherited the same hole.
+                            "pin_connections": s.pin_connections,
                             "level": s.level,
                             "group": s.group.clone().unwrap_or_default(),
                             "retention_days": s.retention_days,
                             "block_bytes": s.block_bytes.unwrap_or(0),
+                            "block_account": s.block_account,
                             "block_used": d.usage_lifetime(&s.host),
                             "enabled": s.enabled,
                             "warm_pool": s.warm_pool,
@@ -215,6 +247,18 @@ fn m_get_config(
             && v != &active_port
         {
             pending.insert("port".into(), v.clone());
+        }
+        // §129 2a: the TLS pair is bind-time too. A cleared value ("")
+        // pending against a serving pair matters as much as a set one.
+        for (k, active) in [
+            ("tls_cert", crate::serve::settings::path_str(&d.tls_cert)),
+            ("tls_key", crate::serve::settings::path_str(&d.tls_key)),
+        ] {
+            if let Some(v) = staged.get(k)
+                && v != &json!(active)
+            {
+                pending.insert(k.into(), v.clone());
+            }
         }
         #[cfg(feature = "indexer")]
         {
@@ -272,15 +316,13 @@ fn m_get_scripts(
     _api_body: &mut Option<Vec<u8>>,
 ) -> Option<Value> {
     Some({
+        // §129 2b follow-up: the honest list is everything the daemon
+        // can run for a job - global AND per-category scripts (deduped
+        // by basename, the name clients send back as `script=`).
+        // "None" first: SAB's null choice, and what keeps a client's
+        // dropdown rendering at all.
         let mut scripts = vec![json!("None")];
-        if let Some(name) = d
-            .script
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().into_owned())
-        {
+        for (name, _) in d.known_scripts() {
             scripts.push(json!(name));
         }
         json!({"scripts": scripts})
@@ -341,6 +383,41 @@ fn m_config(
                 timed_pause(d, v.parse().unwrap_or(0), true);
                 json!({"status": true})
             }
+            // The two credentials get the same anti-drive-by gate as
+            // `apikey_new`/`nzbkey_new`. Writing them THROUGH `config`
+            // reaches the identical `set_apikey`/`nzbkey` code with none
+            // of the protection, over a plain GET - so on a keyless
+            // install (`NZBFAST_OPEN=1`, or one predating first-run
+            // minting) an `<img src=".../api?mode=config&name=apikey
+            // &value=…">` on any page the user happens to visit installs
+            // an attacker-chosen key. That is precisely the outcome
+            // `credential_mutation_allowed`'s own doc describes for the
+            // mint routes: "the owner is locked out of their own daemon
+            // by a key nobody has" - except here the attacker knows the
+            // key, so `server_secret`, `script` and `backup_export`
+            // follow. The gate is a no-op for legitimate callers (curl,
+            // *arr, the dashboard's own POST); only a browser navigation
+            // trips it.
+            (Some(name @ ("apikey" | "nzbkey")), Some(v)) => match same_site_only(req) {
+                Ok(()) => match apply_and_save(d, name, v) {
+                    Ok((live, saved)) => {
+                        info!(
+                            target: "config",
+                            "{name} → {}{}",
+                            log_value(name, v),
+                            if saved {
+                                ""
+                            } else {
+                                " (NOT SAVED - reverts on restart)"
+                            }
+                        );
+                        let _ = live;
+                        json!({"status": true, "saved": saved})
+                    }
+                    Err(e) => json!({"status": false, "error": e}),
+                },
+                Err(e) => json!({"status": false, "error": e}),
+            },
             (Some(name), Some(v)) => match apply_and_save(d, name, v) {
                 Ok((live, saved)) => {
                     info!(
@@ -826,6 +903,29 @@ fn credential_mutation_allowed(req: &tiny_http::Request) -> Result<(), String> {
     if req.method() != &tiny_http::Method::Post {
         return Err("POST required to create a key".into());
     }
+    same_site_only(req)
+}
+
+/// The same-site half of [`credential_mutation_allowed`], on its own.
+///
+/// `mode=config&name=apikey|nzbkey` writes the same two credentials as
+/// the mint routes, through the same `set_apikey`/`nzbkey` code, and had
+/// none of this - so on a keyless install an `<img src=".../api?mode=
+/// config&name=apikey&value=…">` on any page the user visited installed
+/// an attacker-chosen key and locked the owner out, with the attacker
+/// holding the only credential.
+///
+/// It gets the same-site check but NOT the POST requirement, because
+/// unlike the mint routes this one has non-browser callers that have
+/// always used GET (curl, scripts, the first-run flows the
+/// `firstrun_key` suite pins). Dropping the POST half costs nothing
+/// here: the attack is a browser being used as a confused deputy, and
+/// every browser since 2023 labels such a request `Sec-Fetch-Site:
+/// cross-site` whether it came from an `<img>`, an iframe, a redirect or
+/// a cross-site form, GET or POST. A caller that sends no
+/// `Sec-Fetch-*`/`Origin` at all is not a browser and keeps working,
+/// exactly as the mint gate already allows.
+fn same_site_only(req: &tiny_http::Request) -> Result<(), String> {
     let hv = |name: &'static str| {
         req.headers()
             .iter()

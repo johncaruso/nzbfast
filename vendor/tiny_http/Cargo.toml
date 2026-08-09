@@ -1,8 +1,8 @@
 # Vendored from crates.io tiny_http 0.12.0 - see VENDORING.md for WHY and for
 # the exact local patches. Trimmed vs the published manifest: the crate's own
-# dev-dependencies (fdlimit / rustc-serialize / sha1) and tests are not vendored,
-# and the optional TLS backends stay optional-and-unused (we terminate TLS
-# nowhere in this listener; NNTP TLS is rustls in nzbkit).
+# dev-dependencies (fdlimit / rustc-serialize / sha1) and tests are not vendored.
+# The rustls TLS backend is REAL since patch 13 (TODO §129 2a: native HTTPS for
+# the daemon UI/API); the openssl backend stays a stub.
 [package]
 edition = "2018"
 name = "tiny_http"
@@ -20,13 +20,19 @@ ascii = "1.0"
 chunked_transfer = "1"
 httpdate = "1.0.2"
 log = "0.4.4"
+# ssl-rustls only (patch 13). No provider feature and no default features:
+# the caller hands in a fully built rustls::ServerConfig, so this crate never
+# constructs one - and the workspace links both aws-lc-rs and ring, which
+# makes a provider choice here wrong for every caller that chose the other.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12"] }
 
 [features]
 default = []
-# Declared but deliberately empty: the optional TLS backends are NOT vendored
-# (this listener terminates no TLS - NNTP TLS is rustls, in nzbkit). The names
-# exist only so the crate's own `cfg(feature = "ssl-*")` checks are recognised
-# rather than warned about as unexpected cfg values. Do not enable them; the
-# code they gate references crates that are no longer dependencies.
+# Real since patch 13 (see VENDORING.md): the daemon's opt-in native HTTPS
+# (TODO §129 2a) rides tiny_http's own accept loop with a rustls acceptor.
+ssl-rustls = ["dep:rustls"]
+# Declared but deliberately empty: the openssl backend is NOT vendored. The
+# name exists only so the crate's own `cfg(feature = "ssl-openssl")` checks
+# are recognised rather than warned about as unexpected cfg values. Do not
+# enable it; the code it gates references crates that are not dependencies.
 ssl-openssl = []
-ssl-rustls = []

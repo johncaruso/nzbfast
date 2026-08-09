@@ -1,5 +1,9 @@
 use super::*;
 
+#[path = "settings_apply.rs"]
+mod settings_apply;
+use settings_apply::apply_setting_tail;
+
 /// Everything `get_config` needs to read the live daemon, so a table row
 /// can be a plain `fn` pointer instead of a closure over locals.
 pub(super) struct ConfigCtx<'a> {
@@ -212,7 +216,13 @@ pub(super) const fn ro(name: &'static str, read: fn(&ConfigCtx) -> Value) -> Set
 /// Paths and the control port.
 pub(super) const PATHS: &[Setting] = &[
     rw("port", |c| json!(c.d.port)),
+    // §129 2a: opt-in native HTTPS. Bind-time values like the port -
+    // the write arms validate the files NOW (so a typo fails the save,
+    // not the next restart), persist, and `pending` carries the diff.
+    rw("tls_cert", |c| json!(path_str(&c.d.tls_cert))),
+    rw("tls_key", |c| json!(path_str(&c.d.tls_key))),
     rw("out_dir", |c| json!(c.d.out_dir().to_string_lossy())),
+    rw("move_pace", |c| json!(c.d.move_pace.lock_ok().clone())),
     rw("move_completed", |c| {
         json!(
             c.d.move_completed
@@ -230,6 +240,14 @@ pub(super) const PATHS: &[Setting] = &[
     rw("watch", |c| json!(path_str(&c.d.watch_dir.lock_ok()))),
     rw("watch_interval_secs", |c| {
         json!(c.d.watch_interval_secs.load(Ordering::Relaxed))
+    }),
+    rw("dupe_action", |c| json!(c.d.dupe_action.lock_ok().clone())),
+    rw("cat_meta", |c| json!(c.d.cat_meta.lock_ok().clone())),
+    rw("watch_recursive", |c| {
+        json!(c.d.watch_recursive.load(Ordering::Relaxed))
+    }),
+    rw("watch_move_rejected", |c| {
+        json!(c.d.watch_move_rejected.load(Ordering::Relaxed))
     }),
     rw(
         "delete_to_trash",
@@ -331,6 +349,9 @@ pub(super) const SPEED: &[Setting] = &[
     rw("auto_connections", |c| {
         json!(c.d.auto_connections.load(Ordering::Relaxed))
     }),
+    rw("live_tune", |c| {
+        json!(c.d.live_tune.load(Ordering::Relaxed))
+    }),
     ro("conntune", |c| {
         serde_json::to_value(crate::conntune::load(c.cfg_path)).unwrap_or_else(|_| json!({}))
     }),
@@ -405,6 +426,15 @@ pub(super) const RENAME: &[Setting] = &[
     }),
     rw("history_rows", |c| {
         json!(c.d.history_rows.load(Ordering::Relaxed))
+    }),
+    // §129 D5: optional retention, BOTH default 0 = keep everything
+    // (history is unlimited by ruling; the knobs exist for whoever
+    // disagrees, and they ship OFF).
+    rw("history_keep_count", |c| {
+        json!(c.d.history_keep_count.load(Ordering::Relaxed))
+    }),
+    rw("history_keep_days", |c| {
+        json!(c.d.history_keep_days.load(Ordering::Relaxed))
     }),
     rw("history_color_names", |c| {
         json!(c.d.history_color_names.load(Ordering::Relaxed))
@@ -653,6 +683,9 @@ pub(super) const AUTOMATION: &[Setting] = &[
     rw("watch_keep_nzb", |c| {
         json!(c.d.watch_keep_nzb.load(Ordering::Relaxed))
     }),
+    // §129 3e. Only the switch: the judge's thresholds live in
+    // settings.json under `slow_storage`.
+    rw("slow_storage_pause", |c| json!(c.d.slow_storage.enabled())),
     rw("fast_par", |c| json!(c.d.fast_par.load(Ordering::Relaxed))),
     rw("prefer_external_unrar", |c| {
         json!(c.d.prefer_external_unrar.load(Ordering::Relaxed))
@@ -686,6 +719,9 @@ pub(super) const AUTOMATION: &[Setting] = &[
                             "enabled": t.enabled,
                             "on_failure": t.on_failure,
                             "category": t.category,
+                            "events": t.events,
+                            "email_to": t.email_to,
+                            "email_from": t.email_from,
                             "has_token": !t.token.is_empty(),
                             "last_send": health.get(&crate::notify::target_key(t)),
                         })
@@ -1208,8 +1244,9 @@ fn set_quota_period(
     Ok({
         let p = match v.trim() {
             "d" | "D" => b'd',
+            "w" | "W" => b'w',
             "m" | "M" => b'm',
-            _ => return Err("quota_period must be d or m".into()),
+            _ => return Err("quota_period must be d, w or m".into()),
         };
         d.quota_period.store(p, Ordering::Relaxed);
         (true, json!((p as char).to_string()))
@@ -2035,6 +2072,15 @@ fn set_password_file(
     })
 }
 
+/// §129 3e. Switching it OFF while a storage pause is holding must
+/// RELEASE that pause, or the user is left with a paused queue and the
+/// mechanism that would resume it disarmed. The watcher does that on its
+/// next tick (it owns the judge state), so this only flips the flag.
+fn set_slow_storage_pause(d: &Arc<Daemon>, on: bool) -> (bool, Value) {
+    d.slow_storage.set_enabled(on);
+    (true, json!(on))
+}
+
 fn set_password_prompt(
     d: &Arc<Daemon>,
     _name: &str,
@@ -2295,6 +2341,56 @@ fn set_port(d: &Arc<Daemon>, name: &str, v: &str) -> std::result::Result<(bool, 
     })
 }
 
+/// §129 2a: the TLS pair is validated at SAVE time - a path typo or a
+/// non-PEM file fails the Apply with the reason, instead of surfacing as
+/// a refused restart later with nobody watching the log. Empty clears
+/// the half (both empty = plain HTTP). Applies at the next restart, like
+/// the port; take_listener re-validates at bind with the same wording.
+fn set_tls_cert(
+    _d: &Arc<Daemon>,
+    _name: &str,
+    v: &str,
+) -> std::result::Result<(bool, Value), String> {
+    let p = v.trim();
+    if !p.is_empty() {
+        use rustls::pki_types::pem::PemObject;
+        let certs: Vec<rustls::pki_types::CertificateDer<'_>> =
+            rustls::pki_types::CertificateDer::pem_file_iter(std::path::Path::new(p))
+                .map_err(|e| format!("{p}: {e}"))?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| format!("{p}: {e}"))?;
+        if certs.is_empty() {
+            return Err(format!(
+                "{p}: no certificates in the file (is it a PEM certificate?)"
+            ));
+        }
+        let (_, leaf) = x509_parser::parse_x509_certificate(certs[0].as_ref())
+            .map_err(|e| format!("{p}: not a valid X.509 certificate ({e})"))?;
+        let val = leaf.validity();
+        if !val.is_valid_at(x509_parser::time::ASN1Time::now()) {
+            return Err(format!(
+                "{p}: the certificate is expired or not valid yet (valid {} to {})",
+                val.not_before, val.not_after
+            ));
+        }
+    }
+    Ok((false, json!(p)))
+}
+
+fn set_tls_key(
+    _d: &Arc<Daemon>,
+    _name: &str,
+    v: &str,
+) -> std::result::Result<(bool, Value), String> {
+    let p = v.trim();
+    if !p.is_empty() {
+        use rustls::pki_types::pem::PemObject;
+        rustls::pki_types::PrivateKeyDer::from_pem_file(std::path::Path::new(p))
+            .map_err(|e| format!("{p}: {e}"))?;
+    }
+    Ok((false, json!(p)))
+}
+
 fn set_out_dir(
     d: &Arc<Daemon>,
     _name: &str,
@@ -2310,8 +2406,11 @@ fn set_out_dir(
         // and fail loudly if we can't - better than silently pointing the
         // downloads at a folder that won't accept them.
         std::fs::create_dir_all(&path).map_err(|e| format!("can't use {p}: {e}"))?;
-        if !path_writable(&path) {
-            return Err(format!("{p} is not writable"));
+        // Same real-write rule as the move destinations: access(2)
+        // consults permission bits, and permission bits are not the
+        // only gatekeeper.
+        if let Err(e) = write_probe(&path) {
+            return Err(format!("{p} did not accept a test write: {e}"));
         }
         // LIVE: the next enqueue builds its job directory from here. The
         // spool (queue journal / usage / art) was fixed at startup and
@@ -2337,8 +2436,13 @@ fn set_move_completed(
             let path = PathBuf::from(p);
             require_absolute_dest(&path)?;
             std::fs::create_dir_all(&path).map_err(|e| format!("can't use {p}: {e}"))?;
-            if !path_writable(&path) {
-                return Err(format!("{p} is not writable"));
+            // A REAL write, not access(2): permission bits are not the
+            // only gatekeeper (macOS network-volume consent said no
+            // while access said yes, 7 Aug), and catching that here
+            // costs one empty directory instead of a stranded payload
+            // per finished job.
+            if let Err(e) = write_probe(&path) {
+                return Err(format!("{p} did not accept a test write: {e}"));
             }
             if same_dir(&path, &d.out_root.read_ok()) {
                 return Err(
@@ -2363,8 +2467,9 @@ fn set_move_completed_cats(
             let p = path.display();
             require_absolute_dest(path)?;
             std::fs::create_dir_all(path).map_err(|e| format!("can't use {p}: {e}"))?;
-            if !path_writable(path) {
-                return Err(format!("{p} is not writable"));
+            // Same real-write rule as the global destination above.
+            if let Err(e) = write_probe(path) {
+                return Err(format!("{p} did not accept a test write: {e}"));
             }
             // The global destination has always been refused when it
             // is the download folder; the per-category ones were not
@@ -2461,6 +2566,13 @@ pub(super) fn apply_setting(
         "auto_connections" => {
             let on = flag();
             d.auto_connections.store(on, Ordering::Relaxed);
+            (true, json!(on))
+        }
+        "live_tune" => {
+            let on = flag();
+            d.live_tune.store(on, Ordering::Relaxed);
+            // The pool build reads the hub's mirror; keep them one value.
+            d.hub.live_tune.store(on, Ordering::Relaxed);
             (true, json!(on))
         }
         "update_checks" => {
@@ -2571,6 +2683,21 @@ pub(super) fn apply_setting(
             (true, json!(n))
         }
         "history_rows" => set_history_rows(d, name, v)?,
+        "history_keep_count" | "history_keep_days" => {
+            let n = v
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("{name}: a number, 0 = keep everything"))?;
+            if name == "history_keep_count" {
+                d.history_keep_count.store(n, Ordering::Relaxed);
+            } else {
+                d.history_keep_days.store(n, Ordering::Relaxed);
+            }
+            // Applies now, not at the next park - setting a cap on a
+            // grown history is exactly when the user wants it enforced.
+            d.history_enforce_retention();
+            (true, json!(n))
+        }
         "history_color_names" => {
             let on = flag();
             d.history_color_names.store(on, Ordering::Relaxed);
@@ -2643,210 +2770,9 @@ pub(super) fn apply_setting(
             d.library_recheck_secs.store(n, Ordering::Relaxed);
             (true, json!(n))
         }
-        "index_groups" => set_index_groups(d, name, v)?,
-        #[cfg(feature = "indexer")]
-        "index_interests" => set_index_interests(d, name, v)?,
-        "index_interests_applied" => {
-            // Internal bookkeeping, persisted so a restart does not
-            // re-apply interests over groups the user has since pruned.
-            *d.index_interests_applied.lock_ok() = v.trim().to_string();
-            (true, json!(v.trim()))
-        }
-        "index_interval_secs" => {
-            let n = uint()?.max(30);
-            d.index_interval_secs.store(n, Ordering::Relaxed);
-            (true, json!(n))
-        }
-        "index_scan_par" => {
-            let n = uint()?.clamp(1, 8);
-            d.index_scan_par.store(n, Ordering::Relaxed);
-            (true, json!(n))
-        }
-        "delete_to_trash" => set_delete_to_trash(d, name, v)?,
-        "cleanup_delete_mode" => set_cleanup_delete_mode(d, name, v)?,
-        "watch_interval_secs" => set_watch_interval_secs(d, name, v)?,
-        "index_tip_secs" => set_index_tip_secs(d, name, v)?,
-        "nested_max_depth" => set_nested_max_depth(d, name, v)?,
-        "oracle_sample" => {
-            // M29: idle STAT budget, STATs/hour/server (0 = off).
-            let n = uint()?.min(3600);
-            d.oracle_sample.store(n, Ordering::Relaxed);
-            (true, json!(n))
-        }
-        "index_backfill" => {
-            let n = uint()?;
-            d.index_backfill.store(n, Ordering::Relaxed);
-            (true, json!(n))
-        }
-        "index_max_age_secs" => {
-            let n = uint()?;
-            d.index_max_age_secs.store(n, Ordering::Relaxed);
-            (true, json!(n))
-        }
-        "group_desc_isc" => {
-            let on = v == "1" || v.eq_ignore_ascii_case("true");
-            d.group_desc_isc.store(on, Ordering::Relaxed);
-            (true, json!(on))
-        }
-        "index_retention" => {
-            let on = v == "1" || v.eq_ignore_ascii_case("true");
-            d.index_retention.store(on, Ordering::Relaxed);
-            (true, json!(on))
-        }
-        "index_pause_on_download" => {
-            let on = v == "1" || v.eq_ignore_ascii_case("true");
-            d.index_pause_on_download.store(on, Ordering::Relaxed);
-            (true, json!(on))
-        }
-        "predb_enabled" => set_predb_enabled(d, name, v)?,
-        "predb_corr_enabled" => set_predb_corr_enabled(d, name, v)?,
-        "predb_corr_auto" => set_predb_corr_auto(d, name, v)?,
-        #[cfg(feature = "indexer")]
-        "predb_max_rows" => set_predb_max_rows(d, name, v)?,
-        #[cfg(feature = "indexer")]
-        "predb_seed_days" => {
-            // The source's own paging depth is the real ceiling; 366 is
-            // just the point past which asking is pointless.
-            let n = uint()?.clamp(1, 366);
-            d.predb_seed_days.store(n, Ordering::Relaxed);
-            (true, json!(n))
-        }
-        "predb_server" => set_predb_server(d, name, v)?,
-        "predb_channels" => set_predb_channels(d, name, v)?,
-        "predb_nick" => set_predb_nick(d, name, v)?,
-        "index_paused" => set_index_paused(d, name, v)?,
-        #[cfg(feature = "indexer")]
-        "index_enabled" => set_index_enabled(d, name, v)?,
-        #[cfg(feature = "indexer")]
-        "spot_enabled" => set_spot_enabled(d, name, v)?,
-        "spot_groups" => set_spot_groups(d, name, v)?,
-        "spot_backfill" => set_spot_backfill(d, name, v)?,
-        // M34 size cap. Four settings, and only the last of them can
-        // delete anything - see index_evict.
-        "index_max_bytes" => {
-            // SAB-style sizes, same as min_free/quota: "20G", "500M",
-            // bare bytes. 0 = unlimited, the default.
-            let n = size()?;
-            d.index_max_bytes.store(n, Ordering::Relaxed);
-            (true, json!(n))
-        }
-        #[cfg(feature = "indexer")]
-        "index_evict_order" => set_index_evict_order(d, name, v)?,
-        #[cfg(feature = "indexer")]
-        "index_evict_kinds" => set_index_evict_kinds(d, name, v)?,
-        "index_evict" => set_index_evict(d, name, v)?,
-        #[cfg(feature = "indexer")]
-        "index_gates" => set_index_gates(d, name, v)?,
-        // Clearing a key persists NULL, not "". save_setting REMOVES a
-        // null key, so "cleared" means "stop overriding" - the --apikey
-        // flag or the default applies again on the next launch. Storing
-        // "" instead made the empty string win over an explicit --apikey
-        // forever, with no way back through the API: every restart read
-        // the blank back and unauthenticated the daemon.
-        //
-        // The deliberate consequence: while --apikey is passed you cannot
-        // turn auth OFF from the dashboard - you drop the flag. That is
-        // the right precedence for a credential.
-        //
-        // Removing the key from settings.json is only half of "keyless"
-        // though: first_run_apikey ALSO reads the minted key file beside
-        // the config, and reading it back is what makes a key stable
-        // across restarts. So clearing here without touching that file
-        // left the daemon keyless until the next restart and then keyed
-        // again, with nothing on screen to explain it. Delete the file
-        // too, so the user's choice actually survives.
-        //
-        // Deleted, not blanked: the empty-file branch in first_run_apikey
-        // deliberately refuses to mint a replacement and warns loudly
-        // every boot, which is the right answer to a file someone
-        // truncated by hand but pure noise for a choice made in the
-        // dashboard. With the file gone, the same function falls through
-        // to its first-run test, sees the settings file we are about to
-        // write (and the running install's spool), and leaves the daemon
-        // keyless - silently, which is what was asked for.
-        "apikey" => set_apikey(d, name, v)?,
-        "nzbkey" => {
-            let k = v.trim().to_string();
-            *d.nzbkey.lock_ok() = (!k.is_empty()).then(|| k.clone());
-            (true, if k.is_empty() { Value::Null } else { json!(k) })
-        }
-        // Same shape as apikey/nzbkey above: clearing it persists NULL, so
-        // save_setting REMOVES the key and the launch-time default applies
-        // again. Storing "" made the empty string a saved OVERRIDE that won
-        // on every later start, with no way back through the API.
-        "omdb_key" => {
-            let k = v.trim().to_string();
-            *d.omdb_key.lock_ok() = (!k.is_empty()).then(|| k.clone());
-            (true, if k.is_empty() { Value::Null } else { json!(k) })
-        }
-        "feeds" => set_feeds(d, name, v)?,
-        "indexers" => set_indexers(d, name, v)?,
-        "watchlist_external" => set_watchlist_external(d, name, v)?,
-        "watchlist_instant" => set_watchlist_instant(d, name, v)?,
-        "watchlist_instant_max" => set_watchlist_instant_max(d, name, v)?,
-        "watchlist" => set_watchlist(d, name, v)?,
-        "smart_folders" => set_smart_folders(d, name, v)?,
-        "cleanup_exts" => {
-            // M23: comma list of extensions ("par2, sfv, srr, url").
-            let list = crate::smart::parse_ext_list(v);
-            *d.cleanup_exts.lock_ok() = list.clone();
-            (true, json!(list))
-        }
-        "password_file" => set_password_file(d, name, v)?,
-        "password_prompt" => set_password_prompt(d, name, v)?,
-        "unpack_eat_volumes" => set_unpack_eat_volumes(d, name, v)?,
-        "par_cleanup" => {
-            let on = flag();
-            d.par_cleanup.store(on, Ordering::Relaxed);
-            (true, json!(on))
-        }
-        "watch_keep_nzb" => {
-            // Live: the watch loop reads it per pickup.
-            let on = flag();
-            d.watch_keep_nzb.store(on, Ordering::Relaxed);
-            (true, json!(on))
-        }
-        "fast_par" => set_fast_par(d, name, v)?,
-        "prefer_external_unrar" => set_prefer_external_unrar(d, name, v)?,
-        "custom_categories" => set_custom_categories(d, name, v)?,
-        "failure_link" => set_failure_link(d, name, v)?,
-        "prefer_quality" => set_prefer_quality(d, name, v)?,
-        "notify_targets" => set_notify_targets(d, name, v)?,
-        "arr_giveup_threshold" => set_arr_giveup_threshold(d, name, v)?,
-        "arr_instances" => set_arr_instances(d, name, v)?,
-        // Restart-only: bound/opened at startup. Persisted now, applied
-        // on the next launch.
-        "mem_limit" => {
-            let b = size()?; // 0 = automatic sizing
-            (false, json!(b))
-        }
-        "port" => set_port(d, name, v)?,
-        "out_dir" => set_out_dir(d, name, v)?,
-        "move_completed" => set_move_completed(d, name, v)?,
-        "move_completed_cats" => set_move_completed_cats(d, name, v)?,
-        "categories" => set_categories(d, name, v)?,
-        "index_db" => {
-            let p = v.trim();
-            if p.is_empty() {
-                return Err("index_db can't be empty".into());
-            }
-            (false, json!(p))
-        }
-        // Three different failures used to arrive here looking identical.
-        // The table tells them apart: a row that says it is read-only, a
-        // row someone declared and then forgot to write an arm for (our
-        // bug, and the one that used to fail silently), and a name that
-        // was simply never a setting.
-        _ => {
-            return Err(match setting(name) {
-                Some(s) if s.write != Write::Setting => format!("{name} is read-only"),
-                Some(_) => format!(
-                    "{name} is declared in the settings table but apply_setting has no arm \
-                     for it - that is a bug, please report it"
-                ),
-                None => format!("unsupported config item {name}"),
-            });
-        }
+        // The rest of the table is in settings_apply.rs - this match was
+        // 507 lines, past the size gate's function ceiling.
+        _ => apply_setting_tail(d, name, v)?,
     })
 }
 

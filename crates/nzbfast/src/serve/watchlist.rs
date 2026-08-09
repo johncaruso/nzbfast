@@ -165,7 +165,9 @@ fn settle_pending_upgrades(d: &Arc<Daemon>, state: &mut crate::watchlist::WatchS
                 // way a still-downloading predecessor already does.
                 let old_busy = d.queue.lock_ok().iter().any(|j| {
                     let g = j.lock_ok();
-                    g.nzo_id == p.old_nzo && (g.state == JobState::Downloading || g.finalizing)
+                    g.nzo_id == p.old_nzo
+                        && (matches!(g.state, JobState::Downloading | JobState::Finishing)
+                            || g.finalizing)
                 });
                 if old_busy {
                     info!(
@@ -181,7 +183,9 @@ fn settle_pending_upgrades(d: &Arc<Daemon>, state: &mut crate::watchlist::WatchS
                     let mut q = d.queue.lock_ok();
                     let pos = q.iter().position(|j| {
                         let g = j.lock_ok();
-                        g.nzo_id == p.old_nzo && g.state != JobState::Downloading && !g.finalizing
+                        g.nzo_id == p.old_nzo
+                            && !matches!(g.state, JobState::Downloading | JobState::Finishing)
+                            && !g.finalizing
                     });
                     pos.and_then(|i| q.remove(i))
                 };
@@ -256,6 +260,7 @@ fn settle_pending_upgrades(d: &Arc<Daemon>, state: &mut crate::watchlist::WatchS
                         .lock()
                         .unwrap()
                         .retain(|j| j.lock_ok().nzo_id != p.old_nzo);
+                    d.history_tombstone(std::slice::from_ref(&p.old_nzo));
                     d.save_queue();
                     // Asked of the REMOVAL, not of the settings. This
                     // read the two globals and inferred a fate from them,

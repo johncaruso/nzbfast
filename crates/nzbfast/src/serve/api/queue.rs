@@ -12,7 +12,11 @@ use super::ApiCtx;
 /// rendered from the same one, so a control that refuses here is a
 /// control the user could already see was not on offer.
 fn finishing_tail(d: &Arc<Daemon>, g: &Job) -> bool {
-    g.state == JobState::Downloading && d.tail_phase(&g.nzo_id).is_some()
+    // §129: the lane gave the tail its own state, so the answer no
+    // longer leans on the phase word alone - but the Downloading+phase
+    // arm stays for the moment between net-drain and lane submission.
+    g.state == JobState::Finishing
+        || (g.state == JobState::Downloading && d.tail_phase(&g.nzo_id).is_some())
 }
 
 /// Set (or clear) one job's pause flag, with the one refusal that makes
@@ -92,26 +96,42 @@ fn planned_servers(d: &Daemon, cfg_path: &std::path::Path) -> Vec<Value> {
     let Ok(c) = nzbkit::config::Config::load(cfg_path) else {
         return Vec::new();
     };
-    let tuned = if crate::conntune::enabled(cfg_path) {
-        crate::conntune::load(cfg_path)
-    } else {
-        Default::default()
-    };
+    let store = crate::conntune::load(cfg_path);
+    let apply_knees = crate::conntune::enabled(cfg_path);
+    // With the live controller on, the next download SEEDS from the
+    // bucket store and the knee does not cap - report that number, not
+    // the knee-capped one this install would no longer open.
+    let live_tune = d.live_tune.load(Ordering::Relaxed) || crate::conntune::live_tune_on();
+    let bkt = crate::conntune::bucket_of(crate::conntune::local_hour());
+    let now = epoch_secs();
+    let shaped = d.shaped_hosts.lock_ok();
     let global = d.connections.load(Ordering::Relaxed).max(1);
     c.servers
         .iter()
         .filter(|s| s.enabled)
         .map(|s| {
             let base = global.min(s.connections.max(1) as usize);
+            let budget = if live_tune && !s.pin_connections {
+                crate::conntune::seed_connections(store.get(&s.host), bkt, now, base)
+            } else {
+                crate::conntune::applied_connections(
+                    base,
+                    s.pin_connections,
+                    apply_knees.then(|| store.get(&s.host)).flatten(),
+                )
+            };
             json!({
                 "host": s.host,
-                "budget": crate::conntune::applied_connections(
-                    base, s.pin_connections, tuned.get(&s.host)),
+                "budget": budget,
                 "connected": 0,
                 "bytes": 0,
                 "tried": 0,
                 "missing": 0,
                 "idle": true,
+                // Decay flag (conn-tuning design §6): this host fell to
+                // under half its usual per-connection rate.
+                "shaped": shaped.get(&s.host).map(|sh| json!({
+                    "since": sh.since, "ref_per_conn_bps": sh.ref_per_conn_bps})),
             })
         })
         .collect()
@@ -459,6 +479,7 @@ fn m_eat_volumes(
                     // Durable before the caller's retry: the answer
                     // is given on a failed job and spent by a run
                     // that may be on the other side of a restart.
+                    d.history_upsert_if_present(&job);
                     d.save_queue();
                     json!({"status": true, "nzo_id": id})
                 }
@@ -551,10 +572,13 @@ fn m_set_password(
                                               the unlock was not started"}));
                         }
                         // Crash safety: the password (and the raised
-                        // flag) reach queue.json BEFORE any
+                        // flag) reach the record's store BEFORE any
                         // filesystem mutation, so a restart still
                         // knows the password the user supplied even
-                        // if power dies mid-unlock.
+                        // if power dies mid-unlock. A locked record
+                        // is a HISTORY record - the store is the
+                        // history store.
+                        d.history_upsert_if_present(&job);
                         d.save_queue();
                     }
                     // C1: the job may be DOWNLOADING right now.
@@ -635,26 +659,16 @@ fn m_set_password(
                                 if !done.identify.is_empty() {
                                     j.identify = done.identify;
                                 }
-                                // UX §18: the move-completed
-                                // relocation can fail part way here
-                                // exactly as it can on the ordinary
-                                // completion path, and `moved` below
-                                // follows the bytes that DID move -
-                                // which is precisely what makes the
-                                // other half invisible. Unlock
-                                // consumed this and dropped it, so a
-                                // payload split by a password unlock
-                                // had no durable record at all: no
-                                // warning in the row, and nothing for
-                                // a later delete to reach the source
-                                // side by. Written unconditionally,
-                                // like the completion path, so a
-                                // re-run that finally moves the rest
-                                // clears the warning.
-                                j.move_split = match &done.move_split {
-                                    Some(src) => src.to_string_lossy().to_string(),
-                                    None => String::new(),
-                                };
+                                // C: the relocation runs on the mover
+                                // worker now. Same contract as the
+                                // completion path - a fresh unlock
+                                // re-run starts with clean move fields
+                                // and hands the move over rather than
+                                // holding this tail for a NAS copy.
+                                j.move_split.clear();
+                                j.move_failed.clear();
+                                j.move_attempts = 0;
+                                j.move_pending = d2.move_destination_configured(&j.category);
                                 if let Some(dest) = done.moved {
                                     j.filed = j.tv_sort && is_season_dir(&dest);
                                     // The suffix and episode title
@@ -665,18 +679,25 @@ fn m_set_password(
                                     j.filed_title = j.filed.then_some(done.filed_title);
                                     j.out_dir = dest;
                                 }
+                                let owes_move = j.move_pending;
                                 drop(j);
+                                d2.history_upsert_if_present(&job2);
                                 d2.save_queue();
+                                if owes_move {
+                                    d2.mover_enqueue(&job2);
+                                }
                             } else {
                                 let mut j = job2.lock_ok();
                                 j.fail_message = "password did not unlock the archive".into();
                                 drop(j);
+                                d2.history_upsert_if_present(&job2);
                                 d2.save_queue();
                                 info!(target: "unlock", "{name:?}: password did not unlock");
                             }
                         });
                         json!({"status": true, "unpacking": true})
                     } else {
+                        d.history_upsert_if_present(&job);
                         d.save_queue();
                         json!({"status": true})
                     }
@@ -684,6 +705,98 @@ fn m_set_password(
             }
         }
     })
+}
+
+/// §129 1b: the dashboard's ONE revisioned round-trip. The client hands
+/// back the `queue_rev` / `history_rev` it last applied plus its events
+/// cursor; an unchanged collection answers `null` instead of a payload,
+/// so an idle 1 s refresh costs two atomic loads and a small stats
+/// block - at ANY history size (the 1d gate). `stats` always rides (it
+/// is small and changes by nature every second); the queue rides
+/// whenever anything is actively transferring, because progress is a
+/// continuous value no revision can honestly stand for. Lifecycle
+/// events (job.completed / job.failed, seq-numbered) ride the same
+/// response and replace the client's histSeen snapshot diffing.
+///
+/// Dashboard-only: the SAB and NZBGet facades are untouched by all of
+/// this, and external clients keep their exact pre-§129 rows.
+fn m_dashboard(
+    d: &Arc<Daemon>,
+    req: &mut tiny_http::Request,
+    params: &std::collections::HashMap<String, String>,
+    ctx: &ApiCtx<'_>,
+    api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    let num = |k: &str| params.get(k).and_then(|v| v.parse::<u64>().ok());
+    let (client_q, client_h) = (
+        num("queue_rev").unwrap_or(0),
+        num("history_rev").unwrap_or(0),
+    );
+    // An ABSENT events param is a fresh page priming its cursor: it
+    // gets the current seq and no backlog (page loads never replay old
+    // toasts). Any numeric cursor - zero included - gets everything
+    // after it; treating 0 as "prime" swallowed a daemon's first-ever
+    // event for a page that was already open watching.
+    let since = num("events");
+    // Revisions are read BEFORE the payloads are built: a mutation that
+    // lands mid-build bumps past what we answer with, so the client
+    // simply refetches next tick - stale-rev-with-fresh-payload is
+    // harmless in that direction and impossible in the other.
+    let qrev = d.queue_rev.load(Ordering::Relaxed);
+    let hrev = d.history_rev.load(Ordering::Relaxed);
+    let any_active = d.queue.lock_ok().iter().any(|j| {
+        let g = j.lock_ok();
+        matches!(g.state, JobState::Downloading | JobState::Finishing) || g.finalizing
+    });
+    let queue = if client_q != qrev || any_active {
+        queue_json(d, params)
+            .get("queue")
+            .cloned()
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let history = if client_h != hrev {
+        let q = super::super::history::HistQuery {
+            failed_only: false,
+            category: params
+                .get("hist_category")
+                .filter(|c| !c.is_empty() && *c != "*")
+                .cloned(),
+            ids: None,
+            search: params
+                .get("hist_search")
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty()),
+            bucket: params
+                .get("hist_filter")
+                .filter(|b| matches!(b.as_str(), "done" | "failed" | "locked"))
+                .cloned(),
+            start: num("hist_start").unwrap_or(0) as usize,
+            // Never unbounded here: this is the per-second poll. A
+            // client that wants more rows raises its window.
+            limit: num("hist_limit").unwrap_or(50).clamp(1, 500) as usize,
+        };
+        let (slots, n, counts) = super::super::history::history_page(d, &q, true);
+        json!({"slots": slots, "noofslots": n, "counts": counts})
+    } else {
+        Value::Null
+    };
+    let (events, reset) = match since {
+        None => (Vec::new(), false),
+        Some(n) => d.life_since(n),
+    };
+    let stats = m_stats(d, req, params, ctx, api_body)?;
+    Some(json!({
+        "queue_revision": qrev,
+        "queue": queue,
+        "history_revision": hrev,
+        "history": history,
+        "stats": stats,
+        "events": events,
+        "events_seq": d.life_seq.load(Ordering::Relaxed),
+        "events_reset": reset,
+    }))
 }
 
 fn m_stats(
@@ -707,25 +820,7 @@ fn m_stats(
         // walking the disk shipped counters from before the walk
         // beside `downloaded` read after it - two instants in one
         // answer. Monotone snapshots come last, beside the build.
-        let cpu_pct = {
-            let now = Instant::now();
-            let cpu = nzbkit::mem::cpu_time_secs().unwrap_or(0.0);
-            let ncpu = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
-            let mut prev = d.cpu_sample.lock_ok();
-            match *prev {
-                Some((t0, _, last)) if now.duration_since(t0).as_secs_f64() < 0.5 => last,
-                Some((t0, c0, _)) => {
-                    let wall = now.duration_since(t0).as_secs_f64();
-                    let pct = ((cpu - c0) / wall / ncpu * 100.0).clamp(0.0, 100.0);
-                    *prev = Some((now, cpu, pct));
-                    pct
-                }
-                None => {
-                    *prev = Some((now, cpu, 0.0));
-                    0.0
-                }
-            }
-        };
+        let cpu_pct = d.cpu_pct();
         let (disk_free, disk_total) = disk_stat_walk(&d.out_dir()).unwrap_or((0, 0));
         // Phase 0(b) nested-archive prevalence (process lifetime):
         // how often nested layers appear, of what inner type, and
@@ -791,6 +886,12 @@ fn m_stats(
                             // unobtainable.
                             "reconnects": s.reconnects.load(Ordering::Relaxed),
                             "blocked_ms": s.blocked_ms.load(Ordering::Relaxed),
+                            // Decay flag (conn-tuning design §6): the
+                            // live tuner measured this host under half
+                            // its usual per-connection rate on a
+                            // sustained multi-stretch quorum.
+                            "shaped": d.shaped_hosts.lock_ok().get(&s.host).map(|sh| json!({
+                                "since": sh.since, "ref_per_conn_bps": sh.ref_per_conn_bps})),
                         })
                     })
                     .collect()
@@ -977,20 +1078,35 @@ fn m_addfile(
                 let prio = if stream { 2 } else { param_priority(params) };
                 let origin = api_origin(ctx.ua_hdr, origin_of(params));
                 match d.enqueue(&bytes, &fname, &cat, prio, pw, &origin, false) {
-                    Ok(id) if stream => json!({
-                        "status": true, "nzo_ids": [id],
-                        "m3u": format!("{}/m3u/{id}{}", ctx.base, ctx.key_q),
-                        "stream": format!("{}/stream/{id}?t={}", ctx.base, d.stream_token(&id)),
-                    }),
+                    // §129 2b: pp=/script= used to be accepted and
+                    // silently dropped; now they are recorded on the
+                    // job (and the pp mapping logged - decision 5).
+                    //
                     // Truth-audit I: a job parked as a held
                     // ALTERNATIVE has NOT joined the queue to run,
                     // and "Added to the queue" was the reply either
                     // way. `held` carries the ids that parked, so
                     // the add flow can say which.
-                    Ok(id) => json!({
-                        "status": true, "nzo_ids": [id],
-                        "held": if d.held_as_duplicate(&id) { vec![id] } else { vec![] },
-                    }),
+                    Ok(id) => {
+                        d.record_add_params(
+                            &id,
+                            params.get("pp").map(String::as_str),
+                            params.get("script").map(String::as_str),
+                            ctx.via_add_only,
+                        );
+                        if stream {
+                            json!({
+                                "status": true, "nzo_ids": [id],
+                                "m3u": format!("{}/m3u/{id}{}", ctx.base, ctx.key_q),
+                                "stream": format!("{}/stream/{id}?t={}", ctx.base, d.stream_token(&id)),
+                            })
+                        } else {
+                            json!({
+                                "status": true, "nzo_ids": [id],
+                                "held": if d.held_as_duplicate(&id) { vec![id] } else { vec![] },
+                            })
+                        }
+                    }
                     Err(e) => json!({"status": false, "error": e.to_string()}),
                 }
             }
@@ -1031,15 +1147,27 @@ fn m_addurl(
                     .or_else(|| name_from_fetch(&f, &url))
                     .unwrap_or_else(|| "download.nzb".to_string());
                 match d.enqueue_fetched(&f, &name, &cat, prio, pw.as_deref(), 0, &origin, false) {
-                    Ok(id) if stream => json!({
-                        "status": true, "nzo_ids": [id],
-                        "m3u": format!("{}/m3u/{id}{}", ctx.base, ctx.key_q),
-                        "stream": format!("{}/stream/{id}?t={}", ctx.base, d.stream_token(&id)),
-                    }),
-                    Ok(id) => json!({
-                        "status": true, "nzo_ids": [id],
-                        "held": if d.held_as_duplicate(&id) { vec![id] } else { vec![] },
-                    }),
+                    // §129 2b: same pp=/script= recording as addfile.
+                    Ok(id) => {
+                        d.record_add_params(
+                            &id,
+                            params.get("pp").map(String::as_str),
+                            params.get("script").map(String::as_str),
+                            ctx.via_add_only,
+                        );
+                        if stream {
+                            json!({
+                                "status": true, "nzo_ids": [id],
+                                "m3u": format!("{}/m3u/{id}{}", ctx.base, ctx.key_q),
+                                "stream": format!("{}/stream/{id}?t={}", ctx.base, d.stream_token(&id)),
+                            })
+                        } else {
+                            json!({
+                                "status": true, "nzo_ids": [id],
+                                "held": if d.held_as_duplicate(&id) { vec![id] } else { vec![] },
+                            })
+                        }
+                    }
                     Err(e) => json!({"status": false, "error": e.to_string()}),
                 }
             }
@@ -1157,6 +1285,11 @@ fn m_queue_save(
 ) -> Option<Value> {
     Some({
         let saved = d.save_queue();
+        // "Save queue" is the remedy the durability errors name, and
+        // since §129 1a the history record lives in its own store - a
+        // full flush has to rewrite that too, or the remedy would not
+        // remedy a failed history write.
+        d.history_compact();
         if saved {
             info!(target: "queue", "queue re-saved on request");
         }
@@ -1184,6 +1317,11 @@ fn m_queue(
                 // A deleted job's prefetch sidecar must stop
                 // writing to its directory.
                 d.poke_sidecar(hit_id);
+                // §129: and its post-network tail must stop pulling
+                // recovery volumes. Not covered by the hub abort below -
+                // that one is scoped to the job that OWNS the hub, and a
+                // Finishing job by definition does not.
+                d.cancel_tail_fetches(hit_id);
                 let del_files = params.get("del_files").map(String::as_str) == Some("1");
                 let mut stopped_active = false;
                 // Collected under the queue lock, recorded after it -
@@ -1211,6 +1349,13 @@ fn m_queue(
                     if hit(j) {
                         let mut g = j.lock_ok();
                         let active = g.state == JobState::Downloading;
+                        // §129: a Finishing job's tail is running in the
+                        // lane - its writers are live like `finalizing`,
+                        // but the hub abort below belongs to whatever is
+                        // DOWNLOADING now, so it takes the non-active
+                        // arm and relies on the tombstone making its
+                        // tail a no-op at park.
+                        let lane = g.state == JobState::Finishing;
                         if active {
                             // The pipeline is running - mark it
                             // for silent drop and abort below.
@@ -1239,7 +1384,7 @@ fn m_queue(
                             let _ = std::fs::remove_file(&g.nzb_path);
                         }
                         if del_files {
-                            if active || g.finalizing {
+                            if active || lane || g.finalizing {
                                 // Writers are still live; removing
                                 // now just lets the next positioned
                                 // write recreate the files and
@@ -1729,6 +1874,9 @@ fn m_history(
                     .map(|(r, _)| r.nzo_id.as_str())
                     .collect();
                 h.retain(|j| !doomed.contains(j.lock_ok().nzo_id.as_str()));
+                // §129 1a: the store forgets them too, once the lock is
+                // down (below, beside save_queue).
+                let doomed_ids: Vec<String> = doomed.iter().map(|s| s.to_string()).collect();
                 // A bulk sweep needs to say how much it swept:
                 // "Cleared." over a list that still has rows in
                 // it is indistinguishable from a no-op. `status`
@@ -1767,6 +1915,7 @@ fn m_history(
                     d.note_delete_kept(&name, &dir, &why);
                 }
                 if count > 0 {
+                    d.history_tombstone(&doomed_ids);
                     d.save_queue();
                 }
                 json!({"status": count > 0, "removed": count})
@@ -1844,6 +1993,14 @@ pub(in crate::serve) fn dispatch(
             // tracking id (SAB may reissue; we keep it stable).
             json!({"status": d.retry(&id), "nzo_id": id})
         }
+        // Re-attempt ONLY the move to the completed folder for a
+        // Completed history job whose move failed (Job::move_failed).
+        // The drawer's own retry button: `retry` above would re-queue
+        // a download that is already whole on disk.
+        "retry_move" => {
+            let id = params.get("value").cloned().unwrap_or_default();
+            json!({"status": d.retry_move_now(&id), "nzo_id": id})
+        }
         // TODO 101: this job's own consent to the volume-eating unpack,
         // given in the disk-full drawer. Consent only - it starts
         // nothing; the caller retries the job afterwards, and the
@@ -1918,6 +2075,7 @@ pub(in crate::serve) fn dispatch(
         "queue_save" => return m_queue_save(d, req, params, ctx, api_body),
         "queue" => return m_queue(d, req, params, ctx, api_body),
         "history" => return m_history(d, req, params, ctx, api_body),
+        "dashboard" => return m_dashboard(d, req, params, ctx, api_body),
         _ => return None,
     })
 }

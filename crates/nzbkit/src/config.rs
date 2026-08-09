@@ -103,6 +103,33 @@ pub struct ServerConfig {
     /// spent. None/0 = unlimited (flatrate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_bytes: Option<u64>,
+    /// Every byte from this server costs money: spend none deliberately.
+    ///
+    /// A flagged server serves the user's actual download exactly as
+    /// before - what it never gets is the traffic nzbfast sends for its
+    /// own benefit: connection-ladder probes, the system benchmark's
+    /// provider leg, index header pulls, and (owned by the M7b.2 racing
+    /// work) speculative duplicate fetches.
+    ///
+    /// DECOUPLED from `level` and from `block_bytes`, which is the whole
+    /// point of having it. Until now per-byte economics were INFERRED
+    /// from the topology - `level > 0` for racing, `block_bytes.is_some()`
+    /// for the prober - and both inferences are wrong in both
+    /// directions. A metered account can sit at level 0 (it is the only
+    /// provider the user has), and a flatrate account can sit at level 2
+    /// (it is a second unlimited backbone kept for completion). Guessing
+    /// costs real money in one direction and free speed in the other, so
+    /// the user gets to say it outright.
+    ///
+    /// Default OFF, and deliberately not auto-set from any signal: the
+    /// server editor SUGGESTS it at level > 0 (the strongest hint a
+    /// server is a fill account) and leaves the decision alone.
+    ///
+    /// Not a spending cap - that is `block_bytes`, and the two compose:
+    /// the cap says when to stop, this says never to spend on our own
+    /// curiosity in the first place.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub block_account: bool,
     /// M32: bind outgoing connections for this server to
     /// a specific local IP - multi-homed boxes and VPN split-tunnel
     /// setups. The address family also picks the target family (a v4
@@ -247,6 +274,33 @@ pub const MIN_IDLE_RELEASE_SECS: u64 = 60;
 const TIGHT_SOURCE_IPS: u32 = 3;
 
 impl ServerConfig {
+    /// May nzbfast spend this server's bytes on its OWN curiosity -
+    /// connection-ladder probes, the system benchmark's provider leg,
+    /// index header pulls - as opposed to the download the user asked
+    /// for?
+    ///
+    /// Two ways to answer no, and both are honoured: the explicit
+    /// [`ServerConfig::block_account`] flag, and the older inference
+    /// from a configured prepaid block, which stays because plenty of
+    /// installs predate the flag and their owners should not have to
+    /// re-declare something they already said.
+    ///
+    /// One predicate rather than one per caller, because the callers
+    /// have to AGREE. `update_tune_hint` decides the line-speed verdict
+    /// is complete once every measurable server carries a probe result:
+    /// if its idea of "measurable" is wider than the prober's, one
+    /// unprobed server suppresses the verdict for the whole install,
+    /// permanently and with nothing in the log saying why. That bug has
+    /// been shipped once already (against block accounts); sharing the
+    /// predicate is what stops it happening again.
+    ///
+    /// `block_bytes: Some(0)` reads as flatrate here, matching the pool,
+    /// the job planner and the settings UI, all of which treat 0 as "no
+    /// block configured".
+    pub fn may_spend_on_measurement(&self) -> bool {
+        !self.block_account && !self.block_bytes.is_some_and(|b| b > 0)
+    }
+
     /// Does this server's account limit distinct source addresses
     /// tightly enough that an idle install holding one is a lockout?
     ///
@@ -534,6 +588,7 @@ pub fn parse_sabnzbd_ini(text: &str) -> Result<Vec<ServerConfig>, ConfigError> {
             group: None,
             retention_days: get("retention").parse().unwrap_or(0),
             block_bytes: None,
+            block_account: false,
             bind_ip: None,
             socks5: None,
             enabled: true,
@@ -637,6 +692,7 @@ pub fn parse_nzbget_conf(text: &str) -> Vec<ServerConfig> {
             group: (grp > 0).then(|| format!("g{grp}")),
             retention_days: get("retention").parse().unwrap_or(0),
             block_bytes: None,
+            block_account: false,
             bind_ip: None,
             socks5: None,
             enabled: true,
@@ -680,6 +736,75 @@ mod warm_pool_default_tests {
 
     fn srv(json: &str) -> ServerConfig {
         serde_json::from_str(json).unwrap()
+    }
+
+    /// M7b.2 §5.7: the block-account flag round-trips, defaults to OFF,
+    /// and writes nothing when it is off.
+    ///
+    /// The serialize half matters as much as the parse half: the daemon
+    /// re-writes config.local.json whenever the editor saves a server,
+    /// and people hand-edit that file. A `"block_account": false` line
+    /// appearing under every server they never touched is noise that
+    /// reads like a setting they chose.
+    #[test]
+    fn the_block_account_flag_defaults_off_and_round_trips() {
+        let off = srv(r#"{"host":"news.example.com"}"#);
+        assert!(
+            !off.block_account,
+            "a config written before the flag existed declares nothing"
+        );
+        assert!(
+            !serde_json::to_string(&off)
+                .unwrap()
+                .contains("block_account"),
+            "an off flag writes no key"
+        );
+
+        let on = srv(r#"{"host":"h","block_account":true}"#);
+        assert!(on.block_account);
+        assert!(
+            serde_json::to_string(&on)
+                .unwrap()
+                .contains(r#""block_account":true"#)
+        );
+
+        // Per SERVER, like every other account property.
+        let cfg: Config =
+            serde_json::from_str(r#"{"servers":[{"host":"a","block_account":true},{"host":"b"}]}"#)
+                .unwrap();
+        assert!(cfg.servers[0].block_account);
+        assert!(
+            !cfg.servers[1].block_account,
+            "the flag must not leak between servers"
+        );
+    }
+
+    /// The flag is INDEPENDENT of the level and of the block size: that
+    /// independence is the whole reason it exists.
+    ///
+    /// Before it, per-byte economics were inferred from the topology,
+    /// and the inference is wrong in both directions - a metered account
+    /// can be someone's only provider (level 0), and an unlimited one
+    /// can sit at level 2 as a completion backbone. Each of these four
+    /// combinations is a real configuration.
+    #[test]
+    fn measurement_spending_reads_the_flag_not_the_topology() {
+        // Flatrate primary: measure freely.
+        assert!(srv(r#"{"host":"a"}"#).may_spend_on_measurement());
+        // Flatrate server parked at a fill level: still free to measure.
+        assert!(srv(r#"{"host":"a","level":2}"#).may_spend_on_measurement());
+        // Metered, and the user's ONLY provider. The topology says
+        // primary; the bill says otherwise, and the bill wins.
+        assert!(!srv(r#"{"host":"a","block_account":true}"#).may_spend_on_measurement());
+        // The older inference still holds for configs that predate the
+        // flag: a prepaid block is metered whether or not it says so.
+        assert!(
+            !srv(r#"{"host":"a","block_bytes":5000000000}"#).may_spend_on_measurement(),
+            "a configured block is metered even without the flag"
+        );
+        // Zero reads as "no block configured" - the same reading the
+        // pool, the job planner and the settings UI take.
+        assert!(srv(r#"{"host":"a","block_bytes":0}"#).may_spend_on_measurement());
     }
 
     /// The operator's own number beats our hostname guess, in BOTH

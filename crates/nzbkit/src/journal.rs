@@ -90,7 +90,26 @@ struct WriteState {
 
 pub struct Journal {
     state: Mutex<WriteState>,
+    /// Placements parked by [`Journal::retire_for_decrypt`], keyed by the
+    /// retired output name, waiting for [`Journal::record_decrypted`] to
+    /// republish them as `D` records. An entry whose publish never comes
+    /// (rename failed, job died first) just dies with the journal - the
+    /// conservative refetch the bare retirement always meant.
+    decrypt_stash: Mutex<HashMap<String, Vec<StashedArticle>>>,
     pub path: PathBuf,
+}
+
+/// One placement parked between retirement and decrypt-publish: enough
+/// to re-emit the article as a `D` record under the slot's real
+/// destination name.
+struct StashedArticle {
+    slot: usize,
+    slot_name: String,
+    slot_size: u64,
+    id: String,
+    frags: Vec<Frag>,
+    /// Parsed per-fragment crypto markers (empty for `R` records).
+    mask: Vec<bool>,
 }
 
 /// One journaled article: every fragment must restore for the article
@@ -206,6 +225,7 @@ impl Journal {
                     files: HashMap::new(),
                     used_names: HashSet::new(),
                 }),
+                decrypt_stash: Mutex::new(HashMap::new()),
                 path,
             },
             resume,
@@ -416,6 +436,109 @@ impl Journal {
         let mut st = self.state.lock_ok();
         st.file.write_all(buf.as_bytes())?;
         st.file.sync_data()
+    }
+
+    /// [`Journal::invalidate`] for the finish decrypt: retire the claim
+    /// over `files` exactly as `invalidate` does, but first park every
+    /// placement the retirement drops, so a decrypt that goes on to
+    /// PUBLISH (verified plaintext renamed over the ciphertext) can hand
+    /// them back via [`Journal::record_decrypted`] as `D` records - and a
+    /// later failure in the same job (another file's ENOSPC, the nested
+    /// pass) then costs the retry a local re-encrypt instead of a
+    /// near-full refetch (TODO 100, Gary's 14.87 GB re-download).
+    ///
+    /// The parse happens under the writer lock, so the snapshot is
+    /// consistent with every record already appended; the durable `X` is
+    /// written before this returns, same contract as `invalidate`.
+    pub fn retire_for_decrypt(&self, files: &[String]) -> std::io::Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let mut st = self.state.lock_ok();
+        let mut resume = ResumeState::default();
+        if let Ok(f) = File::open(&self.path) {
+            let mut lines = std::io::BufReader::new(f).lines();
+            let _ = lines.next(); // header: fingerprint already matched at open
+            parse_lines(lines.map_while(Result::ok), &mut resume);
+        }
+        let mut stash = Vec::new();
+        for name in files {
+            let name = sanitize_filename(name);
+            let mut arts = Vec::new();
+            for (slot, sp) in &resume.slots {
+                for a in &sp.articles {
+                    if a.frags.iter().any(|f| f.file == name) {
+                        arts.push(StashedArticle {
+                            slot: *slot,
+                            slot_name: sp.name.clone(),
+                            slot_size: sp.size,
+                            id: a.id.clone(),
+                            frags: a.frags.clone(),
+                            mask: a.crypto_frag.clone(),
+                        });
+                    }
+                }
+            }
+            stash.push((name, arts));
+        }
+        // The durable X, before the caller mutates a byte - identical to
+        // `invalidate` (one write, then fsync).
+        let mut buf = String::new();
+        for f in files {
+            buf.push_str("X ");
+            buf.push_str(f);
+            buf.push('\n');
+        }
+        st.file.write_all(buf.as_bytes())?;
+        st.file.sync_data()?;
+        drop(st);
+        let mut parked = self.decrypt_stash.lock_ok();
+        for (name, arts) in stash {
+            parked.insert(name, arts);
+        }
+        Ok(())
+    }
+
+    /// The decrypt PUBLISHED `name` (plaintext verified and renamed into
+    /// place): write its crypt facts (`E`/`K`/`T` events, collected from
+    /// the ciphertext before the rename destroyed it) and republish the
+    /// placements [`Journal::retire_for_decrypt`] parked as `D` records -
+    /// the plaintext-once grammar, which a resume run restores by
+    /// RE-ENCRYPTING the on-disk plaintext instead of refetching.
+    ///
+    /// Ordering makes this safe without an fsync: it runs only after the
+    /// rename landed, so a kill anywhere leaves either the bare
+    /// retirement (conservative refetch) or records that truthfully
+    /// describe the published plaintext. Only power loss can reorder the
+    /// two, the same exposure the in-stream `D` path already accepts -
+    /// and the resume's full-hash verification is the backstop there.
+    pub fn record_decrypted(&self, name: &str, events: &[CryptoJournalEvent]) {
+        self.record_crypto_events(events);
+        let key = sanitize_filename(name);
+        let Some(arts) = self.decrypt_stash.lock_ok().remove(&key) else {
+            return;
+        };
+        for a in arts {
+            // A fragment inside the published file now restores by
+            // re-encryption; fragments in neighbors keep whatever the
+            // original record said (a neighbor published earlier in this
+            // batch already carries `true` from its own D line).
+            let mask: Vec<bool> = a
+                .frags
+                .iter()
+                .enumerate()
+                .map(|(i, f)| a.mask.get(i).copied().unwrap_or(false) || f.file == key)
+                .collect();
+            self.record_placed_crypto(
+                a.slot,
+                &a.id,
+                Some((a.slot_name.clone(), a.slot_size)),
+                &a.slot_name,
+                a.slot_size,
+                &a.frags,
+                &mask,
+            );
+        }
     }
 
     /// Download finished and verified - the journal has served its purpose.
@@ -1217,6 +1340,118 @@ mod tests {
             "the stale one stays retired"
         );
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// TODO 100, the publish half of the retirement handshake. The finish
+    /// decrypt retires the claim over its output, mutates it to
+    /// plaintext, and - once the rename LANDED - republishes the parked
+    /// placements as `D` records with the crypt facts. A resume run then
+    /// rebuilds the POSTED bytes by re-encrypting the local plaintext:
+    /// zero refetch for a file that was already done, instead of the
+    /// near-full re-download Gary watched.
+    #[test]
+    fn decrypt_publish_republishes_placements_as_restorable_d_records() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-journal-dp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let nzb = b"<nzb>decpub</nzb>";
+
+        // A real RAR5-shaped crypt: password-derived key, IV, stored
+        // check, 40 plaintext bytes -> 48 cipher bytes (8 pad).
+        let pw = "s3cret";
+        let (salt, lg2, iv) = ([7u8; 16], 4u8, [9u8; 16]);
+        let keys = crate::rarcrypt::derive_keys(pw, &salt, lg2).unwrap();
+        let unp = 40u64;
+        let plain: Vec<u8> = (0..40u8).collect();
+        let pad = vec![0xAAu8; 8];
+        let mut cipher = plain.clone();
+        cipher.extend_from_slice(&pad);
+        crate::rarcrypt::CbcEncStream::new(&keys.aes(), &iv).encrypt(&mut cipher);
+
+        // Run 1: the whole cipher stream direct-extracted into movie.mkv,
+        // posted at volume offset 8 (behind a header).
+        let (j, _) = Journal::open(&dir, nzb).unwrap();
+        j.record_placed(
+            0,
+            "<enc@x>",
+            None,
+            "v.part1.rar",
+            8 + cipher.len() as u64,
+            &[frag("movie.mkv", 0, 8, cipher.len() as u64)],
+        );
+        // The finish decrypt: retire, mutate, publish.
+        j.retire_for_decrypt(&["movie.mkv".to_string()]).unwrap();
+        std::fs::write(dir.join("movie.mkv"), &plain).unwrap();
+        j.record_decrypted(
+            "movie.mkv",
+            &[
+                CryptoJournalEvent::Params {
+                    name: "movie.mkv".into(),
+                    salt,
+                    lg2,
+                    iv,
+                    unp,
+                    check: Some(crate::rarcrypt::make_check(&keys)),
+                },
+                CryptoJournalEvent::TailPad {
+                    name: "movie.mkv".into(),
+                    pad,
+                },
+            ],
+        );
+        drop(j);
+
+        let (_j2, resume) = Journal::open(&dir, nzb).unwrap();
+        // A wrong password must prove out and refetch, never rebuild
+        // garbage posted bytes.
+        let r = restore(&dir, &resume, Some("wrong"));
+        assert!(r.ids.is_empty(), "wrong password must refetch");
+        // The right one restores the article with byte-exact posted bytes.
+        let restored = restore(&dir, &resume, Some(pw));
+        assert!(
+            restored.ids.contains("<enc@x>"),
+            "published plaintext must resume locally"
+        );
+        let vol = std::fs::read(dir.join("v.part1.rar")).unwrap();
+        assert_eq!(
+            &vol[8..],
+            &cipher[..],
+            "re-encrypted posted bytes must be byte-exact"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The conservative half stays conservative: a retirement whose
+    /// publish never came (rename failed, process died between the two)
+    /// keeps refetching exactly as the bare invalidate always did.
+    #[test]
+    fn retire_for_decrypt_without_publish_still_refetches() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-journal-rp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let nzb = b"<nzb>retire-park</nzb>";
+        std::fs::write(dir.join("movie.mkv"), vec![1u8; 64]).unwrap();
+
+        let (j, _) = Journal::open(&dir, nzb).unwrap();
+        j.record_placed(
+            0,
+            "<a@x>",
+            None,
+            "v.part1.rar",
+            64,
+            &[frag("movie.mkv", 0, 0, 64)],
+        );
+        j.retire_for_decrypt(&["movie.mkv".to_string()]).unwrap();
+        drop(j);
+
+        let (_j2, resume) = Journal::open(&dir, nzb).unwrap();
+        let restored = restore(&dir, &resume, None);
+        assert!(
+            restored.ids.is_empty(),
+            "an unpublished retirement must refetch"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

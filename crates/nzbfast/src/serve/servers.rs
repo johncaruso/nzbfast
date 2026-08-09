@@ -98,17 +98,6 @@ pub(super) fn normalized_server(
                 .map_or(8, |c| c.clamp(1, 999))
         ),
     );
-    // Absent means false, and the key is dropped rather than written
-    // false: this file is hand-edited by people, and a lock the user
-    // never asked for should not appear in it.
-    match incoming.get("pin_connections").and_then(Value::as_bool) {
-        Some(true) => {
-            ob.insert("pin_connections".into(), json!(true));
-        }
-        _ => {
-            ob.remove("pin_connections");
-        }
-    }
     for key in ["username", "group"] {
         match incoming.get(key).and_then(Value::as_str).map(str::trim) {
             Some("") => {
@@ -148,17 +137,34 @@ pub(super) fn normalized_server(
             None => {}
         }
     }
-    // §36: per-server connection pooling, off unless asked for. Removed
-    // rather than written false so the config file stays clean and the
-    // serde default keeps meaning "off".
-    match incoming.get("warm_pool").and_then(Value::as_bool) {
-        Some(true) => {
-            ob.insert("warm_pool".into(), json!(true));
+    // The three per-server booleans: §36 connection pooling, the
+    // connection-count lock, and M7b.2 §5.7's block-account flag. All
+    // off unless asked for, and removed rather than written false so
+    // the config file stays clean (people hand-edit it) and the serde
+    // default keeps meaning "off".
+    //
+    // ABSENT leaves the stored value alone; only an explicit `false`
+    // clears it. Not pedantry: `applyConns` (the ladder's "Apply N to
+    // this server" button) posts a partial server object with just the
+    // fields it knows, and under the older "absent means false" rule
+    // for `pin_connections` that button silently unpinned a server the
+    // user had deliberately pinned. The editor form always sends all
+    // three, so the clearing path is unaffected.
+    //
+    // block_account is deliberately independent of `level` and of
+    // `block_bytes` above: "every byte here is billed" is the user's
+    // statement about their plan, not something to re-derive from
+    // where the server sits in the tier order.
+    for key in ["warm_pool", "pin_connections", "block_account"] {
+        match incoming.get(key).and_then(Value::as_bool) {
+            Some(true) => {
+                ob.insert(key.into(), json!(true));
+            }
+            Some(false) => {
+                ob.remove(key);
+            }
+            None => {}
         }
-        Some(false) => {
-            ob.remove("warm_pool");
-        }
-        None => {}
     }
     // Idle release, all three optional. An empty field means "not set",
     // which is NOT the same as 0 - 0 seconds is the deliberate "hold

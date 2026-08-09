@@ -1,0 +1,683 @@
+//! TODO §129 phase 1 contract: history in its own store (unlimited,
+//! paged, searchable) and the revisioned `mode=dashboard` round-trip.
+//! Written BEFORE the implementation, per the phase's "pin the contract
+//! with tests first" rule - see
+//! research/PLAN-2026-08-08-129-phase1-history-dashboard.md.
+//!
+//! Everything here is black-box over HTTP against a spawned daemon with
+//! no news servers (the scratch-daemon pattern): history rows are seeded
+//! by writing the persistence files the daemon itself reads, which is
+//! also how the migration contract gets exercised for free.
+
+mod scratch;
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// One attempt, returning the response BODY - the http_wedge.rs shape:
+/// bytes first, de-chunk, UTF-8 last (tiny_http chunks anything over
+/// 32 KB and a chunk header can land mid-codepoint).
+fn http_once(port: u16, req: &str) -> std::io::Result<Vec<u8>> {
+    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+    write!(
+        s,
+        "GET {req} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut raw = Vec::new();
+    let read = s.read_to_end(&mut raw);
+    if raw.is_empty() {
+        return Err(read.err().unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "closed without answering",
+            )
+        }));
+    }
+    let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Ok(Vec::new());
+    };
+    let (head, body) = raw.split_at(at + 4);
+    let chunked = String::from_utf8_lossy(head)
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked");
+    Ok(if chunked {
+        dechunk(body)
+    } else {
+        body.to_vec()
+    })
+}
+
+fn dechunk(mut b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(nl) = b.windows(2).position(|w| w == b"\r\n") {
+        let line = String::from_utf8_lossy(&b[..nl]);
+        let size = line.split(';').next().unwrap_or("").trim();
+        let n = usize::from_str_radix(size, 16).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        let (start, end) = (nl + 2, nl + 2 + n);
+        if end > b.len() {
+            out.extend_from_slice(&b[start.min(b.len())..]);
+            break;
+        }
+        out.extend_from_slice(&b[start..end]);
+        b = &b[(end + 2).min(b.len())..];
+    }
+    out
+}
+
+/// Retried only when the daemon produced NOTHING (pre-byte refusal on a
+/// loaded box); an answered request is never retried.
+fn http(port: u16, req: &str) -> Vec<u8> {
+    let mut last = String::new();
+    for attempt in 0..5u32 {
+        match http_once(port, req) {
+            Ok(out) => return out,
+            Err(e) => {
+                last = e.to_string();
+                std::thread::sleep(Duration::from_millis(100 * u64::from(attempt) + 50));
+            }
+        }
+    }
+    panic!("daemon on :{port} never served {req}: {last}");
+}
+
+fn api(port: u16, q: &str) -> Value {
+    let body = http(port, &format!("/api?output=json&apikey=sekrit&{q}"));
+    let text = String::from_utf8(body).expect("API body is UTF-8");
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("bad JSON for {q:?}: {e}\n{text}"))
+}
+
+/// Same call, but the caller wants the raw body size too (the phase-1d
+/// "unchanged refresh is small" gate lives on bytes, not parsed shape).
+fn api_raw(port: u16, q: &str) -> (Value, usize) {
+    let body = http(port, &format!("/api?output=json&apikey=sekrit&{q}"));
+    let n = body.len();
+    let text = String::from_utf8(body).expect("API body is UTF-8");
+    let v =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("bad JSON for {q:?}: {e}\n{text}"));
+    (v, n)
+}
+
+struct KillOnDrop(Child);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+struct Running {
+    _child: KillOnDrop,
+    port: u16,
+}
+
+fn scratch(name: &str) -> scratch::ScratchDir {
+    let dir = std::env::temp_dir().join(format!("nzbfast-drev-{}-{name}", std::process::id()));
+    let dir = scratch::ScratchDir::attach(&dir);
+    std::fs::write(dir.join("config.json"), "{\"servers\":[]}").unwrap();
+    // An existing install (no first-run key minted; the key comes from
+    // --apikey), indexer off - nothing here needs it.
+    std::fs::write(dir.join("settings.json"), "{\"index_enabled\": false}").unwrap();
+    dir
+}
+
+/// One synthetic finished-job record in the persisted `job_json` shape.
+/// Only the fields `job_from_json` requires plus what the assertions
+/// read; everything else exercises the absent-key legacy paths.
+fn hist_record(dir: &Path, i: usize, name: &str, state: &str, category: &str) -> Value {
+    json!({
+        "nzo_id": format!("SABnzbd_nzo_h{i}"),
+        "name": name,
+        "nzb_path": dir.join(format!("spool-{i}.nzb")).to_string_lossy(),
+        "out_dir": dir.join("complete").join(name).to_string_lossy(),
+        "state": state,
+        "category": category,
+        "total_bytes": 1000 + i as u64,
+        "finished_unix": 1_754_000_000i64 + i as i64,
+        "fail_message": if state == "Failed" { "articles missing" } else { "" },
+    })
+}
+
+/// Seed history the LEGACY way: a queue.json still carrying a "history"
+/// array. The daemon must both read it and split it out (migration).
+fn seed_legacy(dir: &Path, records: &[Value]) {
+    let spool = dir.join(".spool");
+    std::fs::create_dir_all(&spool).unwrap();
+    let v = json!({"next_id": 100_000, "queue": [], "history": records});
+    std::fs::write(
+        spool.join("queue.json"),
+        serde_json::to_string_pretty(&v).unwrap(),
+    )
+    .unwrap();
+}
+
+fn serve(dir: &Path) -> Running {
+    for attempt in 0..3 {
+        let port = free_port();
+        let log = dir.join(format!("daemon-{port}.log"));
+        let out = std::fs::File::create(&log).unwrap();
+        let err = out.try_clone().unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_nzbfast"))
+            .env("NZBFAST_NO_ENRICH", "1")
+            .env_remove("NZBFAST_OPEN")
+            .arg("--config")
+            .arg(dir.join("config.json"))
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .unwrap();
+        let mut running = Running {
+            _child: KillOnDrop(child),
+            port,
+        };
+        // Readiness = OUR banner in OUR log (a bare connect can catch a
+        // stranger on a recycled port - see index_size_cap.rs).
+        let banner = format!("open the dashboard at  http://localhost:{port}/");
+        let mut dead = false;
+        for _ in 0..300 {
+            if std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains(&banner)
+                && TcpStream::connect(("127.0.0.1", port)).is_ok()
+            {
+                return running;
+            }
+            if running._child.0.try_wait().ok().flatten().is_some() {
+                dead = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let tail = std::fs::read_to_string(&log).unwrap_or_default();
+        drop(running);
+        assert!(
+            attempt < 2,
+            "daemon never announced its listener on {port} (exited early: {dead})\n{tail}"
+        );
+    }
+    unreachable!()
+}
+
+fn slots(v: &Value) -> Vec<Value> {
+    v["history"]["slots"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// 1+2: history survives a restart in its own file, and a legacy
+/// queue.json (history array inside) is split on first boot - read,
+/// migrated out, and never lost.
+#[test]
+fn history_survives_restart_in_its_own_file() {
+    let dir = scratch("ownfile");
+    seed_legacy(
+        &dir,
+        &[
+            hist_record(&dir, 1, "Alpha.Movie.2020", "Completed", "movies"),
+            hist_record(&dir, 2, "Beta.Show.S01E01", "Failed", "tv"),
+        ],
+    );
+
+    {
+        let d = serve(&dir);
+        let h = api(d.port, "mode=history");
+        assert_eq!(slots(&h).len(), 2, "legacy rows visible after boot: {h}");
+        // The split happened: history has its own file, queue.json no
+        // longer carries the array. (Poll briefly - the migration runs
+        // at load, but give a slow CI disk a beat.)
+        let spool = dir.join(".spool");
+        let mut split = false;
+        for _ in 0..50 {
+            let q: Value = serde_json::from_str(
+                &std::fs::read_to_string(spool.join("queue.json")).unwrap_or_default(),
+            )
+            .unwrap_or(Value::Null);
+            let gone = q
+                .get("history")
+                .and_then(Value::as_array)
+                .is_none_or(|a| a.is_empty());
+            if spool.join("history.jsonl").exists() && gone {
+                split = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(split, "queue.json was not split into history.jsonl");
+    }
+
+    // A second boot reads the new layout.
+    let d = serve(&dir);
+    let h = api(d.port, "mode=history");
+    let s = slots(&h);
+    assert_eq!(s.len(), 2, "rows survive the restart: {h}");
+    // Newest first: record 2 finished later.
+    assert_eq!(s[0]["name"], "Beta.Show.S01E01", "{h}");
+    assert_eq!(s[0]["status"], "Failed", "{h}");
+    assert_eq!(s[1]["status"], "Completed", "{h}");
+}
+
+/// 3: paging and search live at the store - `start`/`limit` windows,
+/// `noofslots` counts the FILTERED total, `search=` narrows by name
+/// case-insensitively, `nzo_ids=` bypasses the window, facet `counts`
+/// ride the reply, and the existing filters still compose.
+#[test]
+fn history_paging_and_search() {
+    let dir = scratch("paging");
+    let records: Vec<Value> = (0..40)
+        .map(|i| {
+            let (name, state, cat) = if i % 4 == 0 {
+                (format!("Beta.Show.S01E{i:02}"), "Failed", "tv")
+            } else {
+                (format!("Alpha.Movie.{i:02}"), "Completed", "movies")
+            };
+            hist_record(&dir, i, &name, state, cat)
+        })
+        .collect();
+    seed_legacy(&dir, &records);
+    let d = serve(&dir);
+    let port = d.port;
+
+    // The unpaged facade answer: everything, newest first.
+    let all = api(port, "mode=history");
+    assert_eq!(slots(&all).len(), 40, "{all}");
+    assert_eq!(all["history"]["noofslots"], 40, "{all}");
+
+    // A window: 10 rows starting at 5, total still 40.
+    let page = api(port, "mode=history&start=5&limit=10");
+    let s = slots(&page);
+    assert_eq!(s.len(), 10, "{page}");
+    assert_eq!(page["history"]["noofslots"], 40, "{page}");
+    // Newest-first means row 5 is the record with the 5th-highest
+    // finished_unix: i=34.
+    assert_eq!(s[0]["nzo_id"], "SABnzbd_nzo_h34", "{page}");
+
+    // Search narrows, case-insensitively, and noofslots follows.
+    let found = api(port, "mode=history&search=beta.show");
+    assert_eq!(slots(&found).len(), 10, "{found}");
+    assert_eq!(found["history"]["noofslots"], 10, "{found}");
+    // Search + window compose.
+    let found = api(port, "mode=history&search=BETA&start=0&limit=3");
+    assert_eq!(slots(&found).len(), 3, "{found}");
+    assert_eq!(found["history"]["noofslots"], 10, "{found}");
+    // A search that matches nothing says so rather than answering all.
+    let none = api(port, "mode=history&search=zzz-not-here");
+    assert_eq!(slots(&none).len(), 0, "{none}");
+    assert_eq!(none["history"]["noofslots"], 0, "{none}");
+
+    // nzo_ids always finds its row, whatever window would hide it.
+    let byid = api(port, "mode=history&start=0&limit=2&nzo_ids=SABnzbd_nzo_h0");
+    assert_eq!(slots(&byid).len(), 1, "{byid}");
+    assert_eq!(slots(&byid)[0]["nzo_id"], "SABnzbd_nzo_h0", "{byid}");
+
+    // Facet counts for the dashboard's bucket chips: computed over the
+    // search/category-filtered set, additive key.
+    let c = &all["history"]["counts"];
+    assert_eq!(c["all"], 40, "{all}");
+    assert_eq!(c["done"], 30, "{all}");
+    assert_eq!(c["failed"], 10, "{all}");
+    assert_eq!(c["locked"], 0, "{all}");
+
+    // The existing filters still compose with the new ones.
+    let f = api(port, "mode=history&failed_only=1&category=tv&limit=4");
+    assert_eq!(slots(&f).len(), 4, "{f}");
+    assert_eq!(f["history"]["noofslots"], 10, "{f}");
+    for s in slots(&f) {
+        assert_eq!(s["status"], "Failed", "{f}");
+    }
+}
+
+/// 4: the SAB facade row is byte-stable - the exact key set external
+/// clients see today, no key dropped, none renamed. New capability is
+/// additive only.
+#[test]
+fn mode_history_facade_is_stable() {
+    let dir = scratch("facade");
+    seed_legacy(
+        &dir,
+        &[hist_record(
+            &dir,
+            1,
+            "Alpha.Movie.2020",
+            "Completed",
+            "movies",
+        )],
+    );
+    let d = serve(&dir);
+    let h = api(d.port, "mode=history");
+    let s = slots(&h);
+    assert_eq!(s.len(), 1, "{h}");
+    let row = s[0].as_object().expect("row is an object");
+    // The pre-phase-1 contract, key for key (history.rs history_json).
+    for key in [
+        "nzo_id",
+        "name",
+        "nzb_name",
+        "origin",
+        "nzb_path",
+        "category",
+        "status",
+        "fail_message",
+        "fail_detail",
+        "disk_full",
+        "space_needed",
+        "fail_kind",
+        "auto_retry_at",
+        "auto_retry_why",
+        "fail_hint",
+        "fail_action",
+        "retry",
+        "library",
+        "duplicate_key",
+        "storage",
+        "path",
+        "bytes",
+        "size",
+        "downloaded_bytes",
+        "elapsed_secs",
+        "completed",
+        "bad_blocks",
+        "verify_blocks",
+        "password_required",
+        "has_password",
+        "unpack_blocked_by",
+        "move_split",
+        "move_failed",
+        "move_pending",
+        "archive_shape",
+        "media",
+        "identity_name",
+        "identity_imdb",
+        "identity_src",
+        "filed_as",
+        "smart_rule",
+        "moved_to",
+        "cleaned_files",
+        "cleaned_par2",
+        "cleaned_trash",
+        "identify",
+        "script_line",
+    ] {
+        assert!(row.contains_key(key), "facade key {key} missing: {h}");
+    }
+    assert_eq!(row["status"], "Completed", "{h}");
+    assert_eq!(row["bytes"], 1001, "{h}");
+}
+
+/// 5: the revisioned round-trip. First call returns everything plus the
+/// revision handles; an unchanged repeat returns no collections and a
+/// SMALL body; a history mutation bumps the revision and the collection
+/// comes back.
+#[test]
+fn dashboard_mode_revisions() {
+    let dir = scratch("revs");
+    let records: Vec<Value> = (0..30)
+        .map(|i| {
+            hist_record(
+                &dir,
+                i,
+                &format!("Alpha.Movie.{i:02}"),
+                "Completed",
+                "movies",
+            )
+        })
+        .collect();
+    seed_legacy(&dir, &records);
+    let d = serve(&dir);
+    let port = d.port;
+
+    // First poll: no revisions offered, everything comes back.
+    let first = api(port, "mode=dashboard&hist_limit=10");
+    let qrev = first["queue_revision"].as_u64().expect("queue_revision");
+    let hrev = first["history_revision"]
+        .as_u64()
+        .expect("history_revision");
+    let seq = first["events_seq"].as_u64().expect("events_seq");
+    assert!(
+        first["queue"].is_object(),
+        "first poll carries the queue: {first}"
+    );
+    assert!(
+        first["history"].is_object(),
+        "first poll carries history: {first}"
+    );
+    let hist = &first["history"];
+    assert_eq!(
+        hist["slots"].as_array().map(Vec::len),
+        Some(10),
+        "the requested window, not everything: {first}"
+    );
+    assert_eq!(hist["noofslots"], 30, "{first}");
+    assert!(first["stats"].is_object(), "stats always ride: {first}");
+    // Summary rows are COMPACT: the heavyweight drawer-only keys stay
+    // off the per-second wire.
+    let srow = hist["slots"][0].as_object().unwrap();
+    for key in ["nzo_id", "name", "status", "bytes", "completed", "category"] {
+        assert!(srow.contains_key(key), "summary key {key} missing: {first}");
+    }
+    for absent in ["fail_detail", "identify", "script_line", "cleaned_files"] {
+        assert!(
+            !srow.contains_key(absent),
+            "summary rows must not carry {absent}: {first}"
+        );
+    }
+
+    // Unchanged repeat: no collections, and the body is small however
+    // large history is (the phase-1d gate in miniature).
+    let (again, n) = api_raw(
+        port,
+        &format!("mode=dashboard&queue_rev={qrev}&history_rev={hrev}&events={seq}&hist_limit=10"),
+    );
+    assert!(
+        again["queue"].is_null(),
+        "unchanged queue must not be resent: {again}"
+    );
+    assert!(
+        again["history"].is_null(),
+        "unchanged history must not be resent: {again}"
+    );
+    assert!(again["stats"].is_object(), "stats still ride: {again}");
+    assert!(
+        n < 4096,
+        "unchanged refresh weighed {n} bytes - the idle poll must stay small"
+    );
+
+    // A history mutation bumps the revision and the page returns.
+    let del = api(
+        port,
+        "mode=history&name=delete&value=SABnzbd_nzo_h29&del_files=0",
+    );
+    assert_eq!(del["status"], true, "{del}");
+    let after = api(
+        port,
+        &format!("mode=dashboard&queue_rev={qrev}&history_rev={hrev}&events={seq}&hist_limit=10"),
+    );
+    let hrev2 = after["history_revision"]
+        .as_u64()
+        .expect("history_revision");
+    assert!(
+        hrev2 != hrev,
+        "a delete must bump the history revision: {after}"
+    );
+    assert!(
+        after["history"].is_object(),
+        "changed history is resent: {after}"
+    );
+    assert_eq!(after["history"]["noofslots"], 29, "{after}");
+
+    // The events cursor: nothing new means an empty list, not a replay;
+    // a cursor from before the ring means an explicit reset signal.
+    let ev = after["events"].as_array().expect("events array");
+    // (a delete is not a lifecycle event; whatever arrived, seqs are
+    // monotonic and past our cursor)
+    for e in ev {
+        assert!(e["seq"].as_u64().expect("event seq") > seq, "{after}");
+    }
+    assert_eq!(after["events_reset"], false, "{after}");
+}
+
+/// One multipart POST - enough for mode=addfile.
+fn http_post_nzb(port: u16, name: &str, nzb: &str) -> Value {
+    let boundary = "xxNZBFASTBOUNDARYxx";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"nzbfile\"; \
+         filename=\"{name}\"\r\nContent-Type: text/xml\r\n\r\n{nzb}\r\n--{boundary}--\r\n"
+    );
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        s,
+        "POST /api?mode=addfile&output=json&apikey=sekrit HTTP/1.1\r\nHost: x\r\n\
+         Content-Type: multipart/form-data; boundary={boundary}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let at = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("headers");
+    let (head, body) = raw.split_at(at + 4);
+    let body = if String::from_utf8_lossy(head)
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        dechunk(body)
+    } else {
+        body.to_vec()
+    };
+    serde_json::from_slice(&body).expect("addfile answers JSON")
+}
+
+/// 5b: lifecycle events ride the round-trip. A page that primed its
+/// cursor (first poll OMITS the events param - no replay) then sees a
+/// job fail is handed a `job.failed` event past its cursor - including
+/// the daemon's FIRST event ever, i.e. a numeric cursor of 0 is "give
+/// me everything after 0", never a second prime.
+#[test]
+fn lifecycle_events_reach_a_watching_client() {
+    let dir = scratch("events");
+    let d = serve(&dir);
+    let port = d.port;
+
+    // Prime: no events param at all -> current seq, no backlog.
+    let first = api(port, "mode=dashboard");
+    let seq0 = first["events_seq"].as_u64().expect("events_seq");
+    assert_eq!(first["events"].as_array().map(Vec::len), Some(0), "{first}");
+
+    // A job on a daemon with no servers fails fast and parks.
+    let nzb = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+        <nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\
+        <file poster=\"t@t\" date=\"1722000000\" subject=\"&quot;Event.Test&quot; yEnc (1/1)\">\
+        <groups><group>alt.binaries.test</group></groups>\
+        <segments><segment bytes=\"5000\" number=\"1\">evt1@test</segment></segments>\
+        </file></nzb>";
+    let added = http_post_nzb(port, "event-test.nzb", nzb);
+    assert_eq!(added["status"], true, "{added}");
+
+    // The event arrives past our cursor.
+    let mut got = None;
+    for _ in 0..150 {
+        let r = api(port, &format!("mode=dashboard&events={seq0}"));
+        let evs = r["events"].as_array().cloned().unwrap_or_default();
+        if let Some(e) = evs.iter().find(|e| e["kind"] == "job.failed") {
+            got = Some(e.clone());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let e = got.expect("a job.failed event reached the events cursor");
+    assert!(e["seq"].as_u64().unwrap_or(0) > seq0, "{e}");
+    assert!(e["nzo_id"].as_str().is_some_and(|s| !s.is_empty()), "{e}");
+    assert!(
+        e["fail_message"].as_str().is_some_and(|s| !s.is_empty()),
+        "{e}"
+    );
+
+    // A fresh page arriving NOW still never replays it.
+    let fresh = api(port, "mode=dashboard");
+    assert_eq!(fresh["events"].as_array().map(Vec::len), Some(0), "{fresh}");
+    assert!(fresh["events_seq"].as_u64().unwrap_or(0) > seq0, "{fresh}");
+}
+
+/// 6: retention knobs exist, ship OFF (unlimited is the default - the
+/// recorded product ruling), and enforce a count cap when set.
+#[test]
+fn retention_knobs_off_by_default_and_enforced_when_set() {
+    // Default: nothing purges. 60 seeded rows are all present after boot.
+    let dir = scratch("keepdef");
+    let records: Vec<Value> = (0..60)
+        .map(|i| {
+            hist_record(
+                &dir,
+                i,
+                &format!("Alpha.Movie.{i:02}"),
+                "Completed",
+                "movies",
+            )
+        })
+        .collect();
+    seed_legacy(&dir, &records);
+    {
+        let d = serve(&dir);
+        let h = api(d.port, "mode=history");
+        assert_eq!(h["history"]["noofslots"], 60, "unlimited by default: {h}");
+    }
+    drop(dir);
+
+    // With history_keep_count=50: the 10 oldest go, the newest 50 stay.
+    let dir = scratch("keepcap");
+    let records: Vec<Value> = (0..60)
+        .map(|i| {
+            hist_record(
+                &dir,
+                i,
+                &format!("Alpha.Movie.{i:02}"),
+                "Completed",
+                "movies",
+            )
+        })
+        .collect();
+    seed_legacy(&dir, &records);
+    std::fs::write(
+        dir.join("settings.json"),
+        "{\"index_enabled\": false, \"history_keep_count\": 50}",
+    )
+    .unwrap();
+    let d = serve(&dir);
+    let h = api(d.port, "mode=history");
+    assert_eq!(h["history"]["noofslots"], 50, "count cap enforced: {h}");
+    let s = slots(&h);
+    assert_eq!(s.len(), 50, "{h}");
+    // Newest kept, oldest gone.
+    assert_eq!(s[0]["nzo_id"], "SABnzbd_nzo_h59", "{h}");
+    assert!(
+        !s.iter().any(|r| r["nzo_id"] == "SABnzbd_nzo_h9"),
+        "the oldest rows were not purged: {h}"
+    );
+}

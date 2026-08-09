@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- DMG window background. The Finder window is 660x400 pt; the canvas
+<!-- DMG window background. The Finder window's CONTENT area is
+     660x400 pt (the .DS_Store frame adds the title bar on top); the canvas
      is a 660x660 SQUARE (all design in the top 400) because qlmanage
      pads non-square thumbnails with white - a square canvas renders
      edge-to-edge dark. Palette = the dashboard dark theme.

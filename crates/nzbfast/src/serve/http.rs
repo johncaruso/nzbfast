@@ -5,6 +5,30 @@
 
 use super::*;
 
+/// The FULL API key only - the add-only NZB key does not open this door.
+///
+/// The playback family (`/stream`, `/m3u`, `/watch`, `/preview/probe`)
+/// hands out the user's finished media, and `/stream` against a
+/// never-fetched library entry additionally force-starts the job: a
+/// queue mutation past a user pause. `/jobnzb` already refuses the
+/// add-only credential on the narrower ground that "a job's spool says
+/// what this user downloads", and serving the bytes is strictly more
+/// than reading the spool - so accepting the nzbkey here let a
+/// credential that ships to browser push extensions walk the entire
+/// library, `nzo_id`s being a plain incrementing counter.
+///
+/// Same three arms as `route_jobnzb`: a keyless install stays open, a
+/// configured apikey must match, and an install with ONLY an nzbkey
+/// (the lockout state) opens nothing. Players are unaffected - they
+/// carry the per-job `?t=` stream token, which is checked separately.
+fn full_key_ok(given: Option<&str>, apikey: &Option<String>, nzbkey: &Option<String>) -> bool {
+    match (apikey, nzbkey) {
+        (None, None) => true,
+        (Some(k), _) => given.is_some_and(|g| ct_eq(g, k)),
+        (None, Some(_)) => false,
+    }
+}
+
 fn route_stream(req: tiny_http::Request, d: &Arc<Daemon>, path: &str, query: &str) {
     // M11: progressive playback of the active download's media
     // file; M14i: /stream/<nzo_id> fetches a parked library job
@@ -26,15 +50,7 @@ fn route_stream(req: tiny_http::Request, d: &Arc<Daemon>, path: &str, query: &st
     let key_ok = {
         let a = d.apikey.lock_ok().clone();
         let n = d.nzbkey.lock_ok().clone();
-        match (&a, &n) {
-            (None, None) => true,
-            (a, n) => {
-                a.as_deref()
-                    .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-                    || n.as_deref()
-                        .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-            }
-        }
+        full_key_ok(given, &a, &n)
     };
     let token_ok = want
         .as_deref()
@@ -97,15 +113,7 @@ fn route_preview_probe(req: tiny_http::Request, d: &Arc<Daemon>, id: &str, query
     let key_ok = {
         let a = d.apikey.lock_ok().clone();
         let n = d.nzbkey.lock_ok().clone();
-        match (&a, &n) {
-            (None, None) => true,
-            (a, n) => {
-                a.as_deref()
-                    .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-                    || n.as_deref()
-                        .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-            }
-        }
+        full_key_ok(given, &a, &n)
     };
     let token_ok = sp.get("t").is_some_and(|t| ct_eq(t, &d.stream_token(&id)));
     if !(key_ok || token_ok) {
@@ -213,15 +221,7 @@ fn route_m3u(req: tiny_http::Request, d: &Arc<Daemon>, id: &str, query: &str) {
     let ok = {
         let a = d.apikey.lock_ok().clone();
         let n = d.nzbkey.lock_ok().clone();
-        match (&a, &n) {
-            (None, None) => true,
-            (a, n) => {
-                a.as_deref()
-                    .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-                    || n.as_deref()
-                        .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-            }
-        }
+        full_key_ok(given, &a, &n)
     };
     if !ok {
         let blocked = d.note_auth_failure(peer_ip(&req), "m3u/watch");
@@ -273,15 +273,7 @@ fn route_watch(req: tiny_http::Request, d: &Arc<Daemon>, query: &str) {
     let ok = {
         let a = d.apikey.lock_ok().clone();
         let n = d.nzbkey.lock_ok().clone();
-        match (&a, &n) {
-            (None, None) => true,
-            (a, n) => {
-                a.as_deref()
-                    .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-                    || n.as_deref()
-                        .is_some_and(|k| given.is_some_and(|g| ct_eq(g, k)))
-            }
-        }
+        full_key_ok(given, &a, &n)
     };
     if !ok {
         let blocked = d.note_auth_failure(peer_ip(&req), "m3u/watch");
@@ -845,24 +837,17 @@ pub(super) fn spawn_http_workers(
                     Some(trimmed) => trimmed,
                 };
                 if path == "/" || path == "/index.html" {
-                    let _ = req.respond(
-                        // §5 i18n: stamp the daemon-default locale into the page
-                        // (the JS token '__NZBFAST_LOCALE__') so embedded
-                        // webviews localize without a saved browser pref.
-                        tiny_http::Response::from_string(
-                            ui_shell_state(&d, ui_themed(DASHBOARD_HTML))
-                                .replace("__NZBFAST_LOCALE__", &d.ui_locale.lock_ok()),
-                        )
-                        .with_header(
-                            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..])
-                                .unwrap(),
-                        )
-                        // A stale cached page keeps polling with old JS -
-                        // always revalidate so daemon upgrades reach the UI.
-                        .with_header(
-                            tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..])
-                                .unwrap(),
-                        ),
+                    // §5 i18n: stamp the daemon-default locale into the page
+                    // (the JS token '__NZBFAST_LOCALE__') so embedded
+                    // webviews localize without a saved browser pref.
+                    // respond_page keeps no-cache (a stale cached page keeps
+                    // polling with old JS) but adds gzip + an ETag over the
+                    // substituted bytes, so a revalidation is 304-sized.
+                    respond_page(
+                        req,
+                        ui_shell_state(&d, ui_themed(DASHBOARD_HTML))
+                            .replace("__NZBFAST_LOCALE__", &d.ui_locale.lock_ok()),
+                        "text/html",
                     );
                     continue;
                 }
@@ -871,25 +856,14 @@ pub(super) fn spawn_http_workers(
                     .strip_prefix("/i18n/")
                     .and_then(|f| f.strip_suffix(".json"))
                 {
-                    let resp = match i18n_catalog(lang) {
-                        Some(body) => tiny_http::Response::from_string(body)
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Content-Type"[..],
-                                    &b"application/json"[..],
-                                )
-                                .unwrap(),
-                            )
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Cache-Control"[..],
-                                    &b"no-cache"[..],
-                                )
-                                .unwrap(),
-                            ),
-                        None => tiny_http::Response::from_string("{}").with_status_code(404),
-                    };
-                    let _ = req.respond(resp);
+                    match i18n_catalog(lang) {
+                        Some(body) => respond_page(req, body.to_string(), "application/json"),
+                        None => {
+                            let _ = req.respond(
+                                tiny_http::Response::from_string("{}").with_status_code(404),
+                            );
+                        }
+                    }
                     continue;
                 }
                 // Browser icons and the web manifest, embedded like the pages.
@@ -945,41 +919,17 @@ pub(super) fn spawn_http_workers(
                         );
                         continue;
                     };
-                    let _ = req.respond(
-                        tiny_http::Response::from_string(ui_themed(body))
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Content-Type"[..],
-                                    &b"text/html"[..],
-                                )
-                                .unwrap(),
-                            )
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Cache-Control"[..],
-                                    &b"no-cache"[..],
-                                )
-                                .unwrap(),
-                            ),
-                    );
+                    respond_page(req, ui_themed(body), "text/html");
                     continue;
                 }
                 #[cfg(feature = "indexer")]
                 if path == "/wall" || path == "/wall/" {
                     // M13: the poster wall (embedded like the dashboard).
-                    let _ = req.respond(
-                        tiny_http::Response::from_string(
-                            ui_shell_state(&d, ui_themed(WALL_HTML))
-                                .replace("__NZBFAST_LOCALE__", &d.ui_locale.lock_ok()),
-                        )
-                        .with_header(
-                            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..])
-                                .unwrap(),
-                        )
-                        .with_header(
-                            tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..])
-                                .unwrap(),
-                        ),
+                    respond_page(
+                        req,
+                        ui_shell_state(&d, ui_themed(WALL_HTML))
+                            .replace("__NZBFAST_LOCALE__", &d.ui_locale.lock_ok()),
+                        "text/html",
                     );
                     continue;
                 }

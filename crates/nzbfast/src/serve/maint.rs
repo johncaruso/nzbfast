@@ -94,8 +94,11 @@ pub(super) fn restart_in_place(
     }
     // exec replaces the image without running any exit handler, so the
     // log tee has to be drained here or the last lines before a restart
-    // die in its pipe.
-    nzbkit::logtee::drain();
+    // die in its pipe - and then UNINSTALLED, or the replacement image
+    // inherits the dead pipe as its stdout and a launcher-attached
+    // daemon.log never sees another line (restore_for_exec drains
+    // first).
+    nzbkit::logtee::restore_for_exec();
     let err = cmd.exec(); // only returns on failure
     error!(
         target: "restart",

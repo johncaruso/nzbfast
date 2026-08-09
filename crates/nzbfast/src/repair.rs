@@ -227,442 +227,15 @@ pub(crate) fn reextract_dir(dir: &std::path::Path, password: Option<&str>) -> Re
     }
 }
 
-/// `.volNNN+MM.par2` / `.volNNN-MMM.par2` → declared recovery-slice count.
-pub(crate) fn vol_count_from_name(name: &str) -> Option<usize> {
-    nzbkit::nzb::par2_vol_count(name)
-}
-
-/// Download the chosen recovery volumes to `out_dir` (same decode→pwrite
-/// path as the main run). Shared by the disk repair path and the mapped
-/// (into-the-output) path.
-pub(crate) async fn fetch_volumes(
-    servers: &[(ServerConfig, nzbkit::pool::PoolConfig)],
-    nzb: &Nzb,
-    out_dir: &Path,
-    buf_pool: &Arc<nzbkit::pool::BufPool>,
-    file_indexes: &[usize],
-) -> Result<()> {
-    let mut ids: Vec<nzbkit::pool::ArticleReq> = Vec::new();
-    let mut id_to_file: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for &fi in file_indexes {
-        let age_days = nzb_age_days(nzb.files[fi].date);
-        for seg in &nzb.files[fi].segments {
-            let b = format!("<{}>", seg.message_id);
-            id_to_file.insert(b.clone(), fi);
-            ids.push(nzbkit::pool::ArticleReq {
-                id: b,
-                age_days,
-                part: seg.number,
-            });
-        }
-    }
-    fetch_volume_articles(
-        servers,
-        ids,
-        id_to_file,
-        out_dir,
-        buf_pool,
-        volume_prealloc_cap(nzb),
-        None,
-    )
-    .await
-    .map(|_| ())
-}
-
-/// Reservation ceiling for a recovery-volume side-fetch, the same bound
-/// `main` hands the extractor: a recovery volume cannot legitimately
-/// exceed the whole post, and the yEnc `size=` it declares is a poster-
-/// controlled number that on Linux turns into a real `fallocate`. The
-/// posted byte count is itself an untrusted attribute (and 0 means the
-/// NZB carried no byte attributes at all - unknown, not zero), so the
-/// post's article GEOMETRY bounds it either way: reserving more space
-/// requires declaring more articles, which the download is then held
-/// accountable for. See [`Nzb::geometry_bytes`].
-pub(crate) fn volume_prealloc_cap(nzb: &Nzb) -> u64 {
-    let geometry = nzb.geometry_bytes();
-    match nzb.total_bytes() {
-        0 => geometry,
-        posted => posted.min(geometry),
-    }
-}
-
-/// Shrink the download fleet to the one-connection-per-server side pool the
-/// M2c.5 speculative prefetch runs on. The main pool already holds this
-/// account's grants, so the prefetch may add exactly one connection per
-/// server or the provider starts refusing them.
-pub(crate) fn side_pool_servers(
-    servers: &[(ServerConfig, nzbkit::pool::PoolConfig)],
-) -> Vec<(ServerConfig, nzbkit::pool::PoolConfig)> {
-    servers
-        .iter()
-        .map(|(sc, pc)| {
-            let mut sc = sc.clone();
-            sc.connections = 1;
-            let mut pc = pc.clone();
-            // The POOL config is what spawns workers (pool::fetch_all_multi);
-            // ServerConfig.connections was consumed when this config was
-            // built, far above. Setting only that one leaves the "tiny side
-            // pool" a full second fleet, opened mid-download.
-            pc.connections = 1;
-            // Same reason it must stay small: side-pool workers are not part
-            // of the download, so they must not move the dashboard's
-            // per-server gauges either.
-            pc.live = None;
-            // TODO 114: the steer seam defers each Done's completion
-            // until the consumer's note_decoded verdict - and the
-            // side-fetch consumer (consume_volume_articles) never
-            // gives one (it has no QueueControl at all), so a cloned
-            // crc_steer would park every delivery forever and hang
-            // the volume fetch. Damaged side-fetched volumes already
-            // have their own answer: incomplete volumes stay
-            // fetchable and repair proves the bytes.
-            pc.crc_steer = false;
-            (sc, pc)
-        })
-        .collect()
-}
-
-/// Inner driver for recovery-volume side-fetches: downloads the given
-/// article set on its own small pool and assembles the volume file(s)
-/// in `out_dir`. Returns (article failures, paths written) - the
-/// failure count is how a caller tells a COMPLETE volume from a
-/// partial one, and only a complete volume may ever enter a whole-file
-/// exclusion list (a partial one must stay fetchable for its missing
-/// articles).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn fetch_volume_articles(
-    servers: &[(ServerConfig, nzbkit::pool::PoolConfig)],
-    ids: Vec<nzbkit::pool::ArticleReq>,
-    id_to_file: std::collections::HashMap<String, usize>,
-    out_dir: &Path,
-    buf_pool: &Arc<nzbkit::pool::BufPool>,
-    // Ceiling on what one volume writer may RESERVE - see
-    // [`volume_prealloc_cap`]. u64::MAX = no ceiling.
-    prealloc_cap: u64,
-    // Cancellation handle for callers that must be able to stop a
-    // side-fetch mid-volume (Codex 5 Aug M3: the speculative prefetch
-    // could hold Cancel/Pause through a blackholed provider's whole
-    // retry ladder). The handle attaches to each rung's pool; abort()
-    // drops in-flight reads and the run returns promptly. Paths already
-    // written are still harvested and returned.
-    ctl: Option<&nzbkit::pool::QueueControl>,
-) -> Result<(usize, Vec<PathBuf>)> {
-    use nzbkit::pool::{FetchOutcome, fetch_all_multi_ctl};
-    // Side-fetch: small volume sets, fast disk-writer consumer - a
-    // modest fixed depth (≈25 MB) instead of the old 256 (~200 MB of
-    // budget-exempt bytes on a box that may only have 256 MB total).
-    let (tx, rx) = tokio::sync::mpsc::channel::<FetchOutcome>(32);
-    let out_dir2 = out_dir.to_path_buf();
-    let pool2 = buf_pool.clone();
-    let consumer = tokio::spawn(async move {
-        consume_volume_articles(rx, id_to_file, out_dir2, pool2, prealloc_cap).await
-    });
-    let t0 = Instant::now();
-    let stats = fetch_all_multi_ctl(servers, ids, tx, ctl).await;
-    let (failures, paths) = consumer.await?;
-    let raw: u64 = stats.iter().map(|s| s.bytes).sum();
-    println!(
-        "  fetched {:.1} MB of recovery data in {:.2?}{}",
-        raw as f64 / 1e6,
-        t0.elapsed(),
-        if failures > 0 {
-            format!(" ({failures} article failures)")
-        } else {
-            String::new()
-        }
-    );
-    Ok((failures as usize, paths))
-}
-
-/// Decode side-fetched articles onto their volume files. Returns
-/// (article failures, paths actually written) - split out of
-/// [`fetch_volume_articles`] so the writer-failure path is reachable from
-/// a test without a server.
-///
-/// A volume whose writer cannot be created is DROPPED, not fatal: the
-/// declared name is attacker-influenced (it may sanitise to something
-/// unopenable) and the disk may be full or read-only. Panicking here took
-/// the consumer task down and, with it, every other volume in the same
-/// side-fetch. Absent from the returned paths means "we did not get that
-/// volume", which every caller already handles - the slices are counted
-/// from the files that actually landed, so nothing is over-credited.
-pub(crate) async fn consume_volume_articles(
-    mut rx: tokio::sync::mpsc::Receiver<nzbkit::pool::FetchOutcome>,
-    id_to_file: std::collections::HashMap<String, usize>,
-    out_dir: PathBuf,
-    buf_pool: Arc<nzbkit::pool::BufPool>,
-    prealloc_cap: u64,
-) -> (u32, Vec<PathBuf>) {
-    use nzbkit::disk::{FileWriter, sanitize_filename};
-    use nzbkit::pool::FetchOutcome;
-    use std::collections::hash_map::Entry;
-    use std::collections::{HashMap, HashSet};
-
-    let mut writers: HashMap<usize, (PathBuf, Arc<FileWriter>)> = HashMap::new();
-    // Volumes whose writer could not be opened. Remembered so the create
-    // is attempted ONCE per volume rather than once per article - on a
-    // full disk that would be thousands of failing opens - and so the
-    // failure is reported once.
-    let mut unwritable: HashSet<usize> = HashSet::new();
-    let mut failures = 0u32;
-    while let Some(outcome) = rx.recv().await {
-        match outcome {
-            FetchOutcome::Done { id, raw } => {
-                let Some(&fi) = id_to_file.get(&id) else {
-                    buf_pool.give(raw);
-                    continue;
-                };
-                match nzbkit::yenc_simd::decode(&raw) {
-                    Ok(dec) if !unwritable.contains(&fi) => {
-                        let w = match writers.entry(fi) {
-                            Entry::Occupied(e) => Some(&e.into_mut().1),
-                            Entry::Vacant(slot) => {
-                                let path = out_dir.join(sanitize_filename(&dec.name));
-                                // The declared `size=` is the poster's
-                                // number and on Linux preallocation is a
-                                // real fallocate, so it reserves only up
-                                // to the ceiling. `size` itself stays
-                                // unclamped (the writer reports it).
-                                match FileWriter::create_capped(&path, dec.file_size, prealloc_cap)
-                                {
-                                    Ok(f) => Some(&slot.insert((path, Arc::new(f))).1),
-                                    Err(e) => {
-                                        println!(
-                                            "  ⚠ cannot write recovery volume {} ({e}) - skipping it",
-                                            path.display()
-                                        );
-                                        unwritable.insert(fi);
-                                        None
-                                    }
-                                }
-                            }
-                        };
-                        match w {
-                            Some(w) if w.write_at(dec.offset(), &dec.data).is_ok() => {}
-                            _ => failures += 1,
-                        }
-                    }
-                    _ => failures += 1,
-                }
-                buf_pool.give(raw);
-            }
-            _ => failures += 1,
-        }
-    }
-    (failures, writers.into_values().map(|(p, _)| p).collect())
-}
-
-#[cfg(test)]
-mod recovery_volume_tests {
-    use super::*;
-    use nzbkit::pool::{BufPool, FetchOutcome};
-    use std::collections::HashMap;
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nzbfast-vol-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// One complete single-part yEnc article body, exactly as the fetch
-    /// pool hands it to the consumer. `declared` is the `size=` field -
-    /// the number the POSTER controls, which is the whole point here.
-    fn article(name: &str, declared: u64, data: &[u8]) -> Vec<u8> {
-        nzbkit::yenc::encode(name, declared, Some((1, 1)), 1, data)
-    }
-
-    /// Drive the real consumer over `arts` = (file index, article body).
-    async fn consume(dir: &Path, arts: Vec<(usize, Vec<u8>)>, cap: u64) -> (u32, Vec<PathBuf>) {
-        let (tx, rx) = tokio::sync::mpsc::channel::<FetchOutcome>(16);
-        let mut id_to_file = HashMap::new();
-        for (n, (fi, body)) in arts.into_iter().enumerate() {
-            let id = format!("<a{n}@test>");
-            id_to_file.insert(id.clone(), fi);
-            tx.send(FetchOutcome::Done { id, raw: body }).await.unwrap();
-        }
-        drop(tx);
-        // Spawned, so a panic in the consumer surfaces as a JoinError
-        // instead of unwinding the test itself - that is the assertion
-        // for the panic regression below.
-        tokio::spawn(consume_volume_articles(
-            rx,
-            id_to_file,
-            dir.to_path_buf(),
-            BufPool::new(4),
-            cap,
-        ))
-        .await
-        .expect("the recovery-volume consumer task must not panic")
-    }
-
-    /// BUG (HIGH): the PAR2 recovery-volume side-fetch preallocated the
-    /// attacker-declared yEnc `size=` with NO ceiling - `FileWriter::create`
-    /// -> `create_capped(.., u64::MAX)` -> `set_len` plus a real Linux
-    /// `fallocate`. It bypassed the ceiling the extractor already had, so a
-    /// small post could reserve the victim's free space on ext4/XFS.
-    #[tokio::test]
-    async fn a_recovery_volume_cannot_reserve_past_the_posted_ceiling() {
-        let dir = temp_dir("cap");
-        const HUGE: u64 = 8 << 40; // 8 TiB "declared"
-        const POSTED: u64 = 1 << 20; // what the NZB actually posted
-        let payload = vec![0x5Au8; 4096];
-
-        let (failures, paths) = consume(
-            &dir,
-            vec![(0, article("set.vol000+01.par2", HUGE, &payload))],
-            POSTED,
-        )
-        .await;
-
-        assert_eq!(failures, 0);
-        assert_eq!(paths.len(), 1);
-        let len = std::fs::metadata(&paths[0]).unwrap().len();
-        assert_eq!(
-            len, POSTED,
-            "a poster-declared volume size must not reserve past the posted ceiling"
-        );
-        // The cap bounds the RESERVATION only - the article's bytes still
-        // land at their offset, byte for byte.
-        assert_eq!(
-            &std::fs::read(&paths[0]).unwrap()[..payload.len()],
-            &payload[..]
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// THE test that matters: a wrong fix here silently de-optimises every
-    /// real download. A genuine recovery volume, whose declared size fits
-    /// under the posted ceiling, must still be reserved IN FULL from the
-    /// first article - not clamped to the bytes that have arrived.
-    #[tokio::test]
-    async fn a_legitimate_recovery_volume_still_preallocates_in_full() {
-        let dir = temp_dir("cap-ok");
-        const SIZE: u64 = 4_000_000; // the volume's real size
-        const POSTED: u64 = 64_000_000; // the NZB's posted bytes
-        let first_part = vec![0x11u8; 8192];
-
-        let (failures, paths) = consume(
-            &dir,
-            vec![(0, article("set.vol000+02.par2", SIZE, &first_part))],
-            POSTED,
-        )
-        .await;
-        assert_eq!(failures, 0);
-        assert_eq!(
-            std::fs::metadata(&paths[0]).unwrap().len(),
-            SIZE,
-            "a legitimate volume under the ceiling must be preallocated in full, \
-             not clamped to the bytes received so far"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-
-        // And with no ceiling at all: byte-for-byte the old behaviour.
-        let dir = temp_dir("cap-none");
-        let (_, paths) = consume(
-            &dir,
-            vec![(0, article("set.vol000+02.par2", SIZE, &first_part))],
-            u64::MAX,
-        )
-        .await;
-        assert_eq!(std::fs::metadata(&paths[0]).unwrap().len(), SIZE);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The ceiling for an NZB without byte attributes (0 posted bytes
-    /// means "unknown", not zero) used to be NO ceiling at all - which
-    /// let a poster omit `bytes=` and reserve the declared yEnc `size=`
-    /// unbounded. The post's article geometry bounds it instead: one
-    /// declared article justifies one article's worth of reservation,
-    /// never a 0 ceiling (which would reserve nothing for every volume
-    /// of such a post).
-    #[test]
-    fn an_nzb_without_byte_attributes_is_bounded_by_its_geometry() {
-        let xml = br#"<?xml version="1.0"?>
-<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
- <file subject="set.vol000+01.par2 yEnc (1/1)" date="1700000000">
-  <groups><group>alt.binaries.test</group></groups>
-  <segments><segment number="1">a@test</segment></segments>
- </file>
-</nzb>"#;
-        let nzb = nzbkit::nzb::Nzb::parse(xml).unwrap();
-        assert_eq!(nzb.total_bytes(), 0);
-        assert_eq!(volume_prealloc_cap(&nzb), 16 << 20);
-    }
-
-    /// Codex H3: the posted `bytes=` total is as poster-controlled as
-    /// the yEnc `size=`, so "min(size, posted)" was the attacker picking
-    /// both sides - one tiny article declaring two 100 GB numbers became
-    /// a real fallocate. The article geometry caps it: a single-segment
-    /// post can never justify more than one article's worth.
-    #[test]
-    fn an_inflated_posted_byte_count_is_bounded_by_its_geometry() {
-        let xml = br#"<?xml version="1.0"?>
-<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
- <file subject="set.vol000+01.par2 yEnc (1/1)" date="1700000000">
-  <groups><group>alt.binaries.test</group></groups>
-  <segments><segment bytes="109951162777600" number="1">a@test</segment></segments>
- </file>
-</nzb>"#;
-        let nzb = nzbkit::nzb::Nzb::parse(xml).unwrap();
-        assert_eq!(volume_prealloc_cap(&nzb), 16 << 20);
-        // And a genuine posted count under the geometry passes through.
-        let xml2 = br#"<?xml version="1.0"?>
-<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
- <file subject="set.vol000+01.par2 yEnc (1/2)" date="1700000000">
-  <groups><group>alt.binaries.test</group></groups>
-  <segments>
-   <segment bytes="750000" number="1">a@test</segment>
-   <segment bytes="750000" number="2">b@test</segment>
-  </segments>
- </file>
-</nzb>"#;
-        let nzb2 = nzbkit::nzb::Nzb::parse(xml2).unwrap();
-        assert_eq!(volume_prealloc_cap(&nzb2), 1_500_000);
-    }
-
-    /// BUG (LOW): the writer was created with `.expect("create recovery
-    /// volume")` inside the consumer task, so a volume that could not be
-    /// opened - a name that sanitises to something unopenable, a full or
-    /// read-only disk - panicked the task and took every OTHER volume in
-    /// the same side-fetch with it. An unwritable volume is a volume we
-    /// did not get, nothing more.
-    #[tokio::test]
-    async fn an_unwritable_recovery_volume_does_not_panic_the_consumer() {
-        let dir = temp_dir("unwritable");
-        // A directory sitting exactly where the volume file must go: the
-        // create fails, deterministically, on every platform.
-        std::fs::create_dir_all(dir.join("set.vol000+01.par2")).unwrap();
-        let good = vec![0x22u8; 2048];
-
-        let (failures, paths) = consume(
-            &dir,
-            vec![
-                (0, article("set.vol000+01.par2", 1 << 20, &[1u8; 512])),
-                // A second article for the SAME dead volume: the create
-                // must not be retried per article, and it must still not
-                // panic.
-                (0, article("set.vol000+01.par2", 1 << 20, &[2u8; 512])),
-                (1, article("set.vol001+02.par2", 2048, &good)),
-            ],
-            1 << 30,
-        )
-        .await;
-
-        assert_eq!(
-            failures, 2,
-            "both articles of the dead volume count as failures"
-        );
-        assert_eq!(
-            paths.len(),
-            1,
-            "the healthy volume of the same fetch still lands"
-        );
-        assert!(paths[0].ends_with("set.vol001+02.par2"));
-        assert_eq!(std::fs::read(&paths[0]).unwrap(), good);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-}
+mod sidefetch;
+// The side-fetch driver, its consumer and the two small helpers that
+// price a volume moved out whole (§129 residue 2). Re-exported rather
+// than re-pathed at every call site: nothing about the split is
+// interesting to a caller, and `use super::*` importers stay valid.
+pub(crate) use sidefetch::{
+    SideCancel, fetch_volume_articles, fetch_volumes, side_pool_servers, vol_count_from_name,
+    volume_prealloc_cap,
+};
 
 /// Candidate recovery volumes of the NZB: (file idx, declared slices,
 /// encoded bytes). Unknown counts get a conservative size-based estimate.
@@ -747,6 +320,10 @@ pub(crate) async fn try_mapped_repair(
     // self-prove re-reads untouched files with MD5 too, not just their
     // per-block CRC32s.
     full_verify: bool,
+    // The owner's side-fetch cancel handle - see [`SideCancel`]. The
+    // parity this path fetches is network work like any other, and a
+    // deleted job must stop asking for it.
+    cancel: Option<&SideCancel>,
 ) -> Result<bool> {
     use nzbkit::par2repair::{
         MAX_INPUT_SLICES, MAX_REPAIR_DIM, VolumeIo, recovery_slice_locators, repair_mapped,
@@ -881,7 +458,7 @@ pub(crate) async fn try_mapped_repair(
             dl_bytes as f64 / 1e6
         );
         fetched_files = chosen.iter().map(|&vi| vols[vi].0).collect();
-        fetch_volumes(servers, nzb, out_dir, &buf_pool, &fetched_files).await?;
+        fetch_volumes(servers, nzb, out_dir, &buf_pool, &fetched_files, cancel).await?;
     }
 
     // Harvest every recovery slice on disk (bootstrap + fetched volumes).
@@ -1050,6 +627,8 @@ pub(crate) async fn fetch_and_repair(
     // recovery blocks - the one repair failure whose arithmetic belongs
     // in the job's fail message, not just the console.
     shortfall: &mut Option<(usize, usize)>,
+    // The owner's side-fetch cancel handle - see [`SideCancel`].
+    cancel: Option<&SideCancel>,
 ) -> Result<bool> {
     let mut fetched_files: Vec<usize> = Vec::new();
     if needed > 0 {
@@ -1079,7 +658,7 @@ pub(crate) async fn fetch_and_repair(
         );
 
         fetched_files = chosen.iter().map(|&vi| vols[vi].0).collect();
-        fetch_volumes(servers, nzb, out_dir, &buf_pool, &fetched_files).await?;
+        fetch_volumes(servers, nzb, out_dir, &buf_pool, &fetched_files, cancel).await?;
     }
 
     // Reed-Solomon repair: native in-process GF(2^16) first - verifies the
@@ -1223,7 +802,7 @@ pub(crate) async fn fetch_and_repair(
         "repair short - fetching all {} remaining volume(s)",
         remaining.len()
     );
-    fetch_volumes(servers, nzb, out_dir, &buf_pool, &remaining).await?;
+    fetch_volumes(servers, nzb, out_dir, &buf_pool, &remaining, cancel).await?;
     if native_repair() {
         return Ok(true);
     }
@@ -1341,6 +920,7 @@ mod repair_tests {
             missing,
             &mut Vec::new(),
             false,
+            None,
         )
         .await
         .expect("guard declines are Ok(false), not errors")
@@ -1576,6 +1156,7 @@ mod repair_tests {
             group: None,
             retention_days: 0,
             block_bytes: None,
+            block_account: false,
             bind_ip: None,
             socks5: None,
             enabled: true,

@@ -38,6 +38,7 @@ mod identify;
 mod identity;
 mod import_sab;
 mod interests;
+mod lanegate;
 mod logging;
 mod nettools;
 mod newznab;
@@ -304,10 +305,12 @@ enum Command {
         /// PEM cert chain; with --tls-key, serves implicit TLS (port-563
         /// shape) instead of plain TCP. Every provider is TLS, so the
         /// plain leg alone measures a path no real user is on. Make a
-        /// pair with:
+        /// pair with (basicConstraints=CA:FALSE matters - rustls refuses
+        /// a CA certificate used as the server cert, CaUsedAsEndEntity):
         ///   openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem \
         ///     -out cert.pem -days 30 -subj /CN=localhost \
-        ///     -addext subjectAltName=DNS:localhost,IP:127.0.0.1
+        ///     -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
+        ///     -addext basicConstraints=critical,CA:FALSE
         /// then point the client at it with NZBFAST_EXTRA_CA=cert.pem.
         #[arg(long)]
         tls_cert: Option<PathBuf>,
@@ -320,64 +323,12 @@ enum Command {
     /// chosen by flag, so ANY client can be raced against the same
     /// fault shapes the payout rigs price. Writes the matching .nzb;
     /// two-server profiles bind a clean twin on --port2.
+    // The flags live in chaos_serve.rs, beside the profile table they
+    // select: a fault shape and the switch that turns it on drift apart
+    // when they sit in different files. A plain comment, not a doc one:
+    // clap prints doc comments as help text.
     #[command(hide = true)]
-    ChaosServe {
-        /// One of chaos_serve::PROFILES: clean, flap, flap-dial,
-        /// deadair, deadair-dial, brownout, jitter, jitter-dial,
-        /// corrupt, corruptstorm, splitbrain, slowconn, bodyerror,
-        /// authcap, authbad, capghost, outage, cgnat, handover,
-        /// slowstart, truncate, deadpost, mutequit, mutegreeting
-        /// (the -dial variants add a 250 ms greeting delay per
-        /// connection, so reconnect strategies pay their real dial
-        /// cost on loopback).
-        #[arg(long, default_value = "clean")]
-        profile: String,
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
-        /// Faulty (or single) server port.
-        #[arg(long, default_value_t = 1190)]
-        port: u16,
-        /// Clean-twin port (flap/brownout/corrupt/corruptstorm/
-        /// splitbrain profiles).
-        #[arg(long, default_value_t = 1191)]
-        port2: u16,
-        /// Total corpus payload ("300M", "1G", …). Held in RAM.
-        #[arg(long, default_value = "300M")]
-        size: String,
-        #[arg(long, default_value_t = 3)]
-        files: u32,
-        /// Article payload size; ~740K matches real posts.
-        #[arg(long, default_value = "740K")]
-        article_size: String,
-        /// Where to write the matching NZB.
-        #[arg(long, default_value = "chaos.nzb")]
-        nzb: PathBuf,
-        /// Shifts deterministic fault positions and corpus bytes; keep
-        /// it fixed across clients so every client sees the same run.
-        #[arg(long, default_value_t = 111)]
-        seed: u64,
-        /// Healthy per-connection cap ("2M" = 2 MB/s).
-        #[arg(long, default_value = "2M")]
-        per_conn: String,
-        /// Whole-server line cap; 0 = per-connection cap only.
-        #[arg(long, default_value = "0")]
-        line: String,
-        /// Create real PAR2 recovery volumes at this redundancy (%)
-        /// with an external `par2` binary (PAR2_BIN to override) and
-        /// serve them as part of the corpus.
-        #[arg(long)]
-        par2_redundancy: Option<u32>,
-        /// Override the profile's faulted-article count
-        /// (deadair/corrupt/splitbrain) or every-N (corruptstorm,
-        /// desync).
-        #[arg(long)]
-        fault_count: Option<usize>,
-        /// Article-ize real files from disk into the corpus (repeatable).
-        /// A playable video here turns the chaos rig into a playback
-        /// end-to-end fixture; --files 0 serves only these.
-        #[arg(long)]
-        media: Vec<PathBuf>,
-    },
+    ChaosServe(chaos_serve::Cli),
     /// Scan group headers into the local release index (M12).
     #[cfg(feature = "indexer")]
     Index {
@@ -488,6 +439,21 @@ enum Command {
         /// another host needs; use 127.0.0.1 to keep it to this machine.
         #[arg(long, default_value = "0.0.0.0")]
         bind: String,
+        /// PEM certificate chain; with --tls-key the dashboard and API
+        /// are served over HTTPS instead of plain HTTP (one listener,
+        /// one scheme). A reverse proxy or Tailscale stays a fine
+        /// alternative - see the manual's "expose it safely" section.
+        /// Self-signed test pair (basicConstraints=CA:FALSE matters -
+        /// strict clients refuse a CA certificate as a server cert):
+        ///   openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem \
+        ///     -out cert.pem -days 365 -subj /CN=localhost \
+        ///     -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
+        ///     -addext basicConstraints=critical,CA:FALSE
+        #[arg(long)]
+        tls_cert: Option<PathBuf>,
+        /// PEM private key matching --tls-cert.
+        #[arg(long)]
+        tls_key: Option<PathBuf>,
         /// Open the web dashboard in the default browser once the server
         /// is listening (the double-click launchers use this).
         #[arg(long)]
@@ -515,7 +481,8 @@ enum Command {
         /// Download quota per period, e.g. 100G (Force jobs bypass).
         #[arg(long)]
         quota: Option<String>,
-        /// Quota period: d = daily, m = monthly (UTC boundaries).
+        /// Quota period: d = daily, w = weekly (Monday), m = monthly
+        /// (local-calendar boundaries).
         #[arg(long, default_value = "d")]
         quota_period: char,
         /// RSS feeds config (JSON list of {url, interval_secs, category,
@@ -978,47 +945,7 @@ async fn run() -> Result<()> {
             nzbkit::benchserve::serve_with(&format!("{bind}:{port}"), set, tls).await?;
             Ok(())
         }
-        Command::ChaosServe {
-            profile,
-            bind,
-            port,
-            port2,
-            size,
-            files,
-            article_size,
-            nzb,
-            seed,
-            per_conn,
-            line,
-            par2_redundancy,
-            fault_count,
-            media,
-        } => {
-            let size = serve::parse_size(&size).ok_or_else(|| anyhow::anyhow!("bad --size"))?;
-            let article_size = serve::parse_size(&article_size)
-                .ok_or_else(|| anyhow::anyhow!("bad --article-size"))?
-                as usize;
-            let per_conn_bps =
-                serve::parse_size(&per_conn).ok_or_else(|| anyhow::anyhow!("bad --per-conn"))?;
-            let line_bps = serve::parse_size(&line).ok_or_else(|| anyhow::anyhow!("bad --line"))?;
-            chaos_serve::run(chaos_serve::Opts {
-                profile,
-                bind,
-                port,
-                port2,
-                size,
-                files,
-                article_size,
-                nzb,
-                seed,
-                per_conn_bps,
-                line_bps,
-                par2_redundancy,
-                fault_count,
-                media,
-            })
-            .await
-        }
+        Command::ChaosServe(cli) => chaos_serve::run(cli.opts(serve::parse_size)?).await,
         #[cfg(feature = "indexer")]
         Command::Index {
             group,
@@ -1098,6 +1025,8 @@ async fn run() -> Result<()> {
         Command::Serve {
             port,
             bind,
+            tls_cert,
+            tls_key,
             open,
             apikey,
             nzbkey,
@@ -1142,6 +1071,8 @@ async fn run() -> Result<()> {
                 group_desc_isc: false,
                 port,
                 bind,
+                tls_cert,
+                tls_key,
                 open,
                 apikey,
                 nzbkey,

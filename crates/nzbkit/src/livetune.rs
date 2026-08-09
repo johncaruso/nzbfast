@@ -189,6 +189,22 @@ impl ServerTuner {
         self.ceiling
     }
 
+    /// Whether this controller is still answering the question the
+    /// user's CURRENT setting asks.
+    ///
+    /// The ceiling is fixed at construction and every later clamp only
+    /// narrows, so a controller cannot follow a raised connections
+    /// count - the James shape, one layer up from the stored knee it
+    /// was first found in: the typed number reaches the pool build and
+    /// stops there, while the live target keeps walking inside the old
+    /// ceiling. A caller that re-reads the setting each epoch asks
+    /// this and rebuilds the controller when it says no; `new` applies
+    /// the same `max(1)` the constructor does, so a nonsense 0 is not
+    /// a change.
+    pub fn ceiling_matches(&self, configured: usize) -> bool {
+        self.ceiling == configured.max(1)
+    }
+
     /// Feed the epoch that just finished, measured at the count
     /// [`ServerTuner::desired`] answered when it started.
     pub fn on_epoch(&mut self, obs: EpochObs) {
@@ -446,6 +462,43 @@ mod tests {
             "did not follow the knee down: {}",
             t.target()
         );
+    }
+
+    /// The James case for the LIVE layer, in the shape the daemon's
+    /// epoch loop uses it: the user raises connections mid-session.
+    /// The controller's own ceiling can never grow, so the loop asks
+    /// `ceiling_matches` against the freshly read setting and rebuilds
+    /// when it says no. What that has to buy: the typed number runs on
+    /// the very next epoch, and the fleet can then walk ABOVE the
+    /// ceiling it had been living under - without the rebuild it stays
+    /// pinned there forever, which is the whole complaint.
+    #[test]
+    fn a_raised_setting_rebuilds_the_controller_and_frees_the_walk() {
+        let mut seed = 0xfeed_1234;
+        let mut t = ServerTuner::new(6, 6, 2);
+        drive(&mut t, 3, 200, &mut seed);
+        assert!((2..=4).contains(&t.target()), "phase 1: {}", t.target());
+        assert!(t.ceiling_matches(6));
+
+        // Settings: 6 -> 24.
+        assert!(!t.ceiling_matches(24), "a raised setting must be noticed");
+        if !t.ceiling_matches(24) {
+            t = ServerTuner::new(24, 24, 3);
+        }
+        assert_eq!(
+            t.desired(),
+            24,
+            "the number the user typed runs on the next epoch"
+        );
+
+        // And the walk is no longer fenced by the old ceiling.
+        drive(&mut t, 20, 400, &mut seed);
+        assert!(
+            t.target() > 6,
+            "still fenced by the retired ceiling at {}",
+            t.target()
+        );
+        assert!((19..=21).contains(&t.target()), "phase 2: {}", t.target());
     }
 
     /// A ceiling of one is not tunable and must simply sit still.

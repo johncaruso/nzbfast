@@ -1,6 +1,12 @@
 use super::*;
 use tracing::{error, info, warn};
 
+// The index-handle discipline and the M34 size cap - a second `impl Daemon`,
+// moved out bodily (TODO 106). A child module, so it keeps the private
+// fields and the private reader types in scope.
+#[path = "daemon_index.rs"]
+mod daemon_index;
+
 /// How many index reads may be in flight at once.
 ///
 /// The point is the gap between this and the HTTP worker count (8): a
@@ -159,6 +165,27 @@ pub struct LadderLive {
     pub done: bool,
 }
 
+/// §129 2b (decision 5): one category's real behavior. Stored in
+/// settings.json under `cat_meta` as `{name: {dir, priority, script}}`;
+/// every field defaults to "as before".
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct CatMeta {
+    /// Subfolder of the download root this category lands in (may
+    /// nest, "tv/anime"). Empty = a subfolder named after the
+    /// category. Absolute destinations stay the mover's job
+    /// (`move_completed_cats`).
+    #[serde(default)]
+    pub dir: String,
+    /// Default priority for adds that did not name one (-100). None =
+    /// no default. SAB range: -1 low, 0 normal, 1 high, 2 force.
+    #[serde(default)]
+    pub priority: Option<i32>,
+    /// Post-processing script for this category; empty = the global
+    /// script setting. A job-level `script=` param still wins.
+    #[serde(default)]
+    pub script: String,
+}
+
 pub struct Daemon {
     /// Streaming handle into the active download (M11).
     pub hub: Arc<crate::StreamHub>,
@@ -189,6 +216,26 @@ pub struct Daemon {
     pub paused_by_offline: std::sync::atomic::AtomicBool,
     pub queue: Mutex<VecDeque<Arc<Mutex<Job>>>>,
     pub history: Mutex<Vec<Arc<Mutex<Job>>>>,
+    /// §129 1b: the dashboard's change handles. Bumped at the
+    /// persistence seam - `save_queue` for the queue, every history
+    /// store write for history - so `mode=dashboard` can answer "nothing
+    /// changed" with two atomic loads instead of two payloads. Progress
+    /// counters deliberately touch neither: while anything downloads the
+    /// queue section is sent regardless (continuous values have no
+    /// honest revision).
+    pub queue_rev: AtomicU64,
+    pub history_rev: AtomicU64,
+    /// §129 1b: discrete lifecycle events (job.completed, job.failed...)
+    /// with a monotonic `seq`, so clients stop inferring toasts from
+    /// snapshot diffs. Ring bounded at `histstore::LIFE_RING`; a client
+    /// behind the tail is told to reseed rather than replayed.
+    pub life_seq: AtomicU64,
+    pub life_events: Mutex<VecDeque<Value>>,
+    /// §129 D5: optional retention, BOTH 0 = unlimited (the shipped
+    /// default, by ruling). Count keeps the newest N records;
+    /// days drops Completed records older than N days.
+    pub history_keep_count: AtomicU64,
+    pub history_keep_days: AtomicU64,
     /// Serializes "decide where this job goes" against "publish it".
     ///
     /// `choose_out_dir` asks `dir_claim`, which takes and RELEASES the
@@ -217,6 +264,25 @@ pub struct Daemon {
     /// a history delete removed the record from under the move entirely.
     /// A job listed here refuses both until the move settles.
     pub moving: Mutex<std::collections::HashSet<String>>,
+    /// The mover's work queue: finished jobs whose move to the
+    /// completed folder is owed (Job::move_pending). Fed by finalize,
+    /// unlock and the boot rescan; drained by per-TARGET sequential
+    /// lanes (serve/mover.rs) - same destination stays serial, two
+    /// different destinations never queue behind each other.
+    pub(super) mover_q: Mutex<VecDeque<Arc<Mutex<Job>>>>,
+    /// Wakes the mover when `mover_q` gains work.
+    pub(super) mover_wake: tokio::sync::Notify,
+    /// The mover's pacing token bucket - ONE for the whole daemon, so
+    /// concurrent lanes divide one budget instead of each granting
+    /// itself the whole of it. See [`mover::mover_pacer`].
+    pub(super) mover_bucket: Mutex<mover::PaceState>,
+    /// How file moves share the machine with downloads ("File moves").
+    /// "yield" (default): pace the copy to the measured headroom and go
+    /// full speed when the queue is idle. "full": never pace. Any
+    /// integer: a fixed cap in MB/s. One setting with three modes on
+    /// purpose - fast networks want "full", shared links want a number,
+    /// everyone else wants downloads to win.
+    pub(super) move_pace: Mutex<String>,
     /// Output directories chosen but not yet owned by any job record.
     ///
     /// `dir_claim` answers from the queue and history, so a directory
@@ -312,6 +378,12 @@ pub struct Daemon {
     /// published mapping, a healthcheck or DSM's own Open button, and a
     /// saved override just makes the install unreachable.
     pub port_locked: bool,
+    /// §129 2a: the TLS pair THIS run is serving with (None = plain
+    /// HTTP). Bind-time state like [`port`](Self::port), not live state:
+    /// the settings rows persist a new pair, `pending` surfaces the
+    /// difference, and a restart applies it.
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
     pub library_cats: Mutex<Vec<String>>,
     /// nzo_id whose extractor the hub holds (the last real download started).
     pub active_stream: Mutex<Option<String>>,
@@ -382,6 +454,20 @@ pub struct Daemon {
     /// connection ladder and cap its per-job connections at the knee -
     /// over-asking measured 3-4× slower (connect-flood defense).
     pub auto_connections: std::sync::atomic::AtomicBool,
+    /// TODO 112 live connection tuning on/off (live setting
+    /// `live_tune`, default OFF until the §129 real-line gate passes;
+    /// NZBFAST_LIVE_TUNE=1 is the dev override). With it ON the epoch
+    /// controller chooses each server's connection count during
+    /// downloads and the stored knee stops capping jobs - measurements
+    /// SEED, only typed numbers cap (conn-tuning design, 8 Aug 2026).
+    /// Mirrored onto `hub.live_tune` because the pool build in
+    /// get/fleet.rs has the hub, not the daemon.
+    pub live_tune: std::sync::atomic::AtomicBool,
+    /// Hosts currently carrying the decay flag (conn-tuning design §6),
+    /// mirrored from conntune.json by the live tuner so the 1 s queue
+    /// poll never re-reads the file. Seeded at spawn, updated on every
+    /// raise/clear.
+    pub shaped_hosts: Mutex<std::collections::HashMap<String, crate::conntune::Shaped>>,
     /// Leave adult titles out of the poster wall and the release list
     /// (settings key `wall_hide_adult`, default ON).
     ///
@@ -611,6 +697,15 @@ pub struct Daemon {
     /// behind"). Implemented as an implicit extra entry in the
     /// `cleanup_exts` sweep, so it inherits that sweep's guards.
     pub par_cleanup: AtomicBool,
+    /// §129 lane width (settings.json `postproc_jobs`, default 2,
+    /// clamp 1..=4). Deliberately not in the settings UI yet - a
+    /// setting is three places, and the knob waits for demand.
+    pub postproc_jobs: AtomicU64,
+    /// §129 3e / §108 decision 4: pause the queue when the output volume
+    /// stops keeping up for minutes at a time. The switch, the
+    /// thresholds and the live pause all live inside it - see
+    /// `serve::slowstore`.
+    pub(super) slow_storage: super::slowstore::Governor,
     /// Permissions to put on finished downloads (#20), as a umask: dirs
     /// get `0o777 & !umask`, files `0o666 & !umask`. `u32::MAX` is OFF
     /// and is the default, so an install that says nothing keeps exactly
@@ -988,6 +1083,9 @@ pub struct Daemon {
     /// §125: the learned peak the throughput graph anchors 100% to -
     /// seeded by `line_speed`, overridden by sustained measurement.
     pub link_peak: super::linkpeak::LinkPeak,
+    /// §129 4b: the "Why is this slow?" attribution engine - fed by
+    /// the same 1 s ticker as `link_peak`, published on the queue poll.
+    pub(super) whyslow: super::whyslow::WhySlow,
     /// What the connection tuner wants the user to know: a shortfall
     /// against `line_speed` with the likeliest remedy, or empty when
     /// capability is fine (or unjudgeable - line speed unset, or an
@@ -1054,8 +1152,25 @@ pub struct Daemon {
     pub(super) auto_retry_secs: AtomicU64,
     /// Byte budget per quota period (0 = off).
     pub(super) quota: AtomicU64,
-    /// b'd' (daily) or b'm' (monthly).
+    /// b'd' (daily), b'w' (weekly, Monday) or b'm' (monthly).
     pub(super) quota_period: std::sync::atomic::AtomicU8,
+    /// §129 2g: a scheduled quota_reset fired; the download runner owns
+    /// the ledger and zeroes it on its next pass.
+    pub(super) quota_reset: AtomicBool,
+    /// §129 2d: what happens to a duplicate add. "pause" (the default,
+    /// M14f: held as an ALTERNATIVE that auto-promotes if the original
+    /// fails), "discard" (refused outright - the add errors), or "fail"
+    /// (filed straight to history as Failed, which is what a *arr wants
+    /// so its own failure handling can pick a different release).
+    /// Live - read per add. `allow_dupe` (the wall's asked-and-said-yes)
+    /// bypasses all three.
+    pub(super) dupe_action: Mutex<String>,
+    /// §129 2b (decision 5): real per-category behavior, keyed by the
+    /// category name. Everything defaults to "as before": empty dir =
+    /// the category's own subfolder, priority None = no default,
+    /// empty script = the global one. Live - read per add and per
+    /// job completion.
+    pub(super) cat_meta: Mutex<std::collections::HashMap<String, CatMeta>>,
     /// Watch folder for dropped .nzb files (None = off).
     pub(super) watch_dir: Mutex<Option<PathBuf>>,
     /// Keep the picked-up .nzb in the watch folder instead of moving it
@@ -1066,6 +1181,20 @@ pub struct Daemon {
     /// restart would re-download the whole folder. Live - read per
     /// pickup, so it needs no boot-apply beyond the saved-settings replay.
     pub watch_keep_nzb: AtomicBool,
+    /// Scan subfolders of the watch folder too, with the first
+    /// subfolder's name becoming the job's category (watch/tv/x.nzb
+    /// lands in "tv") - the layout Sonarr-era muscle memory expects.
+    /// A first-level folder named "rejected" is never scanned: it is
+    /// the quarantine below. Live - read per pass.
+    pub watch_recursive: AtomicBool,
+    /// Move a complete-but-unusable .nzb (parse/enqueue rejection) into
+    /// <watch>/rejected/ with a .txt beside it saying why. Off, the
+    /// file stays put and only the dashboard strip explains it.
+    /// Truncated files are NEVER moved regardless: a stalled copy can
+    /// resume, and yanking the destination mid-copy is exactly the
+    /// "nzbfast deleted my download" complaint the strip exists to
+    /// prevent. Live - read per rejection.
+    pub watch_move_rejected: AtomicBool,
     /// Watch-folder files that failed to parse/enqueue, with the
     /// (mtime, len, error, related nzo_id) they failed at. Skipped on
     /// later passes until the file changes - with the watch folder
@@ -1531,68 +1660,18 @@ pub fn parse_evict_kinds(s: &str) -> std::result::Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// Everything the size cap must never delete, assembled from the four
-/// sources the user picked. Pure so the assembly can be tested without a
-/// daemon; `Daemon::protected_set` gathers the inputs.
-///
-/// Over-protection is the safe direction here and the code takes it
-/// wherever the two sides are ambiguous: a watchlisted film with no
-/// pinned year contributes both the bare `m:<title>` key and every
-/// `m:<title>:<year>` the index resolved for it, because the watcher
-/// would grab any of them.
-/// Arguments, in order: title_keys of watchlisted shows/films;
-/// title_keys of everything queued, downloading or completed; the touch
-/// log's title_keys and release ids, already filtered to the protection
-/// window.
+// The protected-set trio (assemble_protected / watch_item_keys /
+// shrink_shortfall_reason) lives with its callers in daemon_index.rs
+// (TODO 106 code motion, size gate); re-exported so every existing
+// `super::` and `daemon::` path still resolves here.
 #[cfg(feature = "indexer")]
-pub fn assemble_protected(
-    watchlisted: Vec<String>,
-    owned: Vec<String>,
-    opened_titles: Vec<String>,
-    opened_releases: Vec<i64>,
-) -> nzbkit::index::Protected {
-    let mut keys: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for k in watchlisted.into_iter().chain(owned).chain(opened_titles) {
-        if !k.is_empty() && seen.insert(k.clone()) {
-            keys.push(k);
-        }
-    }
-    let mut ids = opened_releases;
-    ids.sort_unstable();
-    ids.dedup();
-    nzbkit::index::Protected {
-        title_keys: keys,
-        release_ids: ids,
-    }
-}
-
-/// The title_keys one watchlist entry stands for, from the entry alone.
-/// TV keys carry no year so they are exact; a film pinned to a year also
-/// matches the year-less form, because a stem without a year in it
-/// parses to `m:<title>`.
-#[cfg(feature = "indexer")]
-pub fn watch_item_keys(item: &crate::watchlist::WatchItem) -> Vec<String> {
-    let norm = nzbkit::release::norm_title(&item.title);
-    if norm.is_empty() {
-        return Vec::new();
-    }
-    if item.kind == "tv" {
-        return vec![format!("t:{norm}")];
-    }
-    // 24D: a custom category's key is "c:<slug>:<title>" plus whatever
-    // identity tail the release carried, so the bare form is exact only
-    // for the episodic and daily shapes. The tailed keys (one per F1
-    // session) cannot be enumerated from the item alone - `protected_set`
-    // asks the index for those, as it does for a year-less film.
-    if crate::watchlist::is_custom_kind(&item.kind) {
-        return vec![format!("c:{}:{norm}", item.kind)];
-    }
-    match item.year {
-        Some(y) => vec![format!("m:{norm}:{y}"), format!("m:{norm}")],
-        None => vec![format!("m:{norm}")],
-    }
-}
+pub use daemon_index::shrink_shortfall_reason;
+// The other two have no caller outside daemon_index.rs in a production
+// build - only `serve::tests_index` reaches them, through serve's
+// `use daemon::*`. Re-exporting them unconditionally is an unused import
+// on the non-test build, and this crate builds with `-D warnings`.
+#[cfg(all(test, feature = "indexer"))]
+pub use daemon_index::{assemble_protected, watch_item_keys};
 
 /// Is this a moment a VACUUM may run in? The engine's `compact()` doc
 /// puts the burden on the caller: it exclusive-locks and rewrites the
@@ -1627,25 +1706,6 @@ pub enum EvictOutcome {
     Nothing,
     /// The index could not be opened.
     Unavailable,
-}
-
-/// Why a prune stopped short of the size it was asked for. Two very
-/// different situations wear the same symptom, and telling the user the
-/// wrong one sends them hunting for protected releases that do not exist.
-#[cfg(feature = "indexer")]
-pub fn shrink_shortfall_reason(protected_keys: usize) -> String {
-    if protected_keys == 0 {
-        "nothing is protected, so this is the database's own floor - the schema, its \
-         indexes, and whatever the eviction order does not select. Nothing more can be \
-         removed at this target."
-            .to_string()
-    } else {
-        format!(
-            "the rest is protected ({protected_keys} keys: watchlisted, queued, already \
-             downloaded, or opened in the last {OPENED_PROTECT_DAYS} days). Raise the \
-             target, or remove some of those first."
-        )
-    }
 }
 
 /// The `wall_tip` response body. `tip: None` means the index read
@@ -1972,12 +2032,7 @@ impl Daemon {
     /// these there is nothing to search but the local index, and with one
     /// or more the local index is the optional extra.
     pub fn enabled_indexers(&self) -> usize {
-        self.indexers
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|i| i.enabled)
-            .count()
+        self.indexers.lock_ok().iter().filter(|i| i.enabled).count()
     }
 
     /// May the watchlist spend the user's indexer accounts? See
@@ -2124,8 +2179,7 @@ impl Daemon {
             nick: self.predb_nick.lock_ok().clone(),
             channels: self
                 .predb_channels
-                .lock()
-                .unwrap()
+                .lock_ok()
                 .split(',')
                 .map(str::trim)
                 .filter(|c| !c.is_empty())
@@ -2291,8 +2345,7 @@ pub(super) fn wind_down(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, reason: &s
     let connected = || -> usize {
         d.hub
             .pool_live
-            .lock()
-            .unwrap()
+            .lock_ok()
             .as_ref()
             .map(|l| {
                 l.servers
@@ -2680,9 +2733,6 @@ impl Daemon {
         self.index_db.with_file_name("groupstats.tsv")
     }
 
-    /// Run `f` against the shared index, opening it lazily. Returns the
-    /// closure's value, or `None` if the index can't be opened (feature
-    /// effectively off) - callers treat that as "no results".
     /// M30: dupe keys of everything already in the library or on its
     /// way there - Completed history plus the current queue. The wall
     /// joins browse rows against this to badge "you have this".
@@ -2730,449 +2780,11 @@ impl Daemon {
         set
     }
 
-    // -- M34 index size cap ------------------------------------------------
-
-    /// Where the "recently opened" touch log lives (spool, beside the
-    /// watchlist state - same lifecycle, same crash-safe writer).
-    #[cfg(feature = "indexer")]
-    pub(super) fn opened_path(&self) -> PathBuf {
-        self.spool.join("index-opened.json")
-    }
-
-    /// Note that the user opened a card's detail sheet.
-    #[cfg(feature = "indexer")]
-    pub fn touch_opened_title(&self, title_key: &str) {
-        let now = epoch_secs() as i64;
-        let dirty = self
-            .index_opened
-            .lock()
-            .unwrap()
-            .touch_title(title_key, now);
-        if dirty {
-            self.save_opened();
-        }
-    }
-
-    /// Note that the user pulled an indexed release - /getnzb, or
-    /// queueing it from the wall.
-    #[cfg(feature = "indexer")]
-    pub fn touch_opened_release(&self, id: i64) {
-        let now = epoch_secs() as i64;
-        let dirty = self.index_opened.lock_ok().touch_release(id, now);
-        if dirty {
-            self.save_opened();
-        }
-    }
-
-    #[cfg(feature = "indexer")]
-    pub(super) fn save_opened(&self) {
-        let now = epoch_secs() as i64;
-        let snapshot = {
-            let mut log = self.index_opened.lock_ok();
-            log.expire(now, OPENED_PROTECT_DAYS * 86_400);
-            log.clone()
-        };
-        if let Ok(text) = serde_json::to_string(&snapshot) {
-            let _ = crate::persist::write_atomic(&self.opened_path(), text.as_bytes());
-        }
-    }
-
-    /// The eviction policy the current settings describe. An
-    /// unrecognised order can only get here through a hand-edited
-    /// settings.json (`apply_setting` validates), and falls back to the
-    /// default rather than refusing to run.
-    #[cfg(feature = "indexer")]
-    pub(super) fn evict_policy(&self) -> nzbkit::index::EvictPolicy {
-        let order_s = self.index_evict_order.lock_ok().clone();
-        nzbkit::index::EvictPolicy {
-            order: parse_evict_order(&order_s).unwrap_or(nzbkit::index::EvictOrder::Ladder),
-            kinds: self.index_evict_kinds.lock_ok().clone(),
-        }
-    }
-
-    /// Everything the size cap must not touch. All four protections the
-    /// user asked for:
-    ///
-    ///  1. watchlisted titles - the shows and films they told us to keep
-    ///     hunting for; evicting those rows makes the watcher blind;
-    ///  2. anything queued or downloading right now;
-    ///  3. anything already downloaded (completed history) - same
-    ///     title_key set the wall's "you have this" badge is built from;
-    ///  4. anything opened, fetched or queued in the last
-    ///     `OPENED_PROTECT_DAYS` days.
-    ///
-    /// Cost is one clone of the queue/history/watchlist name lists, one
-    /// pass over the touch log, and - for watchlist films with no pinned
-    /// year, and for every custom-category entry - one card query each to
-    /// resolve the keys the index actually holds. It is called at most
-    /// once per eviction pass.
-    #[cfg(feature = "indexer")]
-    pub fn protected_set(&self) -> nzbkit::index::Protected {
-        let items = self.watchlist.lock_ok().clone();
-        let mut watchlisted: Vec<String> = Vec::new();
-        for item in &items {
-            // Disabled items still count: switching a show off is not
-            // the same as saying "throw away what you found".
-            watchlisted.extend(watch_item_keys(item));
-        }
-        // An empty-title custom item deliberately means "watch the whole
-        // category". It has no single identity key, so enumerate every
-        // classified key instead of letting the empty title fall out of
-        // the per-title resolver below.
-        let whole_custom: Vec<String> = items
-            .iter()
-            .filter(|i| {
-                crate::watchlist::is_custom_kind(&i.kind)
-                    && nzbkit::release::norm_title(&i.title).is_empty()
-            })
-            .map(|i| i.kind.clone())
-            .collect();
-        if !whole_custom.is_empty() {
-            self.with_index(|ix| {
-                for kind in &whole_custom {
-                    if let Ok(keys) = ix.title_keys_for_kind(kind) {
-                        watchlisted.extend(keys);
-                    }
-                }
-                Some(())
-            });
-        }
-        // A film watchlisted without a year matches every year the index
-        // holds under that title (that is exactly what the watcher does
-        // when it matches), so ask the index which those are instead of
-        // guessing. Bounded work: only year-less film entries, one FTS
-        // card query each, capped page.
-        //
-        // A custom-category entry needs the same treatment for the same
-        // reason, and always: its releases key on
-        // "c:<slug>:<title>:<year>:<identity tail>", which the entry
-        // alone cannot spell. Query per (kind, title) pair either way.
-        let yearless: Vec<(String, String)> = items
-            .iter()
-            .filter(|i| {
-                crate::watchlist::is_custom_kind(&i.kind) || (i.kind != "tv" && i.year.is_none())
-            })
-            .map(|i| {
-                let kind = if crate::watchlist::is_custom_kind(&i.kind) {
-                    i.kind.clone()
-                } else {
-                    "movie".into()
-                };
-                (kind, nzbkit::release::norm_title(&i.title))
-            })
-            .filter(|(_, n)| !n.is_empty())
-            .collect();
-        if !yearless.is_empty() {
-            self.with_index(|ix| {
-                for (kind, norm) in &yearless {
-                    let q = nzbkit::index::BrowseQuery {
-                        q: norm.clone(),
-                        kind: Some(kind.clone()),
-                        limit: 200,
-                        curated: false,
-                        ..Default::default()
-                    };
-                    let Ok((cards, _)) = ix.browse_cards(
-                        &q,
-                        // "" parses to Latest - the sort is irrelevant,
-                        // only the keys on the page matter.
-                        nzbkit::index::CardSort::parse(""),
-                        false,
-                        false,
-                        None,
-                    ) else {
-                        continue;
-                    };
-                    let prefix = if kind == "movie" {
-                        format!("m:{norm}:")
-                    } else {
-                        format!("c:{kind}:{norm}")
-                    };
-                    for c in cards {
-                        if c.title_key.starts_with(&prefix) {
-                            watchlisted.push(c.title_key);
-                        }
-                    }
-                }
-                Some(())
-            });
-        }
-
-        let now = epoch_secs() as i64;
-        let window = OPENED_PROTECT_DAYS * 86_400;
-        let (opened_titles, opened_releases) = {
-            let log = self.index_opened.lock_ok();
-            (
-                log.titles
-                    .iter()
-                    .filter(|(_, t)| now - **t <= window)
-                    .map(|(k, _)| k.clone())
-                    .collect::<Vec<_>>(),
-                log.releases
-                    .iter()
-                    .filter(|(_, t)| now - **t <= window)
-                    .map(|(id, _)| *id)
-                    .collect::<Vec<_>>(),
-            )
-        };
-        assemble_protected(
-            watchlisted,
-            // Queue + completed history, keyed the way the index groups
-            // releases. Already the daemon's notion of "the user has, or
-            // is getting, this".
-            self.owned_title_keys().into_iter().collect(),
-            opened_titles,
-            opened_releases,
-        )
-    }
-
-    /// Prune the index down to `target` bytes under the current policy,
-    /// protecting the four categories above. Returns the engine's report
-    /// plus how many protected keys/ids stood in the way, or None when
-    /// the index cannot be opened. Never compacts - it only raises
-    /// `compact_pending` for the idle-window VACUUM.
-    ///
-    /// The caller decides WHETHER to evict (the `index_evict` toggle);
-    /// this decides only HOW.
-    #[cfg(feature = "indexer")]
-    pub(super) fn evict_to(&self, target: u64) -> EvictOutcome {
-        let policy = self.evict_policy();
-        let protected = self.protected_set();
-        let n_prot = protected.title_keys.len() + protected.release_ids.len();
-        // The whole set, uncapped - see EVICT_MAX_PASSES for why there is
-        // no longer a ceiling here.
-        let Some(mut rep) = self.with_index(|ix| ix.evict_to(target, &policy, &protected).ok())
-        else {
-            return EvictOutcome::Unavailable;
-        };
-        // Keep going while the engine is still making progress and has not
-        // told us it was stopped. `live_after` is the honest size (see the
-        // note in evict_pass); `bytes_after` cannot fall before a compact,
-        // so testing progress with it would loop until the bound every
-        // single time.
-        for _ in 1..EVICT_MAX_PASSES {
-            if rep.blocked || rep.live_after <= target {
-                break;
-            }
-            let Some(more) = self.with_index(|ix| ix.evict_to(target, &policy, &protected).ok())
-            else {
-                break;
-            };
-            if more.removed == 0 {
-                rep.blocked = more.blocked;
-                rep.live_after = more.live_after;
-                break;
-            }
-            rep.removed += more.removed;
-            rep.bytes_after = more.bytes_after;
-            rep.live_after = more.live_after;
-            rep.needs_compact |= more.needs_compact;
-            rep.blocked = more.blocked;
-        }
-        if rep.needs_compact {
-            self.compact_pending.store(true, Ordering::Relaxed);
-        }
-        let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
-        if rep.live_after > target {
-            // Protection is absolute: the engine stops rather than delete
-            // a row from the protected set, and that is the right outcome
-            // even though the cap is still exceeded. Say so plainly - a
-            // silently-still-too-big database is how a user concludes the
-            // feature is broken. And be honest about WHICH wall we hit:
-            // with nothing protected, the remainder is the database's own
-            // floor (schema, indexes, rows no policy selects), not the
-            // user's data being defended.
-            // Sizes here are the LIVE figures, not the file size: the file
-            // cannot shrink until the deferred compact runs, so logging
-            // that would print the same number twice and read as a no-op.
-            info!(
-                target: "index",
-                "size cap: removed {} rows, {:.0} MB → {:.0} MB of live content, \
-                 still over the {:.0} MB target - {}",
-                rep.removed,
-                mb(rep.live_before),
-                mb(rep.live_after),
-                mb(target),
-                shrink_shortfall_reason(n_prot),
-            );
-        } else if rep.removed > 0 {
-            info!(
-                target: "index",
-                "size cap: removed {} rows, {:.0} MB → {:.0} MB of live content \
-                 (target {:.0} MB){}",
-                rep.removed,
-                mb(rep.live_before),
-                mb(rep.live_after),
-                mb(target),
-                if rep.needs_compact {
-                    ", the file stays at its current size until the compact runs at idle"
-                } else {
-                    ""
-                }
-            );
-        }
-        EvictOutcome::Ran(rep, n_prot)
-    }
-
-    /// One automatic eviction pass, exactly as the scan loop runs it.
-    /// `Nothing` when the feature is off, unconfigured, or the database
-    /// is already under its cap - the common case, and the reason this is
-    /// cheap to call after every pass.
-    #[cfg(feature = "indexer")]
-    pub(super) fn evict_pass(&self) -> EvictOutcome {
-        if !self.index_evict.load(Ordering::Relaxed) {
-            return EvictOutcome::Nothing;
-        }
-        let cap = self.index_max_bytes.load(Ordering::Relaxed);
-        if cap == 0 {
-            return EvictOutcome::Nothing;
-        }
-        // live_bytes, NOT db_bytes. SQLite DELETE hands pages to the
-        // freelist without shortening the file, so db_bytes cannot fall
-        // until the deferred compact runs - and this check fires after
-        // every scan pass. Testing the cap against the file size meant an
-        // index that had just been evicted was still "over cap" on the
-        // very next pass, so eviction re-ran forever, taking the write
-        // lock and re-arming the compact each time, until the index was
-        // empty and even then never settling. live_bytes is what
-        // eviction can actually move, and is the size the file WOULD have
-        // once compacted, so it is the honest thing to hold to a promise
-        // about disk. The user-facing readout still shows the file size;
-        // see index_stats.
-        match self.with_index(|ix| ix.live_bytes().ok()) {
-            None => EvictOutcome::Unavailable,
-            Some(now) if now <= cap => EvictOutcome::Nothing,
-            Some(_) => self.evict_to(cap),
-        }
-    }
-
-    /// M31b: build (or return the cached) taste profile - the genre/kind/
-    /// decade distribution of what the user has downloaded and watchlisted.
-    /// Cached for ~60 s; the affinity wall sort calls this per page.
-    #[cfg(feature = "indexer")]
-    pub(super) fn taste_profile(&self) -> TasteProfile {
-        {
-            let g = self.taste_cache.lock_ok();
-            if let Some((at, tp)) = g.as_ref()
-                && at.elapsed() < std::time::Duration::from_secs(60)
-            {
-                return tp.clone();
-            }
-        }
-        // Each source signal contributes 1.0. Repeated title_keys (e.g.
-        // many episodes of one show) accumulate, which reads as stronger
-        // affinity - intentional.
-        let mut freq: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-        let mut n_signals: u32 = 0;
-        for j in self.history.lock_ok().iter() {
-            let g = j.lock_ok();
-            if g.state == JobState::Completed {
-                let key = crate::wall::parse_release(&g.name).key;
-                if !key.is_empty() {
-                    *freq.entry(key).or_default() += 1.0;
-                    n_signals += 1;
-                }
-            }
-        }
-        for w in self.watchlist.lock_ok().iter() {
-            let norm = nzbkit::release::norm_title(&w.title);
-            if norm.is_empty() {
-                continue;
-            }
-            // Build the parse key exactly as the parser does so it joins
-            // to the titles table.
-            let key = if w.kind == "tv" {
-                format!("t:{norm}")
-            } else if let Some(y) = w.year {
-                format!("m:{norm}:{y}")
-            } else {
-                format!("m:{norm}")
-            };
-            *freq.entry(key).or_default() += 1.0;
-            n_signals += 1;
-        }
-        // One batched lookup of the enriched rows for the distinct keys.
-        let keys: Vec<String> = freq.keys().cloned().collect();
-        let rows = self
-            .with_index_read(|ix| ix.titles_for_keys(&keys).ok())
-            .unwrap_or_default();
-        let mut genre_w: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-        let mut kind_w: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-        let mut year_sum = 0f64;
-        let mut year_wt = 0f64;
-        for (key, w) in &freq {
-            let Some(tr) = rows.get(key) else { continue };
-            let genres: Vec<&str> = tr
-                .genres
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !genres.is_empty() {
-                let share = w / genres.len() as f32;
-                for g in genres {
-                    *genre_w.entry(g.to_string()).or_default() += share;
-                }
-            }
-            if !tr.kind.is_empty() {
-                *kind_w.entry(tr.kind.clone()).or_default() += w;
-            }
-            if tr.year > 0 {
-                year_sum += tr.year as f64 * *w as f64;
-                year_wt += *w as f64;
-            }
-        }
-        let norm_top = |m: std::collections::HashMap<String, f32>, keep: usize| {
-            let sum: f32 = m.values().sum();
-            let mut v: Vec<(String, f32)> = if sum > 0.0 {
-                m.into_iter().map(|(k, w)| (k, w / sum)).collect()
-            } else {
-                Vec::new()
-            };
-            v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            v.truncate(keep);
-            v
-        };
-        let tp = TasteProfile {
-            genres: norm_top(genre_w, 8),
-            kinds: norm_top(kind_w, 4),
-            decade_center: (year_wt > 0.0).then(|| (year_sum / year_wt).round() as i32),
-            n_signals,
-        };
-        *self.taste_cache.lock_ok() = Some((std::time::Instant::now(), tp.clone()));
-        tp
-    }
-
-    /// M31b: turn a taste profile + owned set into the SQL-side scoring
-    /// context, or None when there is nothing to rank by (cold start).
-    /// Weights are pre-scaled so genre dominates, kind is secondary, and
-    /// decade is a light nudge; owned titles get a -1000 sink in SQL.
-    #[cfg(feature = "indexer")]
-    pub(super) fn affinity_ctx(&self, tp: &TasteProfile) -> Option<nzbkit::index::AffinityCtx> {
-        if tp.n_signals == 0
-            || (tp.genres.is_empty() && tp.kinds.is_empty() && tp.decade_center.is_none())
-        {
-            return None;
-        }
-        Some(nzbkit::index::AffinityCtx {
-            genres: tp
-                .genres
-                .iter()
-                .map(|(g, w)| (g.clone(), w * 10.0))
-                .collect(),
-            fav_kind: tp.kinds.first().map(|(k, w)| (k.clone(), w * 2.0)),
-            decade_center: tp.decade_center,
-            decade_weight: 1.0,
-            owned: self.owned_title_keys(),
-        })
-    }
-
     /// The categories offered to clients, `*` excluded, as the comma list
     /// the `categories` setting round-trips.
     pub(super) fn cat_list(&self) -> String {
         self.cats
-            .lock()
-            .unwrap()
+            .lock_ok()
             .iter()
             .filter(|c| *c != "*")
             .cloned()
@@ -3214,368 +2826,6 @@ impl Daemon {
             let on_disk = map.get("categories").and_then(Value::as_str).unwrap_or("");
             map.insert("categories".into(), json!(merge_cat_list(on_disk, &mine)));
         });
-    }
-
-    #[cfg(feature = "indexer")]
-    pub(super) fn with_index<T>(
-        &self,
-        f: impl FnOnce(&nzbkit::index::Index) -> Option<T>,
-    ) -> Option<T> {
-        if !self.index_db_wanted() {
-            return None;
-        }
-        // blocking_db: both the mutex WAIT (up to another writer's
-        // whole transaction, 10 s busy_timeout included) and the
-        // closure's own synchronous SQLite run off the async workers.
-        // Measured 2026-08-05: three inline deepen ingests plus the tip
-        // ingest and a predb fold occupied every tokio worker at once,
-        // and the download runner - a ready task with an expired 500 ms
-        // poll timer - had no thread to resume on for 38 s.
-        crate::persist::blocking_db(|| {
-            let mut guard = self.index.lock_ok();
-            if guard.is_none() {
-                *guard = nzbkit::index::Index::open(&self.index_db).ok();
-                if guard.is_some() {
-                    self.index_migrated.store(true, Ordering::Release);
-                }
-            }
-            guard.as_ref().and_then(f)
-        })
-    }
-
-    /// Borrow one of the pooled read-only connections, opening another
-    /// if the pool has not reached [`INDEX_READ_CONNS`] yet.
-    ///
-    /// Waits at most [`INDEX_READ_WAIT`] and then gives up. Giving up is
-    /// the feature: the caller is an HTTP worker, and a worker that
-    /// waits without a bound is a worker the next slow query removes
-    /// from the pool.
-    #[cfg(feature = "indexer")]
-    fn index_read_acquire(&self) -> Reader<'_> {
-        let deadline = std::time::Instant::now() + INDEX_READ_WAIT;
-        let mut st = self.index_read.inner.lock_ok();
-        loop {
-            if let Some(conn) = st.idle.pop() {
-                return Reader::Got(IndexReader {
-                    pool: &self.index_read,
-                    conn: Some(conn),
-                    generation: st.generation,
-                });
-            }
-            if st.live < INDEX_READ_CONNS {
-                // Reserve the slot BEFORE releasing the lock, or every
-                // waiter racing here opens its own connection and the
-                // ceiling means nothing.
-                st.live += 1;
-                let generation = st.generation;
-                drop(st);
-                match nzbkit::index::Index::open_read_only(&self.index_db) {
-                    Ok(conn) => {
-                        return Reader::Got(IndexReader {
-                            pool: &self.index_read,
-                            conn: Some(conn),
-                            generation,
-                        });
-                    }
-                    Err(_) => {
-                        self.index_read.inner.lock_ok().live -= 1;
-                        // The slot just came back; a waiter parked on
-                        // the condvar would otherwise sleep out its
-                        // whole budget and answer Busy despite it.
-                        self.index_read.handed_back.notify_one();
-                        return Reader::Unavailable;
-                    }
-                }
-            }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                // Say so, at most once a minute. The 2 Aug wedge was
-                // diagnosed by timing endpoints by hand against a live
-                // daemon; a saturated read pool is the one symptom that
-                // names this failure directly, and it belongs in the log
-                // rather than in whoever happens to be curling.
-                let last = self.index_read_warned.load(Ordering::Relaxed);
-                let secs = epoch_secs();
-                if secs.saturating_sub(last) >= 60
-                    && self
-                        .index_read_warned
-                        .compare_exchange(last, secs, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    warn!(
-                        target: "index",
-                        "all {INDEX_READ_CONNS} index read connections busy for \
-                         {INDEX_READ_WAIT:?} - query endpoints are answering \"busy\". \
-                         A query has gone slow; the rest of the API is unaffected."
-                    );
-                }
-                return Reader::Busy;
-            }
-            let (guard, _) = self
-                .index_read
-                .handed_back
-                .wait_timeout(st, deadline - now)
-                .unwrap_or_else(|e| e.into_inner());
-            st = guard;
-        }
-    }
-
-    /// Read-only access for the interactive query endpoints (wall2,
-    /// search, browse, make_nzb, the newznab facade). Runs on a pooled
-    /// read-only connection, so a long ingest batch or maintenance pass
-    /// holding the read-write connection cannot park an HTTP worker
-    /// here: WAL readers run concurrently with the writer.
-    ///
-    /// `None` when the index is off, when the read failed, and - since
-    /// the 2 Aug wedge - when every read connection is busy and none
-    /// came free within [`INDEX_READ_WAIT`]. Callers already render an
-    /// absent index as an empty answer, which is the right shape for
-    /// "ask again in a moment" too; what matters is that the worker goes
-    /// back to the pool instead of queueing. Use
-    /// [`Self::index_read_checked`] where the difference is worth showing
-    /// the user.
-    ///
-    /// Falls back to `with_index` until a read-write open has run the
-    /// migrations - a startup-shaped moment where nothing holds a long
-    /// lock. When the read-only open itself FAILS after migration (the
-    /// file was just wiped, fd exhaustion), the fallback is
-    /// `try_with_index`: post-wipe is not startup-shaped - a chunked
-    /// compaction or ANALYZE can be holding the write mutex for real
-    /// time, and parking every query worker on it is the 2 Aug wedge.
-    /// Saturation deliberately does not fall back at all: that mutex is
-    /// exactly what this path exists to stay off.
-    #[cfg(feature = "indexer")]
-    pub(super) fn with_index_read<T>(
-        &self,
-        f: impl FnOnce(&nzbkit::index::Index) -> Option<T>,
-    ) -> Option<T> {
-        self.index_read_checked(f).unwrap_or(None)
-    }
-
-    /// As [`Self::with_index_read`], with saturation reported rather than
-    /// flattened into "nothing found": [`IndexBusy`] means every read
-    /// connection was busy. The query surfaces a user watches while it
-    /// runs (the wall, search) say so instead of blanking, which is the
-    /// honest answer and stops a busy index reading as an empty one.
-    #[cfg(feature = "indexer")]
-    pub(super) fn index_read_checked<T>(
-        &self,
-        f: impl FnOnce(&nzbkit::index::Index) -> Option<T>,
-    ) -> Result<Option<T>, IndexBusy> {
-        if !self.index_db_wanted() {
-            return Ok(None);
-        }
-        if !self.index_migrated.load(Ordering::Acquire) {
-            return Ok(self.with_index(f));
-        }
-        match self.index_read_acquire() {
-            Reader::Got(ix) => Ok(f(&ix)),
-            Reader::Busy => Err(IndexBusy),
-            Reader::Unavailable => Ok(self.try_with_index(f)),
-        }
-    }
-
-    /// Best-effort write access: run `f` on the read-write connection if
-    /// it is free RIGHT NOW, skip entirely if anything holds it. For
-    /// side-writes an interactive endpoint can shrug off (wall2's title
-    /// seeding) - the point of the read-only path is that those handlers
-    /// never park behind an ingest, so their embedded writes must not
-    /// park either.
-    #[cfg(feature = "indexer")]
-    pub(super) fn try_with_index<T>(
-        &self,
-        f: impl FnOnce(&nzbkit::index::Index) -> Option<T>,
-    ) -> Option<T> {
-        if !self.index_db_wanted() {
-            return None;
-        }
-        let Ok(mut guard) = self.index.try_lock() else {
-            return None;
-        };
-        if guard.is_none() {
-            *guard = nzbkit::index::Index::open(&self.index_db).ok();
-            if guard.is_some() {
-                self.index_migrated.store(true, Ordering::Release);
-            }
-        }
-        guard.as_ref().and_then(f)
-    }
-
-    /// Retire every read-only connection so the next `with_index_read`
-    /// opens fresh ones. Called wherever the write side republishes or
-    /// drops its own connection. For committed data this is
-    /// belt-and-braces (a WAL reader picks up every commit on its next
-    /// query anyway), but it is what keeps the readers correct across
-    /// index_wipe deleting the file out from under them - a read-only
-    /// handle would otherwise serve the deleted inode forever.
-    ///
-    /// Connections lent out right now are retired by the generation
-    /// bump: their query finishes on the old handle and the guard closes
-    /// it instead of pooling it, so this never waits on a running query.
-    #[cfg(feature = "indexer")]
-    pub(super) fn drop_index_read(&self) {
-        let mut st = self.index_read.inner.lock_ok();
-        st.generation = st.generation.wrapping_add(1);
-        st.live = st.live.saturating_sub(st.idle.len());
-        st.idle.clear();
-        drop(st);
-        // Every retired idle connection is a freed slot; wake the
-        // waiters so they open fresh ones now instead of sleeping out
-        // their budget and answering Busy.
-        self.index_read.handed_back.notify_all();
-    }
-
-    /// index_stats' database figures (releases, complete, db_bytes,
-    /// live_bytes) without ever parking the caller on the index mutex.
-    /// try_lock: when the connection is free, compute fresh and refresh
-    /// the cache; when a scan batch or maintenance pass holds it, serve
-    /// the last known figures. A few-seconds-stale count is fine for a
-    /// status pill - four HTTP workers queued behind a 62s lock hold
-    /// is how one dashboard tab wedged the whole daemon.
-    #[cfg(feature = "indexer")]
-    pub(super) fn index_stats_snapshot(&self) -> (u64, u64, u64, u64) {
-        if !self.index_db_wanted() {
-            return (0, 0, 0, 0);
-        }
-        if let Ok(mut guard) = self.index.try_lock() {
-            if guard.is_none() {
-                *guard = nzbkit::index::Index::open(&self.index_db).ok();
-                if guard.is_some() {
-                    self.index_migrated.store(true, Ordering::Release);
-                }
-            }
-            if let Some(ix) = guard.as_ref() {
-                let (total, complete) = ix.stats().unwrap_or((0, 0));
-                let snap = (
-                    total,
-                    complete,
-                    ix.db_bytes().unwrap_or(0),
-                    ix.live_bytes().unwrap_or(0),
-                );
-                *self.index_stats_cache.lock_ok() = Some(snap);
-                return snap;
-            }
-            return (0, 0, 0, 0);
-        }
-        self.index_stats_cache
-            .lock()
-            .unwrap()
-            .unwrap_or((0, 0, 0, 0))
-    }
-
-    /// Mutable variant for the odd transaction-shaped call (IMDb
-    /// snapshot ingest). Same lazy-open, same single connection.
-    #[cfg(feature = "indexer")]
-    pub(super) fn with_index_mut<T>(
-        &self,
-        f: impl FnOnce(&mut nzbkit::index::Index) -> Option<T>,
-    ) -> Option<T> {
-        if !self.index_db_wanted() {
-            return None;
-        }
-        // blocking_db: see `with_index` - the write side is the one
-        // that actually starved the runner.
-        crate::persist::blocking_db(|| {
-            let mut guard = self.index.lock_ok();
-            if guard.is_none() {
-                *guard = nzbkit::index::Index::open(&self.index_db).ok();
-                if guard.is_some() {
-                    self.index_migrated.store(true, Ordering::Release);
-                }
-            }
-            guard.as_mut().and_then(f)
-        })
-    }
-
-    /// Every path to the index database goes through `with_index` or its
-    /// read-only sibling `with_index_read` (which checks the same switches,
-    /// and can never create the file - its open is READ_ONLY), so the
-    /// switches above are the whole "no disk" story: with both sources
-    /// off, the file is never opened - never CREATED, on a fresh install
-    /// - and every caller (wall, browse, watchlist, oracle, the newznab
-    /// facade) sees the same empty answer it would see before a first
-    /// scan. The `Index::open` calls in the scan loops are not
-    /// exceptions: they only run inside a pass, which the matching pause
-    /// predicate has already stopped.
-    ///
-    /// Turning a switch off also drops the handle we are holding - once
-    /// the OTHER source no longer wants it - so the connection, its page
-    /// cache and the WAL go with it rather than sitting resident until
-    /// restart.
-    #[cfg(feature = "indexer")]
-    pub(super) fn close_index(&self) {
-        // Still wanted by the other source: nothing to close.
-        if self.index_db_wanted() {
-            return;
-        }
-        self.drop_index_read();
-        // Retire the generation under the same lock the republish takes:
-        // a scan task that reads it after this point sees the new one
-        // and declines, and one that read the old one is already waiting
-        // on the lock we hold.
-        let mut guard = self.index.lock_ok();
-        self.index_generation.fetch_add(1, Ordering::SeqCst);
-        if guard.take().is_some() {
-            info!(target: "index", "closed the database - no content source is switched on");
-        }
-    }
-
-    /// The generation a scan pass must still be running under to publish
-    /// its connection. See [`Self::index_generation`].
-    #[cfg(feature = "indexer")]
-    pub(super) fn index_era(&self) -> u64 {
-        self.index_generation.load(Ordering::SeqCst)
-    }
-
-    /// Publish a freshly-opened shared connection on behalf of a scan
-    /// pass that started at `era` - unless the index was switched off or
-    /// wiped while that pass ran, in which case the pass's connection is
-    /// simply dropped and the index stays closed.
-    #[cfg(feature = "indexer")]
-    pub(super) fn publish_index(&self, era: u64, fresh: nzbkit::index::Index) {
-        let mut guard = self.index.lock_ok();
-        // `index_db_wanted`, not `index_enabled`: a spot pass republishes
-        // the same shared connection, and on a spots-only install the
-        // indexer switch is off by definition. Asking the narrower
-        // question would leave that install publishing nothing.
-        if !may_publish_index(self.index_era(), era, self.index_db_wanted()) {
-            return;
-        }
-        *guard = Some(fresh);
-    }
-
-    /// The master switch, for the workers that are not scan passes.
-    ///
-    /// `with_index` already makes these threads harmless - their queries
-    /// come back empty and they fall into their idle sleeps - but "does
-    /// no work" and "does not run" are different claims, and the switch
-    /// promises the second. The enrichers would still call out to the
-    /// art cache and the photo lane would still walk `.spool/art` on
-    /// disk, so each one asks this before its first move of the cycle.
-    #[cfg(feature = "indexer")]
-    pub(super) fn indexer_off(&self) -> bool {
-        !self.index_enabled.load(Ordering::Relaxed)
-    }
-
-    /// Slim build: there is no built-in indexer, so it is always off.
-    #[cfg(not(feature = "indexer"))]
-    pub(super) fn indexer_off(&self) -> bool {
-        true
-    }
-
-    /// Park a worker thread while the indexer is off. Returns true when
-    /// it slept, so callers read as `if d.park_if_off(30) { continue }`.
-    /// A poll rather than a condvar: switching the indexer on is a
-    /// once-in-an-install event, and up to `secs` of extra latency
-    /// before the metadata lanes wake is invisible next to the scan pass
-    /// that has to run first anyway.
-    #[cfg(feature = "indexer")]
-    pub(super) fn park_if_off(&self, secs: u64) -> bool {
-        if self.indexer_off() {
-            std::thread::sleep(std::time::Duration::from_secs(secs));
-            return true;
-        }
-        false
     }
 
     /// M29: everything a wall verdict needs - the availability-ledger
@@ -3690,10 +2940,29 @@ impl Daemon {
     /// The canonical (pre-collision) output directory for a name+category.
     pub(super) fn base_out_dir(&self, category: &str, dir_stem: &str) -> PathBuf {
         if category.is_empty() {
-            self.out_dir().join(dir_stem)
-        } else {
-            self.out_dir().join(category).join(dir_stem)
+            return self.out_dir().join(dir_stem);
         }
+        // §129 2b: a category can rename its subfolder (SAB's relative
+        // "Folder"). Sanitized per component so "tv/anime" nests and
+        // nothing escapes the download root; the default stays the
+        // category's own name, exactly as before.
+        let sub = self
+            .cat_meta
+            .lock_ok()
+            .get(category)
+            .map(|m| m.dir.clone())
+            .unwrap_or_default();
+        if sub.is_empty() {
+            return self.out_dir().join(category).join(dir_stem);
+        }
+        let mut p = self.out_dir();
+        for c in sub
+            .split(['/', '\\'])
+            .filter(|c| !c.is_empty() && *c != "." && *c != "..")
+        {
+            p = p.join(nzbkit::disk::sanitize_filename(c));
+        }
+        p.join(dir_stem)
     }
 
     /// Where an equivalent release already lives, if anywhere: `("queue" |
@@ -3826,6 +3095,19 @@ impl Daemon {
         if !category.is_empty() {
             category = nzbkit::disk::sanitize_filename(&category);
         }
+        // §129 2b: the category's default priority fills an add that
+        // did not name one (-100, SAB's "default"). An explicit
+        // priority - including -2 add-paused - always wins.
+        let mut priority = priority;
+        if priority == SAB_DEFAULT_PRIORITY
+            && let Some(p) = self
+                .cat_meta
+                .lock_ok()
+                .get(&category)
+                .and_then(|m| m.priority)
+        {
+            priority = p;
+        }
         let dir_stem = nzbkit::disk::sanitize_filename(&stem);
         let base_out_dir = self.base_out_dir(&category, &dir_stem);
         // Two DIFFERENT NZBs whose names sanitize to the same stem and carry
@@ -3868,7 +3150,38 @@ impl Daemon {
         // job still carries its identity, so everything downstream that
         // reasons about duplicates keeps working.
         let key = dupe_key(&stem);
-        let duplicate = !allow_dupe && self.dupe_collision(&stem).is_some();
+        let collision = if allow_dupe {
+            None
+        } else {
+            self.dupe_collision(&stem)
+        };
+        let duplicate = collision.is_some();
+        // §129 2d: what a duplicate add becomes is the user's call now.
+        // "pause" is the M14f hold; "discard" refuses the add outright;
+        // "fail" files it straight to history as Failed (the *arr
+        // contract: a failed grab triggers their own search for a
+        // different release, where a silently held one just sits).
+        let dupe_action = self.dupe_action.lock_ok().clone();
+        if let Some(c) = &collision
+            && dupe_action == "discard"
+        {
+            drop(publish);
+            // The spool copy was written above; a refused add must not
+            // leave it behind.
+            let _ = std::fs::remove_file(&spool_path);
+            info!(
+                target: "queue",
+                "refused {stem:?} - duplicate of {} ({}, {}), and duplicates \
+                 are set to be discarded",
+                c.name, c.nzo_id, c.where_
+            );
+            anyhow::bail!(
+                "duplicate of {:?} ({}) - discarded; the duplicates setting \
+                 decides this",
+                c.name,
+                c.where_
+            );
+        }
         // Late-pick groundwork: was the runner free to take this job the
         // moment it lands? Only then does a slow pick mean the runner was
         // starved (the fixed inline-SQLite bug held picks back 38 s)
@@ -3935,6 +3248,9 @@ impl Daemon {
             zip_packed,
             unpack_blocked_by: String::new(),
             move_split: String::new(),
+            move_failed: String::new(),
+            move_attempts: 0,
+            move_pending: false,
             archive_shape: String::new(),
             inner_crc: 0,
             identity_name: String::new(),
@@ -3943,6 +3259,8 @@ impl Daemon {
             auto_retry_at: None,
             auto_retry_why: None,
             pp_params: Vec::new(),
+            sab_pp: None,
+            script_override: String::new(),
             replaces,
             // §77: filled in by the health prober on its next idle tick.
             // Deliberately not probed inline here - enqueue is called
@@ -3955,6 +3273,41 @@ impl Daemon {
             cleaned_par2: 0,
             cleaned_trash: false,
         }));
+        // §129 2d, dupe_action = "fail": the job never queues - it files
+        // straight to history as Failed, through the same seam every
+        // history mutation uses (history_upsert beside save_queue), and
+        // emits the job.failed lifecycle event a real failure would.
+        // Retry from history remains the escape hatch: the spool .nzb
+        // is in place and retry asks the duplicates question afresh.
+        if let Some(c) = &collision
+            && dupe_action == "fail"
+        {
+            {
+                let mut g = job.lock_ok();
+                g.state = JobState::Failed;
+                g.paused = false;
+                g.priority = 0;
+                g.fail_message = format!(
+                    "duplicate of {:?} ({}) - failed; the duplicates setting decides this",
+                    c.name, c.where_
+                );
+                g.finished_at = Some(Instant::now());
+                g.finished_unix = Some(unix_now());
+            }
+            self.history.lock_ok().push(job.clone());
+            drop(publish);
+            info!(
+                target: "queue",
+                "{nzo_id} filed to history as FAILED - duplicate of {} ({}), and \
+                 duplicates are set to fail",
+                c.name, c.nzo_id
+            );
+            self.save_queue();
+            let _ = self.history_upsert(std::slice::from_ref(&job));
+            self.life_emit_parked(&job);
+            self.history_enforce_retention();
+            return Ok(nzo_id);
+        }
         self.queue.lock_ok().push_back(job);
         // Published: the directory and the identity are now visible to
         // every other adder.
@@ -4209,8 +3562,7 @@ impl Daemon {
             let connected = || -> usize {
                 d.hub
                     .pool_live
-                    .lock()
-                    .unwrap()
+                    .lock_ok()
                     .as_ref()
                     .map(|l| {
                         l.servers
@@ -4295,6 +3647,32 @@ impl Daemon {
         self.download_idle_for().is_none_or(|idle| idle < after)
     }
 
+    /// All-core CPU% (0-100) from the process cpu-time delta since the
+    /// previous call. One getrusage/task_info per call, no sampling
+    /// thread; sub-500 ms re-polls (a second open dashboard, or the
+    /// stats poll landing beside the whyslow ticker) reuse the last
+    /// reading instead of amplifying noise. Shared sample state - both
+    /// consumers reading through here is what keeps them agreeing.
+    pub(super) fn cpu_pct(&self) -> f64 {
+        let now = Instant::now();
+        let cpu = nzbkit::mem::cpu_time_secs().unwrap_or(0.0);
+        let ncpu = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+        let mut prev = self.cpu_sample.lock_ok();
+        match *prev {
+            Some((t0, _, last)) if now.duration_since(t0).as_secs_f64() < 0.5 => last,
+            Some((t0, c0, _)) => {
+                let wall = now.duration_since(t0).as_secs_f64();
+                let pct = ((cpu - c0) / wall / ncpu * 100.0).clamp(0.0, 100.0);
+                *prev = Some((now, cpu, pct));
+                pct
+            }
+            None => {
+                *prev = Some((now, cpu, 0.0));
+                0.0
+            }
+        }
+    }
+
     /// Live download speed (bytes/sec) over a ~5 s rolling window of
     /// decoded-byte samples (also feeds queue_json's kbpersec).
     pub(super) fn current_speed_bps(&self) -> f64 {
@@ -4338,8 +3716,7 @@ impl Daemon {
     /// Lifetime bytes billed to `host` (block-account accounting).
     pub(super) fn usage_lifetime(&self, host: &str) -> u64 {
         self.usage
-            .lock()
-            .unwrap()
+            .lock_ok()
             .get("lifetime")
             .and_then(|v| v.get(host))
             .and_then(Value::as_u64)
@@ -4402,8 +3779,194 @@ impl Daemon {
     /// and a library scan that runs first indexes the state before it.
     /// Both go on the blocking pool, together, so a slow script delays
     /// the scan rather than the queue.
+    /// §129 2b: which script this job runs, if any. Resolution order:
+    /// the job's own `script=` param ("None" = explicitly none), the
+    /// category's script, the global setting.
+    /// §129 2b follow-up: every script this daemon can actually run for
+    /// a job - the global setting plus each category's own - keyed by
+    /// the BASENAME clients name them by. `mode=get_scripts` serves
+    /// these names, and `script=` on an add sends one back, so the two
+    /// must resolve through one list or the round trip breaks (it did:
+    /// the name came back and was run as a cwd-relative path). First
+    /// entry wins a basename tie, global first.
+    pub(super) fn known_scripts(&self) -> Vec<(String, PathBuf)> {
+        let mut out: Vec<(String, PathBuf)> = Vec::new();
+        let mut push = |p: &std::path::Path| {
+            if let Some(name) = p.file_name().map(|s| s.to_string_lossy().into_owned())
+                && !out.iter().any(|(n, _)| *n == name)
+            {
+                out.push((name, p.to_path_buf()));
+            }
+        };
+        if let Some(g) = self.script.lock_ok().as_deref() {
+            push(g);
+        }
+        for m in self.cat_meta.lock_ok().values() {
+            let s = m.script.trim();
+            if !s.is_empty() {
+                push(std::path::Path::new(s));
+            }
+        }
+        out
+    }
+
+    pub(super) fn resolve_script(&self, job: &Arc<Mutex<Job>>) -> Option<PathBuf> {
+        let (over, cat) = {
+            let g = job.lock_ok();
+            (g.script_override.clone(), g.category.clone())
+        };
+        if over.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        if !over.is_empty() {
+            return Some(PathBuf::from(over));
+        }
+        let cs = self
+            .cat_meta
+            .lock_ok()
+            .get(&cat)
+            .map(|m| m.script.clone())
+            .unwrap_or_default();
+        if !cs.is_empty() {
+            return Some(PathBuf::from(cs));
+        }
+        self.script.lock_ok().clone()
+    }
+
+    /// §129 2b: record the SAB add params the API used to accept and
+    /// silently drop (`pp=`, `script=`), and log the compatibility
+    /// mapping for the ones one-pass cannot honor literally - never
+    /// silently ignore (decision 5).
+    ///
+    /// `add_only` is true when the request authenticated with the
+    /// add-only NZB key rather than the full API key. That credential is
+    /// handed to browser push extensions by design, so it must not be
+    /// able to choose which program the daemon runs.
+    pub(super) fn record_add_params(
+        &self,
+        nzo_id: &str,
+        pp: Option<&str>,
+        script: Option<&str>,
+        add_only: bool,
+    ) {
+        let pp = pp
+            .and_then(|p| p.trim().parse::<i64>().ok())
+            .filter(|p| (0..=3).contains(p));
+        let script = script
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            // A bare name is what SAB clients send back from
+            // mode=get_scripts, so it must resolve against the same
+            // list that answer came from - stored verbatim it became a
+            // cwd-relative path that ran nothing. A value with a path
+            // separator is an operator-typed location and stays as
+            // written; "none" is SAB's own null and suppresses the
+            // category/global ladder in resolve_script.
+            .and_then(|s| {
+                if s.eq_ignore_ascii_case("none") {
+                    return Some(s);
+                }
+                if s.contains('/') || s.contains('\\') {
+                    // An operator-typed absolute location, stored as
+                    // written - but ONLY for a full-key caller.
+                    // `addfile`/`addurl` are on the add-only allowlist,
+                    // so without this test the NZB key reached
+                    // `Command::new`: `resolve_script` returns
+                    // `script_override` verbatim and the job tail
+                    // executes it. That is the same escalation
+                    // `m_config`'s bootstrap check already refuses ("an
+                    // add-only credential escalating to arbitrary
+                    // config, and from there to code execution, because
+                    // `script` is run on the job tail and `addfile` is
+                    // itself add-only") - this was the door left open
+                    // beside it. The bare-name form below is safe for
+                    // either caller: it resolves against the configured
+                    // list and cannot name anything the operator has not
+                    // already installed.
+                    if add_only {
+                        warn!(
+                            target: "queue",
+                            "{nzo_id}: ignoring script={s:?} - a path may only be \
+                             set with the full API key, and this add came in on \
+                             the add-only NZB key (name a configured script \
+                             instead, or set it on the category)"
+                        );
+                        return None;
+                    }
+                    return Some(s);
+                }
+                match self.known_scripts().into_iter().find(|(n, _)| *n == s) {
+                    Some((_, p)) => Some(p.to_string_lossy().into_owned()),
+                    None => {
+                        warn!(
+                            target: "queue",
+                            "{nzo_id}: script {s:?} is not configured on this \
+                             daemon - the job runs with its category/global \
+                             script instead (set the script globally or on \
+                             the category to use it)"
+                        );
+                        None
+                    }
+                }
+            });
+        if pp.is_none() && script.is_none() {
+            return;
+        }
+        let Some(job) = self
+            .queue
+            .lock_ok()
+            .iter()
+            .find(|j| j.lock_ok().nzo_id == nzo_id)
+            .cloned()
+        else {
+            return;
+        };
+        {
+            let mut g = job.lock_ok();
+            if let Some(p) = pp {
+                g.sab_pp = Some(p);
+                if p <= 1 {
+                    info!(
+                        target: "queue",
+                        "{nzo_id}: pp={p} requested - repair and unpack are integral \
+                         to the one-pass download, so the request is recorded and \
+                         shown on the job, and the download runs normally"
+                    );
+                }
+            }
+            if let Some(s) = script {
+                g.script_override = s.clone();
+                info!(target: "queue", "{nzo_id}: script={s} for this job");
+            }
+        }
+        self.save_queue();
+    }
+
+    /// §129 2e: fire the notification targets routed onto a warning
+    /// event ("disk", "quota"). Cheap no-op unless a target actually
+    /// asked for the token; the send goes to the blocking pool - the
+    /// callers sit in the download runner.
+    pub(super) fn notify_event(self: &Arc<Self>, event: &'static str, message: &str) {
+        let targets = self.notify_targets.lock_ok().clone();
+        if !targets
+            .iter()
+            .any(|t| t.enabled && t.events.iter().any(|e| e == event))
+        {
+            return;
+        }
+        let cx = crate::notify::Ctx::for_event(event, message);
+        let d = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let out = crate::notify::fire(&targets, &cx, unix_now());
+            let mut health = d.notify_health.lock_ok();
+            for (k, o) in out {
+                health.insert(k, o);
+            }
+        });
+    }
+
     pub(super) fn run_post_job_hooks(self: &Arc<Self>, job: &Arc<Mutex<Job>>) {
-        let script = self.script.lock_ok().clone();
+        let script = self.resolve_script(job);
         let targets = self.notify_targets.lock_ok().clone();
         let mode = self.failure_link.lock_ok().clone();
         let secs = self.auto_retry_secs.load(Ordering::Relaxed);
@@ -4806,12 +4369,13 @@ impl Daemon {
                 let _ = std::fs::remove_file(&g.nzb_path);
             }
         }
-        self.queue
-            .lock()
-            .unwrap()
-            .retain(|j| j.lock_ok().nzo_id != id);
+        self.queue.lock_ok().retain(|j| j.lock_ok().nzo_id != id);
         // The job's queue-row activity dies with the row.
         self.hub.activity.lock_ok().remove(&id);
+        // §129: so does its recovery-fetch cancel handle. Same key, same
+        // place, same reason - the tail is over, and neither map may
+        // outgrow the queue.
+        self.hub.tail_cancel.lock_ok().remove(&id);
         // Read LIVE, not from the snapshot above: everything between the two
         // is unlocked, and file removal is slow. A queue or JSON-RPC delete
         // landing in that window used to be decided against a stale
@@ -4924,7 +4488,22 @@ impl Daemon {
             self.giveup_note_outcome(&job, armed_auto_retry);
         }
         if !tombstone {
-            self.history.lock_ok().push(job);
+            // C: hand the owed move over only once the record is IN
+            // history - the mover looks the job up there, and it runs
+            // on its own worker so this park (and the runner tail
+            // behind it) never waits on a NAS copy.
+            let owes_move = job.lock_ok().move_pending;
+            self.history.lock_ok().push(job.clone());
+            // §129 1a/1b: the record reaches its own store the moment it
+            // reaches history, and the lifecycle event replaces the
+            // dashboard's snapshot-diff toast inference. Then retention,
+            // which is a no-op unless the optional knobs are set.
+            let _ = self.history_upsert(std::slice::from_ref(&job));
+            self.life_emit_parked(&job);
+            self.history_enforce_retention();
+            if owes_move {
+                self.mover_enqueue(&job);
+            }
         }
         // The original failed → promote its best held ALTERNATIVE (M14f).
         // Not while an automatic retry is armed: the original is coming
@@ -5510,33 +5089,187 @@ impl Daemon {
         } else {
             String::new()
         };
-        let (moved, move_split) = self.relocate_completed(out_dir, cat, renamed);
-        // #20: the modes go on LAST, once the payload has stopped moving.
-        // Anything earlier is undone by the unpack, the rename passes or
-        // the relocation itself, all of which create files of their own.
-        // `moved` is the destination when the job was relocated, and that
-        // is the tree the *arr will actually look at.
+        // C: the move-completed relocation does NOT run here any more.
+        // This whole function sits on the finalize tail, and the runner
+        // awaits that tail before it may start the next job - so a
+        // multi-minute NAS copy used to stall the entire queue. The
+        // caller marks the job `move_pending` instead and the mover
+        // worker (spawn_mover) runs `relocate_completed` off-path.
+        let moved = renamed;
+        // #20: the modes go on LAST, once the payload has stopped moving
+        // here. The mover applies them again after its relocation, for
+        // the same reason and with the destination root.
         let umask = self.out_umask.load(Ordering::Relaxed);
         if umask <= 0o777 {
             let final_dir = moved.as_deref().unwrap_or(out_dir);
-            // Stop the parent walk at whichever root that tree belongs
-            // to: a moved job is under its destination, not under the
-            // download root, and walking past it would re-mode
-            // directories the user never gave us.
-            let root = moved
-                .as_deref()
-                .and_then(|_| self.move_completed.read_ok().clone())
-                .unwrap_or_else(|| self.out_root.read_ok().clone());
+            let root = self.out_root.read_ok().clone();
             crate::smart::apply_out_umask(final_dir, Some(&root), umask);
         }
         Finalized {
             moved,
-            move_split,
             suffix,
             filed_title,
             identify: identified,
             swept,
         }
+    }
+
+    /// The root a completed job in `cat` moves to, and whether it came
+    /// from the per-category override (`move_completed_cats`) rather
+    /// than the global completed folder. `None` = no destination is
+    /// configured for this category, which is the feature being off for
+    /// it.
+    ///
+    /// One lookup, three callers: the finalize gate
+    /// ([`Self::move_destination_configured`]), the move itself
+    /// ([`Self::relocate_completed`]) and the mover's lane key
+    /// ([`mover::lane_key_for`]). They must never disagree - a lane
+    /// keyed off a root the move does not use is a lane keyed off the
+    /// wrong device.
+    pub(super) fn move_dest_root(&self, cat: &str) -> Option<(PathBuf, bool)> {
+        // Per-category override wins, and applies even when the global
+        // destination is unset.
+        let cat_root = self
+            .move_completed_cats
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(c, _)| *c == cat)
+            .map(|(_, p)| p.clone());
+        match cat_root {
+            Some(p) => Some((p, true)),
+            None => self.move_completed.read_ok().clone().map(|p| (p, false)),
+        }
+    }
+
+    /// Is a move to a completed folder configured for this category?
+    /// The gate finalize uses to decide whether a finished job owes the
+    /// mover a visit.
+    pub(super) fn move_destination_configured(&self, cat: &str) -> bool {
+        self.move_dest_root(cat).is_some()
+    }
+
+    /// The mover's byte budget right now, in bytes/second. None = no
+    /// cap. Read per pacing decision, so a mode change or a download
+    /// starting mid-copy takes effect within one chunk.
+    ///
+    /// `wire_bps` is the caller's live measurement of what downloads
+    /// are pulling (the pacer samples the daemon's own progress
+    /// counter). Yield mode subtracts it from the line's capacity plus
+    /// a 10% margin: on most home setups downloads are receive and the
+    /// NAS copy is send, so the wire rarely contends - but CPU, disk
+    /// and the NAS itself do, and the download's own measured rate is
+    /// the one lever that tracks all of them.
+    pub(super) fn mover_budget_bps(&self, wire_bps: u64) -> Option<u64> {
+        let mode = self.move_pace.lock_ok().clone();
+        match mode.as_str() {
+            "full" => None,
+            "yield" | "" => {
+                // Idle queue: no cap. The threshold is generous so a
+                // trickling health probe does not throttle a 10 GbE
+                // copy to the floor.
+                if wire_bps < 1_000_000 {
+                    return None;
+                }
+                let line = match self.line_speed.load(Ordering::Relaxed) {
+                    0 => self.best_rate_bps.load(Ordering::Relaxed),
+                    l => l,
+                };
+                if line == 0 {
+                    // Nothing known about the line: fall back to a
+                    // fixed modest share rather than guessing zero.
+                    return Some(20_000_000);
+                }
+                Some((line.saturating_sub(wire_bps + line / 10)).max(5_000_000))
+            }
+            n => n.parse::<u64>().ok().map(|mb| mb.max(1) * 1_000_000),
+        }
+    }
+
+    /// Hand a finished job to the mover worker. Idempotent enough for
+    /// its callers: a job re-enqueued while already queued just gets
+    /// processed twice, and the second pass finds `move_pending` false
+    /// and does nothing.
+    pub(super) fn mover_enqueue(&self, job: &Arc<Mutex<Job>>) {
+        self.mover_q.lock_ok().push_back(job.clone());
+        self.mover_wake.notify_one();
+    }
+
+    /// One mover step: attempt the owed relocation for `job`. Runs on
+    /// the blocking pool (bulk I/O). Returns true when the job should
+    /// be RE-queued because another actor holds its files right now (a
+    /// recategorize mid-flight).
+    pub(super) fn mover_process(self: &Arc<Self>, job: &Arc<Mutex<Job>>) -> bool {
+        let (id, out_dir, cat) = {
+            let g = job.lock_ok();
+            if !g.move_pending || g.state != JobState::Completed || g.tombstone {
+                // Nothing owed (a delete or a second enqueue got here
+                // first). Clear the marker if it survived a tombstone,
+                // so a restart does not resurrect the move.
+                drop(g);
+                job.lock_ok().move_pending = false;
+                return false;
+            }
+            if g.finalizing {
+                // An unlock re-run owns the directory; it re-enqueues
+                // when it finishes.
+                return false;
+            }
+            (g.nzo_id.clone(), g.out_dir.clone(), g.category.clone())
+        };
+        // Same fence as recategorize and redrive: deletes and retries
+        // stand off while files are in flight.
+        if !self.moving.lock_ok().insert(id.clone()) {
+            return true; // busy - try again shortly
+        }
+        struct Fence(Arc<Daemon>, String);
+        impl Drop for Fence {
+            fn drop(&mut self) {
+                self.0.moving.lock_ok().remove(&self.1);
+            }
+        }
+        let _fence = Fence(self.clone(), id);
+        // Test-only: a move with visible width, so a test can watch the
+        // lanes overlap (and the fleet cap hold) on a machine with one
+        // volume, where every real move is an instant rename.
+        #[cfg(test)]
+        {
+            let ms = mover::TEST_MOVE_DELAY_MS.load(Ordering::Relaxed);
+            if ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
+        let (moved, split, failed) = self.relocate_completed(&out_dir, &cat, None);
+        let mut j = job.lock_ok();
+        j.move_pending = false;
+        j.move_failed = failed.unwrap_or_default();
+        j.move_split = match &split {
+            Some(src) => src.to_string_lossy().to_string(),
+            None => String::new(),
+        };
+        self.settle_move_attempt(&mut j);
+        if let Some(dest) = moved {
+            j.filed = j.tv_sort && is_season_dir(&dest);
+            j.out_dir = dest.clone();
+            drop(j);
+            // The modes go on after the payload stops moving (#20),
+            // rooted at the destination the files now live under.
+            let umask = self.out_umask.load(Ordering::Relaxed);
+            if umask <= 0o777 {
+                let root = self
+                    .move_dest_root(&cat)
+                    .map(|(r, _)| r)
+                    .unwrap_or_else(|| self.out_root.read_ok().clone());
+                crate::smart::apply_out_umask(&dest, Some(&root), umask);
+            }
+        } else {
+            drop(j);
+        }
+        // The record it just rewrote is a HISTORY record (movers run
+        // post-park) - its store line has to follow the bytes.
+        self.history_upsert_if_present(job);
+        self.save_queue();
+        false
     }
 
     /// Post-download synthesised naming (films): if the main video is
@@ -5604,6 +5337,52 @@ impl Daemon {
             .filter(|k| !k.is_empty())
     }
 
+    /// Why a move destination could not be reached, when the OS error
+    /// on its own reads as something it is not.
+    ///
+    /// `create_dir_all` reports the failure of the deepest component it
+    /// could not create. On macOS an absent network volume makes that
+    /// component a child of `/Volumes`, which is owned by root - so the
+    /// mkdir is refused for want of PERMISSION and the daemon logs
+    /// "Permission denied (os error 13)" for a destination whose real
+    /// problem is that nothing is mounted there. That message sent one
+    /// investigation after a TCC grant that was never involved (8 Aug
+    /// 2026); the filesystem could have said so in one line, so now it
+    /// does.
+    ///
+    /// Only speaks when a component ABOVE the job's own folder is
+    /// missing. The leaf being absent is the ordinary case - the mover
+    /// creates it - and saying so on every failure would be noise.
+    pub(super) fn unreachable_dest_hint(dest: &std::path::Path) -> Option<String> {
+        // `ancestors` walks leaf-first, so the last one that does not
+        // exist is the SHALLOWEST missing component: the thing whose
+        // absence explains all the others.
+        let mut missing: Option<&std::path::Path> = None;
+        for a in dest.ancestors() {
+            if a.exists() {
+                break;
+            }
+            missing = Some(a);
+        }
+        let missing = missing.filter(|m| *m != dest)?;
+        // A mount point is a child of the platform's volume root, and
+        // that is the mounted-or-not question rather than an ordinary
+        // absent folder.
+        let at_volume_root = missing.parent().and_then(|p| p.to_str()).is_some_and(|p| {
+            matches!(p, "/Volumes" | "/media" | "/mnt") || p.eq_ignore_ascii_case("/net")
+        });
+        Some(if at_volume_root {
+            format!(
+                " - {} does not exist, so that volume is probably not mounted \
+                 (its parent belongs to root, which is why an absent volume \
+                 reports as a permission error)",
+                missing.display()
+            )
+        } else {
+            format!(" - {} does not exist", missing.display())
+        })
+    }
+
     /// M33: relocate a finished job to the `move_completed` destination
     /// (a NAS share etc.), keeping the category subfolder and whatever
     /// renaming/Season-filing just produced. Returns the job's final
@@ -5620,29 +5399,30 @@ impl Daemon {
     /// path all pointing at a directory the files have left.
     ///
     /// Returns (the job's final directory when it changed, the SOURCE
-    /// directory that still holds part of the payload). The second is
-    /// `Some` only for the split case - UX §18: the split was logged and
-    /// then thrown away, so history painted the job green and named
-    /// exactly one of the two folders it was now in.
+    /// directory that still holds part of the payload, why nothing
+    /// moved). The second is `Some` only for the split case - UX §18:
+    /// the split was logged and then thrown away, so history painted the
+    /// job green and named exactly one of the two folders it was now in.
+    /// The third is `Some` only for the nothing-moved failure, and it
+    /// exists for the same reason: the error was logged and then thrown
+    /// away, so a completed job whose files never left the download
+    /// folder looked exactly like one whose files did (7 Aug 2026 -
+    /// five of them, for hours). It feeds [`Job::move_failed`], and
+    /// with a destination configured this function now never declines
+    /// silently: every outcome is a log line, including "already
+    /// there".
     pub(super) fn relocate_completed(
         &self,
         out_dir: &std::path::Path,
         cat: &str,
         renamed: Option<PathBuf>,
-    ) -> (Option<PathBuf>, Option<PathBuf>) {
-        // Per-category override wins; it IS that category's root, so
-        // the category component is not repeated inside it. Overrides
-        // apply even when the global destination is unset.
-        let cat_root = self
-            .move_completed_cats
-            .read()
-            .unwrap()
-            .iter()
-            .find(|(c, _)| *c == cat)
-            .map(|(_, p)| p.clone());
-        let global = self.move_completed.read_ok().clone();
-        let Some(root) = cat_root.clone().or(global) else {
-            return (renamed, None);
+    ) -> (Option<PathBuf>, Option<PathBuf>, Option<String>) {
+        // A per-category override IS that category's root, so the
+        // category component is not repeated inside it - which is what
+        // `from_cat` is for below.
+        let Some((root, from_cat)) = self.move_dest_root(cat) else {
+            // The one legitimately silent decline: the feature is off.
+            return (renamed, None, None);
         };
         let cur = renamed.clone().unwrap_or_else(|| out_dir.to_path_buf());
         // Mirror the layout under the destination: the path relative to
@@ -5660,7 +5440,7 @@ impl Daemon {
                     PathBuf::from(cat).join(base)
                 }
             });
-        if cat_root.is_some()
+        if from_cat
             && !cat.is_empty()
             && let Ok(r) = rel.strip_prefix(cat)
         {
@@ -5688,7 +5468,17 @@ impl Daemon {
                 _ => false,
             };
         if same_place {
-            return (renamed, None);
+            // Not silent: with a destination configured, "no move
+            // happened" and "the move was not owed" have to be
+            // distinguishable from the outside. This is the line that
+            // was missing while five finished jobs sat in the download
+            // folder with nothing anywhere saying why.
+            info!(
+                target: "move",
+                "{} is already inside the completed folder - nothing to move",
+                cur.display()
+            );
+            return (renamed, None, None);
         }
         // One dirent walk of the job's own folder, so a failure can be
         // told apart: nothing moved (the job is still where it was) or
@@ -5697,10 +5487,15 @@ impl Daemon {
         // it merges with what is already there, so a Season folder on a
         // NAS looks non-empty whether our files reached it or not.
         let before = file_count(&cur);
-        match crate::smart::move_tree(&cur, &dest) {
+        // Paced: the mover must never slow a live download (mode
+        // "yield", the default), and the pacer reads the mode live so
+        // a settings change lands within one chunk. The bucket behind
+        // it is the daemon's, shared by every lane copying right now.
+        let pace = mover::mover_pacer(self);
+        match crate::smart::move_tree_paced(&cur, &dest, Some(&pace)) {
             Ok(()) => {
                 info!(target: "move", "completed → {}", dest.display());
-                (Some(dest), None)
+                (Some(dest), None, None)
             }
             Err(e) => {
                 // NOT the flat "leaving files in place" this used to say.
@@ -5710,9 +5505,13 @@ impl Daemon {
                 // in exactly one of the two directories the job was now in.
                 // Say which case this was rather than assuming either.
                 let moved_some = file_count(&cur) < before;
+                // Composed once and carried into BOTH the log line and
+                // the job record: the record outlives the ring, and it
+                // is the one the dashboard shows.
+                let hint = Self::unreachable_dest_hint(&dest).unwrap_or_default();
                 error!(
                     target: "move",
-                    "{} → {}: {e}\n\
+                    "{} → {}: {e}{hint}\n\
                      [move] {}",
                     cur.display(),
                     dest.display(),
@@ -5735,9 +5534,17 @@ impl Daemon {
                 // say the payload is in TWO places - the log line above
                 // is the only other witness, and it rolls out of the ring.
                 if moved_some {
-                    (Some(dest), Some(cur))
+                    (Some(dest), Some(cur), None)
                 } else {
-                    (renamed, None)
+                    // Destination + error, composed here because only
+                    // this moment has both. It becomes Job::move_failed:
+                    // the amber row, the drawer line and the auto-retry
+                    // all hang off it.
+                    (
+                        renamed,
+                        None,
+                        Some(format!("{}: {e}{hint}", dest.display())),
+                    )
                 }
             }
         }
@@ -5791,11 +5598,7 @@ impl Daemon {
     /// to the picked job as the fetch spawns and is the thing the
     /// watchdog already steers by.
     pub(super) fn owns_hub(&self, want: impl Fn(&str) -> bool) -> bool {
-        self.active_stream
-            .lock()
-            .unwrap()
-            .as_deref()
-            .is_some_and(want)
+        self.active_stream.lock_ok().as_deref().is_some_and(want)
     }
 
     /// The wire status for a job that has left the network but is still
@@ -5957,15 +5760,14 @@ impl Daemon {
 
     /// M32: re-queue any Failed history job whose auto-retry cooldown has
     /// elapsed. Called from the scheduler loop; one lock + linear scan.
-    pub(super) fn run_due_auto_retries(&self) {
+    pub(super) fn run_due_auto_retries(self: &Arc<Self>) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         let due: Vec<(String, String)> = self
             .history
-            .lock()
-            .unwrap()
+            .lock_ok()
             .iter()
             .filter_map(|j| {
                 let g = j.lock_ok();
@@ -5990,6 +5792,179 @@ impl Daemon {
                 }
             }
         }
+        // The other half of the cooldown: a COMPLETED job whose move to
+        // the completed folder failed retries the MOVE, never the
+        // download. Separate arm on purpose - `retry` above would pull
+        // the record out of history and re-fetch a payload that is
+        // already whole on disk.
+        let due_moves: Vec<String> = self
+            .history
+            .lock_ok()
+            .iter()
+            .filter_map(|j| {
+                let g = j.lock_ok();
+                (g.state == JobState::Completed
+                    && !g.move_failed.is_empty()
+                    && g.auto_retry_at.is_some_and(|t| t <= now))
+                .then(|| g.nzo_id.clone())
+            })
+            .collect();
+        for id in due_moves {
+            self.redrive_move(&id);
+        }
+    }
+
+    /// Record what one move attempt did to the job and arm - or refuse
+    /// to arm - the next automatic try. Call with the job lock held,
+    /// once `move_failed` carries the attempt's outcome.
+    ///
+    /// The one place the ladder lives. Both movers (the finalize-side
+    /// worker and the scheduler's redrive) used to carry their own copy
+    /// of "re-arm the flat cooldown", which is how the retry stayed
+    /// unbounded in two places at once: nothing counted the attempts,
+    /// so nothing could grow the delay or ever stop. An unreachable
+    /// destination is not a transient the way a missing article is -
+    /// an unmounted destination volume logged 45 identical EACCES
+    /// failures over 15 hours on 8 Aug 2026, and the 45th was as
+    /// uninformative as the first.
+    ///
+    /// Giving up is not giving up on the payload: every byte is whole
+    /// at `out_dir`, the row stays amber, the drawer still names the
+    /// destination and the error, and `Try the move now` restarts the
+    /// ladder the moment the user has fixed what was wrong.
+    pub(super) fn settle_move_attempt(&self, j: &mut Job) {
+        if j.move_failed.is_empty() {
+            j.move_attempts = 0;
+            // Only ever disarm OUR reason: a stamp left by anything
+            // else is not this function's to clear.
+            if j.auto_retry_why.as_deref() == Some("move") {
+                j.auto_retry_at = None;
+                j.auto_retry_why = None;
+            }
+            return;
+        }
+        j.move_attempts = j.move_attempts.saturating_add(1);
+        let base = self.auto_retry_secs.load(Ordering::Relaxed);
+        // Zero is the user turning automatic retries off outright, and
+        // it is not a give-up worth logging - they asked for this.
+        if base == 0 {
+            return;
+        }
+        if j.move_attempts >= MOVE_RETRY_GIVE_UP {
+            // Disarm rather than merely declining to re-arm. The
+            // redrive clears the stamp before it tries, so this is
+            // usually already None - but the finalize-side mover does
+            // not, and a stamp left behind here is the scheduler's cue
+            // to run the whole ladder again, which is the unbounded
+            // loop this function exists to end.
+            j.auto_retry_at = None;
+            j.auto_retry_why = None;
+            warn!(
+                target: "move",
+                "{}: giving up on the move after {} failed attempts - {}. \
+                 The download is safe at {}; \"Try the move now\" in its \
+                 history drawer starts a fresh ladder.",
+                j.nzo_id,
+                j.move_attempts,
+                j.move_failed,
+                j.out_dir.display()
+            );
+            return;
+        }
+        let secs = move_retry_delay(base, j.move_attempts);
+        j.auto_retry_at = Some(unix_now() as u64 + secs);
+        j.auto_retry_why = Some("move".to_string());
+    }
+
+    /// Re-attempt the move-completed relocation for a parked Completed
+    /// job whose first attempt failed (Job::move_failed). Files only -
+    /// the download is done and stays done. Returns false when the job
+    /// is missing, unfenced state forbids it, or no failure is recorded.
+    ///
+    /// The observed failure mode this exists for is transient: macOS
+    /// denied a network volume to the daemon for a moment and allowed
+    /// it minutes later (7 Aug 2026), so "try again on the M32
+    /// cooldown" converts hours of silently-stranded payloads into one
+    /// delayed move. On another failure the cooldown re-arms - each
+    /// attempt is one create_dir plus one copy that stops at the first
+    /// error, so a persistently absent NAS costs a probe per cycle, not
+    /// a re-download.
+    pub(super) fn redrive_move(self: &Arc<Self>, nzo_id: &str) -> bool {
+        let Some(job) = self.history_job(nzo_id) else {
+            return false;
+        };
+        // Same fence pair the recategorize path takes, for the same
+        // reasons: `moving` keeps deletes/retries off the payload while
+        // files are in flight, and `finalizing` means the tail already
+        // owns the directory. The fence is dropped by the guard inside
+        // the blocking task, so it holds exactly as long as files can
+        // be moving; the early-out paths below release it by hand.
+        if !self.moving.lock_ok().insert(nzo_id.to_string()) {
+            return false;
+        }
+        struct MoveClaim(Arc<Daemon>, String);
+        impl Drop for MoveClaim {
+            fn drop(&mut self) {
+                self.0.moving.lock_ok().remove(&self.1);
+            }
+        }
+        let claim = MoveClaim(self.clone(), nzo_id.to_string());
+        let (out_dir, cat) = {
+            let mut g = job.lock_ok();
+            if g.state != JobState::Completed || g.finalizing || g.move_failed.is_empty() {
+                return false; // claim drops here, releasing the fence
+            }
+            // Disarm before the attempt so a success does not leave a
+            // stale cooldown ticking; a failure re-arms below.
+            g.auto_retry_at = None;
+            g.auto_retry_why = None;
+            (g.out_dir.clone(), g.category.clone())
+        };
+        let d = self.clone();
+        let job2 = job.clone();
+        let id2 = nzo_id.to_string();
+        // The copy is bulk I/O - blocking pool, with the fence riding
+        // along in `claim` so it cannot be released before the move
+        // settles.
+        tokio::task::spawn_blocking(move || {
+            let _claim = claim;
+            info!(target: "move", "{id2}: retrying the move to the completed folder");
+            let (moved, split, failed) = d.relocate_completed(&out_dir, &cat, None);
+            let mut j = job2.lock_ok();
+            j.move_failed = failed.unwrap_or_default();
+            j.move_split = match &split {
+                Some(src) => src.to_string_lossy().to_string(),
+                None => String::new(),
+            };
+            if let Some(dest) = moved {
+                j.filed = j.tv_sort && is_season_dir(&dest);
+                j.out_dir = dest;
+            }
+            // Arms the NEXT rung, or stops the ladder. The disarm above
+            // ran before the attempt, so this is the only thing that
+            // can leave a stamp behind.
+            d.settle_move_attempt(&mut j);
+            drop(j);
+            d.history_upsert_if_present(&job2);
+            d.save_queue();
+        });
+        true
+    }
+
+    /// The drawer button's redrive: forget the failed-attempt count
+    /// first, then try.
+    ///
+    /// A user pressing "Try the move now" has almost always just fixed
+    /// the thing that was wrong - mounted the volume, granted the
+    /// share, freed the disk - so the ladder starts again from its
+    /// first rung, and a job the daemon had given up on becomes
+    /// automatic again. Without the reset, one manual press on a job at
+    /// the give-up count would try exactly once and go quiet forever.
+    pub(super) fn retry_move_now(self: &Arc<Self>, nzo_id: &str) -> bool {
+        if let Some(job) = self.history_job(nzo_id) {
+            job.lock_ok().move_attempts = 0;
+        }
+        self.redrive_move(nzo_id)
     }
 
     pub(super) fn retry(&self, nzo_id: &str) -> bool {
@@ -6133,6 +6108,9 @@ impl Daemon {
         }
         self.queue.lock_ok().push_back(job);
         drop(publish);
+        // The record has LEFT history: stop it replaying there. Its new
+        // life as a queue record is save_queue's to persist.
+        self.history_tombstone(&[nzo_id.to_string()]);
         self.save_queue();
         true
     }
@@ -6161,23 +6139,23 @@ impl Daemon {
         let _g = IO.lock_ok();
         let jobs: Vec<Value> = self
             .queue
-            .lock()
-            .unwrap()
+            .lock_ok()
             .iter()
             .map(|j| job_json(&j.lock_ok()))
             .collect();
-        let hist: Vec<Value> = self
-            .history
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|j| job_json(&j.lock_ok()))
-            .collect();
+        // §129 1a: history is NOT here any more. It lives in its own
+        // append-only store (`histstore.rs`), written by the sites that
+        // actually change it - park, delete, retry, recategorize, the
+        // unlock/mover bookkeeping - so an unlimited history stops
+        // costing every queue mutation an O(all-time) rewrite.
         let v = json!({
             "next_id": self.next_id.load(Ordering::Relaxed),
             "queue": jobs,
-            "history": hist,
         });
+        // The dashboard's change handle, bumped WITH the write: a queue
+        // change that should survive restart comes through here, so the
+        // revision sees it by construction.
+        self.queue_rev.fetch_add(1, Ordering::Relaxed);
         let path = self.spool.join("queue.json");
         match serde_json::to_string_pretty(&v) {
             Ok(text) => match crate::persist::write_atomic(&path, text.as_bytes()) {
@@ -6221,28 +6199,83 @@ impl Daemon {
         // A torn/corrupt file falls back to the .bak of the last good
         // parse - never "start empty" and let the next save_queue make
         // the loss permanent.
-        let Some(v) = crate::persist::load_json_with_backup(&path) else {
-            return;
+        // §129 1a: history has its own store now. Replay it FIRST so the
+        // legacy-migration merge below can prefer the newer layout when
+        // both name an id (a crash between the split's two writes).
+        let (stored_hist, wants_compaction) = self.history_replay();
+        let (v, mut legacy_hist) = match crate::persist::load_json_with_backup(&path) {
+            Some(v) => {
+                let legacy = v
+                    .get("history")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                (Some(v), legacy)
+            }
+            None => (None, Vec::new()),
         };
-        let arr = |k: &str| {
-            v.get(k)
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-        };
-        let (queued, history) = restore_records(&arr("queue"), &arr("history"));
+        // Records already living in history.jsonl win over their legacy
+        // queue.json copies - the split happened, then something wrote
+        // history.jsonl, then the queue.json rewrite was lost.
+        legacy_hist.retain(|r| {
+            r.get("nzo_id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| !stored_hist.iter().any(|j| j.nzo_id == id))
+        });
+        let migrating = !legacy_hist.is_empty();
+        let queue_arr = v
+            .as_ref()
+            .and_then(|v| v.get("queue"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let (queued, from_file) = restore_records(&queue_arr, &legacy_hist);
+        // `from_file` is the legacy history records plus any terminal
+        // records restore_records routed OUT of the queue array
+        // (interrupted post-processing). Order for the final Vec, oldest
+        // first: legacy array, then the store's records, then the routed
+        // ones (they finished last, mid-shutdown). A routed record whose
+        // park already reached history.jsonl before the crash keeps the
+        // store's copy.
+        let legacy_ids: std::collections::HashSet<String> = legacy_hist
+            .iter()
+            .filter_map(|r| r.get("nzo_id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        let (legacy_part, routed): (Vec<Job>, Vec<Job>) = from_file
+            .into_iter()
+            .partition(|j| legacy_ids.contains(&j.nzo_id));
+        let routed: Vec<Job> = routed
+            .into_iter()
+            .filter(|j| !stored_hist.iter().any(|s| s.nzo_id == j.nzo_id))
+            .collect();
+        let routed_any = !routed.is_empty();
+        let mut history = legacy_part;
+        history.extend(stored_hist);
+        history.extend(routed);
         let (nq, nh) = (queued.len(), history.len());
         for job in queued {
             self.register_cat(&job.category);
-            self.queue
-                .lock()
-                .unwrap()
-                .push_back(Arc::new(Mutex::new(job)));
+            self.queue.lock_ok().push_back(Arc::new(Mutex::new(job)));
         }
         for job in history {
             self.register_cat(&job.category);
             self.history.lock_ok().push(Arc::new(Mutex::new(job)));
         }
+        let v = match v {
+            Some(v) => v,
+            None => {
+                // No queue.json at all, but maybe a history store.
+                if wants_compaction {
+                    self.history_compact();
+                }
+                self.history_enforce_retention();
+                if nh > 0 {
+                    info!(target: "queue", "restored {nh} history jobs");
+                }
+                return;
+            }
+        };
         if let Some(n) = v.get("next_id").and_then(Value::as_u64) {
             // Never reuse an id - SABnzbd clients key on nzo_id uniqueness,
             // and stream tokens are H(secret, nzo_id): a reused id would
@@ -6256,6 +6289,24 @@ impl Daemon {
             self.next_id
                 .store(n.max(cur).max(Self::id_floor()), Ordering::Relaxed);
         }
+        // The one-time split, and the store's own housekeeping. Compact
+        // FIRST (it writes every live record, so migrated and routed
+        // rows land in history.jsonl), then rewrite queue.json without
+        // its history array - in that order, so a crash between the two
+        // duplicates records into both files (deduped above on the next
+        // boot) rather than losing them from both.
+        if migrating || routed_any || wants_compaction {
+            self.history_compact();
+        }
+        if migrating {
+            self.save_queue();
+            info!(
+                target: "queue",
+                "history moved out of queue.json into its own store ({} records)",
+                nh
+            );
+        }
+        self.history_enforce_retention();
         if nq + nh > 0 {
             info!(target: "queue", "restored {nq} queued + {nh} history jobs");
         }

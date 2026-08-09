@@ -162,23 +162,35 @@ impl QuotaLedger {
     }
 
     /// Identity token for the current quota period: daily quotas roll at
-    /// LOCAL midnight, monthly ones on the local 1st. Encoded as
-    /// days*86_400 of the period's first (local) civil day - a pure
-    /// function of the civil date, so it is stable across DST shifts
-    /// inside a period, and identical to the old UTC-based values on a
-    /// UTC machine, so upgrading doesn't spuriously reset the ledger.
+    /// LOCAL midnight, weekly ones on the local Monday, monthly ones on
+    /// the local 1st. Encoded as days*86_400 of the period's first
+    /// (local) civil day - a pure function of the civil date, so it is
+    /// stable across DST shifts inside a period, and identical to the
+    /// old UTC-based values on a UTC machine, so upgrading doesn't
+    /// spuriously reset the ledger.
     pub(super) fn period_start(period: char) -> u64 {
         Self::period_start_on(period, Self::local_civil_today())
     }
 
     /// The pure half of `period_start` - see the timezone-boundary tests.
     pub(super) fn period_start_on(period: char, (y, m, d): (i64, u32, u32)) -> u64 {
-        let dom = if period == 'm' { 1 } else { d };
         // A clock set before 1970 gives negative days; the straight
         // `as u64` cast wrapped huge and the multiply overflowed (debug
         // panic in the download runner's tick). Clamp to epoch - the
         // token only has to CHANGE when the period rolls.
-        days_from_civil(y, m, dom).max(0) as u64 * 86_400
+        let days = match period {
+            'm' => days_from_civil(y, m, 1),
+            // §129 2g: back to the most recent Monday. Epoch day 0 was
+            // a Thursday, so (days + 3) mod 7 is the Monday-based
+            // weekday; rem_euclid keeps pre-epoch dates from going
+            // negative before the clamp.
+            'w' => {
+                let days = days_from_civil(y, m, d);
+                days - (days.rem_euclid(7) + 3) % 7
+            }
+            _ => days_from_civil(y, m, d),
+        };
+        days.max(0) as u64 * 86_400
     }
 
     pub(super) fn open(spool: &std::path::Path, period: char) -> Self {

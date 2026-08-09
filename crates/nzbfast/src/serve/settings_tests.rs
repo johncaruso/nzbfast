@@ -261,9 +261,15 @@ fn set_verify_mode_moves_the_flag_pair() {
 fn set_quota_period_accepts_both_cases() {
     let (_t, d) = daemon_in("quotap");
     d.quota_period.store(b'd', Ordering::Relaxed);
-    let e = set_quota_period(&d, "quota_period", "w").unwrap_err();
-    assert!(e.contains("d or m"), "{e}");
+    let e = set_quota_period(&d, "quota_period", "y").unwrap_err();
+    assert!(e.contains("d, w or m"), "{e}");
     assert_eq!(d.quota_period.load(Ordering::Relaxed), b'd');
+    // §129 2g: weekly joined the menu.
+    assert_eq!(
+        set_quota_period(&d, "quota_period", "W").unwrap(),
+        (true, json!("w"))
+    );
+    assert_eq!(d.quota_period.load(Ordering::Relaxed), b'w');
     assert_eq!(
         set_quota_period(&d, "quota_period", "M").unwrap(),
         (true, json!("m"))

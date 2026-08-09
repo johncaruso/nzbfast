@@ -45,8 +45,9 @@ cp "$REPO/COPYRIGHT.md" "$STAGE/.extras/COPYRIGHT.md"
 cp "$APP/Contents/Resources/NzbFast.icns" "$STAGE/.VolumeIcon.icns"
 
 # Background: render the committed SVG at 2x, mark it 144 dpi so Finder
-# draws it at 660x660 points, crisp on retina (the 660x400 window shows
-# the styled top; the square canvas avoids qlmanage's white padding).
+# draws it at 660x660 points, crisp on retina (the window's 660x400
+# content area shows the styled top; the square canvas avoids qlmanage's
+# white padding).
 qlmanage -t -s 1320 -o "$STAGE/.background" dmg-background.svg >/dev/null
 mv "$STAGE/.background/dmg-background.svg.png" "$STAGE/.background/background.png"
 sips -s dpiWidth 144 -s dpiHeight 144 "$STAGE/.background/background.png" >/dev/null

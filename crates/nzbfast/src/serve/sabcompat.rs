@@ -673,7 +673,8 @@ fn slot_progress(
         // repair, unpack, unlock, rename, and the move to the
         // destination). Reporting 0% with everything still to fetch made
         // a finished download look like it had gone backwards.
-        None if tail || state == JobState::Completed => (100, 0),
+        // `Finishing` (§129) is that tail as a state of its own.
+        None if tail || matches!(state, JobState::Completed | JobState::Finishing) => (100, 0),
         None if state == JobState::Downloading => (0, total_bytes),
         // Decoded bytes against an encoded total, so this reads a few
         // percent shy of the truth (audit #15). A floor, never an
@@ -683,6 +684,101 @@ fn slot_progress(
             total_bytes.saturating_sub(downloaded_bytes.min(total_bytes)),
         ),
     }
+}
+
+/// The scheduler-hold banner facts. `a`/`b` shipped first and stay,
+/// because the dashboard reads them - but a caller cannot tell which is
+/// which, and the pair means different things per reason: name them.
+/// Both numbers are gigabytes, except the §129 postproc backpressure
+/// pair, which is a count and its bound.
+fn hold_json(k: &str, a: f64, b: f64) -> Value {
+    let mut o = serde_json::Map::new();
+    o.insert("kind".into(), json!(k));
+    o.insert("reason".into(), json!(k));
+    o.insert("a".into(), json!(a));
+    o.insert("b".into(), json!(b));
+    match k {
+        "disk" => {
+            o.insert("free_gb".into(), json!(a));
+            o.insert("min_free_gb".into(), json!(b));
+        }
+        "postproc" => {
+            o.insert("finishing".into(), json!(a));
+            o.insert("bound".into(), json!(b));
+        }
+        _ => {
+            o.insert("spent_gb".into(), json!(a));
+            o.insert("cap_gb".into(), json!(b));
+        }
+    }
+    Value::Object(o)
+}
+
+/// Unix seconds when downloading is expected to resume by itself.
+/// Null unless something has actually promised a time: a timed pause
+/// (its own deadline, to the second - `pause_int` rounds up to whole
+/// minutes and would say "1m left" for four seconds) or a schedule
+/// with a Resume entry ahead of it.
+fn resume_at(d: &Daemon, paused_now: bool, pause_source: &str) -> Option<i64> {
+    if !paused_now {
+        None
+    } else if let Some(left) = d
+        .pause_until
+        .lock_ok()
+        .map(|t| t.saturating_duration_since(Instant::now()).as_secs().max(1))
+    {
+        Some(job::unix_now() + left as i64)
+    } else if pause_source == "schedule" {
+        let entries = d.schedule.lock_ok().clone();
+        next_resume_in(&entries, local_minute_of_week())
+            .map(|mins| job::unix_now() + i64::from(mins) * 60)
+    } else {
+        None
+    }
+}
+
+/// Watch-folder rejects: shown in the Queue card with a Delete button
+/// (mode=watch_failed_delete). Sorted for a stable render. Built
+/// outside json! - the macro can't parse a typed let binding.
+fn watch_failed_json(d: &Daemon) -> Vec<Value> {
+    let wf = d.watch_failed.lock_ok();
+    let mut v: Vec<_> = wf
+        .iter()
+        .map(|(p, (_, _, err, id))| {
+            (
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                err.clone(),
+                id.clone(),
+                // What Delete addresses. Two watch folders can hold
+                // rejected files of the same NAME, and the basename
+                // then names neither of them (Codex sweep 2,
+                // 3 Aug L1).
+                crate::serve::tasks::watch_fail_id(p),
+            )
+        })
+        .collect();
+    v.sort();
+    v.into_iter()
+        .map(|(name, error, nzo_id, wf_id)| {
+            // The strip used to render one sentence for all six of
+            // these, four of which are successes with an unfinished
+            // file beside them. `kind` is the token it switches on
+            // and `ingested` is the half that decides whether Delete
+            // is safe here - both derived by the classifier that
+            // lives beside the strings that produced them.
+            let kind = crate::serve::tasks::watch_fail_kind(&error);
+            json!({"name": name, "error": error, "kind": kind,
+                   "ingested": crate::serve::tasks::watch_fail_ingested(kind),
+                   // The queue or history record that made this file
+                   // redundant, for the states that have one.
+                   "nzo_id": nzo_id,
+                   // The handle Delete sends back.
+                   "id": wf_id})
+        })
+        .collect()
 }
 
 pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, String>) -> Value {
@@ -713,28 +809,11 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
     let free_now = free_bytes(&d.out_dir());
     // Why nothing is starting, if the scheduler is holding the queue -
     // the dashboard renders this instead of an unexplained "idle".
-    let hold = d.queue_hold.lock_ok().as_ref().map(|(k, a, b)| {
-        // `a`/`b` shipped first and stay, because the dashboard reads
-        // them - but a caller holding this payload cannot tell which is
-        // which, and the pair means different things per reason. Name
-        // them, units included: both numbers are gigabytes.
-        let mut o = serde_json::Map::new();
-        o.insert("kind".into(), json!(k));
-        o.insert("reason".into(), json!(k));
-        o.insert("a".into(), json!(a));
-        o.insert("b".into(), json!(b));
-        match k.as_str() {
-            "disk" => {
-                o.insert("free_gb".into(), json!(a));
-                o.insert("min_free_gb".into(), json!(b));
-            }
-            _ => {
-                o.insert("spent_gb".into(), json!(a));
-                o.insert("cap_gb".into(), json!(b));
-            }
-        }
-        Value::Object(o)
-    });
+    let hold = d
+        .queue_hold
+        .lock_ok()
+        .as_ref()
+        .map(|(k, a, b)| hold_json(k, *a, *b));
     let q = d.queue.lock_ok();
     // §91: the active job's progress is read fresh at every pairing with
     // a slot's state (see `active_left` below), never snapshotted up
@@ -851,12 +930,11 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
             // §91: both sampled under this slot's lock, after its state
             // was read, so (status, percentage) is one instant.
             //
-            // The pipeline's own phase word for this job once it is past
-            // the network: the queue has no state for the tail, so this
-            // is what tells a finishing job from a downloading one. A
-            // suspended job is answering "Paused" below and its phase
-            // would only contradict that.
-            let phase = (j.state == JobState::Downloading && !j.suspended)
+            // The pipeline's own phase word once past the network; a
+            // suspended job answers "Paused" below and its phase would
+            // only contradict that.
+            let phase = (matches!(j.state, JobState::Downloading | JobState::Finishing)
+                && !j.suspended)
                 .then(|| d.tail_phase(&j.nzo_id))
                 .flatten();
             let live = (j.state == JobState::Downloading)
@@ -902,6 +980,12 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
                 // The whole post-network tail: repair hand-off, unlock,
                 // rename, the move to the destination.
                 JobState::Completed => ("finalizing", String::new(), None),
+                // §129: the activity map still carries the REAL stage.
+                JobState::Finishing => (
+                    activity_map.get(&j.nzo_id).copied().unwrap_or("finalizing"),
+                    String::new(),
+                    None,
+                ),
                 JobState::Downloading if !j.suspended => {
                     let tok = activity_map.get(&j.nzo_id).copied().unwrap_or("fetching");
                     if tok == "fetching" && active_id.as_deref() == Some(j.nzo_id.as_str()) {
@@ -993,6 +1077,9 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
                     // keep waiting".
                     JobState::Downloading if phase.is_some() => phase.unwrap_or("Downloading"),
                     JobState::Downloading => "Downloading",
+                    // §129: SAB's own stage words; "Moving" for the
+                    // finalize window - no new compat vocabulary.
+                    JobState::Finishing => phase.unwrap_or("Moving"),
                     _ if j.paused => "Paused",
                     // `Completed` is set when the NETWORK leg ends, well
                     // before repair hand-off, unlock, rename and the move
@@ -1005,6 +1092,9 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
                     JobState::Completed => "Moving",
                     _ => "Queued",
                 },
+                // Ours, not SAB's (additive): the dashboard's state
+                // word; `status` keeps SAB vocabulary for the *arrs.
+                "finishing": j.state == JobState::Finishing,
                 "index": i,
                 "percentage": format!("{pct}"),
                 "mb": format!("{:.2}", j.total_bytes as f64 / API_MB),
@@ -1033,6 +1123,12 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
                 // rule matched.
                 "smart_rule": j.smart_rule,
                 "duplicate_key": j.dupe_key.as_deref().unwrap_or(""),
+                // §129 2b: the SAB pp level the add requested (null =
+                // none named) and the job's script= override - the
+                // drawer shows the one-pass mapping instead of the
+                // params silently vanishing.
+                "sab_pp": j.sab_pp,
+                "script_override": j.script_override,
                 // M24, ours like `origin`: the queue drawer's password
                 // control shows whether one is already attached. The
                 // value itself never leaves the daemon - history's
@@ -1112,26 +1208,7 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
     } else {
         *d.pause_source.lock_ok()
     };
-    // Unix seconds when downloading is expected to resume by itself.
-    // Null unless something has actually promised a time: a timed pause
-    // (its own deadline, to the second - `pause_int` rounds up to whole
-    // minutes and would say "1m left" for four seconds) or a schedule
-    // with a Resume entry ahead of it.
-    let resume_at = if !paused_now {
-        None
-    } else if let Some(left) = d
-        .pause_until
-        .lock_ok()
-        .map(|t| t.saturating_duration_since(Instant::now()).as_secs().max(1))
-    {
-        Some(job::unix_now() + left as i64)
-    } else if pause_source == "schedule" {
-        let entries = d.schedule.lock_ok().clone();
-        next_resume_in(&entries, local_minute_of_week())
-            .map(|mins| job::unix_now() + i64::from(mins) * 60)
-    } else {
-        None
-    };
+    let resume_at = resume_at(d, paused_now, pause_source);
     // Who chose the speed cap now in force. The auto governor moves the
     // number every second, so it names itself here rather than writing
     // "auto" over the operator's stored source on every step.
@@ -1140,49 +1217,7 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
     } else {
         *d.limit_source.lock_ok()
     };
-    // Watch-folder rejects: shown in the Queue card with a Delete button
-    // (mode=watch_failed_delete). Sorted for a stable render. Built
-    // outside json! - the macro can't parse a typed let binding.
-    let watch_failed: Vec<Value> = {
-        let wf = d.watch_failed.lock_ok();
-        let mut v: Vec<_> = wf
-            .iter()
-            .map(|(p, (_, _, err, id))| {
-                (
-                    p.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string(),
-                    err.clone(),
-                    id.clone(),
-                    // What Delete addresses. Two watch folders can hold
-                    // rejected files of the same NAME, and the basename
-                    // then names neither of them (Codex sweep 2,
-                    // 3 Aug L1).
-                    crate::serve::tasks::watch_fail_id(p),
-                )
-            })
-            .collect();
-        v.sort();
-        v.into_iter()
-            .map(|(name, error, nzo_id, wf_id)| {
-                // The strip used to render one sentence for all six of
-                // these, four of which are successes with an unfinished
-                // file beside them. `kind` is the token it switches on
-                // and `ingested` is the half that decides whether Delete
-                // is safe here - both derived by the classifier that
-                // lives beside the strings that produced them.
-                let kind = crate::serve::tasks::watch_fail_kind(&error);
-                json!({"name": name, "error": error, "kind": kind,
-                       "ingested": crate::serve::tasks::watch_fail_ingested(kind),
-                       // The queue or history record that made this file
-                       // redundant, for the states that have one.
-                       "nzo_id": nzo_id,
-                       // The handle Delete sends back.
-                       "id": wf_id})
-            })
-            .collect()
-    };
+    let watch_failed = watch_failed_json(d);
     // Recent watch-folder pickups, newest last. The dashboard toasts the
     // ones stamped after its own first poll, so a page opened later never
     // replays old events. Like watch_failed, built outside json!.
@@ -1309,7 +1344,7 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         // Ours: {kind:"disk"|"quota", a, b} while the scheduler holds
         // the queue (a/b are free/floor or spent/cap, in GB). Null when
         // downloads can start. The *arrs ignore unknown keys.
-        "hold": hold,
+        "hold": hold, "storage_pause": crate::serve::slowstore::payload(d),
         "speedlimit_abs": d.hub.rate.get(),
         // The configured line speed, bytes/sec, 0 when unset. Ours: the
         // header's limit menu offers percentage presets only once this
@@ -1321,6 +1356,10 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         // unknown); source "measured" or "line" (see serve/linkpeak.rs).
         "link_peak": peak_bps, "link_peak_src": peak_src,
         "link_line_hint": line_hint,
+        // §129 4b: the layer that owns the current shortfall, with the
+        // numbers that convicted it - or null when no job is on the
+        // wire. Tokens only; the dashboard owns the words.
+        "whyslow": d.whyslow.payload(d),
         "auto_speed": d.auto_speed.load(Ordering::Relaxed),
         "watch_failed": watch_failed,
         "watch_picked": watch_picked,
@@ -1516,7 +1555,8 @@ fn jr_listgroups(d: &Arc<Daemon>) -> Value {
                 // instant - a snapshot from before the queue walk
                 // could pair the previous job's progress with a
                 // group that started downloading mid-walk.
-                let phase = (g.state == JobState::Downloading && !g.suspended)
+                let phase = (matches!(g.state, JobState::Downloading | JobState::Finishing)
+                    && !g.suspended)
                     .then(|| d.tail_phase(&g.nzo_id))
                     .flatten();
                 let tail = phase.is_some();
@@ -1583,7 +1623,14 @@ fn jr_listgroups(d: &Arc<Daemon>) -> Value {
                             Some("Extracting") => "UNPACKING",
                             Some(_) => "MOVING",
                             None if downloading => "DOWNLOADING",
-                            None if g.state == JobState::Completed => "MOVING",
+                            // §129 Finishing with no phase word left is
+                            // the finalize/move window - same NZBGet
+                            // vocabulary as the Completed mover arm.
+                            None if matches!(
+                                g.state,
+                                JobState::Completed | JobState::Finishing
+                            ) =>
+                                "MOVING",
                             None if g.paused => "PAUSED",
                             None => "QUEUED",
                         }),
@@ -1877,6 +1924,11 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                 // its directory - the *arrs delete through here, so this
                 // is an ordinary path, not a corner of one.
                 d.poke_sidecar(hit_id);
+                // §129, same as the REST arm: a Finishing job's repair
+                // must stop pulling recovery volumes. The hub abort at
+                // the bottom cannot do it - it is scoped to the hub's
+                // owner, and a job in the lane is not that.
+                d.cancel_tail_fetches(hit_id);
                 let mut stopped_active = false;
                 let mut q = d.queue.lock_ok();
                 let before = q.len();
@@ -2035,16 +2087,20 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                     );
                 } else {
                     let before = h.len();
+                    let mut gone: Vec<String> = Vec::new();
                     h.retain(|j| {
                         let g = j.lock_ok();
                         let hit = ids.contains(&nzo_int(&g.nzo_id));
                         if hit {
                             // Record deleted for good - drop its spooled .nzb.
                             let _ = std::fs::remove_file(&g.nzb_path);
+                            gone.push(g.nzo_id.clone());
                         }
                         !hit
                     });
                     ok = h.len() < before;
+                    drop(h);
+                    d.history_tombstone(&gone);
                 }
             }
             "HistoryRedownload" | "HistoryReturn" | "HistoryRetry" => {

@@ -2751,6 +2751,43 @@ function appendCards(page){
     .insertAdjacentHTML('beforeend', cardsHtml(page));
   document.getElementById('count').textContent =
     wtotal ? tn('wall.count',wtotal,'{n} title','{n} titles') : '';
+  evictCards();
+}
+// §129 1c: the DOM does not grow without bound. `cards` (the data,
+// which paging offsets key off) is untouched; only the OLDEST card
+// nodes leave once the grid passes WALL_DOM_CAP, with a full-width
+// spacer keeping the scroll height so the viewport does not jump.
+// Scrolling back up past the spacer means those cards are gone until a
+// reset re-render - the price of 30 pages of art not living in memory.
+const WALL_DOM_CAP=600;
+function evictCards(){
+  const wall=document.getElementById('wall');
+  let live=wall.querySelectorAll('.card').length;
+  if(live<=WALL_DOM_CAP) return;
+  const before=wall.scrollHeight;
+  let spacer=document.getElementById('wspacer');
+  let el=spacer?spacer.nextElementSibling:wall.firstElementChild;
+  while(live>WALL_DOM_CAP&&el){
+    const next=el.nextElementSibling;
+    // Headers and skeletons between evicted cards go with them; a
+    // header whose whole group left would otherwise sit orphaned at
+    // the top labelling nothing.
+    if(el.classList.contains('card')) live--;
+    el.remove();
+    el=next;
+  }
+  // A header now leading the survivors belongs to a group whose head
+  // was cut mid-group - it still labels the cards after it, keep it.
+  const delta=before-wall.scrollHeight;
+  if(delta>0){
+    if(!spacer){
+      spacer=document.createElement('div');
+      spacer.id='wspacer';
+      spacer.style.gridColumn='1/-1';
+      wall.prepend(spacer);
+    }
+    spacer.style.height=((parseFloat(spacer.style.height)||0)+delta)+'px';
+  }
 }
 // Back-compat shim: everything that called refresh() now resets page 1.
 const refresh=()=>wallFetch(true);

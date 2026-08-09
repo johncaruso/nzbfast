@@ -449,4 +449,17 @@ impl Extractor {
             c.set_decrypt_barrier(barrier);
         }
     }
+
+    /// Install the post-rename decrypt publish notification (see
+    /// [`DecryptPublish`]). Same inheritance contract as the barrier.
+    pub fn set_decrypt_publish(&self, publish: DecryptPublish) {
+        let child = {
+            let mut inner = self.inner.lock_ok();
+            inner.decrypt_publish = Some(publish.clone());
+            inner.child.clone()
+        };
+        if let Some(c) = child {
+            c.set_decrypt_publish(publish);
+        }
+    }
 }

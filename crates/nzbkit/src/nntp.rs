@@ -12,6 +12,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 
 use crate::config::ServerConfig;
 
+pub mod resolve;
+pub use resolve::{Resolve, ResolveFuture, SystemResolver, install_resolver, resolver_installed};
+
 #[derive(Debug, thiserror::Error)]
 pub enum NntpError {
     #[error("I/O: {0}")]
@@ -866,10 +869,11 @@ fn quit_bound() -> std::time::Duration {
 /// bounds the silence.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Resolve `host`, pin one address (prefer IPv4 - providers count
-/// simultaneous source IPs, and macOS can otherwise spread connections
-/// across IPv4 + rotating IPv6 privacy addresses), apply the server's
-/// bind_ip/rcvbuf, connect. A bind_ip's family overrides the IPv4
+/// Resolve `host` (prefer IPv4 - providers count simultaneous source
+/// IPs, and macOS can otherwise spread connections across IPv4 +
+/// rotating IPv6 privacy addresses), apply the server's
+/// bind_ip/rcvbuf, and connect to the first candidate that answers
+/// ([`dial_in_order`]). A bind_ip's family overrides the IPv4
 /// preference: binding a v6 source to a v4 target can't work.
 async fn direct_connect(
     host: &str,
@@ -894,19 +898,11 @@ async fn direct_connect_opts(
                 std::io::Error::other(format!("bind_ip {s:?} is not an IP address"))
             })?),
         };
-    let mut addrs: Vec<std::net::SocketAddr> =
-        tokio::net::lookup_host((host, port)).await?.collect();
-    match bind {
-        Some(ip) => addrs.retain(|a| a.is_ipv4() == ip.is_ipv4()),
-        None => addrs.sort_by_key(|a| !a.is_ipv4()),
-    }
-    if addrs.is_empty() {
-        return Err(std::io::Error::other(match bind {
-            Some(ip) if ip.is_ipv4() => format!("{host} has no IPv4 address to match bind_ip"),
-            Some(_) => format!("{host} has no IPv6 address to match bind_ip"),
-            None => format!("{host} did not resolve"),
-        }));
-    }
+    // The one DNS call on the download path, behind the §129 3a seam:
+    // production resolves with `lookup_host` exactly as before, the rig
+    // installs a registry (`mock::dns`) so DNS faults are reproducible.
+    let answer = resolve::resolve(host, port).await?;
+    let addrs = resolve::order_candidates(host, answer, bind)?;
     let one = |addr: std::net::SocketAddr| async move {
         let socket = if addr.is_ipv4() {
             tokio::net::TcpSocket::new_v4()?
@@ -933,33 +929,69 @@ async fn direct_connect_opts(
         }
         socket.connect(addr).await
     };
-    // Dial-race experiment (dark, NZBFAST_DIAL_RACE=1): providers sit
-    // behind DNS pools and individual nodes vary - a bad node hands out
-    // the "one mysteriously slow session" shape everything downstream
-    // then has to fight. Race the top two addresses, first TCP connect
-    // wins, loser is closed pre-greeting (a transient extra SYN, never
-    // an NNTP session, so provider session caps don't see it). The
-    // address-family preference above still orders the field.
-    let race = addrs.len() >= 2 && std::env::var("NZBFAST_DIAL_RACE").is_ok_and(|v| v == "1");
-    if !race {
-        return one(addrs[0]).await;
+    dial_in_order(&addrs, one).await
+}
+
+/// How many resolved addresses a single dial will actually try. A
+/// provider's DNS pool can answer with a dozen; walking all of them
+/// would shrink each attempt's share of [`CONNECT_TIMEOUT`] to
+/// something too small to complete a real handshake on a slow link.
+/// Three is enough to survive a dead node without turning one dial into
+/// a scan.
+const MAX_DIAL_CANDIDATES: usize = 3;
+
+/// Dial the candidates in order, first TCP connect wins.
+///
+/// Until §129 3a this returned after `addrs[0]` alone, so one dead node
+/// in a provider's A-record set failed the dial outright while a live
+/// address sat right behind it - a coin-flip outage on a two-address
+/// pool, and the only escape was the dark `NZBFAST_DIAL_RACE`. Walking
+/// the list is what `TcpStream::connect((host, port))` does and what
+/// every other client does; the reproduction is
+/// `resolve_tests::dead_first_candidate_still_connects`.
+///
+/// That flag is gone (§129 3c tail, priced 8 Aug 2026 - the table is in
+/// TODO §129). Once this walk existed the race won only one shape, a
+/// first node alive but congested, and lost two the walk handles: it
+/// cancels a healthy in-flight dial when the second candidate refuses,
+/// and being a two-way `select!` it can never reach a third candidate.
+/// `dial_race_tests::the_walk_reaches_a_live_third_candidate` is what
+/// remains of the round.
+///
+/// Bounded on purpose. With more than one candidate each attempt gets
+/// an equal slice of [`CONNECT_TIMEOUT`], so an address that blackholes
+/// the SYN (no RST - the OS would sit on it for ~75 s) cannot eat the
+/// whole budget and starve the address behind it, and the total stays
+/// inside the caller's existing bound. A single candidate keeps the old
+/// shape byte for byte: no extra deadline, `Connection::connect`'s
+/// CONNECT_TIMEOUT is still the only clock.
+async fn dial_in_order<T, F, Fut>(addrs: &[std::net::SocketAddr], one: F) -> std::io::Result<T>
+where
+    F: Fn(std::net::SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let tried = &addrs[..addrs.len().min(MAX_DIAL_CANDIDATES)];
+    if let [only] = tried {
+        return one(*only).await;
     }
-    let (a, b) = (addrs[0], addrs[1]);
-    tokio::select! {
-        r = one(a) => match r {
-            Ok(s) => Ok(s),
-            Err(_) => one(b).await,
-        },
-        r = async {
-            // Stagger the second SYN slightly: on a healthy first
-            // address this keeps the race nearly free.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            one(b).await
-        } => match r {
-            Ok(s) => Ok(s),
-            Err(_) => one(a).await,
-        },
+    let slice = CONNECT_TIMEOUT / tried.len() as u32;
+    // Report the LAST failure, matching `TcpStream::connect`'s
+    // multi-address behavior: the final address tried is the one whose
+    // error is most likely to describe the host as a whole.
+    let mut last = None;
+    for &addr in tried {
+        match tokio::time::timeout(slice, one(addr)).await {
+            Ok(Ok(s)) => return Ok(s),
+            Ok(Err(e)) => last = Some(e),
+            Err(_) => {
+                last = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("connect to {addr} timed out"),
+                ));
+            }
+        }
     }
+    Err(last.expect("the candidate list is never empty here"))
 }
 
 /// Best-effort short TCP keepalive on a not-yet-connected socket (see
@@ -2430,6 +2462,45 @@ impl Connection {
         self.send_unflushed(&format!("BODY {message_id}")).await
     }
 
+    /// §129 3g: the alignment fence, sent straight after a BODY on a
+    /// provider whose refusals arrive bare.
+    ///
+    /// A bare "430 no such article" carries nothing the pool can check,
+    /// so a response dropped upstream is invisible: every later read
+    /// answers the slot behind, and a present article collects the
+    /// refusal meant for the next one. An id-echoing provider is immune
+    /// for free - `check_echoed_id` fails the first misaligned response
+    /// and the session dies before anything is misfiled - and this is
+    /// how a bare one gets the same protection: put a command in the
+    /// stream whose answer cannot be mistaken for a BODY's. It rides
+    /// the same pipeline, so it costs no round trip, and DATE is the
+    /// cheapest thing a server can answer.
+    pub async fn send_fence(&mut self) -> Result<(), NntpError> {
+        self.send_unflushed("DATE").await
+    }
+
+    /// Read the answer to a [`send_fence`]. Anything a BODY could have
+    /// answered means the stream is off by one and this slot holds
+    /// somebody else's response; anything else - 111, or an error from
+    /// a server that does not implement DATE - is the fence's own
+    /// answer, and alignment holds through it.
+    ///
+    /// Accepting the refusals is the point of not requiring 111: a
+    /// provider that answers DATE with 500 is odd but harmless, while
+    /// treating that as a desync would cut every session it ever gave
+    /// us. A shifted BODY response cannot hide in that gap, because the
+    /// codes a BODY answers with are exactly the ones rejected here.
+    pub async fn read_fence(&mut self) -> Result<(), NntpError> {
+        let st = self.read_status().await?;
+        match st.code {
+            222 | 220 | 423 | 430 | 451 => Err(NntpError::Unexpected {
+                cmd: "DATE".into(),
+                line: st.line,
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Read one BODY response into a caller-supplied buffer (buffer-pool
     /// friendly). `Ok(true)` on 222 with the raw dot-stuffed body appended
     /// to `out`; `Ok(false)` if the article is missing (423/430, plus
@@ -2452,34 +2523,38 @@ impl Connection {
     /// a session-level failure). `None` skips the check (serial
     /// callers that own the whole conversation).
     ///
-    /// `miss_echoed`: set on a miss to whether the refusal line echoed
-    /// a (matching) message-id. An un-echoed miss is positional-only
-    /// evidence - if an upstream frontend dropped the previous
-    /// pipelined response, this "430 no such article" belongs to the
-    /// NEXT article - and the pool treats it as suspect rather than
-    /// authoritative (see `handle_missing`).
+    /// `id_echoed`: whether this response's status line carried a
+    /// (matching) message-id, on a hit as well as a miss. An un-echoed
+    /// miss is positional-only evidence - if an upstream frontend
+    /// dropped the previous pipelined response, this "430 no such
+    /// article" belongs to the NEXT article - and the pool treats it as
+    /// suspect rather than authoritative (see `handle_missing`). An
+    /// echoed one is the opposite and is worth as much: it passed
+    /// `check_echoed_id`, so it PROVES the socket was still aligned at
+    /// this response, which is what bounds §129 3g's suspect window.
     pub async fn read_body_into(
         &mut self,
         out: &mut Vec<u8>,
         expected: Option<&str>,
-        miss_echoed: &std::sync::atomic::AtomicBool,
+        id_echoed: &std::sync::atomic::AtomicBool,
     ) -> Result<bool, NntpError> {
         let st = self.read_status().await?;
         check_echoed_id(&st, expected)?;
+        // A plausible id on the line already passed check_echoed_id, so
+        // presence = confirmed echo - on a hit exactly as on a miss. It
+        // only counts when the caller named the article it expected:
+        // with `expected` None nothing was compared, and an id that was
+        // never checked proves nothing about alignment.
+        id_echoed.store(
+            expected.is_some() && echoed_message_id(&st.line).is_some(),
+            std::sync::atomic::Ordering::Release,
+        );
         match st.code {
             222 => {
                 self.read_multiline_into(out).await?;
                 Ok(true)
             }
-            423 | 430 | 451 => {
-                // A plausible id on the line already passed
-                // check_echoed_id, so presence = confirmed echo.
-                miss_echoed.store(
-                    echoed_message_id(&st.line).is_some(),
-                    std::sync::atomic::Ordering::Release,
-                );
-                Ok(false)
-            }
+            423 | 430 | 451 => Ok(false),
             _ => Err(NntpError::Unexpected {
                 cmd: "BODY".into(),
                 line: st.line,
@@ -2511,14 +2586,14 @@ impl Connection {
         stall: std::time::Duration,
     ) -> Result<(bool, std::time::Duration), NntpError> {
         let status_seen = std::sync::atomic::AtomicBool::new(false);
-        let miss_echoed = std::sync::atomic::AtomicBool::new(false);
+        let id_echoed = std::sync::atomic::AtomicBool::new(false);
         self.read_body_into_two_phase_noting(
             out,
             expected,
             first_byte,
             stall,
             &status_seen,
-            &miss_echoed,
+            &id_echoed,
         )
         .await
     }
@@ -2535,7 +2610,7 @@ impl Connection {
         first_byte: std::time::Duration,
         stall: std::time::Duration,
         status_seen: &std::sync::atomic::AtomicBool,
-        miss_echoed: &std::sync::atomic::AtomicBool,
+        id_echoed: &std::sync::atomic::AtomicBool,
     ) -> Result<(bool, std::time::Duration), NntpError> {
         let t0 = std::time::Instant::now();
         let st = match tokio::time::timeout(first_byte, self.read_status()).await {
@@ -2545,20 +2620,18 @@ impl Connection {
         status_seen.store(true, std::sync::atomic::Ordering::Release);
         let ttfb = t0.elapsed();
         check_echoed_id(&st, expected)?;
+        // See `read_body_into`: a plausible id means it matched the
+        // `expected` the caller named, hit or miss alike.
+        id_echoed.store(
+            expected.is_some() && echoed_message_id(&st.line).is_some(),
+            std::sync::atomic::Ordering::Release,
+        );
         match st.code {
             222 => {
                 read_multiline_paced(&mut self.wire, out, stall).await?;
                 Ok((true, ttfb))
             }
-            423 | 430 | 451 => {
-                // See `read_body_into`: presence of a plausible id
-                // means it matched `expected` above.
-                miss_echoed.store(
-                    echoed_message_id(&st.line).is_some(),
-                    std::sync::atomic::Ordering::Release,
-                );
-                Ok((false, ttfb))
-            }
+            423 | 430 | 451 => Ok((false, ttfb)),
             _ => Err(NntpError::Unexpected {
                 cmd: "BODY".into(),
                 line: st.line,
@@ -2619,9 +2692,9 @@ impl Connection {
     /// Serial path (one command in flight): no echoed-id enforcement.
     pub async fn read_body(&mut self) -> Result<Option<Vec<u8>>, NntpError> {
         let mut raw = Vec::with_capacity(800 * 1024);
-        let miss_echoed = std::sync::atomic::AtomicBool::new(false);
+        let id_echoed = std::sync::atomic::AtomicBool::new(false);
         Ok(self
-            .read_body_into(&mut raw, None, &miss_echoed)
+            .read_body_into(&mut raw, None, &id_echoed)
             .await?
             .then_some(raw))
     }
@@ -2994,6 +3067,7 @@ mod compress_tests {
             group: None,
             retention_days: 0,
             block_bytes: None,
+            block_account: false,
             bind_ip: None,
             socks5: None,
             enabled: true,
@@ -3228,16 +3302,16 @@ mod compress_tests {
         let mut raw = Vec::new();
         // Expected id supplied: the 451 echoes the SAME id, so the
         // echoed-id check must stay quiet and the miss must stand.
-        let miss_echoed = std::sync::atomic::AtomicBool::new(false);
+        let id_echoed = std::sync::atomic::AtomicBool::new(false);
         let got = conn
-            .read_body_into(&mut raw, Some("<gone@example>"), &miss_echoed)
+            .read_body_into(&mut raw, Some("<gone@example>"), &id_echoed)
             .await;
         assert!(
             matches!(got, Ok(false)),
             "451 must read as a missing article, got {got:?}"
         );
         assert!(
-            miss_echoed.load(std::sync::atomic::Ordering::Acquire),
+            id_echoed.load(std::sync::atomic::Ordering::Acquire),
             "an id-echoing refusal must report a confirmed echo"
         );
         assert!(raw.is_empty(), "a miss must append no body bytes");
@@ -3249,12 +3323,131 @@ mod compress_tests {
         let mut raw2 = Vec::new();
         // This rigged server echoes <gone@example> whatever was asked;
         // the serial caller passes None, so no enforcement applies.
-        let miss_echoed2 = std::sync::atomic::AtomicBool::new(false);
+        let id_echoed2 = std::sync::atomic::AtomicBool::new(false);
         assert!(matches!(
-            conn.read_body_into(&mut raw2, None, &miss_echoed2).await,
+            conn.read_body_into(&mut raw2, None, &id_echoed2).await,
             Ok(false)
         ));
         conn.quit().await;
+    }
+
+    /// §129 3g: `id_echoed` reports the echo on a HIT too, not only on a
+    /// refusal. The pool needs it there: a response whose id it could
+    /// check is proof the socket was still aligned at that point, which
+    /// is what bounds the window of bare refusals a later desync can
+    /// discredit. Reporting it only on misses left a bare-refusing
+    /// provider with no alignment proof at all between its refusals.
+    #[tokio::test]
+    async fn a_hit_reports_its_echoed_id_as_well_as_a_miss() {
+        fn spawn_echoing_body_server() -> u16 {
+            use std::io::Write;
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = l.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                let Ok((mut sock, _)) = l.accept() else {
+                    return;
+                };
+                let _ = sock.write_all(b"200 echo test server\r\n");
+                loop {
+                    let Ok(line) = read_line(&mut sock) else {
+                        return;
+                    };
+                    if line.is_empty() || line == "QUIT" {
+                        let _ = sock.write_all(b"205 bye\r\n");
+                        return;
+                    }
+                    if line.starts_with("BODY ") {
+                        let _ = sock.write_all(b"222 0 <a@example> body\r\nhello\r\n.\r\n");
+                    } else {
+                        let _ = sock.write_all(b"500 what\r\n");
+                    }
+                }
+            });
+            port
+        }
+
+        let cfg = test_server_config(spawn_echoing_body_server());
+        let (mut conn, _) = Connection::connect(&cfg).await.expect("connect");
+        conn.send_body("<a@example>").await.expect("send BODY");
+        let mut raw = Vec::new();
+        let id_echoed = std::sync::atomic::AtomicBool::new(false);
+        let got = conn
+            .read_body_into(&mut raw, Some("<a@example>"), &id_echoed)
+            .await;
+        assert!(matches!(got, Ok(true)), "222 must read as a hit: {got:?}");
+        assert!(
+            id_echoed.load(std::sync::atomic::Ordering::Acquire),
+            "a hit that echoed the id we asked for is the pool's proof \
+             that this session was reading the right slot"
+        );
+        conn.quit().await;
+    }
+
+    /// §129 3g: the alignment fence reads a slot, and what may live in
+    /// that slot is the whole point. A server's own answer to DATE - or
+    /// its refusal to implement it - means the stream is where we think
+    /// it is; a BODY's answer means a response went missing upstream and
+    /// everything since has been one slot early.
+    #[tokio::test]
+    async fn the_fence_accepts_any_answer_that_is_not_a_bodys() {
+        fn spawn_fence_server(reply: &'static str) -> u16 {
+            use std::io::Write;
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = l.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                let Ok((mut sock, _)) = l.accept() else {
+                    return;
+                };
+                let _ = sock.write_all(b"200 fence test server\r\n");
+                loop {
+                    let Ok(line) = read_line(&mut sock) else {
+                        return;
+                    };
+                    if line.is_empty() || line == "QUIT" {
+                        let _ = sock.write_all(b"205 bye\r\n");
+                        return;
+                    }
+                    let _ = sock.write_all(reply.as_bytes());
+                }
+            });
+            port
+        }
+
+        // The ordinary answer, and the answer of a server that has never
+        // heard of DATE. Both say the same thing: this slot is the
+        // fence's, so the response before it was the body's.
+        for reply in ["111 20260719000000\r\n", "500 unknown command\r\n"] {
+            let cfg = test_server_config(spawn_fence_server(reply));
+            let (mut conn, _) = Connection::connect(&cfg).await.expect("connect");
+            conn.send_fence().await.expect("send DATE");
+            conn.flush().await.expect("flush");
+            assert!(
+                conn.read_fence().await.is_ok(),
+                "{reply:?} is the fence's own answer, not a body's"
+            );
+            conn.quit().await;
+        }
+
+        // And the shapes that mean a response was dropped upstream: a
+        // body's answer arriving where the fence's belongs.
+        for reply in [
+            "222 0 <a@example> body\r\n",
+            "430 no such article\r\n",
+            "451 0 <gone@example>\r\n",
+        ] {
+            let cfg = test_server_config(spawn_fence_server(reply));
+            let (mut conn, _) = Connection::connect(&cfg).await.expect("connect");
+            conn.send_fence().await.expect("send DATE");
+            conn.flush().await.expect("flush");
+            assert!(
+                matches!(
+                    conn.read_fence().await,
+                    Err(super::NntpError::Unexpected { .. })
+                ),
+                "{reply:?} in the fence's slot means the stream is off by one"
+            );
+            conn.quit().await;
+        }
     }
 
     #[tokio::test]
@@ -3285,3 +3478,14 @@ mod compress_tests {
 // entry while `super::*` keeps the private internals reachable.
 #[cfg(test)]
 mod unit_tests;
+
+// DNS fault families (§129 3a): dead-first candidate lists, a slow
+// resolver, a resolver that fails mid-run, and family mixes. Same
+// child-module reason as `unit_tests` - and they live under `nntp`
+// rather than beside the pool rigs because pool.rs is over its
+// size-gate entry.
+#[cfg(test)]
+mod resolve_tests;
+
+#[cfg(test)]
+mod dial_race_tests;

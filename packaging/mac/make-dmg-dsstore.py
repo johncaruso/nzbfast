@@ -26,14 +26,28 @@ if not bg.exists():
 
 alias = Alias.for_file(str(bg))
 
-# Window: 660x400 at (200,120). Icon view, no chrome.
+# Window frame at (200,120). Icon view, no chrome. Two measured facts
+# (verified live on macOS 27, 2026-08-08) size the frame:
+#   - WindowBounds is the WHOLE window frame including the ~28 pt title
+#     bar, not the content area. A 400-tall frame left ~372 pt of
+#     content and cropped the bottom of the step panels (they end at
+#     y=386 in the 660x400 design).
+#   - Finder IGNORES the Show* booleans below and follows the user's
+#     global path-bar/status-bar preference, costing up to ~56 pt more.
+#     The flags stay for older Finders that do honor them.
+# So: 400 design + 28 title bar + 56 optional bars = 484. For users
+# without the bars the spare height just shows more of the background's
+# dark gradient (the canvas is a 660x660 square), which reads as margin.
 bwsp = {
     "ShowStatusBar": False,
     "ShowToolbar": False,
     "ShowPathbar": False,
     "ShowSidebar": False,
+    "ShowTabView": False,
+    "ContainerShowSidebar": False,
+    "PreviewPaneVisibility": False,
     "SidebarWidth": 0,
-    "WindowBounds": "{{200, 120}, {660, 400}}",
+    "WindowBounds": "{{200, 120}, {660, 484}}",
 }
 icvp = {
     "viewOptionsVersion": 1,

@@ -324,6 +324,7 @@ async fn flap_breaker_clamps_a_flapping_server_to_one_keeper() {
                 retention_days: 0,
                 rcvbuf: None,
                 block_bytes: None,
+                block_account: false,
                 bind_ip: None,
                 socks5: None,
                 enabled: true,
@@ -391,6 +392,7 @@ async fn flap_keeper_target_follows_observed_cap() {
                 retention_days: 0,
                 rcvbuf: None,
                 block_bytes: None,
+                block_account: false,
                 bind_ip: None,
                 socks5: None,
                 enabled: true,
@@ -2615,6 +2617,7 @@ async fn early_fanout_arms_at_the_tail_latch_not_the_pending_floor() {
                 retention_days: 0,
                 rcvbuf: None,
                 block_bytes: None,
+                block_account: false,
                 bind_ip: None,
                 socks5: None,
                 enabled: true,
@@ -2644,6 +2647,8 @@ async fn early_fanout_arms_at_the_tail_latch_not_the_pending_floor() {
         dup: false,
         prebyte_expiries: 0,
         soft_430: 0,
+        fenced: false,
+        rearms: 0,
     };
 
     // Plain fan-out, tail latched, pending far above the floor: the
@@ -2704,6 +2709,8 @@ async fn early_fanout_arms_at_the_tail_latch_not_the_pending_floor() {
         dup: false,
         prebyte_expiries: 0,
         soft_430: 0,
+        fenced: false,
+        rearms: 0,
     };
     steered.register_inflight(&refetch, 1); // recovery leg on server b
     steered
@@ -2742,6 +2749,7 @@ async fn queue_control_exports_the_tail_latch() {
                 retention_days: 0,
                 rcvbuf: None,
                 block_bytes: None,
+                block_account: false,
                 bind_ip: None,
                 socks5: None,
                 enabled: true,
@@ -2792,6 +2800,7 @@ async fn hedge_races_a_straggler_at_the_adaptive_bound() {
                 retention_days: 0,
                 rcvbuf: None,
                 block_bytes: None,
+                block_account: false,
                 bind_ip: None,
                 socks5: None,
                 enabled: true,
@@ -2834,6 +2843,8 @@ async fn hedge_races_a_straggler_at_the_adaptive_bound() {
         dup: false,
         prebyte_expiries: 0,
         soft_430: 0,
+        fenced: false,
+        rearms: 0,
     };
     shared.register_inflight(&w0, 0);
     shared
@@ -2862,6 +2873,8 @@ async fn hedge_races_a_straggler_at_the_adaptive_bound() {
         dup: false,
         prebyte_expiries: 0,
         soft_430: 0,
+        fenced: false,
+        rearms: 0,
     };
     shared.register_inflight(&w1, 0);
     shared
@@ -2888,6 +2901,8 @@ async fn hedge_races_a_straggler_at_the_adaptive_bound() {
         dup: false,
         prebyte_expiries: 0,
         soft_430: 0,
+        fenced: false,
+        rearms: 0,
     };
     shared.register_inflight(&w2, 0);
     shared
@@ -2946,6 +2961,7 @@ async fn suspect_dup_races_a_pre_byte_stall_at_once() {
                 retention_days: 0,
                 rcvbuf: None,
                 block_bytes: None,
+                block_account: false,
                 bind_ip: None,
                 socks5: None,
                 enabled: true,
@@ -2970,6 +2986,8 @@ async fn suspect_dup_races_a_pre_byte_stall_at_once() {
         dup: false,
         prebyte_expiries: 0,
         soft_430: 0,
+        fenced: false,
+        rearms: 0,
     };
     let servers = vec![mk("a", true), mk("b", true)];
     let reqs: Vec<ArticleReq> = (0..(ENDGAME_MAX + 10))
@@ -3162,5 +3180,192 @@ async fn payout_prebyte_escalation_saves_cold_storage_articles() {
     assert_eq!(
         done, n,
         "the cold-storage article must complete without NZBFAST_READ_TIMEOUT_SECS"
+    );
+}
+
+/// §129 3g fence-retirement rig: ONE server, no twin, mostly missing
+/// and refusing BARE, so the alignment fence arms on its first refusal
+/// and every dispatch after that carries a DATE.
+///
+/// Returns the outcomes, the live-note ring, and the server itself -
+/// `date_log` (the `served` count at each DATE) against the final
+/// `served` is the only place from which "is this server still being
+/// fenced" is observable, since a fence leaves no client-side trace a
+/// test can reach.
+async fn fence_leg(
+    n_articles: usize,
+    missing_every: usize,
+    chaos: crate::mock::Chaos,
+) -> (
+    Vec<FetchOutcome>,
+    Vec<String>,
+    crate::mock::MockServer,
+    std::collections::HashSet<String>,
+) {
+    let data: Vec<u8> = (0..(n_articles as u32) * 4_000).map(|i| i as u8).collect();
+    let mut articles = std::collections::HashMap::new();
+    let segs = crate::mock::make_file_articles("f.bin", &data, 4_000, "fence", &mut articles);
+    let ids: Vec<String> = segs.iter().map(|(id, _, _)| format!("<{id}>")).collect();
+    // Mostly-missing on purpose: a bare refusal is what arms the fence,
+    // and a run of them is the only window in which a desync is
+    // invisible, so this is the shape both legs need.
+    let absent: std::collections::HashSet<String> = ids
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % missing_every != 0)
+        .map(|(_, id)| id.clone())
+        .collect();
+    for id in &absent {
+        articles.remove(id);
+    }
+    let absent_out = absent.clone();
+    let srv = crate::mock::MockServer::start(
+        articles,
+        crate::mock::Chaos {
+            missing: absent,
+            ..chaos
+        },
+    )
+    .await;
+    let reqs: Vec<ArticleReq> = ids.iter().map(|id| ArticleReq::fresh(id.clone())).collect();
+    let cfg = PoolConfig {
+        desync_fence: true,
+        adaptive_timeout: true,
+        ..Default::default()
+    };
+    let servers = vec![payout_server(&srv, 2, cfg)];
+    let live = LiveStats::for_servers(&servers);
+    let servers: Vec<(ServerConfig, PoolConfig)> = servers
+        .into_iter()
+        .map(|(s, mut c)| {
+            c.live = Some(live.clone());
+            (s, c)
+        })
+        .collect();
+    let (tx, mut rx) = mpsc::channel(64);
+    let fetch = tokio::spawn(async move { fetch_all_multi(&servers, reqs, tx).await });
+    let collect = tokio::spawn(async move {
+        let mut out = Vec::new();
+        while let Some(o) = rx.recv().await {
+            out.push(o);
+        }
+        out
+    });
+    tokio::time::timeout(Duration::from_secs(120), fetch)
+        .await
+        .expect("fence leg hung")
+        .unwrap();
+    let outcomes = collect.await.unwrap();
+    let notes: Vec<String> = live
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| format!("{} {}", e.kind, e.detail))
+        .collect();
+    (outcomes, notes, srv, absent_out)
+}
+
+/// §129 3g: a provider that reads DATE and answers nothing must stop
+/// being fenced. Every fence it is sent goes unanswered, and the
+/// unanswered fence kills the session that sent it, so without
+/// retirement this server's sessions die forever on a fault it does
+/// not have - the fence's own cost, charged to the innocent.
+///
+/// Retirement has to LATCH. The first shape of it cleared
+/// `bare_refuser`, which `handle_missing` re-arms on the very next bare
+/// 430, so fencing came back within one refusal and the live note
+/// re-emitted every cycle: that regression is what the "never fenced
+/// again" half of this assertion catches.
+#[tokio::test(flavor = "multi_thread")]
+async fn fence_retires_on_a_date_silent_provider_and_never_comes_back() {
+    let (outcomes, notes, srv, _) = fence_leg(
+        160,
+        4,
+        crate::mock::Chaos {
+            mute_date: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let dates = srv.date_log.lock_ok().clone();
+    let last_date = dates.last().copied().unwrap_or(0);
+    let served = srv.served.load(Ordering::Relaxed);
+    // The rig has to be measuring something: no fence at all means the
+    // arming path never ran and the leg proves nothing.
+    assert!(
+        !dates.is_empty(),
+        "the fence never armed - a bare-refusing server must be fenced"
+    );
+    assert_eq!(
+        notes.iter().filter(|n| n.starts_with("fence-off")).count(),
+        1,
+        "retirement must be announced exactly once, not once per cycle: {notes:?}"
+    );
+    // Retirement is two duds deep, one per session, so the fences on
+    // the wire are bounded by a couple of pipelines' worth. What makes
+    // this an assertion about LATCHING rather than about counting is
+    // the second half: the run served hundreds of requests after the
+    // last DATE, so fencing did not come back.
+    assert!(
+        served - last_date > served / 2,
+        "fencing resumed after retirement: last DATE at {last_date} of {served} served"
+    );
+    let failed: Vec<&FetchOutcome> = outcomes
+        .iter()
+        .filter(|o| matches!(o, FetchOutcome::Failed { .. }))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "a DATE-silent provider must not fail articles it holds: {failed:?}"
+    );
+    let done = outcomes
+        .iter()
+        .filter(|o| matches!(o, FetchOutcome::Done { .. }))
+        .count();
+    assert_eq!(done, 40, "every article the server holds must arrive");
+}
+
+/// The safety half: a server whose fences DO work, and which really is
+/// dropping responses, must keep its fence. `skip_nth_response`
+/// withholds every Nth BODY answer, so a later fence read collects a
+/// BODY-shaped status - the desync the fence exists to catch - and
+/// counting that toward retirement would disarm the check on exactly
+/// the provider that needs it. It cannot: this server answers its
+/// first fence, `fence_ok` latches, and no dud is ever counted again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_desyncing_provider_keeps_its_fence() {
+    let (outcomes, notes, srv, absent) = fence_leg(
+        160,
+        4,
+        crate::mock::Chaos {
+            skip_nth_response: 12,
+            ..Default::default()
+        },
+    )
+    .await;
+    let dates = srv.date_log.lock_ok().clone();
+    let last_date = dates.last().copied().unwrap_or(0);
+    let served = srv.served.load(Ordering::Relaxed);
+    assert!(
+        notes.iter().all(|n| !n.starts_with("fence-off")),
+        "a desyncing server must never retire its fence: {notes:?}"
+    );
+    assert!(
+        served - last_date < served / 4,
+        "fencing stopped early on a desyncing server: last DATE at {last_date} of {served} served"
+    );
+    // And the fence's own job, unchanged: no article the server holds
+    // may be declared Missing off a misattributed refusal.
+    let held: Vec<&String> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            FetchOutcome::Missing { id, .. } if !absent.contains(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        held.is_empty(),
+        "present article(s) declared Missing by a desynced session: {held:?}"
     );
 }

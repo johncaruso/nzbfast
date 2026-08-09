@@ -33,9 +33,14 @@ fn live(hosts: &[&str]) -> Arc<LiveStats> {
                 missing_note_at: AtomicU64::new(0),
                 missing_at_note: AtomicU64::new(0),
                 last_timeout_note: AtomicU64::new(0),
+                srv_rate: AtomicU64::new(0),
+                srv_rate_at: AtomicU64::new(0),
+                srv_art_ms: AtomicU64::new(0),
+                steered: AtomicBool::new(false),
             })
             .collect(),
         events: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        race: Default::default(),
     })
 }
 

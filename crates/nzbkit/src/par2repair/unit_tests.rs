@@ -359,3 +359,237 @@ fn recovery_slice_locators_report_only_the_wanted_set() {
     let want = generate_recovery(&slices, BS, 0);
     assert_eq!(&vol[locs[0].1..locs[0].1 + locs[0].2], &want[..]);
 }
+
+// --- §129: block-parallel hashing --------------------------------------
+//
+// Every payload below is non-repeating (the xorshift `payload`) - a
+// periodic payload lets a sliding-window scanner "find" a block at the
+// wrong offset and would mask an indexing bug in the pool.
+
+/// The Par2File that parsing a real index would yield for `data`:
+/// whole-file MD5 plus per-block IFSC MD5+CRC over zero-padded blocks.
+fn meta_for(name: &str, data: &[u8], bs: usize) -> Par2File {
+    let blocks = data
+        .chunks(bs)
+        .map(|c| {
+            let mut padded = c.to_vec();
+            padded.resize(bs, 0);
+            BlockCheck {
+                md5: Md5::digest(&padded).into(),
+                crc32: crc32fast::hash(&padded),
+            }
+        })
+        .collect();
+    Par2File {
+        file_id: fid(0),
+        name: name.into(),
+        length: data.len() as u64,
+        md5: Md5::digest(data).into(),
+        md5_16k: Md5::digest(&data[..data.len().min(16384)]).into(),
+        blocks,
+    }
+}
+
+/// The worker pool must reproduce the serial scanner's verdicts exactly
+/// across damage shapes: pristine, mid-file damage, damaged tail,
+/// trailing junk (still clean), truncation. Small file, so this drives
+/// `hash_blocks_par` directly - the size gate is exercised separately.
+#[test]
+fn block_hash_pool_matches_serial_scanner_verdicts() {
+    let dir = tmpdir("hashpool");
+    let pristine = payload(BS * 37 + 9, 21);
+    let meta = meta_for("h.bin", &pristine, BS);
+    let mut damaged = pristine.clone();
+    for x in &mut damaged[BS * 5..BS * 6] {
+        *x ^= 0x5a;
+    }
+    for x in &mut damaged[BS * 37..] {
+        *x ^= 0x11; // the 9-byte tail block too
+    }
+    let mut junk = pristine.clone();
+    junk.extend_from_slice(&payload(31, 22));
+    let truncated = &pristine[..BS * 12 + 7];
+    let cases: [(&str, &[u8]); 4] = [
+        ("pristine", &pristine),
+        ("damaged", &damaged),
+        ("junk", &junk),
+        ("trunc", truncated),
+    ];
+    for (tag, bytes) in cases {
+        let p = dir.join(tag);
+        std::fs::write(&p, bytes).unwrap();
+        // threads=1 never takes the pool path: serial ground truth.
+        let serial = verify_pass1(&p, &meta, BS, 1).unwrap();
+        let f = File::open(&p).unwrap();
+        let disk_len = bytes.len() as u64;
+        let limit = meta.length.min(disk_len);
+        let (crc_ok, all_md5) = hash_blocks_par(
+            &|off, buf| crate::disk::read_exact_at(&f, buf, off),
+            limit,
+            meta.length,
+            &meta.blocks,
+            BS,
+            disk_len >= meta.length,
+            4,
+        )
+        .unwrap();
+        let md5_ok = disk_len >= meta.length && all_md5;
+        assert_eq!(md5_ok, serial.clean, "{tag}: clean verdict");
+        if serial.clean {
+            assert!(crc_ok.iter().all(|&b| b), "{tag}: clean means every block");
+        } else {
+            let want = serial
+                .present
+                .expect("serial pass tracks blocks on a damaged file");
+            assert_eq!(crc_ok, want, "{tag}: presence bitmap");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Above HASH_PAR_MIN_BYTES `verify_pass1` and `md5_matches` switch to
+/// the pool; the full verdict must agree with the serial pass on
+/// pristine, damaged and truncated shapes.
+#[test]
+fn parallel_gate_agrees_with_serial_above_threshold() {
+    let dir = tmpdir("hashgate");
+    let bs = 4096usize;
+    let len = (HASH_PAR_MIN_BYTES as usize) + bs * 3 + 137; // odd tail
+    let pristine = payload(len, 31);
+    let meta = meta_for("big.bin", &pristine, bs);
+    let mut damaged = pristine.clone();
+    for w in 0..3usize {
+        let at = w * len / 3 + w * 17;
+        for x in &mut damaged[at..at + 64] {
+            *x ^= 0xa5;
+        }
+    }
+    let truncated = &pristine[..len - bs - 5];
+    let cases: [(&str, &[u8]); 3] = [
+        ("pristine", &pristine),
+        ("damaged", &damaged),
+        ("trunc", truncated),
+    ];
+    for (tag, bytes) in cases {
+        let p = dir.join(tag);
+        std::fs::write(&p, bytes).unwrap();
+        let serial = verify_pass1(&p, &meta, bs, 1).unwrap();
+        let par = verify_pass1(&p, &meta, bs, 8).unwrap();
+        assert_eq!(par.exists, serial.exists, "{tag}: exists");
+        assert_eq!(par.intact, serial.intact, "{tag}: intact");
+        assert_eq!(par.clean, serial.clean, "{tag}: clean");
+        assert_eq!(par.present, serial.present, "{tag}: presence bitmap");
+        assert_eq!(
+            md5_matches(&p, &meta, bs, 8).unwrap(),
+            md5_matches(&p, &meta, bs, 1).unwrap(),
+            "{tag}: md5_matches verdict"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// End to end above the gate: a big damaged file goes through the
+/// pool-hashed verify, the rebuild, and the pool-hashed post-patch
+/// proof, and the bytes land identical to the pristine payload.
+#[test]
+fn big_damaged_file_repairs_identically_through_the_pool() {
+    let dir = tmpdir("bigrepair");
+    let bs = 4096usize;
+    let len = (HASH_PAR_MIN_BYTES as usize) + 5 * bs + 999;
+    let big = payload(len, 41);
+    let files: &[(&str, &[u8])] = &[("big.bin", &big)];
+    let mut damaged = big.clone();
+    for w in 0..3usize {
+        let at = (w * 7 + 2) * bs + w; // three distinct blocks
+        for x in &mut damaged[at..at + 96] {
+            *x ^= 0x3c;
+        }
+    }
+    std::fs::write(dir.join("big.bin"), &damaged).unwrap();
+    std::fs::write(dir.join("set.par2"), par2_index(SET, bs, files)).unwrap();
+    std::fs::write(
+        dir.join("set.vol0+4.par2"),
+        par2_volume(SET, bs, files, &[0, 1, 2, 3]),
+    )
+    .unwrap();
+    match repair_dir(&dir).expect("big set repairs") {
+        RepairStatus::Repaired(r) => assert_eq!(r.blocks_rebuilt, 3),
+        other => panic!("expected Repaired, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), big);
+    match repair_dir(&dir).expect("repaired set re-verifies") {
+        RepairStatus::NoDamage => {}
+        other => panic!("expected NoDamage after repair, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The mapped driver's self-prove takes the pool branch for a big
+/// rebuilt file (full IFSC, above the gate): the repair must succeed,
+/// the bytes must land identical, and a write that corrupts a byte
+/// outside the rebuilt blocks must still fail the prove - the per-block
+/// proof covers EVERY byte, exactly like the whole-file MD5 it stands
+/// in for.
+#[test]
+fn mapped_self_prove_pool_branch_proves_and_fails() {
+    let bs = 4096usize;
+    let len = (HASH_PAR_MIN_BYTES as usize) + 3 * bs + 501;
+    let big = payload(len, 51);
+    let meta = meta_for("big.bin", &big, bs);
+    let n = meta.length.div_ceil(bs as u64) as usize;
+    let gfiles: &[(&str, &[u8])] = &[("big.bin", &big)];
+    let slices = global_slices(gfiles, bs);
+    let recovery: Vec<(u32, Vec<u8>)> = (0..3u32)
+        .map(|e| (e, generate_recovery(&slices, bs, e)))
+        .collect();
+    struct BufIo(
+        std::sync::Mutex<Vec<u8>>,
+        Option<usize>,
+        std::sync::atomic::AtomicBool,
+    );
+    impl VolumeIo for BufIo {
+        fn read(&self, _f: usize, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+            let d = self.0.lock().unwrap();
+            let off = off as usize;
+            buf.copy_from_slice(&d[off..off + buf.len()]);
+            Ok(())
+        }
+        fn write(&self, _f: usize, off: u64, data: &[u8]) -> std::io::Result<()> {
+            let mut d = self.0.lock().unwrap();
+            let off = off as usize;
+            d[off..off + data.len()].copy_from_slice(data);
+            if let Some(rot) = self.1
+                && !self.2.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                d[rot] ^= 0xff; // one silent corruption far from the patch
+            }
+            Ok(())
+        }
+    }
+    for (rot, want_ok) in [(None, true), (Some(7 * bs + 11), false)] {
+        let mut present = vec![true; n];
+        let mut damaged = big.clone();
+        for blk in [1usize, 3] {
+            present[blk] = false;
+            for x in &mut damaged[blk * bs..(blk + 1) * bs] {
+                *x = 0;
+            }
+        }
+        let io = BufIo(
+            std::sync::Mutex::new(damaged),
+            rot,
+            std::sync::atomic::AtomicBool::new(false),
+        );
+        let files = vec![(meta.clone(), present)];
+        let res = repair_mapped(&files, bs, &recovery, &io, true);
+        if want_ok {
+            assert_eq!(res.expect("mapped repair proves itself"), 2);
+            assert_eq!(io.0.into_inner().unwrap(), big, "bytes identical");
+        } else {
+            assert!(
+                matches!(res, Err(RepairError::VerifyFailed(_))),
+                "corruption outside the rebuilt blocks must fail the prove, got {res:?}"
+            );
+        }
+    }
+}

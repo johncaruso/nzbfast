@@ -575,6 +575,27 @@ fn quota_period_rolls_on_the_local_calendar() {
     assert_eq!(L::period_start_on('d', (2026, 7, 19)), 20_653 * 86_400);
 }
 
+/// §129 2g: the weekly period pins to the most recent local Monday.
+#[test]
+fn weekly_quota_period_pins_to_the_local_monday() {
+    use super::QuotaLedger as L;
+    // 2026-07-19 encodes as day 20_653 (asserted above) and is a
+    // Sunday, so 2026-08-03 (+15 days) is a Monday.
+    let monday = super::days_from_civil(2026, 8, 3) as u64 * 86_400;
+    for d in 3..=9 {
+        assert_eq!(
+            L::period_start_on('w', (2026, 8, d)),
+            monday,
+            "2026-08-{d:02} belongs to the week of Monday the 3rd"
+        );
+    }
+    assert_eq!(
+        L::period_start_on('w', (2026, 8, 10)),
+        super::days_from_civil(2026, 8, 10) as u64 * 86_400,
+        "the next Monday opens a new weekly period"
+    );
+}
+
 /// Codex 7 Aug M2: the UTC-to-local token migration must not discard a
 /// non-UTC user's persisted spend. A LEGACY ledger (no "local" marker)
 /// whose token matches what the old UTC scheme computes right now is

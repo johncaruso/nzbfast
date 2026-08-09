@@ -37,6 +37,58 @@ fn note_activity_impl(hub: &Option<Arc<StreamHub>>, stream_owner: &str, tok: &'s
     }
 }
 
+/// §129: this run's cancel handle for the post-network tail's
+/// recovery-volume side-fetches, published on the hub under the owning
+/// nzo_id so a delete can find it.
+///
+/// Deliberately NOT `queue_ctl`. That one is the MAIN pool's, the
+/// daemon publishes it in a single hub slot, and that slot belongs to
+/// whatever is downloading NOW - so by the time this run's repair is
+/// pulling parity, the next job owns it, and a cancel aimed there would
+/// kill a healthy unrelated download while this one fetched on. Keyed
+/// by owner instead, and released at `Daemon::park` beside the activity
+/// token. No hub (a CLI run) means nobody can ask for a cancel; the
+/// handle still exists so the driver's contract is the same everywhere.
+/// Lifted out of `get_with_progress` for the size gate.
+fn install_tail_cancel(
+    hub: &Option<Arc<StreamHub>>,
+    stream_owner: &str,
+) -> Arc<crate::repair::SideCancel> {
+    let c = Arc::new(crate::repair::SideCancel::new());
+    if let Some(h) = hub {
+        h.tail_cancel
+            .lock_ok()
+            .insert(stream_owner.to_string(), c.clone());
+    }
+    c
+}
+
+/// D1 (big-link): how many independent I/O runtimes to shard the fleet
+/// across. The single-runtime path tops out at ~4.1 Gbps per process -
+/// one I/O driver thread saturates while the NIC still has headroom -
+/// so big machines with enough connections spread it over the
+/// soak-proven `fetch_all_sharded`. Small boxes stay single-runtime:
+/// extra runtimes are pure overhead below the ceiling. NZBFAST_SHARDS=n
+/// forces either way (1 = force single-runtime), clamped because each
+/// shard spins its own 2-thread runtime and an absurd value
+/// (NZBFAST_SHARDS=100000) would panic on thread exhaustion and take the
+/// download down with it; 16 covers any real fleet. Lifted out of
+/// `get_with_progress` for the size gate.
+fn shard_count(total_conns: usize) -> usize {
+    std::env::var("NZBFAST_SHARDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.clamp(1, 16))
+        .unwrap_or_else(|| {
+            let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+            if cores >= 12 && total_conns >= 24 {
+                (total_conns / 16).clamp(2, 4)
+            } else {
+                1
+            }
+        })
+}
+
 /// The one-line launch banner: file count, eager/total megabytes, and
 /// where the output lands. Lifted out of `get_with_progress` for the
 /// size gate (the §91 rule: the gate forces fixes into helpers).
@@ -52,6 +104,18 @@ fn announce_plan(nzb_path: &Path, files: usize, eager: u64, total: u64, out_dir:
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Test-only (`NZBFAST_TEST_STALL_TAIL_MS`): hold the post-network tail
+/// open so the §129 lane suite can observe the Finishing state
+/// deterministically. Unset (the only production state) is a no-op.
+async fn test_stall_tail() {
+    if let Some(ms) = std::env::var("NZBFAST_TEST_STALL_TAIL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
+
 pub(crate) async fn get_with_progress(
     config: &Path,
     nzb_path: &Path,
@@ -179,6 +243,10 @@ pub(crate) async fn get_with_progress(
     // read positions into promotions through it.
     let queue_ctl = Arc::new(nzbkit::pool::QueueControl::default());
     let abort_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // §129: this run's recovery-fetch cancel handle - see
+    // `install_tail_cancel`.
+    let side_cancel = install_tail_cancel(&hub, stream_owner);
+    let cancel = Some(side_cancel.as_ref());
     // The seek/promote ladder and the hub publish: see install_seek in
     // get/vrig.rs. slot_arts is taken - the SeekCtl owns it from here.
     let seek_names = install_seek(
@@ -239,7 +307,7 @@ pub(crate) async fn get_with_progress(
         rt,
     } = build_counters(&budget, progress, &hub, resume_have_bytes);
     // The decode-consumer fleet: see spawn_decode_consumers.
-    let (consumers, pending_d) = spawn_decode_consumers(
+    let (consumers, pending_d, pending_r) = spawn_decode_consumers(
         decoders,
         &rx,
         &buf_pool,
@@ -317,30 +385,10 @@ pub(crate) async fn get_with_progress(
         &slot_file,
         &nzb,
     );
-    // D1 (big-link): the single-runtime path tops out at ~4.1 Gbps per
-    // process - one I/O driver thread saturates while the NIC has headroom.
-    // On big machines with enough connections, shard the fleet across
-    // independent runtimes (the soak-proven fetch_all_sharded). Small
-    // boxes stay on the single-runtime path: extra runtimes are pure
-    // overhead below the ceiling. NZBFAST_SHARDS=n forces either way
-    // (1 = force single-runtime).
+    // D1 (big-link): how many I/O runtimes this fleet is worth - see
+    // `shard_count`.
     let total_conns: usize = servers.iter().map(|(_, c)| c.connections).sum();
-    let shards = std::env::var("NZBFAST_SHARDS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        // Clamp the operator override: each shard spins its own 2-thread
-        // runtime, and an absurd value (NZBFAST_SHARDS=100000) would panic
-        // on thread exhaustion and take down the download. 16 covers any
-        // real fleet.
-        .map(|n| n.clamp(1, 16))
-        .unwrap_or_else(|| {
-            let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-            if cores >= 12 && total_conns >= 24 {
-                (total_conns / 16).clamp(2, 4)
-            } else {
-                1
-            }
-        });
+    let shards = shard_count(total_conns);
     let stats = if shards > 1 {
         println!("  sharding {total_conns} connections across {shards} I/O runtimes");
         let servers_owned = servers.clone();
@@ -364,6 +412,7 @@ pub(crate) async fn get_with_progress(
         par_race_task,
         consumers,
         &pending_d,
+        &pending_r,
         &extractor,
         &journal,
         t0,
@@ -382,11 +431,14 @@ pub(crate) async fn get_with_progress(
     )
     .await?;
 
+    test_stall_tail().await;
+
     // Issue #14 drain fallback - deferred slots the active set covers
     // fetch on the side machinery: see fetch_matched_deferred in
     // get/settle.rs.
     fetch_matched_deferred(
         &verifier, &sniff, &slots, &slot_file, &servers, &nzb, out_dir, &buf_pool, &extractor,
+        cancel,
     )
     .await;
 
@@ -465,6 +517,7 @@ pub(crate) async fn get_with_progress(
         recovery_errs,
         recovery_missing,
         &note_activity,
+        cancel,
     )
     .await?;
 

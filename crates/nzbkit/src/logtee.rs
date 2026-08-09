@@ -1,9 +1,13 @@
 //! Self-tee of stdout+stderr into an in-memory ring buffer, so the
 //! daemon can serve its own recent log to the dashboard (mode=log) -
 //! nothing to configure, works regardless of how the process was
-//! launched. Unix: dup2 both fds onto a pipe; a reader thread echoes
-//! every line to the ORIGINAL stdout (so terminals/redirects still see
-//! it) and keeps the last `CAP` lines. On non-unix the tee is a no-op
+//! launched. Unix: dup2 both fds onto a pipe; a capture thread keeps
+//! the last `CAP` lines and hands each one to a separate echo thread
+//! for the ORIGINAL stdout (so terminals/redirects still see it). Two
+//! threads on purpose: the echo target is outside our control and can
+//! stop accepting output (an exec-orphaned pipe, a launcher that quit
+//! reading), and only the echo may ever block on it - the ring, and
+//! the daemon's own printing, must not. On non-unix the tee is a no-op
 //! and the ring stays empty (the dashboard says so).
 
 use crate::sync::MutexExt;
@@ -51,6 +55,47 @@ fn log_cap_bytes() -> u64 {
 }
 
 static RING: OnceLock<Arc<Mutex<VecDeque<String>>>> = OnceLock::new();
+
+/// The pre-tee stdout, kept so [`restore_for_exec`] can put it back on
+/// fds 1/2 before a re-exec. -1 until the tee is installed. The echo
+/// thread owns the fd (its `File` closes it on queue disconnect, which
+/// needs the capture thread gone first), but that can only happen after
+/// both dup2s in `restore_for_exec` have already retired the pipe's
+/// last write ends, so the value here never goes stale while anyone
+/// still reads it.
+#[cfg(unix)]
+static ORIG_STDOUT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Lines the echo thread never got because its queue was full - which
+/// only happens when the echo target itself has stopped accepting
+/// output (a launcher that quit reading its pipe, a hung NFS log file).
+/// The ring is not affected; this only counts what the OUTSIDE lost.
+#[cfg(any(unix, test))]
+static ECHO_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// What the capture thread hands the echo thread. The drain handshake
+/// travels the same queue so it keeps its FIFO meaning: once the echo
+/// thread reaches the mark, everything queued before it has been echoed.
+#[cfg(any(unix, test))]
+enum Echoed {
+    // On a Windows TEST build this enum exists only because `capture` -
+    // which the capture-path tests exercise everywhere - needs a channel
+    // token to send. The reader of the line (the echo thread) and the
+    // one Mark sender are both unix-only install code, so over there the
+    // payload is "read" and Mark is constructed; on windows+test neither
+    // happens and the lint is right that nothing looks at them.
+    #[cfg_attr(all(test, not(unix)), allow(dead_code))]
+    Line(Vec<u8>),
+    #[cfg(unix)]
+    Mark,
+}
+
+/// Echo queue depth, lines. Deep enough that a briefly slow terminal
+/// never drops anything; shallow enough that a genuinely dead target
+/// costs a bounded amount of memory, not the daemon. Unix-only, unlike
+/// the enum above: no test sizes the queue.
+#[cfg(unix)]
+const ECHO_QUEUE: usize = 256;
 
 /// Lines ever captured, counting the ones already evicted from the ring.
 /// Monotonic, so a caller can bracket a span of output (see [`mark`] and
@@ -118,6 +163,48 @@ fn ring_line(buf: &[u8]) -> String {
     String::from_utf8_lossy(trim_newline(buf)).into_owned()
 }
 
+/// Ring one captured line, then offer it to the echo thread without
+/// ever waiting on it.
+///
+/// The order is the point, and it is the fix for a real death: the ring
+/// used to be fed only AFTER a blocking echo write, so when the echo
+/// target stopped accepting output the whole capture froze with it -
+/// the dashboard log ended mid-download and, once the tee pipe filled
+/// too, every thread in the daemon that printed blocked behind it
+/// (seen live, 7 Aug 2026: four finished jobs whose [move] outcomes
+/// vanished). The ring is the copy the daemon itself serves, so it gets
+/// the line first and unconditionally; the echo is best-effort and a
+/// full queue means the OUTSIDE copy loses the line, never the ring.
+#[cfg(any(unix, test))]
+fn capture(ring: &Mutex<VecDeque<String>>, tx: &std::sync::mpsc::SyncSender<Echoed>, buf: &[u8]) {
+    let line = ring_line(buf);
+    {
+        let mut g = ring.lock_ok();
+        if g.len() >= CAP {
+            g.pop_front();
+        }
+        g.push_back(line);
+        // Bumped under the ring lock so `since` cannot read a
+        // count that disagrees with the lines it can see.
+        SEEN.fetch_add(1, Ordering::Relaxed);
+    }
+    if tx.try_send(Echoed::Line(buf.to_vec())).is_err()
+        && ECHO_DROPPED.fetch_add(1, Ordering::Relaxed) == 0
+    {
+        // Say so IN the ring, once: a launcher that stopped reading its
+        // pipe is otherwise indistinguishable from a daemon that went
+        // quiet, and the ring is the one place still listening.
+        let mut g = ring.lock_ok();
+        if g.len() >= CAP {
+            g.pop_front();
+        }
+        g.push_back(
+            "[log] stdout stopped accepting output - later lines reach only this log".to_string(),
+        );
+        SEEN.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// One captured line without its trailing CR/LF.
 #[cfg(any(unix, test))]
 fn trim_newline(buf: &[u8]) -> &[u8] {
@@ -151,45 +238,45 @@ pub fn install() {
                 return;
             }
             libc::close(wr);
+            // The read end and the stashed original are this process's
+            // plumbing, not part of the stdio contract: mark them
+            // CLOEXEC so neither a spawned child nor a re-exec'd image
+            // (mode=restart_daemon) inherits them. Without this the
+            // fds leaked into every child, and across an exec they
+            // kept the dead pipe alive in the replacement process.
+            libc::fcntl(rd, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(orig, libc::F_SETFD, libc::FD_CLOEXEC);
+            ORIG_STDOUT.store(orig, Ordering::Relaxed);
             // Only once the pipe is really in place: a drain with no
             // reader behind it would print its own handshake.
             let _ = DRAIN.set((Mutex::new(0), Condvar::new()));
-            let ring2 = ring.clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Echoed>(ECHO_QUEUE);
+            // The echo thread: the only place that writes to the
+            // original stdout, and the only thread a dead or wedged
+            // echo target can stop. Blocking here is harmless - the
+            // capture thread never waits on this queue.
             std::thread::spawn(move || {
-                use std::io::{BufRead, BufReader, Write};
+                use std::io::Write;
                 use std::os::unix::io::FromRawFd;
-                let mut src = BufReader::new(std::fs::File::from_raw_fd(rd));
                 let mut echo = std::fs::File::from_raw_fd(orig);
-                // Read raw bytes, NOT `lines()`. `BufRead::lines()` yields
-                // Err(InvalidData) on the first non-UTF-8 byte, and a
-                // legacy-encoded RAR/PAR2 filename reaches here whenever a
-                // child (unrar/par2, run with inherited stdio) prints one.
-                // The old `let Ok(line) = line else { break }` then exited
-                // this thread, closing the pipe's read end - so the
-                // daemon's next print hit EPIPE and panicked, with the
-                // panic message lost down the same dead pipe (silent death).
-                // read_until only stops on EOF or a genuine read error.
-                let mut buf: Vec<u8> = Vec::with_capacity(256);
                 // Size-cap bookkeeping for a redirected regular file:
                 // fstat only every ~1 MB echoed, not per line.
                 let cap = log_cap_bytes();
                 let echo_is_file = cap > 0 && echo.metadata().map(|m| m.is_file()).unwrap_or(false);
                 let mut since_check: u64 = 0;
-                loop {
-                    buf.clear();
-                    match src.read_until(b'\n', &mut buf) {
-                        Ok(0) | Err(_) => break, // pipe closed, or read error
-                        Ok(_) => {}
-                    }
-                    if trim_newline(&buf) == DRAIN_MARK {
-                        // A drain handshake, not output: everything
-                        // written before it has now been echoed.
-                        if let Some((n, cv)) = DRAIN.get() {
-                            *n.lock_ok() += 1;
-                            cv.notify_all();
+                while let Ok(msg) = rx.recv() {
+                    let buf = match msg {
+                        Echoed::Mark => {
+                            // A drain handshake, not output: everything
+                            // queued before it has now been echoed.
+                            if let Some((n, cv)) = DRAIN.get() {
+                                *n.lock_ok() += 1;
+                                cv.notify_all();
+                            }
+                            continue;
                         }
-                        continue;
-                    }
+                        Echoed::Line(buf) => buf,
+                    };
                     if echo_is_file {
                         since_check += buf.len() as u64;
                         if since_check >= 1 << 20 {
@@ -217,18 +304,44 @@ pub fn install() {
                     // Echo the exact bytes so terminals/redirects still see
                     // byte-for-byte what was written (newline included).
                     let _ = echo.write_all(&buf);
-                    // The ring keeps a lossy, newline-trimmed copy for the
-                    // dashboard - U+FFFD in place of undecodable bytes,
-                    // never a lost line.
-                    let line = ring_line(&buf);
-                    let mut g = ring2.lock_ok();
-                    if g.len() >= CAP {
-                        g.pop_front();
+                }
+            });
+            let ring2 = ring.clone();
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader};
+                use std::os::unix::io::FromRawFd;
+                let mut src = BufReader::new(std::fs::File::from_raw_fd(rd));
+                // Read raw bytes, NOT `lines()`. `BufRead::lines()` yields
+                // Err(InvalidData) on the first non-UTF-8 byte, and a
+                // legacy-encoded RAR/PAR2 filename reaches here whenever a
+                // child (unrar/par2, run with inherited stdio) prints one.
+                // The old `let Ok(line) = line else { break }` then exited
+                // this thread, closing the pipe's read end - so the
+                // daemon's next print hit EPIPE and panicked, with the
+                // panic message lost down the same dead pipe (silent death).
+                // read_until only stops on EOF or a genuine read error.
+                let mut buf: Vec<u8> = Vec::with_capacity(256);
+                loop {
+                    buf.clear();
+                    match src.read_until(b'\n', &mut buf) {
+                        Ok(0) | Err(_) => break, // pipe closed, or read error
+                        Ok(_) => {}
                     }
-                    g.push_back(line);
-                    // Bumped under the ring lock so `since` cannot read a
-                    // count that disagrees with the lines it can see.
-                    SEEN.fetch_add(1, Ordering::Relaxed);
+                    if trim_newline(&buf) == DRAIN_MARK {
+                        // Forward the handshake so it keeps its FIFO
+                        // meaning; when the echo queue is refusing even
+                        // the mark, waiting is pointless (the 500 ms cap
+                        // in `drain` would expire anyway) - acknowledge
+                        // now, the ring already holds everything.
+                        if tx.try_send(Echoed::Mark).is_err()
+                            && let Some((n, cv)) = DRAIN.get()
+                        {
+                            *n.lock_ok() += 1;
+                            cv.notify_all();
+                        }
+                        continue;
+                    }
+                    capture(&ring2, &tx, &buf);
                 }
             });
             // Every exit path drains, including the ones nobody writes:
@@ -244,6 +357,37 @@ pub fn install() {
 #[cfg(unix)]
 extern "C" fn drain_at_exit() {
     drain();
+}
+
+/// Undo the tee ahead of an exec: drain, then put the ORIGINAL
+/// stdout back on fds 1 and 2.
+///
+/// exec kills every thread but keeps fds 1/2 - which the tee has
+/// pointed at its pipe, whose reader thread does not survive. The
+/// replacement image then re-runs [`install`], dup(1)s what it finds
+/// there, and echoes every line into a pipe nobody reads: a daemon the
+/// launcher started with stdout on daemon.log stopped appending to it
+/// forever after mode=restart_daemon - and one pipe buffer (64 KiB)
+/// later the blocked echo froze the in-memory ring too, with the
+/// daemon's printing threads next in line (seen live, 7 Aug 2026:
+/// four finished jobs whose completed-move outcomes all vanished).
+///
+/// fd 2 first, then fd 1: only the second dup2 retires the pipe's last
+/// write end, so the reader cannot see EOF (and close the fd this
+/// copies from) between the two calls. dup2 leaves CLOEXEC clear on
+/// the target, so the restored fds cross the exec - the whole point.
+pub fn restore_for_exec() {
+    #[cfg(unix)]
+    {
+        drain();
+        let orig = ORIG_STDOUT.load(Ordering::Relaxed);
+        if orig >= 0 {
+            unsafe {
+                libc::dup2(orig, 2);
+                libc::dup2(orig, 1);
+            }
+        }
+    }
 }
 
 /// Wait until the reader has echoed everything written to stdout/stderr
@@ -282,7 +426,43 @@ pub fn drain() {
 
 #[cfg(test)]
 mod tests {
-    use super::{CAP, ring_line, span_len};
+    use super::{CAP, ECHO_DROPPED, capture, ring_line, span_len};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// The behavior that took a live daemon down on 7 Aug 2026: the echo
+    /// target (an exec-orphaned pipe) stopped accepting output, and
+    /// because the ring was fed only after a BLOCKING echo write, the
+    /// dashboard log froze with it - four finished jobs' completed-move
+    /// outcomes simply never appeared anywhere. Pin the fix: a wedged
+    /// echo must cost only the echo, never the ring.
+    #[test]
+    fn a_wedged_echo_never_stops_the_ring() {
+        let ring = Mutex::new(VecDeque::new());
+        // Queue of 1 that nobody drains = the wedged echo thread. The
+        // receiver stays alive so try_send fails with Full, not
+        // Disconnected - the exact live shape.
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        capture(&ring, &tx, b"first\n");
+        capture(&ring, &tx, b"second\n"); // echo queue now refuses
+        capture(&ring, &tx, b"third\n");
+        let g = ring.lock().unwrap();
+        for want in ["first", "second", "third"] {
+            assert!(
+                g.iter().any(|l| l == want),
+                "{want:?} must reach the ring even with the echo wedged"
+            );
+        }
+        // The outside's loss is counted and announced in the ring once,
+        // so a launcher that quit reading its pipe is diagnosable.
+        assert!(ECHO_DROPPED.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+        assert_eq!(
+            g.iter()
+                .filter(|l| l.contains("stopped accepting output"))
+                .count(),
+            1
+        );
+    }
 
     /// The span a failed job snapshots has to survive every way its ends
     /// can disagree - the ring is global, bounded, and older than any one

@@ -156,7 +156,15 @@ fn settings_block(port: u16) -> serde_json::Map<String, serde_json::Value> {
 /// match is ever reformatted this stops finding arms and the count
 /// assertion below fails loudly, which is the right direction to fail.
 fn allowlist() -> Vec<String> {
-    let src = include_str!("../src/serve/settings.rs");
+    // The table lives in TWO functions since TODO 106 split it: names the
+    // first half does not know fall through to `apply_setting_tail` in
+    // settings_apply.rs. Reading only the first half silently halved the
+    // allowlist - the count assertion below is what caught it, which is
+    // exactly the direction it was written to fail in.
+    let src = concat!(
+        include_str!("../src/serve/settings.rs"),
+        include_str!("../src/serve/settings_apply.rs"),
+    );
     let mut names = Vec::new();
     let mut inside = false;
     for line in src.lines() {
@@ -172,8 +180,13 @@ fn allowlist() -> Vec<String> {
         // been reworded once already, and when it changed this loop ran
         // on into the rest of the file and collected every JSON-RPC mode
         // and locale code in it as a "setting".
+        // ...and STOP at it, rather than ending the scan: with both
+        // halves concatenated there is a second `pub(super) fn
+        // apply_setting_tail` further down, and breaking here would
+        // collect only the first table.
         if line == "}" {
-            break;
+            inside = false;
+            continue;
         }
         // `        "a" | "b" => {` at exactly two levels of indent.
         let Some(rest) = line.strip_prefix("        \"") else {

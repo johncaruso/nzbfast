@@ -196,14 +196,12 @@ pub(crate) async fn index_scan_into(
     if probes.is_empty() {
         anyhow::bail!("no configured server carries {group}");
     }
-    if probes
-        .iter()
-        .all(|p| p.server.block_bytes.is_some_and(|b| b > 0))
-    {
+    if probes.iter().all(|p| !p.server.may_spend_on_measurement()) {
         info!(
             target: "scan",
-            "{group}: only block accounts are enabled - header \
-             traffic is spending prepaid credit"
+            "{group}: every server carrying it is metered (block account \
+             or billed per byte) - header traffic is spending the user's \
+             own bytes"
         );
     }
     // Primary = the probe with the largest article span: one number

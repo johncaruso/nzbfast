@@ -419,6 +419,9 @@ pub(super) fn spawn(daemon: &std::sync::Arc<super::daemon::Daemon>) {
             let throttle = d.hub.rate.get();
             let line = d.line_speed.load(Ordering::Relaxed);
             d.link_peak.tick(bps, throttle, line);
+            // §129 4b rides the same readings: the learner and the
+            // attribution can never disagree about what the link did.
+            super::whyslow::feed(&d, bps, throttle, line);
         }
     });
 }

@@ -54,9 +54,14 @@ async fn ladder_against(
     )
     .await;
     let cfg = srv.server_config();
+    // The daemon discovers real-article ids before laddering; the mock's
+    // overview rows stand in for a history NZB here.
+    let ids = nzbkit::sysbench::discover_ids(&cfg, "alt.binaries.bench", 8_000)
+        .await
+        .expect("mock group yields ids");
     let out = nzbkit::sysbench::conn_ladder(
         &cfg,
-        "alt.binaries.bench",
+        ids,
         max_conns,
         ceiling,
         secs_per_step,
@@ -326,13 +331,15 @@ async fn cancel_stops_the_ladder_between_rungs() {
     // "Press Cancel" once two rungs have landed.
     let seen = Arc::new(AtomicUsize::new(0));
     let s2 = seen.clone();
-    let out =
-        nzbkit::sysbench::conn_ladder(&cfg, "alt.binaries.bench", 64, 0, 3, move |_, _, steps| {
-            s2.store(steps.len(), Ordering::Relaxed);
-            steps.len() < 2
-        })
+    let ids = nzbkit::sysbench::discover_ids(&cfg, "alt.binaries.bench", 8_000)
         .await
-        .expect("a cancelled ladder still returns what it measured");
+        .expect("mock group yields ids");
+    let out = nzbkit::sysbench::conn_ladder(&cfg, ids, 64, 0, 3, move |_, _, steps| {
+        s2.store(steps.len(), Ordering::Relaxed);
+        steps.len() < 2
+    })
+    .await
+    .expect("a cancelled ladder still returns what it measured");
     assert!(
         out.len() <= 3,
         "cancel did not stop the climb - {} rungs came back",
@@ -348,4 +355,31 @@ async fn cancel_stops_the_ladder_between_rungs() {
             .map(|s| (s.connections, s.gbps))
             .collect::<Vec<_>>()
     );
+}
+
+/// The STAT gate the real-article supply rides on: presence answers
+/// come back in input order, misses read false, and the sweep is one
+/// pipelined connection - the property that makes gating 300+ ids
+/// cheap enough to run before every ladder.
+#[tokio::test(flavor = "multi_thread")]
+async fn stat_presence_reports_misses_in_order() {
+    let (articles, rows) = bench_group(6);
+    let srv = MockServer::start_full(articles, HashMap::new(), rows, Chaos::default()).await;
+    let cfg = srv.server_config();
+    let ids = vec![
+        "<tune-0@mock>".to_string(),
+        "<gone-a@mock>".to_string(),
+        "<tune-3@mock>".to_string(),
+        "<gone-b@mock>".to_string(),
+        "<tune-5@mock>".to_string(),
+    ];
+    let present = nzbkit::sysbench::stat_presence(&cfg, &ids)
+        .await
+        .expect("STAT sweep ran");
+    assert_eq!(present, vec![true, false, true, false, true]);
+    // An empty sample is a clean empty answer, not a hang.
+    let none = nzbkit::sysbench::stat_presence(&cfg, &[])
+        .await
+        .expect("empty");
+    assert!(none.is_empty());
 }

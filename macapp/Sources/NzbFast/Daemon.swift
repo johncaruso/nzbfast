@@ -2,6 +2,7 @@ import Foundation
 // Launcher handshake only (see `isNzbfast`): the engine proves it holds the
 // token in runtime.json before this wrapper hands it the stored API key.
 import CryptoKit
+import os
 
 /// Owns the bundled `nzbfast serve` engine: attach to an already-running
 /// daemon on the persisted port, or spawn our own as a managed child.
@@ -13,14 +14,29 @@ import CryptoKit
 /// is non-recursive so the output folder below it is never scanned).
 final class Daemon {
     static let shared = Daemon()
+    private static let log = Logger(subsystem: "com.nzbfast.app", category: "daemon")
 
-    let dataDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("nzbfast")
+    /// Rehearsal isolation. When set, EVERY mutable path - data dir,
+    /// downloads, watch folder, and the persisted port - lives under this
+    /// root, so a test build can never see the real install's state,
+    /// attach to its daemon, or upgrade-restart it. Overriding $HOME is
+    /// NOT enough for that: FileManager's user-domain lookups in a GUI
+    /// app resolve the real home regardless, which is how a quit
+    /// rehearsal build found the live data dir and put a crash alert on
+    /// the user's screen (8 Aug 2026). Never set in production.
+    static let testRoot: URL? = ProcessInfo.processInfo.environment["NZBFAST_TEST_ROOT"]
+        .map { URL(fileURLWithPath: $0, isDirectory: true) }
+
+    let dataDir = testRoot?.appendingPathComponent("data")
+        ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("nzbfast")
     /// The user's Downloads folder - watch target and output parent.
-    let watchDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+    let watchDir = testRoot?.appendingPathComponent("watch")
+        ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
     /// Pre-1.0.2 builds downloaded to ~/Downloads/nzbfast - keep using it
     /// when it already exists so an upgrade doesn't split the library.
     let downloadsDir: URL = {
+        if let root = testRoot { return root.appendingPathComponent("downloads") }
         let dl = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
         let legacy = dl.appendingPathComponent("nzbfast")
         var isDir: ObjCBool = false
@@ -32,18 +48,53 @@ final class Daemon {
     var logURL: URL { dataDir.appendingPathComponent("daemon.log") }
 
     /// The port the dashboard lives on. Persisted so relaunches attach to
-    /// the same daemon instead of scanning again.
-    private(set) var port: Int = UserDefaults.standard.integer(forKey: "daemonPort")
+    /// the same daemon instead of scanning again. Under a test root the
+    /// persistence moves to a file there - UserDefaults reaches the real
+    /// preference store whatever $HOME says, and a remembered REAL port
+    /// is an attach (and §98 upgrade-restart) waiting to happen.
+    private(set) var port: Int = {
+        guard let root = testRoot else {
+            return UserDefaults.standard.integer(forKey: "daemonPort")
+        }
+        let f = root.appendingPathComponent("port.txt")
+        return Int((try? String(contentsOf: f, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
+    }()
+
+    /// The one writer of the persisted port (see `port` above for why the
+    /// test root gets a file).
+    private func persistPort(_ p: Int) {
+        port = p
+        if let root = Daemon.testRoot {
+            try? String(p).write(
+                to: root.appendingPathComponent("port.txt"), atomically: true, encoding: .utf8)
+        } else {
+            UserDefaults.standard.set(p, forKey: "daemonPort")
+        }
+    }
     private(set) var child: Process?
     /// True when THIS app launched the engine - only then may quit stop it.
     private(set) var spawnedByUs = false
     /// Set before any stop we initiate, so terminationHandler can tell a
     /// crash from a requested exit.
     private var deliberateStop = false
+    /// Set for good once stop() begins. spawn() refuses past this point,
+    /// so a quit that lands mid-startup can't have start() bring up a
+    /// fresh engine AFTER the stop already swept - that engine would
+    /// outlive the app as an orphan.
+    private var stopping = false
     /// Called on the main queue when the child dies on its own.
     var onUnexpectedExit: ((String) -> Void)?
 
     var baseURL: URL { URL(string: "http://127.0.0.1:\(port)/")! }
+
+    /// For QuitWatchdog's last resort ONLY: the pid of the engine WE
+    /// spawned, readable from the watchdog's background thread. Nil when
+    /// attached - an attached engine is never ours to kill, even then.
+    var childPidForEmergencyKill: pid_t? {
+        guard spawnedByUs, let c = child, c.isRunning else { return nil }
+        return c.processIdentifier
+    }
 
     private var engineURL: URL {
         Bundle.main.resourceURL!.appendingPathComponent("bin/nzbfast")
@@ -400,8 +451,7 @@ final class Daemon {
         for candidate in candidates {
             guard await isNzbfast(port: candidate) else { continue }
             // Every consumer follows the port we ACTUALLY attached to.
-            port = candidate
-            UserDefaults.standard.set(candidate, forKey: "daemonPort")
+            persistPort(candidate)
             // §98: an engine that outlives the app also outlives an
             // UPGRADE - installing a newer .dmg used to change nothing,
             // because this arm attached to the old engine and never
@@ -457,8 +507,7 @@ final class Daemon {
             }
         }
         guard chosen > 0 else { return .failed("no free port between 6789 and 6889") }
-        port = chosen
-        UserDefaults.standard.set(chosen, forKey: "daemonPort")
+        persistPort(chosen)
         do {
             try spawn()
         } catch {
@@ -470,7 +519,23 @@ final class Daemon {
         return .failed("the engine didn't answer on port \(port) within 15 s")
     }
 
+    /// Orders spawn's publish against stop's `stopping = true`. The two
+    /// run on different cooperative-pool threads (startStack's Task vs
+    /// the quit path's Task.detached), and a bare check-then-act let a
+    /// quit land inside spawn's filesystem window: stop() saw no child,
+    /// the app exited, and the process p.run() had just forked kept
+    /// serving headless until the next launch adopted it.
+    private let stateLock = NSLock()
+
     private func spawn() throws {
+        stateLock.lock()
+        let stopRequested = stopping
+        stateLock.unlock()
+        guard !stopRequested else {
+            throw NSError(
+                domain: "nzbfast", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "quit already in progress"])
+        }
         let fm = FileManager.default
         for dir in [dataDir, downloadsDir] {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -510,8 +575,21 @@ final class Daemon {
         }
         deliberateStop = false
         try p.run()
+        stateLock.lock()
+        if stopping {
+            // The quit arrived between the entry guard and run(). stop()
+            // found no child to sweep, so this one is ours to kill right
+            // here - published, it would outlive the app as a headless
+            // engine until the next launch adopted it.
+            stateLock.unlock()
+            p.terminate()
+            throw NSError(
+                domain: "nzbfast", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "quit already in progress"])
+        }
         child = p
         spawnedByUs = true
+        stateLock.unlock()
     }
 
     /// Poll mode=version every 250 ms until the daemon answers.
@@ -533,6 +611,22 @@ final class Daemon {
     /// Then the orphan sweep, which is what makes the app replaceable:
     /// see `stopBundleOrphans()`.
     func stop() async {
+        // Under the lock so it orders against spawn's publish: after
+        // this, spawn either saw the flag and threw, or published its
+        // child where the guard below will find it.
+        stateLock.lock()
+        stopping = true
+        stateLock.unlock()
+        Self.log.notice(
+            "stop: begin (spawnedByUs \(self.spawnedByUs), child pid \(self.child?.processIdentifier ?? -1), port \(self.port))")
+        // Test hook for the quit watchdog (see QuitWatchdog): wedge here
+        // forever so a rehearsal can prove the app still exits on time.
+        // Never set outside that rehearsal.
+        if ProcessInfo.processInfo.environment["NZBFAST_TEST_WEDGE_STOP"] != nil {
+            Self.log.error("stop: NZBFAST_TEST_WEDGE_STOP set - wedging deliberately")
+            while true { try? await Task.sleep(nanoseconds: 3_600_000_000_000) }
+        }
+        defer { Self.log.notice("stop: done") }
         if !spawnedByUs {
             // Attached, not spawned. If what we attached to is one of our
             // own bundle engines, it is ours to stop - and mode=shutdown
@@ -560,9 +654,13 @@ final class Daemon {
         _ = try? await URLSession.shared.data(for: req)
         let deadline = Date().addingTimeInterval(5)
         while Date() < deadline {
-            if !c.isRunning { return }
+            if !c.isRunning {
+                Self.log.notice("stop: child exited after mode=shutdown")
+                return
+            }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
+        Self.log.error("stop: child ignored mode=shutdown for 5 s - SIGKILL")
         kill(c.processIdentifier, SIGKILL)
     }
 
@@ -598,14 +696,26 @@ final class Daemon {
     }
 
     /// Engines running out of THIS bundle that are not our own child.
+    ///
+    /// BOTH sides of the path compare go through the same
+    /// resolvingSymlinksInPath, because the two sources disagree on
+    /// symlinked prefixes: proc_pidpath reports the kernel's resolved
+    /// path (/private/tmp/...), while Foundation's resolver maps the
+    /// /private aliases back OFF (/tmp/...). Canonicalising only our own
+    /// side made every orphan invisible to the sweep - and to the
+    /// graceful shutdown POST gated on it - whenever the bundle sat
+    /// behind such a prefix.
     private func bundleOrphanPIDs() -> [pid_t] {
-        let mine = engineURL.resolvingSymlinksInPath().path
+        let canon = { (p: String) in
+            URL(fileURLWithPath: p).resolvingSymlinksInPath().path
+        }
+        let mine = canon(engineURL.path)
         let ours = child?.processIdentifier ?? -1
         return liveProcessIDs().filter { pid in
             guard pid != ours, pid != getpid() else { return false }
             var buf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
             guard proc_pidpath(pid, &buf, UInt32(MAXPATHLEN)) > 0 else { return false }
-            return String(cString: buf) == mine
+            return canon(String(cString: buf)) == mine
         }
     }
 

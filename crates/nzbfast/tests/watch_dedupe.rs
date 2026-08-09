@@ -266,3 +266,147 @@ fn a_failed_history_row_still_lets_the_file_be_retried() {
     drop(r);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// §129 2c: with `watch_recursive` on, a file dropped in a subfolder is
+/// picked up, and the subfolder's name becomes the job's category.
+#[test]
+fn recursive_watch_uses_the_first_subfolder_as_the_category() {
+    let (dir, watch, _sha) = scratch("recurse");
+    // The root file is not this test's subject.
+    std::fs::remove_file(watch.join("release.nzb")).unwrap();
+    std::fs::write(
+        dir.join("settings.json"),
+        "{\"delete_to_trash\":false,\"watch_recursive\":true}",
+    )
+    .unwrap();
+    let tv = watch.join("tv");
+    std::fs::create_dir_all(&tv).unwrap();
+    // Distinct bytes from sample_nzb(): identical content would trip
+    // the sha dedupe, which is the other tests' subject, not ours.
+    std::fs::write(
+        tv.join("show.nzb"),
+        sample_nzb().replace("dedupe", "recurse"),
+    )
+    .unwrap();
+
+    let r = serve(&dir, &watch);
+    let log = r.wait_for("picked up show.nzb from watch/tv");
+    for _ in 0..100 {
+        if !tv.join("show.nzb").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        !tv.join("show.nzb").exists(),
+        "the subfolder file should have been ingested\n{log}"
+    );
+    let queued: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join(".spool/queue.json")).unwrap())
+            .unwrap();
+    let cats: Vec<String> = queued["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["category"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        cats.contains(&"tv".to_string()),
+        "the job's category should be the subfolder name, got {cats:?}\n--- log ---\n{}",
+        r.log()
+    );
+
+    drop(r);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The control for the test above: with the switch OFF (the default) a
+/// subfolder file is invisible - a walker that ignored the flag would
+/// silently make recursion always-on.
+#[test]
+fn subfolders_are_not_scanned_unless_recursive_is_on() {
+    let (dir, watch, _sha) = scratch("norecurse");
+    std::fs::remove_file(watch.join("release.nzb")).unwrap();
+    std::fs::write(
+        dir.join("settings.json"),
+        "{\"delete_to_trash\":false,\"watch_interval_secs\":1}",
+    )
+    .unwrap();
+    let tv = watch.join("tv");
+    std::fs::create_dir_all(&tv).unwrap();
+    std::fs::write(
+        tv.join("show.nzb"),
+        sample_nzb().replace("dedupe", "norecurse"),
+    )
+    .unwrap();
+
+    let r = serve(&dir, &watch);
+    // Three 1 s passes are plenty for a wrongly-recursive walk to bite.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        tv.join("show.nzb").exists(),
+        "a subfolder file must be left alone with recursion off\n--- log ---\n{}",
+        r.log()
+    );
+    assert!(
+        !r.log().contains("picked up show.nzb"),
+        "a subfolder file must not be queued with recursion off\n--- log ---\n{}",
+        r.log()
+    );
+
+    drop(r);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §129 2c: with `watch_move_rejected` on, a complete-but-unusable file
+/// is moved into <watch>/rejected/ with a note saying why - and the
+/// quarantine folder itself is never scanned, so it cannot boomerang.
+#[test]
+fn a_rejected_file_is_quarantined_with_a_note_when_the_switch_is_on() {
+    let (dir, watch, _sha) = scratch("reject");
+    std::fs::remove_file(watch.join("release.nzb")).unwrap();
+    std::fs::write(
+        dir.join("settings.json"),
+        "{\"delete_to_trash\":false,\"watch_move_rejected\":true,\"watch_recursive\":true,\"watch_interval_secs\":1}",
+    )
+    .unwrap();
+    // Complete (closing </nzb> present) but unusable: no files inside.
+    std::fs::write(
+        watch.join("bad.nzb"),
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n</nzb>\n",
+    )
+    .unwrap();
+
+    let r = serve(&dir, &watch);
+    r.wait_for("moved to");
+    assert!(
+        !watch.join("bad.nzb").exists(),
+        "the rejected file should have moved out of the watch root\n--- log ---\n{}",
+        r.log()
+    );
+    let moved = watch.join("rejected/bad.nzb");
+    assert!(
+        moved.exists(),
+        "the rejected file should be in the quarantine\n--- log ---\n{}",
+        r.log()
+    );
+    let note = std::fs::read_to_string(watch.join("rejected/bad.nzb.why.txt"))
+        .expect("the quarantine should carry a .why.txt note");
+    assert!(
+        note.contains("could not use this file"),
+        "the note should explain the failure, got:\n{note}"
+    );
+    // Even with recursion on, the quarantine is not rescanned: exactly
+    // one rejection in the log after a few more passes.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let rejections = r.log().matches("bad.nzb rejected: ").count();
+    assert_eq!(
+        rejections,
+        1,
+        "the quarantined file must not be scanned again\n--- log ---\n{}",
+        r.log()
+    );
+
+    drop(r);
+    let _ = std::fs::remove_dir_all(&dir);
+}

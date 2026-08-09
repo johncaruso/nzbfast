@@ -87,6 +87,70 @@ fn http_once(port: u16, req: &str) -> std::io::Result<String> {
     Ok(out.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
 }
 
+/// One GET carrying the headers a BROWSER would attach when a page on
+/// somebody else's site causes the request (an `<img>`, an iframe, a
+/// redirect, a cross-site form). Non-browser callers send neither.
+fn http_cross_site(port: u16, req: &str) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    write!(
+        s,
+        "GET {req} HTTP/1.1\r\nHost: x\r\nSec-Fetch-Site: cross-site\r\n\
+         Origin: http://evil.example\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write");
+    let mut raw = Vec::new();
+    let _ = s.read_to_end(&mut raw);
+    let out = String::from_utf8_lossy(&raw);
+    out.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
+}
+
+/// A keyless daemon must not let a page the user merely VISITED install
+/// an API key.
+///
+/// `mode=config&name=apikey` reaches the same `set_apikey` as
+/// `apikey_new`, which has been gated against exactly this since it was
+/// written - but the config route had nothing, so on a keyless install
+/// (`NZBFAST_OPEN=1`, or one predating first-run minting) an `<img
+/// src="http://nas.local:6789/api?mode=config&name=apikey&value=zzz">`
+/// installed an attacker-chosen key. The owner is then locked out and
+/// the attacker holds the only credential, so `server_secret` (provider
+/// passwords in the clear), `script` and `backup_export` all follow.
+///
+/// The gate is same-site only, NOT POST-only: scripts and curl have
+/// always set this over GET and must keep working, which the tests above
+/// pin. Only a browser-labelled cross-site request is refused.
+#[test]
+fn a_cross_site_page_cannot_install_an_api_key() {
+    let dir = scratch("csrf-apikey");
+    std::fs::write(dir.join("settings.json"), "{}").unwrap(); // keyless install
+    let r = serve(&dir, &[]);
+
+    let drive_by = http_cross_site(
+        r.port,
+        "/api?mode=config&name=apikey&value=attacker-key&output=json",
+    );
+    assert!(
+        !drive_by.contains("\"status\": true") && !drive_by.contains("\"status\":true"),
+        "a cross-site page installed an API key: {drive_by}"
+    );
+    // ...and it really is still keyless, rather than merely having
+    // answered unhelpfully: the anonymous API still works.
+    let anon = http(r.port, "/api?mode=queue&output=json");
+    assert!(
+        !rejected(&anon),
+        "the drive-by closed the API, so a key was installed: {anon}"
+    );
+    // The same write from a non-browser caller (no Sec-Fetch-*, no
+    // Origin) is untouched.
+    let ok = http(
+        r.port,
+        "/api?mode=config&name=apikey&value=chosen-key&output=json",
+    );
+    assert!(ok.contains("\"status\""), "script set rejected: {ok}");
+    let now = http(r.port, "/api?mode=queue&output=json");
+    assert!(rejected(&now), "the legitimate set did not take: {now}");
+}
+
 struct KillOnDrop(Child);
 impl Drop for KillOnDrop {
     fn drop(&mut self) {

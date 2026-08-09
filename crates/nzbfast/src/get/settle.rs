@@ -53,6 +53,12 @@ pub(super) async fn settle_verify_repair(
     recovery_errs: u64,
     recovery_missing: u64,
     note_activity: &(dyn Fn(&'static str) + Sync),
+    // §129: the owner's recovery-fetch cancel handle, threaded the
+    // same way `note_activity` is and for a sibling reason - the
+    // repair paths below reach the network, and the tail they run in
+    // now outlives the download slot, so a deleted job must be able
+    // to stop them. `crate::repair::SideCancel`; None on the CLI.
+    cancel: Option<&crate::repair::SideCancel>,
 ) -> Result<SettleVerdict> {
     // Slots whose offset-0 article never landed are still unclassified,
     // their spans held in memory - flush them to plain files so settle
@@ -84,6 +90,7 @@ pub(super) async fn settle_verify_repair(
                 derrs,
                 sparse_slots,
                 note_activity,
+                cancel,
             )
             .await
         }
@@ -105,6 +112,7 @@ pub(super) async fn settle_verify_repair(
                 recovery_errs,
                 recovery_missing,
                 note_activity,
+                cancel,
             )
             .await
         }
@@ -134,6 +142,12 @@ async fn settle_with_set(
     derrs: u64,
     sparse_slots: &[String],
     note_activity: &(dyn Fn(&'static str) + Sync),
+    // §129: the owner's recovery-fetch cancel handle, threaded the
+    // same way `note_activity` is and for a sibling reason - the
+    // repair paths below reach the network, and the tail they run in
+    // now outlives the download slot, so a deleted job must be able
+    // to stop them. `crate::repair::SideCancel`; None on the CLI.
+    cancel: Option<&crate::repair::SideCancel>,
 ) -> Result<SettleVerdict> {
     // --- settle verification (in-stream results; read-back only for gaps) ---
     let mut damage_in_mapped = false;
@@ -423,6 +437,16 @@ async fn settle_with_set(
                         || s.abandoned.load(Ordering::Relaxed) > 0)
             })
             .map(|(i, s)| (i, s.hint.as_str()))
+            // Issue #23's spare rule, the same predicate the census
+            // applies: furniture the recovery set does not cover cannot
+            // be healed by any repair, so it does not fail the job - it
+            // is dropped at finish instead. Everything reaching the
+            // partition is short; the uncovered side is by definition
+            // the "set does not cover it" half, so the extension test is
+            // the whole question here. Without this, a job that took ANY
+            // damage failed on a file the census had already spared,
+            // while the identical post with damage == 0 completed.
+            .filter(|(_, hint)| !crate::get::census::is_spared_metadata(hint))
             .partition(|(_, hint)| {
                 set_names.contains(&nzbkit::disk::sanitize_filename(hint).to_lowercase())
             })
@@ -452,6 +476,7 @@ async fn settle_with_set(
             password,
             sparse_slots,
             note_activity,
+            cancel,
             damage_in_mapped,
             needed,
             &already,
@@ -515,6 +540,12 @@ async fn run_set_repair(
     password: Option<&str>,
     sparse_slots: &[String],
     note_activity: &(dyn Fn(&'static str) + Sync),
+    // §129: the owner's recovery-fetch cancel handle, threaded the
+    // same way `note_activity` is and for a sibling reason - the
+    // repair paths below reach the network, and the tail they run in
+    // now outlives the download slot, so a deleted job must be able
+    // to stop them. `crate::repair::SideCancel`; None on the CLI.
+    cancel: Option<&crate::repair::SideCancel>,
     mut damage_in_mapped: bool,
     needed: usize,
     already: &[usize],
@@ -528,6 +559,10 @@ async fn run_set_repair(
     let mut reextract_failed: Option<String> = None;
     let mut repair_shortfall: Option<(usize, usize)> = None;
     note_activity("repairing");
+    // §129: one repair at a time across concurrent tails. The token
+    // above already says "repairing", so a queued wait reads truthfully;
+    // held for the whole pass (mapped repair, materialize, disk repair).
+    let _cpu = crate::lanegate::heavy_cpu().await;
     // M2c.1: first try repairing straight INTO the extracted
     // output through the block→payload mapping - no volume
     // files ever touch disk. Every declined case (gate miss,
@@ -557,6 +592,7 @@ async fn run_set_repair(
             // it off is asking for MD5 everywhere, including
             // here.
             !fast_verify,
+            cancel,
         )
         .await?
     } else {
@@ -672,6 +708,7 @@ async fn run_set_repair(
             buf_pool.clone(),
             extractor,
             &mut repair_shortfall,
+            cancel,
         )
         .await?;
         // A successful disk repair re-read the WHOLE set off
@@ -865,6 +902,12 @@ async fn settle_without_set(
     recovery_errs: u64,
     recovery_missing: u64,
     note_activity: &(dyn Fn(&'static str) + Sync),
+    // §129: the owner's recovery-fetch cancel handle, threaded the
+    // same way `note_activity` is and for a sibling reason - the
+    // repair paths below reach the network, and the tail they run in
+    // now outlives the download slot, so a deleted job must be able
+    // to stop them. `crate::repair::SideCancel`; None on the CLI.
+    cancel: Option<&crate::repair::SideCancel>,
 ) -> Result<SettleVerdict> {
     let mut all_good;
     let mut repair_shortfall: Option<(usize, usize)> = None;
@@ -960,7 +1003,8 @@ async fn settle_without_set(
                     "fetching {} deferred recovery volume(s) for disk repair…",
                     deferred_vols.len()
                 );
-                if let Err(e) = fetch_volumes(servers, nzb, out_dir, buf_pool, &deferred_vols).await
+                if let Err(e) =
+                    fetch_volumes(servers, nzb, out_dir, buf_pool, &deferred_vols, cancel).await
                 {
                     println!("  ⚠ deferred volume fetch failed: {e}");
                 }
@@ -972,6 +1016,9 @@ async fn settle_without_set(
             };
             let t0 = Instant::now();
             note_activity("repairing");
+            // §129: same one-repair-at-a-time permit as the set-repair
+            // path; released when this directory pass ends.
+            let _cpu = crate::lanegate::heavy_cpu().await;
             println!(
                 "no PAR2 set came from the NZB, but the downloaded files \
                  include one - repairing from disk…"
@@ -1195,6 +1242,11 @@ async fn settle_without_set(
                     .filter(|(i, s)| {
                         slot_is_uncovered_hole(out_dir, extractor.slot_path(*i), &s.hint, &covered)
                     })
+                    // Issue #23's spare rule again - `slot_is_uncovered_hole`
+                    // has already established the set does not cover this
+                    // file, which is exactly when furniture cannot be
+                    // healed and must not fail the job.
+                    .filter(|(_, s)| !crate::get::census::is_spared_metadata(&s.hint))
                     .map(|(_, s)| s.hint.clone())
                     .collect();
                 // The census's own out-of-set findings belong
@@ -1284,6 +1336,7 @@ pub(super) async fn fetch_matched_deferred(
     out_dir: &Path,
     buf_pool: &Arc<nzbkit::pool::BufPool>,
     extractor: &Arc<nzbkit::extract::Extractor>,
+    cancel: Option<&crate::repair::SideCancel>,
 ) {
     if let Some(set) = verifier.set() {
         for (sidx, file_size) in sniff.matched_deferred(&set) {
@@ -1292,7 +1345,7 @@ pub(super) async fn fetch_matched_deferred(
                 slots[sidx].hint
             );
             let fi = slot_file[sidx];
-            if let Err(e) = fetch_volumes(servers, nzb, out_dir, buf_pool, &[fi]).await {
+            if let Err(e) = fetch_volumes(servers, nzb, out_dir, buf_pool, &[fi], cancel).await {
                 println!("  ⚠ fetching it failed ({e}) - leaving it to the repair pass");
                 continue;
             }

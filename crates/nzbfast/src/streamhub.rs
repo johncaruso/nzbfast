@@ -60,6 +60,19 @@ pub(crate) struct StreamHub {
     /// ("stopped by user") instead of settling/extracting partial data.
     pub abort: std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
     pub queue_ctl: std::sync::Mutex<Option<Arc<nzbkit::pool::QueueControl>>>,
+    /// §129: per-owning-nzo_id cancel handle for a run's recovery-volume
+    /// side-fetches, keyed exactly like `activity` below and removed at
+    /// the same place (`Daemon::park`).
+    ///
+    /// It cannot be `queue_ctl`, and that is the whole reason this map
+    /// exists: `queue_ctl` and `abort` are overwritten per job and carry
+    /// no owner tag, so they belong to whatever is DOWNLOADING now. Once
+    /// the postproc lane let a tail outlive its download slot, the job
+    /// whose repair is pulling parity is routinely not that job - and
+    /// deleting it aborted a healthy unrelated download while its own
+    /// side-fetch ran on, which is the hazard `owns_hub` was written for.
+    pub tail_cancel:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<crate::repair::SideCancel>>>,
     /// Connections parked between jobs (see `nzbkit::warmpool`). Lives on
     /// the hub because it must outlive any single download - that is the
     /// entire point. Daemon only: a one-shot CLI `get` has no second job
@@ -84,6 +97,11 @@ pub(crate) struct StreamHub {
     /// live-tuned. State, never a setting: nothing here is persisted.
     pub live_targets:
         std::sync::Mutex<std::collections::HashMap<String, Arc<nzbkit::pool::ConnTarget>>>,
+    /// The `live_tune` setting, mirrored here by the daemon (settings
+    /// apply + restart restore) because the pool build in get/fleet.rs
+    /// reaches the hub, not the daemon. False on a CLI run and on a
+    /// prefetch sidecar's fresh hub - sidecars are never live-tuned.
+    pub live_tune: std::sync::atomic::AtomicBool,
     /// M2c.5: may this run speculatively prefetch a recovery volume the
     /// moment an article goes terminally Missing? The daemon enables it
     /// per MAIN job when no quota is configured (mirrors the sidecar-

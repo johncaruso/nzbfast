@@ -151,6 +151,25 @@ that sweep's remaining four HTTP findings, done as one pass (see
     `recv().unwrap()` calls on the path of every response, where an absent
     parser thread is normal, so all five no longer panic.
 
+13. **`Cargo.toml`, `src/lib.rs`, `src/ssl/rustls.rs` - the rustls backend is
+    real, and takes a prebuilt config (TODO §129 2a, native HTTPS for the
+    daemon UI/API).** The `ssl-rustls` feature was vendored as a declared-but-
+    empty stub; it now enables an optional `rustls 0.23` dependency (upstream's
+    implementation targeted the 0.20 API). Deliberate departure from upstream:
+    `SslConfig` under this feature carries `Arc<rustls::ServerConfig>` instead
+    of raw PEM byte vectors, so certificate parsing, validation and error
+    wording live with the caller - which can name the offending FILE, check
+    expiry, and choose the crypto provider. The last point is load-bearing:
+    the workspace links both aws-lc-rs and ring, so a provider-less
+    `rustls::ServerConfig::builder()` in here would panic at run time (same
+    trap `nzbkit::benchserve::tls_config` documents). No provider feature is
+    enabled on the dependency for the same reason. The handshake stays lazy
+    (`StreamOwned` handshakes on first read/write in the worker, never in the
+    accept thread), and patch 12's per-connection handshake - which upstream
+    ran ONLY for HTTPS - already runs everywhere, so HTTPS connections get the
+    same one-outstanding-request admission as plain ones. `ssl-openssl`
+    remains a stub.
+
 ## Admission control (patches 9-12)
 
 These four were reported as separate findings (2, 3, 4 and A5 of the 25 Jul
@@ -231,8 +250,9 @@ asserts they are configured tightly enough to matter.
 
 - `Cargo.toml` rewritten: dev-dependencies dropped (`fdlimit`,
   `rustc-serialize`, `sha1` - old, and the crate's own test suite is not
-  vendored), optional TLS backends dropped entirely. We terminate TLS nowhere in
-  this listener; NNTP TLS is rustls, in `nzbkit`.
+  vendored). The openssl TLS backend is dropped entirely; the rustls backend
+  was dropped at vendoring time and restored by patch 13 for the daemon's
+  opt-in native HTTPS (NNTP TLS is separate and stays in `nzbkit`).
 - `benches/`, `tests/`, `examples/`, `README.md`, `CHANGELOG.md` not vendored.
 - The crate's own `#[cfg(test)]` unit tests **are** kept (they ship inside
   `src/`), and they pass - including `equal_reader`'s, which cover the patched

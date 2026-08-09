@@ -27,6 +27,7 @@ fn server(host: &str) -> ServerConfig {
         group: None,
         retention_days: 0,
         block_bytes: None,
+        block_account: false,
         bind_ip: None,
         socks5: None,
         enabled: true,
@@ -53,6 +54,8 @@ fn work(id: &str) -> Work {
         dup: false,
         prebyte_expiries: 0,
         soft_430: 0,
+        fenced: false,
+        rearms: 0,
     }
 }
 
@@ -1565,6 +1568,7 @@ async fn a_mute_parked_connection_does_not_hold_a_finished_run() {
         group: None,
         retention_days: 0,
         block_bytes: None,
+        block_account: false,
         bind_ip: None,
         socks5: None,
         enabled: true,
@@ -1933,7 +1937,17 @@ async fn a_bare_430_defers_the_verdict_and_says_so() {
     sh.charge_wire();
 
     let before = sh.deferred.load(Ordering::Relaxed);
-    handle_missing(&cfg, ctx, &sh, &tx, &mut inflight, Vec::new(), false).await;
+    handle_missing(
+        &cfg,
+        ctx,
+        &sh,
+        &tx,
+        &mut inflight,
+        Vec::new(),
+        false,
+        &mut Default::default(),
+    )
+    .await;
     assert_eq!(
         sh.deferred.load(Ordering::Relaxed),
         before + 1,
@@ -1956,7 +1970,17 @@ async fn a_bare_430_defers_the_verdict_and_says_so() {
         .expect("the requeued work");
     let mut inflight: VecDeque<Work> = [w].into_iter().collect();
     sh.charge_wire();
-    handle_missing(&cfg, ctx, &sh, &tx, &mut inflight, Vec::new(), false).await;
+    handle_missing(
+        &cfg,
+        ctx,
+        &sh,
+        &tx,
+        &mut inflight,
+        Vec::new(),
+        false,
+        &mut Default::default(),
+    )
+    .await;
     assert!(
         matches!(rx.try_recv(), Ok(FetchOutcome::Missing { id, .. }) if id == "<a@x>"),
         "the second bare 430 confirms the first and declares the article"
@@ -1965,6 +1989,161 @@ async fn a_bare_430_defers_the_verdict_and_says_so() {
         sh.deferred.load(Ordering::Relaxed),
         before + 1,
         "a resolving response is not a deferral"
+    );
+}
+
+/// §129 3g: the confirming repeat is a WINDOWED confirmation, not a
+/// one-time pass for the whole run. Two bare refusals only confirm each
+/// other while both were read off aligned sockets; when the session that
+/// took the first one is afterwards shown to have been reading responses
+/// off by one, that refusal was never evidence about this article at all
+/// and the pass comes back.
+///
+/// Before this, `soft_430` was set once and carried across every requeue
+/// forever, so it defeated exactly ONE desync event per article: a second
+/// misattributed refusal - from an unrelated event, on a different
+/// session, minutes later - folded straight into `tried_430` and
+/// declared an article the server HOLDS terminally Missing. On a
+/// single-server run nothing contradicts that verdict, which makes it
+/// silent data loss rather than a slowdown.
+#[tokio::test]
+async fn a_proven_desync_gives_the_bare_430_pass_back() {
+    let servers = vec![(server("s"), PoolConfig::default())];
+    let (sh, _) = Shared::new(fresh(&["<a@x>"]), &servers);
+    let cfg = PoolConfig::default();
+    let ctx = ctx_for(&servers, 0);
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut ledger: VecDeque<String> = VecDeque::new();
+
+    // A desynced session's refusal: bare, and about the article behind.
+    let w = sh.queue.lock().await.pop_front().expect("the seeded work");
+    let mut inflight: VecDeque<Work> = [w].into_iter().collect();
+    sh.charge_wire();
+    handle_missing(
+        &cfg,
+        ctx,
+        &sh,
+        &tx,
+        &mut inflight,
+        Vec::new(),
+        false,
+        &mut ledger,
+    )
+    .await;
+    assert_eq!(
+        ledger.len(),
+        1,
+        "a bare refusal goes in the session's ledger - it is the only \
+         record of what a later desync proof would have to void"
+    );
+
+    // That session then reads an id that is not the one it asked for,
+    // proving every refusal since its last checked id was positional
+    // evidence off a misaligned socket.
+    sh.void_soft_430(&ledger, ctx.group_bits);
+
+    // The next bare refusal is therefore FIRST evidence again.
+    let w = sh
+        .queue
+        .lock()
+        .await
+        .pop_front()
+        .expect("the requeued work");
+    let mut inflight: VecDeque<Work> = [w].into_iter().collect();
+    sh.charge_wire();
+    handle_missing(
+        &cfg,
+        ctx,
+        &sh,
+        &tx,
+        &mut inflight,
+        Vec::new(),
+        false,
+        &mut Default::default(),
+    )
+    .await;
+    assert!(
+        rx.try_recv().is_err(),
+        "the voided refusal cannot confirm anything - declaring the \
+         article here is the false Missing this item exists to close"
+    );
+    assert_eq!(sh.queue.lock().await.len(), 1, "requeued for the recheck");
+
+    // And with no fresh proof, the pair that follows still resolves it:
+    // re-arming may not turn a dead post into a loop.
+    let w = sh
+        .queue
+        .lock()
+        .await
+        .pop_front()
+        .expect("the requeued work");
+    let mut inflight: VecDeque<Work> = [w].into_iter().collect();
+    sh.charge_wire();
+    handle_missing(
+        &cfg,
+        ctx,
+        &sh,
+        &tx,
+        &mut inflight,
+        Vec::new(),
+        false,
+        &mut Default::default(),
+    )
+    .await;
+    assert!(
+        matches!(rx.try_recv(), Ok(FetchOutcome::Missing { id, .. }) if id == "<a@x>"),
+        "two refusals off aligned sockets are still a confirmation"
+    );
+}
+
+/// §129 3g, the other half: the re-arm is CAPPED, so a provider that
+/// desyncs on every session cannot keep an article out of a terminal
+/// verdict for ever. The first cut of the fix had no cap and hung the
+/// 1-in-5 desync leg outright - every session's death handed every
+/// article it had refused its pass back, and a wholly-absent post then
+/// had no way to resolve at all.
+#[tokio::test]
+async fn the_re_armed_pass_is_capped_so_the_run_still_terminates() {
+    let servers = vec![(server("s"), PoolConfig::default())];
+    let (sh, _) = Shared::new(fresh(&["<a@x>"]), &servers);
+    let cfg = PoolConfig::default();
+    let ctx = ctx_for(&servers, 0);
+    let (tx, mut rx) = mpsc::channel(8);
+
+    // Every single refusal is followed by a proof of desync - the worst
+    // case a hostile or badly broken frontend can produce.
+    for round in 0..(SOFT_REARM_CAP as usize + 2) {
+        let Some(w) = sh.queue.lock().await.pop_front() else {
+            break; // resolved: the article left the queue for good
+        };
+        let mut ledger: VecDeque<String> = VecDeque::new();
+        let mut inflight: VecDeque<Work> = [w].into_iter().collect();
+        sh.charge_wire();
+        handle_missing(
+            &cfg,
+            ctx,
+            &sh,
+            &tx,
+            &mut inflight,
+            Vec::new(),
+            false,
+            &mut ledger,
+        )
+        .await;
+        sh.void_soft_430(&ledger, ctx.group_bits);
+        if let Ok(FetchOutcome::Missing { id, .. }) = rx.try_recv() {
+            assert_eq!(id, "<a@x>");
+            assert!(
+                round <= SOFT_REARM_CAP as usize + 1,
+                "resolved after {round} rounds"
+            );
+            return;
+        }
+    }
+    panic!(
+        "the article never reached a terminal verdict in \
+         {} rounds of refusal-plus-proof - the re-arm is unbounded",
+        SOFT_REARM_CAP + 2
     );
 }
 

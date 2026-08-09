@@ -15,6 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
+// The rig's DNS half (§129 3a). Everything above this line injects
+// faults AFTER a connection exists; `dns` injects them before one does.
+pub mod dns;
+
 /// Failure injection for one mock server.
 #[derive(Default, Clone)]
 pub struct Chaos {
@@ -34,6 +38,18 @@ pub struct Chaos {
     /// Fixed delay before every successful BODY response (a "slow
     /// server" - per-connection throughput ≈ article_size / delay).
     pub delay_ms: u64,
+    /// Echo the requested message-id on the refusal line ("430 no such
+    /// article <id>") instead of the bare form. Real providers split
+    /// both ways, and the difference is not cosmetic: the pool treats an
+    /// UN-echoed 430 as positional-only evidence and requeues the
+    /// article uncharged for one confirming repeat (see `Work::soft_430`
+    /// - a frontend that dropped a pipelined response would otherwise
+    /// misfile the refusal onto the next article). So a non-echoing
+    /// provider is asked up to TWICE for every article it does not have,
+    /// and an echoing one exactly once. §129 3d's baseline has to price
+    /// both, because which family the provider belongs to doubles the
+    /// cost of its absence.
+    pub echo_missing_id: bool,
     /// Fixed delay before every 430. `delay_ms` deliberately does not
     /// cover the refusal path, but a real 430 is a full round trip like
     /// any other (~30-80 ms transatlantic), and a wholly-dead post is
@@ -45,6 +61,13 @@ pub struct Chaos {
     /// provider that ACKs the QUIT at TCP level but never answers it
     /// (seen live; used to park the exit path forever).
     pub mute_quit: bool,
+    /// Read DATE and answer it with nothing, forever, while every other
+    /// command is served normally. RFC 3977 makes DATE mandatory, but a
+    /// frontend that never implemented it is the fault §129 3g's
+    /// `fence_dud` retirement exists for: every fence this server is
+    /// sent goes unanswered, so without retirement each session dies on
+    /// its own alignment check and the job never finishes.
+    pub mute_date: bool,
     /// Accept connections but never send the greeting - the connection
     /// just sits. Models a mute/half-dead frontend; a worker stuck in
     /// connect() must not hang a finished run's join.
@@ -282,6 +305,24 @@ struct ThrottleState {
     /// Server birth - the shared epoch the handover schedule ticks
     /// against, so every connection freezes on the SAME clock.
     started: std::time::Instant,
+    /// Body bytes THIS server put on the wire (dot-stuffed payload
+    /// plus, on the ARTICLE path, its header block), across every
+    /// connection - the server-side twin of the client's per-server
+    /// byte ledger, shared with [`MockServer::bytes_out`].
+    ///
+    /// Counted here rather than at the call sites because
+    /// [`Self::pace_write`] is the one funnel every SERVED body passes
+    /// through (overview and header responses are not body bytes and
+    /// do not go through it); only the two truncation arms, which
+    /// bypass pacing to cut the socket mid-body, charge themselves.
+    ///
+    /// The §129 3c contract asserts provider accounting, and that
+    /// assertion is only worth making against an independent witness:
+    /// "the client says server A moved 4 MB" means nothing unless A
+    /// itself agrees it wrote 4 MB. Truncated and corrupted bodies
+    /// count what actually went out, which is what the client's own
+    /// counter sees too.
+    bytes_out: Arc<AtomicU64>,
 }
 
 impl ThrottleState {
@@ -292,7 +333,16 @@ impl ThrottleState {
             dip_state: Default::default(),
             line_override: Default::default(),
             started: std::time::Instant::now(),
+            bytes_out: Default::default(),
         })
+    }
+
+    /// Charge `data` to the wire ledger without pacing it - for the
+    /// truncation arms, which cut the socket mid-body and so never
+    /// reach [`Self::pace_write`].
+    fn note_out(&self, data: &[u8]) {
+        self.bytes_out
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
     }
 
     /// The line cap in force right now, arming the dip when concurrency
@@ -331,6 +381,8 @@ impl ThrottleState {
         w: &mut W,
         data: &[u8],
     ) -> std::io::Result<()> {
+        self.bytes_out
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
         if t.per_conn_bps == 0 && t.line_bps == 0 && self.line_override.load(Ordering::Relaxed) == 0
         {
             return w.write_all(data).await;
@@ -423,10 +475,11 @@ pub struct PostChaos {
     pub reject_after: u64,
 }
 
-/// Shared POST-path counters (across every connection of one server):
-/// POST/IHAVE command lines seen, and articles actually read off the wire.
+/// Shared counters for one server, across every connection of it:
+/// POST/IHAVE command lines seen, articles read off the wire, STATs
+/// answered, and body bytes written back.
 #[derive(Default)]
-struct PostCounters {
+struct Counters {
     commands: AtomicU64,
     articles: AtomicU64,
     /// STAT commands answered, across every connection. Shared with
@@ -435,6 +488,13 @@ struct PostCounters {
     /// "nothing probed while a download ran" is only checkable from the
     /// server's side.
     stats: Arc<AtomicU64>,
+    /// The value of `served` at the moment each DATE command arrived,
+    /// across every connection. Shared with [`MockServer::date_log`]:
+    /// the §129 3g alignment fence is a DATE written behind a BODY, so
+    /// this is the only place from which "is this server still being
+    /// fenced" is observable at all, and its LAST entry against the
+    /// final `served` is what says fencing stopped for good.
+    date_log: Arc<std::sync::Mutex<Vec<u64>>>,
 }
 
 /// One overview row served for OVER/XOVER (spot-ingestion tests).
@@ -501,6 +561,19 @@ async fn refuse_delay(chaos: &Chaos) {
     }
 }
 
+/// The refusal line for `id`, in whichever of the two real-world shapes
+/// [`Chaos::echo_missing_id`] selects. The bare form stays the default
+/// because it is the harder one - the client cannot attribute it
+/// positionally with confidence, which is the whole reason `soft_430`
+/// exists.
+fn refusal(chaos: &Chaos, id: &str) -> String {
+    if chaos.echo_missing_id {
+        format!("430 no such article {id}\r\n")
+    } else {
+        "430 no such article\r\n".to_string()
+    }
+}
+
 /// One article on the wire: the raw dot-stuffed yEnc body.
 fn wire_body(article: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(article.len() + 16);
@@ -525,6 +598,16 @@ pub struct MockServer {
     /// pre-flight prober is STAT-only, so this is the one place its
     /// traffic (or its absence, while a download runs) is visible.
     pub stats: Arc<AtomicU64>,
+    /// The `served` count at the moment of each DATE command, across
+    /// all connections - see [`Counters::date_log`]. The §129 3g
+    /// alignment fence rides behind a BODY as a DATE, so this is where
+    /// a test reads whether this server is being fenced, and where it
+    /// stopped being fenced.
+    pub date_log: Arc<std::sync::Mutex<Vec<u64>>>,
+    /// Body bytes this server put on the wire, across all connections -
+    /// the independent witness for the §129 3c provider-accounting
+    /// clause (see [`Counters::bytes_out`]).
+    pub bytes_out: Arc<AtomicU64>,
     /// Every BODY request's message-id (with angle brackets) in arrival
     /// order, across all connections - the M11 tests assert queue-order
     /// effects (head/tail burst, seek promotion) against this.
@@ -610,9 +693,11 @@ impl MockServer {
         let pause2 = pause.clone();
         let accepted = Arc::new(AtomicU64::new(0));
         let accepted2 = accepted.clone();
-        let post_counters: Arc<PostCounters> = Default::default();
-        let stats = post_counters.stats.clone();
+        let counters: Arc<Counters> = Default::default();
+        let stats = counters.stats.clone();
+        let date_log = counters.date_log.clone();
         let throttle_state = ThrottleState::new();
+        let bytes_out = throttle_state.bytes_out.clone();
         let throttle_state2 = throttle_state.clone();
         let handle = tokio::spawn(async move {
             loop {
@@ -643,7 +728,7 @@ impl MockServer {
                 let stall_once = stall_once.clone();
                 let stall_pre_once = stall_pre_once.clone();
                 let pause = pause2.clone();
-                let post_counters = post_counters.clone();
+                let counters = counters.clone();
                 let ts = throttle_state.clone();
                 ts.active.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
@@ -712,7 +797,7 @@ impl MockServer {
                         stall_once,
                         stall_pre_once,
                         pause,
-                        post_counters,
+                        counters,
                         ts.clone(),
                     )
                     .await;
@@ -730,6 +815,8 @@ impl MockServer {
             served,
             accepted,
             stats,
+            date_log,
+            bytes_out,
             body_log,
             pause,
             plane: plane2,
@@ -755,6 +842,69 @@ impl MockServer {
         LineControl(self.throttle_state.clone())
     }
 
+    /// Per-message-id REQUEST counts, across every connection, in id
+    /// order. Derived from `body_log`, so it counts what the client
+    /// ASKED for - a 430, a stalled request and a served body are each
+    /// one request, because each is one round trip the client paid for.
+    ///
+    /// The §129 3c contract's refetch clause reads this: after a
+    /// crash-and-resume, the ids requested twice must be bounded by
+    /// what was genuinely in flight at the kill, not by the whole
+    /// download.
+    pub fn serve_counts(&self) -> std::collections::BTreeMap<String, u64> {
+        let mut out: std::collections::BTreeMap<String, u64> = Default::default();
+        for id in self.body_log.lock_ok().iter() {
+            *out.entry(id.clone()).or_default() += 1;
+        }
+        out
+    }
+
+    /// Ids this server was asked for more than once, with their counts,
+    /// most-repeated first. The refetch ledger in one call.
+    pub fn refetched(&self) -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = self
+            .serve_counts()
+            .into_iter()
+            .filter(|(_, n)| *n > 1)
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
+    /// One-line serve-count dump for a rig log: totals plus the worst
+    /// offenders. `chaos-serve` prints this per tick, and once more on
+    /// shutdown, so the bench-box matrix can check the refetch clause
+    /// from the server's own log the way an in-process test checks it
+    /// from [`Self::refetched`].
+    ///
+    /// Carries `dials` (accepted connections) as well, so one line
+    /// answers both the failover and the refetch clause and neither has
+    /// to be read off a tick that may be a tick stale.
+    pub fn serve_count_line(&self, label: &str) -> String {
+        let counts = self.serve_counts();
+        let requests: u64 = counts.values().sum();
+        let repeats: Vec<(String, u64)> = self.refetched();
+        let extra: u64 = repeats.iter().map(|(_, n)| n - 1).sum();
+        let top: Vec<String> = repeats
+            .iter()
+            .take(5)
+            .map(|(id, n)| format!("{id}x{n}"))
+            .collect();
+        format!(
+            "SERVE-COUNTS {label}: dials={} requests={requests} distinct={} refetched_ids={} \
+             extra_requests={extra} bytes_out={}{}",
+            self.accepted.load(Ordering::Relaxed),
+            counts.len(),
+            repeats.len(),
+            self.bytes_out.load(Ordering::Relaxed),
+            if top.is_empty() {
+                String::new()
+            } else {
+                format!(" top={}", top.join(","))
+            }
+        )
+    }
+
     /// Append overview rows, as if those articles had just been posted.
     /// GROUP's high-water mark moves with them, so a client tracking the
     /// head of the group sees them on its next tick - which is how a post
@@ -778,6 +928,7 @@ impl MockServer {
             group: None,
             retention_days: 0,
             block_bytes: None,
+            block_account: false,
             bind_ip: None,
             socks5: None,
             enabled: true,
@@ -798,11 +949,11 @@ async fn handle_post(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
     articles: &Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>,
     chaos: &Chaos,
-    post_counters: &Arc<PostCounters>,
+    counters: &Arc<Counters>,
 ) -> std::io::Result<bool> {
     if chaos.post_rejected {
         w.write_all(b"440 posting not allowed\r\n").await?;
-    } else if post_counters.commands.fetch_add(1, Ordering::Relaxed) < chaos.post.try_later {
+    } else if counters.commands.fetch_add(1, Ordering::Relaxed) < chaos.post.try_later {
         w.write_all(b"503 service temporarily unavailable\r\n")
             .await?;
     } else {
@@ -810,7 +961,7 @@ async fn handle_post(
         w.flush().await?;
         match read_posted_article(reader).await? {
             Some((id, body)) => {
-                let nth = post_counters.articles.fetch_add(1, Ordering::Relaxed) + 1;
+                let nth = counters.articles.fetch_add(1, Ordering::Relaxed) + 1;
                 if nth <= chaos.post.ack_lost {
                     // Article read, nothing said back, socket gone.
                     if chaos.post.ack_lost_keeps {
@@ -861,7 +1012,7 @@ async fn serve_conn(
     stall_once: Arc<std::sync::Mutex<HashSet<String>>>,
     stall_pre_once: Arc<std::sync::Mutex<HashSet<String>>>,
     pause: Arc<std::sync::atomic::AtomicBool>,
-    post_counters: Arc<PostCounters>,
+    counters: Arc<Counters>,
     throttle: Arc<ThrottleState>,
 ) -> std::io::Result<()> {
     sock.set_nodelay(true)?;
@@ -1016,7 +1167,7 @@ async fn serve_conn(
                 None => w.write_all(b"430 no such article\r\n").await?,
             }
         } else if upper == "POST" {
-            if !handle_post(&mut w, &mut reader, &articles, &chaos, &post_counters).await? {
+            if !handle_post(&mut w, &mut reader, &articles, &chaos, &counters).await? {
                 return Ok(());
             }
         } else if let Some(id) = cmd
@@ -1024,7 +1175,7 @@ async fn serve_conn(
             .or_else(|| cmd.strip_prefix("ihave "))
         {
             let claimed = id.trim().to_string();
-            if post_counters.commands.fetch_add(1, Ordering::Relaxed) < chaos.post.try_later {
+            if counters.commands.fetch_add(1, Ordering::Relaxed) < chaos.post.try_later {
                 w.write_all(b"436 transfer failed, try again later\r\n")
                     .await?;
             } else if articles.lock_ok().contains_key(&claimed) {
@@ -1034,7 +1185,7 @@ async fn serve_conn(
                 w.flush().await?;
                 match read_posted_article(&mut reader).await? {
                     Some((_, body)) => {
-                        let nth = post_counters.articles.fetch_add(1, Ordering::Relaxed) + 1;
+                        let nth = counters.articles.fetch_add(1, Ordering::Relaxed) + 1;
                         if nth <= chaos.post.ack_lost {
                             // Article read, nothing said back, socket gone.
                             if chaos.post.ack_lost_keeps {
@@ -1054,13 +1205,23 @@ async fn serve_conn(
             w.write_all(b"101 capabilities\r\nVERSION 2\r\nPIPELINING\r\n.\r\n")
                 .await?;
         } else if upper.starts_with("DATE") {
-            w.write_all(b"111 20260719000000\r\n").await?;
+            counters
+                .date_log
+                .lock_ok()
+                .push(served.load(Ordering::Relaxed));
+            // A provider that reads DATE and answers nothing at all.
+            // The command is legal and mandatory, so nothing upstream
+            // of the read can tell: the client only finds out when the
+            // slot it expected the answer in holds the next response.
+            if !chaos.mute_date {
+                w.write_all(b"111 20260719000000\r\n").await?;
+            }
         } else if let Some(id) = cmd
             .strip_prefix("STAT ")
             .or_else(|| cmd.strip_prefix("stat "))
         {
             let id = id.trim();
-            let nth = post_counters.stats.fetch_add(1, Ordering::Relaxed) + 1;
+            let nth = counters.stats.fetch_add(1, Ordering::Relaxed) + 1;
             if chaos.post.stat_dies {
                 return Ok(());
             }
@@ -1072,7 +1233,7 @@ async fn serve_conn(
                 w.write_all(format!("223 0 {id}\r\n").as_bytes()).await?;
             } else {
                 refuse_delay(&chaos).await;
-                w.write_all(b"430 no such article\r\n").await?;
+                w.write_all(refusal(&chaos, id).as_bytes()).await?;
             }
         } else if let Some(id) = cmd
             .strip_prefix("BODY ")
@@ -1120,12 +1281,12 @@ async fn serve_conn(
             }
             if vanished(&chaos, &served) {
                 refuse_delay(&chaos).await;
-                w.write_all(b"430 no such article\r\n").await?;
+                w.write_all(refusal(&chaos, &id).as_bytes()).await?;
                 continue;
             }
             if chaos.missing.contains(&id) {
                 refuse_delay(&chaos).await;
-                w.write_all(b"430 no such article\r\n").await?;
+                w.write_all(refusal(&chaos, &id).as_bytes()).await?;
                 continue;
             }
             // Split-brain: the index knows the requested id (no 430),
@@ -1135,7 +1296,7 @@ async fn serve_conn(
             let stored = chaos.swap.get(&id).unwrap_or(&id);
             let Some(article) = articles.lock_ok().get(stored).cloned() else {
                 refuse_delay(&chaos).await;
-                w.write_all(b"430 no such article\r\n").await?;
+                w.write_all(refusal(&chaos, &id).as_bytes()).await?;
                 continue;
             };
             if chaos.delay_ms > 0 {
@@ -1183,6 +1344,7 @@ async fn serve_conn(
             let mut wire = wire_body(&body);
             if chaos.truncate.contains(&id) {
                 wire.truncate(wire.len() / 2);
+                throttle.note_out(&wire); // bypasses pace_write's ledger
                 w.write_all(&wire).await?;
                 return Ok(()); // cut the connection mid-body
             }
@@ -1259,19 +1421,19 @@ async fn serve_conn(
             }
             if vanished(&chaos, &served) {
                 refuse_delay(&chaos).await;
-                w.write_all(b"430 no such article\r\n").await?;
+                w.write_all(refusal(&chaos, &id).as_bytes()).await?;
                 continue;
             }
             if chaos.missing.contains(&id) {
                 refuse_delay(&chaos).await;
-                w.write_all(b"430 no such article\r\n").await?;
+                w.write_all(refusal(&chaos, &id).as_bytes()).await?;
                 continue;
             }
             // Split-brain swap (see BODY).
             let stored = chaos.swap.get(&id).unwrap_or(&id);
             let Some(article) = articles.lock_ok().get(stored).cloned() else {
                 refuse_delay(&chaos).await;
-                w.write_all(b"430 no such article\r\n").await?;
+                w.write_all(refusal(&chaos, &id).as_bytes()).await?;
                 continue;
             };
             if chaos.delay_ms > 0 {
@@ -1316,6 +1478,7 @@ async fn serve_conn(
             wire.extend_from_slice(&wire_body(&body));
             if chaos.truncate.contains(&id) {
                 wire.truncate(wire.len() / 2);
+                throttle.note_out(&wire); // bypasses pace_write's ledger
                 w.write_all(&wire).await?;
                 return Ok(());
             }

@@ -626,11 +626,33 @@ pub(super) fn measure_system(
     // what their first one shows alone (issue #12, round 2). SABnzbd's
     // own test pulls from a CDN over HTTP and measures the line, not the
     // providers; ours is the number that predicts a real download.
-    let servers: Vec<_> = nzbkit::config::Config::load(cfg_path)
+    //
+    // Metered servers sit this leg out (M7b.2 §5.7). The probe pulls
+    // real article bodies for up to 45 s across the whole fleet, and
+    // the three-layer gap round established what that figure actually
+    // is: the PROVIDERS' rate, not the line's - so on a per-byte
+    // account it is money spent measuring someone else's plan.
+    let all_enabled: Vec<nzbkit::config::ServerConfig> = nzbkit::config::Config::load(cfg_path)
         .map(|c| c.servers.into_iter().filter(|s| s.enabled).collect())
         .unwrap_or_default();
-    if servers.is_empty() {
+    if all_enabled.is_empty() {
         return Err("no servers configured".into());
+    }
+    let servers: Vec<_> = all_enabled
+        .iter()
+        .filter(|s| s.may_spend_on_measurement())
+        .cloned()
+        .collect();
+    if servers.is_empty() {
+        // Say which rule stopped it. Silently probing anyway would
+        // spend the money the flag exists to protect, and silently
+        // reporting 0.00 Gbps would read as a dead link.
+        return Err(
+            "every enabled server is marked as billed per byte, so there is nothing to \
+             measure the network with - this test downloads real articles. Untick \"Every \
+             byte is billed\" on a server to include it."
+                .into(),
+        );
     }
     let conns_total: usize = servers
         .iter()

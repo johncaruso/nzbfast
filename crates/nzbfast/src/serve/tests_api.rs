@@ -790,14 +790,14 @@ fn sab_timeleft_never_emits_an_hours_field_dotnet_will_reject() {
 }
 use serde_json::json;
 
-/// Every match arm in `apply_setting`, read out of our own source.
+/// The match arms of ONE dispatch function, read out of its own source.
 ///
 /// There is no way to reflect over a `match`, and rewriting a hundred
 /// hand-written validators into table rows would be a far bigger risk
 /// than the drift it prevents - so the source IS the reflection. The
 /// arms are string literals at a fixed indent inside one function, so
 /// this is a two-line scan rather than a parser.
-fn apply_setting_arms() -> std::collections::BTreeSet<String> {
+fn match_arms_of(src: &str, signature: &str) -> std::collections::BTreeSet<String> {
     // CR stripped because the splits below are byte-exact. A Windows
     // clone made before `.gitattributes` landed has this source in CRLF
     // (git's own core.autocrlf default), and `"\n}\n"` cannot match
@@ -805,13 +805,13 @@ fn apply_setting_arms() -> std::collections::BTreeSet<String> {
     // rather than reporting drift, which is the one way a guard must
     // never fail. `.gitattributes` pins LF now; this keeps the scan
     // working in a checkout that predates it.
-    let src = include_str!("settings.rs").replace('\r', "");
+    let src = src.replace('\r', "");
     let body = src
-        .split_once("\npub(super) fn apply_setting(")
-        .expect("apply_setting moved or was renamed")
+        .split_once(signature)
+        .unwrap_or_else(|| panic!("{signature} moved or was renamed"))
         .1
         .split_once("\n}\n")
-        .expect("apply_setting has no recognisable end")
+        .unwrap_or_else(|| panic!("{signature} has no recognisable end"))
         .0;
     body.lines()
         .filter_map(|l| l.strip_prefix("        \""))
@@ -827,6 +827,26 @@ fn apply_setting_arms() -> std::collections::BTreeSet<String> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// Every match arm in `apply_setting`, across BOTH halves of the table.
+///
+/// The dispatch outgrew the size gate's function ceiling and split at the
+/// indexer block (TODO 106): names the first half does not know fall
+/// through to `apply_setting_tail` in settings_apply.rs. Scanning only
+/// settings.rs would silently see half the arms and report every name in
+/// the other half as "declared but has no arm" - so both are scanned, and
+/// the arm-count floor below is what catches it if a third half appears.
+fn apply_setting_arms() -> std::collections::BTreeSet<String> {
+    let mut arms = match_arms_of(
+        include_str!("settings.rs"),
+        "\npub(super) fn apply_setting(",
+    );
+    arms.extend(match_arms_of(
+        include_str!("settings_apply.rs"),
+        "\npub(super) fn apply_setting_tail(",
+    ));
+    arms
 }
 
 /// THE guard this whole table exists for.
@@ -910,6 +930,63 @@ fn a_truncated_nzb_never_looks_complete() {
     assert!(!nzb_looks_complete(b""));
     // The closing tag has to be at the END, not merely present.
     assert!(!nzb_looks_complete(b"<nzb></nzb><file>still writing"));
+}
+
+/// M7b.2 §5.7: the block-account flag survives a trip through the
+/// server editor, and an OFF flag leaves no key behind.
+///
+/// The partial-object case is the one with teeth. `applyConns` - the
+/// ladder's "Apply N to this server" button - posts only the fields it
+/// knows about, and under an "absent means false" rule every per-server
+/// boolean the user had set would be silently cleared by pressing it.
+/// That is exactly how `pin_connections` behaved before this landed, so
+/// it is asserted here alongside the new flag rather than trusted.
+#[test]
+fn per_server_booleans_survive_a_partial_save() {
+    let stored = json!({
+        "host": "news.example.com", "port": 563, "tls": true,
+        "block_account": true, "pin_connections": true, "warm_pool": true,
+    });
+    // What applyConns sends: host, port, tls, connections, and nothing
+    // about the checkboxes.
+    let partial = json!({
+        "host": "news.example.com", "port": 563, "tls": true, "connections": 12,
+    });
+    let out = normalized_server(Some(&stored), &partial).expect("host is set");
+    assert_eq!(out["connections"], 12);
+    for key in ["block_account", "pin_connections", "warm_pool"] {
+        assert_eq!(
+            out[key], true,
+            "{key} was cleared by a save that never mentioned it"
+        );
+    }
+
+    // The editor form always sends all three, so an explicit false is
+    // still how a user turns one off - and it REMOVES the key rather
+    // than writing false, because people read this file by hand.
+    let cleared = json!({
+        "host": "news.example.com", "port": 563, "tls": true,
+        "block_account": false, "pin_connections": false, "warm_pool": false,
+    });
+    let out = normalized_server(Some(&stored), &cleared).expect("host is set");
+    for key in ["block_account", "pin_connections", "warm_pool"] {
+        assert!(out.get(key).is_none(), "{key}: off must write no key");
+    }
+
+    // And it is independent of the tier and of the block size: a
+    // level-0 server with no block can still be billed per byte.
+    let fresh = json!({
+        "host": "news.example.com", "port": 563, "tls": true, "block_account": true,
+    });
+    let out = normalized_server(None, &fresh).expect("host is set");
+    assert_eq!(out["block_account"], true);
+    assert!(out.get("level").is_none());
+    assert!(out.get("block_bytes").is_none());
+    // Round-trips back through the config parser as the flag it was.
+    let parsed: nzbkit::config::ServerConfig = serde_json::from_value(out).unwrap();
+    assert!(parsed.block_account);
+    assert_eq!(parsed.level, 0);
+    assert!(!parsed.may_spend_on_measurement());
 }
 
 /// Sub-second resolution is load-bearing now that a pass can follow
@@ -1041,4 +1118,449 @@ fn live_tip_policy_applies_custom_categories_to_gate_and_ingest() {
     let _ = std::fs::remove_file(&db);
     let _ = std::fs::remove_file(db.with_extension("db-wal"));
     let _ = std::fs::remove_file(db.with_extension("db-shm"));
+}
+
+/// The 7 Aug incident's product half, pinned: with a global
+/// move_completed set, a finished job whose directory sits OUTSIDE the
+/// configured out-root (the live shape - the settings out-root named one
+/// folder, the jobs landed in its parent) still gets its move ATTEMPTED,
+/// and the outcome comes back as data rather than only a log line.
+#[test]
+fn relocate_attempts_the_move_for_an_out_of_root_job() {
+    use crate::serve::testutil::test_daemon;
+
+    let dir = std::env::temp_dir().join(format!("nzbfast-reloc-attempt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = test_daemon(&dir);
+    *d.move_completed.write_ok() = Some(dir.join("nas"));
+    // The job's folder is NOT under d.out_dir() - strip_prefix fails and
+    // the category fallback (empty cat, the watch-folder default) must
+    // still produce a destination rather than an early return.
+    let job_dir = dir.join("elsewhere").join("Some.Release");
+    std::fs::create_dir_all(&job_dir).unwrap();
+    std::fs::write(job_dir.join("payload.bin"), b"bytes").unwrap();
+
+    let (moved, split, failed) = d.relocate_completed(&job_dir, "", None);
+    assert_eq!(failed, None, "a movable job must not report a failure");
+    assert_eq!(split, None);
+    let dest = dir.join("nas").join("Some.Release");
+    assert_eq!(moved.as_deref(), Some(dest.as_path()));
+    assert!(
+        dest.join("payload.bin").exists(),
+        "the payload must actually move"
+    );
+    assert!(!job_dir.exists() || std::fs::read_dir(&job_dir).unwrap().next().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A move that fails outright must say so IN THE RETURN, not only in a
+/// log line - the log died once (7 Aug) and five finished jobs sat in
+/// the download folder looking exactly like moved ones.
+#[cfg(unix)]
+#[test]
+fn relocate_reports_a_nothing_moved_failure_as_data() {
+    use crate::serve::testutil::test_daemon;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("nzbfast-reloc-fail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = test_daemon(&dir);
+    let nas = dir.join("nas");
+    std::fs::create_dir_all(&nas).unwrap();
+    *d.move_completed.write_ok() = Some(nas.clone());
+    let job_dir = dir.join("elsewhere").join("Some.Release");
+    std::fs::create_dir_all(&job_dir).unwrap();
+    std::fs::write(job_dir.join("payload.bin"), b"bytes").unwrap();
+    // An unwritable destination root stands in for the live failure (a
+    // network volume the OS denies).
+    std::fs::set_permissions(&nas, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let (moved, split, failed) = d.relocate_completed(&job_dir, "", None);
+    std::fs::set_permissions(&nas, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(moved, None);
+    assert_eq!(split, None);
+    let why = failed.expect("a nothing-moved failure must come back as data");
+    assert!(
+        why.contains(&*nas.join("Some.Release").to_string_lossy()),
+        "the failure must name the destination: {why}"
+    );
+    assert!(
+        job_dir.join("payload.bin").exists(),
+        "nothing moved - the payload must be whole at the source"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The move-retry ladder climbs and then stops. A destination volume
+/// that was not mounted (8 Aug 2026) had one Completed job log the
+/// identical EACCES every 20 minutes for 15 hours, because each failure
+/// re-armed a FLAT cooldown with nothing counting the attempts.
+#[test]
+fn a_move_that_keeps_failing_backs_off_and_finally_gives_up() {
+    use crate::serve::job::{MOVE_RETRY_GIVE_UP, MOVE_RETRY_MAX_SECS, move_retry_delay};
+
+    const BASE: u64 = 1200; // the default 20 minutes
+    // First retry waits the plain base, then it doubles.
+    assert_eq!(move_retry_delay(BASE, 1), BASE);
+    assert_eq!(move_retry_delay(BASE, 2), 2 * BASE);
+    assert_eq!(move_retry_delay(BASE, 3), 4 * BASE);
+    // ...to a ceiling, so a destination that is simply gone stops
+    // filling the log rather than costing a probe every 20 minutes.
+    assert_eq!(move_retry_delay(BASE, 30), MOVE_RETRY_MAX_SECS);
+    // A base longer than the ceiling is the user's own choice and is
+    // never shortened to it.
+    let week = 7 * 24 * 3600;
+    assert_eq!(move_retry_delay(week, 1), week);
+    assert!(move_retry_delay(week, 9) >= week);
+    // The shift cannot overflow however many attempts have failed.
+    assert!(move_retry_delay(u64::MAX, u32::MAX) > 0);
+
+    // And the ladder is finite: total time tried is about a day, not
+    // forever.
+    let total: u64 = (1..MOVE_RETRY_GIVE_UP)
+        .map(|n| move_retry_delay(BASE, n))
+        .sum();
+    assert!(
+        (12 * 3600..48 * 3600).contains(&total),
+        "give-up should land inside a day or so, got {total}s"
+    );
+}
+
+/// The counter drives arming: the daemon stops re-arming at the give-up
+/// count and leaves the record amber for a human, and the drawer's own
+/// button restarts the whole ladder.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_move_ladder_stops_and_a_manual_retry_restarts_it() {
+    use crate::serve::job::{JobState, MOVE_RETRY_GIVE_UP, job_from_json};
+    use crate::serve::testutil::test_daemon;
+
+    let dir = std::env::temp_dir().join(format!("nzbfast-moveladder-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = test_daemon(&dir);
+    d.auto_retry_secs.store(1200, Ordering::Relaxed);
+    let mut j = job_from_json(&json!({
+        "nzo_id": "SABnzbd_nzo_ladder",
+        "name": "Some.Release",
+        "nzb_path": dir.join("some.nzb").to_string_lossy(),
+        "out_dir": dir.join("elsewhere").to_string_lossy(),
+        "state": "Completed",
+        "category": "",
+        "move_failed": "/Volumes/TV/Downloaded/Some.Release: Permission denied (os error 13)",
+    }))
+    .unwrap();
+    assert_eq!(j.state, JobState::Completed);
+
+    // Every failure up to the give-up count arms a longer cooldown.
+    let mut last = 0u64;
+    for n in 1..MOVE_RETRY_GIVE_UP {
+        d.settle_move_attempt(&mut j);
+        assert_eq!(j.move_attempts, n);
+        let at = j.auto_retry_at.expect("a retry is still owed");
+        assert_eq!(j.auto_retry_why.as_deref(), Some("move"));
+        // Non-decreasing, not strictly increasing: the ladder is capped
+        // at MOVE_RETRY_MAX_SECS and the top rungs are deliberately the
+        // same length.
+        assert!(
+            at >= last,
+            "attempt {n} must not wait less than the one before"
+        );
+        last = at;
+    }
+    // The one that reaches the count arms nothing.
+    d.settle_move_attempt(&mut j);
+    assert_eq!(j.move_attempts, MOVE_RETRY_GIVE_UP);
+    assert!(
+        j.auto_retry_at.is_none(),
+        "the ladder must end rather than retry an unreachable destination forever"
+    );
+    // ...but the payload is still reported, so the row stays amber and
+    // the drawer keeps naming the destination and the error.
+    assert!(!j.move_failed.is_empty());
+
+    // A landed move clears the count and the stamp together.
+    j.auto_retry_at = Some(1);
+    j.auto_retry_why = Some("move".into());
+    j.move_failed.clear();
+    d.settle_move_attempt(&mut j);
+    assert_eq!(j.move_attempts, 0);
+    assert!(j.auto_retry_at.is_none());
+
+    // The drawer button forgets the spent budget, so a job the daemon
+    // had given up on becomes automatic again once the user has fixed
+    // whatever was wrong.
+    j.move_failed = "/Volumes/TV/Downloaded/Some.Release: Permission denied".into();
+    j.move_attempts = MOVE_RETRY_GIVE_UP;
+    let job = Arc::new(Mutex::new(j));
+    d.history.lock_ok().push(job.clone());
+    // No destination is configured on this daemon, so the redrive
+    // itself is a no-op - the reset is what this asserts.
+    d.retry_move_now("SABnzbd_nzo_ladder");
+    assert_eq!(job.lock_ok().move_attempts, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The whole reported path, through the real mover: a `move_completed`
+/// on a volume that is not mounted records a failure that SAYS it is
+/// not mounted, and arms exactly one backed-off retry rather than the
+/// flat forever-loop.
+///
+/// `/Volumes` is owned by root on every Mac, so a destination under an
+/// absent volume is refused with EACCES by any user - which is what
+/// makes this reproducible without a NAS and without privileges.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_move_to_an_unmounted_volume_explains_itself_and_arms_one_retry() {
+    use crate::serve::job::{JobState, job_from_json};
+    use crate::serve::testutil::test_daemon;
+
+    let dir = std::env::temp_dir().join(format!("nzbfast-unmounted-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = test_daemon(&dir);
+    // Nothing has ever been mounted here, and nothing can create it.
+    let absent = std::path::PathBuf::from(format!(
+        "/Volumes/NzbfastNotMounted-{}/Downloaded",
+        std::process::id()
+    ));
+    assert!(!absent.exists(), "the test needs a genuinely absent volume");
+    *d.move_completed.write_ok() = Some(absent.clone());
+    d.auto_retry_secs.store(1200, Ordering::Relaxed);
+
+    let job_dir = d.out_dir().join("Some.Release");
+    std::fs::create_dir_all(&job_dir).unwrap();
+    std::fs::write(job_dir.join("payload.bin"), b"bytes").unwrap();
+
+    let (moved, split, failed) = d.relocate_completed(&job_dir, "", None);
+    assert!(
+        split.is_none(),
+        "nothing can have moved to a missing volume"
+    );
+    // `None` is "the job's directory did not change" - the payload
+    // stays exactly where it was, which is the whole point.
+    assert!(moved.is_none(), "nothing moved, so nothing was re-pointed");
+    let failed = failed.expect("an unreachable destination must be recorded");
+    assert!(
+        failed.contains("not mounted"),
+        "the record has to explain the EACCES, got: {failed}"
+    );
+    assert!(
+        job_dir.join("payload.bin").exists(),
+        "the payload is untouched"
+    );
+
+    // ...and the ladder starts at its first rung, once.
+    let mut j = job_from_json(&json!({
+        "nzo_id": "SABnzbd_nzo_unmounted",
+        "name": "Some.Release",
+        "nzb_path": dir.join("some.nzb").to_string_lossy(),
+        "out_dir": job_dir.to_string_lossy(),
+        "state": "Completed",
+        "category": "",
+    }))
+    .unwrap();
+    assert_eq!(j.state, JobState::Completed);
+    j.move_failed = failed;
+    d.settle_move_attempt(&mut j);
+    assert_eq!(j.move_attempts, 1);
+    assert_eq!(j.auto_retry_why.as_deref(), Some("move"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An absent mount answers EACCES, not ENOENT, because the component
+/// that cannot be created lives inside root-owned `/Volumes` - so the
+/// daemon has to say what the OS error will not.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unmounted_destination_says_so_instead_of_permission_denied() {
+    use std::path::Path;
+
+    let hint = Daemon::unreachable_dest_hint(Path::new(
+        "/Volumes/DefinitelyNotMounted/Downloaded/Some.Release",
+    ))
+    .expect("a missing volume is worth explaining");
+    assert!(hint.contains("/Volumes/DefinitelyNotMounted"));
+    assert!(hint.contains("not mounted"), "got {hint}");
+    // A leaf that does not exist yet is the ORDINARY case - the mover
+    // creates it - so it earns no hint.
+    let tmp = std::env::temp_dir();
+    assert!(Daemon::unreachable_dest_hint(&tmp.join("nzbfast-absent-leaf")).is_none());
+    // A missing folder that is not a mount point is still named, just
+    // without the volume guess.
+    let deep = Daemon::unreachable_dest_hint(&tmp.join("nzbfast-absent/a/b/c"))
+        .expect("a missing parent is worth naming");
+    assert!(deep.contains("nzbfast-absent"));
+    assert!(!deep.contains("not mounted"), "got {deep}");
+}
+
+/// redrive_move: the M32 cooldown's move half. A parked Completed job
+/// with move_failed set gets its move re-attempted (files only), and a
+/// success clears the amber and re-points the record.
+#[tokio::test(flavor = "multi_thread")]
+async fn redrive_move_retries_the_move_and_clears_the_marker() {
+    use crate::serve::job::{JobState, job_from_json};
+    use crate::serve::testutil::test_daemon;
+
+    let dir = std::env::temp_dir().join(format!("nzbfast-redrive-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = test_daemon(&dir);
+    let nas = dir.join("nas");
+    *d.move_completed.write_ok() = Some(nas.clone());
+    let job_dir = dir.join("elsewhere").join("Some.Release");
+    std::fs::create_dir_all(&job_dir).unwrap();
+    std::fs::write(job_dir.join("payload.bin"), b"bytes").unwrap();
+    let job = Arc::new(Mutex::new(
+        job_from_json(&json!({
+            "nzo_id": "SABnzbd_nzo_redrive",
+            "name": "Some.Release",
+            "nzb_path": dir.join("some.nzb").to_string_lossy(),
+            "out_dir": job_dir.to_string_lossy(),
+            "state": "Completed",
+            "category": "",
+            "move_failed": "/nas/Some.Release: Permission denied (os error 13)",
+        }))
+        .unwrap(),
+    ));
+    assert_eq!(job.lock_ok().state, JobState::Completed);
+    d.history.lock_ok().push(job.clone());
+
+    assert!(d.redrive_move("SABnzbd_nzo_redrive"));
+    // The move runs on the blocking pool; wait for it to settle.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        {
+            let g = job.lock_ok();
+            if g.move_failed.is_empty() && g.out_dir != job_dir {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "redrive did not settle"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let g = job.lock_ok();
+    assert_eq!(g.out_dir, nas.join("Some.Release"));
+    assert!(g.out_dir.join("payload.bin").exists());
+    assert!(
+        g.auto_retry_at.is_none(),
+        "a landed move leaves no cooldown armed"
+    );
+    drop(g);
+    // The fence is down again: a second call declines (nothing failed).
+    assert!(!d.redrive_move("SABnzbd_nzo_redrive"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B (7 Aug): setting move_completed must prove the daemon can WRITE
+/// there, with a real marker write - access(2) said yes while the OS
+/// denied every actual write, so the bad setting was accepted and
+/// failed 78 GB later, one finished job at a time.
+#[cfg(unix)]
+#[test]
+fn setting_move_completed_probes_with_a_real_write() {
+    use crate::serve::testutil::test_daemon;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("nzbfast-moveprobe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = test_daemon(&dir);
+    let nas = dir.join("nas");
+    std::fs::create_dir_all(&nas).unwrap();
+    std::fs::set_permissions(&nas, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let v = apply_setting(&d, "move_completed", &nas.to_string_lossy());
+    std::fs::set_permissions(&nas, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let e = v.expect_err("an unwritable destination must be refused");
+    assert!(e.contains("test write"), "{e}");
+    assert!(
+        d.move_completed.read_ok().is_none(),
+        "the bad value must not stick"
+    );
+    // And the probe leaves no droppings on success.
+    apply_setting(&d, "move_completed", &nas.to_string_lossy()).unwrap();
+    assert_eq!(std::fs::read_dir(&nas).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C: one mover step. A parked Completed job with `move_pending` gets
+/// its relocation attempted; success clears the marker and re-points
+/// the record, and the fence never survives the step.
+#[tokio::test(flavor = "multi_thread")]
+async fn mover_process_moves_a_pending_job_and_clears_the_marker() {
+    use crate::serve::job::{JobState, job_from_json};
+    use crate::serve::testutil::test_daemon;
+
+    let dir = std::env::temp_dir().join(format!("nzbfast-moverstep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = test_daemon(&dir);
+    let nas = dir.join("nas");
+    *d.move_completed.write_ok() = Some(nas.clone());
+    let job_dir = dir.join("out").join("Some.Release");
+    std::fs::create_dir_all(&job_dir).unwrap();
+    std::fs::write(job_dir.join("payload.bin"), b"bytes").unwrap();
+    let job = Arc::new(Mutex::new(
+        job_from_json(&json!({
+            "nzo_id": "SABnzbd_nzo_moverstep",
+            "name": "Some.Release",
+            "nzb_path": dir.join("some.nzb").to_string_lossy(),
+            "out_dir": job_dir.to_string_lossy(),
+            "state": "Completed",
+            "category": "",
+            "move_pending": true,
+        }))
+        .unwrap(),
+    ));
+    assert_eq!(job.lock_ok().state, JobState::Completed);
+    d.history.lock_ok().push(job.clone());
+
+    let requeue = tokio::task::spawn_blocking({
+        let d = d.clone();
+        let job = job.clone();
+        move || d.mover_process(&job)
+    })
+    .await
+    .unwrap();
+    assert!(!requeue);
+    let g = job.lock_ok();
+    assert!(!g.move_pending, "a settled move leaves no pending marker");
+    assert_eq!(g.move_failed, "");
+    assert_eq!(g.out_dir, nas.join("Some.Release"));
+    assert!(g.out_dir.join("payload.bin").exists());
+    drop(g);
+    assert!(
+        !d.moving.lock_ok().contains("SABnzbd_nzo_moverstep"),
+        "the fence must come down with the step"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C: the mover's byte budget - three modes, one setting.
+#[test]
+fn mover_budget_follows_the_mode() {
+    use crate::serve::testutil::test_daemon;
+    let dir = std::env::temp_dir().join(format!("nzbfast-pace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = test_daemon(&dir);
+    // Default: yield. Idle queue = no cap; an active download carves
+    // out the line minus the wire minus a 10% margin, floored.
+    assert_eq!(d.mover_budget_bps(0), None, "idle queue must be uncapped");
+    d.line_speed.store(100_000_000, Ordering::Relaxed);
+    assert_eq!(d.mover_budget_bps(60_000_000), Some(30_000_000));
+    assert_eq!(
+        d.mover_budget_bps(95_000_000),
+        Some(5_000_000),
+        "the floor keeps a saturated line from starving the move to zero"
+    );
+    *d.move_pace.lock_ok() = "80".to_string();
+    assert_eq!(d.mover_budget_bps(60_000_000), Some(80_000_000));
+    *d.move_pace.lock_ok() = "full".to_string();
+    assert_eq!(d.mover_budget_bps(60_000_000), None);
+    let _ = std::fs::remove_dir_all(&dir);
 }

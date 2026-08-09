@@ -20,8 +20,11 @@ comparator churns hundreds of untouched lines into your diff:
 - `en.reference.json` - plain `Object.keys().sort()` (code-point order,
   so `status.Idle` sorts before `status.idle`). That is what `extract.js`
   writes; never hand-edit it, just rerun the script.
-- `<lang>.json` - `localeCompare` order (case-insensitive, so
-  `status.connecting` sorts before `status.Downloading`).
+- `<lang>.json` - `Object.keys().sort((a,b)=>a.localeCompare(b))`
+  localeCompare order (re-verified byte-for-byte against all 27 shipped
+  files on 7 Aug 2026: localeCompare re-serializes every file
+  identically, plain code-point sort churns ~19 lines per file). Do not
+  trust a claim here without re-running the byte-identity test.
 
 Both use `JSON.stringify(obj, null, 1)` plus a trailing newline. To add
 keys to every catalogue, merge them in and re-serialize with the matching

@@ -22,7 +22,12 @@
 //! - Patterns are case-insensitive wildcards (`*`, `?`) against the
 //!   title; a pattern without wildcards matches as a substring.
 //! - `size>N` / `size<N` (K/M/G/T suffixes) compare the item's size.
-//! Duplicate detection (M14f) then holds anything already queued or done.
+//! - §129 2d: an Accept rule can carry its own filing -
+//!   `Accept(category=tv, priority=high): *1080p*` - overriding the
+//!   feed's category and the default priority for items it matches
+//!   (priority: force/high/normal/low or -2..2).
+//! Duplicate detection (M14f) then holds anything already queued or done
+//! (or discards / fails them - the `dupe_action` setting).
 
 use serde::{Deserialize, Serialize};
 
@@ -158,34 +163,121 @@ fn term_matches(term: &str, item: &FeedItem) -> bool {
     }
 }
 
-/// Apply a feed's rule list; true = download this item.
-pub fn rules_accept(rules: &[String], item: &FeedItem) -> bool {
+/// §129 2d: options an Accept rule may carry in parentheses -
+/// `Accept(category=tv, priority=high): *1080p*` - so one feed can file
+/// different matches differently. Only meaningful on Accept: Require
+/// and Reject can only say no, and "no" has no destination.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RuleOpts {
+    pub category: Option<String>,
+    pub priority: Option<i32>,
+}
+
+/// SAB's priority names, or a bare number. None = not a priority.
+pub fn parse_priority(s: &str) -> Option<i32> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "force" => Some(2),
+        "high" => Some(1),
+        "normal" => Some(0),
+        "low" => Some(-1),
+        other => other.parse().ok().filter(|p| (-2..=2).contains(p)),
+    }
+}
+
+/// `accept(category=tv, priority=high)` -> ("accept", opts). Unknown
+/// option keys and unparseable values are ignored rather than failing
+/// the rule: the rules language has always shrugged at what it does not
+/// recognise, and a typo must not silently turn a Reject into a no-op
+/// AND kill the feed.
+fn parse_kind(kind: &str) -> (String, RuleOpts) {
+    let kind = kind.trim();
+    let (base, rest) = match kind.split_once('(') {
+        Some((b, r)) => (b, r.trim_end().strip_suffix(')').unwrap_or(r)),
+        None => (kind, ""),
+    };
+    let mut opts = RuleOpts::default();
+    for part in rest.split(',') {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        let v = v.trim();
+        match k.trim().to_ascii_lowercase().as_str() {
+            "category" | "cat" if !v.is_empty() => opts.category = Some(v.to_string()),
+            "priority" | "prio" => opts.priority = parse_priority(v),
+            _ => {}
+        }
+    }
+    (base.trim().to_ascii_lowercase(), opts)
+}
+
+/// One item's fate under a feed's rules, carrying WHY - the dry-run
+/// preview shows it verbatim - and the deciding Accept rule's options.
+#[derive(Debug, PartialEq)]
+pub struct Judgement {
+    pub accept: bool,
+    /// The rule that decided it, as written, or a stock phrase for the
+    /// default outcomes.
+    pub why: String,
+    pub opts: RuleOpts,
+}
+
+/// Apply a feed's rule list and say which rule decided.
+pub fn rules_judge(rules: &[String], item: &FeedItem) -> Judgement {
     let mut has_accept = false;
-    let mut accepted = false;
+    let mut accepted: Option<(String, RuleOpts)> = None;
     for rule in rules {
         let Some((kind, expr)) = rule.split_once(':') else {
             continue;
         };
         let hit = term_matches(expr, item);
-        match kind.trim().to_ascii_lowercase().as_str() {
+        let (base, opts) = parse_kind(kind);
+        match base.as_str() {
             "require" => {
                 if !hit {
-                    return false;
+                    return Judgement {
+                        accept: false,
+                        why: format!("did not satisfy {}", rule.trim()),
+                        opts: RuleOpts::default(),
+                    };
                 }
             }
             "reject" => {
                 if hit {
-                    return false;
+                    return Judgement {
+                        accept: false,
+                        why: format!("matched {}", rule.trim()),
+                        opts: RuleOpts::default(),
+                    };
                 }
             }
             "accept" => {
                 has_accept = true;
-                accepted |= hit;
+                // First matching Accept wins - its options are the
+                // deliberate ones for this pattern.
+                if hit && accepted.is_none() {
+                    accepted = Some((rule.trim().to_string(), opts));
+                }
             }
             _ => {}
         }
     }
-    !has_accept || accepted
+    match (has_accept, accepted) {
+        (true, Some((why, opts))) => Judgement {
+            accept: true,
+            why: format!("matched {why}"),
+            opts,
+        },
+        (true, None) => Judgement {
+            accept: false,
+            why: "no Accept rule matched".into(),
+            opts: RuleOpts::default(),
+        },
+        (false, _) => Judgement {
+            accept: true,
+            why: "accepted (no Accept rules)".into(),
+            opts: RuleOpts::default(),
+        },
+    }
 }
 
 /// Position and as-written name of the next element in `xml` whose
@@ -483,6 +575,13 @@ mod tests {
         }
     }
 
+    /// The 2d refactor folded the old boolean `rules_accept` into
+    /// [`rules_judge`]; this shim keeps the pre-2d semantics asserted
+    /// below without shipping a dead public function.
+    fn rules_accept(rules: &[String], item: &FeedItem) -> bool {
+        rules_judge(rules, item).accept
+    }
+
     #[test]
     fn globs() {
         assert!(glob_match("*1080p*", "Show.S01E02.1080p.WEB"));
@@ -512,6 +611,43 @@ mod tests {
         // Substring term (no wildcard).
         let r = rules(&["Reject: hdcam"]);
         assert!(!rules_accept(&r, &item("A.HDCAM.x264", 0)));
+    }
+
+    /// §129 2d: an Accept rule's parenthesised options ride the
+    /// judgement; Require/Reject stay pure vetoes; junk options are
+    /// ignored rather than fatal.
+    #[test]
+    fn accept_options_carry_category_and_priority() {
+        let rules: Vec<String> = [
+            "Reject: *HDCAM*",
+            "Accept(category=tv, priority=high): *1080p*",
+            "Accept: *720p*",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let j = rules_judge(&rules, &item("A.1080p", 0));
+        assert!(j.accept);
+        assert_eq!(j.opts.category.as_deref(), Some("tv"));
+        assert_eq!(j.opts.priority, Some(1));
+        assert!(j.why.contains("Accept(category=tv"), "{}", j.why);
+        // A plain Accept carries no options.
+        let j = rules_judge(&rules, &item("A.720p", 0));
+        assert!(j.accept);
+        assert_eq!(j.opts, RuleOpts::default());
+        // Reject wins and names the rule that decided.
+        let j = rules_judge(&rules, &item("A.1080p.HDCAM", 0));
+        assert!(!j.accept);
+        assert!(j.why.contains("Reject: *HDCAM*"), "{}", j.why);
+        // Priority spellings; a bad value is simply not a priority.
+        assert_eq!(parse_priority("force"), Some(2));
+        assert_eq!(parse_priority("low"), Some(-1));
+        assert_eq!(parse_priority("-1"), Some(-1));
+        assert_eq!(parse_priority("nonsense"), None);
+        // Unknown option keys do not kill the rule.
+        let j = rules_judge(&["Accept(colour=blue): *x*".to_string()], &item("x", 0));
+        assert!(j.accept);
+        assert_eq!(j.opts, RuleOpts::default());
     }
 
     #[test]

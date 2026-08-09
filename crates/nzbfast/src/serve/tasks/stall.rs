@@ -1,0 +1,575 @@
+//! Two things that watch a download from outside it: [`StallTracker`],
+//! the pure state machine that reports transfer-stall episodes, and the
+//! slow-job watchdog that defers a job monopolised by one slow server and
+//! puts otherwise-idle servers onto the next queued job.
+//!
+//! The tracker is observation ONLY - it produces log lines and the queue
+//! row's "no data for Ns" sub-line and never touches the job. The stall
+//! watchdog that once aborted a healthy run is why action stays out of
+//! its scope.
+//!
+//! Split out of `serve/tasks.rs` whole (TODO 106) - the code is verbatim,
+//! only visibility changed, plus the watchdog's own doc comment reunited
+//! with it (an earlier move had stranded it above `StallTracker`).
+
+use super::*;
+
+/// Transfer-stall episode tracker (Gary, 2 Aug: a mid-download 30-40 s
+/// flatline resumed on its own and nothing anywhere said why). A pure
+/// state machine over per-tick pool-byte totals, so the timing logic is
+/// unit-testable with synthetic clocks. Observation ONLY: it produces
+/// log lines and the queue row's "no data for Ns" sub-line, and never
+/// touches the job - the stall watchdog that once aborted a healthy run
+/// is why action stays out of scope here. Zero throughput is not zero
+/// progress (a wholly-dead post moves no bytes while the pool drives
+/// its refusal ladder perfectly), so an episode is a fact to report,
+/// never a verdict.
+pub(crate) struct StallTracker {
+    threshold: std::time::Duration,
+    /// (nzo_id, display name) of the fetch being observed.
+    job: Option<(String, String)>,
+    last_total: u64,
+    /// When the pool-byte total last moved (or the job was first seen).
+    last_change: Instant,
+    open: bool,
+}
+
+pub(crate) enum StallEvent {
+    /// Bytes have not moved for the threshold: episode starts.
+    Opened { idle_secs: u64, since: Instant },
+    /// Bytes moved again after an open episode.
+    Cleared { idle_secs: u64 },
+    /// The job went away (finished, aborted, paused) mid-episode.
+    Ended { idle_secs: u64, name: String },
+}
+
+impl StallTracker {
+    pub(crate) fn new(threshold: std::time::Duration) -> Self {
+        Self {
+            threshold,
+            job: None,
+            last_total: 0,
+            last_change: Instant::now(),
+            open: false,
+        }
+    }
+
+    /// One sample: the active fetch (if any) and its pool's cumulative
+    /// byte total across all servers. At most one event per call.
+    pub(crate) fn observe(
+        &mut self,
+        now: Instant,
+        job: Option<(&str, &str)>,
+        total_bytes: u64,
+    ) -> Option<StallEvent> {
+        let ended = |s: &Self| {
+            s.open.then(|| StallEvent::Ended {
+                idle_secs: now.duration_since(s.last_change).as_secs(),
+                name: s.job.as_ref().map(|(_, n)| n.clone()).unwrap_or_default(),
+            })
+        };
+        let Some((id, name)) = job else {
+            let ev = ended(self);
+            self.job = None;
+            self.open = false;
+            return ev;
+        };
+        if self.job.as_ref().map(|(i, _)| i.as_str()) != Some(id) {
+            let ev = ended(self);
+            self.job = Some((id.to_string(), name.to_string()));
+            self.last_total = total_bytes;
+            self.last_change = now;
+            self.open = false;
+            return ev;
+        }
+        if total_bytes != self.last_total {
+            self.last_total = total_bytes;
+            let idle = now.duration_since(self.last_change).as_secs();
+            self.last_change = now;
+            if self.open {
+                self.open = false;
+                return Some(StallEvent::Cleared { idle_secs: idle });
+            }
+            return None;
+        }
+        if !self.open && now.duration_since(self.last_change) >= self.threshold {
+            self.open = true;
+            return Some(StallEvent::Opened {
+                idle_secs: now.duration_since(self.last_change).as_secs(),
+                since: self.last_change,
+            });
+        }
+        None
+    }
+}
+
+/// Slow-job watchdog (auto-defer + idle-server prefetch): a queue
+/// shouldn't sit behind one job whose articles live only on one slow
+/// server. Over a rolling window of per-server byte deltas:
+/// - PREFETCH: servers idle for the whole window (their copies of
+///   this job's articles keep 430ing, or they're down) start the next
+///   queued job in a restricted sidecar pipeline instead of idling -
+///   the journal makes the handover free however it ends.
+/// - DEFER: a job taking ≥90% of its bytes from one host at <40% of
+///   the session-best rate while others wait is aborted (journal
+///   keeps all landed articles) and requeued deferred at the back -
+///   pick_job then runs it only when nothing faster is available.
+///   Suppressed while a sidecar is progressing: with the idle
+///   capacity already downloading the next job, every server is busy
+///   and demoting the slow job would only idle its lone server.
+/// Thresholds are env-tunable so tests can compress the timeline.
+pub(in crate::serve) fn spawn_slow_job_watchdog(
+    daemon: &Arc<Daemon>,
+    config: &std::path::Path,
+    mem_budget: nzbkit::mem::MemBudget,
+) {
+    let d = daemon.clone();
+    let config = config.to_path_buf();
+    tokio::spawn(async move {
+        let secs = |k: &str, def: u64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(def)
+                .max(1)
+        };
+        let warmup = secs("NZBFAST_DEFER_WARMUP_SECS", 45);
+        let window = secs("NZBFAST_DEFER_WINDOW_SECS", 30);
+        // Tail-prefetch experiment (dark): when the active job's article
+        // queue runs dry (the pool's network tail), the flat byte window
+        // below would skip the whole prefetch block - which is exactly
+        // backwards, because the tail is when idle line capacity peaks.
+        // With the knob on, a latched tail overrides the flat-window and
+        // single-server gates; every other gate (warmup, quota, pause,
+        // one-sidecar) still applies, and the fleet the byte test then
+        // yields at a dry tail is the bounded BORROW fleet (all healthy
+        // hosts at 1-2 connections each), never a full-budget one.
+        let tail_prefetch = std::env::var("NZBFAST_TAIL_PREFETCH").is_ok_and(|v| v == "1");
+        let tick = (window / 6).clamp(1, 5);
+        // Rolling (time, per-host cumulative bytes) samples of the
+        // ACTIVE job's pool; reset on job change. `attempted` = jobs
+        // already sidecar-tried during the current active job (so a
+        // job whose articles the idle servers don't hold either
+        // isn't retried every tick).
+        let mut win: VecDeque<(Instant, Vec<(String, u64)>)> = VecDeque::new();
+        let mut cur: Option<String> = None;
+        let mut attempted: std::collections::HashSet<String> = Default::default();
+        // Once per active job: "every idle server has refused auth".
+        let mut refusal_noted = false;
+        // Transfer-stall episodes: one log line when the active fetch
+        // moves no bytes for NZBFAST_STALL_LOG_SECS (default 10), one
+        // when it clears - so "send me the log" captures a flatline
+        // after the fact. Observation only, and always on: it runs
+        // BEFORE the auto-defer/prefetch gates below.
+        let mut stall = StallTracker::new(std::time::Duration::from_secs(secs(
+            "NZBFAST_STALL_LOG_SECS",
+            10,
+        )));
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(tick)).await;
+            {
+                // The fetch being observed: hub owner, Downloading, not
+                // pause-suspended (a pause legitimately stops bytes).
+                let fetching = d
+                    .started_at
+                    .lock_ok()
+                    .is_some()
+                    .then(|| d.active_stream.lock_ok().clone())
+                    .flatten();
+                let job_info = fetching.and_then(|id| {
+                    d.queue.lock_ok().iter().find_map(|j| {
+                        let g = j.lock_ok();
+                        (g.nzo_id == id && g.state == JobState::Downloading && !g.suspended)
+                            .then(|| (id.clone(), g.name.clone()))
+                    })
+                });
+                // Per-server (host, connections, bytes, refused) - the
+                // states the episode lines report.
+                let servers: Vec<(String, usize, u64, bool)> = d
+                    .hub
+                    .pool_live
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|l| {
+                        l.servers
+                            .iter()
+                            .map(|s| {
+                                (
+                                    s.host.clone(),
+                                    s.connected.load(Ordering::Relaxed),
+                                    s.bytes.load(Ordering::Relaxed),
+                                    s.refusal.lock_ok().is_some(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // §G: copy any refusal somewhere that outlives the pool.
+                // The Providers card reads it from the live pool, which
+                // is gone the moment the queue drains - so the one
+                // sentence explaining why a paid-for provider did
+                // nothing disappeared exactly when the user went looking
+                // for it. Sampled here rather than in the stats handler
+                // because a headless run has no dashboard polling it.
+                //
+                // The clear arm is deliberately "moved bytes or holds a
+                // connection", not "has no refusal right now": every
+                // server starts each job with an empty refusal slot, so
+                // clearing on that alone would wipe the record a second
+                // after the next job began and refill it a second later.
+                // Bytes or a live connection are proof it authenticated.
+                {
+                    let live = d.hub.pool_live.lock_ok();
+                    if let Some(l) = live.as_ref() {
+                        let mut keep = d.last_refusals.lock_ok();
+                        for s in &l.servers {
+                            if let Some(r) = s.refusal.lock_ok().as_ref() {
+                                keep.insert(
+                                    s.host.clone(),
+                                    ServerRefusal {
+                                        permanent: r.permanent,
+                                        line: r.line.clone(),
+                                        at: unix_now(),
+                                    },
+                                );
+                            } else if s.connected.load(Ordering::Relaxed) > 0
+                                || s.bytes.load(Ordering::Relaxed) > 0
+                            {
+                                keep.remove(&s.host);
+                            }
+                        }
+                    }
+                }
+                let states = || -> String {
+                    if servers.is_empty() {
+                        return "pool not up yet".into();
+                    }
+                    servers
+                        .iter()
+                        .map(|(h, c, _, r)| {
+                            if *r {
+                                format!("{h} refused")
+                            } else {
+                                format!("{h} {c} conn")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let total: u64 = servers.iter().map(|(_, _, b, _)| *b).sum();
+                let name = job_info
+                    .as_ref()
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_default();
+                match stall.observe(
+                    Instant::now(),
+                    job_info.as_ref().map(|(i, n)| (i.as_str(), n.as_str())),
+                    total,
+                ) {
+                    Some(StallEvent::Opened { idle_secs, since }) => {
+                        info!(
+                            target: "stall",
+                            "no data for {idle_secs}s on {name}; servers: {}",
+                            states()
+                        );
+                        *d.stall_since.lock_ok() =
+                            job_info.as_ref().map(|(i, _)| (i.clone(), since));
+                    }
+                    Some(StallEvent::Cleared { idle_secs }) => {
+                        info!(
+                            target: "stall",
+                            "data flowing again on {name} after {idle_secs}s; servers: {}",
+                            states()
+                        );
+                        *d.stall_since.lock_ok() = None;
+                    }
+                    Some(StallEvent::Ended { idle_secs, name }) => {
+                        info!(
+                            target: "stall",
+                            "stall on {name} not resolved after {idle_secs}s (job ended)"
+                        );
+                        *d.stall_since.lock_ok() = None;
+                    }
+                    None => {}
+                }
+            }
+            if !d.auto_defer.load(Ordering::Relaxed) && !d.auto_prefetch.load(Ordering::Relaxed) {
+                win.clear();
+                continue;
+            }
+            let Some(t0) = *d.started_at.lock_ok() else {
+                win.clear();
+                cur = None;
+                continue;
+            };
+            // The job that OWNS the hub, never merely the first
+            // Downloading one in the queue: job N's tail overlaps
+            // job N+1's download, so N stays Downloading (and ahead
+            // in the queue) while pool_live/abort/queue_ctl below
+            // are already N+1's. Picking by position measured N+1's
+            // pool, wrote the demote onto N and fired the abort at
+            // N+1 - killing a healthy download.
+            let Some(active) = d.active_stream.lock_ok().clone() else {
+                win.clear();
+                continue;
+            };
+            let Some(job) = d
+                .queue
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|j| {
+                    let g = j.lock_ok();
+                    g.nzo_id == active && g.state == JobState::Downloading
+                })
+                .cloned()
+            else {
+                win.clear();
+                continue;
+            };
+            let (id, defer_count, demote) = {
+                let g = job.lock_ok();
+                (g.nzo_id.clone(), g.defer_count, g.demote)
+            };
+            if demote {
+                continue; // abort already in flight
+            }
+            if cur.as_deref() != Some(id.as_str()) {
+                win.clear();
+                attempted.clear();
+                refusal_noted = false;
+                cur = Some(id.clone());
+            }
+            let snap: Vec<(String, u64)> = d
+                .hub
+                .pool_live
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|l| {
+                    l.servers
+                        .iter()
+                        .map(|s| (s.host.clone(), s.bytes.load(Ordering::Relaxed)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if snap.is_empty() {
+                continue;
+            }
+            let now = Instant::now();
+            win.push_back((now, snap));
+            while win
+                .front()
+                .is_some_and(|(t, _)| now.duration_since(*t).as_secs() > window)
+            {
+                win.pop_front();
+            }
+            let Some((t_first, first)) = win.front().cloned() else {
+                continue;
+            };
+            let span = now.duration_since(t_first).as_secs_f64();
+            if span < window as f64 * 0.8 {
+                continue;
+            }
+            let base: std::collections::HashMap<&str, u64> =
+                first.iter().map(|(h, b)| (h.as_str(), *b)).collect();
+            let deltas: Vec<(String, u64)> = win
+                .back()
+                .unwrap()
+                .1
+                .iter()
+                .map(|(h, b)| {
+                    (
+                        h.clone(),
+                        b.saturating_sub(base.get(h.as_str()).copied().unwrap_or(0)),
+                    )
+                })
+                .collect();
+            let total: u64 = deltas.iter().map(|(_, b)| b).sum();
+            let rate = total as f64 / span;
+            // Every sustained window is also a reference sample.
+            d.best_rate_bps.fetch_max(rate as u64, Ordering::Relaxed);
+            // Tail-prefetch experiment: a latched network tail with
+            // work still in flight. Read fresh each tick - the latch
+            // only ever appears once per run, and `Some(0)` (tail
+            // finished) must not trigger.
+            let tail_now = tail_prefetch
+                && d.hub
+                    .queue_ctl
+                    .lock_ok()
+                    .as_ref()
+                    .and_then(|c| c.tail_pending())
+                    .is_some_and(|p| p > 0);
+            // A wholly stalled job is the pool's retry logic's
+            // problem, and a single-server setup has nothing to
+            // route around. (Unless the tail override is live: a dry
+            // tail IS a flat window, and borrowing 1-2 connections is
+            // meaningful even from a single server.)
+            if (total == 0 || deltas.len() < 2) && !tail_now {
+                continue;
+            }
+            if now.duration_since(t0).as_secs() < warmup {
+                continue;
+            }
+
+            // ---- Idle-server prefetch: any host that contributed
+            // <1% of the window while the job moved is idle - its
+            // copies of this job's articles keep 430ing (or it's
+            // down). Start the next queued job on JUST those hosts.
+            // Skipped when a period quota is configured: the quota
+            // ledger is the runner's, and opportunistic fetches
+            // shouldn't race a metered budget.
+            if d.auto_prefetch.load(Ordering::Relaxed)
+                && !d.paused.load(Ordering::Relaxed)
+                && d.quota.load(Ordering::Relaxed) == 0
+                && d.sidecar.lock_ok().is_none()
+            {
+                // A server that refused to authenticate (bad
+                // credential, or at its connection/IP cap) moved no
+                // bytes, so by the byte test alone it reads as idle
+                // capacity - and a sidecar whose whole fleet is
+                // refused servers prefetches nothing while the
+                // queued job it claimed sits blocked behind it.
+                let refused: std::collections::HashSet<String> = d
+                    .hub
+                    .pool_live
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|l| {
+                        l.servers
+                            .iter()
+                            .filter(|s| s.refusal.lock_ok().is_some())
+                            .map(|s| s.host.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut any_idle = false;
+                let idle: Vec<String> = deltas
+                    .iter()
+                    .filter(|(_, b)| (*b as f64) < total as f64 * 0.01)
+                    .inspect(|_| any_idle = true)
+                    .filter(|(h, _)| !refused.contains(h))
+                    .map(|(h, _)| h.clone())
+                    .collect();
+                // No healthy idle server (they all refused auth, or
+                // every server is busy on the active job): borrow a
+                // bounded 1-2 connection slice of the healthy BUSY
+                // servers instead, so the next job's tail-overlap
+                // still engages (the 31 Jul soak measured
+                // 49 s line-idle of a 144 s queue without it). The
+                // per-host cap lives on the sidecar hub - see
+                // spawn_sidecar for the budget accounting.
+                let (fleet, borrow) = if idle.is_empty() {
+                    let busy: Vec<String> = deltas
+                        .iter()
+                        .filter(|(_, b)| (*b as f64) >= total as f64 * 0.01)
+                        .filter(|(h, _)| !refused.contains(h))
+                        .map(|(h, _)| h.clone())
+                        .collect();
+                    (busy, true)
+                } else {
+                    (idle, false)
+                };
+                if borrow && any_idle && !refusal_noted {
+                    refusal_noted = true;
+                    info!(
+                        target: "prefetch",
+                        "every idle server refused to authenticate ({}) - borrowing from the busy server(s) instead",
+                        refused.iter().cloned().collect::<Vec<_>>().join(", ")
+                    );
+                }
+                if !fleet.is_empty() {
+                    // Same ordering as pick_job, minus: deferred jobs
+                    // (their articles live on the BUSY server - the
+                    // idle set has already rejected them), library
+                    // entries, and jobs already tried this cycle.
+                    let mut best: Option<(i32, Arc<Mutex<Job>>)> = None;
+                    for j in d.queue.lock_ok().iter() {
+                        let g = j.lock_ok();
+                        if g.state != JobState::Queued
+                            || g.paused
+                            || g.deferred
+                            || g.library
+                            || attempted.contains(&g.nzo_id)
+                        {
+                            continue;
+                        }
+                        if best.as_ref().is_none_or(|(bp, _)| g.priority > *bp) {
+                            best = Some((g.priority, j.clone()));
+                        }
+                    }
+                    if let Some((_, nj)) = best {
+                        spawn_sidecar(&d, &config, &nj, &fleet, &deltas, mem_budget, borrow);
+                        attempted.insert(nj.lock_ok().nzo_id.clone());
+                    }
+                }
+            }
+
+            // The tail override above unlocks ONLY the prefetch block.
+            // The defer verdict below must never see the tail shapes:
+            // `share = top/total` is NaN at total == 0 and NaN slips
+            // the `share < 0.90` demote gate (a healthy job would be
+            // aborted at its own tail), and a single-server job has
+            // nothing to route around.
+            if total == 0 || deltas.len() < 2 {
+                continue;
+            }
+
+            // ---- Defer verdict. Suppressed while an IDLE-server
+            // sidecar runs: the idle capacity is already downloading
+            // the next job, so every server is busy - demoting the
+            // slow job would only idle its lone server. A BORROWED
+            // sidecar claims no idle capacity (it runs on a 1-2
+            // connection slice of the busy servers), so it must not
+            // disarm the watchdog: with borrowing, a sidecar exists
+            // almost whenever a queue does, and suppressing on it
+            // would retire the defer verdict outright.
+            let idle_sidecar = d
+                .sidecar
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|s| !s.borrowed);
+            if defer_count >= 3 || idle_sidecar {
+                continue;
+            }
+            let others_waiting = d.queue.lock_ok().iter().any(|j| {
+                let g = j.lock_ok();
+                g.state == JobState::Queued && !g.paused && !g.deferred
+            });
+            if !others_waiting {
+                continue;
+            }
+            let (top_host, top_bytes) = deltas.iter().max_by_key(|(_, b)| *b).cloned().unwrap();
+            let share = top_bytes as f64 / total as f64;
+            let best = d.best_rate_bps.load(Ordering::Relaxed);
+            if share < 0.90 || best < 1_000_000 || rate >= 0.4 * best as f64 {
+                continue;
+            }
+            let reason = format!(
+                "{:.0}% of the last {:.0}s came from {top_host} at {:.1} MB/s \
+                 (session best {:.1} MB/s) - the other servers had nothing \
+                 for this job",
+                share * 100.0,
+                span,
+                rate / 1e6,
+                best as f64 / 1e6
+            );
+            {
+                let mut g = job.lock_ok();
+                g.demote = true;
+                g.defer_reason = reason.clone();
+            }
+            info!(target: "defer", "{id}: {reason} - moving to the back of the queue");
+            if let Some(f) = d.hub.abort.lock_ok().as_ref() {
+                f.store(true, Ordering::Relaxed);
+            }
+            if let Some(c) = d.hub.queue_ctl.lock_ok().as_ref() {
+                c.abort();
+            }
+            win.clear();
+        }
+    });
+}

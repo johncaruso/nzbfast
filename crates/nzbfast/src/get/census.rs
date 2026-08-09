@@ -6,6 +6,34 @@
 
 use crate::*;
 
+/// Is this slot's name Usenet furniture - metadata a short article must
+/// not fail the job over?
+///
+/// The extension test half of issue #23's spare rule. The caller owns
+/// the other half (the recovery set must NOT cover the file: if it does,
+/// repair can heal it and sparing would skip a heal we can actually do).
+///
+/// Shared rather than restated because the two consumers HAD drifted:
+/// the census spared the file and reported `incomplete == 0`, while
+/// `settle`'s uncovered-hole scan re-derived the same question straight
+/// off the slot counters with no junk test. The two agreed only while a
+/// job took no damage - the moment repair ran, the spared file failed
+/// the job anyway, so a payload PAR2 had rebuilt and MD5-proved was
+/// reported Failed and an *arr blocklisted a good release. One
+/// predicate, one answer, both arms.
+///
+/// An obfuscated slot with no usable extension is never spared: we
+/// cannot tell furniture from payload, and guessing wrong hands an *arr
+/// a directory missing its video.
+pub(super) fn is_spared_metadata(hint: &str) -> bool {
+    let name = nzbkit::disk::sanitize_filename(hint).to_ascii_lowercase();
+    let ext = std::path::Path::new(&name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    !ext.is_empty() && crate::smart::is_junk_ext(&ext)
+}
+
 /// What the settle/repair phase and the failure summary need to know
 /// about how the network phase ended.
 pub(super) struct Census {
@@ -234,12 +262,8 @@ pub(super) fn take_census(
             // we cannot tell furniture from payload, and guessing wrong
             // would hand an *arr a directory missing its video.
             let name = nzbkit::disk::sanitize_filename(&slot.hint).to_ascii_lowercase();
-            let ext = std::path::Path::new(&name)
-                .extension()
-                .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
             let covered = set_names.as_ref().is_some_and(|n| n.contains(&name));
-            if !ext.is_empty() && !covered && crate::smart::is_junk_ext(&ext) {
+            if !covered && is_spared_metadata(&slot.hint) {
                 println!(
                     "  ⚠ {}: {} missing of {} segment(s) - metadata the recovery set \
                      does not cover, so the download is still complete",
@@ -409,6 +433,44 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// Issue #23's spare rule, pinned on the ONE predicate both the
+    /// census and `settle`'s uncovered-hole scan now ask.
+    ///
+    /// They used to ask it separately, and only the census knew about
+    /// junk extensions - so a `.nfo` the census spared was failed by
+    /// settle the moment a job took any damage, and a payload PAR2 had
+    /// rebuilt and MD5-proved reported Failed. Sharing the predicate is
+    /// the fix; this pins its answers so a future edit cannot quietly
+    /// widen it into archives or narrow it out of furniture.
+    #[test]
+    fn spared_metadata_is_furniture_only() {
+        for f in [
+            "movie.nfo",
+            "MOVIE.NFO",
+            "release.sfv",
+            "notes.txt",
+            "hashes.md5",
+            "info.diz",
+        ] {
+            assert!(is_spared_metadata(f), "{f} is furniture and must spare");
+        }
+        for f in [
+            // Payload. A short .rar or .mkv still fails the job - that
+            // is the whole point of the check.
+            "movie.mkv",
+            "movie.part01.rar",
+            "setup.exe",
+            "movie.r00",
+            // No usable extension: we cannot tell furniture from
+            // payload, and guessing wrong hands an *arr a directory
+            // with no video in it.
+            "abcdef0123456789",
+            "",
+        ] {
+            assert!(!is_spared_metadata(f), "{f} must still fail the job");
+        }
+    }
+
     fn srv(host: &str) -> (ServerConfig, nzbkit::pool::PoolConfig) {
         (
             ServerConfig {
@@ -424,6 +486,7 @@ mod tests {
                 group: None,
                 retention_days: 0,
                 block_bytes: None,
+                block_account: false,
                 bind_ip: None,
                 socks5: None,
                 enabled: true,

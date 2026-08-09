@@ -126,6 +126,20 @@ pub type PromoteHook = Arc<dyn Fn(&str, u64, &[(u64, u64)], bool) + Send + Sync>
 /// no journal to poison and the publish proceeds.
 pub type DecryptBarrier = Arc<dyn Fn(&[String]) -> io::Result<()> + Send + Sync>;
 
+/// The other half of the [`DecryptBarrier`] handshake: the plaintext for
+/// this output is verified AND renamed into place, and here are its
+/// crypt facts (`E`/`K`/`T` [`CryptoJournalEvent`]s, gathered from the
+/// ciphertext before the rename destroyed it). The daemon wires it to
+/// `Journal::record_decrypted`, which republishes the placements the
+/// barrier retired as `D` records - so a retry after a LATER failure in
+/// the same job re-encrypts the local plaintext instead of refetching
+/// the whole set (TODO 100). Optional and advisory: unwired, or skipped
+/// when the facts cannot be gathered (RAR4's 8-byte salt does not fit an
+/// `E` line, a check-less set cannot prove the password on resume), the
+/// retirement simply stands and the retry refetches - the pre-existing,
+/// always-correct behaviour.
+pub type DecryptPublish = Arc<dyn Fn(&str, &[CryptoJournalEvent]) + Send + Sync>;
+
 /// Strip release-file suffixes down to the shared stem:
 /// `x.part01.rar`/`x.r00`/`x.vol000+01.par2`/`x.par2`/`x.rar` → `x`,
 /// and split-container volumes `x.7z.001`/`x.zip.001` → `x.7z`/`x.zip`
@@ -395,12 +409,24 @@ pub struct Frag {
 /// PLAINTEXT, so it journals as a `D` record that a resume can only
 /// honor by re-encrypting through the file's journaled `E`/`K`/`T`
 /// facts - an old binary parses `D` as an unknown message-id and simply
-/// refetches. Held spans, header bytes retained in memory, and
-/// discarded spans return `No`.
+/// refetches. Header bytes retained in memory and discarded spans
+/// return `No`.
+///
+/// `Held` means bytes of THIS span were parked for a later re-feed
+/// (pre-classification hold, unresolved split base, beyond the mapped
+/// window) - the article is not on disk yet, but may become so when the
+/// holds drain. It carries the span's partial plain placements (may be
+/// empty); the caller parks the article and completes its journal
+/// record from [`Extractor::drain_late_placements`] once the drained
+/// writes cover the rest. Without this, an article that arrived before
+/// the offset-0 sniff established the store mapper was fully written by
+/// the drain yet never journaled, so every crash/ENOSPC resume
+/// refetched it for no reason.
 pub enum Persist {
     No,
     Placed(Vec<Frag>),
     PlacedCrypto(Vec<Frag>),
+    Held(Vec<Frag>),
 }
 
 // ---- Phase 0(b): nested-archive prevalence instrumentation ----
@@ -767,6 +793,24 @@ struct FwdJob {
     bytes: Vec<u8>,
     /// See [`FwdSpan::repair`].
     repair: bool,
+    /// Queued by a held-span re-feed: no caller composes this job's
+    /// child Persist into an article record, so `deliver_fwd` surfaces
+    /// a Placed result through `late_placements` instead.
+    refeed: bool,
+}
+
+/// Translation window for a forward whose child write returned `Held`:
+/// the child parked (some of) the bytes and will write them inside its
+/// OWN drain, where only child-space placements exist. The window maps
+/// a child placement `(child_slot, child vol range)` back to the parent
+/// slot's volume address space so `drain_late_placements` can report it
+/// against the article that carried the bytes.
+struct FwdWindow {
+    parent_slot: usize,
+    parent_vol_off: u64,
+    child_slot: usize,
+    child_off: u64,
+    len: u64,
 }
 
 /// Where an inner file's bytes go: a real output writer, or a slot of the
@@ -1022,6 +1066,9 @@ struct Inner {
     /// nested level's outputs are journal recovery sources too). See
     /// [`DecryptBarrier`].
     decrypt_barrier: Option<DecryptBarrier>,
+    /// Post-rename decrypt publish notification, inherited like the
+    /// barrier. See [`DecryptPublish`].
+    decrypt_publish: Option<DecryptPublish>,
     /// Plaintext-once gate (see [`CryptoState`]): encrypted store
     /// entries decrypt at write time instead of assembling ciphertext
     /// for the finish pass. `NZBFAST_NO_INSTREAM_DECRYPT=1` restores
@@ -1053,6 +1100,29 @@ struct Inner {
     /// lands AFTER the archive blocked must still be seen mid-run, not
     /// only at finish).
     pw_probe_last: Option<std::time::Instant>,
+    /// True while [`Extractor::drain_holds`] is re-feeding held spans.
+    /// The under-lock write sites capture their placements into
+    /// `late_placements` only in this state, and the hold-push sites
+    /// leave `span_held` alone (a re-held subrange belongs to an
+    /// article that was already reported `Held` when it arrived).
+    refeed_active: bool,
+    /// Plain (non-crypto) writes performed by held-span re-feeds, in
+    /// volume address space, drained by
+    /// [`Extractor::drain_late_placements`]. The journal writer joins
+    /// these against the articles it parked on a `Held` return - a
+    /// held-then-drained article's bytes are durably on disk the moment
+    /// the entry lands here (the re-feed writes run under the routing
+    /// lock, before the drain call returns).
+    late_placements: Vec<(usize, Frag)>,
+    /// Set when the CURRENT top-level write parked bytes of its own
+    /// span in `holds` (reset at write entry; re-feed pushes are
+    /// excluded via `refeed_active`). Read by the write tail to return
+    /// `Persist::Held` instead of `No`.
+    span_held: bool,
+    /// Child-to-parent translation windows for forwards the child
+    /// parked (see [`FwdWindow`]). Grows only while a child is holding
+    /// spans; never pruned - bounded by the count of held forwards.
+    fwd_windows: Vec<FwdWindow>,
 }
 
 /// Increment A: caller-supplied candidate probe. Given the blocked
@@ -1211,6 +1281,7 @@ impl Extractor {
                 password,
                 stream_states: HashMap::new(),
                 decrypt_barrier: None,
+                decrypt_publish: None,
                 verify_gate: None,
                 // Plaintext-once gate: on for a live (enabled, fresh)
                 // extractor unless the env kill-switch restores the
@@ -1228,8 +1299,60 @@ impl Extractor {
                 pw_probe: None,
                 pw_probe_due: false,
                 pw_probe_last: None,
+                refeed_active: false,
+                late_placements: Vec::new(),
+                span_held: false,
+                fwd_windows: Vec::new(),
             }),
         }
+    }
+
+    /// Drain the placements held-span re-feeds performed since the last
+    /// call: `(slot, frag)` pairs for plain (non-crypto) writes that
+    /// landed while `drain_holds` replayed parked spans, in THIS
+    /// level's slot/volume address space. A nested child's drained
+    /// holds are folded in, translated back through the forward windows
+    /// recorded when the child parked them ([`FwdWindow`]); a child
+    /// placement with no window (structurally unexpected) is dropped,
+    /// which errs toward a refetch on resume. The journal writer joins
+    /// these against articles parked on a [`Persist::Held`] return; the
+    /// bytes are already durably written when an entry appears here.
+    pub fn drain_late_placements(&self) -> Vec<(usize, Frag)> {
+        let (mut out, child) = {
+            let mut inner = self.inner.lock_ok();
+            (
+                std::mem::take(&mut inner.late_placements),
+                inner.child.clone(),
+            )
+        };
+        if let Some(c) = child {
+            // Child lock inside its own call, ours re-taken after -
+            // parent and child locks stay unnested, in either order.
+            let child_placed = c.drain_late_placements();
+            if !child_placed.is_empty() {
+                let inner = self.inner.lock_ok();
+                for (cslot, cf) in child_placed {
+                    // A child hold is a subrange of exactly one
+                    // forwarded write, so one containing window is the
+                    // translation (duplicated windows carry identical
+                    // mappings - routing is deterministic).
+                    if let Some(w) = inner.fwd_windows.iter().find(|w| {
+                        w.child_slot == cslot
+                            && cf.vol_off >= w.child_off
+                            && cf.vol_off + cf.len <= w.child_off + w.len
+                    }) {
+                        out.push((
+                            w.parent_slot,
+                            Frag {
+                                vol_off: w.parent_vol_off + (cf.vol_off - w.child_off),
+                                ..cf
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// What this download's archives turned out to be, as far as the
@@ -1326,6 +1449,7 @@ impl Extractor {
                 // at ITS finish, and those files are journal recovery
                 // sources exactly like the parent's - same gate.
                 ci.decrypt_barrier = inner.decrypt_barrier.clone();
+                ci.decrypt_publish = inner.decrypt_publish.clone();
                 // One event sink per chain: a nested encrypted output's
                 // E/K/T records drain through the root exactly like its
                 // placements fold into the root's frags.
@@ -1460,9 +1584,11 @@ impl Extractor {
     ) -> io::Result<Persist> {
         let mut pending: Vec<FwdJob> = Vec::new();
         let mut routed_rar = false;
+        let span_held;
         {
             let mut g = self.inner.lock_ok();
             let inner = &mut *g;
+            inner.span_held = false;
             {
                 let s = &mut inner.slots[slot];
                 if s.name.is_empty() && !name.is_empty() {
@@ -1548,7 +1674,11 @@ impl Extractor {
                         // exists to fetch. Flush it now, off the lock.
                         drop(g);
                         self.flush_pending_promote();
-                        return Ok(Persist::No);
+                        // Whole span parked pre-classification: the
+                        // caller keeps the article's identity and joins
+                        // it with drain_late_placements once the sniff
+                        // establishes a mode and the drain writes it.
+                        return Ok(Persist::Held(Vec::new()));
                     } else {
                         let is_rar = data.starts_with(b"Rar!\x1a\x07\x01\x00")
                             || data.starts_with(b"Rar!\x1a\x07\x00");
@@ -1651,6 +1781,7 @@ impl Extractor {
             if !fwd.is_empty() || !inner.pending_fwd.is_empty() {
                 pending = std::mem::take(&mut inner.pending_fwd);
             }
+            span_held = inner.span_held;
         }
         // The routing lock is down: a 7z part that joined its set above
         // can have its tail articles front-loaded now (the promote walk
@@ -1690,6 +1821,12 @@ impl Extractor {
                 f.repair,
             )?);
         }
+        // A child that parked a forwarded piece writes it inside ITS
+        // OWN drain later: the article must be parked exactly like a
+        // parent-level hold, or the late placement it eventually
+        // surfaces has no article to join.
+        let child_held = fwd_persist.iter().any(|p| matches!(p, Persist::Held(_)));
+        let span_held = span_held || child_held;
         // The pwrites above ran without the lock. If a fallback flipped
         // this slot meanwhile, its read-back could not see these bytes
         // (interval-gated) and may already have unlinked the inner files
@@ -1734,38 +1871,82 @@ impl Extractor {
                 len: j.len as u64,
             })
             .collect();
+        // The partial view a `Held` return carries: plain fragments
+        // only. Crypto fragments are deliberately left out - the caller
+        // completes a held article into a plain `R` record, and an `R`
+        // must never describe plaintext-once bytes; a held span with a
+        // crypto part simply never completes and refetches on resume.
+        let mut plain_frags: Vec<Frag> = if span_held {
+            jobs.iter()
+                .filter(|j| j.crypto.is_none())
+                .map(|j| Frag {
+                    file: j
+                        .writer
+                        .path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    file_off: j.file_off,
+                    vol_off: offset + j.src_start as u64,
+                    len: j.len as u64,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let held = |mut pf: Vec<Frag>| {
+            pf.sort_by_key(|f| f.vol_off);
+            Persist::Held(pf)
+        };
         // Fold the child placements in: a child frag names a child-level
         // output file (already final for the journal); its vol_off is in
         // the CHILD slot's address space, translated back through the
         // affine forward window. Any child part not fully placed makes
-        // the whole article refetch on resume.
+        // the whole article refetch on resume (a child's OWN held spans
+        // are not tracked across levels - only this level's drain
+        // reports late placements).
         let mut crypto_span = crypto_span;
         for (f, p) in fwd.iter().zip(fwd_persist) {
-            let cfrags = match p {
-                Persist::No => return Ok(Persist::No),
-                Persist::Placed(cfrags) => cfrags,
+            let (cfrags, child_plain) = match p {
+                Persist::No | Persist::Held(_) => {
+                    return Ok(if span_held {
+                        held(plain_frags)
+                    } else {
+                        Persist::No
+                    });
+                }
+                Persist::Placed(cfrags) => (cfrags, true),
                 // A nested plaintext-once output: the whole article's
                 // record must be a D line, since at least one fragment
                 // can only restore by re-encryption.
                 Persist::PlacedCrypto(cfrags) => {
                     crypto_span = true;
-                    cfrags
+                    (cfrags, false)
                 }
             };
             for cf in cfrags {
-                frags.push(Frag {
+                let nf = Frag {
                     file: cf.file,
                     file_off: cf.file_off,
                     vol_off: offset + f.src_start as u64 + (cf.vol_off - f.file_off),
                     len: cf.len,
-                });
+                };
+                if span_held && child_plain {
+                    plain_frags.push(nf.clone());
+                }
+                frags.push(nf);
             }
         }
         frags.sort_by_key(|f| f.vol_off);
         let mut covered_to = offset;
         for f in &frags {
             if f.vol_off > covered_to {
-                return Ok(Persist::No);
+                return Ok(if span_held {
+                    held(plain_frags)
+                } else {
+                    Persist::No
+                });
             }
             covered_to = covered_to.max(f.vol_off + f.len);
         }
@@ -1775,6 +1956,8 @@ impl Extractor {
             } else {
                 Persist::Placed(frags)
             })
+        } else if span_held {
+            Ok(held(plain_frags))
         } else {
             Ok(Persist::No)
         }
@@ -1876,7 +2059,28 @@ impl Extractor {
         data: &[u8],
     ) -> io::Result<()> {
         let w = self.ensure_plain_writer(inner, slot)?;
-        w.write_at(offset, data)
+        w.write_at(offset, data)?;
+        // A drained held span landing plain (spill/overflow/fallback
+        // during a drain): file offset == volume offset by definition.
+        // Direct-path fallback rewrites run with refeed_active false and
+        // stay unreported, keeping their deliberate refetch-on-resume.
+        if inner.refeed_active {
+            inner.late_placements.push((
+                slot,
+                Frag {
+                    file: w
+                        .path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    file_off: offset,
+                    vol_off: offset,
+                    len: data.len() as u64,
+                },
+            ));
+        }
+        Ok(())
     }
 
     /// Deliver queued child forwards. Never called with the routing lock
@@ -1885,7 +2089,7 @@ impl Extractor {
     /// slot a merge displaced) in any window still gets its bytes.
     fn deliver_fwd(&self, pending: Vec<FwdJob>) -> io::Result<()> {
         for j in pending {
-            self.deliver_routed(
+            let p = self.deliver_routed(
                 j.parent_slot,
                 j.vol_off,
                 &j.name,
@@ -1894,6 +2098,28 @@ impl Extractor {
                 &j.bytes,
                 j.repair,
             )?;
+            // A re-fed (drained-hold) forward has no caller composing
+            // its Persist into an article record - surface a Placed
+            // result so the article that parked these bytes can still
+            // journal. PlacedCrypto stays unreported: a held article
+            // must never complete into an `R` record over
+            // plaintext-once bytes.
+            if j.refeed
+                && let Persist::Placed(cfrags) = p
+            {
+                let mut inner = self.inner.lock_ok();
+                for cf in cfrags {
+                    inner.late_placements.push((
+                        j.parent_slot,
+                        Frag {
+                            file: cf.file,
+                            file_off: cf.file_off,
+                            vol_off: j.vol_off + (cf.vol_off - j.file_off),
+                            len: cf.len,
+                        },
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -1994,6 +2220,33 @@ impl Extractor {
                                     && grp.routed.get(name) == Some(&cs)
                                 {
                                     grp.routed_plain.insert(name.to_string(), (cs, w));
+                                }
+                                // The child parked (some of) this forward
+                                // and will write it inside ITS drain,
+                                // where only child-space placements
+                                // exist: record the translation window
+                                // now, and surface any partial child
+                                // placements (already on disk) so the
+                                // parked article can complete.
+                                if let Persist::Held(cfrags) = &p {
+                                    inner.fwd_windows.push(FwdWindow {
+                                        parent_slot,
+                                        parent_vol_off: vol_off,
+                                        child_slot: cs,
+                                        child_off: file_off,
+                                        len: bytes.len() as u64,
+                                    });
+                                    for cf in cfrags {
+                                        inner.late_placements.push((
+                                            parent_slot,
+                                            Frag {
+                                                file: cf.file.clone(),
+                                                file_off: cf.file_off,
+                                                vol_off: vol_off + (cf.vol_off - file_off),
+                                                len: cf.len,
+                                            },
+                                        ));
+                                    }
                                 }
                                 return Ok(p);
                             }
@@ -2253,6 +2506,9 @@ impl Extractor {
                 None => {
                     let part = data[span_off as usize..(span_off + len) as usize].to_vec();
                     inner.budget.add(part.len());
+                    if !inner.refeed_active {
+                        inner.span_held = true;
+                    }
                     inner.slots[slot]
                         .holds
                         .push((offset + span_off, HoldSpan::Ram(part)));
@@ -2361,6 +2617,9 @@ impl Extractor {
                                 let part =
                                     data[span_off as usize..(span_off + len) as usize].to_vec();
                                 inner.budget.add(part.len());
+                                if !inner.refeed_active {
+                                    inner.span_held = true;
+                                }
                                 inner.slots[slot]
                                     .holds
                                     .push((offset + span_off, HoldSpan::Ram(part)));
@@ -2397,7 +2656,32 @@ impl Extractor {
                             match &crypto {
                                 Some(cs) if repair => cs.patch(&w, base + piece_off, part)?,
                                 Some(cs) => cs.ingest(&w, base + piece_off, part)?,
-                                None => w.write_at(base + piece_off, part)?,
+                                None => {
+                                    w.write_at(base + piece_off, part)?;
+                                    // A drained held span landing in an
+                                    // inner file: report it, so the
+                                    // article that parked these bytes
+                                    // (Persist::Held) still journals.
+                                    // Plain writes only - a crypto
+                                    // placement must never complete
+                                    // into an `R` record.
+                                    if inner.refeed_active {
+                                        inner.late_placements.push((
+                                            slot,
+                                            Frag {
+                                                file: w
+                                                    .path
+                                                    .file_name()
+                                                    .unwrap_or_default()
+                                                    .to_string_lossy()
+                                                    .into_owned(),
+                                                file_off: base + piece_off,
+                                                vol_off: offset + span_off,
+                                                len,
+                                            },
+                                        ));
+                                    }
+                                }
                             }
                         }
                     }
@@ -2425,6 +2709,7 @@ impl Extractor {
                             file_off: base + piece_off,
                             bytes: data[span_off as usize..(span_off + len) as usize].to_vec(),
                             repair,
+                            refeed: inner.refeed_active,
                         }),
                     }
                 }
@@ -2438,6 +2723,9 @@ impl Extractor {
         if unmapped_from < span_end && !m.complete {
             let part = data[(unmapped_from - offset) as usize..].to_vec();
             inner.budget.add(part.len());
+            if !inner.refeed_active {
+                inner.span_held = true;
+            }
             inner.slots[slot]
                 .holds
                 .push((unmapped_from, HoldSpan::Ram(part)));
@@ -3168,3024 +3456,11 @@ fn blocker_reason(b: &MapBlocker) -> &'static str {
     }
 }
 
+// The inline `mod tests` was 3,018 lines - moved out bodily (TODO 106) and
+// split at its own nested-one-pass banner, since either half alone would
+// otherwise want a size-gate entry.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::rar::fixtures;
+mod mod_tests;
 
-    use super::testutil::*;
-
-    /// The stem is the grouping identity for a whole posted set, so
-    /// every volume-naming shape must reduce to one base - and things
-    /// that merely LOOK like part numbers must survive untouched.
-    #[test]
-    fn release_stems_reduce_every_volume_shape() {
-        let st = |n: &str| release_stem(n);
-        // The classic RAR shapes, unchanged.
-        assert_eq!(st("x.part01.rar"), "x");
-        assert_eq!(st("x.r00"), "x");
-        // Old-style rollover volumes past .r99: the letter walks s..z,
-        // one stem the whole way (vol_sort_key orders the same range).
-        assert_eq!(st("x.s00"), "x");
-        assert_eq!(st("x.t00"), "x");
-        assert_eq!(st("x.z99"), "x");
-        assert_eq!(st("x.z01"), "x");
-        assert_eq!(st("x.vol000+01.par2"), "x");
-        assert_eq!(st("x.par2"), "x");
-        // Split containers: parts and their par2 sidecars share a base.
-        assert_eq!(st("Some.Set.7z.001"), "Some.Set.7z");
-        assert_eq!(st("Some.Set.7z.122"), "Some.Set.7z");
-        assert_eq!(st("Some.Set.7z.1000"), "Some.Set.7z");
-        assert_eq!(st("Some.Set.zip.001"), "Some.Set.zip");
-        assert_eq!(st("Some.Set.7z.001.par2"), "Some.Set.7z");
-        assert_eq!(st("Some.Set.7z.vol03+04.par2"), "Some.Set.7z");
-        // Not volumes: a single archive, short numeric tails, digits
-        // with no container extension in front of them.
-        assert_eq!(st("Album.Track.01"), "Album.Track.01");
-        assert_eq!(st("v1.7z"), "v1.7z");
-        assert_eq!(st("Backup.2019.001"), "Backup.2019.001");
-        assert_eq!(st("Some.Set.7z.01"), "Some.Set.7z.01");
-    }
-
-    #[test]
-    fn vol_sort_key_letter_rollover_and_numeric() {
-        let k = |n: &str| vol_sort_key(n).0;
-        assert!(k("x.rar") < k("x.r00"));
-        assert_eq!(k("x.r00"), 1);
-        assert_eq!(k("x.r99"), 100);
-        // 100+-volume sets roll the letter: continuity across .r99 → .s00
-        // (was u64::MAX, breaking base-resolution at the boundary).
-        assert_eq!(k("x.s00"), 101);
-        assert_eq!(k("x.t00"), 201);
-        // WinRAR numeric volumes order numerically.
-        assert!(k("x.001") < k("x.002"));
-        // Non-volume extensions stay in the terminal bucket.
-        assert_eq!(k("x.srt"), u64::MAX);
-        assert_eq!(k("x.mkv"), u64::MAX);
-    }
-
-    #[test]
-    fn single_volume_direct_extract() {
-        let dir = tmpdir("single");
-        let data = payload(200_000, 1);
-        let vol = fixtures::rar5_volume(&[("movie.mkv", 200_000, &data, false, false)]);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &vol, 7000, 3);
-        let rep = ex.finish().unwrap();
-        assert_eq!(rep.extracted, vec![("movie.mkv".to_string(), 200_000)]);
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), data);
-        // The volume file must NOT exist (one-pass!).
-        assert!(!dir.join("v.rar").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A slot fed strictly out of order (offset 0 dead LAST - the
-    /// synthesized-segment-numbering shape) must ask the installed
-    /// promote hook to front-load the offset-0 article on its FIRST held
-    /// span, and exactly once: the honest-ladder span (0, 1) plus the
-    /// rotation guess (size-X, +1) derived from that first span's offset
-    /// X. Later out-of-order spans must not re-arm it. The set still
-    /// classifies when offset 0 lands and extracts one-pass.
-    #[test]
-    fn out_of_order_slot_probes_offset0_promote_once() {
-        let dir = tmpdir("probe0");
-        let data = payload(200_000, 11);
-        let vol = fixtures::rar5_volume(&[("movie.mkv", 200_000, &data, false, false)]);
-        let ex = Arc::new(Extractor::new(&dir, 1, true));
-        type Calls = Arc<Mutex<Vec<(String, u64, Vec<(u64, u64)>, bool)>>>;
-        let calls: Calls = Default::default();
-        let sink = calls.clone();
-        ex.set_promote_hook(Arc::new(
-            move |n: &str, s: u64, sp: &[(u64, u64)], u: bool| {
-                sink.lock()
-                    .unwrap()
-                    .push((n.to_string(), s, sp.to_vec(), u));
-            },
-        ));
-        let art = 7000usize;
-        let n_arts = vol.len().div_ceil(art);
-        let size = vol.len() as u64;
-        for i in (1..n_arts).chain([0]) {
-            let s = i * art;
-            let e = (s + art).min(vol.len());
-            ex.write(0, "v.rar", size, s as u64, &vol[s..e]).unwrap();
-        }
-        // Asked once, on the first hold: offset 0 where the ladder says
-        // it is, and where a posting-order rotation would put it given
-        // that the first arrival carried offset `art`. The second call
-        // is the inner file's own one-shot probe: drain_holds re-feeds
-        // the held spans BEFORE the classifying span's own forward, so
-        // the child slot also starts out of order (no rotation guess
-        // below the root - rotation is a posting-layer phenomenon).
-        // Probes are NON-urgent: nothing blocks on them, so they must
-        // not flip the pool into stream mode.
-        let x = art as u64;
-        assert_eq!(
-            calls.lock().unwrap().clone(),
-            vec![
-                (
-                    "v.rar".to_string(),
-                    size,
-                    vec![(0, 1), (size - x, size - x + 1)],
-                    false
-                ),
-                ("movie.mkv".to_string(), 200_000, vec![(0, 1)], false),
-            ]
-        );
-        let rep = ex.finish().unwrap();
-        assert_eq!(rep.extracted, vec![("movie.mkv".to_string(), 200_000)]);
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), data);
-        assert!(!dir.join("v.rar").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// BUG (HIGH): the in-stream extractor reserved an attacker-declared
-    /// size. `inner_writer` passes the entry's `unpacked_size` - a RAR
-    /// header vint the poster controls - straight to `FileWriter::create`,
-    /// which `set_len`s and (on Linux) really `fallocate`s it. The
-    /// volume-bounds check does NOT close this in the `split_after`
-    /// shape: the writer is created with the inflated declaration DURING
-    /// the download and the demote only lands at `finish()`, long after
-    /// the blocks are gone.
-    ///
-    /// The ceiling is the NZB's own posted byte count: a store archive
-    /// cannot legitimately unpack to more than what was posted.
-    #[test]
-    fn an_inflated_unpacked_size_cannot_reserve_past_the_posted_ceiling() {
-        let dir = tmpdir("prealloc-cap");
-        let data = payload(200_000, 9);
-        // 200 KB really posted; the header declares 8 TiB and sets
-        // split_after, so nothing demotes until finish().
-        const HUGE: u64 = 8 << 40;
-        let vol = fixtures::rar5_volume(&[("movie.mkv", HUGE, &data, false, true)]);
-        let ex = Extractor::new(&dir, 1, true);
-        let posted = vol.len() as u64;
-        ex.set_prealloc_ceiling(posted);
-        feed(&ex, 0, "x.part1.rar", &vol, 7000, 3);
-
-        // MID-DOWNLOAD - the window the finish-time gates cannot cover.
-        let reserved = std::fs::metadata(dir.join("movie.mkv")).unwrap().len();
-        assert!(
-            reserved <= posted,
-            "reserved {reserved} bytes for a {posted}-byte post declaring {HUGE}"
-        );
-        let _ = ex.finish();
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The other half, and the one a wrong fix breaks silently: a
-    /// legitimate inner file BIGGER than any single volume must still be
-    /// preallocated in full as soon as the first volume identifies it -
-    /// the whole point of preallocation is that the extents are reserved
-    /// before the rest of the download races other files for them.
-    ///
-    /// (This is also why the ceiling is the NZB total and not the sum of
-    /// the group's slot sizes: group membership accretes as volumes
-    /// arrive, so at this point only ONE volume is known.)
-    #[test]
-    fn a_legitimate_large_inner_file_still_preallocates_in_full() {
-        let dir = tmpdir("prealloc-ok");
-        let total = payload(500_000, 2);
-        let vols: Vec<Vec<u8>> = vec![
-            fixtures::rar5_volume(&[("film.mkv", 500_000, &total[..200_000], false, true)]),
-            fixtures::rar5_volume(&[("film.mkv", 500_000, &total[200_000..400_000], true, true)]),
-            fixtures::rar5_volume(&[("film.mkv", 500_000, &total[400_000..], true, false)]),
-        ];
-        let posted: u64 = vols.iter().map(|v| v.len() as u64).sum();
-        assert!(posted > 500_000);
-        let ex = Extractor::new(&dir, 3, true);
-        ex.set_prealloc_ceiling(posted);
-
-        feed(&ex, 0, "x.part1.rar", &vols[0], 9000, 12);
-        assert_eq!(
-            std::fs::metadata(dir.join("film.mkv")).unwrap().len(),
-            500_000,
-            "a legitimate 500 KB inner file must be reserved in full from the first volume"
-        );
-
-        feed(&ex, 1, "x.part2.rar", &vols[1], 9000, 13);
-        feed(&ex, 2, "x.part3.rar", &vols[2], 9000, 11);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(rep.extracted, vec![("film.mkv".to_string(), 500_000)]);
-        assert_eq!(std::fs::read(dir.join("film.mkv")).unwrap(), total);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// BUG (MEDIUM): the decompression-bomb guard counted bytes only on
-    /// the disk and post-pass sinks, so it protected the fallback and not
-    /// the in-stream path every download actually takes. The budget is
-    /// shared across the whole job - inner files do not each get a fresh
-    /// allowance.
-    #[test]
-    fn the_in_stream_path_is_bounded_by_the_extract_budget() {
-        let dir = tmpdir("bomb-instream");
-        let a = payload(200_000, 4);
-        let b = payload(200_000, 5);
-        let vol = fixtures::rar5_volume(&[
-            ("one.bin", 200_000, &a, false, false),
-            ("two.bin", 200_000, &b, false, false),
-        ]);
-        let ex = Extractor::new(&dir, 1, true);
-        // Room for the first inner file and not the second: a shared
-        // budget must refuse, a per-file one would wave both through.
-        ex.set_extract_budget(300_000);
-
-        let art = 8192;
-        let mut err = None;
-        for s in (0..vol.len()).step_by(art) {
-            let e = (s + art).min(vol.len());
-            if let Err(x) = ex.write(0, "v.rar", vol.len() as u64, s as u64, &vol[s..e]) {
-                err = Some(x);
-                break;
-            }
-        }
-        let err = err.expect("a 400 KB extract under a 300 KB budget must be refused");
-        assert!(err.to_string().contains("decompression bomb"), "{err}");
-        assert!(ex.extract_budget_used() > 300_000);
-        let _ = ex.finish();
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The budget must not fire on a job that merely fits - the guard
-    /// exists for bombs, not for large legitimate extracts.
-    #[test]
-    fn the_extract_budget_never_trips_on_a_job_that_fits() {
-        let dir = tmpdir("bomb-fits");
-        let data = payload(200_000, 1);
-        let vol = fixtures::rar5_volume(&[("movie.mkv", 200_000, &data, false, false)]);
-        let ex = Extractor::new(&dir, 1, true);
-        ex.set_extract_budget(200_000);
-        feed(&ex, 0, "v.rar", &vol, 7000, 3);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), data);
-        assert_eq!(ex.extract_budget_used(), 200_000);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn split_volumes_out_of_order() {
-        let dir = tmpdir("split");
-        let total = payload(500_000, 2);
-        let vols: Vec<Vec<u8>> = vec![
-            fixtures::rar5_volume(&[("film.mkv", 500_000, &total[..200_000], false, true)]),
-            fixtures::rar5_volume(&[("film.mkv", 500_000, &total[200_000..400_000], true, true)]),
-            fixtures::rar5_volume(&[("film.mkv", 500_000, &total[400_000..], true, false)]),
-        ];
-        // Feed volumes interleaved and shuffled - vol 3 first.
-        let ex = Extractor::new(&dir, 3, true);
-        feed(&ex, 2, "x.part3.rar", &vols[2], 9000, 11);
-        feed(&ex, 0, "x.part1.rar", &vols[0], 9000, 12);
-        feed(&ex, 1, "x.part2.rar", &vols[1], 9000, 13);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join("film.mkv")).unwrap(), total);
-        assert!(!dir.join("x.part1.rar").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A store entry that DECLARES far more data than the volume holds
-    /// must never ship as a successful extraction. Before the
-    /// volume-bounds check the parse cursor jumped past the volume end,
-    /// the EOF rule marked the volume complete, `mapped_through()` went
-    /// to u64::MAX (so no tail-hold), the end-of-download settle saw
-    /// nothing incomplete, and the CRC gate skipped the file because its
-    /// composed run was shorter than the declared piece - leaving a
-    /// preallocated, mostly-zero file reported as output with exit 0.
-    #[test]
-    fn oversized_data_area_never_ships_a_sparse_file() {
-        let dir = tmpdir("oversize-a");
-        let data = payload(4_000, 5);
-        // 4 KB really posted; the header claims 8 MB of data area.
-        let vol = fixtures::rar5_volume_oversized("movie.mkv", 8 << 20, &data, 8 << 20);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &vol, 700, 3);
-        let rep = ex.finish().unwrap();
-        assert!(
-            !rep.fallbacks.is_empty(),
-            "a volume that overruns itself must demote, got {:?}",
-            rep.fallbacks
-        );
-        assert!(
-            !dir.join("movie.mkv").exists(),
-            "no sparse output may survive the demote"
-        );
-        assert!(
-            rep.extracted.iter().all(|(n, _)| n != "movie.mkv"),
-            "{:?}",
-            rep.extracted
-        );
-        // The volume itself materialized for the disk path, byte-exact,
-        // so unrar gets to fail the job honestly.
-        assert_eq!(std::fs::read(dir.join("v.rar")).unwrap(), vol);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Variant B: every per-volume invariant holds (the data area ends
-    /// exactly at the volume end, the end-of-archive block is there, the
-    /// bytes all arrive) but `split_after` is set on the only piece and
-    /// `unpacked_size` is 8 MB against 4 KB of real data. The parser
-    /// cannot object - the continuation volume it promises simply never
-    /// exists - so the CRC gate has to notice that the header set does
-    /// not tile the file it declares. It used to skip: `split_after`
-    /// nulled the header CRC, and every demote below was gated on
-    /// `tiled`.
-    #[test]
-    fn split_after_with_oversized_unpacked_size_demotes() {
-        let dir = tmpdir("oversize-b");
-        let data = payload(4_000, 6);
-        let vol = fixtures::rar5_volume(&[("movie.mkv", 8 << 20, &data, false, true)]);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &vol, 700, 4);
-        let rep = ex.finish().unwrap();
-        assert!(
-            !rep.fallbacks.is_empty(),
-            "headers that do not cover the file must demote, got {:?}",
-            rep.fallbacks
-        );
-        assert!(
-            !dir.join("movie.mkv").exists(),
-            "no sparse output may survive the demote"
-        );
-        assert!(
-            rep.extracted.iter().all(|(n, _)| n != "movie.mkv"),
-            "{:?}",
-            rep.extracted
-        );
-        assert_eq!(std::fs::read(dir.join("v.rar")).unwrap(), vol);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Variant C: the same truncated header set with the output-CRC
-    /// gate OFF (NZBFAST_NO_OUTPUT_CRC). The knob buys back the CRC
-    /// composition cost, not the structural check - tiling is a pure
-    /// header property, and with it skipped a par-less truncated store
-    /// set shipped its preallocated size as a silent success.
-    #[test]
-    fn oversized_unpacked_size_demotes_even_with_output_crc_off() {
-        let dir = tmpdir("oversize-nocrc");
-        let data = payload(4_000, 6);
-        let vol = fixtures::rar5_volume(&[("movie.mkv", 8 << 20, &data, false, true)]);
-        let ex = Extractor::new(&dir, 1, true);
-        ex.set_verify_output_crc(false);
-        feed(&ex, 0, "v.rar", &vol, 700, 4);
-        let rep = ex.finish().unwrap();
-        assert!(
-            !rep.fallbacks.is_empty(),
-            "the tiling check must run with the CRC gate off, got {:?}",
-            rep.fallbacks
-        );
-        assert!(
-            !dir.join("movie.mkv").exists(),
-            "no sparse output may survive the demote"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The regression that matters most: a REAL multi-volume split set
-    /// (per-volume `data_len` well under the declared whole-file
-    /// `unpacked_size`, stored CRCs, out-of-order arrival) must still go
-    /// through the one-pass path untouched - no demote, byte-exact
-    /// output, no volume files left behind.
-    #[test]
-    fn legitimate_split_set_still_extracts_one_pass() {
-        let dir = tmpdir("split-legit");
-        let total = payload(500_000, 8);
-        let cut = |r: std::ops::Range<usize>| crc32fast::hash(&total[r]);
-        let vols = [
-            fixtures::rar5_volume_n_crc(
-                &[(
-                    "film.mkv",
-                    500_000,
-                    &total[..200_000],
-                    false,
-                    true,
-                    Some(cut(0..200_000)),
-                )],
-                0,
-            ),
-            fixtures::rar5_volume_n_crc(
-                &[(
-                    "film.mkv",
-                    500_000,
-                    &total[200_000..400_000],
-                    true,
-                    true,
-                    Some(cut(200_000..400_000)),
-                )],
-                1,
-            ),
-            // Last piece carries the WHOLE-file CRC, the way real
-            // archivers write it - so the composed gate actually runs.
-            fixtures::rar5_volume_n_crc(
-                &[(
-                    "film.mkv",
-                    500_000,
-                    &total[400_000..],
-                    true,
-                    false,
-                    Some(cut(0..500_000)),
-                )],
-                2,
-            ),
-        ];
-        let ex = Extractor::new(&dir, 3, true);
-        feed(&ex, 2, "x.part3.rar", &vols[2], 9000, 31);
-        feed(&ex, 0, "x.part1.rar", &vols[0], 9000, 32);
-        feed(&ex, 1, "x.part2.rar", &vols[1], 9000, 33);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join("film.mkv")).unwrap(), total);
-        assert!(!dir.join("x.part1.rar").exists());
-        assert!(!dir.join("x.part3.rar").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn obfuscated_names_group_by_inner_file() {
-        let dir = tmpdir("obf");
-        let total = payload(300_000, 5);
-        let v1 =
-            fixtures::rar5_volume_n(&[("real.mkv", 300_000, &total[..150_000], false, true)], 0);
-        let v2 =
-            fixtures::rar5_volume_n(&[("real.mkv", 300_000, &total[150_000..], true, false)], 1);
-        let ex = Extractor::new(&dir, 2, true);
-        // Hash-garbage yEnc names; sorted order of names is WRONG (b < a).
-        feed(&ex, 0, "bbbb1234.bin", &v1, 8000, 7);
-        feed(&ex, 1, "aaaa9999.bin", &v2, 8000, 8);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join("real.mkv")).unwrap(), total);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// TODO §7 #1 regression: a store set carrying MORE THAN ONE inner
-    /// file, with a file boundary inside a middle volume. Volumes group
-    /// by their first inner name, so the E02-only continuation volumes
-    /// formed a separate group that could never base-resolve; at finish()
-    /// that group fell back and deleted E02.mkv - including the head
-    /// bytes the healthy group had extracted (its volumes were never
-    /// materialized), i.e. deterministic whole-file loss at exit 0.
-    #[test]
-    fn multi_file_store_set_extracts_across_file_boundary() {
-        let dir = tmpdir("multifile");
-        let e01 = payload(350_000, 21);
-        let e02 = payload(250_000, 22);
-        let vols = [
-            fixtures::rar5_volume_n(&[("E01.mkv", 350_000, &e01[..200_000], false, true)], 0),
-            fixtures::rar5_volume_n(
-                &[
-                    ("E01.mkv", 350_000, &e01[200_000..], true, false),
-                    ("E02.mkv", 250_000, &e02[..50_000], false, true),
-                ],
-                1,
-            ),
-            fixtures::rar5_volume_n(&[("E02.mkv", 250_000, &e02[50_000..], true, false)], 2),
-        ];
-        // Obfuscated volume names; feed the continuation-only volume FIRST
-        // so its group forms before the boundary volume can link it.
-        let ex = Extractor::new(&dir, 3, true);
-        feed(&ex, 2, "ccc.bin", &vols[2], 9000, 51);
-        feed(&ex, 0, "bbb.bin", &vols[0], 9000, 52);
-        feed(&ex, 1, "aaa.bin", &vols[1], 9000, 53);
-        let rep = ex.finish().unwrap();
-        // Multi-file sets live and die on the CHAIN path: the arithmetic
-        // gate must never have placed beyond it here.
-        assert!(
-            ex.arith_engaged_groups().is_empty(),
-            "{:?}",
-            ex.arith_engaged_groups()
-        );
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(
-            rep.extracted,
-            vec![
-                ("E01.mkv".to_string(), 350_000),
-                ("E02.mkv".to_string(), 250_000)
-            ]
-        );
-        assert_eq!(std::fs::read(dir.join("E01.mkv")).unwrap(), e01);
-        assert_eq!(std::fs::read(dir.join("E02.mkv")).unwrap(), e02);
-        for n in ["bbb.bin", "aaa.bin", "ccc.bin"] {
-            assert!(!dir.join(n).exists(), "volume {n} materialized");
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Finding 14: two DISTINCT inner entries whose names sanitize to the
-    /// same on-disk name ("a/b.txt" -> "a_b.txt" collides with a literal
-    /// "a_b.txt") must each get their own output. Keyed on the sanitized
-    /// name they shared one writer and the second silently overwrote the
-    /// first; keyed on the raw name they land as two disambiguated files.
-    #[test]
-    fn distinct_names_that_sanitize_alike_dont_share_output() {
-        let dir = tmpdir("sanitize-collide");
-        let a = payload(120_000, 61);
-        let b = payload(90_000, 62);
-        let vol = fixtures::rar5_volume(&[
-            ("a/b.txt", 120_000, &a, false, false),
-            ("a_b.txt", 90_000, &b, false, false),
-        ]);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &vol, 7000, 63);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        // Both payloads must survive intact on disk under two distinct names,
-        // never one truncated/interleaved file.
-        let landed: Vec<Vec<u8>> = dir_files(&dir)
-            .into_iter()
-            .map(|n| std::fs::read(dir.join(n)).unwrap())
-            .collect();
-        assert!(landed.iter().any(|f| f == &a), "first entry's bytes lost");
-        assert!(landed.iter().any(|f| f == &b), "second entry's bytes lost");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Finding 15: on a case-insensitive default volume (macOS/Windows)
-    /// "README" and "readme" name one filesystem object, so the second
-    /// output would truncate the first. The claim key folds case there, so
-    /// the second disambiguates and both payloads survive. (On case-
-    /// sensitive Linux they are distinct files already; either way both
-    /// payloads land intact.)
-    #[test]
-    fn case_only_name_collision_keeps_both_outputs() {
-        let dir = tmpdir("case-collide");
-        let a = payload(120_000, 71);
-        let b = payload(90_000, 72);
-        let vol = fixtures::rar5_volume(&[
-            ("README", 120_000, &a, false, false),
-            ("readme", 90_000, &b, false, false),
-        ]);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &vol, 7000, 73);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        let landed: Vec<Vec<u8>> = dir_files(&dir)
-            .into_iter()
-            .map(|n| std::fs::read(dir.join(n)).unwrap())
-            .collect();
-        assert!(landed.iter().any(|f| f == &a), "README bytes lost");
-        assert!(landed.iter().any(|f| f == &b), "readme bytes lost");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Same layout at season-pack scale - six volumes, boundary inside
-    /// v3 - driven through every linking path: sequential (the
-    /// deterministic-loss order), continuations first (the group forms
-    /// before its head volume exists), and boundary volume first (the
-    /// alias exists before either neighbor group).
-    #[test]
-    fn multi_file_store_set_survives_all_feed_orders() {
-        let e01 = payload(350_000, 21);
-        let e02 = payload(250_000, 22);
-        let vols: Vec<Vec<u8>> = vec![
-            fixtures::rar5_volume_n(&[("E01.mkv", 350_000, &e01[..100_000], false, true)], 0),
-            fixtures::rar5_volume_n(
-                &[("E01.mkv", 350_000, &e01[100_000..200_000], true, true)],
-                1,
-            ),
-            fixtures::rar5_volume_n(
-                &[("E01.mkv", 350_000, &e01[200_000..300_000], true, true)],
-                2,
-            ),
-            fixtures::rar5_volume_n(
-                &[
-                    ("E01.mkv", 350_000, &e01[300_000..], true, false),
-                    ("E02.mkv", 250_000, &e02[..50_000], false, true),
-                ],
-                3,
-            ),
-            fixtures::rar5_volume_n(
-                &[("E02.mkv", 250_000, &e02[50_000..150_000], true, true)],
-                4,
-            ),
-            fixtures::rar5_volume_n(&[("E02.mkv", 250_000, &e02[150_000..], true, false)], 5),
-        ];
-        for (t, order) in [
-            [0usize, 1, 2, 3, 4, 5],
-            [4, 5, 0, 1, 2, 3],
-            [3, 4, 5, 2, 1, 0],
-        ]
-        .iter()
-        .enumerate()
-        {
-            let dir = tmpdir(&format!("multifile{t}"));
-            let ex = Extractor::new(&dir, 6, true);
-            for &vi in order {
-                let name = format!("obf{:02x}.bin", (vi as u8) ^ 0x5a);
-                feed(&ex, vi, &name, &vols[vi], 7000, 40 + vi as u64);
-            }
-            let rep = ex.finish().unwrap();
-            // No engagement assert here (unlike the §7 test above): when
-            // the boundary volume's E01-tail parses alone, it is a lone
-            // FINAL piece and the gate may transiently place it at
-            // `total - data_len` - which is the true base of any split
-            // file's final piece, so the chain confirms it and the
-            // one-pass outcome below is what actually matters.
-            assert!(
-                rep.fallbacks.is_empty(),
-                "order {order:?}: {:?}",
-                rep.fallbacks
-            );
-            assert_eq!(
-                rep.extracted,
-                vec![
-                    ("E01.mkv".to_string(), 350_000),
-                    ("E02.mkv".to_string(), 250_000)
-                ],
-                "order {order:?}"
-            );
-            assert_eq!(
-                std::fs::read(dir.join("E01.mkv")).unwrap(),
-                e01,
-                "order {order:?}"
-            );
-            assert_eq!(
-                std::fs::read(dir.join("E02.mkv")).unwrap(),
-                e02,
-                "order {order:?}"
-            );
-            // One-pass: no volume file may exist.
-            let files: Vec<String> = std::fs::read_dir(&dir)
-                .unwrap()
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect();
-            assert_eq!(files.len(), 2, "order {order:?}: {files:?}");
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-    }
-
-    /// SPEC Part A acceptance 1 + 7: a 45-volume uniform single-file
-    /// store set with dotless obfuscated names, fed in a shuffled order
-    /// that keeps the chain short for the whole download, extracts
-    /// one-pass under a tight holds budget - the arithmetic gate places
-    /// every volume the moment its own headers parse. This exact fixture
-    /// demotes with "held-bytes cap" without the gate (the ~13 MB of
-    /// unplaceable spans overrun the 8 MB floor).
-    #[test]
-    fn obfuscated_uniform_store_set_streams_one_pass_any_order() {
-        let dir = tmpdir("arith-onepass");
-        let inner = "qCNsampBzXuv9m9z.mkv";
-        let (data, vols, names) = uniform_store_set(inner, 300_000, 44, 200_000, 31);
-        let ex = Extractor::new(&dir, vols.len(), true);
-        ex.set_holds_cap(8 << 20);
-        // Volume 0 arrives LAST, and the set's final volume early. Either
-        // one is enough: volume 0 proves the file starts where the
-        // arithmetic assumes, and the final piece proves the same thing
-        // through the closure identity (and separately seeds the chain's
-        // backward walk). One of the two is all a set needs to place
-        // every other volume off its own headers.
-        let mut order = shuffled_zero_last(vols.len(), 0xC0FFEE);
-        let tail = vols.len() - 1;
-        let at = order.iter().position(|&v| v == tail).unwrap();
-        order.remove(at);
-        order.insert(0, tail);
-        for vi in order {
-            feed(&ex, vi, &names[vi], &vols[vi], 9000, 60 + vi as u64);
-        }
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(rep.extracted, vec![(inner.to_string(), data.len() as u64)]);
-        assert_eq!(std::fs::read(dir.join(inner)).unwrap(), data);
-        assert_eq!(shape_of(&ex), ["rar5", "store", "one-pass"]);
-        assert!(
-            !ex.arith_engaged_groups().is_empty(),
-            "the gate never engaged"
-        );
-        // Memory acceptance: holds never accumulated the set - only the
-        // in-flight volume's pre-parse spans.
-        assert!(
-            ex.holds_peak() < data.len() / 2,
-            "holds peak {}",
-            ex.holds_peak()
-        );
-        for n in &names {
-            assert!(!dir.join(n).exists(), "volume {n} materialized");
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The honest limit of the same shape: when NEITHER the file's first
-    /// nor its last volume has parsed, no offset is derivable from any
-    /// header, so the bytes must be held. (The offsets are only knowable
-    /// relative to one of those two ends - anything else would be placing
-    /// on an unproven premise, which is exactly what mis-placed a season
-    /// pack's continuation volumes.) A production-sized holds budget
-    /// absorbs that window and the set still one-passes; a budget smaller
-    /// than the window demotes, correctly.
-    #[test]
-    fn a_set_with_neither_end_parsed_holds_then_places() {
-        let inner = "late.mkv";
-        let (data, vols, names) = uniform_store_set(inner, 300_000, 44, 200_000, 31);
-        // Feed order that keeps both ends late: this is the case the
-        // arithmetic gate used to guess its way through.
-        let mut order = shuffled_zero_last(vols.len(), 0xC0FFEE);
-        let tail = vols.len() - 1;
-        let at = order.iter().position(|&v| v == tail).unwrap();
-        order.remove(at);
-        order.insert(order.len() - 1, tail);
-
-        // Budget above the window: one-pass, byte-exact.
-        let dir = tmpdir("arith-lateends-ok");
-        let ex = Extractor::new(&dir, vols.len(), true);
-        ex.set_holds_cap(64 << 20);
-        for &vi in &order {
-            feed(&ex, vi, &names[vi], &vols[vi], 9000, 70 + vi as u64);
-        }
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join(inner)).unwrap(), data);
-        std::fs::remove_dir_all(&dir).unwrap();
-
-        // Budget below it: demotes on the holds cap, and every volume
-        // still reconstructs byte-exact for the disk path. Paging OFF -
-        // with it on (the default) this window pages to scratch and the
-        // set one-passes instead (pinned separately below); this leg
-        // keeps the demote plumbing itself honest.
-        let dir = tmpdir("arith-lateends-tight");
-        let ex = Extractor::new(&dir, vols.len(), true);
-        ex.set_holds_cap(8 << 20);
-        ex.set_holds_paging(false);
-        for &vi in &order {
-            feed(&ex, vi, &names[vi], &vols[vi], 9000, 70 + vi as u64);
-        }
-        let rep = ex.finish().unwrap();
-        assert!(
-            rep.fallbacks
-                .iter()
-                .any(|(_, w)| w.contains("held-bytes cap")),
-            "{:?}",
-            rep.fallbacks
-        );
-        for (vi, vol) in vols.iter().enumerate() {
-            assert_eq!(
-                &std::fs::read(dir.join(&names[vi])).unwrap(),
-                vol,
-                "volume {vi}"
-            );
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// SPEC Part A acceptance 2: the same shape with ONE mid-set volume
-    /// declaring a different `data_len`. The gate engages on the uniform
-    /// majority; the odd volume's parse contradicts the premise while
-    /// unconfirmed placements exist, so the WHOLE group demotes with the
-    /// distinct reason - and every volume reconstructs byte-exact (the
-    /// unrar path's input), with no half-extracted inner file left.
-    #[test]
-    fn uniform_store_set_with_odd_mid_volume_demotes_whole() {
-        let dir = tmpdir("arith-nonuniform");
-        let inner = "inner.bin";
-        let dl = 60_000usize;
-        let n_full = 44usize;
-        let tail = 40_000usize;
-        let total = ((dl + 1) + (n_full - 1) * dl + tail) as u64; // as declared; vol 20 lies
-        let data = payload((dl + 1) + (n_full - 1) * dl + tail, 33);
-        let mut vols: Vec<Vec<u8>> = Vec::new();
-        let mut pos = 0usize;
-        for k in 0..n_full {
-            let len = if k == 0 {
-                dl + 1
-            } else if k == 20 {
-                30_000 // the odd one out
-            } else {
-                dl
-            };
-            let piece = &data[pos..pos + len];
-            pos += len;
-            vols.push(fixtures::rar5_volume_n_crc(
-                &[(
-                    inner,
-                    total,
-                    piece,
-                    k > 0,
-                    true,
-                    Some(crc32fast::hash(piece)),
-                )],
-                k as u64,
-            ));
-        }
-        vols.push(fixtures::rar5_volume_n_crc(
-            &[(
-                inner,
-                total,
-                &data[pos..pos + tail],
-                true,
-                false,
-                Some(crc32fast::hash(&data)),
-            )],
-            n_full as u64,
-        ));
-        let ex = Extractor::new(&dir, vols.len(), true);
-        // Everything but the odd volume first (volume 0 late, so the
-        // gate engages with provisional placements), the odd one last.
-        let mut order: Vec<usize> = (1..=19).chain(21..=44).chain([0, 20]).collect();
-        assert_eq!(order.len(), vols.len());
-        for vi in order.drain(..) {
-            feed(
-                &ex,
-                vi,
-                &format!("g{vi:02}NoDot"),
-                &vols[vi],
-                9000,
-                80 + vi as u64,
-            );
-        }
-        let rep = ex.finish().unwrap();
-        assert_eq!(
-            rep.fallbacks,
-            vec![(inner.to_string(), "non-uniform store set".to_string())]
-        );
-        for (vi, vol) in vols.iter().enumerate() {
-            assert_eq!(
-                &std::fs::read(dir.join(format!("g{vi:02}NoDot"))).unwrap(),
-                vol,
-                "volume {vi} must reconstruct byte-exact"
-            );
-        }
-        assert!(
-            !dir.join(inner).exists(),
-            "no partial inner file may survive"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// SPEC Part A acceptance 4: an encrypted uniform single-file set
-    /// must never engage the arithmetic gate - in-stream decryption was
-    /// built and verified against chained placement, and behavior stays
-    /// exactly as before (this set still one-passes: it completes, so
-    /// the chain closes at the end).
-    #[test]
-    fn encrypted_uniform_store_set_stays_on_chain_path() {
-        let dir = tmpdir("arith-enc");
-        let plain = payload(900_000, 35);
-        let f = fixtures::encrypt_file("hunter2", &plain, 5);
-        let n = f.cipher.len();
-        let (a, b) = (300_000, 600_000);
-        // Uniform piece sizes on purpose: were encryption not excluded,
-        // this shape would qualify.
-        let vols = [
-            fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..a, false, true)], Some(0)),
-            fixtures::rar5_volume_enc(&[("movie.mkv", &f, a..b, true, true)], Some(1)),
-            fixtures::rar5_volume_enc(&[("movie.mkv", &f, b..n, true, false)], Some(2)),
-        ];
-        let ex = Extractor::new(&dir, 3, true);
-        ex.set_password("hunter2");
-        feed(&ex, 2, "zzNoDot", &vols[2], 8000, 91);
-        feed(&ex, 0, "aaNoDot", &vols[0], 8000, 92);
-        feed(&ex, 1, "mmNoDot", &vols[1], 8000, 93);
-        let rep = ex.finish().unwrap();
-        assert!(
-            ex.arith_engaged_groups().is_empty(),
-            "arithmetic gate engaged on an encrypted set"
-        );
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), plain);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The gate's bet is right for a multi-file set's FIRST file (it
-    /// really does start at volume 0, offset 0): continuation volumes
-    /// arriving early engage provisionally, the chain confirms each
-    /// placement as the head volumes fill in, and the boundary volume
-    /// then reveals the multi-file truth WITHOUT a demote - both files
-    /// extract one-pass.
-    #[test]
-    fn provisional_placements_confirmed_by_chain_survive_multifile_reveal() {
-        let dir = tmpdir("arith-confirm");
-        // WinRAR-true: volume 0 carries one byte more (see uniform_store_set).
-        let a = payload(450_001, 41); // spans vols 0..=4, boundary in vol 4
-        let b = payload(120_000, 42); // head 50k in vol 4, final 70k in vol 5
-        let vols = [
-            fixtures::rar5_volume_n(&[("A.mkv", 450_001, &a[..100_001], false, true)], 0),
-            fixtures::rar5_volume_n(&[("A.mkv", 450_001, &a[100_001..200_001], true, true)], 1),
-            fixtures::rar5_volume_n(&[("A.mkv", 450_001, &a[200_001..300_001], true, true)], 2),
-            fixtures::rar5_volume_n(&[("A.mkv", 450_001, &a[300_001..400_001], true, true)], 3),
-            fixtures::rar5_volume_n(
-                &[
-                    ("A.mkv", 450_001, &a[400_001..], true, false),
-                    ("B.mkv", 120_000, &b[..50_000], false, true),
-                ],
-                4,
-            ),
-            fixtures::rar5_volume_n(&[("B.mkv", 120_000, &b[50_000..], true, false)], 5),
-        ];
-        let ex = Extractor::new(&dir, 6, true);
-        for vi in [2usize, 3, 5, 0, 1, 4] {
-            feed(
-                &ex,
-                vi,
-                &format!("c{vi}NoDot"),
-                &vols[vi],
-                9000,
-                70 + vi as u64,
-            );
-        }
-        let rep = ex.finish().unwrap();
-        assert!(
-            !ex.arith_engaged_groups().is_empty(),
-            "vols 2+3 arriving first must have engaged the gate"
-        );
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join("A.mkv")).unwrap(), a);
-        assert_eq!(std::fs::read(dir.join("B.mkv")).unwrap(), b);
-        for vi in 0..6 {
-            assert!(
-                !dir.join(format!("c{vi}NoDot")).exists(),
-                "volume {vi} materialized"
-            );
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The shape that USED to expose a wrong bet: a big second file
-    /// behind a small first one. Its continuation volumes look
-    /// arithmetically plausible (the file is large, so `volnum * data_len`
-    /// fits inside it) but the true bases are shifted by the first file's
-    /// share of volume 0.
-    ///
-    /// The gate no longer bets on it at all: with neither a volume 0 that
-    /// starts this file nor a closure identity that holds, the premise is
-    /// unproven and the group goes to chain resolution - which places it
-    /// correctly. So the set now extracts ONE-PASS where it previously
-    /// wrote bytes at wrong offsets and demoted to recover. The old
-    /// demote-and-reconstruct path is still exercised by
-    /// `uniform_store_set_with_odd_mid_volume_demotes_whole`.
-    #[test]
-    fn a_big_second_file_now_places_instead_of_mis_betting() {
-        let dir = tmpdir("arith-contradict");
-        let f1 = payload(30_000, 43); // wholly inside vol 0
-        let f2 = payload(520_000, 44); // 50k in vol 0, then 4 x 100k, tail 70k
-        let vols = [
-            fixtures::rar5_volume_n(
-                &[
-                    ("f1.bin", 30_000, &f1, false, false),
-                    ("f2.bin", 520_000, &f2[..50_000], false, true),
-                ],
-                0,
-            ),
-            fixtures::rar5_volume_n(&[("f2.bin", 520_000, &f2[50_000..150_000], true, true)], 1),
-            fixtures::rar5_volume_n(&[("f2.bin", 520_000, &f2[150_000..250_000], true, true)], 2),
-            fixtures::rar5_volume_n(&[("f2.bin", 520_000, &f2[250_000..350_000], true, true)], 3),
-            fixtures::rar5_volume_n(&[("f2.bin", 520_000, &f2[350_000..450_000], true, true)], 4),
-            fixtures::rar5_volume_n(&[("f2.bin", 520_000, &f2[450_000..], true, false)], 5),
-        ];
-        let ex = Extractor::new(&dir, 6, true);
-        // Vols 3+4 first: the gate engages and places them at 300k/400k
-        // (true bases 250k/350k). Vol 0 reveals the second entry; the
-        // chain then reaches vol 3 when vols 1+2 parse and contradicts.
-        for vi in [3usize, 4, 0, 1, 2, 5] {
-            feed(
-                &ex,
-                vi,
-                &format!("x{vi}NoDot"),
-                &vols[vi],
-                9000,
-                50 + vi as u64,
-            );
-        }
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join("f1.bin")).unwrap(), f1);
-        assert_eq!(std::fs::read(dir.join("f2.bin")).unwrap(), f2);
-        for vi in 0..vols.len() {
-            assert!(
-                !dir.join(format!("x{vi}NoDot")).exists(),
-                "volume {vi} materialized"
-            );
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A volume missing from the NZB entirely: the gate placed the rest
-    /// arithmetically (no holds, mappers complete), so only the closure
-    /// ruling at settle can notice the set never proved itself - it must
-    /// demote rather than ship a file with a silent hole.
-    #[test]
-    fn unclosed_arithmetic_set_demotes_at_finish() {
-        let dir = tmpdir("arith-unclosed");
-        let inner = "gap.bin";
-        let (_data, vols, names) = uniform_store_set(inner, 60_000, 9, 40_000, 37);
-        let ex = Extractor::new(&dir, vols.len(), true);
-        // Volume 4 never arrives; 0 arrives last among those that do.
-        for vi in [7usize, 2, 9, 5, 1, 8, 3, 6, 0] {
-            feed(&ex, vi, &names[vi], &vols[vi], 9000, 40 + vi as u64);
-        }
-        let rep = ex.finish().unwrap();
-        assert_eq!(
-            rep.fallbacks,
-            vec![(inner.to_string(), "non-uniform store set".to_string())]
-        );
-        assert!(!dir.join(inner).exists(), "no holed inner file may survive");
-        for vi in [7usize, 2, 9, 5, 1, 8, 3, 6, 0] {
-            assert_eq!(
-                &std::fs::read(dir.join(&names[vi])).unwrap(),
-                &vols[vi],
-                "volume {vi} must reconstruct byte-exact"
-            );
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The failure the first LIVE run of the gate exposed (Ant-Man, 134
-    /// volumes): the volume-number vint in the main header grows a byte
-    /// at volume 128, and real archivers keep the VOLUME size constant,
-    /// so the data area shrinks by that byte - `data_len` is NOT
-    /// uniform. A >127-volume set must still qualify and place every
-    /// band correctly (vol 0: D bytes; 1..127: D-1; 128+: D-2).
-    #[test]
-    fn store_set_crossing_the_volnum_vint_band_still_one_passes() {
-        let dir = tmpdir("arith-band");
-        let inner = "band.mkv";
-        let d = 5_001usize; // vol 0's data bytes
-        let n_full = 131usize; // vols 0..=130 non-final, 131 final
-        let tail = 3_000usize;
-        let total = d + 127 * (d - 1) + 3 * (d - 2) + tail;
-        let data = payload(total, 39);
-        let mut vols: Vec<Vec<u8>> = Vec::new();
-        let mut pos = 0usize;
-        for k in 0..n_full {
-            let len = if k == 0 {
-                d
-            } else if k < 128 {
-                d - 1
-            } else {
-                d - 2
-            };
-            let piece = &data[pos..pos + len];
-            pos += len;
-            vols.push(fixtures::rar5_volume_n_crc(
-                &[(
-                    inner,
-                    total as u64,
-                    piece,
-                    k > 0,
-                    true,
-                    Some(crc32fast::hash(piece)),
-                )],
-                k as u64,
-            ));
-        }
-        vols.push(fixtures::rar5_volume_n_crc(
-            &[(
-                inner,
-                total as u64,
-                &data[pos..],
-                true,
-                false,
-                Some(crc32fast::hash(&data)),
-            )],
-            n_full as u64,
-        ));
-        let names: Vec<String> = (0..vols.len()).map(|k| format!("bx{k:03}NoDot")).collect();
-        let ex = Extractor::new(&dir, vols.len(), true);
-        for vi in shuffled_zero_last(vols.len(), 0xBAD5EED) {
-            feed(&ex, vi, &names[vi], &vols[vi], 1_500, 30 + vi as u64);
-        }
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert!(
-            !ex.arith_engaged_groups().is_empty(),
-            "the gate never engaged"
-        );
-        assert_eq!(std::fs::read(dir.join(inner)).unwrap(), data);
-        for n in &names {
-            assert!(!dir.join(n).exists(), "volume {n} materialized");
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// PLAN-multifile acceptance 1: a season-pack-shaped store set - six
-    /// inner files across 60 volumes, boundaries mid-volume, dotless
-    /// obfuscated names - fed in a shuffled order with volume 0 arriving
-    /// LAST, extracts one-pass under a tight holds budget.
-    ///
-    /// This is the 25%-of-multivol-bytes shape the census found (92% of
-    /// bytes above 60 GB). Before tail anchoring it demoted: forward-only
-    /// resolution could place nothing until volume 0 parsed, so the
-    /// unplaceable spans overran the cap.
-    #[test]
-    fn obfuscated_season_pack_streams_one_pass_with_volume_zero_last() {
-        let dir = tmpdir("multifile-pack");
-        // Six episodes, each spanning several volumes, boundaries landing
-        // mid-volume so volumes carry two entries.
-        let eps: Vec<Vec<u8>> = (0..6)
-            .map(|k| payload(1_400_000 + k * 9_000, 40 + k as u8))
-            .collect();
-        // Lay the episodes end to end, then cut at a fixed volume size:
-        // exactly how a real archiver fills volumes.
-        let mut stream: Vec<(usize, usize)> = Vec::new(); // (episode, byte)
-        for (i, e) in eps.iter().enumerate() {
-            for b in 0..e.len() {
-                stream.push((i, b));
-            }
-        }
-        const VOL: usize = 150_000;
-        let mut vols: Vec<Vec<u8>> = Vec::new();
-        let mut at = 0usize;
-        let mut vol_no = 0u64;
-        while at < stream.len() {
-            let end = (at + VOL).min(stream.len());
-            // Which episodes does this volume touch, and how much of each?
-            let mut pieces: Vec<(usize, usize, usize)> = Vec::new(); // (ep, from, to)
-            let mut i = at;
-            while i < end {
-                let (ep, off) = stream[i];
-                let run_end = (i..end).take_while(|&j| stream[j].0 == ep).count() + i;
-                pieces.push((ep, off, off + (run_end - i)));
-                i = run_end;
-            }
-            let specs: Vec<(String, u64, Vec<u8>, bool, bool)> = pieces
-                .iter()
-                .map(|&(ep, from, to)| {
-                    (
-                        format!("Show.S01E{:02}.mkv", ep + 1),
-                        eps[ep].len() as u64,
-                        eps[ep][from..to].to_vec(),
-                        from > 0,
-                        to < eps[ep].len(),
-                    )
-                })
-                .collect();
-            let refs: Vec<(&str, u64, &[u8], bool, bool)> = specs
-                .iter()
-                .map(|(n, t, d, b, a)| (n.as_str(), *t, d.as_slice(), *b, *a))
-                .collect();
-            vols.push(fixtures::rar5_volume_n(&refs, vol_no));
-            vol_no += 1;
-            at = end;
-        }
-        assert!(
-            vols.len() >= 55,
-            "expected a season-pack-scale set, got {}",
-            vols.len()
-        );
-        let names: Vec<String> = (0..vols.len())
-            .map(|k| format!("{:06x}SeasonNoDot{k}", (k as u64 * 2654435761) & 0xffffff))
-            .collect();
-
-        let ex = Extractor::new(&dir, vols.len(), true);
-        ex.set_holds_cap(8 << 20);
-        for vi in shuffled_zero_last(vols.len(), 0x5EA5_0DE7) {
-            feed(&ex, vi, &names[vi], &vols[vi], 9000, 100 + vi as u64);
-        }
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        for (i, e) in eps.iter().enumerate() {
-            let p = dir.join(format!("Show.S01E{:02}.mkv", i + 1));
-            assert_eq!(&std::fs::read(&p).unwrap(), e, "episode {} differs", i + 1);
-        }
-        for n in &names {
-            assert!(!dir.join(n).exists(), "volume {n} materialized");
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// PLAN-multifile acceptance 2: an ISLAND of volumes away from volume
-    /// 0 places its pieces. Each inner file needs a parsed run containing
-    /// its own head or tail, not one reaching back to the start of the
-    /// set - that is the whole point of the tail seed.
-    #[test]
-    fn a_mid_set_island_resolves_without_volume_zero() {
-        let dir = tmpdir("multifile-island");
-        let a = payload(400_000, 61);
-        let b = payload(300_000, 62);
-        // A ends in volume 3; B starts there and ends in volume 5.
-        let vols = [
-            fixtures::rar5_volume_n(&[("A.mkv", 400_000, &a[..100_000], false, true)], 0),
-            fixtures::rar5_volume_n(&[("A.mkv", 400_000, &a[100_000..200_000], true, true)], 1),
-            fixtures::rar5_volume_n(&[("A.mkv", 400_000, &a[200_000..300_000], true, true)], 2),
-            fixtures::rar5_volume_n(
-                &[
-                    ("A.mkv", 400_000, &a[300_000..], true, false),
-                    ("B.mkv", 300_000, &b[..50_000], false, true),
-                ],
-                3,
-            ),
-            fixtures::rar5_volume_n(&[("B.mkv", 300_000, &b[50_000..150_000], true, true)], 4),
-            fixtures::rar5_volume_n(&[("B.mkv", 300_000, &b[150_000..], true, false)], 5),
-        ];
-        // Feed ONLY volumes 3-5: an island with no path back to volume 0.
-        let ex = Extractor::new(&dir, 6, true);
-        for vi in [4usize, 5, 3] {
-            feed(
-                &ex,
-                vi,
-                &format!("isl{vi}NoDot"),
-                &vols[vi],
-                9000,
-                10 + vi as u64,
-            );
-        }
-        // Before finish, B's pieces are PLACED: volume 3 starts B (base
-        // 0) and volume 5 ends it (base = total - data_len), so the whole
-        // island resolves with no path back to volume 0. Forward-only
-        // resolution placed nothing here.
-        assert!(ex.bases_known(&["B.mkv"]), "island pieces must be placed");
-        let rep = ex.finish().unwrap();
-        // The SET is still incomplete - A's head never arrived - so the
-        // group demotes at settle and its partial output is removed. The
-        // point of this test is the placement above, not the verdict.
-        assert!(!rep.fallbacks.is_empty(), "an incomplete set still demotes");
-        assert!(
-            !dir.join("B.mkv").exists(),
-            "a demote removes partial output"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// PLAN-multifile acceptance 5: headers that disagree with THEMSELVES.
-    /// The middle volume claims a piece that does not fit the gap its two
-    /// neighbours leave, so the piece resolves to different offsets from
-    /// each side. No offset here is trustworthy, so the group demotes
-    /// with its own reason - and every volume still reconstructs
-    /// byte-exact for the disk path.
-    #[test]
-    fn a_self_contradictory_chain_demotes_with_its_own_reason() {
-        let dir = tmpdir("chain-contradict");
-        let f = payload(300_000, 71);
-        let vols = [
-            fixtures::rar5_volume_n(&[("f.bin", 300_000, &f[..100_000], false, true)], 0),
-            // Overlaps: claims 150 KB where 100 KB fits.
-            fixtures::rar5_volume_n(&[("f.bin", 300_000, &f[..150_000], true, true)], 1),
-            fixtures::rar5_volume_n(&[("f.bin", 300_000, &f[200_000..], true, false)], 2),
-        ];
-        let ex = Extractor::new(&dir, 3, true);
-        for vi in [0usize, 1, 2] {
-            feed(
-                &ex,
-                vi,
-                &format!("cc{vi}NoDot"),
-                &vols[vi],
-                9000,
-                80 + vi as u64,
-            );
-        }
-        let rep = ex.finish().unwrap();
-        assert!(
-            rep.fallbacks
-                .iter()
-                .any(|(_, w)| w == "inconsistent volume chain"),
-            "{:?}",
-            rep.fallbacks
-        );
-        for (vi, vol) in vols.iter().enumerate() {
-            assert_eq!(
-                &std::fs::read(dir.join(format!("cc{vi}NoDot"))).unwrap(),
-                vol,
-                "volume {vi} must reconstruct byte-exact"
-            );
-        }
-        assert!(!dir.join("f.bin").exists(), "no partial output may survive");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// SPEC Part A trap: under protect_sources (offline `nzbfast
-    /// extract`), an arithmetic demote must DISCARD like the chain path
-    /// does - never materialize a "volume" over the source file it is
-    /// reading.
-    #[test]
-    fn protect_sources_arithmetic_demote_discards() {
-        let dir = tmpdir("arith-protect");
-        let inner = "film.mkv";
-        let dl = 60_000usize;
-        let total = ((dl + 1) + 4 * dl + 40_000) as u64; // declared; vol 3 lies
-        let data = payload((dl + 1) + 4 * dl + 40_000, 45);
-        let mut vols: Vec<Vec<u8>> = Vec::new();
-        let mut pos = 0usize;
-        for k in 0..5usize {
-            let len = if k == 0 {
-                dl + 1
-            } else if k == 3 {
-                30_000
-            } else {
-                dl
-            };
-            let piece = &data[pos..pos + len];
-            pos += len;
-            vols.push(fixtures::rar5_volume_n(
-                &[(inner, total, piece, k > 0, true)],
-                k as u64,
-            ));
-        }
-        vols.push(fixtures::rar5_volume_n(
-            &[(inner, total, &data[pos..pos + 40_000], true, false)],
-            5,
-        ));
-        let names: Vec<String> = (0..6).map(|k| format!("src{k}NoDot")).collect();
-        for (n, v) in names.iter().zip(&vols) {
-            std::fs::write(dir.join(n), v).unwrap();
-        }
-        let ex = Extractor::new(&dir, vols.len(), true);
-        ex.set_protect_sources();
-        // Engage on the uniform majority (vol 0 late), then the odd
-        // volume contradicts and the whole group demotes - to Discard.
-        for vi in [1usize, 2, 4, 5, 0, 3] {
-            feed(&ex, vi, &names[vi], &vols[vi], 9000, 20 + vi as u64);
-        }
-        let rep = ex.finish().unwrap();
-        assert!(
-            rep.fallbacks
-                .iter()
-                .any(|(_, why)| why == "non-uniform store set"),
-            "{:?}",
-            rep.fallbacks
-        );
-        // Sources byte-identical, and no output was left behind.
-        for (n, v) in names.iter().zip(&vols) {
-            assert_eq!(
-                &std::fs::read(dir.join(n)).unwrap(),
-                v,
-                "source {n} touched"
-            );
-        }
-        assert!(!dir.join(inner).exists(), "partial output must not survive");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Two archives in one NZB that reuse an inner filename must not
-    /// share a writer (conflicting-offset interleave, silent since inner
-    /// files aren't PAR2-covered) - and must NOT be merged into one group
-    /// (the shared name is wholly contained, not split: no archive-chain
-    /// evidence).
-    #[test]
-    fn same_inner_name_across_archives_gets_own_files() {
-        let dir = tmpdir("namecollide");
-        let film_a = payload(120_000, 31);
-        let film_b = payload(140_000, 32);
-        let samp_a = payload(30_000, 33);
-        let samp_b = payload(40_000, 34);
-        let va = fixtures::rar5_volume(&[
-            ("filmA.mkv", 120_000, &film_a, false, false),
-            ("sample.mkv", 30_000, &samp_a, false, false),
-        ]);
-        let vb = fixtures::rar5_volume(&[
-            ("filmB.mkv", 140_000, &film_b, false, false),
-            ("sample.mkv", 40_000, &samp_b, false, false),
-        ]);
-        let ex = Extractor::new(&dir, 2, true);
-        feed(&ex, 0, "a.rar", &va, 8000, 61);
-        feed(&ex, 1, "b.rar", &vb, 8000, 62);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join("filmA.mkv")).unwrap(), film_a);
-        assert_eq!(std::fs::read(dir.join("filmB.mkv")).unwrap(), film_b);
-        // One sample per archive, the second under a disambiguated name.
-        let mut samples: Vec<Vec<u8>> = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().ends_with("sample.mkv"))
-            .map(|e| std::fs::read(e.path()).unwrap())
-            .collect();
-        samples.sort_by_key(|s| s.len());
-        assert_eq!(samples.len(), 2, "each archive keeps its own sample");
-        assert_eq!(samples[0], samp_a);
-        assert_eq!(samples[1], samp_b);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn plain_files_still_work() {
-        let dir = tmpdir("plain");
-        let data = payload(50_000, 9);
-        let ex = Extractor::new(&dir, 1, true);
-        // Not a rar - offset-0 article sniffs plain. Feed out of order.
-        ex.write(0, "doc.iso", 50_000, 30_000, &data[30_000..])
-            .unwrap();
-        ex.write(0, "doc.iso", 50_000, 0, &data[..30_000]).unwrap();
-        ex.finish().unwrap();
-        assert_eq!(std::fs::read(dir.join("doc.iso")).unwrap(), data);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn encrypted_headers_fall_back_to_materialized_volume() {
-        let dir = tmpdir("enc");
-        // Signature + encryption block type 4 (valid CRC).
-        let mut vol = Vec::new();
-        vol.extend_from_slice(b"Rar!\x1a\x07\x01\x00");
-        let hdr = [0x04u8, 0x00]; // type 4, flags 0
-        vol.extend_from_slice(&crc32fast::hash(&hdr).to_le_bytes());
-        vol.push(2); // header size vint
-        vol.extend_from_slice(&hdr);
-        vol.extend_from_slice(&payload(5000, 6)); // opaque encrypted stuff
-        let ex = Extractor::new(&dir, 1, true);
-        let n = vol.len();
-        ex.write(0, "sec.rar", n as u64, 0, &vol[..2000]).unwrap();
-        ex.write(0, "sec.rar", n as u64, 2000, &vol[2000..])
-            .unwrap();
-        let rep = ex.finish().unwrap();
-        assert!(rep.extracted.is_empty());
-        // Volume materialized byte-exactly for a future unrar-with-password.
-        assert_eq!(std::fs::read(dir.join("sec.rar")).unwrap(), vol);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn protect_sources_happy_path_extracts_normally() {
-        let dir = tmpdir("protect-ok");
-        let total = payload(300_000, 12);
-        let vols = [
-            fixtures::rar5_volume_n(&[("film.mkv", 300_000, &total[..150_000], false, true)], 0),
-            fixtures::rar5_volume_n(&[("film.mkv", 300_000, &total[150_000..], true, false)], 1),
-        ];
-        let ex = Extractor::new(&dir, 2, true);
-        ex.set_protect_sources();
-        feed(&ex, 0, "x.part1.rar", &vols[0], 8000, 41);
-        feed(&ex, 1, "x.part2.rar", &vols[1], 8000, 42);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join("film.mkv")).unwrap(), total);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The 2026-07 damaged-post bench corruption: re-extraction fed
-    /// volumes off disk, hit the holds cap, and the fallback materialized
-    /// "volumes" over the very files being read (FileWriter::create
-    /// truncates). Protect-sources mode must leave the source files
-    /// byte-identical, never create slot writers, and delete any partial
-    /// inner file.
-    #[test]
-    fn protect_sources_fallback_never_touches_source_files() {
-        let dir = tmpdir("protect-fb");
-        // THREE volumes, unequal, and the MIDDLE one is fed first. A
-        // middle piece is neither its file's head nor its tail, so it
-        // has no seed of its own and cannot resolve until a neighbour
-        // parses - the only remaining shape that piles up holds now that
-        // tail anchoring places final pieces on sight. (The arithmetic
-        // gate also stays out: the sizes are not uniform.)
-        let total = payload(30_000_000, 13);
-        let vols = [
-            fixtures::rar5_volume_n(
-                &[("film.mkv", 30_000_000, &total[..7_000_000], false, true)],
-                0,
-            ),
-            fixtures::rar5_volume_n(
-                &[(
-                    "film.mkv",
-                    30_000_000,
-                    &total[7_000_000..22_000_000],
-                    true,
-                    true,
-                )],
-                1,
-            ),
-            fixtures::rar5_volume_n(
-                &[("film.mkv", 30_000_000, &total[22_000_000..], true, false)],
-                2,
-            ),
-        ];
-        // The volume files exist on disk, as in reextract_dir.
-        std::fs::write(dir.join("x.part1.rar"), &vols[0]).unwrap();
-        std::fs::write(dir.join("x.part2.rar"), &vols[1]).unwrap();
-        std::fs::write(dir.join("x.part3.rar"), &vols[2]).unwrap();
-
-        let ex = Extractor::new(&dir, 3, true);
-        ex.set_protect_sources();
-        ex.set_holds_cap(1); // floors at 8 MB - part2's data area exceeds it
-        // Paging OFF: with it on this window pages and the set
-        // re-extracts one-pass; the subject here is the fallback
-        // discipline under budget pressure, so force the breach.
-        ex.set_holds_paging(false);
-        let feed_seq = |slot: usize, name: &str, vol: &[u8]| {
-            for (i, chunk) in vol.chunks(65_000).enumerate() {
-                ex.write(slot, name, vol.len() as u64, (i * 65_000) as u64, chunk)
-                    .unwrap();
-            }
-        };
-        feed_seq(1, "x.part2.rar", &vols[1]);
-        feed_seq(0, "x.part1.rar", &vols[0]);
-        feed_seq(2, "x.part3.rar", &vols[2]);
-        let rep = ex.finish().unwrap();
-        assert!(!rep.fallbacks.is_empty(), "expected a holds-cap fallback");
-
-        // Source volumes byte-identical - NOT truncated/rewritten.
-        assert_eq!(std::fs::read(dir.join("x.part1.rar")).unwrap(), vols[0]);
-        assert_eq!(std::fs::read(dir.join("x.part2.rar")).unwrap(), vols[1]);
-        assert_eq!(std::fs::read(dir.join("x.part3.rar")).unwrap(), vols[2]);
-        // No slot writers, no half-written inner file masquerading as output.
-        assert!(ex.slot_path(0).is_none());
-        assert!(ex.slot_path(1).is_none());
-        assert!(ex.slot_path(2).is_none());
-        assert!(!dir.join("film.mkv").exists());
-        let extra: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n != "x.part1.rar" && n != "x.part2.rar" && n != "x.part3.rar")
-            .collect();
-        assert!(extra.is_empty(), "unexpected files: {extra:?}");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The same shape with paging ON (the default): the re-extraction
-    /// that used to DISCARD on the holds cap - a real failure mode, the
-    /// 2026-07 damaged-post bench ran into exactly this - now pages the
-    /// middle volume's window to scratch and completes one-pass, sources
-    /// untouched and no scratch left behind.
-    #[test]
-    fn protect_sources_paged_holds_reextract_one_pass() {
-        let dir = tmpdir("protect-paged");
-        let total = payload(30_000_000, 13);
-        let vols = [
-            fixtures::rar5_volume_n(
-                &[("film.mkv", 30_000_000, &total[..7_000_000], false, true)],
-                0,
-            ),
-            fixtures::rar5_volume_n(
-                &[(
-                    "film.mkv",
-                    30_000_000,
-                    &total[7_000_000..22_000_000],
-                    true,
-                    true,
-                )],
-                1,
-            ),
-            fixtures::rar5_volume_n(
-                &[("film.mkv", 30_000_000, &total[22_000_000..], true, false)],
-                2,
-            ),
-        ];
-        std::fs::write(dir.join("x.part1.rar"), &vols[0]).unwrap();
-        std::fs::write(dir.join("x.part2.rar"), &vols[1]).unwrap();
-        std::fs::write(dir.join("x.part3.rar"), &vols[2]).unwrap();
-        let ex = Extractor::new(&dir, 3, true);
-        ex.set_protect_sources();
-        ex.set_holds_cap(1); // floors at 8 MB - part2's data area exceeds it
-        let feed_seq = |slot: usize, name: &str, vol: &[u8]| {
-            for (i, chunk) in vol.chunks(65_000).enumerate() {
-                ex.write(slot, name, vol.len() as u64, (i * 65_000) as u64, chunk)
-                    .unwrap();
-            }
-        };
-        feed_seq(1, "x.part2.rar", &vols[1]);
-        feed_seq(0, "x.part1.rar", &vols[0]);
-        feed_seq(2, "x.part3.rar", &vols[2]);
-        let rep = ex.finish().unwrap();
-        assert!(ex.holds_paged_total() > 0, "paging never engaged");
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join("film.mkv")).unwrap(), total);
-        // Sources byte-identical, and nothing else in the directory -
-        // in particular no scratch outliving finish. Handle closed
-        // first (delete-pending filesystems keep the unlinked name
-        // listed until last close).
-        drop(ex);
-        assert_eq!(std::fs::read(dir.join("x.part1.rar")).unwrap(), vols[0]);
-        assert_eq!(std::fs::read(dir.join("x.part2.rar")).unwrap(), vols[1]);
-        assert_eq!(std::fs::read(dir.join("x.part3.rar")).unwrap(), vols[2]);
-        assert_eq!(
-            dir_files(&dir),
-            vec![
-                "film.mkv".to_string(),
-                "x.part1.rar".to_string(),
-                "x.part2.rar".to_string(),
-                "x.part3.rar".to_string()
-            ]
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn protect_sources_non_rar_sniff_discards() {
-        let dir = tmpdir("protect-plain");
-        let data = payload(50_000, 14);
-        std::fs::write(dir.join("doc.bin"), &data).unwrap();
-        let ex = Extractor::new(&dir, 1, true);
-        ex.set_protect_sources();
-        ex.write(0, "doc.bin", 50_000, 0, &data[..30_000]).unwrap();
-        ex.write(0, "doc.bin", 50_000, 30_000, &data[30_000..])
-            .unwrap();
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.iter().any(|(_, w)| w.contains("not a RAR")));
-        // Source untouched - a plain writer would have truncated it.
-        assert_eq!(std::fs::read(dir.join("doc.bin")).unwrap(), data);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Volume bytes that belong to no data area - service blocks (a RAR
-    /// recovery record) and anything past the end-of-archive marker - go
-    /// to the header stash, and once the mapper is complete that is EVERY
-    /// remaining byte of the volume. Uncharged, a crafted volume (a tiny
-    /// archive plus gigabytes of trailing junk) pinned all of it in RAM
-    /// with no spill and no demote. The stash charges the holds budget,
-    /// so the volume materializes instead.
-    #[test]
-    fn trailing_bytes_past_archive_end_are_capped() {
-        let dir = tmpdir("hdrcap");
-        let data = payload(1_000, 12);
-        let mut vol = fixtures::rar5_volume(&[("a.bin", 1_000, &data, false, false)]);
-        let archive_end = vol.len();
-        vol.extend(payload(12 << 20, 3)); // junk past the end block
-        let ex = Extractor::new(&dir, 1, true);
-        ex.set_holds_cap(1); // floors at 8 MB
-        // Paging OFF: with it on the junk pages to scratch and the tiny
-        // archive extracts one-pass (bounded by the scratch ceiling,
-        // pinned separately) - this test keeps the charge-and-demote
-        // plumbing itself honest.
-        ex.set_holds_paging(false);
-        let art = 64_000;
-        let mut s = 0usize;
-        while s < vol.len() {
-            let e = (s + art).min(vol.len());
-            ex.write(0, "v.rar", vol.len() as u64, s as u64, &vol[s..e])
-                .unwrap();
-            s = e;
-        }
-        assert!(
-            ex.holds_peak() <= (8 << 20) + art + archive_end,
-            "stash peaked at {} - the junk was never charged",
-            ex.holds_peak()
-        );
-        let rep = ex.finish().unwrap();
-        // The reason must be one the caller ROUTES: a level-0 demote it
-        // does not recognize means loose volumes, no payload, exit 0.
-        assert!(
-            rep.fallbacks
-                .iter()
-                .any(|(_, w)| w.contains("held-bytes cap") && !w.starts_with("nested fallback:")),
-            "{:?}",
-            rep.fallbacks
-        );
-        // Demoting is not losing: the volume is byte-identical on disk.
-        assert_eq!(std::fs::read(dir.join("v.rar")).unwrap(), vol);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    // -- archive shape (the live badge's facts) --
-
-    #[test]
-    fn shape_is_empty_until_something_archive_shaped_parses() {
-        let dir = tmpdir("shape-none");
-        let ex = Extractor::new(&dir, 1, true);
-        assert!(ex.archive_shape().is_none(), "nothing fed yet");
-        // A loose file is not an archive and must never grow a badge.
-        let data = payload(50_000, 9);
-        feed(&ex, 0, "notes.txt", &data, 7000, 3);
-        ex.finish().unwrap();
-        assert!(ex.archive_shape().is_none(), "{:?}", shape_of(&ex));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn shape_reports_rar5_store_one_pass() {
-        let dir = tmpdir("shape-store");
-        let data = payload(200_000, 1);
-        let vol = fixtures::rar5_volume(&[("movie.mkv", 200_000, &data, false, false)]);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &vol, 7000, 3);
-        // Known DURING the download, not just at finish - that is the
-        // whole point of the live badge.
-        assert_eq!(shape_of(&ex), ["rar5", "store", "one-pass"]);
-        ex.finish().unwrap();
-        assert_eq!(shape_of(&ex), ["rar5", "store", "one-pass"]);
-        assert_eq!(
-            ex.archive_shape().unwrap().display(),
-            "RAR5 · stored · one-pass"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The naming oracle's key (Tier C item 4): the inner file's stated
-    /// CRC32, latched off the same header parse the shape badge uses.
-    /// Available DURING the download for the same reason the badge is.
-    #[test]
-    fn the_inner_file_crc_is_latched_for_the_naming_oracle() {
-        let dir = tmpdir("crc-latch");
-        let data = payload(200_000, 1);
-        let want = crc32fast::hash(&data);
-        // With the data CRC the way a real archiver always writes it.
-        let vol = fixtures::rar5_volume_n_crc(
-            &[("movie.mkv", 200_000, &data, false, false, Some(want))],
-            0,
-        );
-        let ex = Extractor::new(&dir, 1, true);
-        assert_eq!(ex.inner_crc(), None, "nothing fed yet");
-        feed(&ex, 0, "v.rar", &vol, 7000, 3);
-        assert_eq!(ex.inner_crc(), Some(("movie.mkv".to_string(), want)));
-        ex.finish().unwrap();
-        assert_eq!(ex.inner_crc(), Some(("movie.mkv".to_string(), want)));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A header-encrypted set is the case the oracle cannot serve, and
-    /// it must say so rather than offering a CRC of something else: the
-    /// headers never parse, so there is no entry and no key. This is the
-    /// `-hp` floor, pinned.
-    #[test]
-    fn a_header_encrypted_set_yields_no_crc_key() {
-        let dir = tmpdir("crc-hdr");
-        // Encrypted headers and no password: nothing parses, exactly as
-        // for an obfuscated `-hp` post nobody has the key to.
-        let vol = fixtures::rar4_encrypted_headers(200_000);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &vol, 7000, 3);
-        ex.finish().unwrap();
-        assert!(shape_of(&ex).contains(&"encrypted"), "{:?}", shape_of(&ex));
-        assert_eq!(ex.inner_crc(), None);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn shape_reports_rar4() {
-        let dir = tmpdir("shape-rar4");
-        let data = payload(120_000, 4);
-        let vol = fixtures::rar4_volume(&[("movie.mkv", 120_000, &data, false, false)]);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &vol, 7000, 3);
-        ex.finish().unwrap();
-        assert_eq!(shape_of(&ex)[0], "rar4", "{:?}", shape_of(&ex));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn shape_reports_compressed_set_as_unpacked_on_disk() {
-        let dir = tmpdir("shape-comp");
-        let data = payload(120_000, 2);
-        // A compressed entry cannot be mapped at the top level: the
-        // volume materializes and the badge has to say so.
-        let vol = rar5_compressed_volume("movie.mkv", &data);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &vol, 7000, 3);
-        ex.finish().unwrap();
-        let sh = shape_of(&ex);
-        assert_eq!(sh[0], "rar5", "{sh:?}");
-        assert!(sh.contains(&"compressed"), "{sh:?}");
-        assert!(sh.contains(&"on-disk"), "{sh:?}");
-        assert!(!sh.contains(&"one-pass"), "{sh:?}");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn shape_says_one_pass_when_an_encrypted_set_decrypts_in_stream() {
-        let dir = tmpdir("shape-enc");
-        let plain = payload(200_003, 41);
-        let f = fixtures::encrypt_file("hunter2", &plain, 5);
-        let vol =
-            fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..f.cipher.len(), false, false)], None);
-        let ex = Extractor::new(&dir, 1, true);
-        ex.set_password("hunter2");
-        feed(&ex, 0, "v.rar", &vol, 7000, 3);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        // Plaintext-once: nothing is ever stored locked, so this is an
-        // ordinary one-pass set that happens to be encrypted.
-        assert_eq!(shape_of(&ex), ["rar5", "store", "encrypted", "one-pass"]);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn shape_says_unlocked_at_the_end_on_the_legacy_encrypted_path() {
-        let dir = tmpdir("shape-enc-legacy");
-        let plain = payload(200_003, 41);
-        let f = fixtures::encrypt_file("hunter2", &plain, 5);
-        let vol =
-            fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..f.cipher.len(), false, false)], None);
-        let ex = Extractor::new(&dir, 1, true);
-        ex.set_password("hunter2");
-        // Ciphertext assembled at store offsets, unlocked by the finish
-        // pass - the shape must distinguish it from plaintext-once.
-        ex.set_instream_decrypt(false);
-        feed(&ex, 0, "v.rar", &vol, 7000, 3);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(
-            shape_of(&ex),
-            ["rar5", "store", "encrypted", "unlock-at-end"]
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The badge a RAR4 encrypted set earns. "unlock-at-end" is the
-    /// honest token for it and always will be: RAR4 can never take the
-    /// plaintext-once route (no password check to gate on), so it always
-    /// assembles ciphertext and unlocks in the finish pass. The user-facing
-    /// difference from before this landed is "one-pass at all" - it used to
-    /// materialize every volume and read "on-disk".
-    #[test]
-    fn shape_says_rar4_encrypted_unlocks_at_the_end() {
-        let dir = tmpdir("shape-enc4");
-        let plain = payload(120_007, 43);
-        let f = fixtures::encrypt_file_v4("hunter2", &plain, 51);
-        let vol = fixtures::rar4_volume_enc(&[("movie.mkv", &f, 0..f.cipher.len(), false, false)]);
-        let ex = Extractor::new(&dir, 1, true);
-        ex.set_password("hunter2");
-        feed(&ex, 0, "v.rar", &vol, 7000, 3);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(
-            shape_of(&ex),
-            ["rar4", "store", "encrypted", "unlock-at-end"],
-            "RAR4 must not be badged as materialized any more"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn shape_says_encrypted_when_the_headers_are_locked() {
-        let dir = tmpdir("shape-hdr");
-        // Encrypted headers with no password: nothing parses, so the
-        // blocker is the only place the fact can come from.
-        let vol = fixtures::rar4_encrypted_headers(200_000);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &vol, 7000, 3);
-        ex.finish().unwrap();
-        let sh = shape_of(&ex);
-        assert!(sh.contains(&"encrypted"), "{sh:?}");
-        assert!(sh.contains(&"on-disk"), "{sh:?}");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn shape_reports_a_top_level_7z_as_unpacked_on_disk() {
-        let dir = tmpdir("shape-7z");
-        // A top-level .7z the chase cannot take - here the start header
-        // fails its own CRC, so `sevenz_start_header` declines before the
-        // depth question even arises - lands on disk for the post-pass.
-        // Without the signature sniff the badge would say nothing at all
-        // about a 7z release. (A well-formed one streams instead: see
-        // `sevenz_top_level_extracts_one_pass`.)
-        let mut vol = b"7z\xbc\xaf\x27\x1c".to_vec();
-        vol.extend_from_slice(&payload(80_000, 6));
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "release.7z", &vol, 7000, 3);
-        ex.finish().unwrap();
-        assert_eq!(shape_of(&ex), ["7z", "on-disk"]);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn shape_tag_round_trips_through_the_wire_form() {
-        let dir = tmpdir("shape-tag");
-        let data = payload(200_000, 1);
-        let vol = fixtures::rar5_volume(&[("movie.mkv", 200_000, &data, false, false)]);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &vol, 7000, 3);
-        ex.finish().unwrap();
-        // The daemon persists exactly this string and the dashboard
-        // splits it back apart on whitespace.
-        let tag = ex.archive_shape().unwrap().tag();
-        assert_eq!(tag, "rar5 store one-pass");
-        assert_eq!(
-            tag.split(' ').map(shape_word).collect::<Vec<_>>(),
-            ["RAR5", "stored", "one-pass"]
-        );
-        // An unknown token from a newer daemon still reads as itself.
-        assert_eq!(shape_word("rar9"), "rar9");
-    }
-
-    // -- encrypted RAR5 store sets (native AES decryption) --
-
-    // -- nested one-pass: store-in-store via the recursive child --
-
-    /// Outer store volumes wrapping a store archive wrapping the final
-    /// files: both layers map in one pass - the final files land
-    /// byte-exact and NEITHER the outer volumes NOR the intermediate
-    /// archive ever exist on disk. Driven across three feed orders
-    /// (mirroring `multi_file_store_set_survives_all_feed_orders`).
-    #[test]
-    fn two_level_store_set_extracts_one_pass() {
-        let a = payload(300_000, 81);
-        let b = payload(150_000, 82);
-        let inner_arch = fixtures::rar5_volume(&[
-            ("A.mkv", 300_000, &a, false, false),
-            ("B.mkv", 150_000, &b, false, false),
-        ]);
-        let n = inner_arch.len();
-        // WinRAR-true: vol 0's piece is one byte longer than vol 1's.
-        let (c1, c2) = (n / 3 + 1, n / 3 + 1 + n / 3);
-        let vols: Vec<Vec<u8>> = vec![
-            fixtures::rar5_volume_n(
-                &[("inner.rar", n as u64, &inner_arch[..c1], false, true)],
-                0,
-            ),
-            fixtures::rar5_volume_n(
-                &[("inner.rar", n as u64, &inner_arch[c1..c2], true, true)],
-                1,
-            ),
-            fixtures::rar5_volume_n(
-                &[("inner.rar", n as u64, &inner_arch[c2..], true, false)],
-                2,
-            ),
-        ];
-        for (t, order) in [[0usize, 1, 2], [2, 1, 0], [1, 2, 0]].iter().enumerate() {
-            let dir = tmpdir(&format!("nested2l{t}"));
-            let ex = Extractor::new(&dir, 3, true);
-            for &vi in order {
-                let name = format!("obf{:02x}.bin", (vi as u8) ^ 0x3c);
-                feed(&ex, vi, &name, &vols[vi], 7000, 70 + vi as u64);
-            }
-            let rep = ex.finish().unwrap();
-            assert!(
-                rep.fallbacks.is_empty(),
-                "order {order:?}: {:?}",
-                rep.fallbacks
-            );
-            assert_eq!(
-                rep.extracted,
-                vec![
-                    ("A.mkv".to_string(), 300_000),
-                    ("B.mkv".to_string(), 150_000)
-                ],
-                "order {order:?}"
-            );
-            assert_eq!(
-                std::fs::read(dir.join("A.mkv")).unwrap(),
-                a,
-                "order {order:?}"
-            );
-            assert_eq!(
-                std::fs::read(dir.join("B.mkv")).unwrap(),
-                b,
-                "order {order:?}"
-            );
-            // One pass: no outer volume, no intermediate archive.
-            assert_eq!(
-                dir_files(&dir),
-                vec!["A.mkv".to_string(), "B.mkv".to_string()],
-                "order {order:?}"
-            );
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-    }
-
-    /// An INNER volume boundary spanning two OUTER volumes: the child's
-    /// base for the final file's continuation piece resolves through the
-    /// composed cum-chain, with the level-1 volume's bytes arriving via
-    /// two different parent slots.
-    #[test]
-    fn nested_split_chain() {
-        let f = payload(400_000, 83);
-        let iv1 = fixtures::rar5_volume_n(&[("F.mkv", 400_000, &f[..200_000], false, true)], 0);
-        let iv2 = fixtures::rar5_volume_n(&[("F.mkv", 400_000, &f[200_000..], true, false)], 1);
-        let cut = iv2.len() / 2;
-        let vols: Vec<Vec<u8>> = vec![
-            fixtures::rar5_volume_n(
-                &[
-                    ("inner.part1.rar", iv1.len() as u64, &iv1, false, false),
-                    (
-                        "inner.part2.rar",
-                        iv2.len() as u64,
-                        &iv2[..cut],
-                        false,
-                        true,
-                    ),
-                ],
-                0,
-            ),
-            fixtures::rar5_volume_n(
-                &[(
-                    "inner.part2.rar",
-                    iv2.len() as u64,
-                    &iv2[cut..],
-                    true,
-                    false,
-                )],
-                1,
-            ),
-        ];
-        for (t, order) in [[0usize, 1], [1, 0]].iter().enumerate() {
-            let dir = tmpdir(&format!("nestedsplit{t}"));
-            let ex = Extractor::new(&dir, 2, true);
-            for &vi in order {
-                feed(
-                    &ex,
-                    vi,
-                    &format!("zz{vi}.bin"),
-                    &vols[vi],
-                    8000,
-                    90 + vi as u64,
-                );
-            }
-            let rep = ex.finish().unwrap();
-            assert!(
-                rep.fallbacks.is_empty(),
-                "order {order:?}: {:?}",
-                rep.fallbacks
-            );
-            assert_eq!(
-                rep.extracted,
-                vec![("F.mkv".to_string(), 400_000)],
-                "order {order:?}"
-            );
-            assert_eq!(
-                std::fs::read(dir.join("F.mkv")).unwrap(),
-                f,
-                "order {order:?}"
-            );
-            assert_eq!(
-                dir_files(&dir),
-                vec!["F.mkv".to_string()],
-                "order {order:?}"
-            );
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-    }
-
-    /// Reusing the verified article CRC must compose to exactly what
-    /// hashing the routed bytes composes: a clean nested store set still
-    /// one-passes with no demotion, in every feed order.
-    #[test]
-    fn a_reused_article_crc_extracts_the_same_as_hashing() {
-        let f = payload(400_000, 86);
-        let whole = crc32fast::hash(&f);
-        let iv = [
-            // WinRAR-true geometry: volume 0 carries one byte more (its
-            // main header has no volume-number field).
-            fixtures::rar5_volume_n_crc(
-                &[(
-                    "F.mkv",
-                    400_000,
-                    &f[..150_001],
-                    false,
-                    true,
-                    Some(crc32fast::hash(&f[..150_001])),
-                )],
-                0,
-            ),
-            fixtures::rar5_volume_n_crc(
-                &[(
-                    "F.mkv",
-                    400_000,
-                    &f[150_001..300_001],
-                    true,
-                    true,
-                    Some(crc32fast::hash(&f[150_001..300_001])),
-                )],
-                1,
-            ),
-            fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[300_001..], true, false, Some(whole))],
-                2,
-            ),
-        ];
-        let outer = fixtures::rar5_volume(&[
-            ("i.part1.rar", iv[0].len() as u64, &iv[0], false, false),
-            ("i.part2.rar", iv[1].len() as u64, &iv[1], false, false),
-            ("i.part3.rar", iv[2].len() as u64, &iv[2], false, false),
-        ]);
-        for seed in [11u64, 12, 13] {
-            let dir = tmpdir(&format!("reusecrc{seed}"));
-            let ex = Extractor::new(&dir, 1, true);
-            feed_verified(&ex, 0, "o.rar", &outer, 7000, seed, 0);
-            let rep = ex.finish().unwrap();
-            assert!(rep.fallbacks.is_empty(), "seed {seed}: {:?}", rep.fallbacks);
-            assert_eq!(std::fs::read(dir.join("F.mkv")).unwrap(), f, "seed {seed}");
-            assert_eq!(dir_files(&dir), vec!["F.mkv".to_string()], "seed {seed}");
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-    }
-
-    /// The reused value must actually REACH the composition, and be the
-    /// thing the finish gate judges. A single-level store volume whose
-    /// entry carries a real header CRC is the case where the composed
-    /// value is actually compared: hand over article CRCs that do not
-    /// describe the bytes and the gate has to demote. The payload itself
-    /// is intact, so nothing but the passed-in CRC can cause that - and
-    /// if the run came out clean, the caller's CRC was being ignored and
-    /// the fast path would be vouching for nothing.
-    #[test]
-    fn a_wrong_article_crc_is_not_taken_on_trust() {
-        let f = payload(300_000, 88);
-        let vol = fixtures::rar5_volume_n_crc(
-            &[(
-                "F.mkv",
-                300_000,
-                &f,
-                false,
-                false,
-                Some(crc32fast::hash(&f)),
-            )],
-            0,
-        );
-
-        // Truthful CRCs: extracts, no demotion.
-        let dir = tmpdir("reusecrcok1");
-        let ex = Extractor::new(&dir, 1, true);
-        feed_verified(&ex, 0, "v.rar", &vol, 7000, 11, 0);
-        let rep = ex.finish().unwrap();
-        assert!(
-            rep.fallbacks.is_empty(),
-            "clean set demoted: {:?}",
-            rep.fallbacks
-        );
-        assert_eq!(std::fs::read(dir.join("F.mkv")).unwrap(), f);
-        std::fs::remove_dir_all(&dir).unwrap();
-
-        // Same bytes, CRCs that describe nothing: must NOT pass the gate.
-        let dir = tmpdir("reusecrcbad");
-        let ex = Extractor::new(&dir, 1, true);
-        feed_verified(&ex, 0, "v.rar", &vol, 7000, 11, 0x5AA5_5AA5);
-        let rep = ex.finish().unwrap();
-        assert!(
-            !rep.fallbacks.is_empty(),
-            "a CRC that describes nothing was accepted as proof the payload is good"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Store inner volumes carrying real header CRCs (last piece = whole
-    /// file, earlier pieces = their own bytes, like real archivers write):
-    /// intact data one-pass extracts with NO demotion in any feed order -
-    /// the in-stream CRC gate must never false-positive on clean sets.
-    #[test]
-    fn nested_store_with_crcs_extracts_clean() {
-        let f = payload(400_000, 86);
-        let whole = crc32fast::hash(&f);
-        let iv = [
-            // WinRAR-true geometry: volume 0 carries one byte more (its
-            // main header has no volume-number field).
-            fixtures::rar5_volume_n_crc(
-                &[(
-                    "F.mkv",
-                    400_000,
-                    &f[..150_001],
-                    false,
-                    true,
-                    Some(crc32fast::hash(&f[..150_001])),
-                )],
-                0,
-            ),
-            fixtures::rar5_volume_n_crc(
-                &[(
-                    "F.mkv",
-                    400_000,
-                    &f[150_001..300_001],
-                    true,
-                    true,
-                    Some(crc32fast::hash(&f[150_001..300_001])),
-                )],
-                1,
-            ),
-            fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[300_001..], true, false, Some(whole))],
-                2,
-            ),
-        ];
-        let outer = fixtures::rar5_volume(&[
-            ("i.part1.rar", iv[0].len() as u64, &iv[0], false, false),
-            ("i.part2.rar", iv[1].len() as u64, &iv[1], false, false),
-            ("i.part3.rar", iv[2].len() as u64, &iv[2], false, false),
-        ]);
-        for seed in [11u64, 12, 13] {
-            let dir = tmpdir(&format!("nestcrcok{seed}"));
-            let ex = Extractor::new(&dir, 1, true);
-            feed(&ex, 0, "o.rar", &outer, 7000, seed);
-            let rep = ex.finish().unwrap();
-            assert!(rep.fallbacks.is_empty(), "seed {seed}: {:?}", rep.fallbacks);
-            assert_eq!(std::fs::read(dir.join("F.mkv")).unwrap(), f, "seed {seed}");
-            assert_eq!(dir_files(&dir), vec!["F.mkv".to_string()], "seed {seed}");
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-    }
-
-    /// The residual gauntlet gap: a store inner set whose DATA was
-    /// damaged before packing (headers intact, header CRCs computed over
-    /// the original bytes). Mapping succeeds, so without the CRC gate the
-    /// corrupt payload would ship silently with rc=0. The gate must
-    /// demote the nested level to materialized volumes - byte-exact as
-    /// packed, damage included, where a par2 set can reach them - and
-    /// delete the corrupt extracted output.
-    #[test]
-    fn nested_store_data_damage_demotes_on_crc() {
-        let f = payload(400_000, 87);
-        let whole = crc32fast::hash(&f);
-        let mut iv = [
-            // WinRAR-true geometry: volume 0 carries one byte more (its
-            // main header has no volume-number field).
-            fixtures::rar5_volume_n_crc(
-                &[(
-                    "F.mkv",
-                    400_000,
-                    &f[..150_001],
-                    false,
-                    true,
-                    Some(crc32fast::hash(&f[..150_001])),
-                )],
-                0,
-            ),
-            fixtures::rar5_volume_n_crc(
-                &[(
-                    "F.mkv",
-                    400_000,
-                    &f[150_001..300_001],
-                    true,
-                    true,
-                    Some(crc32fast::hash(&f[150_001..300_001])),
-                )],
-                1,
-            ),
-            fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[300_001..], true, false, Some(whole))],
-                2,
-            ),
-        ];
-        // Poster damage: flip bytes in the middle of i.part2.rar - deep
-        // inside its 150 KB data area, nowhere near the headers.
-        let mid = iv[1].len() / 2;
-        for b in &mut iv[1][mid..mid + 64] {
-            *b ^= 0xA5;
-        }
-        let outer = fixtures::rar5_volume(&[
-            ("i.part1.rar", iv[0].len() as u64, &iv[0], false, false),
-            ("i.part2.rar", iv[1].len() as u64, &iv[1], false, false),
-            ("i.part3.rar", iv[2].len() as u64, &iv[2], false, false),
-        ]);
-        let dir = tmpdir("nestcrcbad");
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "o.rar", &outer, 7000, 21);
-        let rep = ex.finish().unwrap();
-        let nested: Vec<_> = rep
-            .fallbacks
-            .iter()
-            .filter(|(_, w)| w.starts_with("nested fallback:"))
-            .collect();
-        assert_eq!(nested.len(), 1, "{:?}", rep.fallbacks);
-        assert!(
-            nested[0].1.contains("failed its stored CRC"),
-            "{:?}",
-            rep.fallbacks
-        );
-        for (_, w) in &rep.fallbacks {
-            assert!(
-                !w.contains("compressed")
-                    && !w.contains("encrypted")
-                    && !w.contains("password")
-                    && !w.contains("held-bytes cap")
-                    && !w.contains("incomplete mapping"),
-                "nested reason leaks a volume-remediation trigger: {w}"
-            );
-        }
-        // The corrupt payload must not masquerade as output; the volumes
-        // materialize byte-exact AS PACKED (damage included) so a
-        // recovery set can verify and repair them.
-        assert!(!dir.join("F.mkv").exists(), "corrupt output survived");
-        for (i, v) in iv.iter().enumerate() {
-            let p = dir.join(format!("i.part{}.rar", i + 1));
-            assert_eq!(
-                &std::fs::read(&p).unwrap(),
-                v,
-                "volume {} not byte-exact",
-                i + 1
-            );
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A nested RAR4 store file now verifies IN-STREAM (finding 9): the v4
-    /// parser retains the header CRC, so clean inner data extracts on the
-    /// fast path (no demote to a materialized level-1 archive), and
-    /// damaged-before-packing data is caught by the composed CRC and
-    /// demoted honestly instead of shipping with rc=0.
-    #[test]
-    fn nested_rar4_store_verifies_in_stream() {
-        // Clean inner RAR4: composed CRC matches, one-pass extract, no demote.
-        let dir = tmpdir("nest-rar4-gate");
-        let data = payload(60_000, 71);
-        let v4 = fixtures::rar4_volume(&[("old.avi", 60_000, &data, false, false)]);
-        let outer = fixtures::rar5_volume(&[("inner.rar", v4.len() as u64, &v4, false, false)]);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &outer, 5000, 17);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join("old.avi")).unwrap(), data);
-        assert!(
-            !dir.join("inner.rar").exists(),
-            "clean inner RAR4 should not materialize"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-
-        // Damaged inner RAR4: header CRC over pristine bytes, data area
-        // flipped - the gate must demote, never ship the corrupt payload.
-        let dir = tmpdir("nest-rar4-gate-bad");
-        let mut v4b = fixtures::rar4_volume(&[("old.avi", 60_000, &data, false, false)]);
-        let off = {
-            let mut m = crate::rar::VolumeMapper::new(v4b.len() as u64);
-            m.feed(0, &v4b);
-            m.entries[0].data_off as usize
-        };
-        for b in &mut v4b[off + 30_000..off + 30_064] {
-            *b ^= 0x5A;
-        }
-        let outer = fixtures::rar5_volume(&[("inner.rar", v4b.len() as u64, &v4b, false, false)]);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &outer, 5000, 29);
-        let rep = ex.finish().unwrap();
-        assert!(
-            rep.fallbacks
-                .iter()
-                .any(|(_, w)| w.contains("failed its stored CRC")),
-            "{:?}",
-            rep.fallbacks
-        );
-        assert!(
-            !dir.join("old.avi").exists(),
-            "corrupt inner RAR4 payload shipped"
-        );
-        assert_eq!(std::fs::read(dir.join("inner.rar")).unwrap(), v4b);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Compressed inner archive: the child demotes and materializes the
-    /// level-1 file intact - exactly the single-level output the disk
-    /// post-pass expects - reported as a nested fallback whose wording
-    /// must never pattern-match the caller's volume-level remediation
-    /// branches. The job itself succeeds.
-    #[test]
-    fn nested_compressed_inner_demotes() {
-        let dir = tmpdir("nestedcomp");
-        let junk = payload(120_000, 84);
-        let inner_arch = rar5_compressed_volume("F.bin", &junk);
-        let outer = fixtures::rar5_volume(&[(
-            "inner.rar",
-            inner_arch.len() as u64,
-            &inner_arch,
-            false,
-            false,
-        )]);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &outer, 7000, 9);
-        let rep = ex.finish().unwrap();
-        assert_eq!(std::fs::read(dir.join("inner.rar")).unwrap(), inner_arch);
-        assert!(!dir.join("v.rar").exists(), "one-pass: no outer volume");
-        assert!(
-            rep.extracted
-                .iter()
-                .any(|(n, s)| n == "inner.rar" && *s == inner_arch.len() as u64),
-            "{:?}",
-            rep.extracted
-        );
-        let nested: Vec<_> = rep
-            .fallbacks
-            .iter()
-            .filter(|(_, w)| w.starts_with("nested fallback:"))
-            .collect();
-        assert_eq!(nested.len(), 1, "{:?}", rep.fallbacks);
-        for (_, w) in &rep.fallbacks {
-            assert!(
-                !w.contains("compressed")
-                    && !w.contains("encrypted")
-                    && !w.contains("password")
-                    && !w.contains("held-bytes cap")
-                    && !w.contains("incomplete mapping"),
-                "nested reason leaks a volume-remediation trigger: {w}"
-            );
-        }
-        assert_eq!(dir_files(&dir), vec!["inner.rar".to_string()]);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Phase 0(b): the prevalence tally reflects a known nested fixture. A
-    /// store-in-store (outer -> inner.rar -> movie.mkv) streams the inner
-    /// payload entirely in RAM, so the depth-1 child logs one in-stream
-    /// `rar-store` level and bumps `in_stream` + `rar_store`. Depth 0 (the
-    /// outer set) is never counted. The tally is process-global under the
-    /// parallel runner, so the assertions are lower-bound deltas, not
-    /// absolutes.
-    #[test]
-    fn nested_prevalence_counts_in_stream_store() {
-        let before = nested_prevalence();
-        let dir = tmpdir("nestprev");
-        let data = payload(90_000, 91);
-        let inner_arch =
-            fixtures::rar5_volume(&[("movie.mkv", data.len() as u64, &data, false, false)]);
-        let outer = fixtures::rar5_volume(&[(
-            "inner.rar",
-            inner_arch.len() as u64,
-            &inner_arch,
-            false,
-            false,
-        )]);
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &outer, 7000, 41);
-        let rep = ex.finish().unwrap();
-        // In-stream store-in-store: the inner payload is produced directly,
-        // no volume ever materialized, no fallback.
-        assert_eq!(
-            rep.extracted,
-            vec![("movie.mkv".to_string(), data.len() as u64)]
-        );
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        let after = nested_prevalence();
-        assert!(
-            after.in_stream > before.in_stream,
-            "in_stream did not advance ({} -> {})",
-            before.in_stream,
-            after.in_stream
-        );
-        assert!(
-            after.rar_store > before.rar_store,
-            "rar_store did not advance ({} -> {})",
-            before.rar_store,
-            after.rar_store
-        );
-        assert!(
-            after.levels > before.levels,
-            "levels did not advance ({} -> {})",
-            before.levels,
-            after.levels
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Phase 0(b) false-positive guard: `slot_inner_kind` names only the
-    /// three nested-archive modes and stays silent (`None`) for a plain
-    /// file, an unclassified span, or an already-demoted slot - so a
-    /// demoting non-archive can never emit a `demoted` line and bias the
-    /// tally. Deterministic (no counter, no fixture): the whole risk is
-    /// this classifier saying "archive" for a non-archive.
-    #[test]
-    fn slot_inner_kind_ignores_non_archive_slots() {
-        let dir = tmpdir("slotkind");
-        let ex = Extractor::new(&dir, 1, true);
-        let mut g = ex.inner.lock().unwrap();
-        let base = g.slots.len();
-        for m in [
-            SlotMode::Plain,
-            SlotMode::Unknown,
-            SlotMode::RarFallback,
-            SlotMode::Discard,
-            SlotMode::SevenZ,
-        ] {
-            let mut s = Extractor::new_slot();
-            s.mode = m;
-            g.slots.push(s);
-        }
-        assert_eq!(Extractor::slot_inner_kind(&g, base), None, "Plain");
-        assert_eq!(Extractor::slot_inner_kind(&g, base + 1), None, "Unknown");
-        assert_eq!(
-            Extractor::slot_inner_kind(&g, base + 2),
-            None,
-            "RarFallback"
-        );
-        assert_eq!(Extractor::slot_inner_kind(&g, base + 3), None, "Discard");
-        assert_eq!(
-            Extractor::slot_inner_kind(&g, base + 4),
-            Some("7z"),
-            "SevenZ"
-        );
-        drop(g);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Phase 0(b): a group-less nested inner that DEMOTES (an encrypted 7z
-    /// with no password) emits the `demoted` diagnostic at the demote site
-    /// - so `demoted` advances while `levels`/`in_stream` do NOT (the
-    /// materialized .7z is counted under `disk` by the disk post-pass, not
-    /// here). Lower-bound deltas: the tally is process-global.
-    #[test]
-    fn nested_prevalence_counts_demoted_sevenz() {
-        let before = nested_prevalence();
-        let f = payload(120_000, 173);
-        let arch = sevenz_archive(
-            &[("F.bin", &f)],
-            Some(vec![
-                sevenz_rust2::encoder_options::AesEncoderOptions::new(
-                    sevenz_rust2::Password::from("secret"),
-                )
-                .into(),
-            ]),
-            false,
-        );
-        let outer = store_outer("inner.7z", &arch);
-        let dir = tmpdir("prev-7z-demote");
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &outer, 7000, 51);
-        let rep = ex.finish().unwrap();
-        // The 7z demoted to a materialized volume, as its own test proves.
-        assert!(
-            rep.fallbacks
-                .iter()
-                .any(|(_, w)| w.starts_with("nested fallback:")),
-            "{:?}",
-            rep.fallbacks
-        );
-        let after = nested_prevalence();
-        assert!(
-            after.demoted > before.demoted,
-            "demoted did not advance ({} -> {})",
-            before.demoted,
-            after.demoted
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Phase 0(b): the GROUPED demote topology (a multi-volume store set
-    /// whose data is CRC-damaged demotes the whole group via the finish-time
-    /// CRC gate -> fallback_group) also bumps `demoted` - but through
-    /// `report_nested_prevalence`'s groups loop, NOT the demote site. This
-    /// is the double-emit-safe counterpart to the group-less 7z demote test
-    /// above: the two demote topologies take structurally different emit
-    /// paths, and both must count. Lower-bound delta (process-global tally).
-    #[test]
-    fn nested_prevalence_counts_grouped_demote() {
-        let before = nested_prevalence();
-        let f = payload(400_000, 177);
-        let whole = crc32fast::hash(&f);
-        let mut iv = [
-            // WinRAR-true geometry: volume 0 carries one byte more (its
-            // main header has no volume-number field).
-            fixtures::rar5_volume_n_crc(
-                &[(
-                    "F.mkv",
-                    400_000,
-                    &f[..150_001],
-                    false,
-                    true,
-                    Some(crc32fast::hash(&f[..150_001])),
-                )],
-                0,
-            ),
-            fixtures::rar5_volume_n_crc(
-                &[(
-                    "F.mkv",
-                    400_000,
-                    &f[150_001..300_001],
-                    true,
-                    true,
-                    Some(crc32fast::hash(&f[150_001..300_001])),
-                )],
-                1,
-            ),
-            fixtures::rar5_volume_n_crc(
-                &[("F.mkv", 400_000, &f[300_001..], true, false, Some(whole))],
-                2,
-            ),
-        ];
-        // Poster damage deep in volume 2's data area -> the CRC gate demotes
-        // the whole store group at finish.
-        let mid = iv[1].len() / 2;
-        for b in &mut iv[1][mid..mid + 64] {
-            *b ^= 0xA5;
-        }
-        let outer = fixtures::rar5_volume(&[
-            ("i.part1.rar", iv[0].len() as u64, &iv[0], false, false),
-            ("i.part2.rar", iv[1].len() as u64, &iv[1], false, false),
-            ("i.part3.rar", iv[2].len() as u64, &iv[2], false, false),
-        ]);
-        let dir = tmpdir("prev-grouped-demote");
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "o.rar", &outer, 7000, 57);
-        let rep = ex.finish().unwrap();
-        assert!(
-            rep.fallbacks
-                .iter()
-                .any(|(_, w)| w.starts_with("nested fallback:")),
-            "{:?}",
-            rep.fallbacks
-        );
-        let after = nested_prevalence();
-        assert!(
-            after.demoted > before.demoted,
-            "grouped demoted did not advance ({} -> {})",
-            before.demoted,
-            after.demoted
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A 6-deep store chain: levels 0-4 map through the child chain; the
-    /// child AT the depth cap is created disabled, so the level-5 archive
-    /// materializes as an ordinary file. No error, no fallback noise. The
-    /// cap is a per-chain setting: at a cap of 3 the level-3 archive is
-    /// the one left materialized, proving the deepest layer materializes
-    /// wherever the cap lands - it is never a hard failure.
-    #[test]
-    fn nested_depth_cap_materializes() {
-        let data = payload(50_000, 85);
-        let wrap = |name: &str, inner: &[u8]| {
-            fixtures::rar5_volume(&[(name, inner.len() as u64, inner, false, false)])
-        };
-        // A 6-deep store chain: outer(a1) < a2 < a3 < a4 < a5 < payload.
-        // Extracting akN yields ak(N+1); the archive produced AT the cap
-        // is the one left materialized.
-        let payload_rar = wrap("payload.bin", &data);
-        let c5 = wrap("a5.rar", &payload_rar);
-        let c4 = wrap("a4.rar", &c5);
-        let c3 = wrap("a3.rar", &c4);
-        let c2 = wrap("a2.rar", &c3);
-        let outer = wrap("a1.rar", &c2);
-
-        // Default cap (5): the level-5 extraction yields a5.rar, whose own
-        // (depth-5) child is disabled, so a5.rar = payload_rar materializes.
-        let dir = tmpdir("nesteddepth");
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "outer.rar", &outer, 7000, 12);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(
-            rep.extracted,
-            vec![("a5.rar".to_string(), payload_rar.len() as u64)]
-        );
-        assert_eq!(std::fs::read(dir.join("a5.rar")).unwrap(), payload_rar);
-        assert_eq!(dir_files(&dir), vec!["a5.rar".to_string()]);
-        std::fs::remove_dir_all(&dir).unwrap();
-
-        // Configured shallower cap (3): the SAME chain now leaves a3.rar
-        // (= c4) materialized - the cap is honoured, still no failure.
-        let dir3 = tmpdir("nesteddepth3");
-        let ex3 = Extractor::new(&dir3, 1, true);
-        ex3.set_nested_max_depth(3);
-        feed(&ex3, 0, "outer.rar", &outer, 7000, 12);
-        let rep3 = ex3.finish().unwrap();
-        assert!(rep3.fallbacks.is_empty(), "{:?}", rep3.fallbacks);
-        assert_eq!(
-            rep3.extracted,
-            vec![("a3.rar".to_string(), c4.len() as u64)]
-        );
-        assert_eq!(std::fs::read(dir3.join("a3.rar")).unwrap(), c4);
-        assert_eq!(dir_files(&dir3), vec!["a3.rar".to_string()]);
-        std::fs::remove_dir_all(&dir3).unwrap();
-    }
-
-    /// The rollout gates: NZBFAST_NO_NESTED_ONEPASS=1 turns routing off
-    /// at construction, and the runtime setter drives the same
-    /// `nested_on` flag. With routing off the level-1 archive
-    /// materializes exactly as before the nested path existed. The env
-    /// PARSE is asserted on the pure helper - actually setting the
-    /// process env here would flip the gate for every extractor other
-    /// tests construct in the window (process-global state under the
-    /// parallel runner), so the behavioral half runs through the setter,
-    /// which gates the very same routing decision.
-    #[test]
-    fn nested_disabled_by_env() {
-        // Env latch parse: "1" disables, anything else leaves routing on.
-        assert!(nested_env_off_value(Some("1")));
-        assert!(!nested_env_off_value(Some("0")));
-        assert!(!nested_env_off_value(None));
-        let dir = tmpdir("nestedenv");
-        let ex = Extractor::new(&dir, 1, true);
-        assert!(ex.inner.lock().unwrap().nested_on, "gate must default on");
-        ex.set_nested_one_pass(false);
-
-        let data = payload(90_000, 86);
-        let inner_arch =
-            fixtures::rar5_volume(&[("movie.mkv", data.len() as u64, &data, false, false)]);
-        let outer = fixtures::rar5_volume(&[(
-            "inner.rar",
-            inner_arch.len() as u64,
-            &inner_arch,
-            false,
-            false,
-        )]);
-        feed(&ex, 0, "v.rar", &outer, 7000, 5);
-        let rep = ex.finish().unwrap();
-        assert_eq!(
-            rep.extracted,
-            vec![("inner.rar".to_string(), inner_arch.len() as u64)]
-        );
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        assert_eq!(std::fs::read(dir.join("inner.rar")).unwrap(), inner_arch);
-        assert_eq!(dir_files(&dir), vec!["inner.rar".to_string()]);
-        std::fs::remove_dir_all(&dir).unwrap();
-
-        // Same behavior through the runtime setter (daemon rollout knob).
-        let dir2 = tmpdir("nestedenv2");
-        let ex2 = Extractor::new(&dir2, 1, true);
-        ex2.set_nested_one_pass(false);
-        feed(&ex2, 0, "v.rar", &outer, 7000, 6);
-        let rep2 = ex2.finish().unwrap();
-        assert_eq!(
-            rep2.extracted,
-            vec![("inner.rar".to_string(), inner_arch.len() as u64)]
-        );
-        assert_eq!(std::fs::read(dir2.join("inner.rar")).unwrap(), inner_arch);
-        std::fs::remove_dir_all(&dir2).unwrap();
-    }
-
-    // -- nested one-pass phase 2: the chasing decompressor --
-
-    // -- nested one-pass: extreme shapes + depth memory accounting --
-
-    /// Every level of a 4-deep store chain carries a required sibling
-    /// data file next to the deeper archive: level k holds "docs_k.txt"
-    /// plus the level-(k+1) archive, the innermost holding the final
-    /// payload. All four siblings and the payload land byte-exact in the
-    /// output dir; no archive at ANY level and no volume ever touch
-    /// disk. Driven forward and reverse (offset 0 last: every level
-    /// classifies off drained holds).
-    #[test]
-    fn nested_mixed_payload_every_level() {
-        let docs: Vec<Vec<u8>> = (0..4u8)
-            .map(|k| payload(30_000 + k as usize * 1_000, 0xA0 + k))
-            .collect();
-        let final_pay = payload(200_000, 0xB1);
-        let a3 = fixtures::rar5_volume(&[
-            ("docs_3.txt", docs[3].len() as u64, &docs[3], false, false),
-            (
-                "payload.bin",
-                final_pay.len() as u64,
-                &final_pay,
-                false,
-                false,
-            ),
-        ]);
-        let a2 = fixtures::rar5_volume(&[
-            ("docs_2.txt", docs[2].len() as u64, &docs[2], false, false),
-            ("a3.rar", a3.len() as u64, &a3, false, false),
-        ]);
-        let a1 = fixtures::rar5_volume(&[
-            ("docs_1.txt", docs[1].len() as u64, &docs[1], false, false),
-            ("a2.rar", a2.len() as u64, &a2, false, false),
-        ]);
-        let outer = fixtures::rar5_volume(&[
-            ("docs_0.txt", docs[0].len() as u64, &docs[0], false, false),
-            ("a1.rar", a1.len() as u64, &a1, false, false),
-        ]);
-        let want: Vec<(String, u64)> = vec![
-            ("docs_0.txt".to_string(), docs[0].len() as u64),
-            ("docs_1.txt".to_string(), docs[1].len() as u64),
-            ("docs_2.txt".to_string(), docs[2].len() as u64),
-            ("docs_3.txt".to_string(), docs[3].len() as u64),
-            ("payload.bin".to_string(), final_pay.len() as u64),
-        ];
-        for rev in [false, true] {
-            let dir = tmpdir(&format!("nestedmix{}", rev as u8));
-            let ex = Extractor::new(&dir, 1, true);
-            let art = 7000usize;
-            let n_arts = outer.len().div_ceil(art);
-            let order: Vec<usize> = if rev {
-                (0..n_arts).rev().collect()
-            } else {
-                (0..n_arts).collect()
-            };
-            for i in order {
-                let s = i * art;
-                let e = (s + art).min(outer.len());
-                ex.write(0, "v.rar", outer.len() as u64, s as u64, &outer[s..e])
-                    .unwrap();
-            }
-            let rep = ex.finish().unwrap();
-            assert!(rep.fallbacks.is_empty(), "rev={rev}: {:?}", rep.fallbacks);
-            assert_eq!(rep.extracted, want, "rev={rev}");
-            for (k, d) in docs.iter().enumerate() {
-                assert_eq!(
-                    &std::fs::read(dir.join(format!("docs_{k}.txt"))).unwrap(),
-                    d,
-                    "rev={rev} docs_{k}"
-                );
-            }
-            assert_eq!(
-                std::fs::read(dir.join("payload.bin")).unwrap(),
-                final_pay,
-                "rev={rev}"
-            );
-            assert_eq!(
-                dir_files(&dir),
-                vec![
-                    "docs_0.txt".to_string(),
-                    "docs_1.txt".to_string(),
-                    "docs_2.txt".to_string(),
-                    "docs_3.txt".to_string(),
-                    "payload.bin".to_string(),
-                ],
-                "rev={rev}"
-            );
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-    }
-
-    /// Same shape with the level-3 archive COMPRESSED (the chase engages
-    /// at depth): it carries its own sibling plus a STORE archive whose
-    /// payload keeps streaming below the chase. Store-level siblings,
-    /// the chased sibling, and the deepest payload all land byte-exact;
-    /// no archive at any level materializes.
-    #[test]
-    fn nested_mixed_payload_chase_at_depth() {
-        let docs: Vec<Vec<u8>> = (0..4u8)
-            .map(|k| payload(28_000 + k as usize * 1_000, 0x60 + k))
-            .collect();
-        let g = payload(150_000, 0x71);
-        let deep = fixtures::rar5_volume(&[("G.bin", g.len() as u64, &g, false, false)]);
-        let a3 = rars_compressed_volume(&[("docs_3.txt", &docs[3]), ("deep.rar", &deep)]);
-        assert_not_store(&a3);
-        let a2 = fixtures::rar5_volume(&[
-            ("docs_2.txt", docs[2].len() as u64, &docs[2], false, false),
-            ("a3.rar", a3.len() as u64, &a3, false, false),
-        ]);
-        let a1 = fixtures::rar5_volume(&[
-            ("docs_1.txt", docs[1].len() as u64, &docs[1], false, false),
-            ("a2.rar", a2.len() as u64, &a2, false, false),
-        ]);
-        let outer = fixtures::rar5_volume(&[
-            ("docs_0.txt", docs[0].len() as u64, &docs[0], false, false),
-            ("a1.rar", a1.len() as u64, &a1, false, false),
-        ]);
-        let dir = tmpdir("nestedmixchase");
-        let ex = Extractor::new(&dir, 1, true);
-        feed(&ex, 0, "v.rar", &outer, 7000, 17);
-        let rep = ex.finish().unwrap();
-        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-        for (k, d) in docs.iter().enumerate() {
-            assert_eq!(
-                &std::fs::read(dir.join(format!("docs_{k}.txt"))).unwrap(),
-                d,
-                "docs_{k}"
-            );
-        }
-        assert_eq!(std::fs::read(dir.join("G.bin")).unwrap(), g);
-        assert_eq!(
-            dir_files(&dir),
-            vec![
-                "G.bin".to_string(),
-                "docs_0.txt".to_string(),
-                "docs_1.txt".to_string(),
-                "docs_2.txt".to_string(),
-                "docs_3.txt".to_string(),
-            ]
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// One nested level fanning WIDE: a level-1 archive split across
-    /// three outer volumes carries EIGHT sibling files around one deeper
-    /// archive - the out_names/name-claim machinery holds up with many
-    /// concurrent child slots at depth. Two volume feed orders.
-    #[test]
-    fn nested_many_siblings_wide() {
-        let sibs: Vec<Vec<u8>> = (0..8u8)
-            .map(|i| payload(40_000 + i as usize * 3_000, 0xC0 + i))
-            .collect();
-        let names: Vec<String> = (0..8).map(|i| format!("sib_{i}.dat")).collect();
-        let fpay = payload(180_000, 0xD5);
-        let deep = fixtures::rar5_volume(&[("final.bin", fpay.len() as u64, &fpay, false, false)]);
-        let mut entries: Vec<(&str, u64, &[u8], bool, bool)> = Vec::new();
-        for i in 0..4 {
-            entries.push((
-                names[i].as_str(),
-                sibs[i].len() as u64,
-                &sibs[i],
-                false,
-                false,
-            ));
-        }
-        entries.push(("deep.rar", deep.len() as u64, &deep, false, false));
-        for i in 4..8 {
-            entries.push((
-                names[i].as_str(),
-                sibs[i].len() as u64,
-                &sibs[i],
-                false,
-                false,
-            ));
-        }
-        let inner1 = fixtures::rar5_volume(&entries);
-        let n = inner1.len();
-        let (c1, c2) = (n / 3, 2 * n / 3);
-        let vols: Vec<Vec<u8>> = vec![
-            fixtures::rar5_volume_n(&[("inner1.rar", n as u64, &inner1[..c1], false, true)], 0),
-            fixtures::rar5_volume_n(&[("inner1.rar", n as u64, &inner1[c1..c2], true, true)], 1),
-            fixtures::rar5_volume_n(&[("inner1.rar", n as u64, &inner1[c2..], true, false)], 2),
-        ];
-        for (t, order) in [[0usize, 1, 2], [2, 0, 1]].iter().enumerate() {
-            let dir = tmpdir(&format!("nestedwide{t}"));
-            let ex = Extractor::new(&dir, 3, true);
-            for &vi in order {
-                feed(
-                    &ex,
-                    vi,
-                    &format!("w{vi}.bin"),
-                    &vols[vi],
-                    8000,
-                    120 + vi as u64,
-                );
-            }
-            let rep = ex.finish().unwrap();
-            assert!(
-                rep.fallbacks.is_empty(),
-                "order {order:?}: {:?}",
-                rep.fallbacks
-            );
-            for (i, s) in sibs.iter().enumerate() {
-                assert_eq!(
-                    &std::fs::read(dir.join(&names[i])).unwrap(),
-                    s,
-                    "order {order:?} sib {i}"
-                );
-            }
-            assert_eq!(
-                std::fs::read(dir.join("final.bin")).unwrap(),
-                fpay,
-                "order {order:?}"
-            );
-            let mut want = names.clone();
-            want.push("final.bin".to_string());
-            want.sort();
-            assert_eq!(dir_files(&dir), want, "order {order:?}");
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-    }
-
-    /// Depth memory accounting: an 8 MB payload wrapped 1..5 store
-    /// levels deep, fed in order - the chain-wide HoldsBudget peak must
-    /// stay far under the cap and must NOT grow with depth (each level
-    /// is an offset remap, not a buffered copy). A chased compressed
-    /// inner at the same scale reports alongside: its frontier retention
-    /// charges the same budget and stays bounded by it, not by the
-    /// archive size.
-    #[test]
-    fn nested_depth_holds_peak_bounded() {
-        let data = payload(8 << 20, 0x55);
-        let art = 65_536usize;
-        let mut rows: Vec<(String, usize)> = Vec::new();
-        let mut store_peaks: Vec<usize> = Vec::new();
-        for depth in 1..=5usize {
-            let mut cur =
-                fixtures::rar5_volume(&[("payload.bin", data.len() as u64, &data, false, false)]);
-            for k in (1..depth).rev() {
-                let name = format!("a{k}.rar");
-                cur =
-                    fixtures::rar5_volume(&[(name.as_str(), cur.len() as u64, &cur, false, false)]);
-            }
-            // In-order (the honest-post shape) and shuffled (out-of-order
-            // arrival forces real held spans at every level).
-            for shuffled in [false, true] {
-                let dir = tmpdir(&format!("nestedmem{depth}{}", shuffled as u8));
-                let ex = Extractor::new(&dir, 1, true);
-                if shuffled {
-                    feed(&ex, 0, "outer.rar", &cur, art, 200 + depth as u64);
-                } else {
-                    for (i, chunk) in cur.chunks(art).enumerate() {
-                        ex.write(0, "outer.rar", cur.len() as u64, (i * art) as u64, chunk)
-                            .unwrap();
-                    }
-                }
-                let rep = ex.finish().unwrap();
-                assert!(
-                    rep.fallbacks.is_empty(),
-                    "depth {depth}: {:?}",
-                    rep.fallbacks
-                );
-                assert_eq!(
-                    std::fs::read(dir.join("payload.bin")).unwrap(),
-                    data,
-                    "depth {depth}"
-                );
-                let peak = ex.holds_peak();
-                if shuffled {
-                    store_peaks.push(peak);
-                    rows.push((format!("store x{depth} shuf"), peak));
-                } else {
-                    rows.push((format!("store x{depth} seq"), peak));
-                }
-                std::fs::remove_dir_all(&dir).unwrap();
-            }
-        }
-        // Chased compressed inner at the same scale (~8 MB unpacked,
-        // half-entropy input keeps the packed stream near half size).
-        {
-            let f = noisy(8 << 20, 0x99);
-            let inner_arch = rars_compressed_volume(&[("F.bin", &f)]);
-            assert_not_store(&inner_arch);
-            let outer = fixtures::rar5_volume(&[(
-                "inner.rar",
-                inner_arch.len() as u64,
-                &inner_arch,
-                false,
-                false,
-            )]);
-            let dir = tmpdir("nestedmemchase");
-            let ex = Extractor::new(&dir, 1, true);
-            for (i, chunk) in outer.chunks(art).enumerate() {
-                ex.write(0, "outer.rar", outer.len() as u64, (i * art) as u64, chunk)
-                    .unwrap();
-            }
-            let rep = ex.finish().unwrap();
-            assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
-            assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), f);
-            rows.push(("chase 8 MB".to_string(), ex.holds_peak()));
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-        println!("shape          holds_peak (bytes)");
-        for (tag, p) in &rows {
-            println!("{tag:<14} {p:>10}");
-        }
-        for (tag, p) in &rows {
-            assert!(*p < 64 << 20, "{tag}: holds peak {p} breaches 64 MB");
-        }
-        // Not linear in depth: five levels must not retain per-level
-        // copies (linear scaling would add ~8 MB of held payload per
-        // extra level; the allowance covers shuffle variance only).
-        assert!(
-            store_peaks[4] <= store_peaks[0] + (2 << 20),
-            "peak grows with depth: {store_peaks:?}"
-        );
-    }
-
-    // -- nested one-pass phase 3: 7z inner archives via tail prefetch --
-
-    // -- TODO 37 step 1: the SAME chase, one level up (posted .7z) --
-
-    // -- one-pass zip (phase 2): the SAME chase, zip parser --
-
-    // -- one-pass zip, byte-split `.zip.001` sets --
-
-    // -- TODO 37 step 3: `.7z.001` split sets --
-
-    // -- TODO 37 step 2: drop-behind trimming --
-}
+#[cfg(test)]
+mod nested_tests;

@@ -349,6 +349,13 @@ fn m_remote_info(
 ) -> Option<Value> {
     Some({
         let port = d.port;
+        // §129 2a: with native TLS on, every advertised URL (and its QR
+        // code) must say https - the http:// sibling answers nothing.
+        let scheme = if d.tls_cert.is_some() {
+            "https"
+        } else {
+            "http"
+        };
         let mut urls: Vec<Value> = Vec::new();
         // The address the browser ACTUALLY reached us on (Host
         // header) is authoritative - it works by definition, and
@@ -367,7 +374,7 @@ fn m_remote_info(
         let containerized = std::path::Path::new("/.dockerenv").exists();
         if !ctx.host_hdr.is_empty() && !is_loopback {
             urls.push(json!({"kind": "connected",
-                            "url": format!("http://{}/", ctx.host_hdr),
+                            "url": format!("{scheme}://{}/", ctx.host_hdr),
                             "label": "Wi-Fi / same network"}));
         } else {
             // Reached via localhost - auto-detect a shareable LAN
@@ -379,7 +386,7 @@ fn m_remote_info(
             });
             if let Some(a) = lan {
                 urls.push(json!({"kind": "lan",
-                                "url": format!("http://{}:{port}/", a.ip()),
+                                "url": format!("{scheme}://{}:{port}/", a.ip()),
                                 "label": "Wi-Fi / same network"}));
             }
         }
@@ -393,7 +400,7 @@ fn m_remote_info(
                     h = format!("{}.local", h.trim_end_matches(".local"));
                 }
                 urls.push(json!({"kind": "mdns",
-                                    "url": format!("http://{h}:{port}/"),
+                                    "url": format!("{scheme}://{h}:{port}/"),
                                     "label": "Name on your network"}));
             }
         }
@@ -416,7 +423,7 @@ fn m_remote_info(
             });
         if let Some(ip) = ts {
             urls.push(json!({"kind": "tailscale",
-                            "url": format!("http://{ip}:{port}/"),
+                            "url": format!("{scheme}://{ip}:{port}/"),
                             "label": "Tailscale - works from anywhere"}));
         }
         json!({"urls": urls, "port": port,

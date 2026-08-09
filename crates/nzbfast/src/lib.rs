@@ -41,6 +41,7 @@ mod identify;
 mod identity;
 mod import_sab;
 mod interests;
+mod lanegate;
 pub mod logging;
 mod nettools;
 mod newznab;
@@ -97,6 +98,10 @@ pub fn embedded_serve_opts(
     serve::ServeOpts {
         port,
         bind: "127.0.0.1".into(),
+        // Loopback-only host process: TLS is settings-driven if ever
+        // wanted here, same as everything else below.
+        tls_cert: None,
+        tls_key: None,
         open: false,
         apikey,
         nzbkey: None,

@@ -43,6 +43,10 @@ pub mod mkv;
 /// tests and examples in other crates (nzbfast's suites, mockserv).
 #[doc(hidden)]
 pub mod mock;
+/// TLS front end for the chaos mock (§129 3b). Same status as `mock`:
+/// public for the rigs and the chaos-serve binary, not a real API.
+#[doc(hidden)]
+pub mod mock_tls;
 pub(crate) mod mp4;
 pub mod nntp;
 pub mod nzb;
@@ -59,6 +63,7 @@ pub mod preflight;
 pub mod rar;
 pub(crate) mod rarcrypt;
 pub mod release;
+pub mod shaping;
 #[cfg(feature = "indexer")]
 pub mod spot;
 pub mod sync;

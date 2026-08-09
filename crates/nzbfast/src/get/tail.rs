@@ -46,6 +46,9 @@ pub(super) fn unpack_tail(
     // are intermediates the extraction produced, owned by
     // `sweep_spent_entry`, not the downloaded volume set this mode is
     // about.
+    // Lives to the end of the function: the §129 outstanding-need
+    // registration this unpack holds against its output filesystem.
+    let _need_guard: crate::lanegate::NeedGuard;
     let eat_arm = {
         // `tag()`, not `display()`. Every other consumer of this shape
         // reads the raw tokens; `display()` runs each one through
@@ -59,8 +62,20 @@ pub(super) fn unpack_tail(
         let encrypted = shape.split_whitespace().any(|t| t == "encrypted");
         let mut on_disk = collect_rar_volumes(out_dir).unwrap_or_default();
         on_disk.extend(collect_obfuscated_rar_volumes(out_dir).unwrap_or_default());
-        let forecast =
-            crate::eatvol::forecast(out_dir, crate::eatvol::volume_bytes(&on_disk), encrypted);
+        let vol_bytes = crate::eatvol::volume_bytes(&on_disk);
+        // §129 lane admission: register what this unpack still needs on
+        // the output filesystem so concurrent tails stop double-counting
+        // the same free space, and WAIT here (activity already says
+        // "extracting") when we would fit alone but not beside them.
+        // Held to the end of the function - the ladder AND the nested
+        // pass write into the same forecasted room.
+        let needed = if encrypted {
+            vol_bytes.saturating_mul(2)
+        } else {
+            vol_bytes
+        };
+        _need_guard = crate::lanegate::admit_unpack(out_dir, needed, crate::eatvol::MARGIN);
+        let forecast = crate::eatvol::forecast(out_dir, vol_bytes, encrypted);
         let verdict = crate::eatvol::decide(crate::eatvol::mode(), all_good, eat_consent, forecast);
         if verdict.eats() {
             info!(
@@ -80,6 +95,10 @@ pub(super) fn unpack_tail(
     // extractor mapped in-stream like a fresh run, and whatever demoted
     // takes the same disk ladder a fresh run's demotes take, below.
     if resuming && !no_extract && !resume_map && all_good {
+        // §129: the re-extract is the heavy-CPU stage - one at a time
+        // across concurrent tails (the permit, not the lane, is the
+        // serializer, so the MD5-parallel repair work composes).
+        let _cpu = crate::lanegate::heavy_cpu_blocking();
         all_good = reextract_dir(out_dir, password)?;
         if !all_good {
             reextract_failed =
@@ -156,6 +175,7 @@ pub(super) fn unpack_tail(
         // On success the volumes are spent (Part B of the 2026-07-29
         // one-pass spec): a demoted 57.8 GB job used to finish holding
         // both the movie AND its full volume set.
+        let _cpu = crate::lanegate::heavy_cpu_blocking();
         match try_unrar_spent(out_dir, password) {
             Some(spent) => remove_spent_volumes(&spent),
             None => {
@@ -168,6 +188,7 @@ pub(super) fn unpack_tail(
             }
         }
     } else if all_good && unowned_fallback && !enc_fallback {
+        let _cpu = crate::lanegate::heavy_cpu_blocking();
         match try_unrar_spent(out_dir, password) {
             Some(spent) => remove_spent_volumes(&spent),
             None => {
@@ -232,7 +253,12 @@ pub(super) fn unpack_tail(
         None
     };
     if let Some(hold) = nested_hold {
-        let nested_res = extract_nested(out_dir, password, 1);
+        // Same permit as the ladder arms above: the nested pass is a
+        // full re-extract of what the outer extraction produced.
+        let nested_res = {
+            let _cpu = crate::lanegate::heavy_cpu_blocking();
+            extract_nested(out_dir, password, 1)
+        };
         // Restore parked volumes before judging the result - they must be
         // back in place on every path, including the failure ones.
         drop(hold);

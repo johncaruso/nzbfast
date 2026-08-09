@@ -13,11 +13,25 @@ use super::*;
 
 pub(super) const WEEK_MINUTES: u32 = 7 * 24 * 60;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum SchedAction {
     Pause,
     Resume,
     SpeedLimit(u64),
+    /// §129 2g: enable or disable one server (named by host) at the
+    /// scheduled minute - the classic "block account B during peak
+    /// hours" setup. An EDGE action: it fires at its minute and edits
+    /// the config exactly as the settings toggle does, so
+    /// [`effective_state`] deliberately ignores it (replaying a week of
+    /// config edits at startup would fight the user's own toggles).
+    ServerEnable {
+        host: String,
+        on: bool,
+    },
+    /// §129 2g: zero the quota ledger at the scheduled minute, for
+    /// providers whose billing window is not a civil day/week/month.
+    /// Edge action, same reasoning as above.
+    QuotaReset,
 }
 
 #[derive(Debug, Clone)]
@@ -140,7 +154,24 @@ pub(super) fn parse_schedule(json: &str) -> Result<Vec<SchedEntry>> {
                     .ok_or_else(|| bad("bad speedlimit value"))?;
                     SchedAction::SpeedLimit(bps)
                 }
-                _ => return Err(bad("action must be pause|resume|speedlimit")),
+                Some(a @ ("server_enable" | "server_disable")) => {
+                    let host = e
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|h| !h.is_empty())
+                        .ok_or_else(|| bad("server_enable/disable needs value = the server's host"))?;
+                    SchedAction::ServerEnable {
+                        host: host.to_string(),
+                        on: a == "server_enable",
+                    }
+                }
+                Some("quota_reset") => SchedAction::QuotaReset,
+                _ => {
+                    return Err(bad(
+                        "action must be pause|resume|speedlimit|server_enable|server_disable|quota_reset",
+                    ));
+                }
             };
             Ok(SchedEntry {
                 days,
@@ -177,6 +208,8 @@ pub(super) fn effective_state(entries: &[SchedEntry], now: u32) -> (Option<bool>
                         limit = Some((dist, v));
                     }
                 }
+                // Edge actions carry no standing state to reconstruct.
+                SchedAction::ServerEnable { .. } | SchedAction::QuotaReset => {}
             }
         }
     }
@@ -234,6 +267,48 @@ pub(super) fn apply_action(d: &Arc<Daemon>, a: SchedAction) {
             }
         }
         SchedAction::SpeedLimit(v) => d.set_speed_ceiling_from(v, "schedule"),
+        SchedAction::ServerEnable { host, on } => {
+            // The same edit the settings toggle makes (m_server_enable),
+            // keyed by host rather than list index - a schedule outlives
+            // reorders and deletions, and a host is what the user can
+            // read back in the rule. Applies to the next job/reconnect,
+            // exactly like the toggle.
+            let _cfg = crate::setup::config_write_lock();
+            let mut servers = super::servers::current_servers(&d.cfg_path);
+            let Some(s) = servers.iter_mut().find(|s| {
+                s.get("host")
+                    .and_then(Value::as_str)
+                    .is_some_and(|h| h.eq_ignore_ascii_case(&host))
+            }) else {
+                warn!(
+                    target: "schedule",
+                    "no server with host {host:?} - the rule did nothing; \
+                     check the schedule against your server list"
+                );
+                return;
+            };
+            if let Some(o) = s.as_object_mut() {
+                if on {
+                    o.remove("enabled"); // default; keeps the file clean
+                } else {
+                    o.insert("enabled".into(), json!(false));
+                }
+            }
+            match crate::setup::write_servers(&d.cfg_path, &servers) {
+                Ok(()) => info!(
+                    target: "schedule",
+                    "{host} {}",
+                    if on { "enabled" } else { "disabled" }
+                ),
+                Err(e) => warn!(target: "schedule", "could not update {host}: {e}"),
+            }
+        }
+        SchedAction::QuotaReset => {
+            // The ledger lives in the download runner; hand it the
+            // request rather than racing it for the file.
+            d.quota_reset.store(true, Ordering::Relaxed);
+            info!(target: "schedule", "quota reset requested");
+        }
     }
 }
 

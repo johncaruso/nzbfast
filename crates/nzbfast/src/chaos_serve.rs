@@ -16,10 +16,12 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result, anyhow, bail};
 use nzbkit::mock::{Chaos, MockServer, Throttle, make_file_articles};
+use nzbkit::mock_tls::{HandshakeFault, TlsChaos, TlsFront};
 
 /// One corpus file's NZB ingredients.
 struct CorpusFile {
@@ -28,46 +30,175 @@ struct CorpusFile {
     segs: Vec<(String, u64, u32)>,
 }
 
-pub struct Opts {
+/// The `chaos-serve` command line, beside the profile table it selects
+/// from. Sizes arrive as strings ("300M") and are parsed in [`run`].
+#[derive(clap::Args)]
+pub struct Cli {
+    /// One of chaos_serve::PROFILES: clean, flap, flap-dial, deadair,
+    /// deadair-dial, brownout, jitter, jitter-dial, corrupt,
+    /// corruptstorm, desync, splitbrain, slowconn, bodyerror, authcap,
+    /// authbad, capghost, outage, cgnat, handover, slowstart, truncate,
+    /// deadpost, gone, mutequit, mutegreeting, tlsfail, tlstruncate,
+    /// tlscorrupt, tlsresume (the -dial variants add a 250 ms greeting
+    /// delay per connection, so reconnect strategies pay their real
+    /// dial cost on loopback; the tls* ones need --tls-cert/--tls-key).
+    #[arg(long, default_value = "clean")]
     pub profile: String,
+    #[arg(long, default_value = "127.0.0.1")]
     pub bind: String,
+    /// Faulty (or single) server port.
+    #[arg(long, default_value_t = 1190)]
     pub port: u16,
-    /// Clean-twin port for the two-server profiles.
+    /// Clean-twin port (flap/brownout/corrupt/corruptstorm/splitbrain/
+    /// tlsfail profiles).
+    #[arg(long, default_value_t = 1191)]
     pub port2: u16,
-    /// Total corpus payload bytes.
-    pub size: u64,
+    /// Total corpus payload ("300M", "1G", …). Held in RAM.
+    #[arg(long, default_value = "300M")]
+    pub size: String,
+    #[arg(long, default_value_t = 3)]
     pub files: u32,
-    pub article_size: usize,
+    /// Article payload size; ~740K matches real posts.
+    #[arg(long, default_value = "740K")]
+    pub article_size: String,
+    /// Where to write the matching NZB.
+    #[arg(long, default_value = "chaos.nzb")]
     pub nzb: PathBuf,
-    /// Shifts the deterministic fault positions (same seed = same
-    /// faulted ids, the fairness requirement across clients).
+    /// Shifts deterministic fault positions and corpus bytes; keep it
+    /// fixed across clients so every client sees the same run.
+    #[arg(long, default_value_t = 111)]
     pub seed: u64,
-    /// Per-connection cap on the healthy path, bytes/sec.
-    pub per_conn_bps: u64,
-    /// Whole-server line cap, bytes/sec (0 = per-connection only).
-    pub line_bps: u64,
-    /// External `par2 create -r<pct>` over the corpus (needs a par2
-    /// binary; the recovery volumes join the corpus and the NZB).
+    /// Healthy per-connection cap ("2M" = 2 MB/s).
+    #[arg(long, default_value = "2M")]
+    pub per_conn: String,
+    /// Whole-server line cap; 0 = per-connection cap only.
+    #[arg(long, default_value = "0")]
+    pub line: String,
+    /// Create real PAR2 recovery volumes at this redundancy (%) with an
+    /// external `par2` binary (PAR2_BIN to override) and serve them as
+    /// part of the corpus.
+    #[arg(long)]
     pub par2_redundancy: Option<u32>,
-    /// Override the profile's faulted-article count (deadair/corrupt).
+    /// Override the profile's faulted-article count (deadair/corrupt/
+    /// splitbrain) or every-N (corruptstorm, desync).
+    #[arg(long)]
     pub fault_count: Option<usize>,
-    /// Real files to article-ize into the corpus alongside the
-    /// generated ones (a playable video makes the rig a playback
-    /// end-to-end fixture; --files 0 serves only these).
+    /// Article-ize real files from disk into the corpus (repeatable).
+    /// A playable video here turns the chaos rig into a playback
+    /// end-to-end fixture; --files 0 serves only these.
+    #[arg(long)]
     pub media: Vec<PathBuf>,
+    /// PEM cert chain; with --tls-key, every server serves implicit TLS
+    /// (the port-563 shape) through the chaos TLS front and the tls*
+    /// fault profiles work. Mint a pair the way mockserve documents
+    /// (CA:FALSE matters), and point the client at it with
+    /// NZBFAST_EXTRA_CA=cert.pem.
+    #[arg(long)]
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key matching --tls-cert.
+    #[arg(long)]
+    pub tls_key: Option<PathBuf>,
+    /// A second PEM pair for a name clients do NOT dial. Only tlsfail
+    /// reads it: with it, the handshake fails at the client's name
+    /// check instead of being closed mid-flight.
+    #[arg(long)]
+    pub tls_alt_cert: Option<PathBuf>,
+    /// PEM private key matching --tls-alt-cert.
+    #[arg(long)]
+    pub tls_alt_key: Option<PathBuf>,
 }
 
+/// The parsed run configuration: [`Cli`] with its sizes resolved.
+pub struct Opts {
+    profile: String,
+    bind: String,
+    port: u16,
+    port2: u16,
+    /// Total corpus payload bytes.
+    size: u64,
+    files: u32,
+    article_size: usize,
+    nzb: PathBuf,
+    seed: u64,
+    /// Per-connection cap on the healthy path, bytes/sec.
+    per_conn_bps: u64,
+    /// Whole-server line cap, bytes/sec (0 = per-connection only).
+    line_bps: u64,
+    par2_redundancy: Option<u32>,
+    fault_count: Option<usize>,
+    media: Vec<PathBuf>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    tls_alt_cert: Option<PathBuf>,
+    tls_alt_key: Option<PathBuf>,
+}
+
+impl Cli {
+    /// Resolve the size strings into [`Opts`].
+    ///
+    /// `parse` is the crate's own size parser, passed in rather than
+    /// called directly: this file is compiled straight into
+    /// `tests/fault_contract.rs` with `#[path]`, and that test crate has
+    /// no `crate::serve` to reach. Passing it keeps one parser in the
+    /// tree and keeps the include compiling.
+    pub fn opts(self, parse: impl Fn(&str) -> Option<u64>) -> Result<Opts> {
+        let cli = self;
+        let size = |v: &str, what: &str| parse(v).ok_or_else(|| anyhow!("bad {what} {v:?}"));
+        Ok(Opts {
+            size: size(&cli.size, "--size")?,
+            article_size: size(&cli.article_size, "--article-size")? as usize,
+            per_conn_bps: size(&cli.per_conn, "--per-conn")?,
+            line_bps: size(&cli.line, "--line")?,
+            profile: cli.profile,
+            bind: cli.bind,
+            port: cli.port,
+            port2: cli.port2,
+            files: cli.files,
+            nzb: cli.nzb,
+            seed: cli.seed,
+            par2_redundancy: cli.par2_redundancy,
+            fault_count: cli.fault_count,
+            media: cli.media,
+            tls_cert: cli.tls_cert,
+            tls_key: cli.tls_key,
+            tls_alt_cert: cli.tls_alt_cert,
+            tls_alt_key: cli.tls_alt_key,
+        })
+    }
+}
+
+/// Default articles a connection serves before a TLS fault fires.
+pub const TLS_ARTICLES_PER_CONN: usize = 8;
+
+/// The TLS-shaped profiles: they need `--tls-cert`/`--tls-key` and are
+/// refused without them, since serving them over plain TCP would look
+/// like a clean run.
+pub const TLS_PROFILES: &[&str] = &["tlsfail", "tlstruncate", "tlscorrupt", "tlsresume"];
+
 /// What one profile does to each server. `label` feeds the log lines.
-struct Plan {
-    chaos: Chaos,
+///
+/// Public because the §129 3c fault-contract suite
+/// (`crates/nzbfast/tests/fault_contract.rs`) builds its in-process
+/// legs from THIS table rather than a second copy of it. A contract
+/// that drifts from the profiles the bench matrix races is worth
+/// nothing, and two profile tables would drift the day 3a/3b add a
+/// shape to one of them.
+pub struct Plan {
+    pub chaos: Chaos,
+    /// TLS-layer faults for the faulty server, applied in the acceptor
+    /// wrapper in front of it. Default = a plain TLS endpoint (and
+    /// ignored entirely when the rig is not serving TLS). An in-process
+    /// consumer wanting these has to put the front up itself - see
+    /// `nzbkit::mock_tls::TlsFront`.
+    pub tls: TlsChaos,
     /// Second server (clean twin) - None for single-server profiles.
-    twin: Option<Chaos>,
+    pub twin: Option<Chaos>,
     /// Human line printed at startup describing the fault and when it
     /// engages, so the run log is self-describing.
-    onset_note: String,
+    pub onset_note: String,
     /// Body count at which a threshold fault engages (brownout); the
     /// monitor logs the exact onset timestamp when served crosses it.
-    onset_after_bodies: Option<u64>,
+    pub onset_after_bodies: Option<u64>,
 }
 
 pub const PROFILES: &[&str] = &[
@@ -84,6 +215,7 @@ pub const PROFILES: &[&str] = &[
     "desync",
     "splitbrain",
     "slowconn",
+    "shaped",
     "bodyerror",
     "authcap",
     "authbad",
@@ -94,9 +226,40 @@ pub const PROFILES: &[&str] = &[
     "slowstart",
     "truncate",
     "deadpost",
+    "gone",
     "mutequit",
     "mutegreeting",
+    "freshmiss",
+    "oldmiss",
+    "tlsfail",
+    "tlstruncate",
+    "tlscorrupt",
+    "tlsresume",
 ];
+
+/// The NZB `<file date>` a profile declares, in unix seconds. Age is not
+/// decoration here: a 430 on an OLD post is propagation/retention and
+/// carries no guilt, while a 430 on a post the NZB says is hours old is
+/// a provider that did not take the feed (memory
+/// nzbfast-retry-propagation-trap). `freshmiss` and `oldmiss` are the
+/// same fault with the dates swapped, which is the whole point of the
+/// pair - anything that reacts to one must sit still for the other.
+fn post_date(profile: &str) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(FIXED_POST_DATE);
+    match profile {
+        // Two hours old: inside every provider's propagation window, so
+        // "not here yet" is not an available excuse.
+        "freshmiss" => now.saturating_sub(2 * 3600),
+        _ => FIXED_POST_DATE,
+    }
+}
+
+/// The corpus's historic post date (June 2025) - what every profile but
+/// `freshmiss` declares, and what the matrix has always used.
+const FIXED_POST_DATE: u64 = 1_750_000_000;
 
 /// The `-dial` profile variants' per-connection greeting delay (TODO
 /// 115): every fresh connection pays this before the server says 200,
@@ -138,6 +301,23 @@ fn spread_positions(n: usize, count: usize, seed: u64) -> Vec<usize> {
         .collect()
 }
 
+/// Evenly spread `count` positions across ALL `n` articles. Unlike
+/// [`spread_positions`] (mid-queue only, for faults that must bite after
+/// a healthy history) a propagation hole has no such shape: the articles
+/// the provider never took are scattered through the whole post.
+fn stride_positions(n: usize, count: usize, seed: u64) -> Vec<usize> {
+    if n == 0 || count == 0 {
+        return Vec::new();
+    }
+    let count = count.min(n);
+    let phase = (seed as usize) % n;
+    (0..count)
+        .map(|k| (k * n / count + phase) % n)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn ts() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -150,15 +330,17 @@ fn say(msg: &str) {
     let _ = std::io::stdout().flush();
 }
 
-/// Write the multi-file NZB for the corpus.
-fn write_nzb(path: &Path, files: &[CorpusFile]) -> Result<()> {
+/// Write the multi-file NZB for the corpus, declaring `date` (unix
+/// seconds) on every file - the only thing a client can know about a
+/// post's age before it asks for a byte.
+fn write_nzb(path: &Path, files: &[CorpusFile], date: u64) -> Result<()> {
     let mut nzb = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
     );
     for f in files {
         nzb.push_str(&format!(
-            "<file poster=\"chaos@bench.local\" date=\"1750000000\" \
+            "<file poster=\"chaos@bench.local\" date=\"{date}\" \
              subject=\"&quot;{}&quot; yEnc (1/{})\">\n\
              <groups><group>alt.binaries.bench</group></groups>\n<segments>\n",
             f.name,
@@ -226,6 +408,23 @@ fn add_par2(
     Ok(())
 }
 
+/// One PEM cert/key pair into a rustls server config, through the tree's
+/// single loader (`benchserve::tls_config`, which also names the crypto
+/// provider - a bare `builder()` panics at runtime here because both
+/// aws-lc-rs and ring are linked in). Half a pair is a mistake, not a
+/// default.
+fn pem_pair(
+    cert: &Option<PathBuf>,
+    key: &Option<PathBuf>,
+    what: &str,
+) -> Result<Option<Arc<rustls::ServerConfig>>> {
+    match (cert, key) {
+        (Some(c), Some(k)) => Ok(Some(nzbkit::benchserve::tls_config(c, k)?)),
+        (None, None) => Ok(None),
+        _ => bail!("{what} must be given together"),
+    }
+}
+
 /// The profile table. Shapes and ratios mirror the pool.rs payout rigs
 /// (flap = payout_flap_breaker_collapses_ip_cap_churn, brownout =
 /// payout_brownout_recovery_across_config_tiers, deadair =
@@ -234,13 +433,100 @@ fn add_par2(
 /// payout_slope_recycle_frees_a_degraded_session), scaled from the
 /// rigs' tens-of-KB/s throttles to MB/s so a few-hundred-MB corpus
 /// finishes in minutes.
-fn plan(
+///
+/// `dead_code` because the binary itself always goes through
+/// [`plan_with_tls`]; the consumer of this signature is the 3c contract
+/// suite, which compiles this file into its own crate.
+#[allow(dead_code)]
+pub fn plan(
     profile: &str,
     all_ids: &[String],
     per_conn_bps: u64,
     line_bps: u64,
     seed: u64,
     fault_count: Option<usize>,
+) -> Result<Plan> {
+    plan_with_tls(
+        profile,
+        all_ids,
+        per_conn_bps,
+        line_bps,
+        seed,
+        fault_count,
+        TlsPlanIn::default(),
+    )
+}
+
+/// The inputs only the four TLS shapes read, kept off [`plan`] so the
+/// signature the 3c contract suite calls stays as it landed. Byte
+/// budgets scale with `article_size` because they have to: a budget
+/// fixed in bytes either never fires on a small-article corpus or cuts
+/// every article on a large one, and a fault profile that silently does
+/// not engage reads exactly like a client that handled it.
+pub struct TlsPlanIn {
+    pub article_size: usize,
+    /// Articles a connection serves before its fault fires; see
+    /// [`tls_plan`] for why this is not one or two.
+    pub articles_per_conn: usize,
+    /// The mismatched chain that selects tlsfail's wrong-name variant;
+    /// None closes the handshake mid-flight instead.
+    pub alt_cert: Option<Arc<rustls::ServerConfig>>,
+}
+
+impl Default for TlsPlanIn {
+    fn default() -> TlsPlanIn {
+        // chaos-serve's own --article-size default, so a plain `plan`
+        // caller racing a tls* profile still gets budgets that fire.
+        TlsPlanIn {
+            article_size: 740_000,
+            articles_per_conn: TLS_ARTICLES_PER_CONN,
+            alt_cert: None,
+        }
+    }
+}
+
+/// The account-shaping shape (M7b.2 steering/racing rig; memory
+/// nzbfast-giganews-shaping): every connection on the shaped server
+/// serves CORRECT bytes at 1/10th of the healthy per-conn rate, the
+/// clean twin runs at full speed. Nothing ever faults - the whole cost
+/// is per-article serve time, so what a client pays here is exactly its
+/// pipeline-depth and racing policy (the measured live shape:
+/// ~15 Mbps/conn shaped against ~165 clean, articles held ~430 ms
+/// apiece, ~83 MB parked behind slow sessions at queue-dry on a
+/// 26-conn fleet). Its own fn so `plan_with_tls` stays inside the
+/// size gate's function ceiling.
+fn shaped_plan(per_conn_bps: u64, line_bps: u64, base: Chaos, clean_twin: Chaos) -> Plan {
+    let shaped_bps = (per_conn_bps / 10).max(10_000);
+    Plan {
+        chaos: Chaos {
+            throttle: Throttle {
+                per_conn_bps: shaped_bps,
+                line_bps,
+                ..Default::default()
+            },
+            ..base
+        },
+        tls: TlsChaos::default(),
+        twin: Some(clean_twin),
+        onset_note: format!(
+            "shaped: every connection on the shaped server is capped to \
+             {shaped_bps} B/s (1/10th of healthy), correct bytes, from t0; \
+             clean twin on port2"
+        ),
+        onset_after_bodies: None,
+    }
+}
+
+/// [`plan`] with the TLS shapes' inputs supplied.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_with_tls(
+    profile: &str,
+    all_ids: &[String],
+    per_conn_bps: u64,
+    line_bps: u64,
+    seed: u64,
+    fault_count: Option<usize>,
+    tls_in: TlsPlanIn,
 ) -> Result<Plan> {
     let healthy = Throttle {
         per_conn_bps,
@@ -260,6 +546,7 @@ fn plan(
     Ok(match profile {
         "clean" => Plan {
             chaos: base,
+            tls: TlsChaos::default(),
             twin: None,
             onset_note: "clean baseline - no fault".into(),
             onset_after_bodies: None,
@@ -283,6 +570,7 @@ fn plan(
                     },
                     ..Default::default()
                 },
+                tls: TlsChaos::default(),
                 twin: Some(clean_twin),
                 onset_note: format!(
                     "flap{}: accept_cap=2 + drop_after=1 on the faulty server, \
@@ -321,6 +609,7 @@ fn plan(
                     greet_delay_ms: if dial { DIAL_COST_MS } else { 0 },
                     ..base
                 },
+                tls: TlsChaos::default(),
                 twin: None,
                 onset_note: note,
                 onset_after_bodies: None,
@@ -335,6 +624,7 @@ fn plan(
                     brownout_after: after,
                     ..base
                 },
+                tls: TlsChaos::default(),
                 twin: Some(clean_twin),
                 onset_note: format!(
                     "brownout: faulty server goes mute (dead air, no recovery) \
@@ -353,6 +643,7 @@ fn plan(
                     greet_delay_ms: if dial { DIAL_COST_MS } else { 0 },
                     ..base
                 },
+                tls: TlsChaos::default(),
                 twin: None,
                 onset_note: format!(
                     "jitter{}: every 5th body +1800 ms, structural from t0; \
@@ -384,6 +675,7 @@ fn plan(
             );
             Plan {
                 chaos: Chaos { corrupt, ..base },
+                tls: TlsChaos::default(),
                 twin: Some(clean_twin),
                 onset_note: note,
                 onset_after_bodies: None,
@@ -404,6 +696,7 @@ fn plan(
                     corrupt_every: every,
                     ..base
                 },
+                tls: TlsChaos::default(),
                 twin: Some(clean_twin),
                 onset_note: format!(
                     "corruptstorm: every {every}th body served by the faulty \
@@ -429,6 +722,7 @@ fn plan(
                     skip_nth_response: every,
                     ..base
                 },
+                tls: TlsChaos::default(),
                 twin: None,
                 onset_note: format!(
                     "desync: every {every}th BODY/ARTICLE response silently \
@@ -466,6 +760,7 @@ fn plan(
             );
             Plan {
                 chaos: Chaos { swap, ..base },
+                tls: TlsChaos::default(),
                 twin: Some(clean_twin),
                 onset_note: note,
                 onset_after_bodies: None,
@@ -479,6 +774,7 @@ fn plan(
                 slow_conn: Some((3, (per_conn_bps / 40).max(10_000))),
                 ..base
             },
+            tls: TlsChaos::default(),
             twin: None,
             onset_note: format!(
                 "slowconn: the 3rd accepted connection is capped to {} B/s; \
@@ -487,6 +783,7 @@ fn plan(
             ),
             onset_after_bodies: None,
         },
+        "shaped" => shaped_plan(per_conn_bps, line_bps, base, clean_twin),
         // Broken account / 502 storm: connect and AUTH succeed, every
         // BODY answers "502 byte limit exceeded", forever. The clean
         // twin carries the group; the race prices per-server circuit
@@ -496,6 +793,7 @@ fn plan(
                 body_error: Some(u64::MAX),
                 ..base
             },
+            tls: TlsChaos::default(),
             twin: Some(clean_twin),
             onset_note: "bodyerror: every BODY on the faulty server answers 502 \
                          (AUTH fine), forever, structural from t0; clean twin on \
@@ -515,6 +813,7 @@ fn plan(
                 auth_refusal_text: Some("481 max simultaneous IP addresses reached".into()),
                 ..base
             },
+            tls: TlsChaos::default(),
             twin: Some(clean_twin),
             onset_note: "authcap: every AUTH on the faulty server refused with \
                          '481 max simultaneous IP addresses reached', structural \
@@ -533,6 +832,7 @@ fn plan(
                 auth_refusal_text: Some("481 authentication failed".into()),
                 ..base
             },
+            tls: TlsChaos::default(),
             twin: Some(clean_twin),
             onset_note: "authbad: every AUTH on the faulty server refused with \
                          '481 authentication failed', structural from t0; clean \
@@ -555,6 +855,7 @@ fn plan(
                 cap_ghost_ms: 45_000,
                 ..base
             },
+            tls: TlsChaos::default(),
             twin: None,
             onset_note: "capghost: every dial refused with the 502 capacity \
                          text for the first 45000 ms (ghost sessions hold the \
@@ -574,6 +875,7 @@ fn plan(
                 refuse_connect_ms: 45_000,
                 ..base
             },
+            tls: TlsChaos::default(),
             twin: None,
             onset_note: "outage: every accepted connection closed with no \
                          greeting for the first 45000 ms (hard connect \
@@ -586,6 +888,7 @@ fn plan(
                 mute_after_bodies: 25,
                 ..base
             },
+            tls: TlsChaos::default(),
             twin: None,
             onset_note: "cgnat: each connection goes permanently silent after 25 \
                          bodies (no close); a reconnect gets a fresh NAT entry"
@@ -601,6 +904,7 @@ fn plan(
                 handover: Some((12_000, 4_000, 3)),
                 ..base
             },
+            tls: TlsChaos::default(),
             twin: None,
             onset_note: "handover: 3 staggered WANs, each frozen 4000 ms per \
                          12000 ms cycle, structural from t0"
@@ -616,6 +920,7 @@ fn plan(
                 slow_start: Some((3_000, 50_000)),
                 ..base
             },
+            tls: TlsChaos::default(),
             twin: None,
             onset_note: "slowstart: every new connection paced at 50000 B/s for \
                          its first 3000 ms, healthy after"
@@ -640,7 +945,32 @@ fn plan(
             );
             Plan {
                 chaos: Chaos { truncate, ..base },
+                tls: TlsChaos::default(),
                 twin: Some(clean_twin),
+                onset_note: note,
+                onset_after_bodies: None,
+            }
+        }
+        // §129 lane rig: a handful of PAYLOAD articles permanently 430,
+        // single server, no twin - the damage shape that forces a PAR2
+        // repair in the post-network tail (run with --par2-redundancy).
+        // Faults are drawn from the first half of the corpus order so
+        // the recovery volumes (appended last) are never the casualty.
+        "gone" => {
+            let count = fault_count.unwrap_or(4);
+            let missing: HashSet<String> = spread_positions(n / 2, count, seed)
+                .into_iter()
+                .map(|i| all_ids[i].clone())
+                .collect();
+            let note = format!(
+                "gone: {} payload articles answer 430 forever; with recovery \
+                 volumes served, repair from parity is the only way home",
+                missing.len()
+            );
+            Plan {
+                chaos: Chaos { missing, ..base },
+                tls: TlsChaos::default(),
+                twin: None,
                 onset_note: note,
                 onset_after_bodies: None,
             }
@@ -655,6 +985,7 @@ fn plan(
                 missing_delay_ms: 70,
                 ..base
             },
+            tls: TlsChaos::default(),
             twin: None,
             onset_note: "deadpost: every article answers 430 after a 70 ms round \
                          trip; completion is impossible - the wall to a TERMINAL \
@@ -670,6 +1001,7 @@ fn plan(
                 mute_quit: true,
                 ..base
             },
+            tls: TlsChaos::default(),
             twin: None,
             onset_note: "mutequit: healthy server that never answers QUIT; the \
                          measurement is whether completion pays an exit-path hang"
@@ -685,6 +1017,7 @@ fn plan(
                 mute_greeting: true,
                 ..base
             },
+            tls: TlsChaos::default(),
             twin: Some(clean_twin),
             onset_note: "mutegreeting: faulty server accepts connections but \
                          never sends the greeting, structural from t0; clean \
@@ -692,8 +1025,209 @@ fn plan(
                 .into(),
             onset_after_bodies: None,
         },
+        // §129 3b: the four TLS-layer shapes. The mock underneath is
+        // HEALTHY in every one of them - the fault lives in the acceptor
+        // in front of it, which is the whole point: these are failures
+        // of the transport every real user is on, not of the NNTP
+        // conversation, and no existing profile could express them.
+        "tlsfail" | "tlstruncate" | "tlscorrupt" | "tlsresume" => {
+            tls_plan(profile, base, clean_twin, tls_in)
+        }
+        "freshmiss" | "oldmiss" => miss_plan(profile, all_ids, base, clean_twin, seed, fault_count),
         other => bail!("unknown profile {other:?}; one of {}", PROFILES.join("|")),
     })
+}
+
+/// The TLS-shaped profiles. Byte budgets are per connection and scale
+/// with the article size, so the cut always lands mid-body whatever the
+/// corpus is built at.
+fn tls_plan(profile: &str, base: Chaos, clean_twin: Chaos, tls_in: TlsPlanIn) -> Plan {
+    // Articles a connection serves before the fault ends it. Eight, not
+    // the two or three that first looked "severe": a cut requeues
+    // whatever the pipeline had in flight, so cutting on the order of
+    // the window turns EVERY article into a refetch and the run stops
+    // measuring recovery and starts measuring the rig. Eight bites
+    // several times per connection on any corpus a matrix leg uses and
+    // still leaves refetch a bounded, meaningful number (§129 3c's
+    // clause 5 is what caught this: 195 refetches for 126 articles).
+    // --fault-count overrides it, as it does for the other profiles.
+    let per_conn = tls_in.articles_per_conn.max(1) as u64;
+    let art = tls_in.article_size.max(1) as u64 * per_conn;
+    let alt_tls = tls_in.alt_cert;
+    match profile {
+        // Handshake failure with a clean twin carrying the job: what a
+        // client pays for a provider whose TLS is broken but whose TCP
+        // is fine. Both variants, picked by whether an alternate PEM
+        // pair was given - a certificate that chains but does not match
+        // the name is refused by the CLIENT's verifier, a closed
+        // handshake is refused by the socket, and the two travel
+        // different paths through the error taxonomy.
+        "tlsfail" => {
+            let wrong_cert = alt_tls.is_some();
+            Plan {
+                chaos: base,
+                tls: TlsChaos {
+                    handshake_fail: Some(match alt_tls {
+                        Some(cfg) => HandshakeFault::WrongCert(cfg),
+                        None => HandshakeFault::Close,
+                    }),
+                    handshake_fail_count: u64::MAX,
+                    ..Default::default()
+                },
+                twin: Some(clean_twin),
+                onset_note: format!(
+                    "tlsfail: every handshake on the faulty server {}, structural \
+                     from t0; clean twin on port2",
+                    if wrong_cert {
+                        "serves a certificate for the wrong name (--tls-alt-cert)"
+                    } else {
+                        "is closed mid-flight (pass --tls-alt-cert/--tls-alt-key \
+                         for the wrong-certificate variant instead)"
+                    }
+                ),
+                onset_after_bodies: None,
+            }
+        }
+        // The truncation-attack shape: each connection is cut a few
+        // articles in with NO close_notify, so the stream ends exactly
+        // as an attacker cutting it would. Single server on purpose -
+        // with a twin to fall back on, a client that accepted the
+        // partial article would still produce a good file, and the
+        // question here is whether it accepts one at all.
+        "tlstruncate" => Plan {
+            chaos: base,
+            tls: TlsChaos {
+                truncate_after_bytes: art,
+                ..Default::default()
+            },
+            twin: None,
+            onset_note: format!(
+                "tlstruncate: every connection cut after {art} plaintext bytes \
+                 ({per_conn} articles) with NO close_notify (truncation attack \
+                 shape), structural from t0; partial articles must never be \
+                 accepted as complete"
+            ),
+            onset_after_bodies: None,
+        },
+        // A bit flipped in the ciphertext after the handshake: the
+        // record's AEAD tag fails and the session is unusable. A client
+        // must classify it as a connection error and refetch, never
+        // hand the plaintext up.
+        "tlscorrupt" => Plan {
+            chaos: base,
+            tls: TlsChaos {
+                corrupt_record_after_bytes: art,
+                ..Default::default()
+            },
+            twin: None,
+            onset_note: format!(
+                "tlscorrupt: one bit flipped in the ciphertext after {art} bytes \
+                 ({per_conn} articles) on every connection (record MAC fails), \
+                 structural from t0"
+            ),
+            onset_after_bodies: None,
+        },
+        // Kill mid-body, then fail the reconnect's handshake once:
+        // dial-retry and resume together, which is where a client that
+        // reads a failed dial as a dead server abandons a server that
+        // is fine two seconds later.
+        _ => Plan {
+            chaos: base,
+            tls: TlsChaos {
+                fault_during_resume: Some(art),
+                ..Default::default()
+            },
+            twin: None,
+            onset_note: format!(
+                "tlsresume: every connection cut after {art} plaintext bytes \
+                 ({per_conn} articles, no close_notify) and the NEXT dial's \
+                 handshake fails once before the server serves normally again"
+            ),
+            onset_after_bodies: None,
+        },
+    }
+}
+
+/// §129 3d phase 1, the pair the item exists to tell apart. Both
+/// serve the SAME fault - the faulty server answers 430 to 80% of
+/// the post, spread over the whole corpus, while the clean twin
+/// holds every article - and differ only in what the NZB says the
+/// post's age is (see `post_date`).
+///
+/// freshmiss: the post is 2 hours old, so a provider missing four
+/// articles in five did not take the feed. This is the shape a
+/// per-job demotion would be FOR.
+///
+/// oldmiss: the same 430 ratio on a 400-day-old post, which is
+/// ordinary retention/propagation loss and carries no guilt at
+/// all. It is the safety arm: whatever reacts to freshmiss must
+/// do nothing here, because "430 everywhere is NOT proof"
+/// (memory nzbfast-retry-propagation-trap) is exactly how a
+/// healthy provider gets wrongly demoted on old posts.
+///
+/// Refusals are answered at wire speed (no `missing_delay_ms`).
+/// deadpost prices a SLOW refusal deliberately, but the mock
+/// serializes that delay per connection, so borrowing it here
+/// would turn the faulty server into a slow refuser and measure
+/// that instead - two different faults. A real provider answers
+/// a pipelined 430 from an index lookup at about the speed it
+/// answers a header. What this profile prices is the cost of
+/// ASKING a server that does not have the post: one wasted
+/// dispatch per article, and the re-dispatch behind it.
+fn miss_plan(
+    profile: &str,
+    all_ids: &[String],
+    base: Chaos,
+    clean_twin: Chaos,
+    seed: u64,
+    fault_count: Option<usize>,
+) -> Plan {
+    let n = all_ids.len();
+    let count = fault_count.unwrap_or(n * 4 / 5);
+    let missing: HashSet<String> = stride_positions(n, count, seed)
+        .into_iter()
+        .map(|i| all_ids[i].clone())
+        .collect();
+    let note = format!(
+        "{profile}: {} of {n} articles answer 430 forever on the faulty \
+         server, spread over the whole corpus; the clean twin on port2 \
+         holds every one. The NZB declares this post {} - {}",
+        missing.len(),
+        if profile == "freshmiss" {
+            "2 hours old"
+        } else {
+            "over a year old"
+        },
+        if profile == "freshmiss" {
+            "a provider that did not take the feed"
+        } else {
+            "ordinary retention loss, no guilt (the safety arm)"
+        }
+    );
+    Plan {
+        chaos: Chaos { missing, ..base },
+        tls: TlsChaos::default(),
+        twin: Some(clean_twin),
+        onset_note: note,
+        onset_after_bodies: None,
+    }
+}
+
+/// Resolves when the rig is asked to stop: SIGTERM (what the matrix
+/// driver's `stop_chaos` sends) or Ctrl-C at a terminal. Used only to
+/// get one last, exact serve-count dump into the log before exit.
+async fn shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = term.recv() => return,
+                _ = tokio::signal::ctrl_c() => return,
+            }
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 pub async fn run(opts: Opts) -> Result<()> {
@@ -763,64 +1297,173 @@ pub async fn run(opts: Opts) -> Result<()> {
         .iter()
         .flat_map(|f| f.segs.iter().map(|(id, _, _)| format!("<{id}>")))
         .collect();
-    write_nzb(&opts.nzb, &corpus)?;
+    let date = post_date(&opts.profile);
+    write_nzb(&opts.nzb, &corpus, date)?;
     say(&format!(
-        "corpus: {} articles, {:.1} MB payload; nzb at {}",
+        "corpus: {} articles, {:.1} MB payload; nzb declares date={} \
+         ({}); nzb at {}",
         all_ids.len(),
         opts.size as f64 / 1e6,
+        date,
+        if date == FIXED_POST_DATE {
+            "historic post"
+        } else {
+            "recent post"
+        },
         opts.nzb.display()
     ));
 
     // ---- servers ----
-    let plan = plan(
+    let tls_cfg = pem_pair(&opts.tls_cert, &opts.tls_key, "--tls-cert/--tls-key")?;
+    let alt_tls = pem_pair(
+        &opts.tls_alt_cert,
+        &opts.tls_alt_key,
+        "--tls-alt-cert/--tls-alt-key",
+    )?;
+    if TLS_PROFILES.contains(&opts.profile.as_str()) && tls_cfg.is_none() {
+        bail!(
+            "profile {} is a TLS fault shape and needs --tls-cert/--tls-key; \
+             serving it over plain TCP would read as a clean run",
+            opts.profile
+        );
+    }
+    let plan = plan_with_tls(
         &opts.profile,
         &all_ids,
         opts.per_conn_bps,
         opts.line_bps,
         opts.seed,
         opts.fault_count,
+        TlsPlanIn {
+            article_size: opts.article_size,
+            articles_per_conn: opts.fault_count.unwrap_or(TLS_ARTICLES_PER_CONN),
+            alt_cert: alt_tls,
+        },
     )?;
     let twin_articles = plan.twin.is_some().then(|| articles.clone());
+    // Under TLS the mocks move to their own loopback ports and the
+    // fronts own the public ones; the plain path binds as it always did.
+    let inner = |port: u16| match tls_cfg {
+        Some(_) => "127.0.0.1:0".to_string(),
+        None => format!("{}:{}", opts.bind, port),
+    };
     let faulty = MockServer::start_bound(
-        &format!("{}:{}", opts.bind, opts.port),
+        &inner(opts.port),
         articles,
         HashMap::new(),
         Vec::new(),
         plan.chaos,
     )
     .await;
+    let faulty_front = match &tls_cfg {
+        Some(cfg) => Some(
+            TlsFront::start(
+                &format!("{}:{}", opts.bind, opts.port),
+                faulty.addr,
+                cfg.clone(),
+                plan.tls,
+            )
+            .await
+            .with_context(|| format!("bind TLS front on port {}", opts.port))?,
+        ),
+        None => None,
+    };
     say(&format!(
-        "profile {} serving on {} [{}]",
+        "profile {} serving on {}:{} [{}{}]",
         opts.profile,
-        faulty.addr,
+        opts.bind,
+        opts.port,
         if plan.twin.is_some() {
             "faulty"
         } else {
             "single"
-        }
+        },
+        if tls_cfg.is_some() { ", TLS" } else { "" }
     ));
     let twin = match plan.twin {
         Some(chaos) => {
             let t = MockServer::start_bound(
-                &format!("{}:{}", opts.bind, opts.port2),
+                &inner(opts.port2),
                 twin_articles.unwrap_or_default(),
                 HashMap::new(),
                 Vec::new(),
                 chaos,
             )
             .await;
-            say(&format!("clean twin serving on {} [clean]", t.addr));
+            say(&format!(
+                "clean twin serving on {}:{} [clean]",
+                opts.bind, opts.port2
+            ));
             Some(t)
         }
         None => None,
     };
+    // Held for the run: dropping a front stops its listener.
+    let _twin_front = match (&tls_cfg, &twin) {
+        (Some(cfg), Some(t)) => Some(
+            TlsFront::start(
+                &format!("{}:{}", opts.bind, opts.port2),
+                t.addr,
+                cfg.clone(),
+                TlsChaos::default(),
+            )
+            .await
+            .with_context(|| format!("bind TLS front on port {}", opts.port2))?,
+        ),
+        _ => None,
+    };
+    if tls_cfg.is_some() {
+        say(
+            "TLS on (implicit, the port-563 shape): point clients at it with \
+             NZBFAST_EXTRA_CA=<cert.pem>, or with certificate verification off",
+        );
+    }
     say(&format!("ONSET-PLAN {}", plan.onset_note));
 
     // ---- monitor: onset + throughput timeline ----
     let mut onset_logged = plan.onset_after_bodies.is_none();
     let mut last = (0u64, 0u64, 0u64); // served faulty, served twin, accepted faulty
+    // The FINAL serve-count dump rides on the shutdown signal. A
+    // tick-granular last dump can be up to one tick stale, and the §129
+    // 3c refetch clause is counted in single articles - so the numbers a
+    // matrix leg reads have to be taken after the client is done, not
+    // two seconds before it.
+    // Under TLS the mock's `accepted` counts connections that got
+    // THROUGH the handshake, so the front's own tally is the only place
+    // a broken handshake is visible at all - and a TLS profile that
+    // silently fails to engage reads exactly like a client that handled
+    // it. Printed on every tick AND at shutdown, because a short leg
+    // (tlsfail finishes in a second or two) never reaches a tick.
+    let tls_tally = || {
+        faulty_front.as_ref().map_or(String::new(), |f| {
+            let c = &f.counts;
+            format!(
+                " · tls: dials={} handshakes={} broken={} cuts={} flips={}",
+                c.accepted.load(Ordering::Relaxed),
+                c.handshakes.load(Ordering::Relaxed),
+                c.handshake_faults.load(Ordering::Relaxed),
+                c.truncations.load(Ordering::Relaxed),
+                c.corruptions.load(Ordering::Relaxed),
+            )
+        })
+    };
+    let mut done = Box::pin(shutdown());
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+            _ = &mut done => {
+                say(&faulty.serve_count_line("faulty"));
+                if let Some(t) = twin.as_ref() {
+                    say(&t.serve_count_line("twin"));
+                }
+                let tls = tls_tally();
+                if !tls.is_empty() {
+                    say(&format!("FINAL{tls}"));
+                }
+                say("FINAL serve counts above; shutting down");
+                return Ok(());
+            }
+        }
         let sf = faulty.served.load(Ordering::Relaxed);
         let af = faulty.accepted.load(Ordering::Relaxed);
         let st = twin
@@ -834,11 +1477,24 @@ pub async fn run(opts: Opts) -> Result<()> {
             onset_logged = true;
         }
         if (sf, st, af) != (last.0, last.1, last.2) {
+            let tls_note = tls_tally();
             say(&format!(
-                "tick faulty: served={sf} (+{}) accepted={af} · twin: served={st} (+{})",
+                "tick faulty: served={sf} (+{}) accepted={af} · twin: served={st} (+{}){tls_note}",
                 sf - last.0,
                 st - last.1
             ));
+            // Serve counts, per tick, per server: the §129 3c refetch
+            // clause read from the SERVER's side. In-process the
+            // contract suite calls MockServer::refetched(); a bench-box
+            // matrix leg drives an external client and has only this
+            // log, so the same ledger has to reach it as a line. A
+            // resumed job that refetches the whole corpus and one that
+            // refetches only its in-flight gap look identical in the
+            // served= counter above and differ only here.
+            say(&faulty.serve_count_line("faulty"));
+            if let Some(t) = twin.as_ref() {
+                say(&t.serve_count_line("twin"));
+            }
             last = (sf, st, af);
         }
     }

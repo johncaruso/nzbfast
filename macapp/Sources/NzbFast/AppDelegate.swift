@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var pendingLinks: [String] = []
     private var stackReady = false
     private var quitting = false
+    private let quitWatchdog = QuitWatchdog()
 
     // MARK: lifecycle
 
@@ -26,7 +27,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         daemon.onUnexpectedExit = { [weak self] tail in
             Task { @MainActor in self?.childDied(tail) }
         }
+        // Take over kAEQuitApplication (registered after AppKit installs
+        // its handler, so ours wins). AppKit's own routing never delivers
+        // a quit that arrives while an NSAlert.runModal loop is up - the
+        // event just waits for a click that, on an unattended machine
+        // mid-shutdown, never comes. That is the observed hang (8 Aug
+        // 2026): an error alert nobody saw, then a software-update
+        // restart the app silently blocked. Ours aborts the modal first,
+        // so terminate() always gets its turn.
+        NSAppleEventManager.shared().setEventHandler(
+            self, andSelector: #selector(handleQuitEvent(_:withReply:)),
+            forEventClass: AEEventClass(kCoreEventClass),
+            andEventID: AEEventID(kAEQuitApplication))
         Task { await startStack() }
+    }
+
+    @objc private func handleQuitEvent(
+        _ event: NSAppleEventDescriptor, withReply reply: NSAppleEventDescriptor
+    ) {
+        QuitWatchdog.log.notice(
+            "kAEQuitApplication received (modal up: \(NSApp.modalWindow != nil))")
+        if NSApp.modalWindow != nil { NSApp.abortModal() }
+        NSApp.terminate(nil)
     }
 
     private func startStack() async {
@@ -52,7 +74,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             alert.informativeText = "\(why)\n\nLast log lines:\n\(daemon.logTail())"
             alert.addButton(withTitle: "Try Again")
             alert.addButton(withTitle: "Quit")
-            if alert.runModal() == .alertFirstButtonReturn {
+            let choice = alert.runModal()
+            // Same as childDied: a quit may have aborted this modal.
+            guard !quitting else { return }
+            if choice == .alertFirstButtonReturn {
                 Task { await startStack() }
             } else {
                 NSApp.terminate(nil)
@@ -69,7 +94,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         alert.informativeText = "Last log lines:\n\(tail)"
         alert.addButton(withTitle: "Restart")
         alert.addButton(withTitle: "Quit")
-        if alert.runModal() == .alertFirstButtonReturn {
+        let choice = alert.runModal()
+        // A quit can abort this modal from under us (handleQuitEvent).
+        // Termination is already in flight then - restarting the engine
+        // would fight the stop, and terminate() again would skip it.
+        guard !quitting else { return }
+        if choice == .alertFirstButtonReturn {
             Task {
                 if case .failed(let why) = await daemon.restart() {
                     self.windowController.setOverlay(visible: true, text: why)
@@ -84,15 +114,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     /// Graceful quit (shared rule 6): stop OUR child cleanly, then go.
-    /// An attached daemon is never touched.
+    /// An attached daemon is never touched. QuitWatchdog bounds the whole
+    /// thing - once quit is asked for, the reply WILL be sent within its
+    /// ceiling even if the stop wedges, because the OS asks exactly once
+    /// and an unanswered .terminateLater holds a whole shutdown (the
+    /// observed software-update hang, 8 Aug 2026).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if quitting { return .terminateNow }
+        if quitting {
+            // A second ask (Cmd-Q again, or a rushed logout): the stop is
+            // already under way and the watchdog bounds it - just go.
+            QuitWatchdog.log.notice("quit re-requested while stopping - terminateNow")
+            return .terminateNow
+        }
         quitting = true
-        Task {
-            await daemon.stop()
-            DispatchQueue.main.async {
-                NSApp.reply(toApplicationShouldTerminate: true)
-            }
+        QuitWatchdog.log.notice("quit requested")
+        // An error alert nobody is around to dismiss (the engine-crash
+        // dialog on an unattended machine) holds its modal loop through a
+        // whole shutdown otherwise. Aborting makes runModal return
+        // .abort, whose else-branches call NSApp.terminate - which lands
+        // in the quitting-guard above and terminates now. That is the
+        // right outcome: quit was asked for.
+        if NSApp.modalWindow != nil {
+            QuitWatchdog.log.notice("aborting modal panel so quit can proceed")
+            NSApp.abortModal()
+        }
+        quitWatchdog.arm()
+        // Detached on purpose: after .terminateLater the main run loop is
+        // in a modal-ish mode, and a main-actor Task hop is exactly the
+        // scheduling this path must not depend on - the stop runs off the
+        // main thread and the watchdog owns reply delivery.
+        Task.detached { [quitWatchdog] in
+            await Daemon.shared.stop()
+            quitWatchdog.deliver(why: "engine stop finished")
         }
         return .terminateLater
     }

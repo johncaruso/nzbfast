@@ -48,12 +48,22 @@ BASELINE_FILES = {
     # moved its flat free functions out to sibling modules and dispersed
     # its 4,800-line inline `mod tests`; it is 852 lines now, so its entry
     # is GONE. Nothing is left to grandfather.
-    "crates/nzbfast/tests/daemon.rs": 11803,
+    # 11,803, then 12,429 after the 8 Aug §129 burst. Two concurrent
+    # sessions split it at different seams and both landed: the
+    # mid-download password and prefer_external_unrar tests went to
+    # tests/daemon_unpackroute/, the five M11 playback rigs to
+    # tests/stream_live/. 10,678 with both, so the entry ratchets DOWN.
+    "crates/nzbfast/tests/daemon.rs": 10678,
     # 7471 when first measured; two concurrent 5 Aug sessions landed
     # test growth (one-pass rigs + the round-6 crc-retry pricing leg).
     "crates/nzbfast/tests/e2e.rs": 7641,
-    # 7165 when first measured; pre-gate concurrent work landed 7375.
-    "crates/nzbfast/src/smart.rs": 7375,
+    # 7165 when first measured, 7375, then 7629 after the 8 Aug burst.
+    # Two concurrent sessions emptied it in turn, both on the
+    # cleanup_mode_tests pattern: `trash_tests` + `out_umask_tests` to
+    # smart/, then the 3,268-line inline `mod tests` to smart/tests.rs
+    # + sweep_rename_tests.rs (one file of them would have been over
+    # the ceiling on its own). 3,966 with both.
+    "crates/nzbfast/src/smart.rs": 3966,
     # 7081 when first measured; peaked at 10,828 during the fault/tuner
     # campaign. TODO 113 ratchet: the payout/safety rigs moved to
     # pool/rig_tests.rs (their own child module), 10,828 -> 7,855, then
@@ -61,34 +71,69 @@ BASELINE_FILES = {
     # ~170 lines of extraction overhead (signatures + docs): 8,011.
     # 8,282 after the §114 consumer-steer graduation merged over the
     # split (note_decoded seam + handed/steer-inbox plumbing; its rigs
-    # live in rig_tests.rs, which absorbs the test growth).
-    "crates/nzbkit/src/pool.rs": 8282,
+    # live in rig_tests.rs, which absorbs the test growth), 8,492 after
+    # the 8 Aug burst. The remaining inline `mod tests` - 2,443 lines,
+    # a third of the file - moved to pool/inline_tests.rs: 6,051.
+    # That left ONE line of margin under the limit, so the very next
+    # commit to touch the file (§129 3g's response fence) put it back over
+    # at 6,421, then 6,483 through the merge. Out of test code to move, so
+    # this round took the production seam instead: one worker's whole
+    # session lifecycle - dial, pipeline, read, and the dozen ways a
+    # session ends - is 1,791 contiguous lines and moved whole to
+    # pool/session.rs. 4,698, which is margin measured in hundreds of
+    # lines rather than one.
+    "crates/nzbkit/src/pool.rs": 4698,
     # Born 2,988 in the TODO 113 split (the pool's payout/safety rigs,
     # one file because sibling cfg(test) mods cannot share helpers);
     # 3,125 when the §114 consumer-steer rigs replaced the pool-gate
     # ones. All test code - grandfathered like pool.rs's rig growth
     # was, ratchet when the campaign settles.
     "crates/nzbkit/src/pool/rig_tests.rs": 3125,
-    "crates/nzbkit/src/extract/mod.rs": 6192,
-    # 6056 when first measured; pre-gate concurrent work landed 6213, and
-    "crates/nzbfast/src/serve/tasks.rs": 6400,
+    # 6,192, then 6,480 after the 8 Aug burst. Its 3,018-line inline
+    # `mod tests` moved out and split at its own nested-one-pass banner
+    # (mod_tests.rs + nested_tests.rs, neither big enough to want an
+    # entry of its own): 3,467.
+    "crates/nzbkit/src/extract/mod.rs": 3467,
+    # serve/tasks.rs was here at 6,400 (6,056 when first measured, then
+    # 6,213 from pre-gate concurrent work) and the 8 Aug merges took it to
+    # 6,723 - past the slack, the only file-level offender left on main.
+    # It has no inline `mod tests` to give up, so five PRODUCTION seams
+    # came out whole to serve/tasks/: the metadata lanes (enrich.rs), the
+    # watch folder and its six failure states (watchfolder.rs), index
+    # upkeep either side of the scan loop (indexer.rs), the stall tracker
+    # + slow-job watchdog (stall.rs), and connection tuning (tuner.rs).
+    # 2,684 lines now - under the ceiling, so its entry is GONE. Both of
+    # its fn entries below keep their path: spawn_download_worker and
+    # spawn_index_scan stayed in the parent.
     # 5946 when first measured; pre-gate concurrent sessions landed 6106,
     # and the 5 Aug session union 6231 (event taxonomy, 5ab52b20).
     "crates/nzbfast/src/serve/daemon.rs": 6231,
-    "crates/nzbkit/src/par2repair.rs": 5150,
+    # 5,150, then 5,397 after the 8 Aug burst. The inline `mod tests`
+    # (the repair math and the mapped driver) moved to
+    # par2repair/inline_tests.rs, beside unit_tests.rs: 4,206.
+    "crates/nzbkit/src/par2repair.rs": 4206,
     "crates/nzbkit/src/rar.rs": 4088,
     "crates/nzbfast/src/wall.rs": 3911,
     "crates/nzbkit/src/nntp.rs": 3688,
     "crates/nzbkit/src/release.rs": 3505,
-    "crates/nzbkit/src/extract/crypto.rs": 3365,
-    "crates/nzbfast/src/repair.rs": 3305,
+    # extract/crypto.rs was here at 3,365 and reached 3,502. Its inline
+    # `mod tests` moved to extract/crypto_tests.rs, leaving 2,112 - under
+    # the ceiling, so its entry is GONE.
+    # repair.rs was here at 3,305 and reached 3,362 - nine lines of slack
+    # left. The recovery-volume side-fetch driver (its own banner in the
+    # module doc: the side pool, the volume consumer, the two helpers
+    # that price a volume) moved to repair/sidefetch.rs with its tests,
+    # leaving 2,909 - under the ceiling, so its entry is GONE too.
 }
 
 BASELINE_FNS = {
     # "path::fn_name": lines measured
     # 688 when first measured; pre-gate concurrent work landed 719, then 770.
     "crates/nzbfast/src/serve/tasks.rs::spawn_download_worker": 770,
-    "crates/nzbfast/src/serve/sabcompat.rs::queue_json": 652,
+    # 652, then 670 after the 8 Aug burst. `resume_at` and the
+    # watch_failed row builder are self-contained and came out whole (609),
+    # and the lane's own comment trim (61537f5d) merged over it: 604.
+    "crates/nzbfast/src/serve/sabcompat.rs::queue_json": 604,
     "crates/nzbfast/src/serve/tasks.rs::spawn_index_scan": 582,
 }
 

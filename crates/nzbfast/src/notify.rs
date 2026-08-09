@@ -41,6 +41,14 @@ use crate::serve::{Job, JobState};
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What kind of thing sits at the other end.
+///
+/// §129 2e (decision 3): the preset kinds below Webhook are each one
+/// templated HTTP POST in the service's own shape - the native answer
+/// to Apprise without the Python dependency. `body`, when set, is the
+/// MESSAGE TEXT template for a preset (placeholders apply), not the
+/// whole request body; the preset supplies the service's JSON around
+/// it. An "Apprise API server" preset covers everything else Apprise
+/// speaks, for users who run one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -52,6 +60,29 @@ pub enum Kind {
     Jellyfin,
     /// Anything else: a rendered POST of your own.
     Webhook,
+    /// Discord incoming webhook: url = the webhook URL.
+    Discord,
+    /// Slack incoming webhook: url = the webhook URL.
+    Slack,
+    /// Telegram bot: token = `<bot_token>/<chat_id>` (slash-separated -
+    /// bot tokens carry a colon of their own). url empty = the public
+    /// api.telegram.org.
+    Telegram,
+    /// Pushover: token = `<app_token>/<user_key>`. url empty = the
+    /// public api.pushover.net.
+    Pushover,
+    /// ntfy: url = the topic URL (`https://ntfy.sh/mytopic` or
+    /// self-hosted); token = an access token, if the topic needs one.
+    Ntfy,
+    /// Gotify: url = the server, token = an application token.
+    Gotify,
+    /// An Apprise API server: url = its notify endpoint
+    /// (`http://host:8000/notify/<config-key>`).
+    Apprise,
+    /// Native SMTP: url = `smtp://host:port` (STARTTLS when the server
+    /// offers it) or `smtps://host:port` (TLS from the first byte);
+    /// token = `user:password` when the server wants a login.
+    Email,
 }
 
 fn yes() -> bool {
@@ -89,6 +120,19 @@ pub struct Target {
     /// Only fire for this category. Empty = every category.
     #[serde(default)]
     pub category: String,
+    /// §129 2e: event-level routing. Empty = the legacy contract
+    /// (completed jobs, plus failed ones when `on_failure`). Tokens:
+    /// "completed", "failed", "repaired" (a completion whose download
+    /// needed PAR2 repair), "disk" (the low-disk guard fired), "quota"
+    /// (the quota guard fired).
+    #[serde(default)]
+    pub events: Vec<String>,
+    /// Email only: the recipient. Required for [`Kind::Email`].
+    #[serde(default)]
+    pub email_to: String,
+    /// Email only: the From address. Empty = "nzbfast@localhost".
+    #[serde(default)]
+    pub email_from: String,
 }
 
 /// How one target's last delivery went, as its settings row reports it.
@@ -141,28 +185,64 @@ pub struct Ctx {
     pub bytes: u64,
     pub error: String,
     pub nzo_id: String,
+    /// §129 2e: which event this is - "completed", "failed", or a
+    /// warning token ("disk", "quota"). What [`Target::events`] routes
+    /// on.
+    pub event: String,
+    /// The download needed PAR2 repair on the way to Completed - the
+    /// "repaired" routing token.
+    pub repaired: bool,
 }
 
 impl Ctx {
     pub fn from_job(job: &Arc<Mutex<Job>>) -> Ctx {
         let j = job.lock_ok();
+        let ok = j.state == JobState::Completed;
         Ctx {
             name: j.name.clone(),
-            status: if j.state == JobState::Completed {
-                "Completed"
-            } else {
-                "Failed"
-            },
+            status: if ok { "Completed" } else { "Failed" },
             category: j.category.clone(),
             dir: j.out_dir.to_string_lossy().into_owned(),
             bytes: j.total_bytes,
             error: j.fail_message.clone(),
             nzo_id: j.nzo_id.clone(),
+            event: if ok { "completed" } else { "failed" }.into(),
+            repaired: j.bad_blocks.unwrap_or(0) > 0,
+        }
+    }
+
+    /// §129 2e: a non-job event (the disk or quota guard firing), for
+    /// targets routed onto those tokens. The message rides in `name`
+    /// so every template placeholder still means something.
+    pub fn for_event(event: &str, message: &str) -> Ctx {
+        Ctx {
+            name: message.to_string(),
+            status: "Warning",
+            category: String::new(),
+            dir: String::new(),
+            bytes: 0,
+            error: String::new(),
+            nzo_id: String::new(),
+            event: event.to_string(),
+            repaired: false,
         }
     }
 
     fn ok(&self) -> bool {
         self.status == "Completed"
+    }
+
+    /// The one-line human message the preset services send when the
+    /// target has no body template of its own.
+    fn message(&self) -> String {
+        match self.event.as_str() {
+            "completed" if self.repaired => {
+                format!("{} finished downloading (repaired on the way)", self.name)
+            }
+            "completed" => format!("{} finished downloading", self.name),
+            "failed" => format!("{} failed: {}", self.name, self.error),
+            _ => self.name.clone(),
+        }
     }
 
     /// Substitute `{name}`/`{status}`/… into a webhook body, escaping each
@@ -182,6 +262,13 @@ impl Ctx {
             // to_string() wraps in quotes; the template supplies its own.
             quoted[1..quoted.len() - 1].to_string()
         })
+    }
+
+    /// Substitute into plain text (a preset's message, an email body):
+    /// values pass through untouched - the JSON that later wraps the
+    /// text escapes at embed time via `serde_json::json!`.
+    fn render_plain(&self, template: &str) -> String {
+        self.render(template, |v| v.to_string())
     }
 
     /// Substitute into a URL, percent-encoding each value. Without this a
@@ -271,16 +358,33 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-/// Should this target hear about this job at all?
+/// Should this target hear about this event at all?
+///
+/// §129 2e: an `events` list routes precisely; an empty list is the
+/// legacy contract - completed jobs, failed ones only with
+/// `on_failure`, and never the warning events (they did not exist).
 fn wants(t: &Target, cx: &Ctx) -> bool {
     if !t.enabled {
         return false;
     }
-    if !cx.ok() && !t.on_failure {
+    let routed = if t.events.is_empty() {
+        match cx.event.as_str() {
+            "completed" => true,
+            "failed" => t.on_failure,
+            _ => false,
+        }
+    } else {
+        t.events.iter().any(|e| match e.as_str() {
+            "repaired" => cx.event == "completed" && cx.repaired,
+            e => e == cx.event,
+        })
+    };
+    if !routed {
         return false;
     }
     // An empty category on the job means "no category", which only an
-    // unfiltered target matches.
+    // unfiltered target matches. Warning events carry no category and
+    // reach unfiltered targets only.
     t.category.is_empty() || t.category.eq_ignore_ascii_case(&cx.category)
 }
 
@@ -345,6 +449,8 @@ pub fn test(t: &Target) -> Result<u16, String> {
             bytes: 0,
             error: String::new(),
             nzo_id: "test".into(),
+            event: "completed".into(),
+            repaired: false,
         },
     )
 }
@@ -359,10 +465,17 @@ fn agent() -> ureq::Agent {
 /// Build and send one notification. Returns the HTTP status on success.
 fn send(t: &Target, cx: &Ctx) -> Result<u16, String> {
     let base = t.url.trim().trim_end_matches('/');
-    if base.is_empty() {
+    // Email speaks smtp://, and Telegram/Pushover default their public
+    // API host on an empty url - neither belongs under the HTTP scheme
+    // gate below.
+    if t.kind == Kind::Email {
+        return smtp::send_email(t, cx);
+    }
+    let url_optional = matches!(t.kind, Kind::Telegram | Kind::Pushover);
+    if base.is_empty() && !url_optional {
         return Err("no url configured".into());
     }
-    if !(base.starts_with("http://") || base.starts_with("https://")) {
+    if !base.is_empty() && !(base.starts_with("http://") || base.starts_with("https://")) {
         // Deliberately does not echo the URL back. A webhook URL pasted
         // without its scheme is still a bearer capability, and this
         // message goes to the log ring the dashboard shows and the log
@@ -420,6 +533,91 @@ fn send(t: &Target, cx: &Ctx) -> Result<u16, String> {
                 .set("Content-Type", "application/json")
                 .send_string(&body)
         }
+        // §129 2e presets: `body` is the MESSAGE TEXT template here
+        // (placeholders apply), never the raw request - the preset owns
+        // the service's JSON shape so a quote in a release name cannot
+        // break it.
+        Kind::Discord => a
+            .post(base)
+            .set("Content-Type", "application/json")
+            .send_string(&serde_json::json!({"content": preset_text(t, cx)}).to_string()),
+        Kind::Slack => a
+            .post(base)
+            .set("Content-Type", "application/json")
+            .send_string(&serde_json::json!({"text": preset_text(t, cx)}).to_string()),
+        Kind::Telegram => {
+            let Some((bot, chat)) = t.token.split_once('/') else {
+                return Err("Telegram needs token = <bot_token>/<chat_id>".into());
+            };
+            let api = if t.url.trim().is_empty() {
+                "https://api.telegram.org".to_string()
+            } else {
+                base.to_string()
+            };
+            a.post(&format!("{api}/bot{bot}/sendMessage"))
+                .set("Content-Type", "application/json")
+                .send_string(
+                    &serde_json::json!({"chat_id": chat, "text": preset_text(t, cx)}).to_string(),
+                )
+        }
+        Kind::Pushover => {
+            let Some((app, user)) = t.token.split_once('/') else {
+                return Err("Pushover needs token = <app_token>/<user_key>".into());
+            };
+            let api = if t.url.trim().is_empty() {
+                "https://api.pushover.net".to_string()
+            } else {
+                base.to_string()
+            };
+            a.post(&format!("{api}/1/messages.json"))
+                .set("Content-Type", "application/json")
+                .send_string(
+                    &serde_json::json!({
+                        "token": app, "user": user,
+                        "title": "nzbfast", "message": preset_text(t, cx),
+                    })
+                    .to_string(),
+                )
+        }
+        Kind::Ntfy => {
+            let req = a.post(base).set("X-Title", "nzbfast");
+            let req = if t.token.is_empty() {
+                req
+            } else {
+                req.set("Authorization", &format!("Bearer {}", t.token))
+            };
+            req.send_string(&preset_text(t, cx))
+        }
+        Kind::Gotify => {
+            if t.token.is_empty() {
+                return Err("Gotify needs an application token".into());
+            }
+            // The token rides a header, not the query string, so it
+            // stays out of access logs on the way.
+            a.post(&format!("{base}/message"))
+                .set("X-Gotify-Key", &t.token)
+                .set("Content-Type", "application/json")
+                .send_string(
+                    &serde_json::json!({
+                        "title": "nzbfast", "message": preset_text(t, cx),
+                        "priority": if cx.ok() { 4 } else { 7 },
+                    })
+                    .to_string(),
+                )
+        }
+        Kind::Apprise => a
+            .post(base)
+            .set("Content-Type", "application/json")
+            .send_string(
+                &serde_json::json!({
+                    "title": "nzbfast",
+                    "body": preset_text(t, cx),
+                    "type": if cx.ok() { "success" } else { "failure" },
+                })
+                .to_string(),
+            ),
+        // Handled above, before the HTTP scheme gate.
+        Kind::Email => unreachable!("email returns before the scheme gate"),
     };
     match resp {
         Ok(r) => Ok(r.status()),
@@ -452,6 +650,246 @@ fn send(t: &Target, cx: &Ctx) -> Result<u16, String> {
                 .map(|s| format!(": {s}"))
                 .unwrap_or_default(),
         )),
+    }
+}
+
+/// A preset's message text: the target's own `body` template rendered
+/// plain, or the stock one-liner.
+fn preset_text(t: &Target, cx: &Ctx) -> String {
+    if t.body.trim().is_empty() {
+        cx.message()
+    } else {
+        cx.render_plain(&t.body)
+    }
+}
+
+/// §129 2e: the native SMTP sender - a minimal blocking client (EHLO,
+/// STARTTLS or implicit TLS, AUTH PLAIN, one message), so email
+/// notifications need no external binary and no Python. TLS is
+/// nzbkit's shared client config, so the trust anchors are exactly the
+/// download path's - `NZBFAST_EXTRA_CA` included.
+mod smtp {
+    use super::{Ctx, Target, b64, preset_text};
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    trait Rw: Read + Write {}
+    impl<T: Read + Write> Rw for T {}
+
+    struct Conn {
+        s: Box<dyn Rw>,
+        buf: Vec<u8>,
+    }
+
+    impl Conn {
+        fn line(&mut self) -> Result<String, String> {
+            loop {
+                if let Some(i) = self.buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = self.buf.drain(..=i).collect();
+                    return Ok(String::from_utf8_lossy(&line).trim_end().to_string());
+                }
+                // Bounded: a server that talks forever without a newline
+                // is not an SMTP server.
+                if self.buf.len() > 64 * 1024 {
+                    return Err("oversized reply".into());
+                }
+                let mut tmp = [0u8; 512];
+                let n = self.s.read(&mut tmp).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    return Err("connection closed".into());
+                }
+                self.buf.extend_from_slice(&tmp[..n]);
+            }
+        }
+
+        /// One full (possibly multiline) reply. Err on 4xx/5xx, with
+        /// the server's own words - they name the actual problem
+        /// ("relay denied", "authentication failed") better than we
+        /// could.
+        fn reply(&mut self, what: &str) -> Result<(u16, String), String> {
+            let mut all = String::new();
+            loop {
+                let l = self.line()?;
+                let cont = l.len() >= 4 && l.as_bytes()[3] == b'-';
+                all.push_str(&l);
+                all.push('\n');
+                if cont {
+                    continue;
+                }
+                let code: u16 = l
+                    .get(..3)
+                    .and_then(|c| c.parse().ok())
+                    .ok_or_else(|| format!("{what}: malformed reply {l:?}"))?;
+                if code >= 400 {
+                    return Err(format!("{what}: {l}"));
+                }
+                return Ok((code, all));
+            }
+        }
+
+        fn cmd(&mut self, c: &str, what: &str) -> Result<(u16, String), String> {
+            self.s
+                .write_all(c.as_bytes())
+                .and_then(|_| self.s.write_all(b"\r\n"))
+                .and_then(|_| self.s.flush())
+                .map_err(|e| format!("{what}: {e}"))?;
+            self.reply(what)
+        }
+    }
+
+    fn tls(host: &str, tcp: TcpStream) -> Result<Box<dyn Rw>, String> {
+        // nzbkit's shared client config, not a private webpki-only one:
+        // the mail link trusts exactly what the NNTP path trusts, which
+        // is what makes `NZBFAST_EXTRA_CA` (a self-hosted mail relay
+        // with a private CA is the same story as a private indexer)
+        // apply here without a second mechanism.
+        let cfg = nzbkit::nntp::shared_tls_client_config();
+        let name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|_| "bad smtp host name".to_string())?;
+        let conn = rustls::ClientConnection::new(cfg, name).map_err(|e| e.to_string())?;
+        Ok(Box::new(rustls::StreamOwned::new(conn, tcp)))
+    }
+
+    /// An address that can sit inside `<...>` and a header line without
+    /// smuggling more headers in.
+    fn clean_addr<'a>(a: &'a str, what: &str) -> Result<&'a str, String> {
+        let a = a.trim();
+        if a.is_empty()
+            || a.chars()
+                .any(|c| c.is_control() || c == '<' || c == '>' || c == ' ')
+        {
+            return Err(format!("{what} is not a plain address"));
+        }
+        Ok(a)
+    }
+
+    pub(super) fn send_email(t: &Target, cx: &Ctx) -> Result<u16, String> {
+        let url = t.url.trim().trim_end_matches('/');
+        let (tls_first, rest) = if let Some(r) = url.strip_prefix("smtps://") {
+            (true, r)
+        } else if let Some(r) = url.strip_prefix("smtp://") {
+            (false, r)
+        } else {
+            return Err("email url must be smtp://host:port or smtps://host:port".into());
+        };
+        let (host, port) = match rest.rsplit_once(':') {
+            Some((h, p)) => (
+                h.to_string(),
+                p.parse::<u16>().map_err(|_| "bad smtp port".to_string())?,
+            ),
+            None => (rest.to_string(), if tls_first { 465 } else { 587 }),
+        };
+        let to = clean_addr(&t.email_to, "the To address")?;
+        let from = if t.email_from.trim().is_empty() {
+            "nzbfast@localhost"
+        } else {
+            clean_addr(&t.email_from, "the From address")?
+        };
+        // Resolve ourselves and refuse the addresses every other
+        // outbound path refuses (link-local and the cloud-metadata
+        // endpoints - see serve::is_forbidden_fetch_ip). SMTP is raw TCP
+        // rather than a ureq call, so without this it would be the one
+        // outbound fetch of a user-typed host that skips the SSRF guard.
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<std::net::SocketAddr> = (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|e| format!("resolve {host}: {}", e.kind()))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(format!("{host} did not resolve"));
+        }
+        if addrs
+            .iter()
+            .any(|a| crate::serve::is_forbidden_fetch_ip(a.ip()))
+        {
+            return Err("refusing to connect to an internal address".into());
+        }
+        let mut tcp = None;
+        let mut last: Option<std::io::Error> = None;
+        for a in &addrs {
+            match TcpStream::connect_timeout(a, super::TIMEOUT) {
+                Ok(s) => {
+                    tcp = Some(s);
+                    break;
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        let Some(tcp) = tcp else {
+            return Err(format!(
+                "connect {host}:{port}: {}",
+                last.map(|e| e.to_string()).unwrap_or_default()
+            ));
+        };
+        let _ = tcp.set_read_timeout(Some(super::TIMEOUT));
+        let _ = tcp.set_write_timeout(Some(super::TIMEOUT));
+        let mut c;
+        if tls_first {
+            c = Conn {
+                s: tls(&host, tcp)?,
+                buf: Vec::new(),
+            };
+            c.reply("greeting")?;
+            c.cmd("EHLO nzbfast", "EHLO")?;
+        } else {
+            let mut plain = Conn {
+                s: Box::new(tcp.try_clone().map_err(|e| e.to_string())?),
+                buf: Vec::new(),
+            };
+            plain.reply("greeting")?;
+            let (_, ehlo) = plain.cmd("EHLO nzbfast", "EHLO")?;
+            if ehlo.to_ascii_uppercase().contains("STARTTLS") {
+                plain.cmd("STARTTLS", "STARTTLS")?;
+                drop(plain);
+                c = Conn {
+                    s: tls(&host, tcp)?,
+                    buf: Vec::new(),
+                };
+                c.cmd("EHLO nzbfast", "EHLO")?;
+            } else if !t.token.is_empty() {
+                // Never send a login in the clear. The localhost-relay
+                // case (no login) still works plain.
+                return Err(
+                    "the server offers no STARTTLS - use smtps:// or drop the login".into(),
+                );
+            } else {
+                c = plain;
+            }
+        }
+        if !t.token.is_empty() {
+            let Some((u, p)) = t.token.split_once(':') else {
+                return Err("email token must be user:password".into());
+            };
+            let auth = b64(format!("\0{u}\0{p}").as_bytes());
+            c.cmd(&format!("AUTH PLAIN {auth}"), "AUTH")?;
+        }
+        c.cmd(&format!("MAIL FROM:<{from}>"), "MAIL FROM")?;
+        c.cmd(&format!("RCPT TO:<{to}>"), "RCPT TO")?;
+        c.cmd("DATA", "DATA")?;
+        let subject: String = format!("nzbfast: {} - {}", cx.name, cx.status)
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .take(200)
+            .collect();
+        // CRLF line endings and dot-stuffing, per RFC 5321.
+        let text = preset_text(t, cx);
+        let mut body = String::new();
+        for l in text.replace("\r\n", "\n").split('\n') {
+            if l.starts_with('.') {
+                body.push('.');
+            }
+            body.push_str(l);
+            body.push_str("\r\n");
+        }
+        let (code, _) = c.cmd(
+            &format!(
+                "From: {from}\r\nTo: {to}\r\nSubject: {subject}\r\n\
+                 MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}."
+            ),
+            "message",
+        )?;
+        let _ = c.cmd("QUIT", "QUIT");
+        Ok(code)
     }
 }
 
@@ -501,6 +939,8 @@ mod tests {
             bytes: 1234,
             error: String::new(),
             nzo_id: "abc123".into(),
+            event: "completed".into(),
+            repaired: false,
         }
     }
 
@@ -514,7 +954,104 @@ mod tests {
             enabled: true,
             on_failure: false,
             category: String::new(),
+            events: Vec::new(),
+            email_to: String::new(),
+            email_from: String::new(),
         }
+    }
+
+    /// §129 2e: event routing - an empty list keeps the legacy
+    /// contract, a list routes precisely, "repaired" narrows completed.
+    #[test]
+    fn event_routing() {
+        let mut t = target(Kind::Discord);
+        let done = cx();
+        let mut failed = cx();
+        failed.status = "Failed";
+        failed.event = "failed".into();
+        let mut repaired = cx();
+        repaired.repaired = true;
+        let disk = Ctx::for_event("disk", "downloads paused - low disk");
+        // Legacy: completed yes, failed only with on_failure, warnings never.
+        assert!(wants(&t, &done));
+        assert!(!wants(&t, &failed));
+        assert!(!wants(&t, &disk));
+        t.on_failure = true;
+        assert!(wants(&t, &failed));
+        // Routed: only what the list names.
+        t.events = vec!["failed".into(), "disk".into()];
+        assert!(!wants(&t, &done));
+        assert!(wants(&t, &failed));
+        assert!(wants(&t, &disk));
+        // "repaired" is completed-and-repaired, not every completion.
+        t.events = vec!["repaired".into()];
+        assert!(!wants(&t, &done));
+        assert!(wants(&t, &repaired));
+        // The category filter still applies to job events, and a
+        // warning (no category) only reaches unfiltered targets.
+        t.events = vec!["completed".into(), "disk".into()];
+        t.category = "tv".into();
+        assert!(!wants(&t, &done), "movies job vs tv filter");
+        assert!(!wants(&t, &disk), "warnings carry no category");
+        t.category = String::new();
+        assert!(wants(&t, &done));
+    }
+
+    /// The preset message text: stock line by default, the target's own
+    /// template when set, warning events pass their message through.
+    #[test]
+    fn preset_text_shapes() {
+        let mut t = target(Kind::Discord);
+        assert!(preset_text(&t, &cx()).contains("finished downloading"));
+        let mut failed = cx();
+        failed.status = "Failed";
+        failed.event = "failed".into();
+        failed.error = "articles missing".into();
+        assert!(preset_text(&t, &failed).contains("articles missing"));
+        t.body = "{name} -> {status}".into();
+        assert_eq!(
+            preset_text(&t, &cx()),
+            "The Movie & Friends \"2024\" -> Completed",
+            "plain rendering, no JSON escaping - json! escapes at embed time"
+        );
+        let disk = Ctx::for_event("disk", "downloads paused - low disk");
+        t.body = String::new();
+        assert_eq!(preset_text(&t, &disk), "downloads paused - low disk");
+    }
+
+    /// Email guardrails that must not depend on a live server: scheme
+    /// and address validation, and the cleartext-login refusal path is
+    /// covered by the scheme check (smtp:// + token + no STARTTLS needs
+    /// a server; the pure checks live here).
+    #[test]
+    fn email_validation() {
+        let mut t = target(Kind::Email);
+        t.url = "http://mail.example.com".into();
+        t.email_to = "me@example.com".into();
+        let e = send(&t, &cx()).unwrap_err();
+        assert!(e.contains("smtp://"), "{e}");
+        t.url = "smtp://mail.example.com:587".into();
+        t.email_to = "evil\r\nBcc: everyone".into();
+        let e = send(&t, &cx()).unwrap_err();
+        assert!(e.contains("not a plain address"), "{e}");
+    }
+
+    /// SMTP is raw TCP, not a ureq call, so it carries its own copy of
+    /// the outbound SSRF rule: the metadata/link-local class every
+    /// other fetch of a user-typed host already refuses. Loopback stays
+    /// allowed - a localhost relay is the normal no-login setup (and
+    /// what the live-server tests in this module bind to).
+    #[test]
+    fn email_refuses_the_forbidden_address_class() {
+        let mut t = target(Kind::Email);
+        t.email_to = "me@example.com".into();
+        t.url = "smtp://169.254.169.254:587".into();
+        let e = send(&t, &cx()).unwrap_err();
+        assert!(e.contains("internal address"), "{e}");
+        // The refusal is pre-dial: an unspecified address never
+        // resolves into a connect attempt either.
+        t.url = "smtp://0.0.0.0:587".into();
+        assert!(send(&t, &cx()).unwrap_err().contains("internal address"));
     }
 
     #[test]
@@ -565,6 +1102,7 @@ mod tests {
     fn failure_only_reaches_targets_that_asked() {
         let mut failed = cx();
         failed.status = "Failed";
+        failed.event = "failed".into();
         let t = target(Kind::Kodi);
         assert!(wants(&t, &cx()), "completion fires");
         assert!(!wants(&t, &failed), "failure does not, by default");
@@ -852,6 +1390,7 @@ mod tests {
         t.enabled = true;
         let mut failed = cx();
         failed.status = "Failed";
+        failed.event = "failed".into();
         assert!(
             fire(&[t], &failed, 1).is_empty(),
             "did not ask about failures"

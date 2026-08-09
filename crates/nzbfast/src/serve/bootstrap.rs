@@ -394,11 +394,21 @@ pub(super) fn random_apikey() -> Option<String> {
 /// Application Support are already user-only on the other two), and
 /// rewritten on every start, so a stale one from a crashed run is
 /// replaced rather than trusted - and the port it names is checked too.
-pub(super) fn write_runtime_file(settings_path: &std::path::Path, port: u16, token: &str) {
+pub(super) fn write_runtime_file(
+    settings_path: &std::path::Path,
+    port: u16,
+    tls: bool,
+    token: &str,
+) {
     let path = settings_path.with_file_name("runtime.json");
     let body = json!({
         "pid": std::process::id(),
         "port": port,
+        // §129 2a: which scheme this listener answers. Additive - wrappers
+        // that predate it ignore unknown keys, and a wrapper probing http
+        // against a TLS daemon fails its handshake exactly as it would
+        // against a stranger holding the port, which is the safe reading.
+        "tls": tls,
         "token": token,
         "version": env!("CARGO_PKG_VERSION"),
     });
@@ -669,11 +679,12 @@ pub(super) fn is_kind_slug(k: &str) -> bool {
 /// for a credential the user has never seen (the .app and the Windows
 /// installer send the banner to a log file nobody opens). A key already
 /// in the browser needs no help, so it is never re-sent.
-pub(super) fn open_dashboard(port: u16, key: Option<String>) {
+pub(super) fn open_dashboard(port: u16, tls: bool, key: Option<String>) {
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let q = key.map(|k| format!("?apikey={k}")).unwrap_or_default();
-        let url = format!("http://localhost:{port}/{q}");
+        let scheme = if tls { "https" } else { "http" };
+        let url = format!("{scheme}://localhost:{port}/{q}");
         #[cfg(target_os = "macos")]
         let mut cmd = {
             let mut c = std::process::Command::new("open");
@@ -746,6 +757,15 @@ pub(super) fn apply_saved_settings(opts: &mut ServeOpts, path: &std::path::Path)
     }
     if let Some(v) = s("bind").filter(|v| !v.is_empty()) {
         opts.bind = v.to_string();
+    }
+    // §129 2a: an explicitly saved empty string means "TLS off" and must
+    // beat a CLI flag, same as every other key here - a value once
+    // changed in the UI wins on later launches.
+    if let Some(v) = s("tls_cert") {
+        opts.tls_cert = opt_path(v);
+    }
+    if let Some(v) = s("tls_key") {
+        opts.tls_key = opt_path(v);
     }
     if let Some(v) = s("out_dir").filter(|v| !v.is_empty()) {
         opts.out_root = PathBuf::from(v);

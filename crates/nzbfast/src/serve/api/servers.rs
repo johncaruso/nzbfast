@@ -435,6 +435,106 @@ fn m_feed_test(
     })
 }
 
+/// §129 2d: dry-run one feed's rules against its live items. Body:
+/// `{"url": …, "rules": […], "category": …}` - the EDITOR's current
+/// values, not the saved ones, so rules can be tuned before applying.
+/// Reply items carry the verdict ("grab" / "skip" / "seen"), the rule
+/// that decided (why), and the category/priority a grab would use.
+/// Nothing is fetched beyond the feed body and nothing is enqueued;
+/// "seen" comes from the poller's persisted rss-seen.json, so it means
+/// exactly what the poller would mean by it.
+fn m_feed_preview(
+    d: &Arc<Daemon>,
+    req: &mut tiny_http::Request,
+    _params: &std::collections::HashMap<String, String>,
+    _ctx: &ApiCtx<'_>,
+    api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    Some({
+        if req.method() != &tiny_http::Method::Post {
+            json!({"status": false, "error": "POST required"})
+        } else {
+            let raw = api_body.take().unwrap_or_default();
+            let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+            let url = body
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let rules: Vec<String> = body
+                .get("rules")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let feed_cat = body
+                .get("category")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if url.is_empty() {
+                json!({"status": false, "error": "no url"})
+            } else {
+                let r = fetch_url(&url).and_then(|f| {
+                    crate::rss::parse_feed_checked(&String::from_utf8_lossy(&f.bytes))
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                });
+                match r {
+                    Err(e) => {
+                        let h = crate::rss::FeedHealth::failed(
+                            unix_now(),
+                            &e.to_string(),
+                            redact_url_creds,
+                        );
+                        json!({"status": false, "error": h.last_error})
+                    }
+                    Ok(items) => {
+                        let seen: std::collections::HashSet<String> =
+                            std::fs::read(d.spool.join("rss-seen.json"))
+                                .ok()
+                                .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
+                                .map(|v| v.into_iter().collect())
+                                .unwrap_or_default();
+                        // Bounded: a big indexer feed is a few hundred
+                        // items; the preview is a reading aid, not an
+                        // export.
+                        let total = items.len();
+                        let rows: Vec<Value> = items
+                            .into_iter()
+                            .take(200)
+                            .map(|it| {
+                                let j = crate::rss::rules_judge(&rules, &it);
+                                let verdict = if seen.contains(&it.guid) {
+                                    "seen"
+                                } else if j.accept {
+                                    "grab"
+                                } else {
+                                    "skip"
+                                };
+                                json!({
+                                    "title": it.title,
+                                    "size": it.size,
+                                    "verdict": verdict,
+                                    "why": j.why,
+                                    "category": j.opts.category.clone()
+                                        .unwrap_or_else(|| feed_cat.clone()),
+                                    "priority": j.opts.priority.unwrap_or(-100),
+                                })
+                            })
+                            .collect();
+                        json!({"status": true, "total": total, "items": rows})
+                    }
+                }
+            }
+        }
+    })
+}
+
 fn m_indexer_test(
     d: &Arc<Daemon>,
     _req: &mut tiny_http::Request,
@@ -616,7 +716,6 @@ fn m_connladder(
         {
             None => json!({"status": false, "error": "unknown server index"}),
             Some(srv) => {
-                let grp = PROBE_GROUP;
                 // Probe past the CONFIGURED limit on purpose:
                 // some accounts allow 100 sockets, and the knee
                 // may live above a conservative config value.
@@ -638,6 +737,30 @@ fn m_connladder(
                             "error": "a connection test is already running -                                       wait for it to finish, then try again"}));
                 };
                 tokio::runtime::Handle::current().block_on(async {
+                    // Real-content articles from the user's own
+                    // downloads, STAT-verified on this provider (design
+                    // doc 12.1): the synthetic probe group undermeasured
+                    // a provider 17x, in the false-low direction no
+                    // guard can catch. No usable supply = no test, said
+                    // plainly - never a silent probe-group fallback.
+                    let ids = match tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        crate::serve::probeids::real_ladder_ids(d, &srv),
+                    )
+                    .await
+                    {
+                        Err(_) | Ok(None) => {
+                            return json!({"status": false, "no_real_articles": true,
+                            "error": format!(
+                                "{}: no articles from your own recent downloads could \
+                                 be verified on this server, so there is nothing \
+                                 representative to measure with. Complete a download \
+                                 first, then test again",
+                                srv.host
+                            )});
+                        }
+                        Ok(Some(ids)) => ids,
+                    };
                     // Raised with the reopen check: a ladder that
                     // stopped implausibly low now spends up to three
                     // more 5 s probes proving it, and a timeout here
@@ -646,13 +769,7 @@ fn m_connladder(
                         match fixed {
                             Some(n) => {
                                 let n = n.clamp(1, 150);
-                                // Sized for a multi-gig
-                                // line over the 6 s window
-                                // - n×40 drains early and
-                                // caps the reading.
-                                let ids =
-                                    nzbkit::sysbench::discover_ids(&srv, grp, (n * 40).max(7_500))
-                                        .await?;
+                                let ids = ids.clone();
                                 let cfg = nzbkit::pool::PoolConfig {
                                     connections: n,
                                     window: 4,
@@ -691,7 +808,7 @@ fn m_connladder(
                                 let dd = d.clone();
                                 nzbkit::sysbench::conn_ladder(
                                     &srv,
-                                    grp,
+                                    ids.clone(),
                                     cap,
                                     ceiling,
                                     5,
@@ -747,7 +864,18 @@ fn m_connladder(
                                 Some((rungs, peak)) => {
                                     match tokio::time::timeout(
                                         std::time::Duration::from_secs(120),
-                                        nzbkit::sysbench::remeasure(&srv, grp, &rungs, peak, 5),
+                                        // The same verified supply the
+                                        // climb rotated through - the
+                                        // old path re-discovered these
+                                        // very ids, so overlap behavior
+                                        // is unchanged.
+                                        nzbkit::sysbench::remeasure(
+                                            &srv,
+                                            ids.clone(),
+                                            &rungs,
+                                            peak,
+                                            5,
+                                        ),
                                     )
                                     .await
                                     {
@@ -849,9 +977,22 @@ fn m_connladder(
                                                 source: "manual".into(),
                                                 suspect,
                                                 pending: None,
+                                                buckets: Vec::new(),
+                                                shaped: None,
                                                 limit: ceiling,
                                                 v: crate::conntune::SCHEMA,
                                             },
+                                        );
+                                        // A trusted ladder clears the shaped
+                                        // flag in the store; the dashboard's
+                                        // mirror only follows the store inside
+                                        // the live tuner's clean-epoch branch,
+                                        // which does not run with live tuning
+                                        // off or between downloads.
+                                        crate::serve::tasks::mirror_shaped(
+                                            d,
+                                            ctx.cfg_path,
+                                            &srv.host,
                                         );
                                         // Manual runs re-judge line-speed
                                         // coverage too - same as the auto probe.
@@ -991,6 +1132,11 @@ pub(in crate::serve) fn dispatch(
         // credential (`?apikey=…`), and a GET would put it in access
         // logs, browser history and any Referer that follows.
         "feed_test" => return m_feed_test(d, req, params, ctx, api_body),
+        // §129 2d: the dry run behind the Preview button - fetch the
+        // feed NOW and say what the rules WOULD do, item by item,
+        // without grabbing anything. POST for the same credential
+        // reason as feed_test.
+        "feed_preview" => return m_feed_preview(d, req, params, ctx, api_body),
         "indexer_test" => return m_indexer_test(d, req, params, ctx, api_body),
         // M18c: whole-pool burst - every server together at the
         // CURRENT Connections setting, exactly like a real

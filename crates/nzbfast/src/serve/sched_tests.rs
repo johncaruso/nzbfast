@@ -186,3 +186,101 @@ fn fires_at_boundaries() {
     assert!(!e.fires_at(mow(1, 6, 31)));
     assert!(!e.fires_at(mow(2, 6, 30)));
 }
+
+/// §129 2g: the edge actions (server toggles, quota reset) parse, and
+/// contribute NOTHING to the standing pause/limit state - replaying a
+/// week of config edits at startup would fight the user's own toggles.
+#[test]
+fn edge_actions_parse_and_carry_no_state() {
+    let entries = parse_schedule(
+        r#"[
+        {"days":"mon","time":"01:00","action":"server_enable","value":"news.example.com"},
+        {"days":"mon","time":"02:00","action":"server_disable","value":"backup.example.com"},
+        {"days":"mon","time":"03:00","action":"quota_reset"},
+        {"days":"mon","time":"04:00","action":"pause"}
+    ]"#,
+    )
+    .unwrap();
+    assert_eq!(
+        entries[0].action,
+        SchedAction::ServerEnable {
+            host: "news.example.com".into(),
+            on: true
+        }
+    );
+    assert_eq!(
+        entries[1].action,
+        SchedAction::ServerEnable {
+            host: "backup.example.com".into(),
+            on: false
+        }
+    );
+    assert_eq!(entries[2].action, SchedAction::QuotaReset);
+    // Monday 05:00: the pause entry is the state; the edges said nothing.
+    let (paused, limit) = effective_state(&entries, mow(0, 5, 0));
+    assert_eq!(paused, Some(true));
+    assert_eq!(limit, None);
+    // A server action without a host is a config error, said plainly.
+    assert!(parse_schedule(r#"[{"days":"mon","time":"01:00","action":"server_enable"}]"#).is_err());
+    // ...and an unknown action still names the full menu.
+    let err = parse_schedule(r#"[{"days":"mon","time":"01:00","action":"defrag"}]"#)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("quota_reset"), "menu missing from: {err}");
+}
+
+/// §129 2g: a fired server toggle edits the config exactly as the
+/// settings toggle does, keyed by host (case-insensitive); an unknown
+/// host does nothing rather than guessing.
+#[test]
+fn a_scheduled_server_toggle_edits_the_config_by_host() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-schedsrv-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = crate::serve::testutil::test_daemon(&dir);
+    std::fs::write(
+        &d.cfg_path,
+        r#"{"servers":[{"host":"news.example.com","port":563,"username":"u","password":"p"}]}"#,
+    )
+    .unwrap();
+    super::apply_action(
+        &d,
+        SchedAction::ServerEnable {
+            host: "NEWS.example.com".into(),
+            on: false,
+        },
+    );
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&d.cfg_path).unwrap()).unwrap();
+    assert_eq!(
+        cfg["servers"][0]["enabled"],
+        serde_json::json!(false),
+        "the host match is case-insensitive and writes enabled=false"
+    );
+    // Re-enabling removes the key (default; keeps the file clean).
+    super::apply_action(
+        &d,
+        SchedAction::ServerEnable {
+            host: "news.example.com".into(),
+            on: true,
+        },
+    );
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&d.cfg_path).unwrap()).unwrap();
+    assert!(cfg["servers"][0].get("enabled").is_none());
+    // An unknown host must not touch the file.
+    let before = std::fs::read_to_string(&d.cfg_path).unwrap();
+    super::apply_action(
+        &d,
+        SchedAction::ServerEnable {
+            host: "nobody.example.com".into(),
+            on: false,
+        },
+    );
+    assert_eq!(std::fs::read_to_string(&d.cfg_path).unwrap(), before);
+    // A quota reset only raises the flag; the download runner owns the
+    // ledger and applies it on its next pass.
+    super::apply_action(&d, SchedAction::QuotaReset);
+    assert!(d.quota_reset.load(std::sync::atomic::Ordering::Relaxed));
+    let _ = std::fs::remove_dir_all(&dir);
+}

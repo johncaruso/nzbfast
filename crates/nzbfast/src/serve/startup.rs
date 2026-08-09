@@ -108,8 +108,46 @@ pub(super) fn restore_runtime_state(
         if let Some(on) = saved.get("par_cleanup").and_then(Value::as_bool) {
             daemon.par_cleanup.store(on, Ordering::Relaxed);
         }
+        // §129 lane width. settings.json only for now (no UI row until
+        // testers ask - a setting is three places). Clamped again at the
+        // read, so a hand-edited 0 or 99 cannot widen the lane.
+        if let Some(n) = saved.get("postproc_jobs").and_then(Value::as_u64) {
+            daemon.postproc_jobs.store(n.clamp(1, 4), Ordering::Relaxed);
+        }
+        // §129 3e. The switch is a real setting (UI + get_config); the
+        // detector's thresholds are settings.json only, under
+        // `slow_storage`, and every one of them is clamped on read - a
+        // hand-edited file must not be able to make this a hair trigger.
+        if let Some(on) = saved.get("slow_storage_pause").and_then(Value::as_bool) {
+            daemon.slow_storage.set_enabled(on);
+        }
+        if let Some(v) = saved.get("slow_storage") {
+            daemon
+                .slow_storage
+                .set_tune(crate::serve::slowstore::Tune::from_settings(v));
+        }
         if let Some(on) = saved.get("watch_keep_nzb").and_then(Value::as_bool) {
             daemon.watch_keep_nzb.store(on, Ordering::Relaxed);
+        }
+        if let Some(on) = saved.get("watch_recursive").and_then(Value::as_bool) {
+            daemon.watch_recursive.store(on, Ordering::Relaxed);
+        }
+        if let Some(on) = saved.get("watch_move_rejected").and_then(Value::as_bool) {
+            daemon.watch_move_rejected.store(on, Ordering::Relaxed);
+        }
+        if let Some(v) = saved.get("cat_meta") {
+            match serde_json::from_value::<
+                std::collections::HashMap<String, crate::serve::daemon::CatMeta>,
+            >(v.clone())
+            {
+                Ok(m) => *daemon.cat_meta.lock_ok() = m,
+                Err(e) => warn!(target: "config", "ignoring saved cat_meta: {e}"),
+            }
+        }
+        if let Some(m) = saved.get("dupe_action").and_then(Value::as_str)
+            && matches!(m, "pause" | "discard" | "fail")
+        {
+            *daemon.dupe_action.lock_ok() = m.to_string();
         }
         if let Some(on) = saved.get("fast_par").and_then(Value::as_bool) {
             daemon.fast_par.store(on, Ordering::Relaxed);
@@ -252,6 +290,10 @@ pub(super) fn restore_runtime_state(
         if let Some(v) = saved.get("auto_connections").and_then(Value::as_bool) {
             daemon.auto_connections.store(v, Ordering::Relaxed);
         }
+        if let Some(v) = saved.get("live_tune").and_then(Value::as_bool) {
+            daemon.live_tune.store(v, Ordering::Relaxed);
+            daemon.hub.live_tune.store(v, Ordering::Relaxed);
+        }
         if let Some(v) = saved.get("auto_defer").and_then(Value::as_bool) {
             daemon.auto_defer.store(v, Ordering::Relaxed);
         }
@@ -357,6 +399,11 @@ pub(super) fn restore_runtime_state(
         // No create/writable check at startup: a NAS that is down at
         // boot must not wipe the setting - the move path degrades to
         // leave-in-place on its own.
+        if let Some(v) = saved.get("move_pace").and_then(Value::as_str)
+            && !v.is_empty()
+        {
+            *daemon.move_pace.lock_ok() = v.to_string();
+        }
         if let Some(v) = saved.get("move_completed").and_then(Value::as_str)
             && !v.is_empty()
         {
@@ -424,6 +471,24 @@ pub(super) fn restore_runtime_state(
             && (1..=200).contains(&v)
         {
             daemon.history_rows.store(v, Ordering::Relaxed);
+        }
+        // §129 D5: the optional retention knobs (0 = unlimited, the
+        // default). Seeded AFTER load_queue has restored the records,
+        // so enforce once here - the load-time pass ran with the knobs
+        // still at their unlimited defaults.
+        {
+            let mut retention_set = false;
+            if let Some(v) = saved.get("history_keep_count").and_then(Value::as_u64) {
+                daemon.history_keep_count.store(v, Ordering::Relaxed);
+                retention_set = v > 0;
+            }
+            if let Some(v) = saved.get("history_keep_days").and_then(Value::as_u64) {
+                daemon.history_keep_days.store(v, Ordering::Relaxed);
+                retention_set |= v > 0;
+            }
+            if retention_set {
+                daemon.history_enforce_retention();
+            }
         }
         if let Some(v) = saved.get("bench_interval").and_then(Value::as_u64) {
             daemon.bench_interval.store(v, Ordering::Relaxed);
@@ -741,7 +806,61 @@ pub(super) fn resolve_index_enabled(settings_path: &Path, index_groups: &[String
     }
 }
 
-pub(super) fn take_listener(bind: &str, port: u16) -> Result<tiny_http::Server> {
+/// ABSOLUTE from here on. Sonarr reads `misc.complete_dir` out of
+/// get_config to learn where this client puts files, and a relative
+/// path means nothing to another process - different cwd, often a
+/// different container or host - so it reports "Remote Path Mapping"
+/// while the downloads themselves land perfectly, because WE resolve
+/// it against our own cwd. That is exactly the shape of the v1.0.9
+/// report: right folder, wrong error. SABnzbd always answers absolute.
+///
+/// Resolved rather than canonicalized: the directory may not exist
+/// yet on a first run, and canonicalize() fails on a missing path.
+pub(super) fn absolute_out_root(out_root: PathBuf) -> PathBuf {
+    if out_root.is_absolute() {
+        out_root
+    } else {
+        std::env::current_dir()
+            .map(|c| c.join(&out_root))
+            .unwrap_or(out_root)
+    }
+}
+
+/// Both halves or neither: one file alone is a misconfiguration the
+/// user should hear about, but not one worth refusing to start over -
+/// the daemon they had yesterday still works, on plain HTTP.
+pub(super) fn resolve_tls_pair<'a>(
+    tls_cert: &'a Option<PathBuf>,
+    tls_key: &'a Option<PathBuf>,
+) -> Option<(&'a Path, &'a Path)> {
+    match (tls_cert, tls_key) {
+        (Some(c), Some(k)) => Some((c.as_path(), k.as_path())),
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            eprintln!(
+                "⚠ TLS is half-configured ({} is set, {} is not) - serving plain HTTP. \
+                 Set both tls_cert and tls_key, or neither.",
+                if tls_cert.is_some() {
+                    "tls_cert"
+                } else {
+                    "tls_key"
+                },
+                if tls_cert.is_some() {
+                    "tls_key"
+                } else {
+                    "tls_cert"
+                },
+            );
+            None
+        }
+    }
+}
+
+pub(super) fn take_listener(
+    bind: &str,
+    port: u16,
+    tls: Option<(&Path, &Path)>,
+) -> Result<tiny_http::Server> {
     // Take the listener HERE: after the API key is settled, and before the
     // first thing that writes to the data directory.
     //
@@ -782,7 +901,107 @@ pub(super) fn take_listener(bind: &str, port: u16) -> Result<tiny_http::Server> 
     // invariant is "the listener exists AND the file appears before the
     // readiness banner" - both still hold with the bind up here - and it
     // needs the daemon's launcher token, which is only constructed below.
-    tiny_http::Server::http((bind, port)).map_err(|e| anyhow::anyhow!("bind {bind}:{port}: {e}"))
+    match tls {
+        None => tiny_http::Server::http((bind, port))
+            .map_err(|e| anyhow::anyhow!("bind {bind}:{port}: {e}")),
+        Some((cert, key)) => {
+            // Certificate problems are diagnosed HERE, before the bind,
+            // so the error names the file and what is wrong with it -
+            // tiny_http's own failure would say neither, and a browser's
+            // refusal says it in a different tab on a different machine.
+            let config = tls_server_config(cert, key)?;
+            tiny_http::Server::https(
+                (bind, port),
+                tiny_http::SslConfig {
+                    server_config: config,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("bind {bind}:{port} (tls): {e}"))
+        }
+    }
+}
+
+/// Build the rustls server config for `--tls-cert`/`--tls-key`, with the
+/// failure modes an operator actually hits spelled out and the offending
+/// FILE named: unreadable, not PEM, empty chain, expired or not yet valid,
+/// key that does not match. The provider is aws-lc-rs by name, like every
+/// other TLS surface in the tree (both aws-lc-rs and ring are linked, so a
+/// provider-less `builder()` panics at run time - see
+/// `nzbkit::benchserve::tls_config`).
+///
+/// Expiry is checked on the LEAF (first) certificate only, and it refuses
+/// rather than warns: every client will refuse it too, so "starts, then
+/// nothing can connect" is the strictly worse behaviour. A CA-flagged leaf
+/// (basicConstraints CA:TRUE - what a bare `openssl req -x509` mints) only
+/// warns: browsers accept it with a click-through, and only rustls-strict
+/// clients refuse it as CaUsedAsEndEntity.
+fn tls_server_config(cert: &Path, key: &Path) -> Result<std::sync::Arc<rustls::ServerConfig>> {
+    use rustls::pki_types::pem::PemObject;
+    let certs: Vec<rustls::pki_types::CertificateDer<'_>> =
+        rustls::pki_types::CertificateDer::pem_file_iter(cert)
+            .map_err(|e| anyhow::anyhow!("tls_cert {}: {e}", cert.display()))?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| anyhow::anyhow!("tls_cert {}: {e}", cert.display()))?;
+    if certs.is_empty() {
+        anyhow::bail!(
+            "tls_cert {}: no certificates in the file (is it a PEM certificate?)",
+            cert.display()
+        );
+    }
+    match x509_parser::parse_x509_certificate(certs[0].as_ref()) {
+        Ok((_, leaf)) => {
+            let v = leaf.validity();
+            let now = x509_parser::time::ASN1Time::now();
+            if !v.is_valid_at(now) {
+                anyhow::bail!(
+                    "tls_cert {}: the certificate is {} (valid {} to {}) - every browser \
+                     and API client will refuse it. Renew it, or remove tls_cert/tls_key \
+                     to serve plain HTTP",
+                    cert.display(),
+                    if now > v.not_after {
+                        "expired"
+                    } else {
+                        "not valid yet"
+                    },
+                    v.not_before,
+                    v.not_after,
+                );
+            }
+            if leaf.is_ca() {
+                eprintln!(
+                    "⚠ tls_cert {}: the certificate is flagged as a CA \
+                     (basicConstraints CA:TRUE - what a bare `openssl req -x509` produces). \
+                     Browsers allow it with a warning, but strict clients refuse a CA \
+                     certificate used as a server certificate. Re-issue with \
+                     -addext basicConstraints=critical,CA:FALSE to satisfy everyone.",
+                    cert.display()
+                );
+            }
+        }
+        Err(e) => {
+            anyhow::bail!(
+                "tls_cert {}: not a valid X.509 certificate ({e})",
+                cert.display()
+            )
+        }
+    }
+    let key_der = rustls::pki_types::PrivateKeyDer::from_pem_file(key)
+        .map_err(|e| anyhow::anyhow!("tls_key {}: {e}", key.display()))?;
+    let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| anyhow::anyhow!("tls: {e}"))?
+    .with_no_client_auth()
+    .with_single_cert(certs, key_der)
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "tls: {} / {}: {e} (usually the key does not belong to the certificate)",
+            cert.display(),
+            key.display()
+        )
+    })?;
+    Ok(std::sync::Arc::new(config))
 }
 
 pub(super) fn acquire_serve_lock(spool: &Path, config: &Path) -> Result<Option<std::fs::File>> {
@@ -904,6 +1123,22 @@ pub(super) fn spawn_core_tasks(
 
     tasks::spawn_library_recheck(daemon, config);
 
+    // C: the mover - finished jobs' move-completed relocations run
+    // here, off the finalize tail. Re-queue what a previous run left
+    // owed BEFORE the worker starts draining: `move_pending` persists,
+    // and move_tree's staging survives a mid-move kill, so a restart
+    // resumes with a fresh copy instead of a stranded payload.
+    for job in daemon.history.lock_ok().iter() {
+        let owed = {
+            let g = job.lock_ok();
+            g.state == crate::serve::job::JobState::Completed && g.move_pending
+        };
+        if owed {
+            daemon.mover_enqueue(job);
+        }
+    }
+    mover::spawn_mover(daemon);
+
     // §76: the queue-row quality chip - reads the running job's own
     // container header so the row can say what the file IS, and warn
     // when that contradicts the name it was posted under.
@@ -912,15 +1147,43 @@ pub(super) fn spawn_core_tasks(
     tasks::spawn_slow_job_watchdog(daemon, config, mem_budget);
     tasks::spawn_live_tuner(daemon, config);
     super::linkpeak::spawn(daemon);
+    // §129 3e: the chronic slow-storage judge. Inert unless a job is
+    // downloading (or its own pause is holding).
+    super::slowstore::spawn(daemon);
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
+/// M13: the metadata enrichment worker's key. With a TMDB key (config
+/// tmdb_key or TMDB_API_KEY env) it uses TMDB; WITHOUT one it still runs,
+/// keyless, via TVmaze (tv) + Wikidata/Wikipedia (movies) - TMDB declines
+/// API applications for NZB tooling, so keyless is the normal path. iTunes
+/// used to serve movies; Apple removed that endpoint. Network stays on the
+/// worker's thread - never the API's.
+#[cfg(feature = "indexer")]
+pub(super) fn config_tmdb_key(config: &Path) -> Option<String> {
+    nzbkit::config::Config::load(config)
+        .ok()
+        .and_then(|c| c.tmdb_key)
+        .or_else(|| std::env::var("TMDB_API_KEY").ok())
+        .filter(|k| !k.is_empty())
+}
+
+/// The background lanes that need nothing but the daemon and the config
+/// path. Spawned after [`spawn_core_tasks`], and after the enrichment
+/// workers, which need the TMDB key resolved first.
+pub(super) fn spawn_aux_tasks(daemon: &Arc<Daemon>, config: &Path) {
+    tasks::spawn_update_checker(daemon);
+    tasks::spawn_scheduled_bench(daemon, config);
+    tasks::spawn_auto_connections(daemon, config);
+}
+
 pub(super) fn announce_ready(
     daemon: &Arc<Daemon>,
     settings_path: &Path,
     bind: &str,
     port: u16,
+    tls: bool,
     minted_key: &Option<(String, PathBuf)>,
     mint_disclosure: &mut MintDisclosure,
     open: bool,
@@ -937,9 +1200,13 @@ pub(super) fn announce_ready(
     // then silently degraded to the no-token path, which is exactly the
     // permissive arm. The listener is already bound here, so nothing
     // about the file's meaning changes.
-    write_runtime_file(settings_path, port, &daemon.launcher_token);
-    println!("nzbfast is running - open the dashboard at  http://localhost:{port}/");
-    println!("(SABnzbd-compatible API for Sonarr/Radarr at  http://localhost:{port}/api)");
+    write_runtime_file(settings_path, port, tls, &daemon.launcher_token);
+    // The scheme in the banner is load-bearing: harnesses and launchers
+    // treat the exact line as the readiness signal, and a user pasting
+    // the URL must get the one this listener actually answers.
+    let scheme = if tls { "https" } else { "http" };
+    println!("nzbfast is running - open the dashboard at  {scheme}://localhost:{port}/");
+    println!("(SABnzbd-compatible API for Sonarr/Radarr at  {scheme}://localhost:{port}/api)");
     if let Some((key, keyfile)) = &minted_key {
         // Printed exactly once, on the first run that generated it. It is
         // the credential the user must paste into Sonarr/Radarr, so it
@@ -977,12 +1244,27 @@ pub(super) fn announce_ready(
         );
     }
     if open {
-        open_dashboard(port, minted_key.as_ref().map(|(k, _)| k.clone()));
+        open_dashboard(port, tls, minted_key.as_ref().map(|(k, _)| k.clone()));
     }
 }
 
 /// Issue #9: a fresh-install mint with a non-empty download root means
 /// the config directory most likely moved - say so, loudly, once.
+///
+/// One explanation, printed at the moment it is true. A minted key
+/// means the data directory read as brand new; a download root already
+/// in use says the more likely story is an EXISTING install whose
+/// config directory moved out from under it - a recreated container
+/// reading an empty /config, a relative bind mount run from a
+/// different directory, a fresh appdata path. From here everything
+/// behaves like a first run, and without this line the user's next
+/// stop is a bug report titled "all my settings are gone" (issue #9's
+/// field report, verbatim).
+///
+/// A warning ONLY. The download root must never join the
+/// fresh-vs-existing decision itself - that was tried, and it was a
+/// security regression (see first_run_apikey). Nothing here changes
+/// what was minted or decided.
 pub(super) fn warn_if_config_moved(minted_key: &Option<(String, PathBuf)>, out_root: &Path) {
     if minted_key.is_some() {
         let prior_use = out_root.join(".spool").exists()
@@ -1002,4 +1284,476 @@ pub(super) fn warn_if_config_moved(minted_key: &Option<(String, PathBuf)>, out_r
             );
         }
     }
+}
+
+/// What `boot` hands back: the daemon itself, the listener and
+/// lock it took on the way, and the handful of opts values the
+/// rest of serve() still needs. Everything else in ServeOpts is
+/// consumed into the Daemon's fields.
+pub(super) struct Booted {
+    pub(super) daemon: Arc<Daemon>,
+    pub(super) server: tiny_http::Server,
+    /// The single-instance lock. Held, never read: dropping it
+    /// frees the lock, so it must outlive the run - see the bind
+    /// note in serve().
+    pub(super) _serve_lock: Option<std::fs::File>,
+    pub(super) spool: PathBuf,
+    pub(super) bind: String,
+    pub(super) port: u16,
+    pub(super) tls_on: bool,
+    pub(super) open: bool,
+    pub(super) schedule: Option<PathBuf>,
+    pub(super) feeds: Option<PathBuf>,
+    pub(super) speedlimit: Option<String>,
+    pub(super) mem_budget: nzbkit::mem::MemBudget,
+    #[cfg(feature = "indexer")]
+    pub(super) index_db: PathBuf,
+}
+
+/// Resolve the options, take the port and the lock, and build the
+/// Daemon (TODO 106: lifted out of serve(), which was 535 lines
+/// against a 500 ceiling and 334 of them this one struct literal).
+/// The code is verbatim and the ORDER is load-bearing exactly as
+/// startup.rs's header says: the key is settled before the bind,
+/// the bind before anything writes to the data directory.
+pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Result<Booted> {
+    // Owned copies so the construction below reads as it did inside
+    // serve(), where both were locals.
+    let config = config.to_path_buf();
+    let settings_path = settings_path.to_path_buf();
+    let ServeOpts {
+        group_desc_isc: _,
+        port,
+        bind,
+        tls_cert,
+        tls_key,
+        open,
+        apikey,
+        nzbkey,
+        out_root,
+        watch,
+        script,
+        connections,
+        window,
+        decoders,
+        fast_verify,
+        verify_lean,
+        min_free,
+        out_umask,
+        auto_retry_mins,
+        preflight,
+        quota,
+        quota_period,
+        feeds,
+        speedlimit,
+        schedule,
+        auto_speed,
+        library_cats,
+        library_recheck_secs,
+        mem_budget,
+        #[cfg(feature = "indexer")]
+        index_db,
+        #[cfg(feature = "indexer")]
+        index_groups,
+        #[cfg(feature = "indexer")]
+        index_interval_secs,
+        #[cfg(feature = "indexer")]
+        index_backfill,
+        #[cfg(feature = "indexer")]
+        index_max_age_secs,
+        #[cfg(feature = "indexer")]
+        index_gates,
+    } = opts;
+    let legacy_rename_punctuation = legacy_rename_punctuation(&config, &out_root, &settings_path);
+    // The indexer's master switch, and the one migration it needs.
+    //
+    // A saved value always wins - that is the user's answer. With NO
+    // saved value we are either a fresh install (off: see the field's
+    // doc comment) or an install from before the switch existed, and
+    // those two are told apart by whether anything was ever chosen to
+    // index. Groups here already carry settings.json and the config file
+    // (see the settings merge above), so a CLI `--index-groups` or a
+    // hand-written config counts too - starting a daemon that was
+    // explicitly pointed at groups and then not scanning them would be
+    // the same surprise as the upgrade case.
+    #[cfg(not(feature = "indexer"))]
+    let index_enabled = false;
+    #[cfg(feature = "indexer")]
+    let index_enabled = resolve_index_enabled(&settings_path, &index_groups);
+    // Resolved once: every spool path below must agree, or a migrated
+    // daemon reads half its state from the old location.
+    // Both of these were inline here until origin's parallel size-gate
+    // pass lifted them; the comments that explain them live on the
+    // helpers now.
+    let out_root = absolute_out_root(out_root);
+    let tls_pair = resolve_tls_pair(&tls_cert, &tls_key);
+    let server = take_listener(&bind, port, tls_pair)?;
+    let tls_on = tls_pair.is_some();
+    let spool = spool_dir(&config, &out_root);
+    // Windows has no dotfile convention, so `.spool` is plainly visible
+    // wherever it lands - including inside the user's download folder on
+    // an install that predates the data-dir move. Create it up front so
+    // there is something to set the attribute ON: every other writer
+    // makes it implicitly via create_dir_all of a child, which would
+    // leave the hide to lose a race it cannot see.
+    let _ = std::fs::create_dir_all(&spool);
+    nzbkit::disk::hide_from_user(&spool);
+    let _serve_lock = acquire_serve_lock(&spool, &config)?;
+    let daemon = Arc::new(Daemon {
+        hub: Arc::new(crate::StreamHub::default()),
+        paused: std::sync::atomic::AtomicBool::new(false),
+        offline: std::sync::atomic::AtomicBool::new(false),
+        paused_by_offline: std::sync::atomic::AtomicBool::new(false),
+        queue: Mutex::new(VecDeque::new()),
+        history: Mutex::new(Vec::new()),
+        queue_rev: AtomicU64::new(1),
+        history_rev: AtomicU64::new(1),
+        life_seq: AtomicU64::new(0),
+        life_events: Mutex::new(VecDeque::new()),
+        history_keep_count: AtomicU64::new(0),
+        history_keep_days: AtomicU64::new(0),
+        add_lock: Mutex::new(()),
+        moving: Mutex::new(std::collections::HashSet::new()),
+        mover_q: Mutex::new(VecDeque::new()),
+        mover_wake: tokio::sync::Notify::new(),
+        mover_bucket: Mutex::new(mover::PaceState::default()),
+        move_pace: Mutex::new("yield".to_string()),
+        reserved: Mutex::new(std::collections::HashSet::new()),
+        progress: Arc::new(AtomicU64::new(0)),
+        active_total: AtomicU64::new(0),
+        active_dl: Mutex::new(None),
+        started_at: Mutex::new(None),
+        last_download_end: Mutex::new(Instant::now()),
+        stall_since: Mutex::new(None),
+        playback_disk: Mutex::new(std::collections::HashMap::new()),
+        next_id: AtomicU64::new(1),
+        out_root: std::sync::RwLock::new(out_root.clone()),
+        move_completed: std::sync::RwLock::new(None),
+        move_completed_cats: std::sync::RwLock::new(Vec::new()),
+        spool: spool.clone(),
+        cfg_path: config.clone(),
+        cats: Mutex::new(DEFAULT_CATS.iter().map(|s| s.to_string()).collect()),
+        port,
+        // A failed mint leaves an EMPTY token, and `launcher_proof` then
+        // answers a challenge with sha256(":nonce") - a value any process
+        // could compute. Refuse to answer at all instead: the wrappers
+        // treat "no proof" as "an older daemon" and fall back, which is
+        // strictly better than a proof anyone can forge.
+        launcher_token: random_apikey().unwrap_or_default(),
+        port_locked: port_locked(),
+        // What THIS run bound with (both present and valid, or the run
+        // would not exist) - the settings card reads these back, and
+        // `pending` in get_config diffs them against the saved values.
+        tls_cert: if tls_on { tls_cert.clone() } else { None },
+        tls_key: if tls_on { tls_key.clone() } else { None },
+        library_cats: Mutex::new(library_cats),
+        active_stream: Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        index_db: index_db.clone(),
+        #[cfg(feature = "indexer")]
+        index: Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        index_read: IndexReadPool::default(),
+        #[cfg(feature = "indexer")]
+        index_read_warned: AtomicU64::new(0),
+        #[cfg(feature = "indexer")]
+        index_migrated: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "indexer")]
+        index_stats_cache: Mutex::new(None),
+        auto_speed: std::sync::atomic::AtomicBool::new(auto_speed),
+        preflight: std::sync::atomic::AtomicBool::new(preflight),
+        auto_connections: std::sync::atomic::AtomicBool::new(true),
+        // OFF until the §129 real-line gate passes (design §9 step 4).
+        live_tune: std::sync::atomic::AtomicBool::new(false),
+        shaped_hosts: Mutex::new(Default::default()),
+        wall_hide_adult: std::sync::atomic::AtomicBool::new(true),
+        auto_defer: std::sync::atomic::AtomicBool::new(true),
+        post_health: std::sync::atomic::AtomicBool::new(true),
+        post_health_defer: std::sync::atomic::AtomicBool::new(false),
+        auto_prefetch: std::sync::atomic::AtomicBool::new(true),
+        race_stragglers: std::sync::atomic::AtomicBool::new(true),
+        adaptive_timeouts: std::sync::atomic::AtomicBool::new(true),
+        oracle_route: std::sync::atomic::AtomicBool::new(false),
+        index_deepen: AtomicU64::new(200_000),
+        index_coverage: std::sync::atomic::AtomicBool::new(true),
+        index_gapfill: AtomicU64::new(4),
+        bench_interval: AtomicU64::new(0),
+        bench_last: AtomicU64::new(0),
+        update_manifest: Mutex::new(None),
+        update_serial_seen: std::sync::atomic::AtomicU64::new(0),
+        // Notify-only: finding a newer version raises the dashboard
+        // banner and nothing else - the daemon never replaces its own
+        // binary (the self-update code was removed in 1.0.5; the
+        // manifest itself is still ed25519-verified before the banner
+        // trusts it). ON by default so users hear about releases; turn
+        // it off here (or empty update_url) and the daemon never
+        // phones the manifest at all.
+        update_checks: std::sync::atomic::AtomicBool::new(true),
+        unit_bits: std::sync::atomic::AtomicBool::new(false),
+        update_url: Mutex::new(DEFAULT_UPDATE_URL.to_string()),
+        ui_locale: Mutex::new(String::new()),
+        sidecar: Mutex::new(None),
+        media_rejudge: Mutex::new(Vec::new()),
+        best_rate_bps: AtomicU64::new(0),
+        speed_ceiling: AtomicU64::new(0),
+        mem_budget_total: mem_budget.total,
+        feeds: Mutex::new(Vec::new()),
+        feed_health: Mutex::new(Default::default()),
+        last_refusals: Mutex::new(Default::default()),
+        events: Mutex::new(Default::default()),
+        indexers: Mutex::new(Vec::new()),
+        watchlist_external: std::sync::atomic::AtomicBool::new(false),
+        watchlist_external_set: std::sync::atomic::AtomicBool::new(false),
+        indexer_rt: Mutex::new(IndexerRuntime::default()),
+        // §74: on by default and inert without the indexer - see the
+        // field. Saved settings replay over these below.
+        watchlist_instant: AtomicBool::new(true),
+        watchlist_instant_max: std::sync::atomic::AtomicU32::new(INSTANT_MAX_DEFAULT),
+        #[cfg(feature = "indexer")]
+        instant_kicks: Mutex::new(std::collections::VecDeque::new()),
+        #[cfg(feature = "indexer")]
+        instant_pending: Mutex::new(std::collections::HashMap::new()),
+        instant_hint: Mutex::new(Vec::new()),
+        nzblnk_recent: Mutex::new(std::collections::VecDeque::new()),
+        smart_folders: Mutex::new(Vec::new()),
+        par_cleanup: AtomicBool::new(true),
+        postproc_jobs: AtomicU64::new(2),
+        slow_storage: Default::default(),
+        // OFF unless asked for: a silent install keeps its modes (#20).
+        out_umask: std::sync::atomic::AtomicU32::new(out_umask.unwrap_or(u32::MAX)),
+        fast_par: AtomicBool::new(FAST_PAR_DEFAULT),
+        prefer_external_unrar: AtomicBool::new(false),
+        cleanup_exts: Mutex::new(Vec::new()),
+        password_file: Mutex::new(config.with_file_name("passwords.txt")),
+        password_prompt: Mutex::new("done".to_string()),
+        unpack_eat_volumes: Mutex::new("off".to_string()),
+        // Loaded from settings.json below (next to smart_folders); the
+        // reclassify flag starts set so startup reconciles the stored
+        // rows against the current config exactly once (the index stamps
+        // the config fingerprint, so an unchanged config is a no-op).
+        custom_categories: std::sync::RwLock::new(Vec::new()),
+        reclassify_pending: std::sync::atomic::AtomicBool::new(true),
+        // Auto-rename defaults: on, with resolution in the name; codecs /
+        // source / group off; junk sweep on; keep-media-only off. Saved
+        // settings replay over these below.
+        identity_lookup: std::sync::atomic::AtomicBool::new(true),
+        auto_rename: std::sync::atomic::AtomicBool::new(true),
+        rename_resolution: std::sync::atomic::AtomicBool::new(true),
+        rename_vcodec: std::sync::atomic::AtomicBool::new(false),
+        rename_acodec: std::sync::atomic::AtomicBool::new(false),
+        rename_source: std::sync::atomic::AtomicBool::new(false),
+        rename_group: std::sync::atomic::AtomicBool::new(false),
+        rename_year_parens: std::sync::atomic::AtomicBool::new(legacy_rename_punctuation),
+        rename_quality_brackets: std::sync::atomic::AtomicBool::new(legacy_rename_punctuation),
+        rename_extra_words: std::sync::atomic::AtomicBool::new(true),
+        rename_identify: std::sync::atomic::AtomicBool::new(true),
+        // Off by default, alone among the rename sub-settings: it
+        // changes filenames an existing install already wrote, and an
+        // *arr's import matcher is reading those. See the field docs.
+        rename_episode_titles: std::sync::atomic::AtomicBool::new(false),
+        history_rows: AtomicU64::new(10),
+        history_color_names: std::sync::atomic::AtomicBool::new(true),
+        ladder_live: Mutex::new(None),
+        ladder_busy: std::sync::atomic::AtomicBool::new(false),
+        ladder_cancel: std::sync::atomic::AtomicBool::new(false),
+        media_chip_color: std::sync::atomic::AtomicBool::new(true),
+        shape_chip_color: std::sync::atomic::AtomicBool::new(true),
+        rename_junk: std::sync::atomic::AtomicBool::new(true),
+        rename_media_only: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "indexer")]
+        index_max_age_secs: AtomicU64::new(index_max_age_secs),
+        #[cfg(not(feature = "indexer"))]
+        index_max_age_secs: AtomicU64::new(0),
+        // Retention defaults ON: if a user bothered to set a max-age
+        // window they almost always want the DB to hold ~that window,
+        // not hoard everything older. Off = ingest-gate-only (the
+        // pre-M31 behavior), toggle in Settings (persists across
+        // restarts like the other live settings).
+        index_retention: seed_index_retention(&settings_path),
+        index_pause_on_download: seed_index_pause_on_download(&settings_path),
+        index_paused: seed_index_paused(&settings_path),
+        index_enabled: std::sync::atomic::AtomicBool::new(index_enabled),
+        // Pre feed: OFF unless the user has explicitly saved it on. A
+        // missing key, a null, or a non-bool all land here - there is no
+        // path that opens an outbound IRC connection by accident.
+        predb_enabled: seed_predb_enabled(&settings_path),
+        predb_server: seed_predb_server(&settings_path),
+        predb_channels: seed_predb_channels(&settings_path),
+        predb_nick: seed_predb_nick(&settings_path),
+        #[cfg(feature = "indexer")]
+        predb_pending: Mutex::new(Vec::new()),
+        predb_status: Mutex::new(String::new()),
+        // Correlation: same explicit-opt-in contract as the feed. Both
+        // default OFF; a missing key never turns an inference engine on.
+        predb_corr_enabled: seed_predb_corr_enabled(&settings_path),
+        predb_corr_auto: seed_predb_corr_auto(&settings_path),
+        #[cfg(feature = "indexer")]
+        predb_max_rows: std::sync::atomic::AtomicU64::new(predb_seed::PREDB_MAX_ROWS_DEFAULT),
+        #[cfg(not(feature = "indexer"))]
+        predb_max_rows: std::sync::atomic::AtomicU64::new(250_000),
+        #[cfg(feature = "indexer")]
+        predb_seed_days: std::sync::atomic::AtomicU64::new(predb_seed::PREDB_SEED_DAYS_DEFAULT),
+        #[cfg(not(feature = "indexer"))]
+        predb_seed_days: std::sync::atomic::AtomicU64::new(180),
+        #[cfg(feature = "indexer")]
+        predb_seed_running: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "indexer")]
+        predb_seed_status: Mutex::new(String::new()),
+        // Spots are new, so there is no existing-install case to seed
+        // from: nobody has one running today. Straight off until asked.
+        spot_enabled: seed_spot_enabled(&settings_path),
+        spot_groups: seed_spot_groups(&settings_path),
+        spot_backfill: seed_spot_backfill(&settings_path),
+        #[cfg(feature = "indexer")]
+        index_generation: AtomicU64::new(0),
+        index_jobs_active: Arc::new(AtomicUsize::new(0)),
+        // M34 size cap. UI-only settings (no CLI flags), read straight
+        // off settings.json like index_retention above.
+        index_max_bytes: seed_index_max_bytes(&settings_path),
+        // OFF unless the user has explicitly saved it on. A missing key,
+        // a null, or a non-bool all land here - there is no path that
+        // turns deletion on by accident.
+        index_evict: seed_index_evict(&settings_path),
+        #[cfg(feature = "indexer")]
+        index_evict_order: seed_index_evict_order(&settings_path),
+        #[cfg(not(feature = "indexer"))]
+        index_evict_order: Mutex::new("ladder".to_string()),
+        #[cfg(feature = "indexer")]
+        index_evict_kinds: seed_index_evict_kinds(&settings_path),
+        #[cfg(not(feature = "indexer"))]
+        index_evict_kinds: Mutex::new(Vec::new()),
+        #[cfg(feature = "indexer")]
+        compact_pending: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "indexer")]
+        last_auto_trim: std::sync::Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        index_opened: Mutex::new(
+            crate::persist::load_json_with_backup(&spool.join("index-opened.json"))
+                .and_then(|v| serde_json::from_value::<OpenedLog>(v).ok())
+                .unwrap_or_default(),
+        ),
+        #[cfg(feature = "indexer")]
+        index_gates: seed_index_gates(&settings_path, index_gates),
+        line_speed: seed_line_speed(&settings_path),
+        link_peak: linkpeak::LinkPeak::load(spool.join("linkpeak.json")),
+        whyslow: whyslow::WhySlow::default(),
+        tune_hint: Mutex::new(String::new()),
+        cpu_sample: Mutex::new(None),
+        speed_win: Mutex::new(VecDeque::new()),
+        usage: Mutex::new(
+            crate::persist::load_json_with_backup(&spool.join("usage.json"))
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default(),
+        ),
+        pause_until: Mutex::new(None),
+        pause_gen: AtomicU64::new(0),
+        connections: std::sync::atomic::AtomicUsize::new(connections.max(1)),
+        window: std::sync::atomic::AtomicUsize::new(window.max(1)),
+        decoders: std::sync::atomic::AtomicUsize::new(decoders.max(1)),
+        fast_verify: std::sync::atomic::AtomicBool::new(fast_verify),
+        verify_lean: std::sync::atomic::AtomicBool::new(verify_lean),
+        min_free: AtomicU64::new(min_free.unwrap_or(MIN_FREE_DEFAULT)),
+        queue_hold: std::sync::Mutex::new(None),
+        pause_source: std::sync::Mutex::new("user"),
+        limit_source: std::sync::Mutex::new("user"),
+        auto_retry_secs: seed_auto_retry_secs(&settings_path, auto_retry_mins),
+        quota: AtomicU64::new(quota.unwrap_or(0)),
+        quota_reset: AtomicBool::new(false),
+        dupe_action: Mutex::new("pause".to_string()),
+        cat_meta: Mutex::new(std::collections::HashMap::new()),
+        quota_period: std::sync::atomic::AtomicU8::new(match quota_period {
+            'm' => b'm',
+            'w' => b'w',
+            _ => b'd',
+        }),
+        watch_dir: Mutex::new(watch),
+        watch_keep_nzb: AtomicBool::new(false),
+        watch_recursive: AtomicBool::new(false),
+        watch_move_rejected: AtomicBool::new(false),
+        watch_failed: Mutex::new(std::collections::HashMap::new()),
+        watch_picked: Mutex::new(std::collections::VecDeque::new()),
+        auto_retried: Mutex::new(std::collections::VecDeque::new()),
+        giveup_tripped: Mutex::new(std::collections::VecDeque::new()),
+        watch_upgraded: Mutex::new(std::collections::VecDeque::new()),
+        delete_kept: Mutex::new(std::collections::VecDeque::new()),
+        auth_fails: Mutex::new(std::collections::HashMap::new()),
+        #[cfg(feature = "indexer")]
+        enrich_hot: Mutex::new(std::collections::VecDeque::new()),
+        #[cfg(feature = "indexer")]
+        group_catalog: Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        group_fetching: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "indexer")]
+        group_fetch_err: Mutex::new(None),
+        #[cfg(feature = "indexer")]
+        group_stats: Mutex::new(Arc::new(crate::groupstats::StatsCache::default())),
+        #[cfg(feature = "indexer")]
+        group_sampling: Mutex::new(std::collections::HashSet::new()),
+        group_desc_isc: std::sync::atomic::AtomicBool::new(opts.group_desc_isc),
+        script: Mutex::new(script),
+        script_timeout: AtomicU64::new(3600),
+        notify_targets: Mutex::new(Vec::new()),
+        notify_health: Mutex::new(Default::default()),
+        failure_link: Mutex::new("off".to_string()),
+        quality_prefs: seed_quality_prefs(&settings_path),
+        apikey: Mutex::new(apikey),
+        nzbkey: Mutex::new(nzbkey),
+        stream_secret: seed_stream_secret(&settings_path),
+        omdb_key: seed_omdb_key(&settings_path),
+        library_recheck_secs: AtomicU64::new(library_recheck_secs.max(1)),
+        #[cfg(feature = "indexer")]
+        index_groups: Mutex::new(index_groups),
+        #[cfg(not(feature = "indexer"))]
+        index_groups: Mutex::new(Vec::new()),
+        index_interests: Mutex::new(String::new()),
+        index_interests_applied: Mutex::new(String::new()),
+        index_interest_groups: Mutex::new(Vec::new()),
+        #[cfg(feature = "indexer")]
+        index_interval_secs: AtomicU64::new(index_interval_secs),
+        #[cfg(not(feature = "indexer"))]
+        index_interval_secs: AtomicU64::new(900),
+        #[cfg(feature = "indexer")]
+        index_backfill: AtomicU64::new(index_backfill),
+        #[cfg(not(feature = "indexer"))]
+        index_backfill: AtomicU64::new(20000),
+        scan_now: tokio::sync::Notify::new(),
+        #[cfg(feature = "indexer")]
+        scan_deep: AtomicU64::new(0),
+        #[cfg(feature = "indexer")]
+        scan_progress: Mutex::new(Vec::new()),
+        index_scan_par: AtomicU64::new(3),
+        scan_active: std::sync::atomic::AtomicBool::new(false),
+        index_tip_secs: AtomicU64::new(20),
+        watch_interval_secs: AtomicU64::new(5),
+        watch_scan_now: tokio::sync::Notify::new(),
+        oracle_sample: AtomicU64::new(300),
+        schedule: Mutex::new(Vec::new()),
+        schedule_text: Mutex::new(String::new()),
+        watchlist: Mutex::new(Vec::new()),
+        watch_state: Mutex::new(Default::default()),
+        watch_now: tokio::sync::Notify::new(),
+        arr_giveup_threshold: AtomicU64::new(0),
+        arr_instances: Mutex::new(Vec::new()),
+        giveup: Arc::new(Mutex::new(Default::default())),
+        settings_path: settings_path.clone(),
+        #[cfg(feature = "indexer")]
+        taste_cache: Mutex::new(None),
+    });
+
+    Ok(Booted {
+        daemon,
+        server,
+        _serve_lock,
+        spool,
+        bind,
+        port,
+        tls_on,
+        open,
+        schedule,
+        feeds,
+        speedlimit,
+        mem_budget,
+        #[cfg(feature = "indexer")]
+        index_db,
+    })
 }

@@ -570,6 +570,9 @@ fn a_blank_token_keeps_the_stored_one() {
         enabled: true,
         on_failure: false,
         category: String::new(),
+        events: Vec::new(),
+        email_to: String::new(),
+        email_from: String::new(),
     };
     let old = vec![
         t("Plex", Kind::Plex, "http://nas:32400", "PLEXTOKEN"),
@@ -628,6 +631,9 @@ fn a_token_is_never_carried_onto_a_second_target_of_the_same_name() {
         enabled: true,
         on_failure: false,
         category: String::new(),
+        events: Vec::new(),
+        email_to: String::new(),
+        email_from: String::new(),
     };
     // One stored Plex server.
     let old = vec![t("Living Room", Kind::Plex, "http://a:32400", "TOKEN-A")];

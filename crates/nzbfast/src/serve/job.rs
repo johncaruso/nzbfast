@@ -5,6 +5,10 @@ use std::path::Path;
 pub enum JobState {
     Queued,
     Downloading,
+    /// §129: the tail runs in the postproc lane. Set at ticket
+    /// submission, left only via `park`; `job_from_json` maps it back
+    /// to Queued on restart, exactly like mid-Downloading.
+    Finishing,
     Completed,
     Failed,
 }
@@ -263,6 +267,40 @@ pub struct Job {
     /// record that the payload is in two places, since the mover's own
     /// log line rolls out of the memory-only ring.
     pub move_split: String,
+    /// The move to `move_completed` failed OUTRIGHT - nothing moved and
+    /// the payload is still whole at `out_dir`. Holds the destination
+    /// that could not be reached plus the OS error, because by the time
+    /// anyone reads this the log line is usually gone. Empty when no
+    /// move was owed or the move succeeded.
+    ///
+    /// This is the field that ends the silent-green era: a completed
+    /// job whose files never reached the completed folder used to be
+    /// indistinguishable from one whose files did (7 Aug 2026 - five
+    /// finished jobs sat in the download folder for hours). The row
+    /// paints amber from it, the drawer names the destination, and the
+    /// M32 auto-retry machinery re-drives the move off it.
+    pub move_failed: String,
+    /// How many times in a row the move to `move_completed` has failed
+    /// for this job. Zero whenever the move succeeded, was never owed,
+    /// or the user asked for a fresh attempt by hand.
+    ///
+    /// The ladder in [`move_retry_delay`] reads it, and
+    /// [`MOVE_RETRY_GIVE_UP`] ends it. Before this existed the redrive
+    /// re-armed a FLAT cooldown on every failure with nothing counting
+    /// them, so a destination that could not be reached at all was
+    /// retried every 20 minutes forever: an unmounted destination
+    /// volume (8 Aug 2026) had one job log the same EACCES 45 times
+    /// across 15 hours, each one indistinguishable from the last. A
+    /// count is what lets the delay grow and the daemon stop.
+    pub move_attempts: u32,
+    /// The move to `move_completed` is OWED but has not settled yet:
+    /// the mover worker holds it (C: the relocation left the finalize
+    /// tail, so a NAS copy no longer stalls the next download). The
+    /// row shows a "moving" note off this; `out_dir` still names the
+    /// source, which is where the files verifiably are - staging means
+    /// a mid-move kill never strands them elsewhere. Persisted so a
+    /// restart re-queues the move instead of forgetting it.
+    pub move_pending: bool,
     /// What the extractor found this set to be: the space-separated
     /// `ArchiveShape` tokens (`rar5 store one-pass`, `rar4 compressed
     /// on-disk`, ...). Empty while nothing archive-shaped has parsed yet,
@@ -317,6 +355,15 @@ pub struct Job {
     /// with a `drone` GUID and match queue/history items ONLY by that
     /// parameter - it must round-trip through listgroups/history.
     pub pp_params: Vec<(String, String)>,
+    /// §129 2b: the SAB `pp=` level the add requested (0-3), recorded
+    /// so the drawer can show the one-pass mapping (repair and unpack
+    /// are integral; 0/1 is recorded intent, not a behavior change).
+    /// None = the add named no pp level.
+    pub sab_pp: Option<i64>,
+    /// §129 2b: the add's `script=` param. Empty = none given (the
+    /// category's script, then the global one, applies); "None" =
+    /// explicitly no script for this job.
+    pub script_override: String,
     /// This job was given its own directory because a previously
     /// COMPLETED job of the same name still had its payload on disk; on
     /// success it takes over that canonical directory (see
@@ -436,10 +483,6 @@ pub struct Finalized {
     /// The job's new directory, when renaming or the move-completed
     /// destination changed it.
     pub moved: Option<PathBuf>,
-    /// UX §18: the move-completed relocation failed part way, and this
-    /// source directory still holds part of the payload. `moved` has
-    /// followed the bytes that did move. See [`Job::move_split`].
-    pub move_split: Option<PathBuf>,
     /// The quality suffix filing actually wrote. See [`Job::filed_suffix`].
     pub suffix: String,
     /// The episode-title segment filing actually wrote (" - Children"),
@@ -952,12 +995,15 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
         // Cloned handle for the blocking finalize (the caller still
         // needs its own for park()/script).
         let d3 = d.clone();
+        // For the crashed-tail arm below: the closure consumes the
+        // originals.
+        let name_log = name2.clone();
+        let out_log = out2.clone();
         let (
             needs_pw,
             pw_used,
             blocked_by,
             moved,
-            move_split,
             filed_sfx,
             filed_ttl,
             ident,
@@ -1099,7 +1145,6 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
             // left the payload in two directories. Nothing else in the
             // record can say so - `moved` follows the bytes that made
             // it, which is exactly what makes the other half invisible.
-            let mut move_split = None;
             if !needs_pw {
                 // Rename off the canonical name when an oracle supplied
                 // one: `name2` is what the submitter called this and
@@ -1121,7 +1166,6 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
                     },
                 );
                 moved = done.moved.or(moved);
-                move_split = done.move_split;
                 filed_sfx = Some(done.suffix);
                 filed_ttl = Some(done.filed_title);
                 identify = done.identify;
@@ -1133,17 +1177,31 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
                 crate::smart::delete_to_trash() && !crate::smart::trash_unresponsive(),
             );
             (
-                needs_pw, pw_used, blocked_by, moved, move_split, filed_sfx, filed_ttl, ident,
-                identify, cleaned,
+                needs_pw, pw_used, blocked_by, moved, filed_sfx, filed_ttl, ident, identify,
+                cleaned,
             )
             })
         .await
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|e| {
+            // A PANIC in the tail, not a result. This used to be
+            // swallowed whole: the job parked green with the defaults
+            // below and not one line said the unlock, sweeps, rename
+            // and move had never run. The files are untouched - the
+            // panic aborted the closure before or during them - so say
+            // so, and leave an amber note on the row (the still-packed
+            // surface) pointing at Retry, which re-runs this whole
+            // tail.
+            error!(
+                target: "queue",
+                "{name_log:?}: post-processing crashed ({e}) - the downloaded files are \
+                 untouched at {}; retry the job to re-run unpack, rename and move",
+                out_log.display()
+            );
             (
                 false,
                 None,
-                String::new(),
-                None,
+                "post-processing did not finish (internal error) - retry the job to re-run it"
+                    .to_string(),
                 None,
                 None,
                 None,
@@ -1182,13 +1240,18 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
                 j.fail_message = "password required to unpack".into();
             }
             j.unpack_blocked_by = blocked_by;
-            // UX §18. Written unconditionally, so a re-run of
-            // post-processing that finally moves the rest also clears
-            // the warning. A path, not a sentence - see Job::move_split.
-            j.move_split = match &move_split {
-                Some(src) => src.to_string_lossy().to_string(),
-                None => String::new(),
-            };
+            // C: the relocation now happens on the mover worker, off
+            // this tail. A fresh completion starts with clean move
+            // fields, and `move_pending` is what park() hands the
+            // mover - gated exactly as the inline move used to be: a
+            // still-locked job has no settled payload to move.
+            j.move_split.clear();
+            j.move_failed.clear();
+            // A fresh completion is a fresh ladder: whatever the last
+            // attempt on this job cost, this one starts at the first
+            // rung rather than inheriting a spent retry budget.
+            j.move_attempts = 0;
+            j.move_pending = !needs_pw && d.move_destination_configured(&j.category);
             // Recorded even when it changed no filename: an IMDb id with
             // no better name is still the thing that lets the history
             // row link to what it actually is.
@@ -1251,6 +1314,9 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
             j.finalizing = false;
         }
         // Outside the job lock - save_queue locks every job in turn.
+        // The identity/cleanup stamps land on a record that may already
+        // be parked (an unlock re-run) - keep its store line current.
+        d.history_upsert_if_present(job);
         d.save_queue();
     }
 }
@@ -1503,6 +1569,44 @@ pub(crate) fn nzbget_priority(p: i64) -> i32 {
 /// link that just wedged deserves a moment, and an immediate retry into
 /// a still-broken pool would spin.
 pub(super) const SHORT_RETRY_SECS: u64 = 120;
+
+/// Ceiling on the backed-off move cooldown, however many attempts have
+/// failed. Six hours: long enough that a destination which is simply
+/// gone stops filling the log, short enough that a NAS which came back
+/// overnight is picked up by morning without anybody pressing anything.
+pub(super) const MOVE_RETRY_MAX_SECS: u64 = 6 * 3600;
+
+/// How many consecutive failed move attempts before the daemon stops
+/// re-arming and leaves the job parked for a human.
+///
+/// Eight, which with the doubling ladder below is a little over a day
+/// of trying from the default 20-minute base. The move retry is not the
+/// download retry (ONE attempt, see `auto_retry_eligible`): the thing it
+/// waits for is usually a volume that will be back, so it is worth
+/// several tries. What it must not do is try forever - past a day the
+/// answer is not "wait longer", it is "tell the user", and the amber
+/// row plus its `Try the move now` button are already there to be told
+/// through.
+pub(super) const MOVE_RETRY_GIVE_UP: u32 = 8;
+
+/// The cooldown owed before the `attempts`-th consecutive move retry,
+/// given the configured base. `attempts` counts the failures SO FAR
+/// (1 after the first), so the first retry waits the plain base.
+///
+/// Doubling, capped: 20m, 40m, 80m, 2h40, 5h20, then 6h flat. A move
+/// destination fails for one of two reasons and the ladder has to suit
+/// both - a share that dropped for a moment wants the short first rung,
+/// and a volume nobody has plugged in wants the daemon to shut up about
+/// it. Flat-20-minutes served the first and failed the second.
+pub(super) fn move_retry_delay(base: u64, attempts: u32) -> u64 {
+    // Saturating both ways: `base` is user-configured (minutes, up to a
+    // week) and the shift count grows without bound, so the arithmetic
+    // must not be the thing that panics a mover.
+    let steps = attempts.saturating_sub(1).min(u32::BITS - 1);
+    base.checked_shl(steps)
+        .unwrap_or(MOVE_RETRY_MAX_SECS)
+        .min(MOVE_RETRY_MAX_SECS.max(base))
+}
 
 /// Did this failure message come from a full disk? One matcher for the
 /// NZBGet SPACE verdict and the retry guidance, because each platform
@@ -2656,278 +2760,11 @@ pub(super) fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-pub(super) fn job_json(j: &Job) -> Value {
-    json!({
-        "nzo_id": j.nzo_id,
-        "name": j.name,
-        "nzb_path": j.nzb_path.to_string_lossy(),
-        "origin": j.origin,
-        "category": j.category,
-        "state": format!("{:?}", j.state),
-        "total_bytes": j.total_bytes,
-        "out_dir": j.out_dir.to_string_lossy(),
-        "fail_message": j.fail_message,
-        "fail_detail": j.fail_detail,
-        "priority": j.priority,
-        "paused": j.paused,
-        "retries": j.retries,
-        "dupe_key": j.dupe_key,
-        "library": j.library,
-        "fetched": j.fetched,
-        "downloaded_bytes": j.downloaded_bytes,
-        "elapsed_secs": j.elapsed_secs,
-        // Wall clock, so history ages survive a restart.
-        "finished_unix": j.finished_unix,
-        "nzb_sha": j.nzb_sha,
-        "finalizing": j.finalizing,
-        "deferred": j.deferred,
-        "defer_reason": j.defer_reason,
-        "defer_count": j.defer_count,
-        "password": j.password,
-        "bad_blocks": j.bad_blocks,
-        "verify_blocks": j.verify_blocks,
-        "tv_sort": j.tv_sort,
-        "smart_rule": j.smart_rule,
-        // Whether out_dir is the shared season folder. Persisted: a
-        // restart that forgot it would let a delete-with-files remove a
-        // whole season (see Job::filed).
-        "filed": j.filed,
-        // What filing appended to the episode files. Persisted because
-        // the naming settings are live and this is history: recomputing
-        // it later answers about today, not about the files on disk.
-        "filed_suffix": j.filed_suffix,
-        "filed_title": j.filed_title,
-        "filed_base": j.filed_base,
-        "password_required": j.password_required,
-        "eat_volumes_ok": j.eat_volumes_ok,
-        "zip_packed": j.zip_packed,
-        "unpack_blocked_by": j.unpack_blocked_by,
-        // Persisted because it is the only record that the payload is
-        // in two places: nothing can work that out after the fact once
-        // the move's own log line has rolled out of the ring.
-        "move_split": j.move_split,
-        "archive_shape": j.archive_shape,
-        // The identity facts an oracle supplied. Persisted rather than
-        // recomputed: every one of them cost a third-party request, and
-        // the headers the CRC came from are long gone by restart.
-        "inner_crc": j.inner_crc,
-        "identity_name": j.identity_name,
-        "identity_imdb": j.identity_imdb,
-        "identity_src": j.identity_src,
-        "auto_retry_at": j.auto_retry_at,
-        "auto_retry_why": j.auto_retry_why,
-        "pp_params": j.pp_params,
-        "replaces": j.replaces.as_ref().map(|p| p.to_string_lossy()),
-        // Survives a restart: a job the daemon was killed mid-download
-        // still knows where to report its failure when it eventually
-        // does fail, and how deep the replacement chain already is.
-        "failure_link": j.failure_link,
-        "failure_host": j.failure_host,
-        "failure_https": j.failure_https,
-        "failure_depth": j.failure_depth,
-        "identify": j.identify,
-        // §77 pre-flight verdict. Persisted rather than recomputed: the
-        // probe cost a round of STATs against every server, and after a
-        // restart the answer to "was it already missing when you added
-        // it?" cannot be obtained any other way - the post has moved on.
-        "health": j.health.as_ref().map(crate::health::health_json),
-        // §76. Persisted, not recomputed: the live writer it was read
-        // from is gone, and re-probing every history row at load would
-        // wake a disk full of finished downloads to learn what we
-        // already knew.
-        "media": j.media,
-        // What the post-processing sweeps removed (history drawer's
-        // cleanup line). Persisted: the sweeps ran once, at completion,
-        // and nothing can re-count them after the files are gone.
-        "cleaned_files": j.cleaned_files,
-        "cleaned_par2": j.cleaned_par2,
-        "cleaned_trash": j.cleaned_trash,
-    })
-}
-
-pub(super) fn job_from_json(v: &Value) -> Option<Job> {
-    let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
-    let out_dir = PathBuf::from(s("out_dir")?);
-    let tv_sort = v.get("tv_sort").and_then(Value::as_bool).unwrap_or(false);
-    // Records written before `filed` existed have to answer the question
-    // somehow, and the shape of `out_dir` is the whole answer: a season
-    // folder is shared no matter what state the job is sitting in.
-    //
-    // Emphatically NOT gated on `state == "Completed"`. The pre-upgrade
-    // `retry` re-queued a filed job without moving it off the season
-    // folder and then persisted it, so a legacy record can read `Queued`
-    // while `out_dir` is still `Show/Season NN` - and migrating that as
-    // `filed = false` is what hands the next delete-with-files a
-    // `remove_dir_all` of the season.
-    let filed = v
-        .get("filed")
-        .and_then(Value::as_bool)
-        .unwrap_or_else(|| tv_sort && is_season_dir(&out_dir));
-    Some(Job {
-        nzo_id: s("nzo_id")?,
-        name: s("name")?,
-        nzb_path: PathBuf::from(s("nzb_path")?),
-        // Absent on records written before jobs carried an origin.
-        origin: s("origin").unwrap_or_default(),
-        category: s("category").unwrap_or_default(),
-        state: match v.get("state").and_then(Value::as_str)? {
-            "Completed" => JobState::Completed,
-            "Failed" => JobState::Failed,
-            // Queued - including a job caught mid-Downloading by the
-            // shutdown: it goes back through the scheduler and resumes.
-            _ => JobState::Queued,
-        },
-        total_bytes: v.get("total_bytes").and_then(Value::as_u64).unwrap_or(0),
-        out_dir,
-        fail_message: s("fail_message").unwrap_or_default(),
-        fail_detail: s("fail_detail").unwrap_or_default(),
-        // Monotonic clock cannot survive a process, so this stays None;
-        // `finished_unix` is the one that carries the age across.
-        finished_at: None,
-        finished_unix: v.get("finished_unix").and_then(Value::as_i64),
-        nzb_sha: s("nzb_sha").unwrap_or_default(),
-        finalizing: v
-            .get("finalizing")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        priority: v.get("priority").and_then(Value::as_i64).unwrap_or(0) as i32,
-        paused: v.get("paused").and_then(Value::as_bool).unwrap_or(false),
-        // Monotonic like finished_at, so a restart clears it - the
-        // late-pick marker measures THIS process's reaction time.
-        queued_at: None,
-        idle_at_add: false,
-        retries: v.get("retries").and_then(Value::as_u64).unwrap_or(0) as u32,
-        dupe_key: s("dupe_key"),
-        library: v.get("library").and_then(Value::as_bool).unwrap_or(false),
-        fetched: v.get("fetched").and_then(Value::as_bool).unwrap_or(false),
-        tombstone: false,
-        del_on_drop: false,
-        suspended: false,
-        downloaded_bytes: v
-            .get("downloaded_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        elapsed_secs: v.get("elapsed_secs").and_then(Value::as_f64).unwrap_or(0.0),
-        deferred: v.get("deferred").and_then(Value::as_bool).unwrap_or(false),
-        defer_reason: s("defer_reason").unwrap_or_default(),
-        defer_count: v.get("defer_count").and_then(Value::as_u64).unwrap_or(0) as u32,
-        demote: false,
-        password: s("password"),
-        // Records written before verification became nullable stored 0
-        // for BOTH "nothing verified this" and "verified, nothing bad",
-        // and nothing else on the record tells them apart. A non-zero
-        // count is proof a verifier ran, so it survives as a verdict; a
-        // zero without the companion block count is unknowable and reads
-        // as "not verified" rather than claiming a check that may never
-        // have happened. New records carry `verify_blocks` and are
-        // exact.
-        bad_blocks: match (
-            v.get("bad_blocks").and_then(Value::as_u64),
-            v.get("verify_blocks").and_then(Value::as_u64),
-        ) {
-            (Some(bad), _) if bad > 0 => Some(bad),
-            (Some(bad), Some(checked)) if checked > 0 => Some(bad),
-            _ => None,
-        },
-        verify_blocks: v.get("verify_blocks").and_then(Value::as_u64).unwrap_or(0),
-        smart_rule: s("smart_rule").unwrap_or_default(),
-        tv_sort,
-        filed,
-        // Absent on records written before filing recorded its suffix.
-        // NOT `unwrap_or_default()`: an empty suffix is a real value that
-        // means "auto-rename was off, the files are bare {base}.{ext}",
-        // and as a match pattern it takes every quality of the episode.
-        // Legacy records say None and fall back to a recompute, which is
-        // what all of them did before this field existed.
-        filed_suffix: v
-            .get("filed_suffix")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        // Absent on every record written before episode titles existed,
-        // and `delete_tail` reads that absence as "no title on disk" -
-        // which for those records is a fact, not a fallback.
-        filed_title: v
-            .get("filed_title")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        filed_base: v
-            .get("filed_base")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        password_required: v
-            .get("password_required")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        eat_volumes_ok: v
-            .get("eat_volumes_ok")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        zip_packed: v
-            .get("zip_packed")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        unpack_blocked_by: s("unpack_blocked_by").unwrap_or_default(),
-        move_split: s("move_split").unwrap_or_default(),
-        archive_shape: s("archive_shape").unwrap_or_default(),
-        inner_crc: v.get("inner_crc").and_then(Value::as_u64).unwrap_or(0) as u32,
-        identity_name: s("identity_name").unwrap_or_default(),
-        identity_imdb: s("identity_imdb").unwrap_or_default(),
-        identity_src: s("identity_src").unwrap_or_default(),
-        auto_retry_at: v.get("auto_retry_at").and_then(Value::as_u64),
-        auto_retry_why: s("auto_retry_why").filter(|w| !w.is_empty()),
-        pp_params: v
-            .get("pp_params")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|p| {
-                        let pair = p.as_array()?;
-                        Some((
-                            pair.first()?.as_str()?.to_string(),
-                            pair.get(1)?.as_str()?.to_string(),
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        replaces: s("replaces").filter(|v| !v.is_empty()).map(PathBuf::from),
-        failure_link: s("failure_link").unwrap_or_default(),
-        // Absent in records written before the origin check existed. An
-        // empty host fails the match, so such a job reports nowhere -
-        // the safe direction, and only until its next fetch.
-        failure_host: s("failure_host").unwrap_or_default(),
-        // Absent in records written before the scheme was kept. `false`
-        // means "http origin", which only ever permits MORE than the
-        // truth would - and only until the job's next fetch restamps it.
-        failure_https: v
-            .get("failure_https")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        failure_depth: v.get("failure_depth").and_then(Value::as_u64).unwrap_or(0) as u8,
-        identify: s("identify").unwrap_or_default(),
-        // Absent on every record written before §77, and on any record
-        // whose verdict no longer parses: both mean "not sampled", which
-        // renders no badge and sinks nothing.
-        health: v.get("health").and_then(crate::health::health_from_json),
-        // Absent on every record written before §76, and on any that a
-        // future field addition cannot deserialize - both mean "nothing
-        // known about the bytes", which is what an unprobed job is.
-        media: v
-            .get("media")
-            .cloned()
-            .and_then(|m| serde_json::from_value(m).ok()),
-        media_rejudge: false,
-        // Absent on records written before the cleanup line existed:
-        // zero renders no drawer row, which is all those records can
-        // truthfully say.
-        cleaned_files: v.get("cleaned_files").and_then(Value::as_u64).unwrap_or(0) as u32,
-        cleaned_par2: v.get("cleaned_par2").and_then(Value::as_u64).unwrap_or(0) as u32,
-        cleaned_trash: v
-            .get("cleaned_trash")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    })
-}
+// The JSON wire form of a Job, moved out bodily (TODO 106) and re-exported
+// so `job_json` / `job_from_json` remain the same paths they always were.
+#[path = "job_wire.rs"]
+mod job_wire;
+pub(super) use job_wire::{job_from_json, job_json};
 
 #[cfg(test)]
 #[path = "job_tests.rs"]

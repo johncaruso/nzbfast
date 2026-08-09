@@ -283,8 +283,20 @@ pub(super) fn url_host(url: &str) -> String {
         }
         _ => return String::new(),
     };
-    // Authority ends at the first '/', '?' or '#'.
-    let auth = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Authority ends at the first '/', '?', '#' - or '\', which for a
+    // special scheme (http/https both are) the WHATWG URL parser treats
+    // exactly like '/'. Leaving it out made this disagree with the
+    // parser that actually dials: ureq hands the string to `url`, whose
+    // userinfo scan and host scan BOTH break at a backslash, so
+    // `https://192.168.1.1\@indexer.example/x` connects to 192.168.1.1
+    // while this function - splitting only on '/?#', then taking the
+    // part after the last '@' - answered `indexer.example`. That is the
+    // whole failure-link origin check inverted: the one guard stopping
+    // an indexer aiming the daemon at an arbitrary LAN address (loopback
+    // and RFC1918 are deliberately allowed) passed a link that went
+    // somewhere else, and the refusal/report log lines printed the host
+    // it did NOT visit.
+    let auth = rest.split(['/', '?', '#', '\\']).next().unwrap_or("");
     // `user:pass@host` - the LAST '@' separates them, so a password
     // containing '@' cannot smuggle a fake host in front of the real one.
     let hostport = match auth.rsplit_once('@') {

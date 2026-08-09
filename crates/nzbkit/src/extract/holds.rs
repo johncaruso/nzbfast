@@ -493,7 +493,21 @@ impl Extractor {
     }
 
     /// Flush held spans through the slot's current mode.
+    ///
+    /// Runs with `refeed_active` raised: the under-lock write sites
+    /// report every plain placement into `late_placements`, which is
+    /// how an article that was parked whole (Persist::Held) still gets
+    /// its journal record once its bytes land. Saved/restored, not
+    /// set/cleared - drains nest (reresolve firing inside a feed).
     pub(super) fn drain_holds(&self, inner: &mut Inner, slot: usize) -> io::Result<()> {
+        let prev = inner.refeed_active;
+        inner.refeed_active = true;
+        let r = self.drain_holds_feed(inner, slot);
+        inner.refeed_active = prev;
+        r
+    }
+
+    fn drain_holds_feed(&self, inner: &mut Inner, slot: usize) -> io::Result<()> {
         let holds = std::mem::take(&mut inner.slots[slot].holds);
         inner.slots[slot].pre_bytes = 0;
         for (off, span) in holds {
@@ -983,6 +997,91 @@ mod tests {
             vol,
             "materialized volume must be byte-identical"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// TODO 100 follow-up: an article that arrives before the offset-0
+    /// sniff establishes the store mapper parks whole (`Persist::Held`)
+    /// and its bytes land only when the sniff arrives and the holds
+    /// drain, INSIDE the extractor. Those drained writes must surface
+    /// through `drain_late_placements`, or the journal writer has
+    /// nothing to record and every crash/ENOSPC resume refetches
+    /// fully-written payload articles - seen as nondeterministically
+    /// missing `R` records in the §100 e2e.
+    #[test]
+    fn held_then_drained_articles_surface_their_placements() {
+        let dir = tmpdir("holds-late-placements");
+        let inner = "movie.mkv";
+        let data = payload(600_000, 9);
+        let vol = fixtures::rar5_volume(&[(inner, 600_000, &data, false, false)]);
+        let art = 100_000usize;
+        let n = vol.len().div_ceil(art);
+        let ex = Extractor::new(&dir, 1, true);
+        // Every article except offset-0, in reverse: no sniff yet, so
+        // each parks whole and must say so.
+        let mut held: Vec<(u64, u64)> = Vec::new();
+        for i in (1..n).rev() {
+            let s = i * art;
+            let e = ((i + 1) * art).min(vol.len());
+            match ex
+                .write(0, "v.rar", vol.len() as u64, s as u64, &vol[s..e])
+                .unwrap()
+            {
+                Persist::Held(frags) => {
+                    assert!(frags.is_empty(), "a pre-sniff hold has nothing on disk");
+                    held.push((s as u64, (e - s) as u64));
+                }
+                _ => panic!("article {i} arrived pre-sniff and must park as Held"),
+            }
+        }
+        assert!(
+            ex.drain_late_placements().is_empty(),
+            "nothing has drained - nothing may be reported"
+        );
+        // The offset-0 article: the sniff maps the volume and the drain
+        // writes every held payload byte into the inner file.
+        ex.write(0, "v.rar", vol.len() as u64, 0, &vol[..art])
+            .unwrap();
+        let late = ex.drain_late_placements();
+        assert!(
+            late.iter().all(|(slot, f)| *slot == 0 && f.file == inner),
+            "store payload places into the inner file: {late:?}"
+        );
+        // Every held article lying fully inside the data area (the last
+        // one also carries the end-of-archive block, which legitimately
+        // never lands in an output file) must now be fully covered.
+        let covered = |off: u64, len: u64| {
+            let mut iv: Vec<(u64, u64)> = late
+                .iter()
+                .map(|(_, f)| (f.vol_off, f.vol_off + f.len))
+                .filter(|&(s, e)| s >= off && e <= off + len)
+                .collect();
+            iv.sort_unstable();
+            let mut to = off;
+            for (s, e) in iv {
+                if s > to {
+                    return false;
+                }
+                to = to.max(e);
+            }
+            to >= off + len
+        };
+        let mut payload_articles = 0;
+        for &(off, len) in held.iter().filter(|&&(o, l)| o + l < vol.len() as u64) {
+            assert!(
+                covered(off, len),
+                "held article at {off}+{len} drained fully but its placement \
+                 was not reported"
+            );
+            payload_articles += 1;
+        }
+        assert!(payload_articles >= 3, "fixture geometry lost its teeth");
+        // A second drain reports nothing new, and the set still
+        // finishes one-pass, byte-exact.
+        assert!(ex.drain_late_placements().is_empty());
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join(inner)).unwrap(), data);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

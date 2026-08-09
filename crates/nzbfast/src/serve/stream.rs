@@ -215,8 +215,12 @@ pub(super) fn stream_request(
                 }
             };
             if trigger {
+                let nzo = job.lock_ok().nzo_id.clone();
                 d.history.lock_ok().retain(|x| !Arc::ptr_eq(x, &job));
                 d.queue.lock_ok().push_front(job);
+                // Back into the queue: the history store must forget it
+                // or a restart would show it in both places.
+                d.history_tombstone(&[nzo]);
                 d.save_queue();
                 info!(target: "library", "/stream/{id} → fetching now");
             } else {
@@ -629,8 +633,11 @@ pub(super) fn playback_readiness(d: &Daemon, id: &str) -> serde_json::Value {
             let q = d.queue.lock_ok();
             q.iter().find_map(|j| {
                 let j = j.lock_ok();
-                (j.nzo_id == *id)
-                    .then(|| j.state == JobState::Downloading && !j.suspended && !j.paused)
+                (j.nzo_id == *id).then(|| {
+                    matches!(j.state, JobState::Downloading | JobState::Finishing)
+                        && !j.suspended
+                        && !j.paused
+                })
             })
         };
         o["reason"] = match running {

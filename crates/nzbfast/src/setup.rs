@@ -328,12 +328,30 @@ Enter the numbers you want, separated by commas (e.g. 1,3)."
     // Written even when empty: the stored answer is what stops this
     // question coming back, and "nothing" is an answer.
     let value = chosen.join(",");
-    let mut map = match std::fs::read(&settings) {
-        Ok(b) => match serde_json::from_slice::<Value>(&b) {
-            Ok(Value::Object(m)) => m,
-            _ => serde_json::Map::new(),
-        },
-        Err(_) => serde_json::Map::new(),
+    // This writer rewrites the WHOLE settings map, so where it starts
+    // from is load bearing. Reading the primary raw and falling back to
+    // an EMPTY map on any failure meant a store that was merely
+    // interrupted - absent primary with an intact `.bak`, which is
+    // exactly what a crash between write_atomic's temp write and its
+    // rename leaves - published a one-key document over the top of it.
+    // out_dir, categories, feeds, watchlist, notify tokens, servers'
+    // sibling apikey: all gone, and permanently, because the next start
+    // parses that document successfully and REFRESHES the .bak from it.
+    // Same guard and same recovery as `import_sab`'s writer, which was
+    // fixed for this and pins it with a test: refuse outright when the
+    // store is unreadable, and otherwise start from the backup-aware
+    // load rather than from nothing.
+    if crate::persist::json_store_unreadable(&settings) {
+        println!(
+            "  (not recording your answer: {} exists but won't parse - \
+             fix or remove it first, then run setup again)",
+            settings.display()
+        );
+        return Ok(());
+    }
+    let mut map = match crate::persist::load_json_with_backup(&settings) {
+        Some(Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
     };
     map.insert("index_interests".into(), Value::String(value.clone()));
     let text = serde_json::to_string_pretty(&Value::Object(map))?;

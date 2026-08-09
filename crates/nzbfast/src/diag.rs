@@ -31,7 +31,22 @@ pub(crate) fn fail_detail_snapshot(mark: u64) -> String {
     if out.len() > FAIL_DETAIL_BYTES {
         // Truncate from the FRONT on a line boundary, keeping the tail:
         // the verdict and the server table are the last things printed.
-        let cut = out.len() - FAIL_DETAIL_BYTES;
+        // Walk forward to a char boundary FIRST. `out.len() -
+        // FAIL_DETAIL_BYTES` is a byte offset, and these lines are dense
+        // with multi-byte characters - the census prints `⚠` per short
+        // file, `print_failure_diagnostics` prints `·` separators, and
+        // logtee substitutes U+FFFD for any non-UTF-8 byte a child
+        // process emitted. Slicing `out[cut..]` on a continuation byte
+        // panics, and the lane supervisor turns that panic into
+        // "post-processing crashed (internal error)", which REPLACES the
+        // real verdict, drops the evidence this function exists to keep,
+        // and - because `fail_kind` classifies on the message opening -
+        // relabels a MissingArticles/Transport failure as Local, so the
+        // automatic retry never arms.
+        let mut cut = out.len() - FAIL_DETAIL_BYTES;
+        while cut < out.len() && !out.is_char_boundary(cut) {
+            cut += 1;
+        }
         let cut = out[cut..].find('\n').map_or(out.len(), |i| cut + i + 1);
         out = format!("[…earlier lines dropped…]\n{}", &out[cut..]);
     }

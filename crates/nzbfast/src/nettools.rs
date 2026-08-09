@@ -154,7 +154,36 @@ pub(crate) async fn sysbench_cmd(config: &Path, group: &str) -> Result<()> {
     // (issue #12, both rounds: eight connections cannot show more than a
     // few hundred Mbps, and one provider cannot show what five deliver
     // together).
-    let probe_servers: Vec<_> = cfg.servers.iter().filter(|s| s.enabled).cloned().collect();
+    //
+    // Metered servers sit it out, same rule as the daemon's own system
+    // benchmark (M7b.2 §5.7): this leg pulls real article bodies for
+    // 8 s across the whole fleet. Named on the way past, because a
+    // figure quietly covering fewer servers than the operator has
+    // configured is a figure they will misread.
+    let skipped: Vec<&str> = cfg
+        .servers
+        .iter()
+        .filter(|s| s.enabled && !s.may_spend_on_measurement())
+        .map(|s| s.host.as_str())
+        .collect();
+    if !skipped.is_empty() {
+        println!(
+            "network: skipping {} (billed per byte; this probe downloads real articles)",
+            skipped.join(", ")
+        );
+    }
+    let probe_servers: Vec<_> = cfg
+        .servers
+        .iter()
+        .filter(|s| s.enabled && s.may_spend_on_measurement())
+        .cloned()
+        .collect();
+    if probe_servers.is_empty() {
+        anyhow::bail!(
+            "every enabled server is billed per byte, so there is nothing to measure the \
+             network with. Clear `block_account` on a server to include it."
+        );
+    }
     let conns = probe_servers
         .iter()
         .map(|s| (s.connections as usize).clamp(1, 100))
@@ -498,8 +527,10 @@ pub(crate) fn load_server(config: &Path) -> Result<ServerConfig> {
 /// A8 multi-server indexing: the servers worth scanning HEADERS from.
 ///
 /// - enabled only;
-/// - never a prepaid block (`block_bytes` set): OVER traffic burns the
-///   credit that exists to rescue missing bodies;
+/// - never a metered account ([`ServerConfig::may_spend_on_measurement`]:
+///   the explicit block-account flag, or a configured prepaid block):
+///   OVER traffic is bytes the user's download never asked for, and on a
+///   block it burns the credit that exists to rescue missing bodies;
 /// - one per backbone: mirrors share a spool, so a second reseller of
 ///   the same backbone contributes no headers the first didn't. Mirrors
 ///   are detected by the explicit `group` field first, else by
@@ -507,9 +538,13 @@ pub(crate) fn load_server(config: &Path) -> Result<ServerConfig> {
 /// - ranked level-then-config-order, which is the tiebreak order the
 ///   per-group primary choice uses.
 ///
-/// An all-block (but enabled) config falls back to the enabled list
+/// An all-metered (but enabled) config falls back to the enabled list
 /// unfiltered - a user who configured indexing gets an index; the
-/// caller logs that headers are spending block credit.
+/// caller logs that headers are spending billed bytes. Indexing is
+/// opt-in and asks before it starts, so someone who turned it on with
+/// nothing but metered servers has already chosen to spend on it; the
+/// flag reorders who scans, and only silences it where there is a
+/// free alternative.
 /// Resolve a marks server key (see [`nzbkit::index::Index::server_key`])
 /// back to its config entry - the scan loop persists only the key.
 /// None = the config no longer carries that server.
@@ -528,7 +563,7 @@ pub(crate) fn scan_servers(cfg: &Config) -> Vec<ServerConfig> {
         let flat: Vec<&ServerConfig> = cfg
             .servers
             .iter()
-            .filter(|s| s.enabled && !s.block_bytes.is_some_and(|b| b > 0))
+            .filter(|s| s.enabled && s.may_spend_on_measurement())
             .collect();
         if flat.is_empty() {
             cfg.servers.iter().filter(|s| s.enabled).collect()
@@ -1123,6 +1158,22 @@ mod multi_server_selection {
         ]));
         let picked: Vec<String> = scan_servers(&c).into_iter().map(|s| s.host).collect();
         assert_eq!(picked, ["news.eweka.nl", "news.xsnews.nl"]);
+    }
+
+    /// M7b.2 §5.7: the block-account flag keeps headers off a metered
+    /// server just as a configured block size does, and it works on a
+    /// level-0 host - which the block-size inference alone would have
+    /// happily scanned.
+    #[test]
+    fn scan_servers_skip_servers_flagged_as_billed_per_byte() {
+        let c = cfg(serde_json::json!([
+            // Metered by declaration, not by topology: level 0, no block
+            // size, and still not somewhere to spend header traffic.
+            { "host": "news.eweka.nl", "block_account": true },
+            { "host": "news.xsnews.nl" },
+        ]));
+        let picked: Vec<String> = scan_servers(&c).into_iter().map(|s| s.host).collect();
+        assert_eq!(picked, ["news.xsnews.nl"]);
     }
 
     /// The explicit mirror `group` field outranks hostname clustering:

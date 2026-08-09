@@ -61,6 +61,26 @@ pub(super) fn path_writable(p: &std::path::Path) -> bool {
     }
 }
 
+/// Prove a destination accepts writes by DOING one: create and remove a
+/// uniquely named marker directory inside `p`.
+///
+/// `path_writable` above asks `access(2)`, which consults permission
+/// bits - and permission bits are not the only gatekeeper. On 7 Aug
+/// 2026 macOS denied the daemon every actual write to an SMB share
+/// (per-process network-volume consent) while `access` kept saying
+/// yes, so the setting was accepted and the failure surfaced 78 GB
+/// later, one finished job at a time. A real write is the only probe
+/// that answers the question being asked.
+///
+/// A directory, not a file: it is exactly what `move_tree` creates
+/// first, and it cannot collide with payload names.
+pub(super) fn write_probe(p: &std::path::Path) -> std::io::Result<()> {
+    let marker = p.join(format!(".nzbfast-write-probe-{}", std::process::id()));
+    std::fs::create_dir(&marker)?;
+    let _ = std::fs::remove_dir(&marker);
+    Ok(())
+}
+
 /// A move destination has to be an absolute path.
 ///
 /// `create_dir_all` is perfectly happy to make a relative one, and it

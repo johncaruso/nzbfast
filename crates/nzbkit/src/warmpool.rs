@@ -672,6 +672,7 @@ mod tests {
             group: None,
             retention_days: 0,
             block_bytes: None,
+            block_account: false,
             bind_ip: None,
             socks5: None,
             enabled: true,

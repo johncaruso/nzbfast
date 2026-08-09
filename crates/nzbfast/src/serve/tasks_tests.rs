@@ -356,6 +356,7 @@ fn srv(host: &str, block: Option<u64>) -> nzbkit::config::ServerConfig {
         group: None,
         retention_days: 0,
         block_bytes: block,
+        block_account: false,
         bind_ip: None,
         socks5: None,
         enabled: true,
@@ -378,6 +379,8 @@ fn tuned(gbps: f64, asked: usize, connections: usize) -> crate::conntune::Tuned 
         limit: 0,
         v: 0,
         pending: None,
+        buckets: Vec::new(),
+        shaped: None,
     }
 }
 
@@ -428,6 +431,49 @@ fn tune_hint_block_accounts_never_gate_the_verdict() {
     m.insert("news.a.example".to_string(), tuned(0.5, 20, 20));
     super::update_tune_hint(&d, &mixed, &m);
     assert!(d.tune_hint.lock_ok().contains("well short"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M7b.2 §5.7: a `block_account` server is invisible to the tuner in
+/// exactly the way a prepaid block already was.
+///
+/// This is the half of the flag that is easy to get wrong. The prober
+/// skips the server (its ladder would be tens of seconds of billed
+/// article bodies); if THIS function's idea of a measurable server were
+/// any wider, the flagged host would never carry a tuned entry and the
+/// line-speed verdict would be suppressed for the whole install,
+/// forever, with nothing in the log saying why. That bug shipped once
+/// against block accounts; the shared `may_spend_on_measurement`
+/// predicate is what stops the flag re-introducing it.
+#[test]
+fn tune_hint_ignores_servers_flagged_as_billed_per_byte() {
+    let dir = tdir("tune-paid");
+    let d = super::super::testutil::test_daemon(&dir);
+    d.line_speed.store(125_000_000, Ordering::Relaxed);
+    let paid = |host: &str| {
+        let mut s = srv(host, None);
+        s.block_account = true;
+        s
+    };
+    // Flagged and alone: nothing measurable, so no verdict at all.
+    let mut m = std::collections::HashMap::new();
+    m.insert("paid.example".to_string(), tuned(0.2, 20, 20));
+    *d.tune_hint.lock_ok() = "stale words".to_string();
+    super::update_tune_hint(&d, &[paid("paid.example")], &m);
+    assert!(
+        d.tune_hint.lock_ok().is_empty(),
+        "a flagged server is never probed, so it can never be the evidence"
+    );
+    // Flagged BESIDE a measured server: the verdict still lands, and it
+    // is read off the measured one only.
+    let mixed = vec![paid("paid.example"), srv("news.a.example", None)];
+    let mut m = std::collections::HashMap::new();
+    m.insert("news.a.example".to_string(), tuned(0.5, 20, 20));
+    super::update_tune_hint(&d, &mixed, &m);
+    assert!(
+        d.tune_hint.lock_ok().contains("well short"),
+        "one flagged server must not suppress the verdict for the install"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

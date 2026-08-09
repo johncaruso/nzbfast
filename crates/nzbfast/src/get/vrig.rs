@@ -258,9 +258,29 @@ pub(super) fn build_rig(
     {
         let j = Arc::downgrade(journal);
         extractor.set_decrypt_barrier(Arc::new(move |names: &[String]| match j.upgrade() {
-            Some(j) => j.invalidate(names),
+            // retire_for_decrypt = invalidate + parking the dropped
+            // placements, so the publish hook below can republish them.
+            Some(j) => j.retire_for_decrypt(names),
             None => Ok(()),
         }));
+    }
+    // TODO 100: the publish half of the handshake. Once a file's verified
+    // plaintext is RENAMED into place, its crypt facts land as E/K/T
+    // records and the retired placements republish as D records - the
+    // plaintext-once grammar, which a resume run restores by re-encrypting
+    // the local plaintext. Without this, a later failure in the same job
+    // (another file's ENOSPC, the nested pass) left a journal that could
+    // vouch for nothing of a file that was already done, and the retry
+    // refetched essentially the whole set.
+    {
+        let j = Arc::downgrade(journal);
+        extractor.set_decrypt_publish(Arc::new(
+            move |name: &str, evs: &[nzbkit::extract::CryptoJournalEvent]| {
+                if let Some(j) = j.upgrade() {
+                    j.record_decrypted(name, evs);
+                }
+            },
+        ));
     }
     // Crash resume (placement journal): see replay_or_adopt_restored.
     replay_or_adopt_restored(restored, slots, resume_map, &extractor, &verifier, out_dir);

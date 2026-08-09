@@ -85,10 +85,25 @@ pub(super) async fn build_fleet(
     // Still dark (env-only): the race-loss recycle (subsumed by the
     // slope recycle in practice) and the hot spare (needs cap-aware
     // gating first - at an exact provider cap the spare would steal a
-    // worker slot). NZBFAST_KEEPALIVE and NZBFAST_DIAL_RACE are read
-    // directly in the nntp dial path.
+    // worker slot). NZBFAST_KEEPALIVE is read directly in the nntp dial
+    // path (NZBFAST_DIAL_RACE was too, until §129 3c priced it out).
     let recycle_slow = std::env::var("NZBFAST_RECYCLE_SLOW").is_ok_and(|v| v == "1");
     let hot_spare = std::env::var("NZBFAST_HOT_SPARE").is_ok_and(|v| v == "1");
+    // M7b.2 depth steering (dark, env-only): a server whose windowed
+    // per-conn rate falls under 1/4 of the best other live server's
+    // runs shallow pipelines (depth 1) instead of parking `window`
+    // articles behind each slow session. Graduates the race_stragglers
+    // way only with the steering rig's A/B and the real-line legs green
+    // (research/DESIGN-PROVIDER-STEERING-RACING-2026-08-08.md §7).
+    let steer_depth = std::env::var("NZBFAST_STEER_DEPTH").is_ok_and(|v| v == "1");
+    // M7b.2 envelope racing (dark, env-only): per-owner hedge bounds,
+    // the idle-picker envelope race, and the fleet-wide dup-spend
+    // hygiene cap; the whole-run 2x slow-owner rule retires while
+    // armed. Same graduation route as steer_depth. The per-server
+    // block_account setting (design 5.7) is LANDED and wired into
+    // PoolConfig::block_account below, so the economics no longer rest
+    // on the level > 0 inference alone.
+    let race_envelope = std::env::var("NZBFAST_RACE_ENVELOPE").is_ok_and(|v| v == "1");
     // TODO 115, graduated 5 Aug: cap-aware flap keepers - a
     // flap-clamped server whose accept cap was OBSERVED (dials bounced
     // off a capacity refusal) holds min(cap, budget) keepers instead of
@@ -160,6 +175,13 @@ pub(super) async fn build_fleet(
     // Settings never took effect, and it read as a status line rather
     // than as "something overrode you". Name the asked-for count and
     // the switch that turns it off.
+    // Whether the live epoch controller is in charge for this run (the
+    // `live_tune` setting mirrored on the hub, or the dev override).
+    // Computed here because the cap note below must not print when the
+    // knee is not capping.
+    let live_tune = hub.as_ref().is_some_and(|h| {
+        h.live_tune.load(std::sync::atomic::Ordering::Relaxed) || crate::conntune::live_tune_on()
+    });
     let tuned_note: Vec<String> = cfg_all
         .servers
         .iter()
@@ -174,7 +196,10 @@ pub(super) async fn build_fleet(
                 .then(|| format!("{} capped at {} of {asked}", s.host, t.connections))
         })
         .collect();
-    if !tuned_note.is_empty() {
+    // With the live controller on, the knee SEEDS instead of capping -
+    // announcing a cap that is not being applied is the same lie the
+    // pinned-server exclusion exists to avoid.
+    if !live_tune && !tuned_note.is_empty() {
         println!(
             "  connection auto-tune: {} (measured sweet spot; \
              Settings → Auto-tune connections turns this off)",
@@ -200,11 +225,30 @@ pub(super) async fn build_fleet(
         .as_ref()
         .map(|h| h.host_conn_caps.lock_ok().clone())
         .unwrap_or_default();
-    // TODO 112 (dark): with live tuning on, the fleet is SPAWNED at the
-    // ceiling and run at a live target the epoch controller moves - the
-    // applied knee is only the target's starting prior. A pinned server
-    // keeps the old shape: its number is a statement, not a state.
-    let live_tune = hub.is_some() && crate::conntune::live_tune_on();
+    // TODO 112: with live tuning on (the `live_tune` setting, or
+    // NZBFAST_LIVE_TUNE=1 as the dev override), the fleet is SPAWNED at
+    // the ceiling and run at a live target the epoch controller moves.
+    // The target starts at the SEED - the current time-of-day bucket
+    // when it carries evidence, else the trusted knee, else the
+    // configured count (conn-tuning design §5.1) - and the stored knee
+    // does not cap the job: with the controller in charge, measurements
+    // seed and only typed numbers cap. A pinned server keeps the old
+    // shape: its number is a statement, not a state.
+    //
+    // Seeding reads the store directly rather than through `tuned`:
+    // that map is emptied when auto_connections is off, but that toggle
+    // governs the OFFLINE prober and its knee caps - a live-tune seed
+    // is not a cap, and bucket evidence stays useful either way.
+    let seed_store = if live_tune {
+        crate::conntune::load(config)
+    } else {
+        Default::default()
+    };
+    let seed_bucket = crate::conntune::bucket_of(crate::conntune::local_hour());
+    let seed_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let mut servers: Vec<_> = cfg_all
         .servers
         .iter()
@@ -217,11 +261,17 @@ pub(super) async fn build_fleet(
                 crate::conntune::applied_connections(base, s.pin_connections, tuned.get(&s.host));
             let (conns, live_target) = match (live_tune && !s.pin_connections && base > 1, hub) {
                 (true, Some(h)) => {
+                    let seed = crate::conntune::seed_connections(
+                        seed_store.get(&s.host),
+                        seed_bucket,
+                        seed_now,
+                        base,
+                    );
                     let t = h
                         .live_targets
                         .lock_ok()
                         .entry(s.host.clone())
-                        .or_insert_with(|| nzbkit::pool::ConnTarget::new(applied))
+                        .or_insert_with(|| nzbkit::pool::ConnTarget::new(seed))
                         .clone();
                     // A ceiling that moved between jobs clamps the
                     // surviving belief; a belief the controller earned
@@ -242,6 +292,13 @@ pub(super) async fn build_fleet(
                 adaptive_timeout,
                 tail_fanout,
                 tail_fanout_early,
+                steer_depth,
+                race_envelope,
+                // §5.7, and the one place the setting meets the pool:
+                // per-server, never OR-folded across the fleet, because
+                // the whole point of the flag is that one account's
+                // billing says nothing about another's.
+                block_account: s.block_account,
                 hedge,
                 ttfb_hedge,
                 recycle_slow,
@@ -309,5 +366,59 @@ pub(super) async fn build_fleet(
         buf_pool,
         out_pool,
         servers,
+    }
+}
+
+#[cfg(test)]
+mod block_account_wiring {
+    use super::*;
+
+    /// §5.7: the setting reaches the pool, PER SERVER.
+    ///
+    /// This one line is the whole join between a checkbox in the server
+    /// editor and the racing gates in pool.rs, and neither side's own
+    /// tests can see it: nzbkit pins that a flagged PoolConfig never
+    /// races, and nzbkit::config pins that the field parses, but nothing
+    /// else would notice if the wire between them were dropped in a
+    /// refactor of this builder.
+    ///
+    /// Per-server and never OR-folded: one account's billing says
+    /// nothing about another's, so a mixed fleet must come out mixed.
+    #[tokio::test]
+    async fn the_setting_reaches_the_pool_per_server() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"servers":[
+                 {"host":"flat.example"},
+                 {"host":"metered.example","block_account":true}
+               ]}"#,
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("nzbfast-ba-wire-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let fleet = build_fleet(
+            &cfg,
+            &dir.join("config.local.json"),
+            4,
+            4,
+            &None,
+            None,
+            "",
+            &nzbkit::mem::MemBudget::with_total(1 << 30),
+        )
+        .await;
+        let flags: Vec<(String, bool)> = fleet
+            .servers
+            .iter()
+            .map(|(s, p)| (s.host.clone(), p.block_account))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("flat.example".to_string(), false),
+                ("metered.example".to_string(), true),
+            ],
+            "the flag must ride each server's own PoolConfig, not the fleet's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
