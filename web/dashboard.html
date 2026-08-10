@@ -7571,16 +7571,37 @@ function fsJoin(dir,name){ const sep=dir.includes('\\')&&!dir.includes('/')?'\\'
   return dir.endsWith(sep)?dir+name:dir+sep+name; }
 async function fsGo(path){
   const j=await api('fs_list',`&path=${encodeURIComponent(path||'')}&fmode=${fsCtx.mode==='file'?'file':'dir'}`);
-  if(!j.status){ toast(tErr(j.error)||t('toast.dirfail','Could not open that folder.'),true); return; }
+  // Roots (Home, drives, mounted volumes) come back even on a failure -
+  // render them first so the picker NEVER dead-ends on an unmounted drive
+  // or a stale path: the user must always be able to click over to another
+  // drive to repoint their download folder.
+  document.getElementById('fsroots').innerHTML=((j&&j.roots)||[]).map(r=>
+    `<button class="fsroot${r.drive?' drive':''}" data-p="${escA(r.path)}" onclick="fsGo(this.dataset.p)" title="${escA(r.path)}">${r.drive?'💾':'📁'} ${esc(r.name)}</button>`).join('');
+  if(!j || !j.status){
+    // Keep whatever navigation the daemon could still offer, and show the
+    // reason in the list pane instead of only a transient toast.
+    fsCtx.path=(j&&j.path)||fsCtx.path; fsCtx.parent=(j&&j.parent)||null;
+    document.getElementById('fspath').value=(j&&j.path)||path||'';
+    document.getElementById('fsup').disabled=!(j&&j.parent);
+    // The shown folder does not exist - "Choose this folder" would save a
+    // path downloads can never write to. Navigation re-enables it.
+    document.getElementById('fschoose').disabled=true;
+    const w=document.getElementById('fswrite'); w.textContent=''; w.className='';
+    document.getElementById('fslist').innerHTML=
+      `<div class="warn" style="padding:12px">${esc(tErr(j&&j.error)||t('toast.dirfail','Could not open that folder.'))}</div>`;
+    return;
+  }
   fsCtx.path=j.path; fsCtx.parent=j.parent;
   document.getElementById('fspath').value=j.path;
   document.getElementById('fsup').disabled=!j.parent;
+  document.getElementById('fschoose').disabled=false;
+  // The daemon fell back to a readable folder because the one we asked for
+  // is gone (an unmounted drive, a stale config) - say so once.
+  if(j.note) toast(j.note);
   const w=document.getElementById('fswrite');
   if(fsCtx.mode==='file'){ w.textContent=''; w.className=''; }
   else { w.textContent=j.writable?'✓ '+t('fs.writable','writable'):'⚠ '+t('fs.readonly','not writable: downloads would fail here');
     w.className=j.writable?'ok':'warn'; }
-  document.getElementById('fsroots').innerHTML=(j.roots||[]).map(r=>
-    `<button class="fsroot${r.drive?' drive':''}" data-p="${escA(r.path)}" onclick="fsGo(this.dataset.p)" title="${escA(r.path)}">${r.drive?'💾':'📁'} ${esc(r.name)}</button>`).join('');
   const list=document.getElementById('fslist');
   if(!(j.entries||[]).length){ list.innerHTML=`<div class="dim" style="padding:12px">${t('fs.empty','empty folder')}</div>`; return; }
   list.innerHTML=j.entries.map(e=>{

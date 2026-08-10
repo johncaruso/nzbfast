@@ -248,69 +248,142 @@ fn m_fs_list(
     _ctx: &ApiCtx<'_>,
     _api_body: &mut Option<Vec<u8>>,
 ) -> Option<Value> {
-    Some({
-        let want_files = params.get("fmode").map(String::as_str) == Some("file");
-        let raw = params.get("path").map(String::as_str).unwrap_or("");
-        // Empty path → start where the user is now: the current
-        // download root, so "here's where it points today" needs
-        // no typing.
-        let start = if raw.is_empty() {
-            d.out_dir()
-                .canonicalize()
-                .unwrap_or_else(|_| d.out_dir().clone())
-        } else {
-            PathBuf::from(raw)
-        };
-        let mut dir = if start.is_absolute() {
-            start
-        } else {
-            std::env::current_dir().unwrap_or_default().join(start)
-        };
-        // A file path browses its containing folder.
-        if dir.is_file()
-            && let Some(p) = dir.parent()
-        {
-            dir = p.to_path_buf();
-        }
-        let dir = dir.canonicalize().unwrap_or(dir);
-        match std::fs::read_dir(&dir) {
-            Err(e) => json!({
-                "status": false,
-                "path": dir.to_string_lossy(),
-                "error": format!("{}: {e}", dir.to_string_lossy()),
-            }),
-            Ok(rd) => {
-                let mut entries: Vec<(bool, String)> = rd
-                    .flatten()
-                    .filter_map(|e| {
-                        let name = e.file_name().to_string_lossy().to_string();
-                        if name.starts_with('.') {
-                            return None; // hide dotfiles, like most pickers
-                        }
-                        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                        (is_dir || want_files).then_some((is_dir, name))
-                    })
-                    .collect();
-                // Folders first, then case-insensitive by name.
-                entries.sort_by(|a, b| {
-                    b.0.cmp(&a.0)
-                        .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
-                });
-                let entries: Vec<Value> = entries
-                    .into_iter()
-                    .map(|(is_dir, name)| json!({"name": name, "dir": is_dir}))
-                    .collect();
-                json!({
-                    "status": true,
-                    "path": dir.to_string_lossy(),
-                    "parent": dir.parent().map(|p| p.to_string_lossy().to_string()),
-                    "writable": path_writable(&dir),
-                    "entries": entries,
-                    "roots": fs_roots(&d.out_dir()),
-                })
+    Some(fs_list(d, params))
+}
+
+/// Read one directory into the browser's `entries` shape (folders first,
+/// then case-insensitive by name; dotfiles hidden like most pickers).
+/// `Err` when the directory cannot be read at all - the caller uses that
+/// to fall back to a readable ancestor rather than dead-end the picker,
+/// and surfaces the io error (ENOENT vs EACCES) if nothing works.
+fn fs_listing(dir: &std::path::Path, want_files: bool) -> std::io::Result<(Vec<Value>, bool)> {
+    let rd = std::fs::read_dir(dir)?;
+    let mut entries: Vec<(bool, String)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                return None; // hide dotfiles, like most pickers
             }
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            (is_dir || want_files).then_some((is_dir, name))
+        })
+        .collect();
+    // Folders first, then case-insensitive by name.
+    entries.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+    });
+    let entries: Vec<Value> = entries
+        .into_iter()
+        .map(|(is_dir, name)| json!({"name": name, "dir": is_dir}))
+        .collect();
+    Ok((entries, path_writable(dir)))
+}
+
+/// Nearest ancestor of `start` that `read_dir` accepts, walking up to the
+/// filesystem root. Keeps the directory browser off a dead end when the
+/// requested path is gone - an unmounted external drive, a deleted folder,
+/// or a config carried over from another machine that points at a volume
+/// which does not exist here.
+fn nearest_listable(start: &std::path::Path) -> Option<PathBuf> {
+    let mut cur = start.parent();
+    while let Some(p) = cur {
+        if std::fs::read_dir(p).is_ok() {
+            return Some(p.to_path_buf());
         }
-    })
+        cur = p.parent();
+    }
+    None
+}
+
+/// The directory browser. The requested path is best-effort: when it is
+/// gone or unreadable we fall back to the nearest readable ancestor (or
+/// HOME) and say so in `note`, and even the give-up branch still hands back
+/// `roots`/`parent` so the user can always navigate to another drive to
+/// repoint their download folder. Read-only; the full-key auth gate is
+/// applied by the dispatcher before we are reached.
+fn fs_list(d: &Arc<Daemon>, params: &std::collections::HashMap<String, String>) -> Value {
+    let want_files = params.get("fmode").map(String::as_str) == Some("file");
+    let raw = params.get("path").map(String::as_str).unwrap_or("");
+    // Empty path → start where the user is now: the current download
+    // root, so "here's where it points today" needs no typing.
+    let start = if raw.is_empty() {
+        d.out_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| d.out_dir().clone())
+    } else {
+        PathBuf::from(raw)
+    };
+    let mut dir = if start.is_absolute() {
+        start
+    } else {
+        std::env::current_dir().unwrap_or_default().join(start)
+    };
+    // A file path browses its containing folder.
+    if dir.is_file()
+        && let Some(p) = dir.parent()
+    {
+        dir = p.to_path_buf();
+    }
+    let dir = dir.canonicalize().unwrap_or(dir);
+
+    // The requested directory, or - if it is unreadable - the nearest
+    // readable ancestor, or HOME. `note` is set only on a fallback. Each
+    // candidate is tried in turn: an ancestor proven readable can still
+    // vanish between the probe and the listing, and that must not stop
+    // HOME from being tried.
+    let (listed, read_err) = match fs_listing(&dir, want_files) {
+        Ok((entries, writable)) => (Some((dir.clone(), entries, writable, None)), None),
+        Err(e) => {
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(PathBuf::from);
+            let picked = nearest_listable(&dir)
+                .into_iter()
+                .chain(home)
+                .find_map(|c| {
+                    let (entries, writable) = fs_listing(&c, want_files).ok()?;
+                    let note = format!(
+                        "{} is not available - showing {} instead.",
+                        dir.to_string_lossy(),
+                        c.to_string_lossy()
+                    );
+                    Some((c, entries, writable, Some(note)))
+                });
+            (picked, Some(e))
+        }
+    };
+
+    match listed {
+        Some((shown, entries, writable, note)) => {
+            let mut v = json!({
+                "status": true,
+                "path": shown.to_string_lossy(),
+                "parent": shown.parent().map(|p| p.to_string_lossy().to_string()),
+                "writable": writable,
+                "entries": entries,
+                "roots": fs_roots(&d.out_dir()),
+            });
+            if let Some(note) = note {
+                v["note"] = json!(note);
+            }
+            v
+        }
+        // Nothing was readable anywhere - still hand back navigation
+        // targets so the user is never stranded and can pick another drive.
+        None => json!({
+            "status": false,
+            "path": dir.to_string_lossy(),
+            "parent": dir.parent().map(|p| p.to_string_lossy().to_string()),
+            // Keep the io detail (ENOENT vs EACCES) - support logs need it.
+            "error": match read_err {
+                Some(e) => format!("{} is not available: {e}", dir.to_string_lossy()),
+                None => format!("{} is not available", dir.to_string_lossy()),
+            },
+            "roots": fs_roots(&d.out_dir()),
+        }),
+    }
 }
 
 fn m_fs_mkdir(
@@ -982,5 +1055,110 @@ mod tests {
         assert_eq!(got[2], "after");
         assert!(got[1].contains('\u{fffd}'), "expected a replacement char");
         let _ = std::fs::remove_file(&p);
+    }
+
+    fn params(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The download-folder browser must never dead-end. A `path` that does
+    /// not exist (an unmounted drive, a folder deleted since it was set)
+    /// used to answer a bare `{status:false,error}` with NO `roots` - so
+    /// the modal came up with nothing to click and the user could not
+    /// navigate to another drive to repoint their download folder. It now
+    /// falls back to the nearest readable ancestor with a `note`, and
+    /// always carries the roots list.
+    #[test]
+    fn fs_list_on_a_missing_path_falls_back_to_an_ancestor_with_roots() {
+        use crate::serve::testutil::test_daemon;
+        let dir = std::env::temp_dir().join(format!("nzbfast-fslist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = test_daemon(&dir);
+
+        // A deep path whose leaf and intermediate dirs do not exist.
+        let missing = dir.join("gone-drive").join("deeper").join("still");
+        let v = fs_list(&d, &params(&[("path", &missing.to_string_lossy())]));
+
+        // The caller is not stranded: a listing, a note, and roots.
+        assert_eq!(v["status"], true, "must not dead-end: {v}");
+        assert!(
+            v["note"].is_string(),
+            "a fallback must explain what happened: {v}"
+        );
+        let roots = v["roots"].as_array().expect("roots must be present");
+        assert!(!roots.is_empty(), "roots must offer somewhere to go: {v}");
+        // The folder actually shown exists and is a real ancestor to walk
+        // back down from.
+        let shown = std::path::Path::new(v["path"].as_str().unwrap());
+        assert!(shown.is_dir(), "the fallback folder must be real: {v}");
+        assert!(
+            missing.starts_with(shown) || shown == std::path::Path::new("/"),
+            "the fallback must be an ancestor of the requested path: {v}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The empty-path case is the one a person hits on open: it resolves to
+    /// the current download root, and if THAT is gone (a config carried
+    /// over from another machine, an unmounted volume) the picker still has
+    /// to open on something rather than trapping the user on an error.
+    #[test]
+    fn fs_list_empty_path_when_download_root_is_gone_still_opens() {
+        use crate::serve::testutil::test_daemon;
+        let dir = std::env::temp_dir().join(format!("nzbfast-fsgone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = test_daemon(&dir);
+        // Point the download root at a directory that does not exist.
+        *d.out_root.write_ok() = dir.join("unmounted");
+
+        let v = fs_list(&d, &params(&[("path", "")]));
+        assert_eq!(v["status"], true, "an empty path must never dead-end: {v}");
+        assert!(v["note"].is_string(), "the fallback must be explained: {v}");
+        assert!(
+            !v["roots"].as_array().unwrap().is_empty(),
+            "roots must be present even when the download root is gone: {v}"
+        );
+        assert!(
+            std::path::Path::new(v["path"].as_str().unwrap()).is_dir(),
+            "the picker must open on a real folder: {v}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The healthy path is unchanged: a real directory lists its contents
+    /// (folders only, dotfiles hidden), carries no fallback note, and still
+    /// includes the roots.
+    #[test]
+    fn fs_list_on_a_real_directory_lists_it_without_a_note() {
+        use crate::serve::testutil::test_daemon;
+        let dir = std::env::temp_dir().join(format!("nzbfast-fsok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = test_daemon(&dir);
+        // Browse a dedicated folder (the fixture puts out/spool in `dir`).
+        let browse = dir.join("library");
+        std::fs::create_dir_all(browse.join("Movies")).unwrap();
+        std::fs::create_dir_all(browse.join("TV")).unwrap();
+        std::fs::write(browse.join("readme.txt"), b"hi").unwrap();
+        std::fs::write(browse.join(".hidden"), b"x").unwrap();
+
+        let v = fs_list(&d, &params(&[("path", &browse.to_string_lossy())]));
+        assert_eq!(v["status"], true, "{v}");
+        assert!(v.get("note").is_none(), "no fallback, so no note: {v}");
+        let names: Vec<&str> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        // Directory mode hides files and dotfiles; folders come first.
+        assert_eq!(names, vec!["Movies", "TV"], "{v}");
+        assert!(!v["roots"].as_array().unwrap().is_empty(), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

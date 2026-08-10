@@ -1097,3 +1097,105 @@ fn owned_title_keys_parse_names_and_drop_empty_keys() {
         assert_eq!(set.len(), 3);
     });
 }
+
+/// A job's out_dir is the absolute path baked in from the download-folder
+/// setting when it was ADDED. If the user later points the download folder
+/// somewhere else (or a settings.json is carried between machines where the
+/// old path no longer exists), `retry` must re-download into the CURRENT
+/// folder - not re-run the job forever at the stale, possibly-dead path.
+/// Field repro 9 Aug: out_dir was changed to a mounted path, yet retry kept
+/// targeting the old /Volumes/... one and failed with the same error.
+#[test]
+fn retry_reresolves_a_stale_baked_out_dir_to_the_current_download_folder() {
+    with_daemon("retry-staleroot", |d| {
+        let old_root = d.out_dir();
+        let tmp = old_root.parent().expect("tempdir").to_path_buf();
+        let new_root = tmp.join("newout");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        // A Failed history job whose out_dir sits under the OLD root, exactly
+        // as enqueue would have built it (root / category / stem).
+        let old_dir = old_root.join("movies").join("Some.Movie.2024");
+        d.history.lock_ok().push(jv(
+            "SABnzbd_nzo_stale",
+            "Some.Movie.2024",
+            serde_json::json!({
+                "out_dir": old_dir.to_string_lossy(),
+                "category": "movies",
+                "state": "Failed",
+                "fail_message": "boom",
+            }),
+        ));
+
+        // The user changes the download folder AFTER the job was added.
+        *d.out_root.write_ok() = new_root.clone();
+
+        assert!(d.retry("SABnzbd_nzo_stale"), "retry accepted");
+
+        // Left history, landed in the queue, re-aimed at the CURRENT root.
+        assert!(
+            !d.history
+                .lock_ok()
+                .iter()
+                .any(|j| j.lock_ok().nzo_id == "SABnzbd_nzo_stale"),
+            "the record left history"
+        );
+        let q = d.queue.lock_ok();
+        let j = q
+            .iter()
+            .find(|j| j.lock_ok().nzo_id == "SABnzbd_nzo_stale")
+            .expect("re-queued")
+            .clone();
+        let g = j.lock_ok();
+        assert!(
+            g.out_dir.starts_with(&new_root),
+            "retry must target the CURRENT download folder, got {}",
+            g.out_dir.display()
+        );
+        assert!(
+            !g.out_dir.starts_with(&old_root),
+            "retry must not reuse the stale baked path {}",
+            g.out_dir.display()
+        );
+        // Nothing is on disk at the new folder, so progress starts from zero.
+        assert_eq!(g.downloaded_bytes, 0);
+        assert_eq!(g.state, JobState::Queued);
+    });
+}
+
+/// The other half of the same rule: an ordinary failed retry whose out_dir
+/// is STILL under the current download folder keeps its own directory (and
+/// so its journal and its progress). The stale-path re-resolution above must
+/// not disturb the common case.
+#[test]
+fn retry_keeps_an_out_dir_that_is_still_under_the_current_root() {
+    with_daemon("retry-liveroot", |d| {
+        let keep = d.out_dir().join("movies").join("Keep.Me.2024");
+        d.history.lock_ok().push(jv(
+            "SABnzbd_nzo_keep",
+            "Keep.Me.2024",
+            serde_json::json!({
+                "out_dir": keep.to_string_lossy(),
+                "category": "movies",
+                "state": "Failed",
+                "downloaded_bytes": 4096,
+            }),
+        ));
+
+        assert!(d.retry("SABnzbd_nzo_keep"), "retry accepted");
+
+        let q = d.queue.lock_ok();
+        let g = q
+            .iter()
+            .find(|j| j.lock_ok().nzo_id == "SABnzbd_nzo_keep")
+            .expect("re-queued")
+            .clone();
+        let g = g.lock_ok();
+        assert_eq!(
+            g.out_dir, keep,
+            "an under-root retry keeps its own folder in place"
+        );
+        // Its journal is intact at that folder, so its progress is kept.
+        assert_eq!(g.downloaded_bytes, 4096);
+    });
+}

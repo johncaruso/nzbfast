@@ -6041,7 +6041,25 @@ impl Daemon {
         // With NO job lock held: dir_claim locks every job in the queue
         // and history.
         let taken = matches!(self.dir_claim(&cur), DirClaim::Active | DirClaim::Payload);
-        if filed || taken {
+        // A job's out_dir is the absolute path baked in from the
+        // download-folder setting IN FORCE WHEN IT WAS ADDED. If that
+        // setting has since changed - the user picked a new download folder,
+        // or a settings.json was carried between two machines where the old
+        // path (a since-unplugged drive, a differently mounted volume) does
+        // not even exist - the captured path no longer sits under the
+        // current root. Re-running the job as-is would keep writing to, or
+        // fail EACCES/ENOENT against, a folder the user has deliberately
+        // moved away from (field repro 9 Aug: out_dir was changed to a
+        // mounted path, yet retry still targeted the old /Volumes/... one).
+        // Re-derive it from the CURRENT root + this job's category, exactly
+        // as a fresh add resolves it. A path still under the current root is
+        // left untouched, so an ordinary failed retry keeps its own folder,
+        // its journal and its progress. (refile_out_dir honours the category
+        // as a subfolder; a cat_meta `dir` rename is not re-applied here, the
+        // same as the filed/taken paths above - a pre-existing gap, not this
+        // fix's concern.)
+        let stale = !cur.starts_with(self.out_dir());
+        if filed || taken || stale {
             let (dir, replaces) =
                 refile_out_dir(&self.out_dir(), &category, &name, &|p| self.dir_claim(p));
             let mut j = job.lock_ok();
@@ -6051,8 +6069,10 @@ impl Daemon {
                 j.nzo_id,
                 if filed {
                     "was filed into"
-                } else {
+                } else if taken {
                     "another job now owns"
+                } else {
+                    "targeted a download folder that is no longer configured:"
                 },
                 j.out_dir.display(),
                 dir.display()
