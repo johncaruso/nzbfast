@@ -1,6 +1,6 @@
 [package]
 name = "nzbfast"
-version = "1.0.22"
+version = "1.0.23"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -124,7 +124,7 @@ trash = "5.2.6"
 # version nzbtray already links, so the windows build gains no new
 # dependency. libc has no statvfs on windows.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     # GetLocalTime, for the quota ledger's local-midnight rollover.
@@ -146,6 +146,13 @@ ktls = ["nzbkit/ktls"]
 # Off by default: src/lib.rs compiles to EMPTY without it, so the lib
 # target this package now carries costs existing builds nothing.
 ffi = []
+# Build-gate for the six heavy [[test]] targets at the bottom of this
+# file (TODO 116b). EMPTY on purpose - it compiles no code in or out;
+# its only effect is whether cargo builds the targets that name it in
+# required-features. Per-push CI does not pass it, so those targets stop
+# paying link time and disk there; nightly.yml (their home) and
+# pr-check.yml pass `--features heavy-tests` where they run them.
+heavy-tests = []
 
 # Signing tooling for the update manifest (keygen + detached sign) lives
 # in examples/update_sign.rs so the daemon and the release pipeline use
@@ -167,3 +174,45 @@ sevenz-rust2 = { version = "0.21", default-features = false, features = [
     "ppmd",
     "compress",
 ] }
+
+# The six heavy integration targets, build-gated behind `heavy-tests`
+# (TODO 116b). Their home is nightly.yml: daemon/e2e/leak_soak by an
+# actual decision, and index_size_cap/http_wedge/queue_soak because they
+# MEASURE ELAPSED TIME - a different kind of test, not merely a dearer
+# one. ci-private's per-push nextest already filtered all six from
+# RUNNING, but `-E 'not binary(x)'` filters running only, so each still
+# paid full link time and disk on every push - on Linux the linker
+# copies DWARF INTO each statically linked executable. This gate stops
+# the BUILD.
+#
+# The shape deliberately preserves the auto-enrolment default that
+# ci-private.yml's long note insists on: a test target added tomorrow
+# carries no required-features, so it builds AND runs on push
+# automatically. The only names anyone maintains are the few below that
+# must not.
+#
+# Run locally with e.g.:
+#   cargo test -p nzbfast --test daemon --features heavy-tests -- --test-threads=1
+[[test]]
+name = "daemon"
+required-features = ["heavy-tests"]
+
+[[test]]
+name = "e2e"
+required-features = ["heavy-tests"]
+
+[[test]]
+name = "leak_soak"
+required-features = ["heavy-tests"]
+
+[[test]]
+name = "index_size_cap"
+required-features = ["heavy-tests"]
+
+[[test]]
+name = "http_wedge"
+required-features = ["heavy-tests"]
+
+[[test]]
+name = "queue_soak"
+required-features = ["heavy-tests"]

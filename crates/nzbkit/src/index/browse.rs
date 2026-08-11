@@ -97,6 +97,25 @@ pub const ADULT_GENRE_SQL: &str = concat!("NOT ", adult_genre_match_sql!());
 /// title off brought every Adult/Hentai/Erotic release straight back.
 pub const ADULT_GENRE_MATCH_SQL: &str = adult_genre_match_sql!();
 
+/// The OTHER half of "this is adult", as a per-release predicate in the
+/// `{}`-alias form both release-level filter lists use: the release is
+/// not marked with the poster's own adult filing.
+///
+/// The genre test above can only speak for a title that enrichment has
+/// reached. A spot-born card is usually not one of those - it is a
+/// fresh row named from a signed announcement, with no `titles` row
+/// behind it yet and possibly never - and roughly a third of the
+/// Spotnet feed is erotica. So the filter that was supposed to cover
+/// the wall had nothing at all to read on the one source where it
+/// mattered most, and adult spots were kept off the wall by never
+/// being promoted at all (which cost the catalogue 31% of the feed).
+///
+/// `releases.adult` is written at promotion time from the spot's own
+/// `d75` subcategory: not an inference from metadata, but the poster's
+/// filing of their own post. The two tests are OR'd - a card is hidden
+/// if EITHER says adult - so neither has to be complete.
+pub const ADULT_MARK_SQL: &str = "{}adult = 0";
+
 impl Default for BrowseQuery {
     fn default() -> Self {
         BrowseQuery {
@@ -276,6 +295,8 @@ impl Index {
             wheres.push(format!(
                 "{{}}title_key NOT IN (SELECT t.key FROM titles t WHERE {ADULT_GENRE_MATCH_SQL})"
             ));
+            // ...and the spot-born marker, which needs no join at all.
+            wheres.push(ADULT_MARK_SQL.into());
         }
         // M29 3c: availability verdict as a real SQL predicate. A scalar
         // function backed by the oracle Snapshot keeps ALL verdict logic

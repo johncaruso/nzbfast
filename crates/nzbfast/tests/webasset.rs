@@ -200,3 +200,56 @@ fn pages_gzip_etag_and_304() {
         "catalogue inflates to valid JSON"
     );
 }
+
+/// TODO §140 / issue #31: the user's own stylesheet comes from the config
+/// folder, not the binary. The point of the feature is editing it without
+/// a rebuild, so what this pins is that a RUNNING daemon serves the new
+/// bytes after the file changes on disk - and that having no file at all
+/// is quiet rather than a 404 in everyone's console.
+#[test]
+fn the_user_stylesheet_is_live_from_the_config_folder() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-usercss-{}", std::process::id()));
+    let dir = scratch::ScratchDir::attach(&dir);
+    std::fs::write(dir.join("config.json"), "{\"servers\":[]}").unwrap();
+    let (_daemon, port) = serve(&dir);
+
+    // No file: an empty stylesheet, not an error. Both pages link it, so
+    // a 404 here would be a red console line on every install.
+    let (head, body) = http_raw(port, "/custom.css", "");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        header(&head, "Content-Type").is_some_and(|c| c.starts_with("text/css")),
+        "{head}"
+    );
+    assert!(body.is_empty(), "no file means no rules");
+
+    // Written while the daemon runs: served on the next request, with no
+    // restart. This is the assertion that would fail the moment anyone
+    // "optimised" the file into an include_str! or a boot-time cache.
+    std::fs::write(dir.join("custom.css"), "body{--acc:#ff00aa}\n").unwrap();
+    let (head2, body2) = http_raw(port, "/custom.css", "");
+    assert!(head2.starts_with("HTTP/1.1 200"), "{head2}");
+    assert_eq!(String::from_utf8_lossy(&body2), "body{--acc:#ff00aa}\n");
+    let etag = header(&head2, "ETag").expect("stylesheet carries an ETag");
+
+    // Edited again: new bytes, and a validator that moved with them, so a
+    // browser holding the old copy cannot 304 its way past the change.
+    std::fs::write(dir.join("custom.css"), "body{--acc:#00ccff}\n").unwrap();
+    let (head3, body3) = http_raw(port, "/custom.css", &format!("If-None-Match: {etag}\r\n"));
+    assert!(head3.starts_with("HTTP/1.1 200"), "{head3}");
+    assert_eq!(String::from_utf8_lossy(&body3), "body{--acc:#00ccff}\n");
+    assert_ne!(
+        header(&head3, "ETag"),
+        Some(etag),
+        "the tag tracks the file"
+    );
+
+    // And the page asks for it after its own styles, so an equally
+    // specific user rule wins without !important.
+    let (_, page) = http_raw(port, "/", "");
+    let page = String::from_utf8_lossy(&page);
+    let link = page
+        .find(r#"<link rel="stylesheet" href="/custom.css">"#)
+        .expect("dashboard links the user stylesheet");
+    assert!(link > page.rfind("</style>").expect("no style block"));
+}

@@ -133,10 +133,10 @@ jobs:
             /usr/share/swift \
             /usr/local/share/powershell
           df -h / | tail -1
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
-      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -203,7 +203,16 @@ jobs:
         # No escapes: every warning blocks. The categories still allowed
         # are named in the workspace lints table in Cargo.toml, each with
         # its reason.
-        run: cargo clippy -p nzbkit -p nzbfast -p nzbtray --all-targets --no-deps -- -D warnings
+        #
+        # The heavy-tests features are for LINT SCOPE, not for running:
+        # they enrol the seven build-gated targets (TODO 116b - the
+        # [[test]] tables in nzbkit's and nzbfast's Cargo.toml) so clippy
+        # keeps linting them per push exactly as it did before the gate.
+        # Clippy is check-mode and links nothing, so this costs none of
+        # the link time the gate saves - and without it those files would
+        # grow silent clippy debt, the exact class that held main red
+        # 7-10 Aug when a skipped gate came back on.
+        run: cargo clippy -p nzbkit -p nzbfast -p nzbtray --all-targets --no-deps --features nzbkit/heavy-tests,nzbfast/heavy-tests -- -D warnings
       # Prebuilt binary pinned by version and checked by SHA256 rather
       # than trusted, same pattern (and rationale) as the cargo-deny
       # step below.
@@ -266,6 +275,42 @@ jobs:
         # index_size_cap, http_wedge and queue_soak are ~80% of the total
         # runtime because they MEASURE ELAPSED TIME - a different kind of
         # test, not merely a dearer one.
+        #
+        # Since TODO 116b the seven are also gated out of the BUILD.
+        # `-E 'not binary(x)'` filters RUNNING only, so each still paid
+        # full link time and disk here on every push - on this runner the
+        # linker copies DWARF INTO every statically linked executable.
+        # The gate is `required-features = ["heavy-tests"]` on the seven
+        # [[test]] entries in nzbkit's and nzbfast's Cargo.toml; this
+        # step deliberately does not pass the feature, so cargo never
+        # builds them. That shape keeps the auto-enrolment default this
+        # note insists on: a target added tomorrow carries no
+        # required-features and builds AND runs here automatically - the
+        # only names anyone maintains are in Cargo.toml, beside the
+        # targets themselves. An EMPTY feature moves no fingerprint any
+        # cached unit depends on and Cargo.lock does not record features,
+        # so no cache-key bump rides with it (contrast the -v2 note
+        # above). The -E list below stays: nextest accepts binary()
+        # predicates that match nothing, it is the run-stage belt if the
+        # targets are ever built here again, and it is where a reader
+        # learns the seven names.
+        #
+        # The gate's PRICE, measured before landing (11 Aug, dispatch
+        # 31489960984 vs control 31491653304 - same tree, both workspace
+        # crates fully dirtied, warm caches): build here 4m09s vs 4m26s,
+        # because line-tables-only above had already collapsed the Linux
+        # DWARF bill, and 14m51s vs 17m03s on windows-unit, which kept
+        # full debuginfo and bills at 2x - that leg is where the minutes
+        # are. Plus seven fewer statically linked executables written per
+        # run on both legs, which is headroom against the ENOSPC class
+        # this TODO item was born from.
+        #
+        # windows-unit gets the BUILD saving automatically from the same
+        # Cargo.toml gate with its step untouched. Its clippy loses the
+        # seven targets (it does not pass the feature); the whole tree
+        # holds one cfg(windows) site across those files and the Linux
+        # clippy above lints everything else in them, so that hole is a
+        # documented sliver, folded in whenever that job is next edited.
         #
         # Note what does NOT need saying here: `binary(daemon)` is pinned
         # to a max-threads-1 test group in .config/nextest.toml, so
@@ -343,13 +388,13 @@ jobs:
       # short of space, and `rm` on a 2x runner is not free.
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # No toolchain step: rust-toolchain.toml pins the version and
       # rustup installs it for the msvc host on the first cargo
       # invocation. Same as the Windows jobs in pr-check.yml and
       # nightly.yml; an explicit `rustup default stable` would be
       # overridden by that pin anyway.
-      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
         with:
           path: |
             ~/.cargo/registry

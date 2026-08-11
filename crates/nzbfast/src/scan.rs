@@ -1072,6 +1072,10 @@ pub(crate) struct SpotResolveSummary {
     pub(crate) upgraded: u32,
     pub(crate) unusable: u32,
     pub(crate) failed: u32,
+    /// Fresh cards whose head article was STATed, and how many of those
+    /// came back gone (and so were demoted to incomplete).
+    pub(crate) checked: u32,
+    pub(crate) gone: u32,
 }
 
 /// One budgeted spot-NZB resolver pass (E3 / TODO 131): fetch the NZB
@@ -1083,6 +1087,12 @@ pub(crate) struct SpotResolveSummary {
 /// Each spot costs one HEAD plus a handful of BODYs on the first scan
 /// server, so a pass is bounded at `budget` such fetches; the backlog
 /// after a first backfill drains over a few passes, newest first.
+///
+/// A freshly promoted card then gets ONE corroborating STAT of its head
+/// article, up to `SPOT_STAT_PER_PASS` per pass: its completeness comes
+/// from the NZB's own declaration and has never been checked against a
+/// provider, which is survivable at the tip and not at 2011 depth. See
+/// `Index::spot_stat_verdict`.
 pub(crate) async fn spot_resolve_pass(
     config: &Path,
     ix: &mut nzbkit::index::Index,
@@ -1128,8 +1138,15 @@ pub(crate) async fn spot_resolve_pass(
     // missing article fails one. The breaker tells them apart so a
     // mid-pass disconnect does not burn a retry on every pending spot.
     let mut consecutive_failures = 0u32;
+    // Completeness corroboration, rate-limited per pass. `desynced` is
+    // the M29 sampler's rule: a STAT that timed out or errored leaves
+    // an unread status in the socket, so this session must be DROPPED,
+    // never quit() - the goodbye it would read is the STAT's answer,
+    // and the next command reads one reply behind forever.
+    let mut stat_budget = budget.min(nzbkit::index::SPOT_STAT_PER_PASS);
+    let mut desynced = false;
     for s in &pending {
-        if stop() || consecutive_failures >= 3 {
+        if stop() || consecutive_failures >= 3 || desynced {
             break;
         }
         match nzbkit::spot::fetch_spot_nzb(&mut conn, &s.msgid).await {
@@ -1145,7 +1162,27 @@ pub(crate) async fn spot_resolve_pass(
                 };
                 match nzbkit::nzb::Nzb::parse(&bytes) {
                     Ok(nzb) => match ix.promote_spot(&s.msgid, &title, &nzb, now)? {
-                        SpotPromotion::Promoted(_) => sum.promoted += 1,
+                        SpotPromotion::Promoted(rid) => {
+                            sum.promoted += 1;
+                            // Only fresh cards: an Upgraded row is one
+                            // the header scanner already read off the
+                            // wire, so its completeness is an
+                            // observation rather than a declaration and
+                            // there is nothing to corroborate.
+                            if stat_budget > 0
+                                && let Some(head) = ix.release_head_article(rid)?
+                            {
+                                stat_budget -= 1;
+                                match stat_one(&mut conn, &head).await {
+                                    Ok(present) => {
+                                        sum.checked += 1;
+                                        sum.gone += u32::from(!present);
+                                        ix.spot_stat_verdict(&s.msgid, rid, present)?;
+                                    }
+                                    Err(_) => desynced = true,
+                                }
+                            }
+                        }
                         SpotPromotion::Upgraded(_) => sum.upgraded += 1,
                         SpotPromotion::Unusable => sum.unusable += 1,
                     },
@@ -1164,8 +1201,29 @@ pub(crate) async fn spot_resolve_pass(
             }
         }
     }
-    conn.quit().await;
+    if desynced {
+        warn!(target: "spots", "dropping the resolver connection after an unanswered STAT");
+        drop(conn);
+    } else {
+        conn.quit().await;
+    }
     Ok(sum)
+}
+
+/// One STAT, sent and read: `Ok(true)` if the article is there.
+///
+/// The timeout is what makes the caller's desync flag necessary - a
+/// session abandoned mid-command still owes us a status line, so it can
+/// only be dropped, never reused and never quit().
+async fn stat_one(conn: &mut Connection, msgid: &str) -> Result<bool> {
+    let present = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        conn.send_stat(msgid).await?;
+        conn.flush().await?;
+        conn.read_stat().await
+    })
+    .await
+    .context("STAT timed out")??;
+    Ok(present)
 }
 
 pub(crate) fn spot_search(query: &str, db: &Path) -> Result<()> {

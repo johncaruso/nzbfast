@@ -53,6 +53,22 @@ impl Daemon {
         crate::wall::quality_suffix(&crate::wall::parse_release(name), &self.rename_style())
     }
 
+    /// TODO 142 / issue #32: does a job in `cat` take its finished name
+    /// from the .nzb file?
+    ///
+    /// The category's own answer when it gave one, the global switch
+    /// otherwise - the same precedence every other `cat_meta` field
+    /// uses, so "change the download category to allow or disallow it"
+    /// (the reporter's words) is one edit in one place. An unlisted
+    /// category, which is most of them, follows the global.
+    pub(super) fn name_from_nzb(&self, cat: &str) -> bool {
+        self.cat_meta
+            .lock_ok()
+            .get(cat)
+            .and_then(|m| m.nzb_name)
+            .unwrap_or_else(|| self.rename_from_nzb.load(Ordering::Relaxed))
+    }
+
     /// The episode titles a TV job's rename may use: the show's cached
     /// TVmaze episode list, and NOTHING else.
     ///
@@ -310,6 +326,19 @@ impl Daemon {
         let (name, cat, tv_sort) = (job.name, job.cat, job.tv_sort);
         let auto_rename = self.auto_rename.load(Ordering::Relaxed);
         let style = self.rename_style();
+        // TODO 142 / issue #32: this job's name comes from the .nzb file
+        // rather than from what the release parses as. A sibling of the
+        // auto-rename layer and mutually exclusive with it - the two are
+        // different answers to the same question, and running both would
+        // mean naming the file twice.
+        //
+        // Season filing outranks it, which is why `tv_sort` is in the
+        // condition rather than checked later. That rule does not name a
+        // file, it decides a whole directory SHAPE
+        // (`Show/Season 01/Show - S01E02.mkv`), it is opt-in per Smart
+        // Folder rule, and half-applying it - the shape without the
+        // matching filename - produces a library nothing can import.
+        let nzb_naming = !tv_sort && self.name_from_nzb(cat);
         // TODO 24D: user categories classify ahead of the built-ins, and
         // the behaviors below are gated on the release's BASE BEHAVIOR,
         // not its kind: built-in Movie/Tv map to themselves, a custom
@@ -348,6 +377,7 @@ impl Daemon {
         // ever REPLACES a differing claim or ADDS an HD one - a name that
         // claimed nothing is not decorated with "480p" noise.
         if auto_rename
+            && !nzb_naming
             && style.resolution
             && matches!(base, Base::Movie | Base::Tv)
             && let Some(measured) = crate::smart::measured_res(out_dir)
@@ -365,6 +395,7 @@ impl Daemon {
         // title must never guess between its years.
         #[cfg(feature = "indexer")]
         if auto_rename
+            && !nzb_naming
             && matches!(base, Base::Movie)
             && p.year.is_none()
             && let Some(y) = self.with_index(|ix| {
@@ -375,7 +406,12 @@ impl Daemon {
         {
             p.year = Some(y);
         }
-        let suffix = if auto_rename {
+        // Empty under nzb naming, and that is not a detail: `suffix` and
+        // `filed_title` are what the delete and play paths MATCH the
+        // files on disk with (see `Job::filed_suffix`). Filing wrote the
+        // bare .nzb name, so claiming a " [1080p]" tail it never wrote
+        // would make every later lookup miss.
+        let suffix = if auto_rename && !nzb_naming {
             crate::wall::quality_suffix(&p, &style)
         } else {
             String::new()
@@ -385,7 +421,7 @@ impl Daemon {
         // sub-settings: with the master switch off, filing still writes
         // the bare episode base, and decorating THAT would be a rename
         // the user asked not to have.
-        let titles = if auto_rename {
+        let titles = if auto_rename && !nzb_naming {
             self.episode_titles(name)
         } else {
             crate::smart::EpisodeTitles::default()
@@ -396,6 +432,18 @@ impl Daemon {
         let renamed = if tv_sort {
             // Season-filing carries the quality suffix when auto-rename is on.
             crate::smart::tv_organize(&parent, name, out_dir, &suffix, &titles)
+        } else if nzb_naming {
+            // The folder and the ONE biggest payload file. Every other
+            // file - the rest of an episode pack, the sample, the subs,
+            // the .nfo - keeps the name it arrived with; see
+            // `smart::nzbname` for why that is the shape rather than a
+            // limitation.
+            //
+            // Deliberately NOT gated on `auto_rename`: that switch is
+            // the metadata renamer's, and someone who turned it off
+            // because they disliked the names it invents is exactly who
+            // asks for this one.
+            crate::smart::rename_from_nzb(&parent, out_dir, name)
         } else if auto_rename {
             match base {
                 Base::Tv => {
@@ -445,7 +493,12 @@ impl Daemon {
         // here, so it only ever speaks when they were all silent:
         // `nameless_video` returns None the moment any of them landed a
         // name, and no request goes out.
-        let identified = if auto_rename && !tv_sort && !matches!(base, Base::Tv) {
+        // Nzb naming silences this rung too. It is the weakest evidence
+        // in the whole ladder, it costs network, and the user has just
+        // told us in as many words which name they want on the file -
+        // "we asked a film database and disagreed" is not a reply to
+        // that.
+        let identified = if auto_rename && !nzb_naming && !tv_sort && !matches!(base, Base::Tv) {
             self.identify_video(out_dir, job)
         } else {
             String::new()
@@ -475,3 +528,6 @@ impl Daemon {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

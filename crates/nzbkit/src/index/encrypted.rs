@@ -117,6 +117,38 @@ impl Index {
             .is_some()
     }
 
+    /// The same question for a whole page at once: which of `ids` carry
+    /// the current generation's stamp.
+    ///
+    /// One statement rather than a lookup per row because the caller is
+    /// a browse page deciding which rows to offer the on-demand namer
+    /// on, and that runs on every keystroke of the wall's filter. An
+    /// empty input asks nothing.
+    pub fn header_encrypted_ids(&self, ids: &[i64]) -> std::collections::HashSet<i64> {
+        if ids.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        // Bound parameters, not interpolated ids: they are i64 and safe
+        // either way, but a literal-splicing habit is the one that
+        // eventually meets a string.
+        let holes = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut args: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 1);
+        for id in ids {
+            args.push(id);
+        }
+        args.push(&ENC_CLASS);
+        let n = args.len();
+        let sql = format!("SELECT id FROM releases WHERE id IN ({holes}) AND enc_class=?{n}");
+        let Ok(mut stmt) = self.db.prepare_cached(&sql) else {
+            return std::collections::HashSet::new();
+        };
+        stmt.query_map(args.as_slice(), |r| r.get::<_, i64>(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
     /// What the classification has retired, and what a bump would give
     /// back. `stale` is the count carrying an older generation's stamp -
     /// non-zero only after a bump, and the number that says how much
@@ -200,6 +232,41 @@ mod tests {
         assert_eq!(s["bytes"], 10_000_000_000i64);
         assert_eq!(s["stale"], 0);
         assert_eq!(s["by_kind"]["rar5/head-crypt"]["releases"], 1);
+        teardown(&d, ix);
+    }
+
+    /// The batched form answers exactly what the per-row form answers,
+    /// generation included - it feeds the browse page's decision about
+    /// which rows to offer the on-demand namer on, and a wrong answer
+    /// there either nags about archives nobody can read or hides the
+    /// affordance from rows that would give up a name.
+    #[test]
+    fn the_batched_lookup_agrees_with_the_single_one() {
+        let d = dir("batch");
+        let ix = Index::open(&d.join("index.db")).unwrap();
+        let stamped = seed(&ix, "blob-a", 1_000);
+        let plain = seed(&ix, "blob-b", 1_000);
+        let stale = seed(&ix, "blob-c", 1_000);
+        ix.mark_header_encrypted(stamped, EncKind::Rar5HeadCrypt, 2000)
+            .unwrap();
+        ix.db
+            .execute(
+                "UPDATE releases SET enc_class=?2 WHERE id=?1",
+                rusqlite::params![stale, ENC_CLASS + 1],
+            )
+            .unwrap();
+        let all = [stamped, plain, stale, 9_999];
+        let got = ix.header_encrypted_ids(&all);
+        assert_eq!(
+            got,
+            std::collections::HashSet::from([stamped]),
+            "only the current generation's stamp counts, and an id that \
+             does not exist is not a hit"
+        );
+        for id in all {
+            assert_eq!(got.contains(&id), ix.header_encrypted(id), "id {id}");
+        }
+        assert!(ix.header_encrypted_ids(&[]).is_empty());
         teardown(&d, ix);
     }
 

@@ -2441,12 +2441,15 @@ pub(in crate::serve) async fn spot_pass(
                             info!(
                                 target: "spots",
                                 "resolved {} spot NZBs: {} new cards, {} upgraded \
-                                 existing releases, {} unusable, {} failed",
+                                 existing releases, {} unusable, {} failed; \
+                                 {} head articles checked, {} already gone",
                                 sum.fetched,
                                 sum.promoted,
                                 sum.upgraded,
                                 sum.unusable,
-                                sum.failed
+                                sum.failed,
+                                sum.checked,
+                                sum.gone
                             );
                         }
                         // Fresh cards want titles rows so

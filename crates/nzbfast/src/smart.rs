@@ -3750,91 +3750,7 @@ pub fn rename_movie(parent: &Path, out_dir: &Path, base: &str) -> Option<PathBuf
         }
     }
     // Rename the folder itself.
-    let want = parent.join(base);
-    if want == out_dir {
-        return None;
-    }
-    let mut target = want;
-    let mut n = 2;
-    while target.exists() {
-        target = parent.join(format!("{base}.{n}"));
-        n += 1;
-    }
-    match std::fs::rename(out_dir, &target) {
-        Ok(()) => {
-            info!(
-                target: "smart",
-                "renamed {} → {}",
-                out_dir.display(),
-                target.display()
-            );
-            Some(target)
-        }
-        // Windows refuses to rename a DIRECTORY while any file inside it is
-        // open, and at this point the extractor still holds the payload: it
-        // keeps its output writers for the streaming endpoint and stays alive
-        // past completion. So this failed with "Access is denied." on every
-        // Windows install, and because the payload FILE had already been
-        // renamed above (Rust opens with FILE_SHARE_DELETE, which permits
-        // renaming a file but not its parent), an obfuscated download was
-        // left as `complete/movies/<hash>/Example Movie 2019 1080p.mkv` -
-        // half-renamed, which is the worst of both.
-        //
-        // Moving the CONTENTS across works where moving the container does
-        // not, for that same reason: each entry is renamed individually and an
-        // open handle does not stop it - proven by the payload rename above
-        // succeeding. Handles stay valid afterwards (they follow the file, not
-        // the path), so streaming a job whose folder was just renamed keeps
-        // working, which is why this is done here rather than by closing the
-        // writers: closing them makes a /stream request that is waiting for
-        // them hang instead (`stream_of_library_job_triggers_download`).
-        //
-        // Unix renames directories around open descriptors happily, so it
-        // takes the branch above and never reaches this.
-        Err(e) => match move_dir_contents(out_dir, &target) {
-            Ok(()) => {
-                info!(
-                    target: "smart",
-                    "renamed {} → {} (entry by entry: {e})",
-                    out_dir.display(),
-                    target.display()
-                );
-                Some(target)
-            }
-            Err(e2) => {
-                warn!(
-                    target: "smart",
-                    "rename dir {} → {}: {e} (and entry by entry: {e2})",
-                    out_dir.display(),
-                    target.display()
-                );
-                None
-            }
-        },
-    }
-}
-
-/// Move everything in `from` into a fresh `to`, then drop the empty `from`.
-///
-/// The fallback for a directory rename that the platform will not do as one
-/// operation - see the call site. `to` must not already exist; the caller
-/// picked a free name.
-///
-/// Every entry moves with a plain rename, so this stays same-filesystem and
-/// never copies payload: `to` is a sibling of `from`. A partial failure
-/// leaves entries in BOTH places and reports the error, which the caller
-/// turns into "the folder was not renamed" - the files are all still present
-/// under one name or the other, and nothing is deleted here except the
-/// emptied directory itself.
-fn move_dir_contents(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
-        std::fs::rename(entry.path(), to.join(entry.file_name()))?;
-    }
-    // Only removes it if it really is empty, so a missed entry surfaces as a
-    // leftover directory rather than as a deletion.
-    std::fs::remove_dir(from)
+    nzbname::rename_dir(parent, out_dir, base)
 }
 
 // ---------------------------------------------------------------------------
@@ -4040,3 +3956,9 @@ mod out_umask_tests;
 // as pool/unit_tests.rs.
 #[cfg(test)]
 mod cleanup_mode_tests;
+
+// TODO 142 / issue #32: naming a finished job after its .nzb file, and
+// the folder rename it shares with `rename_movie`. A production child
+// module for the same size-gate reason.
+pub mod nzbname;
+pub use nzbname::rename_from_nzb;

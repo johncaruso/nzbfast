@@ -72,6 +72,13 @@ pub(super) fn sweep_orphan_spool_nzbs(d: &Arc<Daemon>) -> usize {
 /// want the port. The listening socket is closed for us because Rust
 /// opens sockets CLOEXEC.
 ///
+/// What that does NOT buy is a port that is free the moment the new image
+/// asks for it: the kernel reclaims the closed listener asynchronously,
+/// and the replacement gets there first often enough to matter. That race
+/// is absorbed at the other end, in `take_listener`'s
+/// `bind_past_a_closing_predecessor` - read its note before concluding
+/// that a restart can just bind.
+///
 /// Note it picks up a REPLACED binary on disk, so this doubles as
 /// "restart onto the version I just installed".
 ///

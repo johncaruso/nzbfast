@@ -24,14 +24,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
       # Same fixture dependency as pr-check: the e2e repair tests CREATE
       # their PAR2 sets with the external `par2` and skip without it.
       - name: test deps (par2 for repair e2e)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq par2
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -39,25 +39,49 @@ jobs:
             target
           key: nightly-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - name: build
+        id: build
         run: cargo build -p nzbfast --locked
-      # Both suites: NZBFAST_NO_ENRICH keeps enrichment workers off the
-      # real internet; NZBFAST_REQUIRE_PAR2 turns a broken par2 install
-      # into a red run instead of silently skipped repair coverage
+      # EVERY suite step below carries the same `if`, and that is the
+      # point: a red suite must not hide the ones after it.
+      #
+      # It used to. The suites ran as plain sequential steps, so one
+      # failure skipped the whole rest of the job, and the four
+      # elapsed-time targets were additionally chained inside ONE
+      # `run: |` block under `bash -e`, which hid them from each other
+      # too. Both layers fired at once for four nights (7-10 Aug 2026):
+      # the e2e `speculative_prefetch` panic skipped the elapsed-time
+      # step entirely, so index_size_cap, http_wedge and queue_soak had
+      # no CI verdict from 6 Aug, and the 10 Aug dispatched re-run that
+      # finally reached the step died on index_size_cap and still never
+      # reached http_wedge. Four days of three targets not running read
+      # exactly like "one known test is broken" (TODO 143).
+      #
+      # `!cancelled()` rather than `always()`: a cancelled run (the
+      # concurrency group superseding it) should stop, not grind through
+      # every suite. And gated on the build having SUCCEEDED, so a
+      # compile failure still reports once instead of six identical
+      # times.
+      #
+      # NZBFAST_NO_ENRICH keeps enrichment workers off the real
+      # internet; NZBFAST_REQUIRE_PAR2 turns a broken par2 install into
+      # a red run instead of silently skipped repair coverage
       # (rationale in pr-check.yml). --test-threads=1 is a hard
       # requirement for the daemon suite (CLAUDE.md invariant 4); the
       # e2e suite tolerates parallelism but carries timing-sensitive
       # stall/watchdog tests (8-10s abort windows), so it runs
       # single-threaded here too - nightly has the time budget.
       - name: daemon suite
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           NZBFAST_NO_ENRICH: "1"
           NZBFAST_REQUIRE_PAR2: "1"
-        run: cargo test -p nzbfast --locked --test daemon -- --test-threads=1
+        run: cargo test -p nzbfast --locked --features heavy-tests --test daemon -- --test-threads=1
       - name: e2e suite
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           NZBFAST_NO_ENRICH: "1"
           NZBFAST_REQUIRE_PAR2: "1"
-        run: cargo test -p nzbfast --locked --test e2e -- --test-threads=1
+        run: cargo test -p nzbfast --locked --features heavy-tests --test e2e -- --test-threads=1
       # The other half of ci-private's exclusion list. That job runs
       # `--workspace` minus seven names; three of them (daemon, e2e,
       # leak_soak) already had a home here, and these four did not have
@@ -76,15 +100,40 @@ jobs:
       # from ci-private's --workspace, never "runs nightly, maybe" from a
       # pattern here. The push path is the default; this list is the
       # exception, and an exception should be a decision.
-      - name: elapsed-time suites
+      #
+      # Every heavy-suite invocation in this file passes `--features
+      # heavy-tests`: since TODO 116b the seven targets carry
+      # required-features in their Cargo.toml so the push path stops
+      # LINKING what it never runs. Forgetting the flag cannot silently
+      # skip a suite - cargo refuses the --test name loudly, naming the
+      # feature.
+      #
+      # One step per target, not one block of four: see the `if` note
+      # above. These four are the ones the old shape hid.
+      - name: elapsed-time suite - conn_tuner
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           NZBFAST_NO_ENRICH: "1"
           NZBFAST_REQUIRE_PAR2: "1"
-        run: |
-          cargo test -p nzbkit --locked --test conn_tuner
-          cargo test -p nzbfast --locked --test index_size_cap -- --test-threads=1
-          cargo test -p nzbfast --locked --test http_wedge -- --test-threads=1
-          cargo test -p nzbfast --locked --test queue_soak -- --test-threads=1
+        run: cargo test -p nzbkit --locked --features heavy-tests --test conn_tuner
+      - name: elapsed-time suite - index_size_cap
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          NZBFAST_NO_ENRICH: "1"
+          NZBFAST_REQUIRE_PAR2: "1"
+        run: cargo test -p nzbfast --locked --features heavy-tests --test index_size_cap -- --test-threads=1
+      - name: elapsed-time suite - http_wedge
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          NZBFAST_NO_ENRICH: "1"
+          NZBFAST_REQUIRE_PAR2: "1"
+        run: cargo test -p nzbfast --locked --features heavy-tests --test http_wedge -- --test-threads=1
+      - name: elapsed-time suite - queue_soak
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          NZBFAST_NO_ENRICH: "1"
+          NZBFAST_REQUIRE_PAR2: "1"
+        run: cargo test -p nzbfast --locked --features heavy-tests --test queue_soak -- --test-threads=1
 
   # Windows leg for the PRIVATE repo. The test suite had NEVER run on
   # Windows until a Windows-on-ARM build probe added the public-repo
@@ -113,14 +162,14 @@ jobs:
     # workspace a good deal slower, so it gets no less.
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # No toolchain step: rust-toolchain.toml pins the version and
       # rustup installs it for the msvc host on the first cargo
       # invocation (same rationale as pr-check.yml's Windows job).
       #
       # No par2 fetch, unlike pr-check's Windows job: par2 there is a
       # fixture tool for the e2e repair tests, which do not run here.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -144,7 +193,7 @@ jobs:
       - name: daemon suite
         env:
           NZBFAST_NO_ENRICH: "1"
-        run: cargo test -p nzbfast --locked --test daemon -- --test-threads=1
+        run: cargo test -p nzbfast --locked --features heavy-tests --test daemon -- --test-threads=1
 
   # TODO 82: the long-run soak. One daemon, a mixed queue (store RAR5,
   # compressed RAR5, 7z, PAR2 repair, password) driven round and round
@@ -174,7 +223,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
       # par2 is a FIXTURE tool here (runtime repair is native): the soak
@@ -183,7 +232,7 @@ jobs:
       # that quietly covers one shape fewer.
       - name: test deps (par2 for the repair shape)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq par2
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -203,13 +252,13 @@ jobs:
         # --nocapture so the per-cycle lines stream into the log: a job
         # that prints nothing for two and a half hours is indistinguishable
         # from a hung one.
-        run: cargo test --release -p nzbfast --locked --test leak_soak -- --ignored --nocapture
+        run: cargo test --release -p nzbfast --locked --features heavy-tests --test leak_soak -- --ignored --nocapture
       # Uploaded on failure TOO - a red soak's sample series is the whole
       # diagnosis, and it is also what a legitimate new baseline gets
       # re-recorded from.
       - name: upload the sample series
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: soak-report
           path: soak-report.json
@@ -224,7 +273,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Prebuilt binary, pinned by tag and checked by SHA256 rather than
       # trusted, since it is fetched from a third party and put on PATH
       # (same pattern as the par2 fetch in pr-check.yml). A cargo

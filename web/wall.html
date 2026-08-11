@@ -262,6 +262,11 @@ select{background:var(--surface);color:var(--fg);border:1px solid var(--line);
 /* A correlated-name suggestion: clickable, visibly tentative. */
 .nbadge.sugg{cursor:pointer;border-style:dashed;color:var(--fg);max-width:340px}
 .nbadge.sugg:hover{border-color:var(--accent,#7aa2f7)}
+/* The on-demand namer's affordance is a real button - it does work, and
+   a click-only <span> is unreachable from the keyboard - wearing the
+   badge's clothes. */
+button.nbadge{font:inherit;font-size:9.5px;font-weight:600;line-height:1.6}
+button.nbadge[disabled]{opacity:.55;cursor:default}
 /* Group-by-title: one row per title, releases nested under the expander. */
 #ltable .exp{background:transparent;border:none;color:var(--dim);cursor:pointer;
   font-size:12px;padding:2px 6px;border-radius:6px}
@@ -576,7 +581,12 @@ body.nosearch #sortwrap,body.nosearch #more{display:none!important}
   font-size:13.5px;color:var(--dim);text-align:center}
 #noidxnote b{color:var(--fg)}
 #noidxnote a{color:var(--acc)}
-</style></head><body>
+</style>
+<!-- Your own CSS, from `custom.css` in the config folder - the same file
+     the dashboard links, so one stylesheet themes both pages. Last in the
+     head so it wins over the built-in rules. See dashboard.html. -->
+<link rel="stylesheet" href="/custom.css">
+</head><body>
 
 <div class="bar">
   <h1><a href="/" data-i18n-title="wall.home.title" title="Downloads and status"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-bolt"/></svg> nzbfast</a></h1>
@@ -2222,6 +2232,15 @@ function nameBadges(r){
   if(!r.pre && r.pre_hint && r.pre_hint.status==='suggested')
     b.push(`<span class="nbadge sugg" onclick="event.stopPropagation();openPreCand(${r.id})"
       title="${esc(t('wall.sugg.tip','A pre announcement matches this post on timing and size. Click to review the candidates: pick the right name or dismiss them.'))}">≈ ${esc(r.pre_hint.name)}</span>`);
+  // The other way to name a dark row, and the opposite kind of answer:
+  // the suggestion above is inferred from timing and size, this reads
+  // the filename out of the posted archive. Offered only where the
+  // daemon says it is worth asking (dark, unnamed, not already known
+  // password-protected), and only on click - a scan-time RAR lane was
+  // measured and rejected.
+  if(!r.pre && r.nameable)
+    b.push(`<button class="nbadge sugg" onclick="event.stopPropagation();rarName(${r.id},this)"
+      title="${esc(t('wall.rarname.title','Reads one to three articles of this post and looks for the real file name inside the archive. Nothing is downloaded and nothing is renamed on disk.'))}">${t('wall.rarname','name this')}</button>`);
   if(r.group) b.push(`<span class="nbadge" dir="ltr" title="${esc(r.group)}">${esc(r.group)}</span>`);
   return b.length?`<div class="brow">${b.join('')}</div>`:'';
 }
@@ -2614,6 +2633,11 @@ async function openCard(k){
       vcodec:r.vcodec, acodec:r.acodec, hdr:r.hdr,
       pref:r.pref, prefhit:r.prefhit,
       have:r.have, rescued:r.rescued, rtitle:r.title, ryear:r.year,
+      // Whether this row is worth offering the archive namer on. Carried
+      // through because the sheet is where a dark release is actually
+      // reachable: the flat list drops junk-scored rows, and a post
+      // wearing a hash for a name scores exactly that.
+      nameable:r.nameable,
     }));
     c.seasons=[...new Set(c.releases.map(r=>r.season).filter(s=>s!=null))].sort((a,b)=>a-b);
     if(c.releases.length){
@@ -2708,6 +2732,8 @@ async function openCard(k){
           <td class="mono dim">${age(r.posted)}</td>
           <td class="${r.complete?'ok':'warn'}">${r.complete?'✓ '+t('wall.complete','complete'):t('wall.partial','partial')}</td>
           <td style="text-align:end;white-space:nowrap">
+            ${r.nameable?`<button class="act ghost" onclick="rarName(${r.id},this)"
+              title="${esc(t('wall.rarname.title','Reads one to three articles of this post and looks for the real file name inside the archive. Nothing is downloaded and nothing is renamed on disk.'))}">${t('wall.rarname','name this')}</button>`:''}
             <button class="act ghost" ${r.complete?'':'disabled'} onclick="grab(${r.id},true)"
               title="${esc(t('wall.play.title','Check it is the right file before downloading all of it'))}">▶ ${t('wall.play','Test')}</button>
             <button class="act" ${r.complete?'':'disabled'} onclick="grab(${r.id},false)">${t('wall.download','Download')}</button>
@@ -2778,6 +2804,54 @@ async function preAssign(id,pid){
 async function preReject(id){
   await api('pre_reject',`&id=${id}`).catch(()=>{});
   closeOvl(); browseFetch();
+}
+
+// ---- name it from the archive's own bytes ---------------------------
+// The on-demand RAR namer (TODO 131 rung 5). ON DEMAND is the whole
+// design: a scan-time lane was built as a pilot and measured NO-GO (24
+// of 26 sampled RAR5 sets are password-protected, ~1.2% real-name yield
+// by bytes), and what survived is one to three articles spent on a row
+// somebody is actually looking at.
+//
+// Either answer is worth having. A name is applied with its own
+// provenance (it came out of the archive, so it outranks every inferred
+// claim); "password-protected" is written down as a terminal
+// classification daemon-side, which is why the row is refetched on that
+// outcome too - the button goes away and no lane ever pays for those
+// articles again.
+async function rarName(id,btn){
+  if(btn.disabled) return;
+  const was=btn.textContent;
+  btn.disabled=true; btn.textContent=t('wall.busy.fetching','Fetching…');
+  const j=await api('rar_name',`&id=${id}`).catch(()=>({status:false}));
+  btn.disabled=false; btn.textContent=was;
+  if(j && j.status && j.name){
+    toast(t('wall.rarname.ok','Read from the archive: {name}',{name:j.name}));
+    rarRefresh();
+    return;
+  }
+  // No outcome at all means the probe never got to look: no provider
+  // reachable, no such row, a timeout. Saying "nothing readable in that
+  // post" there would blame the post for the daemon's problem, which is
+  // the wrong answer to act on (verified against a daemon whose server
+  // was refusing connections - it read as a dead archive).
+  if(j && !j.outcome && j.error){ toast(tErr(j.error)||j.error); return; }
+  const enc = j && j.outcome==='encrypted';
+  toast(enc?t('wall.rarname.enc','That archive is password-protected, so no file name can be read out of it.')
+          :t('wall.rarname.no','Nothing readable in that post: no file name came back.'));
+  if(enc) rarRefresh();
+}
+// Repaint whichever surface the click came from. The sheet caches its
+// release list on the card object, so an open sheet has to have that
+// cache dropped or it repaints the row exactly as it was.
+function rarRefresh(){
+  if(openKey){
+    const c=cards.find(x=>x.key===openKey);
+    if(c) c.releases=null;
+    openCard(openKey);
+    return;
+  }
+  browseFetch();
 }
 
 // ---- cast, crew and person pages ------------------------------------

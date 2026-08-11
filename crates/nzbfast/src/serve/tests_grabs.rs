@@ -908,6 +908,49 @@ fn only_a_dead_post_is_reported_to_the_indexer() {
     assert!(!fail_kind("pre-flight: articles missing beyond repair").transient());
 }
 
+/// TODO §138 (issue #29): the opt-in give-up's sentence, end to end,
+/// through the same classifier the download-proved verdict above uses.
+///
+/// The three consequences are the whole feature and they all hang off
+/// the message OPENING, so this pins them from the producer rather than
+/// from a literal: NOT transient (no automatic retry against a post
+/// nothing carries), FAILURE/HEALTH to the *arr (blocklist the release
+/// and search again, rather than blaming a repair that never ran), and
+/// the `gone` token, which is what suppresses the drawer's Retry button.
+#[test]
+fn the_health_giveup_message_classifies_as_gone() {
+    let h = crate::health::score(
+        &[
+            crate::health::ServerAnswer {
+                host: "a".into(),
+                cells: vec![crate::health::Avail::Missing; 8],
+            },
+            crate::health::ServerAnswer {
+                host: "b".into(),
+                cells: vec![crate::health::Avail::Missing; 8],
+            },
+        ],
+        30,
+        0,
+        1,
+    )
+    .unwrap();
+    assert!(h.no_server_can_supply());
+    // The build tag rides along on the real path, so classify what the
+    // runner actually stores rather than the bare sentence.
+    let msg = crate::with_build(crate::health::giveup_reason(&h));
+    assert!(!fail_kind(&msg).transient(), "{msg}");
+    assert!(fail_kind(&msg).post_unavailable(), "{msg}");
+    assert_eq!(fail_kind_token(fail_kind(&msg)), "gone", "{msg}");
+    assert_eq!(
+        super::nzbget_status(&job(json!({
+            "nzo_id": "gu", "name": "Show.1080p", "nzb_path": "/spool/gu.nzb",
+            "state": "Failed", "out_dir": "/dl/gu", "fail_message": msg,
+        }))),
+        ("FAILURE/HEALTH", "NONE", "NONE")
+    );
+}
+
 /// The wire tokens the drawer switches on. Pinned because they are an
 /// API: renaming one silently drops a remedy button rather than
 /// breaking a build.

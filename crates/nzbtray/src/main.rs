@@ -678,6 +678,42 @@ mod probe_body {
             assert!(keyed_url("http://x/api?mode=queue".into(), &d, true).contains("SECRETKEY123"));
         }
 
+        /// v1.0.22 shipped the M10 latch without arming it on the one
+        /// path Windows users hit every day: the second-instance
+        /// hand-off (a double-clicked .nzb while the tray already
+        /// runs). That branch read `identity_proven()` in a process
+        /// where no probe had ever run, so the latch was its initial
+        /// `false`, every add went keyless, and the daemon refused it
+        /// with the 403 dialog. The latch is process-global Windows-only
+        /// state, so the branch itself cannot run under test on this
+        /// host - pin the source instead: between taking the
+        /// already-running arm and the first post there must be a probe,
+        /// because the probe is the only thing that can set the latch.
+        #[test]
+        fn the_second_instance_probes_before_it_posts() {
+            let src = include_str!("main.rs");
+            // Built in halves so this test's own source cannot satisfy
+            // the searches below.
+            let arm = format!("GetLastError() == {}", "ERROR_ALREADY_EXISTS");
+            let start = src.find(&arm).expect("the second-instance arm exists");
+            let end = src[start..]
+                .find("ensure_daemon")
+                .map(|i| start + i)
+                .unwrap_or(src.len());
+            let block = &src[start..end];
+            let probe = block
+                .find(&format!("probe(port, {}data_dir)", "&"))
+                .expect("the hand-off must probe so the identity latch can arm");
+            for post in ["post_nzb(", "post_nzblnk(", "dash_url("] {
+                if let Some(at) = block.find(post) {
+                    assert!(
+                        probe < at,
+                        "{post} runs before the probe - it will build a keyless URL"
+                    );
+                }
+            }
+        }
+
         /// The launcher handshake, which is what stands between "something
         /// answers on 6789 in our shape" and handing that something the API
         /// key (and with it `mode=server_secret`).
@@ -2043,6 +2079,16 @@ mod app {
             );
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 let port = crate::probe_body::load_port(&data_dir).unwrap_or(BASE_PORT);
+                // IDENTITY_PROVEN is a per-PROCESS latch, and this is a
+                // fresh process: the tray holding the mutex proved the
+                // daemon at its own startup, but that proof lives over
+                // there. Probe once so the runtime.json token challenge
+                // can set our latch, or every hand-off below is built
+                // keyless and the daemon 403s it - v1.0.22 shipped
+                // without this line and every file-association add
+                // failed while the tray was running. An impostor on the
+                // port still fails the challenge and still gets no key.
+                let _ = probe(port, &data_dir);
                 if args.is_empty() && links.is_empty() {
                     open_url(&dash_url(
                         port,

@@ -8,6 +8,67 @@ pub(super) const DASHBOARD_HTML: &str = include_str!(concat!(
     "/../../web/dashboard.html"
 ));
 
+/// The one file in this module that is deliberately NOT embedded: the
+/// user's own stylesheet, read from the config folder at request time
+/// (issue #31, TODO §140).
+///
+/// Everything else here is `include_str!` so an install is a single
+/// binary, and that is exactly what this file must not be. The whole
+/// point is a stylesheet the user edits and reloads - baking it in would
+/// mean a rebuild per tweak, which is the thing being asked for. It is
+/// also why it is a SEPARATE file rather than an edit to the shipped CSS:
+/// it holds only the user's own rules, so an upgrade never touches it.
+pub(super) const USER_CSS_FILE: &str = "custom.css";
+
+/// Refuse to serve a stylesheet larger than this. A hand-written CSS file
+/// is kilobytes; anything past a megabyte is a mistake (a video dropped in
+/// the config folder under the wrong name, a runaway generator), and this
+/// body is read and gzipped on every page load.
+const USER_CSS_MAX: u64 = 1 << 20;
+
+/// The user's stylesheet, or an empty string when there isn't one.
+///
+/// Read from disk per request, not cached: the cost is one open+read of a
+/// small file per PAGE LOAD (the 1 Hz dashboard polling is JSON on other
+/// routes), and `respond_page` puts an ETag over the bytes, so a browser
+/// that already has the file revalidates into a 304 instead of
+/// re-fetching. An edit therefore shows up on the next reload with no
+/// restart and no cache to invalidate.
+///
+/// A missing file is the normal case and is silent on purpose: it answers
+/// with an empty body rather than a 404, so nobody who never wrote one
+/// gets a red line in their browser console, and nothing is logged - this
+/// path runs on every page load.
+///
+/// The path is FIXED - the config file's own directory, one hardcoded
+/// name. No part of the request reaches it, so there is no traversal
+/// surface to defend; a user-settable path would create one.
+pub(super) fn user_css(cfg_path: &Path) -> String {
+    use std::io::Read as _;
+    let path = cfg_path.with_file_name(USER_CSS_FILE);
+    let Ok(file) = std::fs::File::open(&path) else {
+        return String::new();
+    };
+    let mut buf = Vec::new();
+    // Bounded read: one byte past the cap is enough to know it is over.
+    if file.take(USER_CSS_MAX + 1).read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    if buf.len() as u64 > USER_CSS_MAX {
+        // Not silent, unlike the missing case: this one is a real
+        // misconfiguration the user wants to hear about.
+        warn!(
+            "{} is over {} KB - ignoring it",
+            path.display(),
+            USER_CSS_MAX / 1024
+        );
+        return String::new();
+    }
+    // Lossy rather than strict UTF-8: a stray byte in a comment must not
+    // throw away every rule in the file.
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// Browser icons and the web manifest the pages link to, embedded like the
 /// HTML so an install is still a single binary. Returns the body and its
 /// content type, or None if the path is not one of ours.
@@ -342,7 +403,94 @@ pub(super) const MANUAL_HTML: &str = include_str!(concat!(
 
 #[cfg(test)]
 mod tests {
-    use super::DASHBOARD_HTML;
+    use super::{DASHBOARD_HTML, USER_CSS_FILE, user_css};
+
+    /// The user stylesheet is read from disk, so an edit takes effect on
+    /// the next page load. If this ever became an `include_str!` the
+    /// feature would silently turn into "rebuild to restyle" (§140).
+    #[test]
+    fn the_user_stylesheet_is_read_from_the_config_folder_not_the_binary() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-usercss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+
+        // No file is the normal case: empty, and nothing said about it.
+        assert_eq!(user_css(&cfg), "");
+
+        let css = dir.join(USER_CSS_FILE);
+        std::fs::write(&css, "body{background:#123}").unwrap();
+        assert_eq!(user_css(&cfg), "body{background:#123}");
+
+        // Read per call, so the SECOND load sees the edit - the whole
+        // point of not embedding it.
+        std::fs::write(&css, "body{background:#456}").unwrap();
+        assert_eq!(user_css(&cfg), "body{background:#456}");
+
+        // Absurdly large is treated as a mistake, not as a stylesheet.
+        std::fs::write(&css, "a".repeat((super::USER_CSS_MAX + 1) as usize)).unwrap();
+        assert_eq!(user_css(&cfg), "");
+
+        // Nothing in the binary carries the user's rules.
+        assert!(!DASHBOARD_HTML.contains("body{background:#456}"));
+        // ...and both pages ask for it, last, so it wins on ties.
+        const WALL: &str =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/wall.html"));
+        for (page, name) in [(DASHBOARD_HTML, "dashboard"), (WALL, "wall")] {
+            let link = page
+                .find(r#"<link rel="stylesheet" href="/custom.css">"#)
+                .unwrap_or_else(|| panic!("{name} does not link the user stylesheet"));
+            let style = page.rfind("</style>").expect("no style block");
+            assert!(link > style, "{name} links custom.css before its own CSS");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every API sender the dashboard knows how to NAME also has a glyph,
+    /// and every glyph id resolves in the shared sprite. A typo here
+    /// renders an empty box that looks like a missing origin (§140).
+    #[test]
+    fn origin_glyph_ids_resolve_in_the_sprite() {
+        const TOKENS: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../web/ui-tokens.html"
+        ));
+        // `key:'value'` pairs out of a one-line JS object literal.
+        let table = |name: &str| -> Vec<(String, String)> {
+            let at = DASHBOARD_HTML
+                .find(&format!("const {name}="))
+                .unwrap_or_else(|| panic!("no {name} table in the dashboard"));
+            let body = &DASHBOARD_HTML[at..];
+            let body = &body[body.find('{').expect("no table brace") + 1
+                ..body.find("};").expect("unterminated table")];
+            body.split(',')
+                .filter_map(|p| p.split_once(":'"))
+                .map(|(k, v)| {
+                    (
+                        k.trim().trim_matches(['\'', '\n', ' ']).to_string(),
+                        v.trim_end_matches('\'').to_string(),
+                    )
+                })
+                .collect()
+        };
+        let arr = table("ARR_ICON");
+        assert!(arr.len() >= 10, "ARR_ICON looks unparsed: {arr:?}");
+        for (client, icon) in arr.iter().chain(table("ORIGIN_ICON").iter()) {
+            assert!(
+                TOKENS.contains(&format!("<g id=\"{icon}\">")),
+                "{client} points at {icon}, which is not in the icon sprite"
+            );
+        }
+        let named = table("API_CLIENT_NAMES");
+        assert!(named.len() >= 10, "API_CLIENT_NAMES looks unparsed");
+        for (client, _) in &named {
+            assert!(
+                arr.iter().any(|(c, _)| c == client),
+                "{client} has a display name but no glyph - it would fall back \
+                 to the generic API mark"
+            );
+        }
+    }
 
     /// UX §14: a byte formatter may not pair one base with the other's
     /// label.

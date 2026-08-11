@@ -184,6 +184,15 @@ pub(super) struct CatMeta {
     /// script setting. A job-level `script=` param still wins.
     #[serde(default)]
     pub script: String,
+    /// TODO 142 / issue #32: does a finished job in this category take
+    /// its name from the .nzb file? `None` = follow the global
+    /// [`rename_from_nzb`](Daemon::rename_from_nzb) switch; `Some` is an
+    /// explicit allow or disallow for this category alone, which is the
+    /// control the reporter asked for. Here rather than in a new
+    /// `rename_from_nzb_cats` string because per-category behaviour
+    /// already has a home: this struct, one editor row, one saved map.
+    #[serde(default)]
+    pub nzb_name: Option<bool>,
 }
 
 pub struct Daemon {
@@ -492,24 +501,23 @@ pub struct Daemon {
     pub auto_defer: std::sync::atomic::AtomicBool,
     /// TODO §77 post-health prediction on/off (live setting
     /// `post_health`): STAT a handful of a queued job's articles across
-    /// every server and badge the row with the verdict.
-    ///
-    /// ON by default, unlike `preflight` above, because the two do
-    /// different things: `preflight` FAILS a job on its own evidence and
-    /// so has to be asked for, while this only ever puts a coloured dot
-    /// and a sentence on a queue row. A few dozen STATs per job is the
-    /// entire cost.
+    /// every server and badge the row with the verdict. ON by default,
+    /// unlike `preflight` above: that one FAILS a job on its own
+    /// evidence and so has to be asked for, while this only ever puts a
+    /// coloured dot and a sentence on a queue row.
     pub post_health: std::sync::atomic::AtomicBool,
     /// TODO §77 auto-defer on the health verdict (live setting
     /// `post_health_defer`): a red job sinks below healthier ones of the
-    /// same priority in start order.
-    ///
-    /// OFF by default, and REORDERING ONLY - nothing is removed, paused
-    /// or failed. A sample of eight articles is not allowed to decide
-    /// that a release is dead (memory `nzbfast-retry-propagation-trap`);
-    /// the most it may do is let the queue try the healthy-looking items
-    /// first, which costs the red job nothing if the sample was wrong.
+    /// same priority in start order. OFF by default, and REORDERING ONLY
+    /// - nothing is removed, paused or failed. Eight STATs may put the
+    /// healthy-looking items first, which costs the red job nothing when
+    /// the sample was wrong; ending a release on them takes the far
+    /// stricter bar below.
     pub post_health_defer: std::sync::atomic::AtomicBool,
+    /// TODO §138 live setting `post_health_fail`, OFF by default and the
+    /// ONLY thing in §77 that may fail a job - bar and why on
+    /// [`crate::health::PostHealth::no_server_can_supply`].
+    pub post_health_fail: std::sync::atomic::AtomicBool,
     /// Update checker: the manifest of a NEWER version once one is seen
     /// (None = up to date as far as we know), the check on/off toggle,
     /// and the manifest URL (live settings update_checks/update_url).
@@ -542,6 +550,8 @@ pub struct Daemon {
     /// (which have no saved browser preference) come up in the right
     /// language. Live setting ui_locale; the API itself stays English.
     pub ui_locale: Mutex<String>,
+    /// §141 live setting `cors_origin` - values and why on [`CORS_DEFAULT`].
+    pub cors_origin: Mutex<String>,
     /// Auto-deepen (live setting index_deepen): articles of group
     /// HISTORY each scan pass adds below the low-water mark, so the
     /// index grows backward in the background. 0 = off.
@@ -950,6 +960,15 @@ pub struct Daemon {
     /// Aggressive: keep ONLY the media file(s), delete everything else
     /// (default off - irreversible).
     pub rename_media_only: std::sync::atomic::AtomicBool,
+    /// TODO 142 / issue #32: name the finished folder and its main file
+    /// after the .nzb file, instead of after what the release parses as.
+    ///
+    /// Default OFF - not a worse answer than the metadata renamer, a
+    /// DIFFERENT one, and turning it on for everyone would rename
+    /// finished downloads on installs that never asked. A category may
+    /// override it either way: [`CatMeta::nzb_name`],
+    /// [`Daemon::name_from_nzb`].
+    pub rename_from_nzb: std::sync::atomic::AtomicBool,
     /// M12 volume control, live: only index posts newer than this
     /// (seconds; 0 = off). Read by the scan loop each pass.
     pub index_max_age_secs: AtomicU64,

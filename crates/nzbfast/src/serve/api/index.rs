@@ -1347,6 +1347,28 @@ fn m_index_browse(
                     d,
                     rows.iter().filter(|r| r.pre_title.is_empty()).map(|r| r.id),
                 );
+                // TODO 131 rung 5: which rows are worth offering the
+                // on-demand RAR namer on. Unnamed, still wearing a dark
+                // stem, and not already known header-encrypted - that
+                // last one is the point of the terminal classification,
+                // so a row that has been asked once stops being asked.
+                // The obfuscation verdict comes from `stem_is_a_name`,
+                // the ONE definition the byte lanes and the claims gate
+                // share; a second opinion here is how the .7z lane sat
+                // inert at 14,349 rejections.
+                let nameable: std::collections::HashSet<i64> = {
+                    let cands: Vec<i64> = rows
+                        .iter()
+                        .filter(|r| {
+                            r.pre_title.is_empty() && !nzbkit::release::stem_is_a_name(&r.stem)
+                        })
+                        .map(|r| r.id)
+                        .collect();
+                    let enc = d
+                        .with_index_read(|ix| Some(ix.header_encrypted_ids(&cands)))
+                        .unwrap_or_default();
+                    cands.into_iter().filter(|id| !enc.contains(id)).collect()
+                };
                 json!({
                     "total": total,
                     "offset": bq.offset,
@@ -1394,6 +1416,9 @@ fn m_index_browse(
                             // stem; null everywhere else.
                             "pre_hint": hints.get(&r.id).cloned()
                                 .unwrap_or(Value::Null),
+                            // Worth offering `mode=rar_name` on: dark,
+                            // unnamed, not already known encrypted.
+                            "nameable": nameable.contains(&r.id),
                             // The stem it was actually posted
                             // under, when that differs.
                             "posted": if r.pre_title.is_empty() {

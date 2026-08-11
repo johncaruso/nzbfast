@@ -93,7 +93,7 @@ ktls = { version = "6.0", default-features = false, features = ["aws_lc_rs"], op
 # sparse turns that zero-fill into a hole. Same crate and version
 # nzbfast already links.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_IO",
     "Win32_System_Ioctl",
@@ -109,6 +109,13 @@ indexer = ["dep:rusqlite"]
 # Off by default: the receive path this replaces is the one every
 # platform shares, and kTLS only exists on Linux.
 ktls = ["dep:ktls"]
+# Build-gate for the elapsed-time [[test]] target at the bottom of this
+# file (TODO 116b). EMPTY on purpose - it compiles no code in or out;
+# its only effect is whether cargo builds the targets that name it in
+# required-features. Per-push CI does not pass it, so those targets stop
+# paying link time and disk there; nightly.yml (their home) passes
+# `--features heavy-tests` where it runs them.
+heavy-tests = []
 
 [dev-dependencies]
 # `hooks` is what gives the compact-abort test `progress_handler`, the
@@ -132,3 +139,17 @@ sevenz-rust2 = { version = "0.21", default-features = false, features = ["aes256
 # test-util: paused-clock tests (the connect-timeout regression test
 # auto-advances past CONNECT_TIMEOUT instead of sleeping 20 s for real).
 tokio = { version = "1", features = ["test-util"] }
+
+# conn_tuner races a throttled mock over a connection ladder - an
+# elapsed-time suite whose home is nightly.yml, not the push path. The
+# `required-features` gate (TODO 116b) is what keeps per-push CI from
+# BUILDING it: nextest's `-E 'not binary(...)'` filters running only,
+# so before this gate the target still paid full link time and disk on
+# every push while never running there. A test target added tomorrow
+# carries no required-features and so builds AND runs on push
+# automatically - the auto-enrolment default ci-private.yml's long note
+# insists on stays the default. Run locally with:
+#   cargo test -p nzbkit --test conn_tuner --features heavy-tests
+[[test]]
+name = "conn_tuner"
+required-features = ["heavy-tests"]

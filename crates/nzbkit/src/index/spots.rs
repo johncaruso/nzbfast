@@ -114,19 +114,100 @@ impl Index {
             .map(|n| n as u64)
     }
 
+    /// The one article a spot-born release's declared completeness is
+    /// worth corroborating against: the lowest-numbered segment of its
+    /// largest file, bracketed as every msgid is stored here.
+    ///
+    /// LARGEST, not first in the NZB. Sidecars (`.par2`, `.nfo`, a
+    /// sample) are routinely posted in a different run from the payload
+    /// and expire on their own schedule, so asking about one answers a
+    /// question nobody asked; the biggest file is the content itself
+    /// and the article a download would reach for first. Lowest segment
+    /// because that is the one part every file has.
+    pub fn release_head_article(&self, rid: i64) -> rusqlite::Result<Option<String>> {
+        let segs: Option<String> = self
+            .db
+            .prepare_cached(
+                "SELECT segments FROM files WHERE release_id=?1
+                 ORDER BY bytes DESC, filename ASC LIMIT 1",
+            )?
+            .query_row([rid], |r| r.get(0))
+            .optional()?;
+        let Some(segs) = segs else {
+            return Ok(None);
+        };
+        let mut parsed: Vec<(u32, String, u64)> = serde_json::from_str(&segs).unwrap_or_default();
+        parsed.sort_by_key(|(n, _, _)| *n);
+        Ok(parsed.into_iter().next().map(|(_, id, _)| id))
+    }
+
+    /// Record what one corroborating STAT said about a promoted spot,
+    /// and make the card say the same thing.
+    ///
+    /// A spot-born release's `complete` is computed from the segments
+    /// the NZB declares about itself - every part accounted for,
+    /// because the document listing them is the same document claiming
+    /// they exist. Nothing on that path has ever asked a provider. At
+    /// the tip that is usually harmless; at depth it is not, and the
+    /// spot catalogue now walks back to 2011.
+    ///
+    /// So an absent head article demotes the card to incomplete. It is
+    /// not a census - one article cannot prove the other 5,000 are
+    /// there - but it is the difference between "nobody has ever
+    /// looked" and "we looked once and the post is gone", and it is one
+    /// round trip with no body transfer.
+    ///
+    /// The verdict is not permanent by design: if the header scanner
+    /// later ingests real files for this release, its own aggregate
+    /// recompute wins, and that recompute is grounded in articles the
+    /// scanner actually saw on the wire.
+    pub fn spot_stat_verdict(
+        &self,
+        spot_msgid: &str,
+        rid: i64,
+        present: bool,
+    ) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE spots SET stat_ok=?2 WHERE msgid=?1",
+            rusqlite::params![spot_msgid, if present { 1 } else { 2 }],
+        )?;
+        if !present {
+            self.db
+                .execute("UPDATE releases SET complete=0 WHERE id=?1", [rid])?;
+        }
+        Ok(())
+    }
+
+    /// Corroboration tallies for the readout: (checked, gone).
+    pub fn spot_stat_counts(&self) -> rusqlite::Result<(u64, u64)> {
+        self.db.query_row(
+            "SELECT COALESCE(SUM(stat_ok>0),0), COALESCE(SUM(stat_ok=2),0) FROM spots",
+            [],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+        )
+    }
+
     /// One page of spots the resolver still owes an NZB fetch, newest
-    /// first. Excludes adult spots (they stay in the Browse list behind
-    /// the Include-adult checkbox rather than becoming wall cards - the
-    /// wall's own adult filter keys on enriched genres, which a fresh
-    /// card does not have yet), legacy moderation records, and spots
-    /// whose fetch has failed `SPOT_NZB_TRIES` times.
+    /// first. Excludes legacy moderation records and spots whose fetch
+    /// has failed `SPOT_NZB_TRIES` times.
+    ///
+    /// Adult spots used to be excluded here too, and that was a
+    /// workaround standing in for a missing marker: the wall's adult
+    /// filter reads enriched genres, a fresh card has none, so a
+    /// promoted `d75` card would have sailed straight past
+    /// `wall_hide_adult`. Not promoting them kept the wall right and
+    /// cost the catalogue 31% of the feed - the largest single hole in
+    /// it. Now `promote_spot` marks the card `adult` from the spot's
+    /// own subcategory and [`ADULT_MARK_SQL`] filters on that, so the
+    /// setting works and the rows exist. What the user sees by default
+    /// is unchanged: `wall_hide_adult` is on, the raw Spots list still
+    /// hides them behind Include adult.
     pub fn spots_unresolved(&self, limit: u32) -> rusqlite::Result<Vec<Spot>> {
         let mut stmt = self.db.prepare(&format!(
             "SELECT id, msgid, title, category, subcats, size, date,
                     spotter_id, verified, hashcash_ok, nzb_msgids
              FROM spots
              WHERE release_id=0 AND nzb_tried < {SPOT_NZB_TRIES}
-               AND ',' || subcats || ',' NOT LIKE '%,{ADULT_SUBCAT},%'
                AND title NOT LIKE 'DISPOSE %'
              ORDER BY date DESC, id DESC LIMIT ?1"
         ))?;
@@ -543,6 +624,20 @@ impl Index {
                 );
             }
         }
+        // Does the row this promotion is about to write already exist?
+        // Only the adult marker below cares, and it cares a lot: see
+        // the note at that write.
+        let born_here = if poster_key == poster {
+            prior.is_none()
+        } else {
+            self.db
+                .prepare_cached("SELECT id FROM releases WHERE stem=?1 AND poster=?2 AND grp=?3")?
+                .query_row(rusqlite::params![stem, poster_key, grp], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .optional()?
+                .is_none()
+        };
         self.db
             .prepare_cached(
                 "INSERT INTO releases(stem, poster, grp, first_seen, first_posted)
@@ -620,6 +715,32 @@ impl Index {
                 have,
                 need
             ])?;
+        // The poster's own adult filing, carried onto the card they
+        // filed. This is what lets `wall_hide_adult` work on spot-born
+        // cards at all - the genre test it runs on has nothing to read
+        // until (and unless) enrichment reaches the title.
+        //
+        // ONLY on a row this promotion brought into being. A spot that
+        // lands on a release the scanner already holds - by the msgid
+        // quorum above, or by the (stem, poster, grp) upsert adopting
+        // it here - is a claim about SOMEBODY ELSE'S row, and honoring
+        // it would hand anyone who can publish a signed spot a way to
+        // take an existing card off the default wall: Spotnet keys are
+        // free, and the message-ids needed to aim at a post are in any
+        // NZB of it. A row that exists only because of this spot has
+        // nothing to lose that way.
+        if born_here
+            && self
+                .db
+                .prepare_cached("SELECT subcats FROM spots WHERE msgid=?1")?
+                .query_row([spot_msgid], |r| r.get::<_, String>(0))
+                .optional()?
+                .is_some_and(|s| spot_is_adult(&s))
+        {
+            self.db
+                .prepare_cached("UPDATE releases SET adult=1 WHERE id=?1")?
+                .execute([rid])?;
+        }
         // The same claim the dedup branch books, on the row this spot
         // just built. Two things ride on it.
         //
@@ -698,6 +819,19 @@ fn strip_stored_cdata(stored: &str) -> Option<String> {
 /// How many times the resolver retries a spot's NZB fetch before
 /// writing the spot off as list-only.
 pub const SPOT_NZB_TRIES: i64 = 3;
+
+/// How many completeness-corroborating STATs one resolver pass may
+/// spend ([`Index::spot_stat_verdict`]).
+///
+/// One per freshly promoted card, and at the default budget of 40
+/// spots per pass that reaches all of them - a STAT is a round trip
+/// with no body, against a promotion that already cost a HEAD and
+/// several BODYs. The cap is here for the other case: a deep backfill
+/// with the resolve budget wound up (the setting goes to 1000) would
+/// otherwise turn every pass into a STAT run of the same size. Spots
+/// the cap does not reach keep the NZB's own declared verdict, which
+/// is exactly what every spot-born card had before.
+pub const SPOT_STAT_PER_PASS: u32 = 40;
 
 /// The claims ladder tier a spot title enters at, on both promotion
 /// branches. The BINDING is the spot's own NZB - the exact article set
@@ -906,6 +1040,243 @@ mod tests {
             .unwrap();
         assert_eq!(linked, rid);
         assert!(ix.spots_unresolved(10).unwrap().is_empty());
+        teardown(&d, ix);
+    }
+
+    /// TODO 131: an adult spot is promoted like any other, and the card
+    /// carries the poster's own filing so the wall's adult setting can
+    /// act on it.
+    ///
+    /// Before the marker existed the resolver simply skipped `d75`
+    /// spots - 31% of the feed, the biggest single hole in the
+    /// catalogue - because the only adult test the wall had reads
+    /// enriched genres, and a fresh spot-born card has none. What the
+    /// user sees by default is unchanged; what changed is that the
+    /// setting now has something to read.
+    #[test]
+    fn an_adult_spot_becomes_a_card_the_adult_setting_can_hide() {
+        let d = dir("adult");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        let plain = spot("<pl1@spot>", "Plain.Show.S01E01.1080p.WEB.x264-GRP", "a09");
+        let adult = spot(
+            "<ad1@spot>",
+            "Adult.Feature.2026.1080p.WEB.x264-GRP",
+            &format!("a09,{ADULT_SUBCAT}"),
+        );
+        ix.insert_spot(&plain).unwrap();
+        ix.insert_spot(&adult).unwrap();
+        // It is offered to the resolver at all - the old exclusion here
+        // is what kept a third of the feed out of the index.
+        assert_eq!(ix.spots_unresolved(10).unwrap().len(), 2);
+
+        let mut rid_adult = 0;
+        for (s, stem, id) in [
+            (&plain, "aa11bb22cc", "p1@x"),
+            (&adult, "dd33ee44ff", "a1@x"),
+        ] {
+            let nzb = crate::nzb::Nzb {
+                files: vec![nzb_file(
+                    &format!(r#""{stem}.part01.rar" yEnc (1/1)"#),
+                    "alt.binaries.misc",
+                    &[(1, id, 4 << 30)],
+                )],
+                meta: Vec::new(),
+            };
+            match ix.promote_spot(&s.msgid, &s.title, &nzb, 2000).unwrap() {
+                SpotPromotion::Promoted(rid) => {
+                    if s.msgid == adult.msgid {
+                        rid_adult = rid;
+                    }
+                }
+                other => panic!("expected a fresh release, got {other:?}"),
+            }
+        }
+        let marked: i64 = ix
+            .db
+            .query_row("SELECT adult FROM releases WHERE id=?1", [rid_adult], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(marked, 1, "the d75 filing did not reach the card");
+
+        // Both views, because they are the two halves that have to
+        // agree - the flat list was how the genre filter got bypassed
+        // once already.
+        let cards = |hide_adult: bool| -> Vec<String> {
+            let (cards, _) = ix
+                .browse_cards(
+                    &BrowseQuery {
+                        curated: true,
+                        hide_adult,
+                        limit: 50,
+                        ..Default::default()
+                    },
+                    CardSort::Title,
+                    false,
+                    false,
+                    None,
+                )
+                .unwrap();
+            cards.into_iter().map(|c| c.title_key).collect()
+        };
+        let flat = |hide_adult: bool| -> Vec<String> {
+            let (rows, total) = ix
+                .browse(&BrowseQuery {
+                    curated: true,
+                    hide_adult,
+                    limit: 50,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(total as usize, rows.len(), "total disagrees with the page");
+            rows.iter().map(|r| r.display_name().to_string()).collect()
+        };
+        let adult_shown = |v: &[String]| v.iter().any(|s| s.to_lowercase().contains("adult"));
+        let plain_shown = |v: &[String]| v.iter().any(|s| s.to_lowercase().contains("plain"));
+        for (view, on, off) in [
+            ("cards", cards(true), cards(false)),
+            ("flat", flat(true), flat(false)),
+        ] {
+            assert!(
+                adult_shown(&off) && plain_shown(&off),
+                "{view}: nothing is filtered with the setting off: {off:?}"
+            );
+            assert!(
+                !adult_shown(&on),
+                "{view}: the marked card survived the filter: {on:?}"
+            );
+            assert!(
+                plain_shown(&on),
+                "{view}: the filter took an unmarked card with it: {on:?}"
+            );
+        }
+        teardown(&d, ix);
+    }
+
+    /// TODO 131: a spot-born card's completeness is the NZB's own claim
+    /// about itself until one STAT says otherwise.
+    ///
+    /// The corroboration asks about the largest file's first article -
+    /// the payload, not a par2 sidecar posted in a different run - and
+    /// an absent answer demotes the card. One article cannot prove a
+    /// set is whole; it can prove the post is gone, which is the case
+    /// the depth walk keeps producing.
+    #[test]
+    fn one_stat_can_take_a_declared_complete_card_back() {
+        let d = dir("stat");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        let s = spot("<st1@spot>", "Deep.Old.Release.2011.720p-GRP", "a09");
+        ix.insert_spot(&s).unwrap();
+        let nzb = crate::nzb::Nzb {
+            files: vec![
+                // A sidecar posted first, and small.
+                nzb_file(
+                    r#""7a1b2c3d.par2" yEnc (1/1)"#,
+                    "alt.binaries.misc",
+                    &[(1, "pp@x", 1 << 20)],
+                ),
+                // The payload, out of segment order in the NZB.
+                nzb_file(
+                    r#""7a1b2c3d.part01.rar" yEnc (1/2)"#,
+                    "alt.binaries.misc",
+                    &[(2, "b2@x", 2 << 30), (1, "b1@x", 2 << 30)],
+                ),
+            ],
+            meta: Vec::new(),
+        };
+        let rid = match ix.promote_spot(&s.msgid, &s.title, &nzb, 2000).unwrap() {
+            SpotPromotion::Promoted(rid) => rid,
+            other => panic!("expected a fresh release, got {other:?}"),
+        };
+        let complete = |ix: &Index| -> i64 {
+            ix.db
+                .query_row("SELECT complete FROM releases WHERE id=?1", [rid], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(complete(&ix), 1, "the NZB declares every part present");
+        assert_eq!(
+            ix.release_head_article(rid).unwrap().as_deref(),
+            Some("<b1@x>"),
+            "the payload's first part, not the par2 and not NZB order"
+        );
+
+        // Present: nothing changes except the record that we asked.
+        ix.spot_stat_verdict(&s.msgid, rid, true).unwrap();
+        assert_eq!(complete(&ix), 1);
+        assert_eq!(ix.spot_stat_counts().unwrap(), (1, 0));
+
+        // Gone: the card stops claiming to be whole.
+        ix.spot_stat_verdict(&s.msgid, rid, false).unwrap();
+        assert_eq!(
+            complete(&ix),
+            0,
+            "the head article is gone and the card still said complete"
+        );
+        assert_eq!(ix.spot_stat_counts().unwrap(), (1, 1));
+        teardown(&d, ix);
+    }
+
+    /// The marker is written ONLY on a row the spot brought into being.
+    ///
+    /// A spot that lands on a release the scanner already holds is a
+    /// claim about somebody else's row, and Spotnet keys are free: if
+    /// filing `d75` against an existing post hid its card, anyone who
+    /// can read an NZB's message-ids could take any card off the
+    /// default wall for the cost of one signed spot.
+    #[test]
+    fn an_adult_spot_cannot_mark_a_release_it_merely_matched() {
+        let d = dir("adultdedup");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        // The scanner's row first, with the articles the spot will name.
+        ix.ingest(
+            "alt.binaries.misc",
+            &[
+                entry(
+                    r#""Scanner.Held.2026.1080p.WEB.x264-GRP.mkv" yEnc (1/2)"#,
+                    "up@x",
+                    "s1@x",
+                    1 << 30,
+                ),
+                entry(
+                    r#""Scanner.Held.2026.1080p.WEB.x264-GRP.mkv" yEnc (2/2)"#,
+                    "up@x",
+                    "s2@x",
+                    1 << 30,
+                ),
+            ],
+            1_000,
+        )
+        .unwrap();
+        let s = spot(
+            "<ad2@spot>",
+            "Scanner.Held.2026.1080p.WEB.x264-GRP",
+            &format!("a09,{ADULT_SUBCAT}"),
+        );
+        ix.insert_spot(&s).unwrap();
+        let nzb = crate::nzb::Nzb {
+            files: vec![nzb_file(
+                r#""Scanner.Held.2026.1080p.WEB.x264-GRP.mkv" yEnc (1/2)"#,
+                "alt.binaries.misc",
+                &[(1, "s1@x", 1 << 30), (2, "s2@x", 1 << 30)],
+            )],
+            meta: Vec::new(),
+        };
+        let rid = match ix.promote_spot(&s.msgid, &s.title, &nzb, 2000).unwrap() {
+            SpotPromotion::Upgraded(rid) | SpotPromotion::Promoted(rid) => rid,
+            other => panic!("expected the spot to resolve, got {other:?}"),
+        };
+        let marked: i64 = ix
+            .db
+            .query_row("SELECT adult FROM releases WHERE id=?1", [rid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            marked, 0,
+            "a spot marked a row it did not create - that is a free card-hiding primitive"
+        );
         teardown(&d, ix);
     }
 
@@ -1446,11 +1817,17 @@ mod tests {
         teardown(&d, ix);
     }
 
-    /// The resolver's queue: adult spots never become cards, legacy
-    /// moderation rows are skipped, and a fetch that keeps failing is
-    /// written off after the retry cap.
+    /// The resolver's queue: legacy moderation rows are skipped and a
+    /// fetch that keeps failing is written off after the retry cap.
+    ///
+    /// Adult spots are NOT skipped any more - they are promoted like
+    /// anything else and the card carries the poster's filing, which is
+    /// what `wall_hide_adult` reads (see
+    /// `an_adult_spot_becomes_a_card_the_adult_setting_can_hide`). The
+    /// old skip was a stand-in for that marker and it cost the
+    /// catalogue 31% of the feed.
     #[test]
-    fn the_resolver_queue_skips_adult_and_capped_spots() {
+    fn the_resolver_queue_skips_disposed_and_capped_spots() {
         let d = dir("queue");
         let ix = Index::open(&d.join("index.db")).unwrap();
         ix.insert_spot(&spot("<a@s>", "Normal.Release.1080p", "a09"))
@@ -1467,7 +1844,8 @@ mod tests {
         let pending = ix.spots_unresolved(10).unwrap();
         assert_eq!(
             pending.iter().map(|s| s.msgid.as_str()).collect::<Vec<_>>(),
-            vec!["<a@s>"]
+            vec!["<b@s>", "<a@s>"],
+            "newest first, adult included, DISPOSE and capped left out"
         );
         teardown(&d, ix);
     }

@@ -440,6 +440,68 @@ fn set_ui_locale_membership_and_empty_auto() {
     assert_eq!(*d.ui_locale.lock_ok(), "");
 }
 
+/// §141 (issue #33). The default is SABnzbd's `*`; a list narrows it;
+/// empty turns the header off. Everything else is refused HERE, because
+/// the value goes into a response header verbatim and tiny_http header
+/// values are ASCII - CR and LF included.
+#[test]
+fn set_cors_origin_gates_the_charset_and_normalizes_the_list() {
+    let (_t, d) = daemon_in("cors");
+    assert_eq!(*d.cors_origin.lock_ok(), CORS_DEFAULT);
+
+    // The permissive default round-trips, whitespace and all.
+    assert_eq!(
+        set_cors_origin(&d, "cors_origin", " * ").unwrap(),
+        (true, json!("*"))
+    );
+    // A list is trimmed and rejoined so the emit side can split on ','.
+    assert_eq!(
+        set_cors_origin(
+            &d,
+            "cors_origin",
+            "https://a.example ,, moz-extension://abc-123,http://[::1]:6789",
+        )
+        .unwrap(),
+        (
+            true,
+            json!("https://a.example, moz-extension://abc-123, http://[::1]:6789")
+        )
+    );
+    // Empty is a real value: no header at all.
+    assert_eq!(
+        set_cors_origin(&d, "cors_origin", "").unwrap(),
+        (true, json!(""))
+    );
+    assert_eq!(*d.cors_origin.lock_ok(), "");
+
+    // Response splitting, a bare host with no scheme, a path, a space,
+    // and a quote are all refused - and none of them lands.
+    for bad in [
+        "https://x.example\r\nX-Evil: 1",
+        "https://x.example\nX-Evil: 1",
+        "example.com",
+        "https://x.example/path",
+        "https://x.example/",
+        "https://x example",
+        // No scheme separator at all, and an empty half either side.
+        "://x.example",
+        "https://",
+        "https://\"x\".example",
+        // Non-ASCII cannot even be built into a tiny_http header.
+        "https://ünicode.example",
+    ] {
+        assert!(
+            set_cors_origin(&d, "cors_origin", bad).is_err(),
+            "accepted {bad:?}"
+        );
+        assert_eq!(*d.cors_origin.lock_ok(), "", "{bad:?} was stored anyway");
+    }
+
+    // A browser accepts exactly one value, so `*` plus named origins is
+    // a setting half of which would silently do nothing.
+    assert!(set_cors_origin(&d, "cors_origin", "*, https://a.example").is_err());
+}
+
 #[cfg(feature = "indexer")]
 #[test]
 fn set_index_evict_order_membership() {

@@ -471,6 +471,31 @@ async fn wall_groups_dedupes_and_serves() {
         assert_eq!(wire_rows.len(), 1, "{wire_rows:?}");
         assert_eq!(wire_rows[0]["quality"], "720p HDTV", "{wire_rows:?}");
 
+        // TODO 131 rung 5: `nameable` is what puts the on-demand "name
+        // this" affordance on a row, so it has to mean exactly "dark and
+        // unnamed" - a readable release must never be offered a probe it
+        // has no use for.
+        let (code, body) = http_get(port, "/api?mode=index_browse&all=1&apikey=sekrit");
+        assert_eq!(code, 200, "{body}");
+        let rows = serde_json::from_str::<serde_json::Value>(&body).unwrap()["results"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let nameable = |needle: &str| -> bool {
+            rows.iter()
+                .find(|r| r["name"].as_str().is_some_and(|n| n.contains(needle)))
+                .unwrap_or_else(|| panic!("no row for {needle}: {rows:?}"))["nameable"]
+                == serde_json::Value::Bool(true)
+        };
+        assert!(
+            nameable("2137d880a074fa4075a65ce4e21d2f95"),
+            "a hash-named post is exactly what the namer is for: {rows:?}"
+        );
+        assert!(
+            !nameable("The.Matrix.1999.2160p"),
+            "a readable release must not be offered the namer: {rows:?}"
+        );
+
         // 24C: wall2&key= is a card-scoped fetch - the Releases
         // surface's hover preview and group-by-title rows pull ONE
         // title's card (total agrees, no page scan).

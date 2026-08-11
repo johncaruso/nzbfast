@@ -1771,6 +1771,58 @@ pub(super) fn spawn_download_worker(
             // work so the snapshots below are its lines, nobody else's.
             let log_mark = nzbkit::logtee::mark();
 
+            // TODO §138 (issue #29), opt-in `post_health_fail`: the §77
+            // sample already asked every configured server about this
+            // post while the queue was idle. If every one of them said
+            // every sampled article was missing, and the post is old
+            // enough that propagation is no longer an explanation, end
+            // it here - the *arr gets a FAILURE/HEALTH it can blocklist
+            // and re-search on within seconds of the job coming up,
+            // instead of after however long it takes a doomed download
+            // to prove the same thing at full retry ladder.
+            //
+            // Free: no probe runs here, the evidence is the verdict on
+            // the record. The bar is `no_server_can_supply`, which is
+            // deliberately much narrower than the red bucket the
+            // reorder acts on - see its doc for each clause.
+            //
+            // WHY HERE and not in the prober that gathered the evidence:
+            // the runner picks a job and only then marks it Downloading,
+            // so a prober failing a queued job races that window and can
+            // park a job the runner has already started - one record in
+            // history and a live download with no queue row. The runner
+            // is single and owns the transition, so deciding here cannot
+            // race anything, and it is the same seam the opt-in
+            // `preflight` sweep below already fails jobs on.
+            //
+            // Sentence, class and consequences arrive together:
+            // `giveup_reason` opens with `post is gone`, so `fail_kind`
+            // reads Gone - no automatic retry, FAILURE/HEALTH to the
+            // *arr, "find another release" as the suggested move.
+            let giveup: Option<String> = if d.post_health_fail.load(Ordering::Relaxed) {
+                let j = job.lock_ok();
+                j.health
+                    .as_ref()
+                    .filter(|h| h.no_server_can_supply())
+                    .map(crate::health::giveup_reason)
+            } else {
+                None
+            };
+            if let Some(reason) = giveup {
+                {
+                    let mut j = job.lock_ok();
+                    j.state = JobState::Failed;
+                    j.fail_message = crate::with_build(reason);
+                    j.finished_at = Some(Instant::now());
+                    j.finished_unix = Some(unix_now());
+                    info!(target: "health", "{nzo_id}: {}", j.fail_message);
+                }
+                *d.started_at.lock_ok() = None;
+                d.run_post_job_hooks(&job);
+                d.park(job);
+                continue;
+            }
+
             // Opt-in pre-flight (settings.json `preflight`): sample
             // this post's articles before spending the bandwidth. A
             // post nothing carries any more is otherwise discovered

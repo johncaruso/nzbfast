@@ -514,6 +514,7 @@ fn cat_meta_priority_dir_and_script_apply() {
                 dir: "series/current".into(),
                 priority: Some(1),
                 script: "/scripts/tv.py".into(),
+                nzb_name: None,
             },
         );
         // dir: the category's subfolder is renamed, nested, contained.
@@ -1389,6 +1390,47 @@ fn retry_reresolves_a_stale_baked_out_dir_to_the_current_download_folder() {
         // Nothing is on disk at the new folder, so progress starts from zero.
         assert_eq!(g.downloaded_bytes, 0);
         assert_eq!(g.state, JobState::Queued);
+    });
+}
+
+/// TODO 143: a scan pass publishing its connection must leave
+/// `index_migrated` SET.
+///
+/// The flag answers "has a read-write open run the migrations", and
+/// `index_read_checked` sends every query down `with_index`'s UNBOUNDED
+/// wait on the write mutex while it is false - the startup-shaped moment
+/// when nothing holds a long lock. The other four writers of that mutex
+/// only set it on the branch where THEY open the connection
+/// (`guard.is_none()`), so once a pass has published one, that branch
+/// never runs again and the flag stayed false for the life of the
+/// process: the read-only pool became dead code and the 28 Jul / 2 Aug
+/// wedges were reopened on every install whose scan loop published
+/// before the first `with_index` call.
+///
+/// http_wedge pins the symptom end to end. This pins the seam, because
+/// that suite only caught it once Spotnet went default-on and gave its
+/// groupless fixture a pass to publish from - a test whose config is
+/// unrepresentative is how this stayed green while production wedged.
+#[cfg(feature = "indexer")]
+#[test]
+fn a_published_scan_connection_marks_the_index_migrated() {
+    with_daemon("published", |d| {
+        d.index_enabled.store(true, Ordering::Relaxed);
+        // A scan pass opens its OWN connection - migrations run there -
+        // and hands it over. Nothing has called with_index yet, which is
+        // the ordering that made this invisible.
+        let era = d.index_era();
+        let fresh = nzbkit::index::Index::open(&d.index_db).expect("scan pass open");
+        d.publish_index(era, fresh);
+        assert!(
+            d.index.lock_ok().is_some(),
+            "precondition: the pass's connection is the published one"
+        );
+        assert!(
+            d.index_migrated.load(Ordering::Acquire),
+            "a published connection has run the migrations, so queries \
+             must use the read pool rather than the write mutex"
+        );
     });
 }
 

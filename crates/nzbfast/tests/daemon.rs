@@ -7,6 +7,8 @@
 mod daemon_authkey;
 // §123 chip-6 fault x lifecycle cross product (sibling dir, size gate).
 mod daemon_chip6;
+// §138 opt-in give-up legs (sibling dir, size gate).
+mod daemon_health;
 // §129 4a pre-queue hook legs (sibling dir, size gate).
 mod daemon_hooks;
 // Passwords attached mid-download, and the prefer_external_unrar switch:

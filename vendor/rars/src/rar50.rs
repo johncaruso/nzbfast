@@ -3197,9 +3197,19 @@ mod rev_stream_tests {
     #[test]
     fn rev_metadata_of_a_multi_gigabyte_volume_is_read_from_its_header_alone() {
         // A genuine multi-gigabyte declared volume, on disk, parsed inside a
-        // tiny ceiling. The file is sparse: only the header is ever written,
-        // and only the header is ever read - which is the whole claim. The
-        // old path called Rev5Volume::parse on std::fs::read of this file.
+        // tiny ceiling. Only the header is ever written, and only the header
+        // is ever read - which is the whole claim. The old path called
+        // Rev5Volume::parse on std::fs::read of this file, so the declared
+        // size IS the assertion: shrink it and a regression to reading the
+        // whole volume passes unnoticed.
+        //
+        // The extension below is sparse on APFS and ext4 but NOT on NTFS,
+        // which reserves the clusters unless the file is flagged sparse
+        // first (see the fsutil call). That flag is best-effort, so budget
+        // for the 8 GB landing on the Windows CI runner's temp volume for
+        // real: it fits alone, it is not budget for a second test of this
+        // shape. Filling that disk is os error 112 (StorageFull), which is
+        // what nzbname_tests.rs once did.
         let (_, revs) = build_rev_set(&[600, 512, 480], 2);
         let header_end = {
             let source = MemorySource(revs[0].clone());
@@ -3211,8 +3221,28 @@ mod rev_stream_tests {
         let declared = 8u64 << 30;
         {
             let mut file = std::fs::File::create(&path).unwrap();
+            // "Sparse" is a POSIX assumption. APFS and ext4 give a hole
+            // away for free, but NTFS RESERVES every cluster a declared
+            // length covers unless the file carries the sparse
+            // attribute - so `set_len` below answered ERROR_DISK_FULL
+            // (os error 112) on the Windows CI runner, where this test
+            // shares a temp volume with the rest of the suite. The
+            // attribute is only settable through FSCTL_SET_SPARSE, and
+            // this crate forbids `unsafe_code`, so it goes via fsutil
+            // rather than DeviceIoControl. Best-effort by design, and
+            // silent: a filesystem or a box that refuses just keeps the
+            // reserving behaviour, which is still correct wherever the
+            // 8 GB is there. Must run before `set_len`, on the created
+            // file.
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("fsutil")
+                    .args(["sparse", "setflag"])
+                    .arg(&path)
+                    .output();
+            }
             std::io::Write::write_all(&mut file, &revs[0][..header_end as usize]).unwrap();
-            // Sparse: no blocks are allocated for the declared payload.
+            // Only the header is ever written; the declared payload is a hole.
             file.set_len(declared).unwrap();
             file.sync_all().unwrap();
         }

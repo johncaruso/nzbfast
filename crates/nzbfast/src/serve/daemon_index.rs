@@ -801,6 +801,21 @@ impl Daemon {
             return;
         }
         *guard = Some(fresh);
+        // `fresh` came from a read-write `Index::open`, so the migrations
+        // HAVE run - which is the whole question `index_migrated` answers.
+        //
+        // Setting it here is load-bearing, not tidiness. The other four
+        // writers of this mutex only set the flag on the branch where
+        // THEY open the connection (`guard.is_none()`), so once a scan
+        // pass has published one, that branch never runs again and the
+        // flag would stay false for the life of the process. False sends
+        // every query endpoint down `with_index`'s UNBOUNDED wait on this
+        // mutex instead of the read-only pool - which is the 28 Jul and
+        // 2 Aug wedges exactly: parked HTTP workers, then a daemon that
+        // answers nothing at all, `mode=version` included. The pool was
+        // effectively dead code on any install whose scan loop published
+        // before the first `with_index` call (TODO 143).
+        self.index_migrated.store(true, Ordering::Release);
     }
 
     /// The master switch, for the workers that are not scan passes.

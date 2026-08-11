@@ -172,6 +172,54 @@ impl PostHealth {
     pub(crate) fn sinks(&self) -> bool {
         self.bucket == Bucket::Red && !self.waived
     }
+
+    /// TODO §138: does this verdict clear the bar the OPT-IN early
+    /// give-up needs (`post_health_fail`)? Every other surface in this
+    /// module is advisory; this is the one predicate a job can be failed
+    /// on, so it is deliberately much narrower than [`Self::sinks`].
+    ///
+    /// Red is the floor, not the bar. Red only needs `absent > 0` among
+    /// the servers that ANSWERED, and that is nowhere near enough to end
+    /// a release on: a fleet where two hosts of three timed out, or a
+    /// post short one article of eight, is red and may still download
+    /// perfectly. Four things on top, and every one of them is load
+    /// bearing:
+    ///
+    /// * **every configured server answered** (`answered == servers`) -
+    ///   a host that stayed silent had no say, and "no server can supply
+    ///   this" is a claim about the whole fleet, not about the subset
+    ///   that happened to be reachable this minute. This is the promise
+    ///   in issue #29's accepted shape, in one comparison;
+    /// * **every sampled article was missing** (`absent == sampled`) -
+    ///   a partially short post is what PAR2 is for, and a sample of
+    ///   eight cannot tell "short" from "beyond repair" (that estimate
+    ///   is the reporter's wishlist, which was NOT promised);
+    /// * `servers > 0`, so an empty fleet is never unanimous;
+    /// * **not waived** - the user has reordered or re-prioritized this
+    ///   job since the probe, which is them asserting they want it. The
+    ///   defer honours that (see [`Self::sinks`]) and the far heavier
+    ///   action must honour it at least as much.
+    ///
+    /// The age guard rides in via Red: below [`GONE_MIN_AGE_DAYS`] the
+    /// verdict is Amber whatever the servers said, so a post still
+    /// propagating can never reach this. That is the whole
+    /// `nzbfast-retry-propagation-trap` guard and it is the reason this
+    /// takes a [`PostHealth`] instead of raw counts.
+    ///
+    /// Note what is still NOT proven here: a backbone that hiccups for
+    /// five minutes 430s an old post on every server too, and this will
+    /// believe it. That residual is why the setting is off by default
+    /// and says so on its own row - the honest trade is "I would rather
+    /// lose the occasional good release than spend the bandwidth", and
+    /// it is the operator's to make, not ours.
+    pub(crate) fn no_server_can_supply(&self) -> bool {
+        self.bucket == Bucket::Red
+            && !self.waived
+            && self.servers > 0
+            && self.answered == self.servers
+            && self.sampled > 0
+            && self.absent == self.sampled
+    }
 }
 
 /// Score a completed sample. `None` when nothing was learned - no server
@@ -351,6 +399,37 @@ pub(crate) fn failure_clause(h: &PostHealth) -> Option<String> {
             h.sampled
         ))
     }
+}
+
+/// TODO §138: the failure sentence for a job the opt-in give-up ends
+/// before it ever starts. Only ever called on a verdict that already
+/// passed [`PostHealth::no_server_can_supply`].
+///
+/// The opening clause is `post is gone`, which
+/// [`crate::serve::fail_kind`] classifies as [`crate::serve::FailKind`]
+/// `::Gone` - the same class a completed download that proved every
+/// article absent lands in, and the class that matters here for three
+/// separate reasons: it is NOT transient, so `park` arms no automatic
+/// retry against a post nothing carries; it maps to NZBGet's
+/// `FAILURE/HEALTH`, which is what makes the *arr blocklist the release
+/// and go looking for another one instead of asking us again; and its
+/// suggested action is "find another release" rather than "retry".
+/// Prefix-classified, so this sentence must keep leading with it.
+///
+/// The rest is the evidence, in numbers the user can check: how many
+/// servers, how many articles, how old. The sample size is disclosed for
+/// the same reason every other surface in this module discloses it - the
+/// count is never a share of the release - and the setting is named in
+/// the message because a job that vanishes into history without one is
+/// the single most alarming thing this feature can do.
+pub(crate) fn giveup_reason(h: &PostHealth) -> String {
+    format!(
+        "post is gone: all {} sampled article(s) were reported missing by every one of \
+         your {} configured server(s), and at {} day(s) old the post is past the point \
+         where propagation explains it - failed without downloading because the \
+         \"give up on posts no server can supply\" setting is on",
+        h.sampled, h.servers, h.age_days
+    )
 }
 
 pub(crate) fn health_json(h: &PostHealth) -> serde_json::Value {
@@ -565,6 +644,119 @@ mod tests {
         assert_eq!(sample_size(0), SAMPLE_K);
         assert_eq!(sample_size(LARGE_JOB_BYTES - 1), SAMPLE_K);
         assert_eq!(sample_size(LARGE_JOB_BYTES), SAMPLE_K_LARGE);
+    }
+
+    /// TODO §138. The bar the opt-in give-up needs, one clause at a
+    /// time. Everything here except the first case is a verdict the
+    /// AMBER-vs-red reorder is perfectly happy to act on, and none of
+    /// them may end a release.
+    #[test]
+    fn only_a_unanimous_fully_missing_sample_can_give_up() {
+        // Every configured server, every sampled article, past the
+        // propagation age. The one shape that qualifies.
+        let all = score(
+            &[answer("a", &[M, M, M]), answer("b", &[M, M, M])],
+            30,
+            0,
+            1,
+        )
+        .unwrap();
+        assert!(all.no_server_can_supply());
+        assert_eq!(
+            (all.answered, all.servers, all.absent, all.sampled),
+            (2, 2, 3, 3)
+        );
+
+        // THE discriminating case: one server confirms the articles
+        // missing, the other never answered at all. Red (the silent host
+        // is dropped from the verdict), so the reorder still sinks it -
+        // and it must never be failed, because the fleet has not spoken.
+        let silent = score(
+            &[answer("a", &[M, M, M]), answer("dead", &[U, U, U])],
+            30,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(silent.bucket, Bucket::Red);
+        assert!(silent.sinks());
+        assert!(
+            !silent.no_server_can_supply(),
+            "a server that never answered cannot be part of a unanimous verdict"
+        );
+
+        // Short, not gone. Two of three missing everywhere is what PAR2
+        // exists for, and a sample of three cannot say otherwise.
+        let short = score(
+            &[answer("a", &[M, M, H]), answer("b", &[M, M, H])],
+            30,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(short.bucket, Bucket::Red);
+        assert!(!short.no_server_can_supply());
+
+        // An Unknown cell inside a server that DID answer is still a
+        // hole in the evidence: that article was never asked of it.
+        let ragged = score(
+            &[answer("a", &[M, M, U]), answer("b", &[M, M, M])],
+            30,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(ragged.bucket, Bucket::Red);
+        assert!(!ragged.no_server_can_supply());
+
+        // Young enough for propagation to explain it: amber, and amber
+        // never reaches the bar however unanimous it is.
+        for age in 0..GONE_MIN_AGE_DAYS {
+            let young = score(&[answer("a", &[M, M]), answer("b", &[M, M])], age, 0, 1).unwrap();
+            assert_eq!(young.bucket, Bucket::Amber, "age {age}");
+            assert!(!young.no_server_can_supply(), "age {age}");
+        }
+
+        // Green is green.
+        assert!(
+            !score(&[answer("a", &[H, H])], 30, 0, 1)
+                .unwrap()
+                .no_server_can_supply()
+        );
+    }
+
+    /// A waiver is the user saying they want this job. The reorder drops
+    /// its scheduling effect for one, and the much heavier give-up owes
+    /// it at least the same deference.
+    #[test]
+    fn a_waived_verdict_never_gives_up() {
+        let mut s = score(&[answer("a", &[M, M])], 30, 0, 1).unwrap();
+        assert!(s.no_server_can_supply());
+        s.waived = true;
+        assert!(!s.no_server_can_supply());
+        assert!(!s.sinks());
+    }
+
+    /// The give-up sentence has to keep leading with `post is gone`:
+    /// `fail_kind` classifies on the OPENING, and the whole point of the
+    /// feature is the `Gone` class - no auto-retry, FAILURE/HEALTH to
+    /// the *arr, "find another release" as the suggested move.
+    #[test]
+    fn the_giveup_sentence_is_classified_gone_and_shows_its_evidence() {
+        let s = score(&[answer("a", &[M, M]), answer("b", &[M, M])], 41, 0, 1).unwrap();
+        let msg = giveup_reason(&s);
+        assert!(msg.starts_with("post is gone"), "{msg}");
+        assert!(msg.contains("all 2 sampled article(s)"), "{msg}");
+        assert!(msg.contains("your 2 configured server(s)"), "{msg}");
+        assert!(msg.contains("41 day(s) old"), "{msg}");
+        // Never a share of the release, same rule as every other surface.
+        assert!(!msg.contains('%'), "{msg}");
+        // The setting is named: a job that ends up in history without a
+        // byte spent must say what decided that.
+        assert!(
+            msg.contains("give up on posts no server can supply"),
+            "{msg}"
+        );
     }
 
     #[test]

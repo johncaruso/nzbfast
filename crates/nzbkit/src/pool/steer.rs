@@ -786,10 +786,12 @@ mod tests {
         // Busy picker (window_used 1): the envelope arm is idle-only,
         // and at 1 s the article is not stale either (owner untrained,
         // global untrained -> flat 8 s bound). No dup.
-        assert!(sh.pick_dup(0, 1, 1, 0, 1, 0).is_none());
+        assert!(sh.pick_dup(0, 1, 1, 0, Pipeline::payload(1), 0).is_none());
         // Idle picker: owner under 1/4 fleet-best, age past 3x the
         // fastest article time (clamped to the 500 ms floor) - race.
-        let w = sh.pick_dup(0, 1, 1, 0, 0, 0).expect("envelope race fires");
+        let w = sh
+            .pick_dup(0, 1, 1, 0, Pipeline::payload(0), 0)
+            .expect("envelope race fires");
         assert_eq!(w.id, "<old@x>");
         assert!(w.dup);
     }
@@ -799,13 +801,13 @@ mod tests {
         let sh = racing_shared(false);
         // Young article on the slow owner: under the age bound.
         inflight_entry(&sh, "<young@x>", 1, Duration::from_millis(100));
-        assert!(sh.pick_dup(0, 1, 1, 0, 0, 0).is_none());
+        assert!(sh.pick_dup(0, 1, 1, 0, Pipeline::payload(0), 0).is_none());
         // Old article, but the owner recovers to ~1/3 of fleet-best:
         // above the 1/4 arm. The OLD whole-run 2x rule would have raced
         // this - its retirement is the point (one rule, one family).
         sh.note_srv_bytes(1, 9_000_000); // 10 vs 30 = 1/3
         inflight_entry(&sh, "<old@x>", 1, Duration::from_secs(1));
-        assert!(sh.pick_dup(0, 1, 1, 0, 0, 0).is_none());
+        assert!(sh.pick_dup(0, 1, 1, 0, Pipeline::payload(0), 0).is_none());
     }
 
     #[test]
@@ -814,7 +816,7 @@ mod tests {
         sh.dup_bytes_lost.store(u64::MAX / 2, Ordering::Relaxed);
         // A perfect envelope candidate: choked by the cap.
         inflight_entry(&sh, "<old@x>", 1, Duration::from_secs(1));
-        assert!(sh.pick_dup(0, 1, 1, 0, 0, 0).is_none());
+        assert!(sh.pick_dup(0, 1, 1, 0, Pipeline::payload(0), 0).is_none());
         // The endgame 430 ladder is exempt: it carries a Missing
         // verdict, and choking it re-opens the unanimity tails M2c.4
         // closed. Endgame-scale pool, article 430'd on its owner.
@@ -840,7 +842,7 @@ mod tests {
             },
         );
         let w = sh
-            .pick_dup(0, 1, 1, 0, 0, 0)
+            .pick_dup(0, 1, 1, 0, Pipeline::payload(0), 0)
             .expect("the verdict ladder is never throttled by the cap");
         assert_eq!(w.id, "<laddered@x>");
     }
@@ -850,7 +852,7 @@ mod tests {
         let sh = racing_shared(true); // server 0 flagged block_account
         inflight_entry(&sh, "<old@x>", 1, Duration::from_secs(1));
         assert!(
-            sh.pick_dup(0, 1, 1, 0, 0, 0).is_none(),
+            sh.pick_dup(0, 1, 1, 0, Pipeline::payload(0), 0).is_none(),
             "a flagged server's bytes are never spent speculatively (5.7)"
         );
     }
@@ -867,7 +869,7 @@ mod tests {
         // Busy picker allowed: the stale rule keeps its shipped gates.
         let before = sh.hedges_issued.load(Ordering::Relaxed);
         let w = sh
-            .pick_dup(0, 1, 1, 0, 1, 0)
+            .pick_dup(0, 1, 1, 0, Pipeline::payload(1), 0)
             .expect("per-owner stale fires");
         assert_eq!(w.id, "<stale@x>");
         assert_eq!(
@@ -893,6 +895,7 @@ mod tests {
             soft_430: 0,
             fenced: false,
             rearms: 0,
+            ladder: false,
         };
         // Untrained everywhere: no clear winner, everyone takes it.
         assert!(!sh.faster_can_take(&w, 0));

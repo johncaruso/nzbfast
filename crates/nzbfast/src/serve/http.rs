@@ -523,6 +523,16 @@ fn handle_api(
 ) {
     let mut req = req;
     let mut params = params;
+    // §141 (issue #33): decided before anything is read, and applied to
+    // BOTH exits below. The refusal needs it as much as the answer does -
+    // without the header on the 403 a browser extension cannot read the
+    // "API Key Incorrect" body either, so a mistyped key presents as an
+    // unreachable daemon instead of a bad key.
+    let cors = cors_headers(
+        &d.cors_origin.lock_ok().clone(),
+        origin_hdr(&req).as_deref(),
+        false,
+    );
     let mut api_body: Option<Vec<u8>> = None;
     // Keeps the body-budget reservation alive for as long as
     // `api_body` (and the parse of it) is - see [`BodyHold`].
@@ -751,7 +761,7 @@ fn handle_api(
         // body is unchanged: the *arrs and the wrapper probes
         // read the phrases and the hs proof from it, not the
         // status line.
-        let _ = req.respond(json_resp(refusal).with_status_code(403));
+        let _ = req.respond(with_cors(json_resp(refusal).with_status_code(403), cors));
         return;
     }
     // For stream-mode adds: absolute player-handoff links need the
@@ -789,7 +799,7 @@ fn handle_api(
     };
     let body = api::dispatch(d, &mut req, &params, &mode, &ctx, &mut api_body)
         .unwrap_or_else(|| json!({"status": false, "error": format!("unimplemented mode {mode}")}));
-    let _ = req.respond(json_resp(body));
+    let _ = req.respond(with_cors(json_resp(body), cors));
 }
 
 pub(super) fn spawn_http_workers(
@@ -870,6 +880,17 @@ pub(super) fn spawn_http_workers(
                             .replace("__NZBFAST_LOCALE__", &d.ui_locale.lock_ok()),
                         "text/html",
                     );
+                    continue;
+                }
+                // The user's own stylesheet (TODO §140 / issue #31), read
+                // from the config folder per request - see `user_css` for
+                // why this one asset is not embedded. Unauthenticated like
+                // the icons and the page that links it: same origin, same
+                // reachability, and the content is the user's own CSS.
+                // Missing file = an empty 200, so a browser console stays
+                // clean for the 99% who never wrote one.
+                if path == "/custom.css" {
+                    respond_page(req, user_css(&d.cfg_path), "text/css; charset=utf-8");
                     continue;
                 }
                 // §5 i18n catalogues (key→string JSON, embedded like the HTML).
@@ -965,6 +986,24 @@ pub(super) fn spawn_http_workers(
                 }
                 if path == "/watch" {
                     route_watch(req, &d, query);
+                    continue;
+                }
+                // §141 (issue #33): the CORS preflight for the
+                // SAB-compatible API, answered ABOVE the key check on
+                // purpose. A browser sends OPTIONS before the
+                // extension's real request whenever it carries an
+                // X-Api-Key or a JSON body, and it sends it WITHOUT
+                // credentials - so a 403 here means Firefox never sends
+                // the real request at all and the header on the real
+                // response is never reached. 204 with no body: a
+                // preflight answer carries permissions, not content.
+                if path == "/api" && req.method() == &tiny_http::Method::Options {
+                    let hdrs = cors_headers(
+                        &d.cors_origin.lock_ok().clone(),
+                        origin_hdr(&req).as_deref(),
+                        true,
+                    );
+                    let _ = req.respond(with_cors(tiny_http::Response::empty(204), hdrs));
                     continue;
                 }
                 let mut params = parse_query(query);
@@ -1168,6 +1207,111 @@ mod tests {
         assert_eq!(api_body_cap("wall_art"), 10 << 20);
         assert_eq!(api_body_cap("queue"), API_BODY_DEFAULT);
         assert_eq!(api_body_cap(""), 1 << 20);
+    }
+
+    /// The header names and values, spelled out.
+    fn cors(allow: &str, origin: Option<&str>, preflight: bool) -> Vec<(String, String)> {
+        cors_headers(allow, origin, preflight)
+            .iter()
+            .map(|h| (h.field.as_str().as_str().to_string(), h.value.to_string()))
+            .collect()
+    }
+
+    fn value_of(hs: &[(String, String)], name: &str) -> Option<String> {
+        hs.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    }
+
+    /// §141 (issue #33). The default is SABnzbd's, and it is the same
+    /// answer whether or not the caller named an origin - `curl` gets it
+    /// too, which is how the reporter checked SAB in the first place.
+    #[test]
+    fn cors_default_is_the_wildcard_sabnzbd_sends() {
+        for origin in [None, Some("moz-extension://abc")] {
+            let h = cors(CORS_DEFAULT, origin, false);
+            assert_eq!(
+                value_of(&h, "Access-Control-Allow-Origin"),
+                Some("*".to_string())
+            );
+            // One answer for everyone: nothing varies by Origin.
+            assert_eq!(value_of(&h, "Vary"), None);
+            // Illegal beside `*`, and pointless for a key that travels
+            // in the request rather than in a cookie.
+            assert_eq!(value_of(&h, "Access-Control-Allow-Credentials"), None);
+        }
+    }
+
+    /// Empty is off: the state the daemon shipped in before §141, kept
+    /// reachable for anyone who wants it.
+    #[test]
+    fn an_empty_cors_origin_sends_nothing_at_all() {
+        assert!(cors("", Some("https://a.example"), false).is_empty());
+        assert!(cors("   ", Some("https://a.example"), true).is_empty());
+    }
+
+    /// A list answers the caller's own origin, by the CONFIGURED
+    /// spelling - never by echoing the request's bytes back into a
+    /// response header - and always with `Vary: Origin`.
+    #[test]
+    fn a_restricted_cors_origin_answers_only_its_own_list() {
+        let allow = "https://a.example, https://b.example:8080";
+        for o in ["https://a.example", "https://b.example:8080"] {
+            let h = cors(allow, Some(o), false);
+            assert_eq!(
+                value_of(&h, "Access-Control-Allow-Origin"),
+                Some(o.to_string())
+            );
+            assert_eq!(value_of(&h, "Vary"), Some("Origin".to_string()));
+        }
+        // A stranger, a caller with no Origin at all, and a prefix of a
+        // listed origin all get no permission - but the answer still
+        // varies by Origin, so a cache cannot hand one to the other.
+        for o in [
+            Some("https://evil.example"),
+            None,
+            Some("https://a.example.evil.net"),
+            Some("https://a.example:443"),
+        ] {
+            let h = cors(allow, o, false);
+            assert_eq!(value_of(&h, "Access-Control-Allow-Origin"), None, "{o:?}");
+            assert_eq!(value_of(&h, "Vary"), Some("Origin".to_string()), "{o:?}");
+        }
+        // Scheme and host are case-insensitive (RFC 6454); what goes out
+        // is still the configured spelling.
+        let h = cors(allow, Some("HTTPS://A.EXAMPLE"), false);
+        assert_eq!(
+            value_of(&h, "Access-Control-Allow-Origin"),
+            Some("https://a.example".to_string())
+        );
+    }
+
+    /// The preflight trio rides OPTIONS only. Without an answer here
+    /// Firefox never sends the real request, so the header on the real
+    /// response would never be reached.
+    #[test]
+    fn only_the_preflight_carries_methods_and_headers() {
+        let plain = cors(CORS_DEFAULT, None, false);
+        for h in [
+            "Access-Control-Allow-Methods",
+            "Access-Control-Allow-Headers",
+            "Access-Control-Max-Age",
+        ] {
+            assert_eq!(value_of(&plain, h), None, "{h} on a plain answer");
+        }
+        let pre = cors(CORS_DEFAULT, None, true);
+        let methods = value_of(&pre, "Access-Control-Allow-Methods").unwrap();
+        assert!(
+            methods.contains("GET") && methods.contains("POST"),
+            "{methods}"
+        );
+        let allowed = value_of(&pre, "Access-Control-Allow-Headers")
+            .unwrap()
+            .to_ascii_lowercase();
+        for h in ["x-api-key", "authorization", "content-type"] {
+            assert!(allowed.contains(h), "{h} missing from {allowed}");
+        }
+        assert!(value_of(&pre, "Access-Control-Max-Age").is_some());
     }
 
     #[test]

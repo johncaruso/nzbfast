@@ -40,6 +40,16 @@ pub const SEVENZ_MAGIC: &[u8] = &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 /// hostile start header can make the prober fetch and buffer.
 pub const SEVENZ_END_MAX: u64 = 2 << 20;
 
+/// Cap on the PPMd model memory a packed header's coder props may
+/// declare. `Ppmd7Decoder::new` allocates the props' 32-bit memSize up
+/// front - before a single output byte exists for the unpack-size cap
+/// to bound - and sevenz-rust2's header decode passes an effectively
+/// unlimited mem budget, so a 42-byte window declaring 4 GiB is an
+/// instant OOM (found by fuzz). Real writers compress headers with
+/// LZMA; a PPMd header at all is exotic, and 7-Zip's own PPMd default
+/// is 16 MiB, so 64 MiB is generous slack.
+pub const SEVENZ_PPMD_MEM_MAX: u64 = 64 << 20;
+
 /// Property ids of the 7z end-header grammar, as sevenz-rust2 and the
 /// reference implementation spell them. Only the ones the declared-size
 /// pre-scan below needs.
@@ -51,6 +61,10 @@ const K_CRC: u8 = 0x0A;
 const K_FOLDER: u8 = 0x0B;
 const K_CODERS_UNPACK_SIZE: u8 = 0x0C;
 const K_ENCODED_HEADER: u8 = 0x17;
+
+/// 7z method id of PPMd, the one coder whose construction cost is set
+/// by its props (memSize) rather than by the declared output size.
+const SEVENZ_ID_PPMD: [u8; 3] = [0x03, 0x04, 0x01];
 
 /// The parsed 32-byte 7z start header. Offsets are relative to byte 32,
 /// so the end header (the archive map, kept at the TAIL of a 7z)
@@ -94,7 +108,8 @@ pub enum ProbeError {
     BadStart,
     /// Declared end-header size is zero or above [`SEVENZ_END_MAX`],
     /// or a packed (`kEncodedHeader`) header declares a decoded size
-    /// above the same cap (a decompression bomb, not a real header).
+    /// above the same cap, or a PPMd coder memSize above
+    /// [`SEVENZ_PPMD_MEM_MAX`] (a bomb declaration, not a real header).
     HeaderTooBig,
     /// Caller's tail buffer is shorter than the declared header size.
     TailShort,
@@ -221,11 +236,25 @@ impl Scan<'_> {
     }
 }
 
-/// Sum of every unpack size a `kEncodedHeader` window declares - the
-/// number sevenz-rust2 will hand `Read::take` as the decode bound, plus
-/// every intermediate coder buffer. A byte-exact mirror of the library's
-/// parse up to `kCodersUnpackSize` (reader.rs: `read_pack_info`,
-/// `read_unpack_info`, `read_block`), stopping right after the sizes.
+/// What decoding a `kEncodedHeader` window will cost, as DECLARED by
+/// the window itself - the numbers sevenz-rust2 turns into allocations
+/// before one honest byte is produced.
+struct DeclaredCost {
+    /// Sum of every unpack size - the number sevenz-rust2 hands
+    /// `Read::take` as the decode bound, plus every intermediate coder
+    /// buffer (and the LZMA dictionary, which lzma-rust2 clamps to the
+    /// unpack size).
+    unpack: u64,
+    /// Sum of every PPMd coder's props-declared memSize -
+    /// `Ppmd7Decoder::new` allocates it up front, independent of any
+    /// output bound, so it needs its own cap ([`SEVENZ_PPMD_MEM_MAX`]).
+    ppmd_mem: u64,
+}
+
+/// The declared decode cost of a `kEncodedHeader` window. A byte-exact
+/// mirror of the library's parse up to `kCodersUnpackSize` (reader.rs:
+/// `read_pack_info`, `read_unpack_info`, `read_block`), stopping right
+/// after the sizes.
 ///
 /// Returns None when the window does not scan - the library will then
 /// reject the same bytes itself BEFORE any decode (its parse is the
@@ -233,7 +262,7 @@ impl Scan<'_> {
 /// block), so None safely means "let the library produce its error".
 /// Overflow while summing saturates instead of failing: an astronomic
 /// declaration must land in the over-cap bucket, not the None one.
-fn encoded_header_declared_unpack(window: &[u8]) -> Option<u64> {
+fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
     let limit = window.len() as u64;
     let mut s = Scan { b: window, i: 1 }; // window[0] == K_ENCODED_HEADER
     let mut nid = s.u8()?;
@@ -271,6 +300,7 @@ fn encoded_header_declared_unpack(window: &[u8]) -> Option<u64> {
     // block consumes at least two), so a declared-huge `num_blocks`
     // truncates out of the loop before it can balloon this vec.
     let mut block_outs = Vec::new();
+    let mut ppmd_mem = 0u64;
     for _ in 0..num_blocks {
         let num_coders = s.num()?;
         if num_coders > limit {
@@ -280,7 +310,9 @@ fn encoded_header_declared_unpack(window: &[u8]) -> Option<u64> {
         let mut total_out = 0u64;
         for _ in 0..num_coders {
             let bits = s.u8()?;
+            let id_at = s.i;
             s.skip((bits & 0xF) as usize)?;
+            let is_ppmd = s.b[id_at..s.i] == SEVENZ_ID_PPMD;
             let (n_in, n_out) = if bits & 0x10 == 0 {
                 (1, 1)
             } else {
@@ -296,7 +328,16 @@ fn encoded_header_declared_unpack(window: &[u8]) -> Option<u64> {
                 if props > limit {
                     return None;
                 }
+                let props_at = s.i;
                 s.skip(props as usize)?;
+                // PPMd props: order byte, then the 32-bit memSize the
+                // decoder will allocate whole. Shorter props error in
+                // the library before it allocates - safe fall-through.
+                if is_ppmd && props >= 5 {
+                    let p = &s.b[props_at..];
+                    let mem = u32::from_le_bytes([p[1], p[2], p[3], p[4]]);
+                    ppmd_mem = ppmd_mem.saturating_add(mem as u64);
+                }
             }
             if bits & 0x80 != 0 {
                 // Alternative methods: the library refuses these too.
@@ -331,7 +372,10 @@ fn encoded_header_declared_unpack(window: &[u8]) -> Option<u64> {
             total = total.saturating_add(s.num()?);
         }
     }
-    Some(total)
+    Some(DeclaredCost {
+        unpack: total,
+        ppmd_mem,
+    })
 }
 
 /// A sparse Read+Seek view over the two byte ranges a probe actually
@@ -410,9 +454,11 @@ pub fn sevenz_tail_names(head: &[u8], tail: &[u8]) -> Result<Vec<SevenzEntryInfo
     // (already CRC-verified) window first and hold it to the same cap
     // as the stored header. Real posters' packed headers decode to a
     // few hundred bytes; 2 MiB of decoded header metadata is generous.
+    // A PPMd coder's memSize is a second declared allocation the output
+    // cap never touches, so it gets its own cap.
     if window.first() == Some(&K_ENCODED_HEADER)
-        && let Some(declared) = encoded_header_declared_unpack(window)
-        && declared > SEVENZ_END_MAX
+        && let Some(declared) = encoded_header_declared_cost(window)
+        && (declared.unpack > SEVENZ_END_MAX || declared.ppmd_mem > SEVENZ_PPMD_MEM_MAX)
     {
         return Err(ProbeError::HeaderTooBig);
     }
@@ -823,6 +869,53 @@ mod tests {
         assert_ne!(err, ProbeError::HeaderTooBig, "gate overrejected: {err}");
     }
 
+    /// Like [`encoded_window`] but the coder is PPMd with the given
+    /// props memSize, declaring a tiny (64-byte) decoded size - the
+    /// unpack cap alone would wave it through.
+    fn ppmd_window(mem: u32) -> Vec<u8> {
+        let mut w = vec![
+            0x17, // kEncodedHeader
+            0x06, 0x00, 0x01, // kPackInfo: pack_pos=0, one pack stream
+            0x09, 0x10, // kSize: 16 pack bytes
+            0x00, // kEnd (pack info)
+            0x07, 0x0B, 0x01, 0x00, // kUnpackInfo, kFolder, 1 block, internal
+            0x01, // one coder
+            0x23, // flags: 3-byte id + attrs
+        ];
+        w.extend_from_slice(&SEVENZ_ID_PPMD);
+        w.push(0x05); // 5 props bytes: order, then memSize LE
+        w.push(0x06); // order
+        w.extend_from_slice(&mem.to_le_bytes());
+        w.push(0x0C); // kCodersUnpackSize
+        w.push(0xFF); // 8-byte number form
+        w.extend_from_slice(&64u64.to_le_bytes());
+        w.extend_from_slice(&[0x00, 0x00]); // kEnd (unpack info), kEnd
+        w
+    }
+
+    #[test]
+    fn ppmd_mem_bomb_is_rejected_before_decode() {
+        // The fuzz-found shape: declared output is tiny (the unpack cap
+        // passes it) but the PPMd props declare ~4 GiB of model memory,
+        // which Ppmd7Decoder::new would allocate whole before decoding
+        // a byte. Must die at the gate.
+        let (head, tail) = seal(&ppmd_window(0xF923_EF0F));
+        assert_eq!(
+            sevenz_tail_names(&head, &tail),
+            Err(ProbeError::HeaderTooBig)
+        );
+    }
+
+    #[test]
+    fn ppmd_with_sane_mem_passes_the_gate() {
+        // Same window with a modest memSize: the gate must key on the
+        // declaration, not on the PPMd method id (any error but
+        // HeaderTooBig proves it reached the real parser).
+        let (head, tail) = seal(&ppmd_window(1 << 20));
+        let err = sevenz_tail_names(&head, &tail).unwrap_err();
+        assert_ne!(err, ProbeError::HeaderTooBig, "gate overrejected: {err}");
+    }
+
     #[test]
     fn scanner_agrees_with_the_library_on_a_real_packed_header() {
         // The writer LZMA-packs small headers, so the fixture's end
@@ -834,8 +927,9 @@ mod tests {
         let start = sevenz_start(&head).unwrap();
         let window = locate_end_header(&start, &tail).unwrap();
         assert_eq!(window[0], K_ENCODED_HEADER);
-        let declared = encoded_header_declared_unpack(window).expect("scan the real window");
-        assert!(declared > 0 && declared <= SEVENZ_END_MAX);
+        let declared = encoded_header_declared_cost(window).expect("scan the real window");
+        assert!(declared.unpack > 0 && declared.unpack <= SEVENZ_END_MAX);
+        assert_eq!(declared.ppmd_mem, 0, "writer headers are LZMA, not PPMd");
         let entries = sevenz_tail_names(&head, &tail).unwrap();
         assert_eq!(pick_media_name(&entries).as_deref(), Some(NAME));
     }
@@ -860,6 +954,20 @@ mod tests {
             Some("Some.Show.S01E01.1080p.WEB-DL.x264-GRP.mkv"),
             "real store-mode seed must still name itself"
         );
+        // The window seeds are raw kEncodedHeader windows (the fuzz
+        // target seals them into a container itself). Both are bomb
+        // declarations and must die at the gate: one declares an
+        // oversize decoded size, the other a ~4 GiB PPMd memSize (the
+        // fuzz-found OOM of 10 Aug 2026).
+        for name in ["bomb-encoded-header.bin", "ppmd-mem-window.bin"] {
+            let window = std::fs::read(format!("{dir}/{name}")).unwrap();
+            let (head, tail) = seal(&window);
+            assert_eq!(
+                sevenz_tail_names(&head, &tail),
+                Err(ProbeError::HeaderTooBig),
+                "{name} must die at the declared-cost gate"
+            );
+        }
     }
 
     #[test]

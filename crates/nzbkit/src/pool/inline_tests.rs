@@ -340,7 +340,11 @@ async fn futile_scan_throttles_before_retrying() {
     };
     let (tx, _rx) = mpsc::channel(64);
 
-    assert!(next_work(&shared, ctx, &tx, 0).await.is_none());
+    assert!(
+        next_work(&shared, ctx, &tx, Pipeline::payload(0))
+            .await
+            .is_none()
+    );
     assert_ne!(shared.scan_futile[0].load(Ordering::Relaxed), u64::MAX);
 
     // Fresh takeable work appears; within the throttle window the
@@ -356,13 +360,19 @@ async fn futile_scan_throttles_before_retrying() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     });
-    assert!(next_work(&shared, ctx, &tx, 0).await.is_none(), "throttled");
+    assert!(
+        next_work(&shared, ctx, &tx, Pipeline::payload(0))
+            .await
+            .is_none(),
+        "throttled"
+    );
     assert_eq!(shared.queue.lock().await.len(), 51, "queue untouched");
 
     // …and picks it up once the window passes.
     tokio::time::sleep(Duration::from_millis(SCAN_RETRY_MS + 30)).await;
-    let w = next_work(&shared, ctx, &tx, 0)
+    let w = next_work(&shared, ctx, &tx, Pipeline::payload(0))
         .await
         .expect("work after window");
     assert_eq!(w.id, "<fresh>");
@@ -419,33 +429,49 @@ async fn endgame_fans_out_dup_races_for_laddering_articles() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     };
     shared.register_inflight(&lad, 0);
 
     // Fill gate first: a server whose required lower levels haven't
     // all 430'd yet must NOT join the race.
     assert!(
-        shared.pick_dup(2, 0b100, 0b100, 0b011, 0, 1).is_none(),
+        shared
+            .pick_dup(2, 0b100, 0b100, 0b011, Pipeline::payload(0), 1)
+            .is_none(),
         "fill-gated"
     );
-    // Endgame grant: no rate/staleness precondition needed.
+    // A pipeline with a BODY in it still refuses the probe: the
+    // refusal would queue behind a whole transfer.
     assert!(
-        shared.pick_dup(2, 0b100, 0b100, 0, 3, 1).is_none(),
-        "busy pipeline never carries a ladder probe"
+        shared
+            .pick_dup(2, 0b100, 0b100, 0, Pipeline::payload(3), 1)
+            .is_none(),
+        "a ladder probe never rides behind payload"
     );
+    // A pipeline holding only OTHER PROBES takes it. This is the whole
+    // fix for the zero-throughput tail: at damage 60 the endgame
+    // rule's old "empty pipeline" reading capped the fleet at one
+    // verdict per connection per round trip, so the poisoned articles
+    // trickled to terminal at ~6/s while the wire sat idle.
     let d = shared
-        .pick_dup(2, 0b100, 0b100, 0, 0, 1)
-        .expect("endgame dup race");
+        .pick_dup(2, 0b100, 0b100, 0, Pipeline::probes(3), 1)
+        .expect("probes ride behind probes");
     assert_eq!(d.id, "<e0>");
     assert!(d.dup);
+    assert!(d.ladder, "a ladder pick is marked as one");
     // Each backbone races at most once.
     assert!(
-        shared.pick_dup(2, 0b100, 0b100, 0, 0, 1).is_none(),
+        shared
+            .pick_dup(2, 0b100, 0b100, 0, Pipeline::payload(0), 1)
+            .is_none(),
         "already racing"
     );
     // A backbone that 430'd it never re-tries.
     assert!(
-        shared.pick_dup(1, 0b010, 0b010, 0, 0, 1).is_none(),
+        shared
+            .pick_dup(1, 0b010, 0b010, 0, Pipeline::payload(0), 1)
+            .is_none(),
         "430'd backbone"
     );
 
@@ -466,10 +492,12 @@ async fn endgame_fans_out_dup_races_for_laddering_articles() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     };
     big.register_inflight(&lad2, 0);
     assert!(
-        big.pick_dup(2, 0b100, 0b100, 0, 0, 0).is_none(),
+        big.pick_dup(2, 0b100, 0b100, 0, Pipeline::payload(0), 0)
+            .is_none(),
         "normal phase unchanged"
     );
 }
@@ -531,12 +559,15 @@ async fn tail_fanout_races_healthy_articles_in_the_endgame() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     };
     shared.register_inflight(&w, 0);
 
     // Younger than the age floor: nobody speculates yet.
     assert!(
-        shared.pick_dup(1, 0b010, 0b010, 0, 0, 0).is_none(),
+        shared
+            .pick_dup(1, 0b010, 0b010, 0, Pipeline::payload(0), 0)
+            .is_none(),
         "raced a read younger than the age floor"
     );
     shared
@@ -547,28 +578,34 @@ async fn tail_fanout_races_healthy_articles_in_the_endgame() {
         .dispatched = Instant::now() - Duration::from_secs(1);
     // A busy pipeline is not idle capacity.
     assert!(
-        shared.pick_dup(1, 0b010, 0b010, 0, 2, 0).is_none(),
+        shared
+            .pick_dup(1, 0b010, 0b010, 0, Pipeline::payload(2), 0)
+            .is_none(),
         "a busy worker speculated"
     );
     // A fill server never spends paid bytes on speculation.
     assert!(
-        shared.pick_dup(2, 0b100, 0b100, 0b011, 0, 1).is_none(),
+        shared
+            .pick_dup(2, 0b100, 0b100, 0b011, Pipeline::payload(0), 1)
+            .is_none(),
         "a fill server speculated"
     );
     // An idle worker on the OWNER's own server races it...
     let d = shared
-        .pick_dup(0, 0b001, 0b001, 0, 0, 0)
+        .pick_dup(0, 0b001, 0b001, 0, Pipeline::payload(0), 0)
         .expect("same-server tail race");
     assert_eq!(d.id, "<h0>");
     assert!(d.dup);
     // ...each server at most once...
     assert!(
-        shared.pick_dup(0, 0b001, 0b001, 0, 0, 0).is_none(),
+        shared
+            .pick_dup(0, 0b001, 0b001, 0, Pipeline::payload(0), 0)
+            .is_none(),
         "server a raced twice"
     );
     // ...and a second primary joins the same article.
     let d2 = shared
-        .pick_dup(1, 0b010, 0b010, 0, 0, 0)
+        .pick_dup(1, 0b010, 0b010, 0, Pipeline::payload(0), 0)
         .expect("cross-server tail race");
     assert_eq!(d2.id, "<h0>");
 
@@ -585,6 +622,7 @@ async fn tail_fanout_races_healthy_articles_in_the_endgame() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     };
     shared.register_inflight(&w2, 0);
     shared
@@ -594,7 +632,7 @@ async fn tail_fanout_races_healthy_articles_in_the_endgame() {
         .unwrap()
         .dispatched = Instant::now() - Duration::from_secs(1);
     let d3 = shared
-        .pick_dup(1, 0b010, 0b010, 0, 0, 0)
+        .pick_dup(1, 0b010, 0b010, 0, Pipeline::payload(0), 0)
         .expect("second straggler race");
     assert_eq!(d3.id, "<h1>");
 
@@ -608,7 +646,8 @@ async fn tail_fanout_races_healthy_articles_in_the_endgame() {
     off.inflight.lock_ok().get_mut("<h0>").unwrap().dispatched =
         Instant::now() - Duration::from_secs(1);
     assert!(
-        off.pick_dup(1, 0b010, 0b010, 0, 0, 0).is_none(),
+        off.pick_dup(1, 0b010, 0b010, 0, Pipeline::payload(0), 0)
+            .is_none(),
         "tail fan-out fired while switched off"
     );
 
@@ -630,12 +669,14 @@ async fn tail_fanout_races_healthy_articles_in_the_endgame() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     };
     big.register_inflight(&w3, 0);
     big.inflight.lock_ok().get_mut("<n0>").unwrap().dispatched =
         Instant::now() - Duration::from_secs(1);
     assert!(
-        big.pick_dup(1, 0b010, 0b010, 0, 0, 0).is_none(),
+        big.pick_dup(1, 0b010, 0b010, 0, Pipeline::payload(0), 0)
+            .is_none(),
         "speculated outside the endgame"
     );
 }
@@ -706,11 +747,14 @@ async fn a_server_with_more_connections_is_not_mistaken_for_a_faster_one() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     };
     shared.register_inflight(&w, 1); // owned by the SMALL server
 
     assert!(
-        shared.pick_dup(0, 0b01, 0b01, 0, 0, 0).is_none(),
+        shared
+            .pick_dup(0, 0b01, 0b01, 0, Pipeline::payload(0), 0)
+            .is_none(),
         "the big server duplicated an equally fast connection's article"
     );
 
@@ -718,7 +762,7 @@ async fn a_server_with_more_connections_is_not_mistaken_for_a_faster_one() {
     // connection: same worker counts, a quarter of the bytes.
     shared.bytes[1].store(25_000_000, Ordering::Relaxed);
     let d = shared
-        .pick_dup(0, 0b01, 0b01, 0, 0, 0)
+        .pick_dup(0, 0b01, 0b01, 0, Pipeline::payload(0), 0)
         .expect("a genuinely slow owner should still be raced");
     assert_eq!(d.id, "<r0>");
     assert!(d.dup);
@@ -785,16 +829,21 @@ async fn a_fill_server_never_duplicates_primary_work_on_speed() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     };
     shared.register_inflight(&w, 0); // owned by the PRIMARY
 
     assert!(
-        shared.pick_dup(1, 0b10, 0b10, 0, 0, 1).is_none(),
+        shared
+            .pick_dup(1, 0b10, 0b10, 0, Pipeline::payload(0), 1)
+            .is_none(),
         "a block server spent paid bytes racing an article already arriving"
     );
     // The primary, in its place, would take it.
     assert!(
-        shared.pick_dup(1, 0b10, 0b10, 0, 0, 0).is_some(),
+        shared
+            .pick_dup(1, 0b10, 0b10, 0, Pipeline::payload(0), 0)
+            .is_some(),
         "the rate rule itself should still fire for a level-0 server"
     );
 }
@@ -984,6 +1033,54 @@ async fn queue_control_cancel_cost_at_field_scale() {
     eprintln!("11 volumes vs a {n}-article queue: total {total:?}, worst single hold {worst:?}");
 }
 
+/// The queue side of the same rule. In the endgame a queued article
+/// that has already been refused somewhere is a VERDICT PROBE, and the
+/// only thing it must not queue behind is a body: a worker holding
+/// nothing but other probes takes it, a worker mid-transfer leaves it
+/// for someone idle.
+///
+/// This is the gate that produced the measured stall. With it reading
+/// "any pipeline depth at all", a fleet of 20 connections could carry
+/// only 20 outstanding verdicts however many articles were laddering,
+/// so a 60-article damage tail cost 60x5 refusals at one per
+/// connection per round trip - about ten seconds of 0.0 MB/s in front
+/// of a repair that itself took two.
+#[tokio::test]
+async fn a_laddering_article_queues_behind_probes_but_never_behind_payload() {
+    let servers = one_server();
+    let (shared, _) = Shared::new(vec![ArticleReq::fresh("<lad@x>".into())], &servers);
+    let ctx = ctx_for(&servers, 0);
+    let (tx, _rx) = mpsc::channel(8);
+    let _life = WorkerLife::birth(&shared, 0);
+    // Refused by a backbone that is not ours, so it is takeable here
+    // on the merits and only the pipeline rule can turn it away.
+    // (`live_mask` is this one server, so the bit must not be ours or
+    // the article is already terminal.)
+    shared.queue.lock().await[0].tried_430 = 0b10;
+
+    assert!(
+        next_work(&shared, ctx, &tx, Pipeline::payload(1))
+            .await
+            .is_none(),
+        "a probe must not queue behind a body"
+    );
+    assert_eq!(
+        shared.queue.lock().await.len(),
+        1,
+        "left for an idle worker"
+    );
+
+    // Clear the futile-scan throttle the miss above armed - it is a
+    // separate rule with its own test, and it would answer this one.
+    shared.scan_futile[0].store(u64::MAX, Ordering::Relaxed);
+    // Same worker, same article, pipeline now holding probes only.
+    let w = next_work(&shared, ctx, &tx, Pipeline::probes(2))
+        .await
+        .expect("probes ride behind probes");
+    assert_eq!(w.id, "<lad@x>");
+    assert!(w.ladder, "and are dispatched as probes");
+}
+
 fn one_server() -> Vec<(ServerConfig, PoolConfig)> {
     vec![(
         ServerConfig {
@@ -1082,13 +1179,17 @@ async fn a_dead_pipeline_releases_exactly_what_dispatch_charged() {
 
     let mut inflight: VecDeque<Work> = VecDeque::new();
     // One article dispatched normally...
-    let w0 = next_work(&shared, ctx, &tx, 0).await.expect("queued work");
+    let w0 = next_work(&shared, ctx, &tx, Pipeline::payload(0))
+        .await
+        .expect("queued work");
     shared.charge_wire();
     shared.register_inflight(&w0, 0);
     inflight.push_back(w0);
     // ...and the next one's send fails, so it joins the same deque as
     // the front-of-pipeline casualty.
-    let w1 = next_work(&shared, ctx, &tx, 1).await.expect("queued work");
+    let w1 = next_work(&shared, ctx, &tx, Pipeline::payload(1))
+        .await
+        .expect("queued work");
     shared.charge_wire();
     inflight.push_front(w1);
     assert_eq!(
@@ -1135,7 +1236,9 @@ async fn a_productive_sessions_death_charges_no_article() {
 
     let mut inflight: VecDeque<Work> = VecDeque::new();
     for slot in 0..2 {
-        let w = next_work(&shared, ctx, &tx, slot).await.expect("queued");
+        let w = next_work(&shared, ctx, &tx, Pipeline::payload(slot))
+            .await
+            .expect("queued");
         shared.charge_wire();
         shared.register_inflight(&w, 0);
         inflight.push_back(w);
@@ -1154,7 +1257,9 @@ async fn a_productive_sessions_death_charges_no_article() {
     // the charge-driven terminal path is intact.
     let mut inflight: VecDeque<Work> = VecDeque::new();
     for slot in 0..2 {
-        let w = next_work(&shared, ctx, &tx, slot).await.expect("queued");
+        let w = next_work(&shared, ctx, &tx, Pipeline::payload(slot))
+            .await
+            .expect("queued");
         shared.charge_wire();
         shared.register_inflight(&w, 0);
         inflight.push_back(w);
@@ -1270,7 +1375,7 @@ async fn promoted_work_routes_to_the_faster_server() {
 
     // The slow server skips a1/a2 and takes the first non-promoted
     // item; the promoted run stays at the queue front.
-    let w = next_work(&shared, slow, &tx, 0)
+    let w = next_work(&shared, slow, &tx, Pipeline::payload(0))
         .await
         .expect("slow gets non-promoted work");
     assert_eq!(w.id, "<a0>");
@@ -1280,7 +1385,7 @@ async fn promoted_work_routes_to_the_faster_server() {
         "promoted run must stay at the front for the fast server"
     );
     // The fast server takes the promoted item.
-    let w = next_work(&shared, fast, &tx, 0)
+    let w = next_work(&shared, fast, &tx, Pipeline::payload(0))
         .await
         .expect("fast gets promoted work");
     assert_eq!(w.id, "<a1>");
@@ -1290,7 +1395,7 @@ async fn promoted_work_routes_to_the_faster_server() {
     // path (the live wedge: fast servers cycling 430 → requeue while
     // slow ones politely skipped).
     shared.queue.lock().await.front_mut().unwrap().tried_430 = 0b10;
-    let w = next_work(&shared, slow, &tx, 0)
+    let w = next_work(&shared, slow, &tx, Pipeline::payload(0))
         .await
         .expect("slow takes the 430-recovery item");
     assert_eq!(w.id, "<a2>");
@@ -1306,7 +1411,7 @@ async fn promoted_work_routes_to_the_faster_server() {
     shared2.bytes[0].store(1_000_000, Ordering::Relaxed);
     shared2.bytes[1].store(10_000_000, Ordering::Relaxed);
     assert_eq!(ctl2.promote(&["<b0>".to_string()]), 1);
-    let w = next_work(&shared2, slow, &tx, 0)
+    let w = next_work(&shared2, slow, &tx, Pipeline::payload(0))
         .await
         .expect("slow takes it when alone");
     assert_eq!(w.id, "<b0>");
@@ -1351,6 +1456,7 @@ async fn shed_pipeline_requeues_behind_promoted_run_uncharged() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     });
     // A seek promotes a7 and a3 to the front (in that range order).
     let ids: Vec<String> = ["<a7>", "<a3>"].iter().map(|s| s.to_string()).collect();

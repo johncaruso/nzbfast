@@ -1765,6 +1765,62 @@ struct Work {
     /// [`SOFT_REARM_CAP`] so a provider that desyncs on every session
     /// cannot keep an article out of a terminal verdict for ever.
     rearms: u8,
+    /// This dispatch is a VERDICT PROBE, not payload: the article has
+    /// already been refused somewhere and this hop exists only to walk
+    /// it toward (or away from) a unanimous Missing. Set per dispatch -
+    /// a queued item earns it by carrying `tried_430`/`soft_430` bits,
+    /// a ladder fan-out dup is born with it - and read by
+    /// [`Pipeline::payload`], because the endgame gates that used to
+    /// ask "is this worker idle" only ever meant "is a BODY holding
+    /// this socket". A refusal is one small line, so a probe queued
+    /// behind other probes costs nothing, and refusing to pipeline
+    /// them capped verdict throughput at one article per connection
+    /// per round trip - the measured zero-throughput stall before
+    /// repair on a damaged post.
+    ladder: bool,
+}
+
+/// What a worker currently has on the wire, split by kind. The two
+/// numbers gate different things: speculation (racing an article
+/// someone else may yet deliver) is spent only by a worker with
+/// NOTHING outstanding, while a 430-ladder probe only has to keep
+/// clear of payload - a body holds the socket for its whole transfer,
+/// a refusal for one line.
+#[derive(Clone, Copy, Default)]
+struct Pipeline {
+    /// Everything in flight on this connection.
+    used: usize,
+    /// Of those, the ones fetching a body we expect to arrive.
+    payload: usize,
+}
+
+impl Pipeline {
+    /// The pipeline a worker's in-flight deque describes.
+    fn of(inflight: &VecDeque<Work>) -> Pipeline {
+        Pipeline {
+            used: inflight.len(),
+            payload: inflight.iter().filter(|w| !w.ladder).count(),
+        }
+    }
+
+    /// Test/callsite shorthand for a worker holding `n` payload bodies.
+    #[cfg(test)]
+    fn payload(n: usize) -> Pipeline {
+        Pipeline {
+            used: n,
+            payload: n,
+        }
+    }
+
+    /// Test shorthand for a worker holding `n` ladder probes and
+    /// nothing else.
+    #[cfg(test)]
+    fn probes(n: usize) -> Pipeline {
+        Pipeline {
+            used: n,
+            payload: 0,
+        }
+    }
 }
 
 /// TODO 114 consumer steer: one delivered body awaiting the consumer's
@@ -2660,6 +2716,7 @@ impl Shared {
                     soft_430: 0,
                     fenced: false,
                     rearms: 0,
+                    ladder: false,
                 });
             }
         }
@@ -3178,6 +3235,7 @@ impl Shared {
                     soft_430: w.soft_430,
                     fenced: false,
                     rearms: w.rearms,
+                    ladder: false,
                 },
                 server: ctx.idx,
                 group_bits: ctx.group_bits,
@@ -3374,7 +3432,7 @@ impl Shared {
         my_bit: u32,
         group_bits: u32,
         required: u32,
-        window_used: usize,
+        pipe: Pipeline,
         level: u32,
     ) -> Option<Work> {
         // Early fan-out experiment: the tail latch flips at the exact
@@ -3431,8 +3489,8 @@ impl Shared {
                 if inf.server == me {
                     continue;
                 }
-                if window_used > 0 {
-                    continue; // ladder probes ride EMPTY pipelines only
+                if pipe.payload > 0 {
+                    continue; // ladder probes never ride behind a BODY
                 }
                 if inf.tried_430 & required != required {
                     continue; // fill gate: lower levels first
@@ -3463,7 +3521,7 @@ impl Shared {
                 && endgame
                 && !capped
                 && !self.speculative_blocked(my_bit, level)
-                && window_used == 0
+                && pipe.used == 0
                 && inf.tried_fail == 0
                 && inf.dispatched.elapsed() >= TAIL_FANOUT_MIN_AGE
             {
@@ -3496,7 +3554,7 @@ impl Shared {
             // retires in favor of the envelope race + per-owner hedge
             // bound - see `steer::speculative_arm` for the full gates.
             let arm =
-                self.speculative_arm(inf, window_used, my_rate, owner_rate, stale_bound, capped);
+                self.speculative_arm(inf, pipe.used, my_rate, owner_rate, stale_bound, capped);
             if let Some(stale_only) = arm
                 && (!stale_only || hedges_ok)
                 && best.is_none_or(|(_, r, _, _)| owner_rate < r)
@@ -3509,8 +3567,13 @@ impl Shared {
         if let Some((_, _, _, true)) = best {
             self.hedges_issued.fetch_add(1, Ordering::Relaxed);
         }
+        // A ladder pick is the only one whose bytes buy a VERDICT rather
+        // than a copy of a body someone else may still deliver - which is
+        // why it alone rides a pipeline that already holds probes, and why
+        // the item it hands back is marked as one.
+        let is_ladder = matches!(best, Some((_, _, p, false)) if p > 0);
         let rule = match best {
-            Some((_, _, p, false)) if p > 0 => "ladder",
+            _ if is_ladder => "ladder",
             Some((_, _, _, true)) => "stale",
             Some(_) if self.race_envelope => "envelope",
             Some(_) => "slow-owner",
@@ -3544,6 +3607,7 @@ impl Shared {
             soft_430: 0,
             fenced: false,
             rearms: 0,
+            ladder: is_ladder,
         })
     }
 
@@ -3641,6 +3705,7 @@ impl Shared {
             soft_430: 0,
             fenced: false,
             rearms: 0,
+            ladder: false,
         })
     }
 }
@@ -3952,18 +4017,23 @@ async fn next_work(
     shared: &Shared,
     ctx: ServerCtx,
     out: &mpsc::Sender<FetchOutcome>,
-    // Caller's current pipeline depth (M2c.4): in the ENDGAME a
+    // Caller's current pipeline, split by kind (M2c.4): in the ENDGAME a
     // 430-laddering article must not ride BEHIND queued payload bodies
     // - head-of-line blocking on the slowest provider's last windows
-    // was the measured 4-6 s straggler tail. Idle workers (depth 0)
-    // answer a ladder probe in one RTT.
-    window_used: usize,
+    // was the measured 4-6 s straggler tail. It may ride behind OTHER
+    // PROBES, which is the whole difference: a refusal is one line, so
+    // a window of probes answers in one round trip where the old
+    // empty-pipeline rule spent one round trip per probe. That cap -
+    // one verdict per connection per RTT - is what made a damaged post
+    // sit at 0.0 MB/s for ~10 s before repair while every payload byte
+    // was already on disk.
+    pipe: Pipeline,
 ) -> Option<Work> {
     // TTFB-suspicion hedge (TODO 115): an idle worker checks for suspect
     // articles first - their owners are sitting in pre-byte silence
     // RIGHT NOW, and the whole point is to answer inside the budget they
     // have left. One atomic load when dark, quiet, or busy.
-    if let Some(w) = shared.pick_suspect_dup(ctx.bit, ctx.group_bits, ctx.level, window_used) {
+    if let Some(w) = shared.pick_suspect_dup(ctx.bit, ctx.group_bits, ctx.level, pipe.used) {
         return Some(w);
     }
     let endgame = shared.pending.load(Ordering::Acquire) <= ENDGAME_MAX;
@@ -3981,14 +4051,7 @@ async fn next_work(
     let now_ms = shared.start.elapsed().as_millis() as u64;
     let futile_at = shared.scan_futile[ctx.idx].load(Ordering::Relaxed);
     if futile_at != u64::MAX && now_ms.saturating_sub(futile_at) < SCAN_RETRY_MS {
-        return shared.pick_dup(
-            ctx.idx,
-            ctx.bit,
-            ctx.group_bits,
-            required,
-            window_used,
-            ctx.level,
-        );
+        return shared.pick_dup(ctx.idx, ctx.bit, ctx.group_bits, required, pipe, ctx.level);
     }
     // An article every LIVE server has 430'd is terminal even if servers
     // whose workers bowed out never saw it - a dead server can't answer,
@@ -4020,7 +4083,7 @@ async fn next_work(
             }
         }
         for _ in 0..q.len() {
-            let Some(w) = q.pop_front() else { break };
+            let Some(mut w) = q.pop_front() else { break };
             if w.tried_430 & live == live {
                 unservable.push(w.id);
                 continue;
@@ -4028,7 +4091,7 @@ async fn next_work(
             if w.tried_430 & ctx.bit != 0
                 || w.tried_430 & required != required
                 || (w.tried_fail & ctx.bit != 0 && shared.other_can_take(&w, ctx.idx))
-                || (endgame && window_used > 0 && w.tried_430 != 0)
+                || (endgame && pipe.payload > 0 && w.tried_430 != 0)
             {
                 q.push_back(w);
             } else if w.promoted
@@ -4048,6 +4111,12 @@ async fn next_work(
                         |v| v.checked_sub(1),
                     );
                 }
+                // Per-dispatch classification (see `Work::ladder`): an
+                // article carrying refusal evidence is walking toward a
+                // verdict, and this hop is a probe. One that has never
+                // been refused is payload, however long it has been
+                // queued.
+                w.ladder = w.tried_430 != 0 || w.soft_430 != 0;
                 picked = Some(w);
                 break;
             }
@@ -4093,14 +4162,7 @@ async fn next_work(
             );
         }
     }
-    shared.pick_dup(
-        ctx.idx,
-        ctx.bit,
-        ctx.group_bits,
-        required,
-        window_used,
-        ctx.level,
-    )
+    shared.pick_dup(ctx.idx, ctx.bit, ctx.group_bits, required, pipe, ctx.level)
 }
 
 /// Sharded variant: split all servers' connections across `shards`

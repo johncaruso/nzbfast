@@ -324,6 +324,9 @@ pub(crate) async fn try_mapped_repair(
     // parity this path fetches is network work like any other, and a
     // deleted job must stop asking for it.
     cancel: Option<&SideCancel>,
+    // The caller's heavy-CPU permit, handed back for the duration of the
+    // recovery fetch below - see [`crate::lanegate::HeavyCpu`].
+    cpu: &mut crate::lanegate::HeavyCpu,
 ) -> Result<bool> {
     use nzbkit::par2repair::{
         MAX_INPUT_SLICES, MAX_REPAIR_DIM, VolumeIo, recovery_slice_locators, repair_mapped,
@@ -458,7 +461,15 @@ pub(crate) async fn try_mapped_repair(
             dl_bytes as f64 / 1e6
         );
         fetched_files = chosen.iter().map(|&vi| vols[vi].0).collect();
-        fetch_volumes(servers, nzb, out_dir, &buf_pool, &fetched_files, cancel).await?;
+        cpu.without_permit(fetch_volumes(
+            servers,
+            nzb,
+            out_dir,
+            &buf_pool,
+            &fetched_files,
+            cancel,
+        ))
+        .await?;
     }
 
     // Harvest every recovery slice on disk (bootstrap + fetched volumes).
@@ -636,6 +647,9 @@ pub(crate) async fn fetch_and_repair(
     shortfall: &mut Option<(usize, usize)>,
     // The owner's side-fetch cancel handle - see [`SideCancel`].
     cancel: Option<&SideCancel>,
+    // The caller's heavy-CPU permit, handed back for the duration of
+    // both recovery fetches below - see [`crate::lanegate::HeavyCpu`].
+    cpu: &mut crate::lanegate::HeavyCpu,
 ) -> Result<bool> {
     let mut fetched_files: Vec<usize> = Vec::new();
     if needed > 0 {
@@ -665,7 +679,15 @@ pub(crate) async fn fetch_and_repair(
         );
 
         fetched_files = chosen.iter().map(|&vi| vols[vi].0).collect();
-        fetch_volumes(servers, nzb, out_dir, &buf_pool, &fetched_files, cancel).await?;
+        cpu.without_permit(fetch_volumes(
+            servers,
+            nzb,
+            out_dir,
+            &buf_pool,
+            &fetched_files,
+            cancel,
+        ))
+        .await?;
     }
 
     // Reed-Solomon repair: native in-process GF(2^16) first - verifies the
@@ -826,7 +848,10 @@ pub(crate) async fn fetch_and_repair(
         "repair short - fetching all {} remaining volume(s)",
         remaining.len()
     );
-    fetch_volumes(servers, nzb, out_dir, &buf_pool, &remaining, cancel).await?;
+    cpu.without_permit(fetch_volumes(
+        servers, nzb, out_dir, &buf_pool, &remaining, cancel,
+    ))
+    .await?;
     if native_repair() {
         return Ok(true);
     }
@@ -944,6 +969,10 @@ mod repair_tests {
             &mut Vec::new(),
             false,
             None,
+            // `needed` is 0 here, so nothing fetches and the seam is
+            // never exercised - an unheld handle keeps this test off the
+            // process-global permit the parallel suite shares.
+            &mut crate::lanegate::HeavyCpu::unheld(),
         )
         .await
         .expect("guard declines are Ok(false), not errors")

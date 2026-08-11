@@ -325,6 +325,17 @@ impl Index {
         // is a chip away.
         if q.hide_adult {
             title_wheres.push(ADULT_GENRE_SQL.to_string());
+            // The spot-born marker (TODO 131), which is a RELEASE-level
+            // fact rather than a title-level one: the poster of this
+            // post filed it as adult, and the card may have no enriched
+            // title behind it to carry a genre. A card whose releases
+            // are all marked drops out entirely (every row fails the
+            // predicate, so the title_key never reaches the GROUP BY);
+            // one marked release beside unmarked ones only loses that
+            // release, which is the same way the curation rules behave
+            // and the same "errs towards showing" direction as the
+            // genre test above.
+            wheres.push(ADULT_MARK_SQL.into());
         }
         // M30: decade chips - original-year range over the same
         // enriched-year-with-parse-key-fallback expression the Year

@@ -13,6 +13,10 @@
 //!    tail waiting for the permit sits with its activity token unchanged
 //!    (it is genuinely "repairing", just queued for the cores).
 //!
+//!    It gates CORES, so it is never held across a network wait - see
+//!    [`HeavyCpu::without_permit`], the seam the repair pass's recovery
+//!    fetches go through.
+//!
 //! 2. **The per-filesystem outstanding-need ledger.** Concurrent on-disk
 //!    unpacks multiply peak usage, and the §101 forecast reads FREE
 //!    bytes - two concurrent forecasts would both count the same free
@@ -48,12 +52,76 @@ fn cpu_sem() -> &'static Arc<tokio::sync::Semaphore> {
 
 /// Take the heavy-CPU permit from async code (the settle/repair path).
 /// Held for the scope of the returned permit; FIFO-fair across waiters.
-pub(crate) async fn heavy_cpu() -> tokio::sync::OwnedSemaphorePermit {
+async fn heavy_cpu() -> tokio::sync::OwnedSemaphorePermit {
     cpu_sem()
         .clone()
         .acquire_owned()
         .await
         .expect("the heavy-CPU semaphore is never closed")
+}
+
+/// The heavy-CPU permit held by an async pass, with an explicit seam for
+/// the waits that pass makes on something OTHER than cores.
+///
+/// The repair pass holds this for its whole length on purpose (mapped
+/// repair, materialize, disk repair - see `run_set_repair`), and inside
+/// that length it fetches recovery volumes off the network. Holding one
+/// process-global permit across a network wait gates permit turnover on
+/// the provider rather than on CPU work, and the exposure is not the
+/// round trip: a side-fetch has no overall deadline (`fetch_volumes` →
+/// `fetch_all_multi_ctl`, bounded only by the pool's own retry ladder
+/// and stall watchdog, and cancellable only by deleting the job), so a
+/// provider that stops answering parks every OTHER job's repair and
+/// disk-unpack tail behind it. That is not hypothetical: the 7 Aug 2026
+/// wedge parked a side-fetch forever through the consumer-ack seam
+/// (sidefetch.rs `fetch_volume_articles`, fixed there), and this permit
+/// would have spread one job's version of it across the whole daemon.
+///
+/// So: every await under the permit that is not CPU work goes through
+/// [`HeavyCpu::without_permit`] (Codex sweep 10 Aug H3, TODO §137.2).
+pub(crate) struct HeavyCpu(Option<tokio::sync::OwnedSemaphorePermit>);
+
+impl HeavyCpu {
+    /// Wait for the permit and hold it until this handle drops.
+    pub(crate) async fn acquire() -> Self {
+        Self(Some(heavy_cpu().await))
+    }
+
+    /// A handle holding nothing, for a call path reached without the
+    /// permit: `without_permit` on it just awaits. The direct-drive
+    /// repair unit tests use this rather than contending on the
+    /// process-global semaphore the suite runs in parallel with.
+    #[cfg(test)]
+    pub(crate) fn unheld() -> Self {
+        Self(None)
+    }
+
+    /// Give the permit up, await `fut`, then queue for it again.
+    ///
+    /// Re-acquisition is FIFO like any other waiter, so a pass that
+    /// releases can find a sibling's repair ahead of it and finish
+    /// later than it would have. That is the trade being made: one
+    /// pass's wall clock for cores that are not idle behind a network
+    /// wait, and for a stuck provider that can no longer stall every
+    /// other tail in the process.
+    ///
+    /// Cancel-safe in both directions. The permit is dropped before
+    /// `fut` is ever polled, so dropping this future mid-`fut` leaks
+    /// nothing; dropping it during the re-acquire means the caller
+    /// never resumes, so it cannot proceed unpermitted.
+    pub(crate) async fn without_permit<F: Future>(&mut self, fut: F) -> F::Output {
+        match self.0.take() {
+            // Released FIRST: the whole point is that `fut` is not
+            // polled while this permit is held.
+            Some(permit) => {
+                drop(permit);
+                let out = fut.await;
+                self.0 = Some(heavy_cpu().await);
+                out
+            }
+            None => fut.await,
+        }
+    }
 }
 
 /// Take the heavy-CPU permit from sync code (the disk-unpack ladder,
@@ -279,6 +347,16 @@ pub(crate) fn admit_unpack(dir: &Path, needed: u64, margin: u64) -> NeedGuard {
 mod tests {
     use super::*;
 
+    /// The CPU semaphore is process-global and the unit suite runs its
+    /// tests in parallel, so the two tests that take it run one at a
+    /// time. Without this they interleave: each expects to be the only
+    /// claimant, and a permit taken by the other test satisfies neither
+    /// test's assertion while still perturbing both.
+    fn cpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock_ok()
+    }
+
     // One test on purpose: the ledger is process-global and the unit
     // suite runs in parallel, so sequenced assertions about "nobody
     // else has registered" only hold inside a single test body.
@@ -319,9 +397,9 @@ mod tests {
     /// runtime deadlocked, timers included. The runtime therefore lives
     /// on its own thread here, watched over a plain mpsc timeout: with
     /// the old code even the failure path's timer would never fire.
-    /// Only this test touches the process-global CPU semaphore.
     #[test]
     fn permit_wait_does_not_starve_a_one_worker_runtime() {
+        let _serial = cpu_test_lock();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -353,6 +431,77 @@ mod tests {
         done_rx
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("deadlock: the blocking permit waiter starved the one-worker runtime (H11)");
+    }
+
+    /// H3 (Codex sweep 10 Aug, TODO §137.2): the repair pass holds the
+    /// heavy-CPU permit across its recovery-volume fetches, so the
+    /// permit must be HANDED BACK for the duration of each one. The
+    /// property, and the whole point of `without_permit`: while the
+    /// wrapped future is pending, another tail can hold the permit.
+    ///
+    /// Sequenced on channels, not on sleeps - the assertion is ordering
+    /// ("the sibling got in while the fetch was outstanding"), and a
+    /// timing margin would make it a load-sensitive flake on the shared
+    /// checkout ([[nzbfast-daemon-test-flake]]). The outer timeout is
+    /// the only clock, and it is the FAILURE path: a `without_permit`
+    /// that stops releasing leaves the sibling unable to acquire and
+    /// this hangs rather than mis-asserting.
+    ///
+    /// Own runtime on its own thread, like the H11 test above, so the
+    /// hang is caught by that timeout instead of parking the suite.
+    #[test]
+    fn the_permit_is_handed_back_across_a_network_wait() {
+        let _serial = cpu_test_lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("build the runtime");
+            let held_by_sibling = rt.block_on(async {
+                let mut cpu = HeavyCpu::acquire().await;
+                // Stands in for `fetch_volumes`: pending until the
+                // sibling has actually taken the permit.
+                let (fetch_tx, fetch_rx) = tokio::sync::oneshot::channel::<()>();
+                let (got_tx, got_rx) = tokio::sync::oneshot::channel::<()>();
+                let sibling = tokio::spawn(async move {
+                    let _p = heavy_cpu().await;
+                    // Prove it, THEN release: the permit is held at the
+                    // moment the fetch is still outstanding.
+                    let _ = got_tx.send(());
+                    let _ = fetch_tx.send(());
+                });
+                let held_by_sibling = cpu
+                    .without_permit(async move {
+                        let _ = fetch_rx.await;
+                        got_rx.await.is_ok()
+                    })
+                    .await;
+                sibling.await.expect("the sibling task ran");
+                // Re-acquired: `without_permit` returns holding it again.
+                assert!(cpu.0.is_some(), "the permit was not re-acquired");
+                held_by_sibling
+            });
+            // An unheld handle is a no-op wrapper, and it must not
+            // acquire what it never had.
+            rt.block_on(async {
+                let mut unheld = HeavyCpu::unheld();
+                assert_eq!(unheld.without_permit(async { 7u8 }).await, 7);
+                assert!(
+                    unheld.0.is_none(),
+                    "an unheld handle acquired the permit behind the caller's back"
+                );
+            });
+            let _ = done_tx.send(held_by_sibling);
+        });
+        let held_by_sibling = done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the heavy-CPU permit was held across the network wait (H3)");
+        assert!(
+            held_by_sibling,
+            "the sibling never held the permit while the fetch was outstanding"
+        );
     }
 
     /// M9 (Codex sweep 8 Aug): the admission check and the registration

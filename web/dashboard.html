@@ -1113,8 +1113,16 @@ input.txt.sm{max-width:120px}
 .qbadge{display:inline-block;margin-inline-start:8px;padding:1px 7px;border-radius:999px;background:var(--surface-2);border:1px solid var(--line);font-size:11px;color:var(--dim);white-space:nowrap;vertical-align:middle}
 /* Origin glyph: the qbadge idiom minus the pill - one small dim symbol
    whose sentence lives in the tooltip. A bordered pill around a single
-   emoji read as a button. */
-.obadge{display:inline-block;margin-inline-start:6px;font-size:11px;color:var(--dim);opacity:.75;cursor:default;vertical-align:1px}
+   emoji read as a button.
+   Now a sprite icon, not an emoji (§140): 13 px, and a hair more stroke
+   than `.ic` carries at body size, because a 1.7 stroke scaled to 13 px
+   is under a device pixel on a 1x screen and the shape goes to mush.
+   Opacity is a touch higher than the emoji version needed - line art is
+   already lighter than a colour glyph. */
+.obadge{display:inline-block;margin-inline-start:6px;font-size:11px;color:var(--dim);opacity:.85;cursor:default;vertical-align:1px}
+.obadge .ic{width:13px;height:13px;stroke-width:1.9;vertical-align:-2px}
+/* The same mark inline with the origin's NAME, in the drawers. */
+.ic.oic{width:13px;height:13px;stroke-width:1.9;vertical-align:-2px;opacity:.85}
 .qbadge.shape{max-width:min(100%,32em);overflow:hidden;text-overflow:ellipsis}
 /* The media chip. Quiet by default - it is a fact, not a status - and
    amber only when the bytes contradict the name. */
@@ -1141,6 +1149,13 @@ body.chipcolor-shape .qbadge.shape.t-hi{color:var(--acc2);border-color:color-mix
 body.chipcolor-media .qbadge.media.t-mid:not(.bad),
 body.chipcolor-shape .qbadge.shape.t-mid{color:var(--acc);border-color:color-mix(in srgb,var(--acc) 45%,transparent);background:color-mix(in srgb,var(--acc) 12%,transparent)}
 .qbadge.media.bad{color:var(--warn);border-color:var(--warn);background:color-mix(in srgb,var(--warn) 12%,transparent)}
+/* §139 (issue #30): the category pill on queue and history rows. One
+   hue per category NAME (set inline as --catc), so tv is the same
+   colour in both lists and on every machine. The text mixes the hue
+   with the theme's foreground so the same category stays readable in
+   light and dark alike - and the name is spelled out in the pill, so
+   the tint is never the only way to read it. */
+.qbadge.cat{color:color-mix(in srgb,var(--catc) 55%,var(--fg));border-color:color-mix(in srgb,var(--catc) 45%,transparent);background:color-mix(in srgb,var(--catc) 12%,transparent)}
 #wlCal h4{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 6px}
 .calrow{display:flex;gap:10px;align-items:baseline;font-size:12.5px;padding:3px 0;border-bottom:1px dashed var(--line)}
 .calrow:last-child{border-bottom:none}
@@ -1164,9 +1179,12 @@ body.chipcolor-shape .qbadge.shape.t-mid{color:var(--acc);border-color:color-mix
 input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--warn) 8%,var(--surface-2))}
 .rulewarn{grid-column:1/-1;font-size:11.5px;line-height:1.45;color:var(--warn);margin:-2px 0 4px}
 .catrow{display:grid;grid-template-columns:130px 1fr 1fr 130px 36px;gap:8px;margin:6px 0;align-items:center}
-/* #19: category | folder (+ browse) | remove, with the validation line
-   spanning the row like .fhealth does. */
-.catfilerow{display:grid;grid-template-columns:180px 1fr 36px;gap:8px;margin:6px 0;align-items:center}
+/* #19: category | folder (+ browse) | priority | script | nzb name |
+   remove, with the validation line spanning the row like .fhealth does.
+   The track list has to name every child: it still said 3 columns after
+   §129 2b added priority and script, so those two wrapped onto a second
+   line with the select crushed into the 36px remove column. */
+.catfilerow{display:grid;grid-template-columns:180px 1fr 130px 1fr 130px 36px;gap:8px;margin:6px 0;align-items:center}
 /* Opt-in indexing rows: a tick, the plain-language interest, and the
    newsgroups it actually scans underneath it. */
 .wantrow{display:flex;gap:9px;align-items:flex-start;margin:7px 0;cursor:pointer}
@@ -1256,6 +1274,14 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
   #ctxmenu{max-width:calc(100vw - 16px)}
 }
 </style>
+<!-- Your own CSS, from `custom.css` in the config folder (issue #31). LAST
+     in the head on purpose: it loads after every built-in rule, so an
+     equally specific rule of yours wins without !important. The daemon
+     reads it from disk on each load - edit, reload, done, no rebuild and
+     no restart - and answers an empty stylesheet when the file is absent,
+     which is the normal case. Upgrades replace this page but never that
+     file. -->
+<link rel="stylesheet" href="/custom.css">
 </head><body><div class="wrap">
 
 <header>
@@ -1812,6 +1838,8 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input type="checkbox" id="s_post_health" onchange="setCfg('post_health',this.checked?1:0)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.speed.posthealthdefer">Healthy-looking posts start first<span class="hint" data-i18n="set.speed.posthealthdefer.hint">a job whose check came back bad waits behind items of the same priority that checked out better. It only changes the ORDER: nothing is removed, paused or failed, and forcing a job or raising its priority overrides it. Off by default, because a post uploaded moments ago is missing everywhere too</span></label>
     <input type="checkbox" id="s_post_health_defer" onchange="setCfg('post_health_defer',this.checked?1:0)"></div>
+  <div class="row" data-adv="1"><label data-i18n="set.speed.posthealthfail">Give up on posts no server can supply<span class="hint" data-i18n="set.speed.posthealthfail.hint">a job fails without downloading when EVERY one of your servers said EVERY sampled article was missing and the post is too old for that to be propagation. Sonarr or Radarr then blocklists the release and looks for another one straight away, instead of waiting out a download that cannot finish. Off by default and deliberately hard to trigger: one silent server, or one article still present, and the job runs as normal. Even so, a provider having a bad five minutes can look exactly like a dead post, so turn this on only if you would rather lose the occasional good release than spend the bandwidth. Needs the check above</span></label>
+    <input type="checkbox" id="s_post_health_fail" onchange="setCfg('post_health_fail',this.checked?1:0)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.speed.oracleroute">Skip providers the oracle says are gone<span class="hint" data-i18n="set.speed.oracleroute.hint">experimental: when the availability check is confident a provider's backbone has lost a release (takedown), skip it for that download instead of waiting for it to fail. Never skips your last provider. Off by default</span></label>
     <input type="checkbox" id="s_oracle_route" onchange="setCfg('oracle_route',this.checked?1:0)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.speed.oraclesample">Availability checks while idle<span class="hint" data-i18n="set.speed.oraclesample.hint">while nothing is downloading, ask each server about a few articles of indexed releases and remember the answers: that is the picture the setting above reads, and what lets a dead post be recognised before you queue it. Counted per server per hour; 0 turns the checking off. Default 300. Needs the built-in indexer, and stands down entirely while a download runs</span></label>
@@ -1993,6 +2021,8 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input type="checkbox" id="s_rename_junk" onchange="setCfg('rename_junk',this.checked?1:0)"></div>
   <div class="row"><label data-i18n="set.rename.mediaonly">Keep only the media file<span class="hint" data-i18n="set.rename.mediaonly.hint">⚠ permanently deletes everything except the video(s) and subtitles; every episode of a season pack is kept</span></label>
     <input type="checkbox" id="s_rename_media_only" onchange="setCfg('rename_media_only',this.checked?1:0)"></div>
+  <div class="row"><label data-i18n="set.rename.fromnzb">Name downloads after the .nzb file<span class="hint" data-i18n="set.rename.fromnzb.hint">the finished folder and its main file take the name of the .nzb file, instead of the tidied-up name worked out from the release. Only the biggest file is renamed: the rest of an episode pack, the sample, the subtitles and the .nfo keep the names they arrived with. Off by default, and any category can turn it on or off on its own under "Your categories"</span></label>
+    <input type="checkbox" id="s_rename_from_nzb" onchange="setCfg('rename_from_nzb',this.checked?1:0)"></div>
 </div>
 
 <div class="card set" data-sg="organise" data-sk="smart">
@@ -2363,6 +2393,13 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input type="checkbox" id="uiCompact" onchange="setUiCompact(this.checked)"></div>
   <div class="row"><label data-i18n="set.ui.layout">Dashboard layout<span class="hint" data-i18n="set.ui.layout.hint">forget this browser's hidden cards, card order and chart sizes: back to the default layout</span></label>
     <button class="ghost" onclick="resetLayout()" data-i18n="set.ui.layout.btn">Reset layout</button></div>
+  <!-- Issue #31. There is nothing to switch on here: the feature IS the
+       file, so the row's job is to say the name, show where it goes, and
+       get out of the way. The path is filled in from get_config, because
+       "your config folder" is a different place on every platform and in
+       every container. -->
+  <div class="row" data-adv="1"><label data-i18n="set.ui.customcss">Your own CSS<span class="hint" data-i18n="set.ui.customcss.hint">create this file and it loads after the built-in styles, so your rules win without needing !important. Reload a page to see a change; an upgrade replaces the dashboard but never your file.</span></label>
+    <span class="dim mono" id="cssPath" style="font-size:12px;word-break:break-all"></span></div>
 </div>
 
 <div class="card set" data-sg="alerts" data-sk="sounds">
@@ -2419,6 +2456,8 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
       <button class="ghost mini" id="s_nzbkey_show" onclick="showNzbKey(this)" data-i18n="set.sec.apikey.show">Show</button>
       <button class="ghost mini" onclick="newNzbKey()" data-i18n="set.sec.apikey.new">Create new</button>
     </span></div>
+  <div class="row"><label data-i18n="set.sec.cors">Browser extensions<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.sec.cors.hint">which web pages a browser will let read this API. * is the default and matches SABnzbd, so extensions like NZB Unity and NZBDonkey work with no setup - your API key is still needed on every request. To keep it tighter, list the origins you allow instead (https://example.com), separated by commas. Empty sends no header at all, which blocks every extension</span></label>
+    <input class="txt" id="s_cors_origin" spellcheck="false" placeholder="*" onchange="setCfg('cors_origin',this.value)"></div>
   <div class="row"><label data-i18n="set.sec.backup">Settings backup<span class="hint" data-i18n="set.sec.backup.hint">one file holding every setting, your servers (passwords included) and both keys - keep it somewhere private. Restoring it on a fresh install brings everything back</span></label>
     <span style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
       <button class="ghost mini" onclick="backupDownload()" data-i18n="set.sec.backup.dl">Download backup</button>
@@ -5026,6 +5065,20 @@ function ruleBadge(s){
     ? ` <span class="qbadge" title="${escA(t('queue.byrule','Category set by your Smart Folder rule "{name}".',{name:s.smart_rule}))}">▦</span>`
     : '';
 }
+// §139 (issue #30): the job's category on the row itself, instead of
+// only behind a click. The four built-ins get fixed, well-spaced hues;
+// any user category hashes its lowercased name, so the colour is
+// stable across the queue, history and every browser without anyone
+// assigning it. '*' is SAB's "no category" and shows nothing - in a
+// one-category setup a pill on every row would just be noise.
+const CAT_HUES={tv:210,movies:285,music:150,books:35};
+function catBadge(c){
+  if(!c||c==='*') return '';
+  const k=String(c).toLowerCase();
+  let hue=CAT_HUES[k];
+  if(hue==null){ let h=0; for(let i=0;i<k.length;i++) h=(h*31+k.charCodeAt(i))>>>0; hue=h%360; }
+  return ` <span class="qbadge cat" style="--catc:oklch(62% 0.13 ${hue})" title="${escA(t('row.cat.title',"This download's category. Finished downloads are filed in its folder."))}">${esc(c)}</span>`;
+}
 // When the job finished, kept short in the row - time alone for today,
 // day+month this year, day+month+year beyond - with the full stamp on
 // hover; the drawer spells it out. `completed` is unix seconds and 0
@@ -5192,7 +5245,7 @@ function renderHistory(slots){
         ondblclick="openItem('${s.nzo_id}','file')" oncontextmenu="return histMenu(event,'${s.nzo_id}',${retryable})"
         title="${escA(t('hist.row.title3','Click the row for details. Every action is on the row itself: ⋯ opens the rest. Double-click plays, right-click opens the same menu.'))}">
         <td class="selcol"><input type="checkbox" class="rowsel" data-sel="${escA(s.nzo_id)}"${hSel.has(s.nzo_id)?' checked':''} onclick="selClick(event,'h',this)" aria-label="${escA(t('sel.row','Select {name}',{name:s.name}))}"></td>
-        <td><span class="nm"><span class="caret">▶</span><span class="sdot" role="img" aria-label="${escA(dotLabel)}"></span><span class="nmtxt">${esc(s.name)}${identName(s)}${mediaBadge(s.media)}${shapeBadge(s.archive_shape)}${originGlyph(s.origin)}${needsPw?` <span class="warn">· ${t('hist.needpw','needs a password')}</span>`:''}${split?` <span class="warn">· ${t('hist.split','part of it did not move')}</span>`:''}${moveFail?` <span class="warn">· ${t('hist.movefail','not moved to its destination')}</span>`:''}${movingNow?` <span class="dim">· ${t('hist.moving','moving to its destination…')}</span>`:''}</span></span></td>
+        <td><span class="nm"><span class="caret">▶</span><span class="sdot" role="img" aria-label="${escA(dotLabel)}"></span><span class="nmtxt">${esc(s.name)}${identName(s)}${mediaBadge(s.media)}${shapeBadge(s.archive_shape)}${catBadge(s.category)}${originGlyph(s.origin)}${needsPw?` <span class="warn">· ${t('hist.needpw','needs a password')}</span>`:''}${split?` <span class="warn">· ${t('hist.split','part of it did not move')}</span>`:''}${moveFail?` <span class="warn">· ${t('hist.movefail','not moved to its destination')}</span>`:''}${movingNow?` <span class="dim">· ${t('hist.moving','moving to its destination…')}</span>`:''}</span></span></td>
         <td class="nowrap">${s.bytes!=null?fmtSize(s.bytes):esc(s.size||'')}${st}</td>
         <td class="nowrap" style="text-align:end">${ctl}</td></tr>`;
     }).join('')
@@ -5440,7 +5493,7 @@ async function toggleHistRow(tr){
   // no trace of WHY it downloaded). Empty for records that predate the
   // origin field, or carry a token this page does not know - no row then.
   const ol=s.origin?originLabel(s.origin):'';
-  if(ol) rows.push([t('drawer.origin','added by'), esc(ol)]);
+  if(ol) rows.push([t('drawer.origin','added by'), originIconHtml(s.origin)+esc(ol)]);
   if(s.fail_message){
     // "attempt 3" beside the reason. `retry` counts RETRIES and has been
     // on the wire since M32 without ever being rendered, so a job that
@@ -6362,7 +6415,7 @@ function renderQueue(){
     // §129 2f: the checkbox renders its state straight from the Set, so
     // selection survives every setHtml tbody re-render by construction.
     const selBox=`<td class="selcol"><input type="checkbox" class="rowsel" data-sel="${s.nzo_id}"${qSel.has(s.nzo_id)?' checked':''} onclick="selClick(event,'q',this)" aria-label="${escA(t('sel.row','Select {name}',{name:s.filename||s.name}))}"></td>`;
-    return `<tr class="qrow${open?' open':''}" data-id="${s.nzo_id}" data-i="${i}" draggable="${dl||tail?'false':'true'}" tabindex="0" role="button" aria-expanded="${open}">${selBox}<td>${esc(s.filename||s.name)}${identName(s)}${mediaBadge(s.media)}${shapeBadge(s.archive_shape)}${originGlyph(s.origin)}${ruleBadge(s)}${pz?' '+pzLabel:''}${tail?` <span class="dim">· ${tailWord}</span>`:''}${defer}</td><td class="nowrap">${fmtMB(s.mb)}</td>
+    return `<tr class="qrow${open?' open':''}" data-id="${s.nzo_id}" data-i="${i}" draggable="${dl||tail?'false':'true'}" tabindex="0" role="button" aria-expanded="${open}">${selBox}<td>${esc(s.filename||s.name)}${identName(s)}${mediaBadge(s.media)}${shapeBadge(s.archive_shape)}${catBadge(s.cat)}${originGlyph(s.origin)}${ruleBadge(s)}${pz?' '+pzLabel:''}${tail?` <span class="dim">· ${tailWord}</span>`:''}${defer}</td><td class="nowrap">${fmtMB(s.mb)}</td>
       <td class="nowrap dim">${fmtMB(s.mbleft)}</td><td class="nowrap mono" title="${escA(tail?t('queue.eta.finishing','the download is done - this is the work that follows it'):dl?t('queue.eta.active','time to finish this download'):t('queue.eta.queued','estimated finish, once the items ahead complete'))}">${tail?`<span class="dim">${tailWord}</span>`:pz?'-':fmtEta(eta)}</td>
       <td><div class="bar"><i style="width:${s.percentage}%"></i></div>${actSub(s)}</td>
       <td class="nowrap" style="text-align:end">${ctl}</td></tr>`+
@@ -6725,14 +6778,41 @@ function originLabel(o){
 // it, but dim and tiny - it must never compete with the name. Jobs
 // added from this dashboard get no glyph at all: that is the normal
 // case, and marking it would just be noise.
-const ORIGIN_GLYPH={watch:'📂',arr:'🤖',watchlist:'⭐',rss:'📡',url:'🔗',
-  nzblnk:'🔗',wall:'🧱',spot:'📌',indexer:'🔎','failure-link':'↻'};
-function originGlyph(o){
+// These are sprite icons rather than the emoji they replaced, for the
+// reason the sprite itself was built: an emoji renders differently on
+// every OS, cannot take the page's colour, and several of these had to
+// carry meaning at 11 px.
+const ORIGIN_ICON={watch:'i-o-folder',arr:'i-o-app',watchlist:'i-o-star',rss:'i-o-rss',
+  url:'i-o-link',nzblnk:'i-o-link',wall:'i-wall',spot:'i-o-pin',indexer:'i-search',
+  'failure-link':'i-o-retry'};
+// Per-sender glyphs for API-added jobs (issue #31). Every app that posts
+// over the API used to land on one robot, so a Sonarr grab and a Radarr
+// grab were indistinguishable in history - which is the whole reason to
+// have the badge. Neutral shapes for the KIND of library each app keeps,
+// deliberately NOT the projects' own logos: we do not ship anyone else's
+// mark, and the tooltip already names them. A sender with no shape of its
+// own falls back to the generic API glyph rather than to nothing, so a
+// self-named client is still visibly "some app", not "the dashboard".
+const ARR_ICON={sonarr:'i-o-tv',radarr:'i-o-film',lidarr:'i-o-music',readarr:'i-o-book',
+  whisparr:'i-o-cam',prowlarr:'i-o-hub',nzbhydra2:'i-o-funnel',sabnzbd:'i-o-inbox',
+  nzbget:'i-o-inbox',nzb360:'i-o-phone',lunasea:'i-o-phone',nzbunity:'i-o-window',
+  curl:'i-o-term'};
+function originIcon(o){
   if(!o||o==='dashboard') return '';
-  const g=ORIGIN_GLYPH[o.split(':')[0]]||'';
-  const l=originLabel(o);
-  if(!g||!l) return '';
-  return ` <span class="obadge" title="${escA(t('drawer.origin','added by')+' '+l)}">${g}</span>`;
+  if(o.startsWith('arr:')) return ARR_ICON[o.slice(4)]||ORIGIN_ICON.arr;
+  return ORIGIN_ICON[o.split(':')[0]]||'';
+}
+// The bare mark, for places that print the origin's name beside it - the
+// drawers - so the row badge and the sentence teach each other.
+function originIconHtml(o){
+  const ic=originIcon(o);
+  return ic?`<svg class="ic oic" viewBox="0 0 24 24" aria-hidden="true"><use href="#${ic}"/></svg> `:'';
+}
+function originGlyph(o){
+  const ic=originIcon(o);
+  const l=o?originLabel(o):'';
+  if(!ic||!l) return '';
+  return ` <span class="obadge" title="${escA(t('drawer.origin','added by')+' '+l)}"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#${ic}"/></svg></span>`;
 }
 function drawerHtml(s){
   const st=lastStats||{};
@@ -6762,7 +6842,7 @@ function drawerHtml(s){
     // watch-folder pickup starts downloading at once, so the drawer a
     // user opens to ask "why is this here?" was exactly the one branch
     // that never said.
-    const oline=dol?`<div class="dim" style="font-size:12px;margin-top:7px">${t('drawer.origin','added by')} ${esc(dol)}</div>`:'';
+    const oline=dol?`<div class="dim" style="font-size:12px;margin-top:7px">${t('drawer.origin','added by')} ${originIconHtml(s.origin)}${esc(dol)}</div>`:'';
     return files+vline+sline+oline+whyslowBlock(s)+mediaWarnBlock(s.media)+pwBlock(s)
       +`<div style="font-size:12px;margin-top:7px">${nzbBlock(s)}</div>`+probeHtml(s.nzo_id);
   }
@@ -6777,7 +6857,7 @@ function drawerHtml(s){
     const vline=(s.status!=='Moving'&&v.blocks_total>0)?`<div class="dim" style="font-size:12px;margin-top:7px">${t('lane.verify','verify')} ${v.blocks_done}/${v.blocks_total} ${t('drawer.blocks','blocks')}${v.blocks_bad?` · <span class="bad">${t('lane.bad','{n} bad',{n:v.blocks_bad})}</span>`:' · '+t('tile.clean','clean')}</div>`:'';
     return `<div style="font-size:12.5px">${t('drawer.finishing','Downloaded. {phase} - nothing more is being downloaded for this job.',{phase:esc(tStatus(s.status))})}</div>`
       +vline
-      +(dol?`<div class="dim" style="font-size:12px;margin-top:7px">${t('drawer.origin','added by')} ${esc(dol)}</div>`:'')
+      +(dol?`<div class="dim" style="font-size:12px;margin-top:7px">${t('drawer.origin','added by')} ${originIconHtml(s.origin)}${esc(dol)}</div>`:'')
       +mediaWarnBlock(s.media)+healthDetail(s.health)
       +`<div style="font-size:12px;margin-top:7px">${nzbBlock(s)}</div>`;
   }
@@ -6806,7 +6886,7 @@ function drawerHtml(s){
         ?t('drawer.pp.skip','pp={n} was requested (skip repair or unpack). Repair and unpack are part of the one-pass download itself, so the request is recorded here and the download runs normally.',{n:s.sab_pp})
         :t('drawer.pp.normal','pp={n} was requested, which matches normal behavior: repair and unpack happen during the download, and sample cleanup follows your cleanup settings.',{n:s.sab_pp}))}</span>`:''}
       ${s.script_override?`<span class="dim">${t('drawer.script','script')}</span><span class="mono" style="font-size:11.5px">${esc(s.script_override)}</span>`:''}
-      ${dol?`<span class="dim">${t('drawer.origin','added by')}</span><span>${esc(dol)}</span>`:''}
+      ${dol?`<span class="dim">${t('drawer.origin','added by')}</span><span>${originIconHtml(s.origin)}${esc(dol)}</span>`:''}
       ${s.nzb_path?`<span class="dim">${t('drawer.nzbfile','NZB file')}</span><span class="mono" style="word-break:break-all;font-size:11.5px">${esc(s.nzb_path)} ${nzbBlock(s)}</span>`:''}
     </div>`+
     // A stopped or paused job keeps whatever its download already read,
@@ -10385,6 +10465,8 @@ async function loadSettings(){
   if(phc&&document.activeElement!==phc) phc.checked=!!c.post_health;
   const phd=document.getElementById('s_post_health_defer');
   if(phd&&document.activeElement!==phd) phd.checked=!!c.post_health_defer;
+  const phf=document.getElementById('s_post_health_fail');
+  if(phf&&document.activeElement!==phf) phf.checked=!!c.post_health_fail;
   [['s_auto_rename',c.auto_rename],['s_rename_resolution',c.rename_resolution],
    ['s_rename_vcodec',c.rename_vcodec],['s_rename_acodec',c.rename_acodec],
    ['s_rename_source',c.rename_source],['s_rename_group',c.rename_group],
@@ -10392,6 +10474,9 @@ async function loadSettings(){
    ['s_rename_extra_words',c.rename_extra_words],['s_rename_identify',c.rename_identify],
    ['s_rename_episode_titles',c.rename_episode_titles],
    ['s_rename_junk',c.rename_junk],['s_rename_media_only',c.rename_media_only],
+   // Not a rename-sub either: it is the OTHER answer to what a finished
+   // download is called, so it stays readable with auto-rename off.
+   ['s_rename_from_nzb',c.rename_from_nzb],
    // Not a rename-sub: the lookup runs whether or not files are renamed,
    // and what it finds reaches History either way.
    ['s_identity_lookup',c.identity_lookup]]
@@ -10569,6 +10654,10 @@ async function loadSettings(){
   put('s_port', c.port);
   put('s_tls_cert', c.tls_cert||'');
   put('s_tls_key', c.tls_key||'');
+  // §141: an empty cors_origin is a real setting ("send no header"), not
+  // a missing one, so the ?? keeps it distinct from an older daemon that
+  // does not report the row at all.
+  put('s_cors_origin', c.cors_origin ?? '*');
   put('s_ui_locale', c.ui_locale||'');
   const hr=document.getElementById('s_history_rows');
   if(hr && document.activeElement!==hr && c.history_rows) hr.value=c.history_rows;
@@ -10602,6 +10691,11 @@ async function loadSettings(){
   if(!document.querySelector('#notifyrows :focus')) renderNotify(c.notify_targets||[]);
   put('s_arr_giveup_threshold', c.arr_giveup_threshold??0);
   if(!document.querySelector('#arrrows :focus')) renderArr(c.arr_instances||[]);
+  // Issue #31: the user stylesheet is a fixed name beside the config, so
+  // the folder is the only part that varies - derive it from the path we
+  // already publish rather than adding a field for it.
+  const cssp=document.getElementById('cssPath');
+  if(cssp&&c.config_path) cssp.textContent=c.config_path.replace(/[^/\\]+$/,'')+'custom.css';
   document.getElementById('setpaths').textContent=
     `${t('set.paths.servers','servers')} → ${c.config_path} · ${t('set.paths.saved','saved settings')} → ${c.settings_path}`+
     (c.password_file?` · ${t('set.paths.pwfile','archive passwords')} → ${c.password_file}`:'');
@@ -10933,12 +11027,18 @@ function catFileRowHtml(name, dir, meta){
   const why = escA(t('set.disk.cats.builtin.title','always available, so it cannot be renamed or removed - its folder is still yours to set'));
   const prio = m.priority==null ? '' : String(m.priority);
   const popt=(v,l)=>`<option value="${v}"${prio===v?' selected':''}>${esc(l)}</option>`;
+  // Three states, not a checkbox: "no answer" is the useful default and
+  // means "follow the global switch", which a tick cannot say.
+  const nzb = m.nzb_name==null ? '' : (m.nzb_name ? 'on' : 'off');
+  const nopt=(v,l)=>`<option value="${v}"${nzb===v?' selected':''}>${esc(l)}</option>`;
   return `<div class="catfilerow">
     <input class="txt" data-k="name" value="${escA(name||'')}"${fixed?` readonly title="${why}"`:''} placeholder="${escA(t('set.disk.cats.name.ph','category'))}" ${fixed?'':`title="${escA(t('set.disk.cats.name.title','the name Sonarr, Radarr or your app is configured with'))}"`} oninput="catFileCheck(this)">
     <div class="pathrow"><input class="txt" data-k="dir" value="${escA(dir||m.dir||'')}" placeholder="${escA(t('set.disk.cats.dir.ph','a subfolder of the download root'))}" title="${escA(t('set.disk.cats.dir.title','where this category lands. Blank = its own subfolder of the download root; a plain name = that subfolder instead; a full path = downloads land in the root as usual and finished jobs move there'))}" oninput="catFileCheck(this)"><button class="mini" onclick="browseDir(this.previousElementSibling,'dir')" data-i18n-title="btn.browse.title" title="Browse for a folder - including other drives" data-i18n="btn.browse">Browse…</button></div>
     <select class="sel" data-k="prio" title="${escA(t('set.disk.cats.prio.title','default priority for downloads added in this category; an add that names its own priority wins'))}">
       ${popt('',t('set.disk.cats.prio.def','priority: default'))}${popt('2',t('set.disk.cats.prio.force','force'))}${popt('1',t('set.disk.cats.prio.high','high'))}${popt('0',t('set.disk.cats.prio.normal','normal'))}${popt('-1',t('set.disk.cats.prio.low','low'))}${popt('-2',t('set.disk.cats.prio.paused','add paused'))}</select>
     <input class="txt" data-k="script" value="${escA(m.script||'')}" placeholder="${escA(t('set.disk.cats.script.ph','script'))}" title="${escA(t('set.disk.cats.script.title','post-processing script for this category, instead of the global one; blank = the global script'))}">
+    <select class="sel" data-k="nzb" title="${escA(t('set.disk.cats.nzbname.title','name finished downloads in this category after their .nzb file. "default" follows the switch in Auto-rename & cleanup, so a category is how you allow or disallow it for one kind of download'))}">
+      ${nopt('',t('set.disk.cats.nzbname.def','.nzb name: default'))}${nopt('on',t('set.disk.cats.nzbname.on','.nzb name: on'))}${nopt('off',t('set.disk.cats.nzbname.off','.nzb name: off'))}</select>
     <button class="ghost" onclick="this.closest('.catfilerow').remove()"${fixed?' disabled':''} title="${fixed?why:escA(t('set.disk.cats.remove.title','Delete this category'))}" aria-label="${fixed?why:escA(t('set.disk.cats.remove.title','Delete this category'))}">×</button>
     <div class="rulewarn" style="display:none"></div></div>`;
 }
@@ -11005,6 +11105,7 @@ async function saveCatFiles(btn){ await busy(btn,t('busy.applying','Applying…'
     else if(dir) m.dir=dir;
     const prio=g('prio'); if(prio!=='') m.priority=+prio;
     const script=g('script'); if(script) m.script=script;
+    const nzb=g('nzb'); if(nzb==='on') m.nzb_name=true; else if(nzb==='off') m.nzb_name=false;
     if(Object.keys(m).length) meta[name]=m;
   }
   // Both settings, in this order: a destination naming a category the

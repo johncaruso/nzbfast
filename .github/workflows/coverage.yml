@@ -34,6 +34,11 @@
 # test rigs". The floor stays 84 - never lower it, and never widen the
 # exclusion list to make a run pass: a new entry must BE test
 # infrastructure, argued here, in the commit that adds it.
+# mock_tls.rs joined the list on 10 Aug, on a GREEN run (90.57 vs 84):
+# it is the §129 3b TLS front end for the same chaos mock - handshake
+# and record-layer fault injection that only test clients ever drive -
+# and it sat in the metric at 0.00% (216 lines) purely because it
+# landed after the 6 Aug policy commit named its siblings.
 #
 # Nightly, not per-push: a full coverage build recompiles the workspace
 # instrumented, which is minutes, and ci-private is deliberately lean.
@@ -55,10 +60,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: toolchain
         run: rustup toolchain install stable --profile minimal --component llvm-tools && rustup default stable
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -95,7 +100,7 @@ jobs:
       # pulls the most recent table; the per-run key stores this one.
       - name: previous per-file coverage table
         if: always()
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: coverage-table
           key: coverage-table-${{ github.run_id }}
@@ -105,7 +110,7 @@ jobs:
           NZBFAST_NO_ENRICH: "1"
         run: >
           cargo llvm-cov --locked -p nzbkit --lib --fail-under-lines 84
-          --ignore-filename-regex 'nzbkit/src/(mock|sysbench|benchserve)\.rs$'
+          --ignore-filename-regex 'nzbkit/src/(mock|mock_tls|sysbench|benchserve)\.rs$'
       # Must run HERE, before the bins step: `report` globs every
       # binary in the llvm-cov target dir, and after the -p nzbfast
       # --bins run it would charge nzbfast's monomorphized generics to
@@ -118,7 +123,7 @@ jobs:
         run: |
           mkdir -p coverage-table
           cargo llvm-cov report --locked --json \
-            --ignore-filename-regex 'nzbkit/src/(mock|sysbench|benchserve)\.rs$' \
+            --ignore-filename-regex 'nzbkit/src/(mock|mock_tls|sysbench|benchserve)\.rs$' \
             | jq -r '.data[0].files[]
                 | [.filename,
                    .summary.lines.count,

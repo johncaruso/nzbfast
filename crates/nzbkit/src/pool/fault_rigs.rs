@@ -682,6 +682,7 @@ async fn early_fanout_arms_at_the_tail_latch_not_the_pending_floor() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     };
 
     // Plain fan-out, tail latched, pending far above the floor: the
@@ -696,7 +697,9 @@ async fn early_fanout_arms_at_the_tail_latch_not_the_pending_floor() {
     plain.inflight.lock_ok().get_mut("<q0>").unwrap().dispatched =
         Instant::now() - Duration::from_secs(1);
     assert!(
-        plain.pick_dup(1, 0b10, 0b10, 0, 0, 0).is_none(),
+        plain
+            .pick_dup(1, 0b10, 0b10, 0, Pipeline::payload(0), 0)
+            .is_none(),
         "plain fan-out fired above ENDGAME_MAX"
     );
 
@@ -708,7 +711,9 @@ async fn early_fanout_arms_at_the_tail_latch_not_the_pending_floor() {
         Instant::now() - Duration::from_secs(1);
     // ...but not before the latch: no tail, no early rules.
     assert!(
-        early.pick_dup(1, 0b10, 0b10, 0, 0, 0).is_none(),
+        early
+            .pick_dup(1, 0b10, 0b10, 0, Pipeline::payload(0), 0)
+            .is_none(),
         "early fan-out fired before the queue ever ran dry"
     );
     early
@@ -716,7 +721,7 @@ async fn early_fanout_arms_at_the_tail_latch_not_the_pending_floor() {
         .lock_ok()
         .get_or_insert_with(Instant::now);
     let d = early
-        .pick_dup(1, 0b10, 0b10, 0, 0, 0)
+        .pick_dup(1, 0b10, 0b10, 0, Pipeline::payload(0), 0)
         .expect("early fan-out races at the tail latch");
     assert_eq!(d.id, "<q0>");
     assert!(d.dup);
@@ -744,6 +749,7 @@ async fn early_fanout_arms_at_the_tail_latch_not_the_pending_floor() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     };
     steered.register_inflight(&refetch, 1); // recovery leg on server b
     steered
@@ -753,11 +759,15 @@ async fn early_fanout_arms_at_the_tail_latch_not_the_pending_floor() {
         .unwrap()
         .dispatched = Instant::now() - Duration::from_secs(1);
     assert!(
-        steered.pick_dup(1, 0b10, 0b10, 0, 0, 0).is_none(),
+        steered
+            .pick_dup(1, 0b10, 0b10, 0, Pipeline::payload(0), 0)
+            .is_none(),
         "fan-out raced a steer refetch on its own server"
     );
     assert!(
-        steered.pick_dup(0, 0b01, 0b01, 0, 0, 0).is_none(),
+        steered
+            .pick_dup(0, 0b01, 0b01, 0, Pipeline::payload(0), 0)
+            .is_none(),
         "the server whose copy was bad re-raced the refetch"
     );
 }
@@ -878,6 +888,7 @@ async fn hedge_races_a_straggler_at_the_adaptive_bound() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     };
     shared.register_inflight(&w0, 0);
     shared
@@ -908,6 +919,7 @@ async fn hedge_races_a_straggler_at_the_adaptive_bound() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     };
     shared.register_inflight(&w1, 0);
     shared
@@ -917,7 +929,7 @@ async fn hedge_races_a_straggler_at_the_adaptive_bound() {
         .unwrap()
         .dispatched = Instant::now() - Duration::from_secs(2);
     let d = shared
-        .pick_dup(1, 0b10, 0b10, 0, 0, 0)
+        .pick_dup(1, 0b10, 0b10, 0, Pipeline::payload(0), 0)
         .expect("straggler past the adaptive bound should be hedged");
     assert_eq!(d.id, "<s1>");
     assert!(d.dup);
@@ -936,6 +948,7 @@ async fn hedge_races_a_straggler_at_the_adaptive_bound() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     };
     shared.register_inflight(&w2, 0);
     shared
@@ -945,7 +958,9 @@ async fn hedge_races_a_straggler_at_the_adaptive_bound() {
         .unwrap()
         .dispatched = Instant::now() - Duration::from_secs(2);
     assert!(
-        shared.pick_dup(1, 0b10, 0b10, 0, 0, 0).is_none(),
+        shared
+            .pick_dup(1, 0b10, 0b10, 0, Pipeline::payload(0), 0)
+            .is_none(),
         "a capped hedge still issued"
     );
 
@@ -960,7 +975,8 @@ async fn hedge_races_a_straggler_at_the_adaptive_bound() {
     off.inflight.lock_ok().get_mut("<s1>").unwrap().dispatched =
         Instant::now() - Duration::from_secs(2);
     assert!(
-        off.pick_dup(1, 0b10, 0b10, 0, 0, 0).is_none(),
+        off.pick_dup(1, 0b10, 0b10, 0, Pipeline::payload(0), 0)
+            .is_none(),
         "hedge fired while switched off"
     );
 }
@@ -1021,6 +1037,7 @@ async fn suspect_dup_races_a_pre_byte_stall_at_once() {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     };
     let servers = vec![mk("a", true), mk("b", true)];
     let reqs: Vec<ArticleReq> = (0..(ENDGAME_MAX + 10))

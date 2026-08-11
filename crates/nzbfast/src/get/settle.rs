@@ -561,8 +561,11 @@ async fn run_set_repair(
     note_activity("repairing");
     // §129: one repair at a time across concurrent tails. The token
     // above already says "repairing", so a queued wait reads truthfully;
-    // held for the whole pass (mapped repair, materialize, disk repair).
-    let _cpu = crate::lanegate::heavy_cpu().await;
+    // held for the whole pass (mapped repair, materialize, disk repair)
+    // EXCEPT across the recovery fetches, which hand it back for the
+    // duration - it gates cores, and an unanswered side-fetch holding it
+    // would park every other job's tail (§137.2; see `HeavyCpu`).
+    let mut cpu = crate::lanegate::HeavyCpu::acquire().await;
     // M2c.1: first try repairing straight INTO the extracted
     // output through the block→payload mapping - no volume
     // files ever touch disk. Every declined case (gate miss,
@@ -593,6 +596,7 @@ async fn run_set_repair(
             // here.
             !fast_verify,
             cancel,
+            &mut cpu,
         )
         .await?
     } else {
@@ -709,6 +713,7 @@ async fn run_set_repair(
             extractor,
             &mut repair_shortfall,
             cancel,
+            &mut cpu,
         )
         .await?;
         // A successful disk repair re-read the WHOLE set off
@@ -1017,8 +1022,11 @@ async fn settle_without_set(
             let t0 = Instant::now();
             note_activity("repairing");
             // §129: same one-repair-at-a-time permit as the set-repair
-            // path; released when this directory pass ends.
-            let _cpu = crate::lanegate::heavy_cpu().await;
+            // path; released when this directory pass ends. Taken AFTER
+            // the deferred-volume fetch above on purpose - everything
+            // from here down is CPU and local disk, so this pass needs
+            // no `without_permit` seam of its own (§137.2).
+            let _cpu = crate::lanegate::HeavyCpu::acquire().await;
             println!(
                 "no PAR2 set came from the NZB, but the downloaded files \
                  include one - repairing from disk…"

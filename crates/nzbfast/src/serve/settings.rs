@@ -239,6 +239,10 @@ pub(super) const PATHS: &[Setting] = &[
     // not the next restart), persist, and `pending` carries the diff.
     rw("tls_cert", |c| json!(path_str(&c.d.tls_cert))),
     rw("tls_key", |c| json!(path_str(&c.d.tls_key))),
+    // §141 (issue #33): which browser origins may read the SAB API.
+    // Lives beside the port and the TLS pair because it is a property of
+    // the listening surface, not of a download.
+    rw("cors_origin", |c| json!(c.d.cors_origin.lock_ok().clone())),
     rw("out_dir", |c| json!(c.d.out_dir().to_string_lossy())),
     rw("move_pace", |c| json!(c.d.move_pace.lock_ok().clone())),
     rw("move_completed", |c| {
@@ -367,6 +371,9 @@ pub(super) const SPEED: &[Setting] = &[
     rw("post_health_defer", |c| {
         json!(c.d.post_health_defer.load(Ordering::Relaxed))
     }),
+    rw("post_health_fail", |c| {
+        json!(c.d.post_health_fail.load(Ordering::Relaxed))
+    }),
     rw("wall_hide_adult", |c| {
         json!(c.d.wall_hide_adult.load(Ordering::Relaxed))
     }),
@@ -447,6 +454,9 @@ pub(super) const RENAME: &[Setting] = &[
     }),
     rw("rename_media_only", |c| {
         json!(c.d.rename_media_only.load(Ordering::Relaxed))
+    }),
+    rw("rename_from_nzb", |c| {
+        json!(c.d.rename_from_nzb.load(Ordering::Relaxed))
     }),
     rw("history_rows", |c| {
         json!(c.d.history_rows.load(Ordering::Relaxed))
@@ -1094,6 +1104,70 @@ fn set_ui_locale(
         *d.ui_locale.lock_ok() = t.clone();
         (true, json!(t))
     })
+}
+
+/// §141 (issue #33): which origins the SAB-compatible API answers
+/// `Access-Control-Allow-Origin` for.
+///
+/// `*` is the default because that is what real SABnzbd sends, and it is
+/// the only value at which a browser extension works with no
+/// configuration - which is the whole bug. It weakens nothing: the API
+/// key rides every request explicitly, and CORS decides what a page may
+/// READ, not who may call. A comma-separated list of origins narrows it
+/// for anyone who wants it tighter; empty sends no header at all.
+///
+/// The charset is gated HERE rather than at the emit site, because the
+/// value goes into a response header verbatim. tiny_http header values
+/// are `AsciiString`, and CR and LF are ASCII: an ungated setting is
+/// response splitting on the daemon's own origin, which is the same
+/// shape the `/watch` redirect learned the hard way.
+fn set_cors_origin(
+    d: &Arc<Daemon>,
+    _name: &str,
+    v: &str,
+) -> std::result::Result<(bool, Value), String> {
+    let mut cleaned: Vec<String> = Vec::new();
+    for part in v.split(',') {
+        let e = part.trim();
+        if e.is_empty() {
+            continue;
+        }
+        // An origin is scheme + host + optional port and NOTHING else -
+        // no path, no space, no quote, nothing outside ASCII. Splitting
+        // at the `://` is what makes "no path" checkable: the authority
+        // that follows may not carry a slash, so `https://x.example/`
+        // and `https://x.example/../evil` are refused rather than
+        // silently compared against an Origin that can never contain
+        // one. `[`/`]` admit an IPv6 literal; `moz-extension://` and
+        // `chrome-extension://` fall out of the scheme rule.
+        let shaped = e == "*"
+            || e.split_once("://").is_some_and(|(scheme, authority)| {
+                !scheme.is_empty()
+                    && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && scheme
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+                    && !authority.is_empty()
+                    && authority.chars().all(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':' | '[' | ']')
+                    })
+            });
+        if !shaped {
+            return Err("cors_origin: `*`, or origins like https://example.com or \
+                 moz-extension://<id>, comma-separated - or empty to send no header"
+                .into());
+        }
+        cleaned.push(e.to_string());
+    }
+    // A browser accepts exactly ONE value, so `*` alongside named
+    // origins is a contradiction: whichever we answered, the other half
+    // of the setting would be silently doing nothing.
+    if cleaned.len() > 1 && cleaned.iter().any(|e| e == "*") {
+        return Err("cors_origin: `*` cannot be combined with named origins".into());
+    }
+    let joined = cleaned.join(", ");
+    *d.cors_origin.lock_ok() = joined.clone();
+    Ok((true, json!(joined)))
 }
 
 fn set_index_gapfill(
@@ -2353,6 +2427,11 @@ pub(super) fn apply_setting(
             d.post_health_defer.store(on, Ordering::Relaxed);
             (true, json!(on))
         }
+        "post_health_fail" => {
+            let on = flag();
+            d.post_health_fail.store(on, Ordering::Relaxed);
+            (true, json!(on))
+        }
         "wall_hide_adult" => {
             let on = flag();
             d.wall_hide_adult.store(on, Ordering::Relaxed);
@@ -2382,6 +2461,7 @@ pub(super) fn apply_setting(
         }
         "update_url" => set_update_url(d, name, v)?,
         "ui_locale" => set_ui_locale(d, name, v)?,
+        "cors_origin" => set_cors_origin(d, name, v)?,
         "index_deepen" => {
             // Articles of history added per scan pass; 0 = off.
             let n = uint()?;
@@ -2534,6 +2614,11 @@ pub(super) fn apply_setting(
         "rename_media_only" => {
             let on = flag();
             d.rename_media_only.store(on, Ordering::Relaxed);
+            (true, json!(on))
+        }
+        "rename_from_nzb" => {
+            let on = flag();
+            d.rename_from_nzb.store(on, Ordering::Relaxed);
             (true, json!(on))
         }
         "connections" => set_connections(d, name, v)?,

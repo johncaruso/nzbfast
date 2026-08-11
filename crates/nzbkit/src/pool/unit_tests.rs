@@ -56,6 +56,7 @@ fn work(id: &str) -> Work {
         soft_430: 0,
         fenced: false,
         rearms: 0,
+        ladder: false,
     }
 }
 
@@ -1769,7 +1770,7 @@ async fn next_work_reports_a_dead_article_and_latches_the_tail() {
     // terminal, and waiting on it would rotate it forever.
     sh.queue.lock().await.front_mut().unwrap().tried_430 = sh.live_mask();
     let (tx, mut rx) = mpsc::channel(4);
-    let w = next_work(&sh, ctx, &tx, 0)
+    let w = next_work(&sh, ctx, &tx, Pipeline::payload(0))
         .await
         .expect("the healthy article is picked");
     assert_eq!(w.id, "<ok@x>");
@@ -1783,14 +1784,22 @@ async fn next_work_reports_a_dead_article_and_latches_the_tail() {
     // The queue is dry with work still pending: this scan finds nothing,
     // latches the tail phase exactly once, and arms the futile throttle.
     assert!(sh.tail_started.lock_ok().is_none());
-    assert!(next_work(&sh, ctx, &tx, 0).await.is_none());
+    assert!(
+        next_work(&sh, ctx, &tx, Pipeline::payload(0))
+            .await
+            .is_none()
+    );
     assert!(
         sh.tail_started.lock_ok().is_some(),
         "a primary finding the queue dry latches the tail"
     );
     assert_ne!(sh.scan_futile[0].load(Ordering::Relaxed), u64::MAX);
     // An immediate rescan takes the throttled path (dup pick only).
-    assert!(next_work(&sh, ctx, &tx, 0).await.is_none());
+    assert!(
+        next_work(&sh, ctx, &tx, Pipeline::payload(0))
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1807,7 +1816,7 @@ async fn steer_inbox_requeues_are_adopted_in_promoted_first_order() {
         inbox.push(work("<n@x>"));
     }
     let (tx, _rx) = mpsc::channel(4);
-    let w = next_work(&sh, ctx, &tx, 0)
+    let w = next_work(&sh, ctx, &tx, Pipeline::payload(0))
         .await
         .expect("work is available");
     assert_eq!(w.id, "<p@x>", "the promoted steer lands at the front");
@@ -1839,11 +1848,17 @@ async fn a_fill_server_waits_for_every_live_primary_miss() {
     sh.alive[1].fetch_add(1, Ordering::AcqRel);
     let (tx, _rx) = mpsc::channel(4);
     // The primary is live and has not missed: the fill server sits out.
-    assert!(next_work(&sh, ctx1, &tx, 0).await.is_none());
+    assert!(
+        next_work(&sh, ctx1, &tx, Pipeline::payload(0))
+            .await
+            .is_none()
+    );
     sh.scan_futile[1].store(u64::MAX, Ordering::Relaxed);
     // The primary 430'd it: the gate opens.
     sh.queue.lock().await.front_mut().unwrap().tried_430 = server_bit(0);
-    let w = next_work(&sh, ctx1, &tx, 0).await.expect("gate satisfied");
+    let w = next_work(&sh, ctx1, &tx, Pipeline::payload(0))
+        .await
+        .expect("gate satisfied");
     assert_eq!(w.id, "<a@x>");
 }
 
@@ -1862,10 +1877,14 @@ async fn endgame_ladder_articles_ride_empty_pipelines_only() {
     let (tx, _rx) = mpsc::channel(4);
     // A busy pipeline holds it back (head-of-line blocking on the last
     // windows was the measured straggler tail).
-    assert!(next_work(&sh, ctx0, &tx, 3).await.is_none());
+    assert!(
+        next_work(&sh, ctx0, &tx, Pipeline::payload(3))
+            .await
+            .is_none()
+    );
     sh.scan_futile[0].store(u64::MAX, Ordering::Relaxed);
     // An idle worker answers the probe in one RTT.
-    let w = next_work(&sh, ctx0, &tx, 0)
+    let w = next_work(&sh, ctx0, &tx, Pipeline::payload(0))
         .await
         .expect("idle takes the probe");
     assert_eq!(w.id, "<l@x>");
@@ -1891,7 +1910,11 @@ async fn untried_promoted_work_is_left_for_a_faster_server() {
     }
     let (tx, _rx) = mpsc::channel(4);
     // The slow server steps past it - and puts it back at the FRONT.
-    assert!(next_work(&sh, ctx0, &tx, 0).await.is_none());
+    assert!(
+        next_work(&sh, ctx0, &tx, Pipeline::payload(0))
+            .await
+            .is_none()
+    );
     {
         let q = sh.queue.lock().await;
         assert_eq!(q.front().map(|w| w.id.as_str()), Some("<s@x>"));
@@ -1906,7 +1929,7 @@ async fn untried_promoted_work_is_left_for_a_faster_server() {
     // whoever can serve it, serves it.
     sh.scan_futile[0].store(u64::MAX, Ordering::Relaxed);
     sh.queue.lock().await.front_mut().unwrap().tried_430 = server_bit(1);
-    let w = next_work(&sh, ctx0, &tx, 0)
+    let w = next_work(&sh, ctx0, &tx, Pipeline::payload(0))
         .await
         .expect("a missed promote goes to whoever is standing");
     assert_eq!(w.id, "<s@x>");

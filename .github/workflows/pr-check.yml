@@ -14,13 +14,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: test deps (par2 for repair e2e)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq par2
       - name: cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -41,6 +41,16 @@ jobs:
       # which is also how nightly.yml already runs daemon and e2e (e2e
       # carries timing-sensitive stall/watchdog tests, so serialising it
       # is a feature, not a cost).
+      #
+      # The heavy-tests features (TODO 116b): the seven heavy targets
+      # carry required-features in their Cargo.toml so the private
+      # repo's per-push CI stops LINKING what it never runs there. This
+      # job DOES run them - it always has, it is a public-PR gate where
+      # the extra minutes buy real coverage - so both passes here (and
+      # the Windows twins below) pass the feature to keep that exactly
+      # as it was. Forget it and cargo builds a suite short SILENTLY
+      # here (nothing names the targets), which is why the flag rides in
+      # the same commit as the gate.
       - name: test (workspace minus nzbfast)
         env:
           NZBFAST_NO_ENRICH: "1"
@@ -52,7 +62,7 @@ jobs:
         # TARGET, so a single red test in the nzbfast bin used to mean
         # nzbkit's suites - yEnc, PAR2, RAR - never ran at all, and the run
         # reported one binary's result as if it had covered the workspace.
-        run: cargo test --workspace --exclude nzbfast --locked --no-fail-fast
+        run: cargo test --workspace --exclude nzbfast --locked --features nzbkit/heavy-tests --no-fail-fast
       - name: test (nzbfast, single-threaded)
         env:
           NZBFAST_NO_ENRICH: "1"
@@ -63,7 +73,7 @@ jobs:
           # firewall prompt on every rebuild; a Linux runner has no such
           # prompt, so CI is where this belongs.
           NZBFAST_LAN_TESTS: "1"
-        run: cargo test -p nzbfast --locked --no-fail-fast -- --test-threads=1
+        run: cargo test -p nzbfast --locked --features heavy-tests --no-fail-fast -- --test-threads=1
       - name: fmt
         run: cargo fmt -p nzbkit -p nzbfast -p nzbtray --check
       # Parity with ci-private.yml; see TODO 102b for why this is a script
@@ -103,7 +113,7 @@ jobs:
     # the serial daemon suite alone on this runner class.
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The same test dependency the Linux job installs with apt, for the
       # same reason: the e2e fixtures CREATE the PAR2 recovery sets they then
       # damage and repair, and `par2` is the creator. nzbfast itself needs no
@@ -128,7 +138,7 @@ jobs:
       # explicit `rustup default stable` would be overridden by that pin
       # anyway - which is already what happens on the Linux job.
       - name: cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -149,7 +159,7 @@ jobs:
           # As on the Linux leg: par2 is fetched above, so a skip here means
           # the install or the PATH broke and the run must say so.
           NZBFAST_REQUIRE_PAR2: "1"
-        run: cargo test --workspace --exclude nzbfast --locked --no-fail-fast
+        run: cargo test --workspace --exclude nzbfast --locked --features nzbkit/heavy-tests --no-fail-fast
       - name: test (nzbfast, single-threaded)
         env:
           NZBFAST_NO_ENRICH: "1"
@@ -158,7 +168,7 @@ jobs:
           # the Linux runner: it opens an all-interfaces listener, which on
           # Windows is exactly what raises the Defender Firewall dialog,
           # and a hosted runner has nobody to click it.
-        run: cargo test -p nzbfast --locked --no-fail-fast -- --test-threads=1
+        run: cargo test -p nzbfast --locked --features heavy-tests --no-fail-fast -- --test-threads=1
       # Parity with the Linux leg above, which has run clippy all along
       # while this job did not - and clippy only lints what compiles for
       # the host, so `#[cfg(windows)]` code was gated on no runner at all.

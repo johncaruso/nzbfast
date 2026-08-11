@@ -121,6 +121,118 @@ pub(super) fn header_apikey(req: &tiny_http::Request) -> Option<String> {
     })
 }
 
+/// The `Origin` a browser stamped on this request, if any.
+///
+/// Absent on curl, on the *arrs, and on every server-side caller - which
+/// is the point: [`cors_headers`] only has work to do when a browser is
+/// asking.
+pub(super) fn origin_hdr(req: &tiny_http::Request) -> Option<String> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.equiv("Origin"))
+        .map(|h| h.value.as_str().trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Default `cors_origin`: what real SABnzbd answers on its API.
+///
+/// §141 (issue #33). We sent no Access-Control header anywhere, so
+/// Firefox blocked the NZB Unity extension against us while SABnzbd on
+/// the same box worked - and under §105.4 anything real SAB sends and we
+/// omit is our bug, because a client cannot tell a missing feature from
+/// a broken daemon. The permissive default costs no authentication: the
+/// API key travels explicitly on every request, and CORS gates what a
+/// browser PAGE may READ, it is not the authentication layer. Narrowing
+/// it on security grounds would reintroduce exactly the breakage the
+/// issue reports.
+pub(super) const CORS_DEFAULT: &str = "*";
+
+/// The `Access-Control-*` headers the SAB-compatible API answers with.
+///
+/// `allow` is the `cors_origin` setting: `*` (the default), a
+/// comma-separated list of origins, or empty for no header at all.
+/// `origin` is the caller's own `Origin`. In list mode the answer names
+/// ONE origin - a browser accepts exactly one value - so the caller's is
+/// matched against the list and the CONFIGURED spelling is what goes out.
+/// Echoing the request's own bytes back would put attacker text in a
+/// response header, and tiny_http header values are `AsciiString` with
+/// CR and LF firmly inside ASCII: that is the response-splitting shape
+/// the `/watch` redirect already learned once. `Vary: Origin` rides
+/// every list-mode answer so a shared cache cannot serve one origin's
+/// permission to another.
+///
+/// `preflight` adds the OPTIONS-only trio. Without an answer to the
+/// preflight Firefox never sends the real request, so the header on the
+/// real response would never be seen.
+pub(super) fn cors_headers(
+    allow: &str,
+    origin: Option<&str>,
+    preflight: bool,
+) -> Vec<tiny_http::Header> {
+    let allow = allow.trim();
+    if allow.is_empty() {
+        return Vec::new();
+    }
+    let wildcard = allow == "*";
+    let value = if wildcard {
+        Some("*".to_string())
+    } else {
+        origin.and_then(|o| {
+            allow
+                .split(',')
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                // Scheme and host are case-insensitive (RFC 6454); the
+                // configured spelling is the one emitted either way.
+                .find(|e| e.eq_ignore_ascii_case(o))
+                .map(str::to_string)
+        })
+    };
+    // `from_bytes` refuses a value that is not printable ASCII, and
+    // `set_cors_origin` has already gated the charset - but this is a
+    // response header built on a worker with no catch_unwind around it,
+    // so a bad value drops the header rather than killing the worker for
+    // the life of the process.
+    let mk =
+        |name: &str, v: &str| tiny_http::Header::from_bytes(name.as_bytes(), v.as_bytes()).ok();
+    let mut out = Vec::new();
+    if let Some(v) = &value {
+        out.extend(mk("Access-Control-Allow-Origin", v));
+    }
+    if !wildcard {
+        out.extend(mk("Vary", "Origin"));
+    }
+    if preflight {
+        out.extend(mk("Access-Control-Allow-Methods", "GET, POST, OPTIONS"));
+        // The three ways a key reaches us off the query string, plus the
+        // content types the addons post. `Content-Type` is only
+        // preflight-free for the form encodings; NZB Unity's JSON probes
+        // are not, which is how a browser ends up here at all.
+        out.extend(mk(
+            "Access-Control-Allow-Headers",
+            "Content-Type, X-Api-Key, Authorization",
+        ));
+        // A day: the addons repeat the same call constantly and each
+        // uncached preflight is a second round trip.
+        out.extend(mk("Access-Control-Max-Age", "86400"));
+    }
+    out
+}
+
+/// Hang [`cors_headers`] on a response. Separate from building them so
+/// the two `/api` exits - the 403 refusal and the dispatched answer -
+/// cannot disagree about the header set.
+pub(super) fn with_cors<R: std::io::Read>(
+    resp: tiny_http::Response<R>,
+    headers: Vec<tiny_http::Header>,
+) -> tiny_http::Response<R> {
+    let mut resp = resp;
+    for h in headers {
+        resp.add_header(h);
+    }
+    resp
+}
+
 pub(super) fn parse_query(q: &str) -> std::collections::HashMap<String, String> {
     q.split('&')
         .filter_map(|kv| {

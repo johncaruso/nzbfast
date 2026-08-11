@@ -429,6 +429,19 @@ fn additive_migrations(db: &Connection) {
         "ALTER TABLE releases ADD COLUMN pesto_ctr_min INTEGER",
         "ALTER TABLE releases ADD COLUMN pesto_ctr_max INTEGER",
         "ALTER TABLE releases ADD COLUMN pesto_clock INTEGER",
+        // Spot-born adult marker (TODO 131): the person who posted this
+        // release filed it under the Spotnet adult subcategory. 0 = no
+        // such claim, which is every scanner-born row and every spot
+        // filed anywhere else - it is NOT "known not adult".
+        //
+        // Distinct from the wall's genre test (index/browse.rs) on
+        // purpose: that one reads `titles.genres`, which only exists
+        // once enrichment has reached the title, and a fresh spot-born
+        // card usually has no enrichment at all - so on the one source
+        // that is a third erotica the filter had nothing to read. This
+        // column is the poster's own filing of their own post, written
+        // at promotion time, and the two are OR'd together.
+        "ALTER TABLE releases ADD COLUMN adult INTEGER NOT NULL DEFAULT 0",
         // Spot promotion (TODO 131): the release row this spot became
         // (or was found to duplicate); 0 = not resolved yet. Set once
         // the spot's NZB has been fetched and folded into `releases`,
@@ -438,6 +451,14 @@ fn additive_migrations(db: &Connection) {
         // whose payload articles are gone stops being retried after a
         // few passes instead of burning the budget forever.
         "ALTER TABLE spots ADD COLUMN nzb_tried INTEGER NOT NULL DEFAULT 0",
+        // What the one corroborating STAT said about the promoted
+        // release's head article (TODO 131): 0 never asked, 1 the
+        // article is there, 2 it is not. A spot-born card's
+        // completeness is otherwise the NZB's own declaration about
+        // itself, which nothing has ever checked against a provider -
+        // survivable at the tip, badly wrong at depth, where the
+        // catalogue now reaches back to 2011.
+        "ALTER TABLE spots ADD COLUMN stat_ok INTEGER NOT NULL DEFAULT 0",
     ] {
         let _ = db.execute(ddl, []);
     }

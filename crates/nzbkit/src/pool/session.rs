@@ -953,7 +953,15 @@ pub(super) async fn handle_missing(
         // possibly desynced socket - dropping it costs one redundant
         // attempt (the original walks its own ladder), while merging
         // it could push the union to a false unanimous Missing.
-        if !echoed {
+        //
+        // Unless it came back FENCED (§129 3g): the fence's own answer
+        // sits in the slot behind this one and `read_one` has already
+        // read it, so reaching here at all proves this response was in
+        // the slot we asked for. That is the same proof an echoed id
+        // gives, arrived at differently - and without it the whole
+        // endgame fan-out is dead weight against a non-echoing
+        // backbone, spending a dispatch that can never become evidence.
+        if !echoed && !w.fenced {
             return;
         }
         // M2c.4: a duplicate's 430 is real evidence, not a
@@ -1034,7 +1042,19 @@ pub(super) async fn handle_missing(
             w.soft_430 &= !void;
         }
     }
-    if !echoed && w.soft_430 & ctx.group_bits != ctx.group_bits {
+    // The pass is only owed while the refusal is UNPROVEN. On a fenced
+    // dispatch `read_one` has already read the fence's own answer out
+    // of the slot behind this response and killed the session if it
+    // was not there - so alignment is established before this line
+    // runs, which is exactly what the confirming repeat was buying.
+    // Charging such a refusal straight away costs no safety and saves
+    // this backbone a whole extra hop per absent article: on a damaged
+    // post that is half the ladder's questions. Only the bare refusal
+    // that ARMS the fence (the first from a provider, before
+    // `bare_refuser` is set) still takes the slow road, and a provider
+    // that never answers a fence has it retired by `note_fence_dud`,
+    // which puts every article here back on the double pass.
+    if !echoed && !w.fenced && w.soft_430 & ctx.group_bits != ctx.group_bits {
         w.soft_430 |= ctx.group_bits;
         // A wholly dead post takes this branch for EVERY article before
         // any of them can go terminal, so the whole first pass resolves
@@ -1466,7 +1486,7 @@ async fn top_up_window(
             shared.note_wire_cap();
             break;
         }
-        let Some(mut w) = next_work(shared, ctx, out, inflight.len()).await else {
+        let Some(mut w) = next_work(shared, ctx, out, Pipeline::of(inflight)).await else {
             break;
         };
         // B3 wire-cap: charge at dispatch, BEFORE the send can
