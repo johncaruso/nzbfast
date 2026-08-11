@@ -2070,6 +2070,13 @@ where
     }
     // Terminator: inside the stream ("\n.\r\n" tail, dot-stuffing makes
     // a lone dot line unambiguous) or plain text on the wire after it.
+    // An EMPTY overview compressed in-stream is just the dot line with
+    // no preceding newline to anchor the suffix checks - a valid reply
+    // for a range whose articles all expired between GROUP and OVER.
+    if out[start..] == *b".\r\n" || out[start..] == *b".\n" {
+        out.truncate(start);
+        return Ok(());
+    }
     if out[start..].ends_with(b"\n.\r\n") {
         out.truncate(out.len() - 3);
         return Ok(());

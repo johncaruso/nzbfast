@@ -53,7 +53,11 @@ BASELINE_FILES = {
     # mid-download password and prefer_external_unrar tests went to
     # tests/daemon_unpackroute/, the five M11 playback rigs to
     # tests/stream_live/. 10,678 with both, so the entry ratchets DOWN.
-    "crates/nzbfast/tests/daemon.rs": 10678,
+    # ...and 11,146 after the #34 SAB-parity round. What a credential may
+    # do - the full key, the add-only nzbkey, and the bootstrap hatch
+    # between them - is one subject and six tests, and moved whole to
+    # tests/daemon_authkey/. 10,466.
+    "crates/nzbfast/tests/daemon.rs": 10466,
     # 7471 when first measured; two concurrent 5 Aug sessions landed
     # test growth (one-pass rigs + the round-6 crc-retry pricing leg).
     "crates/nzbfast/tests/e2e.rs": 7641,
@@ -83,12 +87,17 @@ BASELINE_FILES = {
     # pool/session.rs. 4,698, which is margin measured in hundreds of
     # lines rather than one.
     "crates/nzbkit/src/pool.rs": 4698,
-    # Born 2,988 in the TODO 113 split (the pool's payout/safety rigs,
-    # one file because sibling cfg(test) mods cannot share helpers);
-    # 3,125 when the §114 consumer-steer rigs replaced the pool-gate
-    # ones. All test code - grandfathered like pool.rs's rig growth
-    # was, ratchet when the campaign settles.
-    "crates/nzbkit/src/pool/rig_tests.rs": 3125,
+    # rig_tests.rs was here at 2,988 (born in the TODO 113 split of the
+    # pool's payout/safety rigs), then 3,125 when the §114 consumer-steer
+    # rigs replaced the pool-gate ones, then 3,372 through the §129
+    # fault campaign. Cut where its own subject changes: every leg that
+    # runs MORE THAN ONE fault at a time - the gauntlet matrix, the
+    # fight legs, early fanout, the hedge/dup races, live-target
+    # parking, the 3g fence - is pool/fault_rigs.rs now. 1,988 lines,
+    # under the ceiling, so its entry is GONE. The two shared rig
+    # helpers are `pub(super)` and imported by path: a sibling cfg(test)
+    # mod is not in scope through `use super::*`, but it is reachable by
+    # name, so no third testkit module was needed.
     # 6,192, then 6,480 after the 8 Aug burst. Its 3,018-line inline
     # `mod tests` moved out and split at its own nested-one-pass banner
     # (mod_tests.rs + nested_tests.rs, neither big enough to want an
@@ -106,8 +115,19 @@ BASELINE_FILES = {
     # its fn entries below keep their path: spawn_download_worker and
     # spawn_index_scan stayed in the parent.
     # 5946 when first measured; pre-gate concurrent sessions landed 6106,
-    # and the 5 Aug session union 6231 (event taxonomy, 5ab52b20).
-    "crates/nzbfast/src/serve/daemon.rs": 6231,
+    # and the 5 Aug session union 6231 (event taxonomy, 5ab52b20), which
+    # the §129 mover lane then owed a lowering it could not safely take
+    # (the boot() extraction was rewriting the file at that moment). It
+    # reached 6,465 instead. Two clusters of `impl Daemon` came out to
+    # SIBLING modules, so `pub(super)` still means "pub in serve" and no
+    # call site moved: what a finished job is called (out_dir,
+    # rename_style, job_suffix, episode_titles, resolve_identity,
+    # finalize_names) is serve/naming.rs, and the Daemon half of the
+    # mover (move_dest_root, mover_enqueue/process, identify_video,
+    # relocate_completed) went to serve/mover.rs beside the lanes that
+    # call it. 5,570 - margin measured in hundreds of lines, which is
+    # the lesson of the pool.rs round.
+    "crates/nzbfast/src/serve/daemon.rs": 5570,
     # 5,150, then 5,397 after the 8 Aug burst. The inline `mod tests`
     # (the repair math and the mapped driver) moved to
     # par2repair/inline_tests.rs, beside unit_tests.rs: 4,206.
@@ -115,7 +135,11 @@ BASELINE_FILES = {
     "crates/nzbkit/src/rar.rs": 4088,
     "crates/nzbfast/src/wall.rs": 3911,
     "crates/nzbkit/src/nntp.rs": 3688,
-    "crates/nzbkit/src/release.rs": 3505,
+    # release.rs was here at 3,505 and reached 3,586 as the dark-verdict
+    # and year-is-an-extension rounds landed. Its inline `mod tests` was
+    # 1,427 lines - nearly half the file - and moved whole to
+    # release_tests.rs (the mock.rs pattern). 2,159, under the ceiling,
+    # so its entry is GONE.
     # extract/crypto.rs was here at 3,365 and reached 3,502. Its inline
     # `mod tests` moved to extract/crypto_tests.rs, leaving 2,112 - under
     # the ceiling, so its entry is GONE.
@@ -130,11 +154,23 @@ BASELINE_FNS = {
     # "path::fn_name": lines measured
     # 688 when first measured; pre-gate concurrent work landed 719, then 770.
     "crates/nzbfast/src/serve/tasks.rs::spawn_download_worker": 770,
-    # 652, then 670 after the 8 Aug burst. `resume_at` and the
-    # watch_failed row builder are self-contained and came out whole (609),
-    # and the lane's own comment trim (61537f5d) merged over it: 604.
-    "crates/nzbfast/src/serve/sabcompat.rs::queue_json": 604,
-    "crates/nzbfast/src/serve/tasks.rs::spawn_index_scan": 582,
+    # queue_json was here at 652, then 670 after the 8 Aug burst. `resume_at`
+    # and the watch_failed row builder came out whole (609), and the lane's
+    # own comment trim (61537f5d) merged over it: 604. The #34 SAB-parity
+    # round then took it to 782 in one commit - it added ~30 keys to the
+    # slot and ~25 to the header. Two more self-contained blocks came out:
+    # the whole queue ROW (`slot_json` + the `SlotCtx` snapshot it is built
+    # against - it reads no daemon state of its own), and the six notice
+    # rings (`queue_notices`). 475 now - under the ceiling, so its entry
+    # is GONE.
+    # spawn_index_scan was here at 582 and reached 648 - the §131 spot
+    # legs landed inside it. Four self-contained blocks of its pass moved
+    # to serve/tasks/indexer.rs, where the rest of the index upkeep
+    # already lives: the Spotnet scan + promote leg (spot_pass), the
+    # category reconcile (reclassify_pending_rows), the retention prune
+    # and planner-statistics refresh (retention_and_statistics), and the
+    # size-cap eviction (evict_pass_and_republish). 316 lines now - under
+    # the ceiling, so its entry is GONE.
 }
 
 CFG_TEST = re.compile(r"\s*#\[cfg\(test\)\]")

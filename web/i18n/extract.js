@@ -45,14 +45,19 @@ for (const f of files) {
   // rich text (-html sites are <div>…</div> or <p>…</p> with no nested div/p)
   for (const m of s.matchAll(/(?<!\[)data-i18n-html="([\w.\-]+)"[^>]*>([\s\S]*?)<\/(?:div|p)>/g))
     put(m[1], m[2]);
-  // attribute pairs
-  for (const m of s.matchAll(/<[^>]*data-i18n-(title|placeholder)="[\w.\-]+"[^>]*>/g)) {
+  // attribute pairs. One element can carry BOTH (the ladder-N input has a
+  // data-i18n-placeholder AND a data-i18n-title): match the whole tag once,
+  // then walk every data-i18n-<which> it declares. The old code took the
+  // FIRST attribute only, so ladder.n.title never reached the reference and
+  // rendered English in all 27 locales with every gate green.
+  for (const m of s.matchAll(/<[^>]*data-i18n-(?:title|placeholder)="[\w.\-]+"[^>]*>/g)) {
     const tag = m[0];
-    const k = tag.match(/data-i18n-(?:title|placeholder)="([\w.\-]+)"/)[1];
-    const which = m[1];
-    const v = tag.match(new RegExp('(?<!data-i18n-)' + which + '="([^"]*)"'));
-    if (v) put(k, decode(v[1]));
-    else clash.push([k, '<NO ' + which + ' ATTR>', f]);
+    for (const a of tag.matchAll(/data-i18n-(title|placeholder)="([\w.\-]+)"/g)) {
+      const which = a[1], k = a[2];
+      const v = tag.match(new RegExp('(?<!data-i18n-)' + which + '="([^"]*)"'));
+      if (v) put(k, decode(v[1]));
+      else clash.push([k, '<NO ' + which + ' ATTR>', f]);
+    }
   }
   // t('key','default')
   // t2 is an alias for t, used where a local `t` shadows the helper. It
@@ -104,6 +109,17 @@ Object.assign(out, {
   // bytes the same name.
   'unit.MiB': 'MiB', 'unit.GiB': 'GiB', 'unit.TiB': 'TiB',
   'unit.MBs': 'MB/s', 'unit.GBs': 'GB/s', 'unit.Mbs': 'Mb/s', 'unit.Gbs': 'Gb/s',
+  // Group-browser column headings: gbHead() renders each one through a
+  // local col(cls,key,def,sort) helper, so t() is called with a variable.
+  // The other five (group/vol/avg/act/last) are scraped only because the
+  // group DETAIL panel happens to repeat them as literals - grp.h.kind is
+  // used nowhere else, so it was invisible.
+  'grp.h.kind': 'Content',
+  // Wall section headings: KINDLBL maps a kind slug to [key, English] and
+  // kindHead() calls t(key,en). wall.cat.apps rode in on a separate literal
+  // t() call; its three siblings had no literal anywhere.
+  'wall.cat.tv': 'TV shows', 'wall.cat.movies': 'Movies',
+  'wall.cat.other': 'Other',
   // Group-browser category chips: rendered via t('grp.cat.'+c, GB_CAT_EN[c])
   'grp.cat.all': 'All', 'grp.cat.movies': 'Movies', 'grp.cat.tv': 'TV',
   'grp.cat.music': 'Music', 'grp.cat.books': 'Books', 'grp.cat.comics': 'Comics',
@@ -136,6 +152,25 @@ Object.assign(out, {
   // SABnzbd's own state words, so the *arrs read them unchanged.
   'status.Verifying': 'Verifying', 'status.Repairing': 'Repairing',
   'status.Extracting': 'Extracting', 'status.Moving': 'Moving',
+  // renderBusyChips(): header chip strip for background subsystems
+  // (stats.busy tokens from the daemon - tokens, never sentences).
+  // Own chip.* namespace: busy.* is the button busy-state family.
+  // The bare key is the one/two-word CHIP LABEL (header space is
+  // scarce); the .hint key is its tooltip sentence.
+  'chip.indexing': 'indexing',
+  'chip.enriching': 'metadata',
+  'chip.predb': 'release feed',
+  'chip.watchlist': 'watchlist',
+  'chip.moving': 'moving',
+  'chip.maintenance': 'upkeep',
+  'chip.measuring': 'measuring',
+  'chip.indexing.hint': 'indexing',
+  'chip.enriching.hint': 'fetching metadata',
+  'chip.predb.hint': 'syncing release feed',
+  'chip.watchlist.hint': 'checking watchlist',
+  'chip.moving.hint': 'moving files',
+  'chip.maintenance.hint': 'database upkeep',
+  'chip.measuring.hint': 'measuring connections',
   // tErr(): fixed daemon error strings (serve.rs), keyed by wire text
   'err.unknown nzo_id': 'unknown nzo_id',
   'err.empty password': 'empty password',
@@ -160,6 +195,10 @@ Object.assign(out, {
   'err.unknown server index': 'unknown server index',
   'err.connect timed out (12 s)': 'connect timed out (12 s)',
   'err.move failed (files in use, or target exists?)': 'move failed (files in use, or target exists?)',
+  // Not from serve.rs: api() mints this one when the request never gets
+  // an answer at all (ERR_UNREACHABLE), so it rides the same tErr() path
+  // as the wire strings.
+  'err.could not reach nzbfast': 'could not reach nzbfast',
 });
 
 // Plural families must ship BOTH English categories (base.one + base.many);

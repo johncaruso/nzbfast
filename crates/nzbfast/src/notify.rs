@@ -133,6 +133,26 @@ pub struct Target {
     /// Email only: the From address. Empty = "nzbfast@localhost".
     #[serde(default)]
     pub email_from: String,
+    /// §129 4a, `Webhook` only: HMAC key. When set, every request this
+    /// target receives carries `X-NzbFast-Signature: sha256=<hex
+    /// HMAC-SHA256 of the exact body bytes>` - the GitHub-webhook shape,
+    /// so existing verification snippets port. Write-only like `token`:
+    /// get_config says only `has_secret`, and a blank secret on save
+    /// keeps the stored one.
+    #[serde(default)]
+    pub secret: String,
+}
+
+/// §129 4a: the signature header value for `body` under `secret` -
+/// `sha256=<lowercase hex>` over the exact bytes sent. One helper for
+/// the notification webhook and the lifecycle dispatcher, so the two
+/// can never drift.
+pub fn sign(secret: &str, body: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes())
+        .expect("hmac accepts any key length");
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
 /// How one target's last delivery went, as its settings row reports it.
@@ -529,9 +549,15 @@ fn send(t: &Target, cx: &Ctx) -> Result<u16, String> {
             } else {
                 cx.render_body(&t.body)
             };
-            a.post(&url)
-                .set("Content-Type", "application/json")
-                .send_string(&body)
+            let req = a.post(&url).set("Content-Type", "application/json");
+            // §129 4a: a secret signs the notification sends too, so a
+            // receiver can verify everything from this target one way.
+            let req = if t.secret.is_empty() {
+                req
+            } else {
+                req.set("X-NzbFast-Signature", &sign(&t.secret, body.as_bytes()))
+            };
+            req.send_string(&body)
         }
         // §129 2e presets: `body` is the MESSAGE TEXT template here
         // (placeholders apply), never the raw request - the preset owns
@@ -636,21 +662,26 @@ fn send(t: &Target, cx: &Ctx) -> Result<u16, String> {
                 }
             ))
         }
-        // A transport error's Display starts with the whole request URL,
-        // path and query included. For a Discord/ntfy/Gotify webhook that
-        // path IS the secret, and this string is logged. Rebuild the
-        // message from the parts that describe the failure instead: the
-        // kind, ureq's own message, and the underlying io/DNS error, which
-        // names host:port at worst.
-        Err(ureq::Error::Transport(t)) => Err(format!(
-            "{}{}{}",
-            t.kind(),
-            t.message().map(|m| format!(": {m}")).unwrap_or_default(),
-            std::error::Error::source(&t)
-                .map(|s| format!(": {s}"))
-                .unwrap_or_default(),
-        )),
+        Err(ureq::Error::Transport(t)) => Err(transport_brief(&t)),
     }
+}
+
+/// A transport error's Display starts with the whole request URL,
+/// path and query included. For a Discord/ntfy/Gotify webhook that
+/// path IS the secret, and this string is logged. Rebuild the
+/// message from the parts that describe the failure instead: the
+/// kind, ureq's own message, and the underlying io/DNS error, which
+/// names host:port at worst. Shared with the §129 4a lifecycle
+/// dispatcher, which logs through the same rule.
+pub fn transport_brief(t: &ureq::Transport) -> String {
+    format!(
+        "{}{}{}",
+        t.kind(),
+        t.message().map(|m| format!(": {m}")).unwrap_or_default(),
+        std::error::Error::source(&t)
+            .map(|s| format!(": {s}"))
+            .unwrap_or_default(),
+    )
 }
 
 /// A preset's message text: the target's own `body` template rendered
@@ -957,6 +988,7 @@ mod tests {
             events: Vec::new(),
             email_to: String::new(),
             email_from: String::new(),
+            secret: String::new(),
         }
     }
 
@@ -1295,6 +1327,30 @@ mod tests {
         let body = req.split("\r\n\r\n").nth(1).unwrap_or_default();
         let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON on the wire");
         assert_eq!(v["text"], "The Movie & Friends \"2024\" -> Completed");
+    }
+
+    /// §129 4a: a secret adds the GitHub-shaped signature header, and it
+    /// verifies against the exact body bytes that went on the wire.
+    #[test]
+    fn a_secret_signs_the_webhook_send() {
+        let (url, rx) = capture_one();
+        let mut t = target(Kind::Webhook);
+        t.url = url;
+        t.secret = "hunter2".into();
+        assert_eq!(send(&t, &cx()).unwrap(), 200);
+        let req = recv(&rx);
+        let (head, body) = req.split_once("\r\n\r\n").unwrap_or_default();
+        let sig = head
+            .lines()
+            .find_map(|l| l.strip_prefix("X-NzbFast-Signature: "))
+            .expect("signature header present");
+        assert_eq!(sig, sign("hunter2", body.as_bytes()));
+        // A known-answer pin so the scheme cannot silently change:
+        // HMAC-SHA256("key", "body") in the sha256=<hex> dressing.
+        assert_eq!(
+            sign("key", b"body"),
+            "sha256=515aae133b435d4000956731f68ae5cf5eb85d4f0dc6a546d2bfcd3595ec1ae1"
+        );
     }
 
     #[test]

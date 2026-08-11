@@ -628,6 +628,17 @@ pub(super) fn engage(d: &Arc<Daemon>, ev: &Evidence, path: &Path, probe: &Probe)
     // min-free guard's message is about SPACE; this one is about speed,
     // and a target routed onto "disk" wants both.
     d.notify_event("disk", &msg);
+    // §129 4a: on the schema this speed pause is its own kind -
+    // storage.slow, not disk.low - because a machine consumer must not
+    // have to parse the message to tell space from speed.
+    d.life_emit(
+        "storage.slow",
+        json!({
+            "message": msg,
+            "path": path.to_string_lossy(),
+            "probe_ms": *ms,
+        }),
+    );
     d.note_event("disk", msg);
     // Deliberately NOT persisted: `persist_pause` writes `paused` into
     // settings.json so a user's pause survives a restart, and a machine

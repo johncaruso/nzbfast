@@ -785,7 +785,61 @@ by time of day.</p>
 <h3>Scripts</h3>
 <p>A post-processing script receives SABnzbd's positional arguments and
 <code>SAB_*</code> environment variables: the large ecosystem of SAB scripts runs
-as-is.</p>
+as-is. NZBGet's dialect is provided beside it - <code>NZBPP_*</code> variables
+(<code>DIRECTORY</code>, <code>NZBNAME</code>, <code>CATEGORY</code>,
+<code>TOTALSTATUS</code>, <code>PARSTATUS</code>, <code>UNPACKSTATUS</code>,
+<code>FINALDIR</code>) and the 93/94/95 exit codes - so an NZBGet extension
+script's core logic runs too. The mapping is honest rather than an emulation:
+repair and unpack happen inside the one-pass download, so a clean completion
+reports <code>PARSTATUS=0</code> and a repaired one <code>PARSTATUS=2</code>.
+Per-script option forms (<code>NZBPO_*</code>) are not provided.
+A script may leave a helper running in the background when it exits and
+nzbfast will not kill it, but nzbfast does stop reading the script's output
+the moment the script itself finishes: give a backgrounded helper its own
+output redirection, or it will be stopped the first time it tries to print.</p>
+<h3>Pre-queue script</h3>
+<p>A second hook runs <em>before</em> a download enters the queue
+(Settings → Folders → Pre-queue script), with SABnzbd's pre-queue contract:
+arguments <code>name, pp, category, script, priority, size, group</code> plus the
+<code>SAB_*</code> environment. Its first line of output accepts (<code>1</code>)
+or rejects (<code>0</code>) the download; lines 2-7 can rename it, set
+<code>pp</code>, change the category, pick a script, or change the priority
+(blank lines keep the default). A rejected download goes to history as Failed
+with the reason, and Retry from history brings it back without asking the
+script again. The hook can never lose a download: if the script is missing,
+crashes, exceeds its time budget, or prints something that is not a verdict,
+the add proceeds untouched and the log says why.</p>
+<h3>Lifecycle events and signed webhooks</h3>
+<p>Every job milestone is a versioned event: <code>job.added</code>,
+<code>job.started</code>, <code>job.finishing</code>, <code>job.repaired</code>,
+<code>job.completed</code>, <code>job.failed</code>, plus
+<code>queue.idle</code>, <code>giveup.tripped</code>, <code>disk.low</code>,
+<code>storage.slow</code> and <code>quota.reached</code>. Each carries
+<code>schema_version</code> (currently 1; new keys may appear without a bump -
+ignore what you do not know), a monotonic <code>seq</code>, and an
+<code>at</code> timestamp in milliseconds.</p>
+<p>To receive them, add a <b>webhook</b> notification target
+(Settings → Automation) and list the event kinds it should get in its
+<i>events</i> field - exact kinds, or a prefix like <code>job.*</code>. The
+target then receives one POST per event: the event JSON as the body plus a
+<code>delivery</code> id (<code>&lt;boot&gt;-&lt;seq&gt;</code>, the handle to
+de-duplicate on), <code>X-NzbFast-Event</code> and
+<code>X-NzbFast-Delivery</code> headers, and - when the target has a signing
+secret - <code>X-NzbFast-Signature: sha256=&lt;hex&gt;</code>, an HMAC-SHA256
+of the exact body bytes under your secret (the same shape GitHub webhooks use).
+Verify in Python:</p>
+<pre><code>expected = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
+ok = hmac.compare_digest(expected, request.headers["X-NzbFast-Signature"])</code></pre>
+<p>Delivery is at-least-once: a target that cannot be reached is retried after
+10&nbsp;s, 60&nbsp;s and 5&nbsp;min, then dropped with the failure shown on the
+target's settings row. An HTTP error answer (404, 401...) is not retried - fix
+the receiver and use Test. Each target has its own delivery lane, so one that
+is slow or unreachable never holds up another; within a lane, deliveries keep
+the order the events happened in, and if one is dropped the sequence numbers
+show the gap. The classic event words
+(<code>completed</code>, <code>failed</code>, <code>repaired</code>,
+<code>disk</code>, <code>quota</code>) keep their human-notification meaning on
+the same target.</p>
 
 <h2 id="arr">11 · Sonarr, Radarr &amp; friends</h2>
 <p>nzbfast speaks the SABnzbd API natively, so every *arr works out of the box,

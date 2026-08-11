@@ -88,6 +88,25 @@ async fn gzip_with_every_header_flag_decodes_and_checks_the_trailer() {
 }
 
 #[tokio::test]
+async fn an_empty_overview_with_an_instream_terminator_is_valid() {
+    // A range whose articles all expired answers 224 with a body that
+    // is JUST the dot line. Compressed in-stream that decodes to
+    // b".\r\n" - no preceding newline, so the suffix checks alone
+    // rejected it and the connection was marked desynced.
+    for terminator in [&b".\r\n"[..], &b".\n"[..]] {
+        let wire = gzip_wire(terminator, terminator.len() as u32);
+        let out = read_compressed(&wire).await.expect("empty overview");
+        assert_eq!(out, b"", "terminator {terminator:?} must strip to empty");
+    }
+    // Same shape under zlib framing.
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(b".\r\n").unwrap();
+    let wire = enc.finish().unwrap();
+    let out = read_compressed(&wire).await.expect("empty zlib overview");
+    assert_eq!(out, b"");
+}
+
+#[tokio::test]
 async fn gzip_trailer_length_mismatch_is_an_error_not_a_short_read() {
     let payload = b"21\tdelta\r\n.\r\n";
     let wire = gzip_wire(payload, payload.len() as u32 + 7);

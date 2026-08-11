@@ -572,14 +572,21 @@ fn m_notify_test(
                     // blank one. Borrow the stored token for
                     // the matching target, exactly as
                     // server_test borrows a saved password.
-                    if t.token.is_empty()
+                    if (t.token.is_empty() || t.secret.is_empty())
                         && let Some(prev) = d
                             .notify_targets
                             .lock_ok()
                             .iter()
                             .find(|p| p.kind == t.kind && p.url == t.url && p.name == t.name)
                     {
-                        t.token = prev.token.clone();
+                        if t.token.is_empty() {
+                            t.token = prev.token.clone();
+                        }
+                        // §129 4a: the signing secret rides the same
+                        // blank-means-keep rule as the token.
+                        if t.secret.is_empty() {
+                            t.secret = prev.secret.clone();
+                        }
                     }
                     // §G: a Test IS a delivery, so it updates the
                     // row's last-send line too. Without this a user
@@ -730,6 +737,16 @@ fn m_sysbench(
     _api_body: &mut Option<Vec<u8>>,
 ) -> Option<Value> {
     Some({
+        // Single-flight (Codex sweep 10 Aug M14): a second tab, or a
+        // manual run coinciding with the schedule, ran the workload
+        // concurrently - the runs distorted each other's numbers and
+        // doubled the compute/disk/provider traffic.
+        let Some(_running) = d.bench_begin() else {
+            return Some(json!({
+                "status": false,
+                "error": "a system benchmark is already running - wait for it to finish",
+            }));
+        };
         let now = epoch_secs();
         match measure_system(d, ctx.cfg_path, &tokio::runtime::Handle::current()) {
             Err(e) => {

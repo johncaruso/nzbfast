@@ -1042,14 +1042,22 @@ pub(super) async fn handle_missing(
         // pool to a watchdog reading only bytes and outstanding count.
         // That is the 31 Jul abort exactly, and this branch reopened it.
         shared.deferred.fetch_add(1, Ordering::Relaxed);
+        // The recheck jumps the queue (behind promoted work) instead of
+        // going to the back. At the back its verdict lands only as the
+        // drain empties - on a long download that defers a terminal
+        // Missing by the WHOLE download, and the M2c.5 speculative
+        // prefetch never sees the damage while there is still a
+        // download to overlap (the 7 Aug nightly red). Position costs
+        // nothing on correctness: this same refusal armed the fence
+        // above, and a fenced read proves alignment BEFORE any verdict
+        // is charged, so the repeat really does converge one round trip
+        // later wherever it is read.
         let mut q = shared.queue.lock().await;
+        let at = q.iter().take_while(|x| x.promoted).count().min(q.len());
         if w.promoted {
-            let at = q.iter().take_while(|x| x.promoted).count().min(q.len());
             shared.promoted_pending.fetch_add(1, Ordering::AcqRel);
-            q.insert(at, w);
-        } else {
-            q.push_back(w);
         }
+        q.insert(at, w);
         return;
     }
     // 430 is authoritative for this server AND its mirror
@@ -1408,6 +1416,128 @@ async fn session_stalled_mid_read(
     cause
 }
 
+/// What one window top-up decided.
+enum TopUp {
+    /// The window is as full as it is going to get - read responses.
+    Filled,
+    /// The write side died under us. The casualty is already requeued
+    /// and the end is already counted; the carried value is the
+    /// `SessionEnds` slot, so the caller records it and redials exactly
+    /// as it does for the read-side deaths above.
+    Redial(usize),
+}
+
+/// Fill the pipeline up to `win`, dispatching one BODY per slot.
+///
+/// Lifted out of `session_loop` whole (TODO 106) - it is the one
+/// self-contained block left in the hottest function in the repo, and
+/// the only reason it could not simply return was the failed-send
+/// path's `continue 'session`, which [`TopUp::Redial`] now carries for
+/// it. Everything the caller does after a session death - the failure
+/// counter, the armed backoff - deliberately stayed at the call site,
+/// where it is shared with the flush-failed arm.
+async fn top_up_window(
+    conn: &mut Connection,
+    cfg: &PoolConfig,
+    ctx: ServerCtx,
+    shared: &Arc<Shared>,
+    out: &mpsc::Sender<FetchOutcome>,
+    inflight: &mut VecDeque<Work>,
+    win: usize,
+    over_target: bool,
+    session_bytes: u64,
+    session_responses: u32,
+) -> TopUp {
+    while inflight.len() < win {
+        if shared.draining.load(Ordering::Acquire) {
+            break;
+        }
+        // TODO 112: over the live target - admit nothing new,
+        // so the pipeline drains toward the park above.
+        if over_target {
+            break;
+        }
+        // B3 wire-cap: over the global in-flight byte budget,
+        // stop topping up - but never below ONE request in
+        // flight, so every connection stays busy and the pool
+        // can't deadlock (the response drain below is what
+        // releases charges and reopens the cap).
+        if !inflight.is_empty() && shared.wire_over_cap(cfg.inflight_cap) {
+            shared.note_wire_cap();
+            break;
+        }
+        let Some(mut w) = next_work(shared, ctx, out, inflight.len()).await else {
+            break;
+        };
+        // B3 wire-cap: charge at dispatch, BEFORE the send can
+        // fail. Every release is a `release_wire(inflight.len())`
+        // over a worker's deque, so the only workable invariant is
+        // "one charge per item in that deque" - and the failed-send
+        // path below deliberately puts `w` into it. Charging after
+        // the send left that one item uncharged while
+        // requeue_or_fail released for it anyway: one flaky send
+        // wrapped the global counter and collapsed every worker in
+        // the pool to pipeline depth one.
+        shared.charge_wire();
+        // §129 3g: on a provider whose refusals arrive bare, the
+        // BODY goes out with an alignment fence behind it. Both
+        // are written unflushed into the same pipeline, so it
+        // costs bytes rather than a round trip, and it gives the
+        // reader something it can CHECK - which is the whole
+        // difference between this provider and an id-echoing one.
+        w.fenced = cfg.desync_fence
+            && shared.bare_refuser[ctx.idx].load(Ordering::Acquire)
+            && !shared.fence_off[ctx.idx].load(Ordering::Acquire);
+        let sent = match conn.send_body(&w.id).await {
+            Ok(()) if w.fenced => conn.send_fence().await,
+            other => other,
+        };
+        if sent.is_err() {
+            // Make the failed article the front-of-inflight casualty
+            // so requeue_or_fail sees it (it was popped, never
+            // registered in inflight). On a ZERO-response session it
+            // is charged (attempts/tried_fail) - a server that RSTs
+            // right after AUTH loops connect+AUTH forever on a
+            // single-server job otherwise. After a completed
+            // response (a body OR an authoritative 430/423) the
+            // socket death is the session's fault, not this
+            // article's, and it requeues uncharged. dup items are
+            // still dropped by requeue_or_fail.
+            inflight.push_front(w);
+            // A failed send is the peer gone under us (RST/EPIPE)
+            // - a session end like any read-side death, counted
+            // so the churn census sees write-side exits too.
+            shared.note_session_end(ctx.idx, 0);
+            if session_bytes > 0 {
+                // Flap breaker: an ESTABLISHED session (it served bytes)
+                // died - count it where it happens, not at some later
+                // redial this worker may never win (a capped provider
+                // bounces most re-entries, which hid the churn entirely).
+                shared.note_flap(ctx.idx);
+            }
+            requeue_or_fail(
+                shared,
+                out,
+                cfg,
+                ctx,
+                inflight,
+                "send failed",
+                session_responses == 0,
+            )
+            .await;
+            return TopUp::Redial(0);
+        }
+        if let Some(l) = &cfg.live {
+            l.servers[ctx.idx]
+                .articles_tried
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        shared.register_inflight(&w, ctx.idx);
+        inflight.push_back(w);
+    }
+    TopUp::Filled
+}
+
 pub(super) async fn session_loop(
     server: &ServerConfig,
     cfg: &PoolConfig,
@@ -1635,95 +1765,24 @@ pub(super) async fn session_loop(
             }
             // Top up the window - unless draining, when we admit nothing
             // new and just let the in-flight requests below complete.
-            while inflight.len() < win {
-                if shared.draining.load(Ordering::Acquire) {
-                    break;
-                }
-                // TODO 112: over the live target - admit nothing new,
-                // so the pipeline drains toward the park above.
-                if over_target {
-                    break;
-                }
-                // B3 wire-cap: over the global in-flight byte budget,
-                // stop topping up - but never below ONE request in
-                // flight, so every connection stays busy and the pool
-                // can't deadlock (the response drain below is what
-                // releases charges and reopens the cap).
-                if !inflight.is_empty() && shared.wire_over_cap(cfg.inflight_cap) {
-                    shared.note_wire_cap();
-                    break;
-                }
-                let Some(mut w) = next_work(&shared, ctx, &out, inflight.len()).await else {
-                    break;
-                };
-                // B3 wire-cap: charge at dispatch, BEFORE the send can
-                // fail. Every release is a `release_wire(inflight.len())`
-                // over a worker's deque, so the only workable invariant is
-                // "one charge per item in that deque" - and the failed-send
-                // path below deliberately puts `w` into it. Charging after
-                // the send left that one item uncharged while
-                // requeue_or_fail released for it anyway: one flaky send
-                // wrapped the global counter and collapsed every worker in
-                // the pool to pipeline depth one.
-                shared.charge_wire();
-                // §129 3g: on a provider whose refusals arrive bare, the
-                // BODY goes out with an alignment fence behind it. Both
-                // are written unflushed into the same pipeline, so it
-                // costs bytes rather than a round trip, and it gives the
-                // reader something it can CHECK - which is the whole
-                // difference between this provider and an id-echoing one.
-                w.fenced = cfg.desync_fence
-                    && shared.bare_refuser[ctx.idx].load(Ordering::Acquire)
-                    && !shared.fence_off[ctx.idx].load(Ordering::Acquire);
-                let sent = match conn.send_body(&w.id).await {
-                    Ok(()) if w.fenced => conn.send_fence().await,
-                    other => other,
-                };
-                if sent.is_err() {
-                    // Make the failed article the front-of-inflight casualty
-                    // so requeue_or_fail sees it (it was popped, never
-                    // registered in inflight). On a ZERO-response session it
-                    // is charged (attempts/tried_fail) - a server that RSTs
-                    // right after AUTH loops connect+AUTH forever on a
-                    // single-server job otherwise. After a completed
-                    // response (a body OR an authoritative 430/423) the
-                    // socket death is the session's fault, not this
-                    // article's, and it requeues uncharged. dup items are
-                    // still dropped by requeue_or_fail.
-                    inflight.push_front(w);
-                    // A failed send is the peer gone under us (RST/EPIPE)
-                    // - a session end like any read-side death, counted
-                    // so the churn census sees write-side exits too.
-                    shared.note_session_end(ctx.idx, 0);
-                    last_end = Some(0);
-                    if session_bytes > 0 {
-                        // Flap breaker: an ESTABLISHED session (it served bytes)
-                        // died - count it where it happens, not at some later
-                        // redial this worker may never win (a capped provider
-                        // bounces most re-entries, which hid the churn entirely).
-                        shared.note_flap(ctx.idx);
-                    }
-                    requeue_or_fail(
-                        &shared,
-                        &out,
-                        cfg,
-                        ctx,
-                        &mut inflight,
-                        "send failed",
-                        session_responses == 0,
-                    )
-                    .await;
-                    session_failures += 1;
-                    pending_backoff = Some(session_backoff_delay(cfg, session_failures));
-                    continue 'session;
-                }
-                if let Some(l) = &cfg.live {
-                    l.servers[ctx.idx]
-                        .articles_tried
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                shared.register_inflight(&w, ctx.idx);
-                inflight.push_back(w);
+            if let TopUp::Redial(cause) = top_up_window(
+                &mut conn,
+                cfg,
+                ctx,
+                &shared,
+                &out,
+                &mut inflight,
+                win,
+                over_target,
+                session_bytes,
+                session_responses,
+            )
+            .await
+            {
+                last_end = Some(cause);
+                session_failures += 1;
+                pending_backoff = Some(session_backoff_delay(cfg, session_failures));
+                continue 'session;
             }
             if inflight.is_empty() {
                 // THE reuse point. `inflight.is_empty()` is the whole

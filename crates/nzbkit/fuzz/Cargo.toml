@@ -11,6 +11,13 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 nzbkit = { path = ".." }
 rars = { path = "../../../vendor/rars" }
+crc32fast = "1"
+# `par2_verify_diff`'s oracle: the FileDesc verdict is an MD5, and the
+# target has to compute it here rather than ask the code under test.
+md-5 = "0.10"
+# url_authority_diff's oracle: the parser ureq dials with. Fuzz-harness
+# only - the daemon itself deliberately links no URL crate.
+url = "2"
 
 # Detach from the parent workspace: cargo-fuzz builds this crate on its own
 # (nightly + sanitizer), and it must not perturb the main workspace build.
@@ -92,6 +99,41 @@ bench = false
 [[bin]]
 name = "zip_stream"
 path = "fuzz_targets/zip_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sevenz_name_probe"
+path = "fuzz_targets/sevenz_name_probe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar_name_probe"
+path = "fuzz_targets/rar_name_probe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pesto_msgid"
+path = "fuzz_targets/pesto_msgid.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "par2_verify_diff"
+path = "fuzz_targets/par2_verify_diff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url_authority_diff"
+path = "fuzz_targets/url_authority_diff.rs"
 test = false
 doc = false
 bench = false

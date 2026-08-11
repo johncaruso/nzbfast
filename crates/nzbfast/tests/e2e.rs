@@ -11,6 +11,7 @@ mod scratch;
 // §123 chip-6 surfaces (bytes-skew and friends) - a sibling-dir child
 // so this file stays inside its size-gate baseline.
 mod e2e_chip6;
+mod e2e_repair;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -2543,13 +2544,26 @@ async fn damaged_post_repairs_into_output_without_volumes() {
 /// settle. Repair must still run - `needed == 0` is a fetch answer, not
 /// a damage verdict (gating repair on it shipped bad blocks as a
 /// "clean download" with exit 0).
+///
+/// The mock refuses in the bare form (no echoed id), so the verdict
+/// takes TWO asks since the 6 Aug soft-430 contract: the first refusal
+/// defers and requeues, the confirming repeat declares. The pad file
+/// below keeps the download running long past that second ask - in the
+/// unpadded release the whole job was about one pipeline-depth long, so
+/// the confirmation could never beat the drain and the watcher's poll
+/// found the damage only after its stop flag (the 7 Aug nightly red).
+/// The requeue jumping the queue (pool/session.rs) is what puts the
+/// confirming ask one pipeline-depth after the first, instead of at
+/// drain-end; this test is the end-to-end pin for that latency.
 #[tokio::test(flavor = "multi_thread")]
 async fn speculative_prefetch_covers_deficit_and_repair_still_runs() {
     if !have_par2() {
         eprintln!("skipping: par2 not installed");
         return;
     }
-    let (fx, inner, _vol_names) = rar_release("specpre", true);
+    let (mut fx, inner, _vol_names) = rar_release("specpre", true);
+    let pad = payload(2_400_000, 11);
+    fx.add_file("pad.bin", &pad, 60_000);
     let victim = fx
         .articles
         .keys()
@@ -2559,7 +2573,7 @@ async fn speculative_prefetch_covers_deficit_and_repair_still_runs() {
     let chaos = Chaos {
         missing: [victim].into(),
         // Slow every body so the download outlives the watcher's poll +
-        // side fetch - the Missing verdict lands in the first batch.
+        // side fetch - the deferred Missing verdict lands mid-download.
         delay_ms: 150,
         ..Default::default()
     };

@@ -2,8 +2,13 @@
 //! addfile upload, queue polling, history with final storage path - all
 //! against the real binary + mock NNTP servers.
 
+// What each credential may do - full key, add-only nzbkey, bootstrap
+// hatch (sibling dir, size gate).
+mod daemon_authkey;
 // §123 chip-6 fault x lifecycle cross product (sibling dir, size gate).
 mod daemon_chip6;
+// §129 4a pre-queue hook legs (sibling dir, size gate).
+mod daemon_hooks;
 // Passwords attached mid-download, and the prefer_external_unrar switch:
 // moved to a child module by TODO 106. Declared here, so they still run in
 // this binary against these fixtures.
@@ -292,6 +297,60 @@ fn delete_without_the_trash(cfg: &Path) {
     std::fs::write(&path, serde_json::Value::Object(saved).to_string()).unwrap();
 }
 
+/// Why the post-proc hook produced nothing, gathered at the moment of
+/// failure. `ScratchDir` removes the whole directory on unwind, so a bare
+/// "hook never ran" leaves NOTHING to post-mortem - the daemon log, the
+/// script and hook.out are all gone by the time the panic is printed, and
+/// answering it means re-running with the removal disabled.
+///
+/// The three questions, in the order they discriminate:
+///
+///  - Did the daemon reach `run_script`? It warns on every non-success -
+///    a launch failure (`failed to launch`), a non-zero exit, and the
+///    deadline kill - so the absence of any `[script]` line means the
+///    hook was never invoked at all (resolve_script said None, or the
+///    post-job hooks never fired) rather than invoked and broken. The
+///    success line is `info`, which the default level drops.
+///  - Is the script still on disk and executable? A hook the daemon
+///    cannot exec is the one failure mode that leaves the download
+///    itself, and every other assert in this test, perfectly healthy.
+///  - What, if anything, reached hook.out - absent, empty (created and
+///    truncated by the redirect, never written) or partial.
+fn hook_diag(hook: &Path, dir: &Path, port: u16) -> String {
+    let log = std::fs::read_to_string(dir.join(format!("daemon-{port}.log"))).unwrap_or_default();
+    let script: Vec<&str> = log.lines().filter(|l| l.contains("[script]")).collect();
+    let script = if script.is_empty() {
+        "(none - the daemon never logged a script line)".to_string()
+    } else {
+        script.join("\n")
+    };
+    let meta = match std::fs::metadata(hook) {
+        Ok(m) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                format!("{} bytes, mode {:o}", m.len(), m.permissions().mode())
+            }
+            #[cfg(not(unix))]
+            {
+                format!("{} bytes", m.len())
+            }
+        }
+        Err(e) => format!("MISSING: {e}"),
+    };
+    let out = match std::fs::read_to_string(dir.join("hook.out")) {
+        Ok(s) if s.is_empty() => "(exists, empty)".to_string(),
+        Ok(s) => s,
+        Err(e) => format!("(absent: {e})"),
+    };
+    let tail: Vec<&str> = log.lines().rev().take(40).collect();
+    format!(
+        "\n--- script lines ---\n{script}\n--- {} ---\n{meta}\n--- hook.out ---\n{out}\n--- daemon log tail ---\n{}",
+        hook.display(),
+        tail.into_iter().rev().collect::<Vec<_>>().join("\n"),
+    )
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sonarr_style_cycle() {
     let dir = std::env::temp_dir().join(format!("nzbfast-daemon-{}", std::process::id()));
@@ -393,6 +452,7 @@ async fn sonarr_style_cycle() {
     let port = d.port;
 
     let dir2 = dir.clone();
+    let hook2 = hook.clone();
     tokio::task::spawn_blocking(move || {
         // Bad API key rejected.
         let r = http(port, "/api?mode=version&apikey=wrong&output=json", None);
@@ -614,6 +674,17 @@ async fn sonarr_style_cycle() {
         // first assert with an empty record, never on "hook never ran".
         // `env:` is the second of the two printf lines, so seeing it means
         // the write finished.
+        //
+        // The five-second budget is DELIBERATELY left where it is. It is
+        // tighter than the completion poll above even though the hook is
+        // dispatched to `spawn_blocking` as `park` files the job into
+        // history - i.e. everything this poll waits on happens after the
+        // "Completed" just observed - so widening it is the obvious
+        // reflex when this reports "hook never ran". Don't: a margin
+        // widened without a diagnosis has buried two real product bugs
+        // in this suite already. `hook_diag` below is the alternative -
+        // make the next failure say WHY, then widen only what the answer
+        // justifies.
         let hook_out = dir2.join("hook.out");
         let mut rec = String::new();
         for _ in 0..50 {
@@ -623,7 +694,11 @@ async fn sonarr_style_cycle() {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        assert!(!rec.is_empty(), "hook never ran");
+        assert!(
+            !rec.is_empty(),
+            "hook never ran{}",
+            hook_diag(&hook2, &dir2, port)
+        );
         assert!(rec.contains("|episode|tv|0"), "{rec}"); // clean name, cat, pp=OK
         assert!(rec.contains("env:0|episode|tv"), "{rec}");
         // $1 final dir, separator-normalised: the daemon hands the script a
@@ -957,8 +1032,10 @@ async fn sab_facade_priorities_and_retry() {
             None,
         );
         assert!(r.contains("\"status\":true"), "{r}");
+        // The COUNT is `retries`; `retry` is SABnzbd's boolean "this one
+        // can be asked for again" (issue #34).
         let h = poll_history(
-            &|h: &str| h.contains("\"retry\":1") && h.contains("Failed"),
+            &|h: &str| h.contains("\"retries\":1") && h.contains("Failed"),
             "retried job to fail again",
         );
         assert!(h.contains(&bad_id), "{h}");
@@ -984,6 +1061,340 @@ async fn sab_facade_priorities_and_retry() {
             None,
         );
         assert!(!out_dir.exists(), "del_files should remove {}", out_dir.display());
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #34: the SAB facade's queue and history bodies carry the whole
+/// shape real SABnzbd sends, not just the keys our own dashboard reads.
+///
+/// The reporter's phone remote (NZB360) sat at "Connecting" for both
+/// Queue and History on v1.0.21 while `mode=addfile` - which reads
+/// neither body - worked throughout, so auth and the add route were
+/// never the problem. The precedent is SAB's own: sabnzbd/sabnzbd#872,
+/// where SAB 2.0 trimmed these same header fields, NZB360's history
+/// stopped working, and the fix was to put `version` back. That issue
+/// also carries a debug log of NZB360's actual traffic, which is the
+/// exact pair replayed at the bottom of this test.
+///
+/// Every key is checked with the TYPE SAB sends, because a missing key
+/// and a wrongly-typed one fail a strongly-typed client identically -
+/// `retry` went out as our try COUNT under the name SAB uses for a
+/// boolean, which is a parse error before it is a wrong number.
+///
+/// Field names and formats come from sabnzbd/api.py (`build_header`,
+/// `build_queue`, `_api_history_default`) and sabnzbd/database.py
+/// (`unpack_history_info`), read at the source rather than from the
+/// wiki - §105.4's own rule for this class.
+#[tokio::test(flavor = "multi_thread")]
+async fn sab_facade_carries_sabnzbds_own_queue_and_history_shape() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-sabshape-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let data = payload(200_000, 9);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("shape.bin", &data, 40_000, "sh", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    xml.push_str(&format!(
+        "  <file poster=\"x\" date=\"0\" subject=\"&quot;shape.bin&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        segs.len()
+    ));
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        use serde_json::Value;
+
+        // What SAB's own JSON says a key is. `Str` and friends are what
+        // a client's declared field type would be; `Null` is a key SAB
+        // sends as null with the feature off, and a client that reads
+        // it must still FIND it.
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        enum Ty {
+            Str,
+            Num,
+            Bool,
+            Arr,
+            Null,
+        }
+        let check = |obj: &Value, where_: &str, want: &[(&str, Ty)]| {
+            let m = obj
+                .as_object()
+                .unwrap_or_else(|| panic!("{where_} is not an object: {obj}"));
+            for (key, ty) in want {
+                let v = m
+                    .get(*key)
+                    .unwrap_or_else(|| panic!("{where_}: SAB sends `{key}` and we do not: {obj}"));
+                let ok = match ty {
+                    Ty::Str => v.is_string(),
+                    Ty::Num => v.is_number(),
+                    Ty::Bool => v.is_boolean(),
+                    Ty::Arr => v.is_array(),
+                    Ty::Null => v.is_null(),
+                };
+                assert!(ok, "{where_}: `{key}` should be {ty:?}, got {v}: {obj}");
+            }
+        };
+        let get = |q: &str| -> Value {
+            let body = http(port, &format!("/api?{q}"), None);
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}"))
+        };
+
+        // A slot to describe: pause first so the job stays in the queue
+        // long enough to be read.
+        http(port, "/api?mode=pause&output=json", None);
+        let boundary = "----shapeb";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"shape.nzb\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let r = http(
+            port,
+            "/api?mode=addfile&output=json&cat=tv",
+            Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+
+        // --- the queue body -------------------------------------------
+        let q = get("mode=queue&output=json");
+        let queue = &q["queue"];
+        check(
+            queue,
+            "queue",
+            &[
+                // build_header()
+                ("version", Ty::Str),
+                ("paused", Ty::Bool),
+                ("paused_all", Ty::Bool),
+                ("pause_int", Ty::Str),
+                ("diskspace1", Ty::Str),
+                ("diskspace2", Ty::Str),
+                ("diskspace1_norm", Ty::Str),
+                ("diskspace2_norm", Ty::Str),
+                ("diskspacetotal1", Ty::Str),
+                ("diskspacetotal2", Ty::Str),
+                ("speedlimit", Ty::Str),
+                ("speedlimit_abs", Ty::Str),
+                ("have_warnings", Ty::Str),
+                ("finishaction", Ty::Null),
+                ("quota", Ty::Str),
+                ("have_quota", Ty::Bool),
+                ("left_quota", Ty::Str),
+                ("cache_art", Ty::Str),
+                ("cache_size", Ty::Str),
+                // build_queue()
+                ("kbpersec", Ty::Str),
+                ("speed", Ty::Str),
+                ("mb", Ty::Str),
+                ("mbleft", Ty::Str),
+                ("size", Ty::Str),
+                ("sizeleft", Ty::Str),
+                ("noofslots", Ty::Num),
+                ("noofslots_total", Ty::Num),
+                ("start", Ty::Num),
+                ("limit", Ty::Num),
+                ("finish", Ty::Num),
+                ("status", Ty::Str),
+                ("timeleft", Ty::Str),
+                ("slots", Ty::Arr),
+            ],
+        );
+        assert_eq!(queue["version"], "4.5.0", "{q}");
+        let slots = queue["slots"].as_array().expect("slots array");
+        assert_eq!(slots.len(), 1, "one paused job should be listed: {q}");
+        check(
+            &slots[0],
+            "queue slot",
+            &[
+                ("index", Ty::Num),
+                ("nzo_id", Ty::Str),
+                ("unpackopts", Ty::Str),
+                ("priority", Ty::Str),
+                ("script", Ty::Str),
+                ("filename", Ty::Str),
+                ("labels", Ty::Arr),
+                ("password", Ty::Str),
+                ("cat", Ty::Str),
+                ("mb", Ty::Str),
+                ("mbleft", Ty::Str),
+                ("size", Ty::Str),
+                ("sizeleft", Ty::Str),
+                ("percentage", Ty::Str),
+                ("mbmissing", Ty::Str),
+                ("direct_unpack", Ty::Null),
+                ("status", Ty::Str),
+                ("avg_age", Ty::Str),
+                ("time_added", Ty::Num),
+                ("timeleft", Ty::Str),
+            ],
+        );
+        // The password itself never leaves the daemon (M24), so SAB's
+        // slot field is present and empty rather than absent.
+        assert_eq!(slots[0]["password"], "", "{q}");
+
+        // --- the history body -----------------------------------------
+        http(port, "/api?mode=resume&output=json", None);
+        let h = (0..150)
+            .find_map(|_| {
+                let h = get("mode=history&output=json");
+                h["history"]["slots"]
+                    .as_array()
+                    .filter(|s| s.first().is_some_and(|r| r["status"] == "Completed"))
+                    .is_some()
+                    .then_some(h)
+                    .or_else(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        None
+                    })
+            })
+            .expect("timed out waiting for the job to complete");
+        let hist = &h["history"];
+        check(
+            hist,
+            "history",
+            &[
+                ("version", Ty::Str),
+                ("total_size", Ty::Str),
+                ("month_size", Ty::Str),
+                ("week_size", Ty::Str),
+                ("day_size", Ty::Str),
+                ("slots", Ty::Arr),
+                ("ppslots", Ty::Num),
+                ("noofslots", Ty::Num),
+                ("last_history_update", Ty::Num),
+            ],
+        );
+        assert_eq!(hist["version"], "4.5.0", "{h}");
+        check(
+            &hist["slots"][0],
+            "history slot",
+            &[
+                ("completed", Ty::Num),
+                ("name", Ty::Str),
+                ("nzb_name", Ty::Str),
+                ("category", Ty::Str),
+                ("pp", Ty::Str),
+                ("script", Ty::Str),
+                ("report", Ty::Str),
+                ("url", Ty::Str),
+                ("status", Ty::Str),
+                ("nzo_id", Ty::Str),
+                ("storage", Ty::Str),
+                ("path", Ty::Str),
+                ("script_line", Ty::Str),
+                ("download_time", Ty::Num),
+                ("postproc_time", Ty::Num),
+                ("stage_log", Ty::Arr),
+                ("downloaded", Ty::Num),
+                ("completeness", Ty::Num),
+                ("fail_message", Ty::Str),
+                ("url_info", Ty::Str),
+                ("bytes", Ty::Num),
+                ("size", Ty::Str),
+                ("meta", Ty::Null),
+                ("series", Ty::Str),
+                ("duplicate_key", Ty::Str),
+                ("md5sum", Ty::Str),
+                ("password", Ty::Str),
+                ("action_line", Ty::Str),
+                ("loaded", Ty::Bool),
+                ("retry", Ty::Bool),
+                ("archive", Ty::Bool),
+                ("time_added", Ty::Num),
+                // Ours, and the reason `retry` could change type: the
+                // attempt count keeps its meaning under its own name.
+                ("retries", Ty::Num),
+            ],
+        );
+        // A Completed job cannot be retried, which is what SAB's boolean
+        // says here.
+        assert_eq!(hist["slots"][0]["retry"], false, "{h}");
+        // SAB's own suffix convention (to_units + "B"), not a bare MB.
+        let size = hist["slots"][0]["size"].as_str().unwrap_or_default();
+        assert!(
+            size.ends_with('B') && size.contains(' '),
+            "history size should be SAB-shaped: {size}"
+        );
+
+        // --- NZB360's literal traffic ---------------------------------
+        // From the SAB debug log in sabnzbd/sabnzbd#872: `output` arrives
+        // TWICE and the queue call carries `start` with no `limit`.
+        let q = get("output=json&output=json&mode=queue&start=0");
+        assert!(q["queue"]["slots"].is_array(), "{q}");
+        let h = get("output=json&output=json&limit=20&mode=history&start=0");
+        assert_eq!(h["history"]["slots"].as_array().map(Vec::len), Some(1), "{h}");
+
+        // --- casing, settled at each dialect's source -----------------
+        // SAB reads `mode` and looks it up with no normalisation
+        // (sabnzbd/api.py: `mode = kwargs.get("mode", "")`, then an exact
+        // `_api_table` lookup), so an uppercase mode is NOT the same
+        // call. §105.4 left this open rather than lowercasing on a
+        // hunch; matching SAB means leaving it case-sensitive, and this
+        // pins that so nobody "fixes" it later.
+        let up = get("mode=QUEUE&output=json");
+        assert!(
+            up.get("queue").is_none(),
+            "an uppercase mode must not be treated as the lowercase one: {up}"
+        );
+        // NZBGet is the opposite, and its source says so: every method
+        // name in XmlRpcProcessor::CreateCommand is compared with
+        // strcasecmp. So the JSON-RPC facade lowercases first, and a
+        // mixed-case method IS the call - the other half of §105.4's
+        // "the NZBGet dialect's equivalents".
+        let mixed = http(
+            port,
+            "/jsonrpc",
+            Some((
+                "application/json",
+                b"{\"method\":\"ListGroups\",\"params\":[],\"id\":7}".as_slice(),
+            )),
+        );
+        let mixed: Value = serde_json::from_str(&mixed).unwrap_or(Value::Null);
+        assert!(
+            mixed.get("result").is_some(),
+            "NZBGet matches methods case-insensitively (strcasecmp): {mixed}"
+        );
     })
     .await
     .unwrap();
@@ -2040,594 +2451,6 @@ async fn nzbget_jsonrpc_facade_cycle() {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         panic!("download never completed into history");
-    })
-    .await
-    .unwrap();
-    let _ = std::fs::remove_dir_all(&dir2);
-}
-
-/// Revealing and rotating the API key are full-`apikey` operations. The
-/// add-only `nzbkey` exists so a script can submit NZBs WITHOUT gaining
-/// control; handing it the API key would promote it to exactly that in
-/// one request, so these two modes must never join the add_only
-/// allowlist. Also pins that a rotated key actually persists - it lives
-/// in settings.json, written by the caller of apply_setting, and a miss
-/// there would hand the user a key that stops working at the next
-/// restart after they had already pasted it into Sonarr.
-#[tokio::test(flavor = "multi_thread")]
-async fn apikey_reveal_and_rotate_need_the_api_key() {
-    let dir = std::env::temp_dir().join(format!("nzbfast-keyui-{}", std::process::id()));
-    let _scratch = scratch::ScratchDir::attach(&dir);
-    let cfg = dir.join("config.json");
-    std::fs::write(
-        &cfg,
-        format!(
-            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
-            free_port()
-        ),
-    )
-    .unwrap();
-    let d = serve(&dir, |port| {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
-        c.env("NZBFAST_NO_ENRICH", "1")
-            .arg("--config")
-            .arg(&cfg)
-            .arg("serve")
-            .arg("--bind")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--apikey")
-            .arg("fullkey")
-            .arg("--nzbkey")
-            .arg("addkey")
-            .arg("--out")
-            .arg(dir.join("complete"));
-        c
-    })
-    .await;
-    let port = d.port;
-
-    let dir2 = dir.clone();
-    tokio::task::spawn_blocking(move || {
-        // The add-only key gets nothing from either mode. A rotation is
-        // POST-only (`credential_mutation_allowed`), so it is asked the
-        // way the dashboard asks it - the point here is the KEY tier,
-        // not the method.
-        let body = |mode: &str| (mode == "apikey_new").then_some(("application/json", &b""[..]));
-        for mode in ["apikey_show", "apikey_new"] {
-            let r = http(
-                port,
-                &format!("/api?mode={mode}&apikey=addkey&output=json"),
-                body(mode),
-            );
-            assert!(
-                r.contains("\"status\":false"),
-                "{mode} answered the add-only key: {r}"
-            );
-            assert!(
-                !r.contains("fullkey"),
-                "{mode} LEAKED the api key to the add-only key: {r}"
-            );
-            // And no key at all is refused too.
-            let r = http(port, &format!("/api?mode={mode}&output=json"), body(mode));
-            assert!(
-                r.contains("\"status\":false"),
-                "{mode} answered an unauthenticated caller: {r}"
-            );
-            assert!(
-                !r.contains("fullkey"),
-                "{mode} LEAKED the api key unauthenticated: {r}"
-            );
-        }
-
-        // The real key can read it.
-        let r = http(
-            port,
-            "/api?mode=apikey_show&apikey=fullkey&output=json",
-            None,
-        );
-        assert!(
-            r.contains("\"apikey\":\"fullkey\""),
-            "reveal did not return the key: {r}"
-        );
-
-        // Rotate, then prove the OLD key is dead, the NEW one works, and
-        // the new one reached settings.json rather than only memory.
-        // A rotation must not be reachable by NAVIGATION: a keyless
-        // install could otherwise be locked out by any page the user
-        // visits, with a key nobody can read.
-        let r = http(
-            port,
-            "/api?mode=apikey_new&apikey=fullkey&output=json",
-            None,
-        );
-        assert!(
-            r.contains("\"status\":false") && !r.contains("\"apikey\":\""),
-            "apikey_new minted a key on a GET: {r}"
-        );
-        let r = http(
-            port,
-            "/api?mode=apikey_new&apikey=fullkey&output=json",
-            Some(("application/json", b"")),
-        );
-        let new = r
-            .split("\"apikey\":\"")
-            .nth(1)
-            .and_then(|s| s.split('"').next())
-            .expect("no key in rotate response")
-            .to_string();
-        assert_ne!(new, "fullkey", "rotate returned the same key: {r}");
-
-        let r = http(port, "/api?mode=version&apikey=fullkey&output=json", None);
-        assert!(
-            r.contains("\"status\":false"),
-            "the old key still works after a rotate: {r}"
-        );
-        let r = http(
-            port,
-            &format!("/api?mode=version&apikey={new}&output=json"),
-            None,
-        );
-        assert!(r.contains("\"nzbfast\""), "the new key does not work: {r}");
-
-        let saved = std::fs::read_to_string(dir2.join("settings.json")).unwrap_or_default();
-        assert!(
-            saved.contains(&new),
-            "rotated key never reached settings.json, so it dies on restart: {saved}"
-        );
-    })
-    .await
-    .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Codex sweep 2, 3 Aug H1 and M1: the /api body contract.
-///
-/// H1 - the previous sweep moved the credential snapshot to AFTER the
-/// body read so a caller could not be authorized on key A, stall the
-/// body, and complete a destructive write once the owner rotated to B.
-/// But the pre-read only fired for three RECOGNIZED content types, and a
-/// handler whose body had not been pre-read fell back to reading the
-/// socket itself - after dispatch, which is after the authorization
-/// decision. So the whole fix could be skipped by omitting
-/// `Content-Type`, or by spelling it `Application/JSON` (media types are
-/// case-insensitive; the classifier was not).
-///
-/// M1 - with the pre-read now covering everything, the handlers' own
-/// caps live in a branch that can no longer run, so the gateway must
-/// apply the endpoint's real limit or nothing does.
-#[tokio::test(flavor = "multi_thread")]
-async fn every_api_post_body_is_read_before_the_key_decision() {
-    let dir = std::env::temp_dir().join(format!("nzbfast-apibody-{}", std::process::id()));
-    let _scratch = scratch::ScratchDir::attach(&dir);
-    let cfg = dir.join("config.json");
-    std::fs::write(
-        &cfg,
-        format!(
-            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
-            free_port()
-        ),
-    )
-    .unwrap();
-    let d = serve(&dir, |port| {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
-        c.env("NZBFAST_NO_ENRICH", "1")
-            .arg("--config")
-            .arg(&cfg)
-            .arg("serve")
-            .arg("--bind")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--apikey")
-            .arg("fullkey")
-            .arg("--out")
-            .arg(dir.join("complete"));
-        c
-    })
-    .await;
-    let port = d.port;
-
-    tokio::task::spawn_blocking(move || {
-        // A JSON body sent with NO Content-Type at all. Before the fix
-        // this skipped the pre-read entirely; the handler then read the
-        // socket after auth, which is the whole rotation window. It has
-        // to keep WORKING - the dashboard's own fetch() sends
-        // text/plain - and it has to be read up front.
-        let body = br#"{"target":{"name":"t","kind":"webhook","url":"http://127.0.0.1:1/x","token":"SEKRIT"}}"#;
-        let r = http_once(port, "/api?mode=notify_test&apikey=fullkey&output=json", Some(("", &body[..])))
-            .expect("no answer");
-        assert!(
-            !r.contains("bad target"),
-            "an untyped JSON body must still reach the handler: {r}"
-        );
-
-        // Mixed-case spelling of the media type: standards-valid, and a
-        // second way past a case-sensitive classifier.
-        let r = http(
-            port,
-            "/api?mode=server_save&apikey=fullkey&output=json",
-            Some(("Application/JSON", br#"{"index":-1,"server":{"host":"h.example","port":119}}"#)),
-        );
-        assert!(
-            r.contains("\"status\":true"),
-            "Application/JSON must be recognized as JSON: {r}"
-        );
-
-        // A body with no key and no mode is refused - and the refusal
-        // must not depend on the handler having drained anything.
-        let r = http(
-            port,
-            "/api?mode=server_save&output=json",
-            Some(("application/json", br#"{"index":-1,"server":{"host":"x","port":119}}"#)),
-        );
-        assert!(!r.contains("\"status\":true"), "an unkeyed write succeeded: {r}");
-
-        // M1: server_save's declared limit is 1 MiB. A body past it is
-        // truncated at the gateway, so it arrives unparseable rather
-        // than being buffered whole - the old flat 256 MiB pre-read
-        // meant a nominal 1 MiB endpoint could take 256 of them.
-        let mut fat = Vec::from(&br#"{"index":-1,"server":{"host":"h2.example","port":119,"pad":""#[..]);
-        fat.resize(fat.len() + (2 << 20), b'A');
-        fat.extend_from_slice(br#""}}"#);
-        let r = http(
-            port,
-            "/api?mode=server_save&apikey=fullkey&output=json",
-            Some(("application/json", &fat)),
-        );
-        assert!(
-            !r.contains("\"status\":true"),
-            "a 2 MiB body reached a 1 MiB endpoint intact: {r}"
-        );
-
-        // ...while addfile, which legitimately carries whole NZBs, is
-        // still allowed well past that. Junk XML, so the ADD fails -
-        // what matters is that the body was not cut off at 1 MiB, which
-        // would have made it fail the same way and prove nothing. The
-        // size is echoed back through the parse error path instead:
-        // assert only that the daemon answered at all and did not
-        // refuse the request outright.
-        let mut big = Vec::from(&b"<?xml version=\"1.0\"?><nzb>"[..]);
-        big.resize(big.len() + (3 << 20), b' ');
-        big.extend_from_slice(b"</nzb>");
-        let r = http(
-            port,
-            "/api?mode=addfile&apikey=fullkey&output=json",
-            Some(("application/xml", &big)),
-        );
-        assert!(!r.is_empty(), "a 3 MiB addfile body got no answer at all: {r}");
-    })
-    .await
-    .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The add-only key's tier, from a push extension's point of view. NZB
-/// Donkey tests a connection with mode=status and fills its category
-/// dropdown from get_cats; NZB Unity tests with mode=fullstatus - so
-/// those three reads must answer the NZB key or the key looks broken in
-/// the exact tools it exists for. Everything with queue contents or
-/// control stays full-key, refusals carry HTTP 403 like SABnzbd (a 200
-/// refusal made NZB Unity's test read as success on a wrong key), and
-/// rotating the NZB key itself is a full-key act with the same
-/// no-self-promotion reasoning as apikey_show/apikey_new.
-#[tokio::test(flavor = "multi_thread")]
-async fn add_only_key_answers_extension_probes_but_nothing_more() {
-    let dir = std::env::temp_dir().join(format!("nzbfast-nzbkeytier-{}", std::process::id()));
-    let _scratch = scratch::ScratchDir::attach(&dir);
-    let cfg = dir.join("config.json");
-    std::fs::write(
-        &cfg,
-        format!(
-            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
-            free_port()
-        ),
-    )
-    .unwrap();
-    let d = serve(&dir, |port| {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
-        c.env("NZBFAST_NO_ENRICH", "1")
-            .arg("--config")
-            .arg(&cfg)
-            .arg("serve")
-            .arg("--bind")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--apikey")
-            .arg("fullkey")
-            .arg("--nzbkey")
-            .arg("addkey")
-            .arg("--out")
-            .arg(dir.join("complete"));
-        c
-    })
-    .await;
-    let port = d.port;
-
-    tokio::task::spawn_blocking(move || {
-        // The three probes the push extensions send, on the add-only key.
-        for (mode, marker) in [
-            ("status", "\"uptime\""),
-            ("fullstatus", "\"uptime\""),
-            ("get_cats", "\"categories\""),
-        ] {
-            let r = http(port, &format!("/api?mode={mode}&apikey=addkey&output=json"), None);
-            assert!(
-                r.contains(marker),
-                "{mode} refused the add-only key, so Donkey/Unity read the key as broken: {r}"
-            );
-        }
-
-        // Queue contents and control stay full-key.
-        for mode in ["queue", "history", "get_config", "pause"] {
-            let r = http(port, &format!("/api?mode={mode}&apikey=addkey&output=json"), None);
-            assert!(
-                r.contains("\"status\":false"),
-                "{mode} answered the add-only key: {r}"
-            );
-        }
-
-        // Refusals are HTTP 403 (SAB parity): a 200 refusal parses as JSON
-        // and NZB Unity's connection test then reports success on a wrong
-        // key. The keyless version probe must stay 200 - the container
-        // healthcheck curls it with -f.
-        let out = raw(
-            port,
-            b"GET /api?mode=queue&apikey=addkey&output=json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
-        );
-        let head = String::from_utf8_lossy(&out);
-        assert!(
-            head.starts_with("HTTP/1.1 403"),
-            "a refusal did not carry 403: {head}"
-        );
-        let out = raw(
-            port,
-            b"GET /api?mode=version&output=json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
-        );
-        let head = String::from_utf8_lossy(&out);
-        assert!(
-            head.starts_with("HTTP/1.1 200"),
-            "the keyless version probe lost its 200: {head}"
-        );
-
-        // The NZB key cannot rotate itself...
-        let r = http(
-            port,
-            "/api?mode=nzbkey_new&apikey=addkey&output=json",
-            Some(("application/json", b"")),
-        );
-        assert!(
-            r.contains("\"status\":false"),
-            "nzbkey_new answered the add-only key: {r}"
-        );
-        // ...the full key can, the old NZB key dies at once, and the new
-        // one holds the same tier.
-        // GET cannot mint one - see the apikey_new rotation above.
-        let r = http(port, "/api?mode=nzbkey_new&apikey=fullkey&output=json", None);
-        assert!(
-            r.contains("\"status\":false") && !r.contains("\"nzbkey\":\""),
-            "nzbkey_new minted a key on a GET: {r}"
-        );
-        let r = http(
-            port,
-            "/api?mode=nzbkey_new&apikey=fullkey&output=json",
-            Some(("application/json", b"")),
-        );
-        let new = r
-            .split("\"nzbkey\":\"")
-            .nth(1)
-            .and_then(|s| s.split('"').next())
-            .expect("no key in nzbkey_new response")
-            .to_string();
-        assert_ne!(new, "addkey", "rotate returned the same key: {r}");
-        let r = http(port, "/api?mode=status&apikey=addkey&output=json", None);
-        assert!(
-            r.contains("\"status\":false"),
-            "the old NZB key still works after a rotate: {r}"
-        );
-        let r = http(port, &format!("/api?mode=status&apikey={new}&output=json"), None);
-        assert!(r.contains("\"uptime\""), "the rotated NZB key does not work: {r}");
-        let r = http(port, &format!("/api?mode=queue&apikey={new}&output=json"), None);
-        assert!(
-            r.contains("\"status\":false"),
-            "the rotated NZB key gained full control: {r}"
-        );
-    })
-    .await
-    .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The other half of a rotation: the write that FAILS. On a full disk or a
-/// read-only settings folder the daemon is already on the new key (nothing
-/// can put the old one back) but settings.json still holds the old one, so
-/// the key dies at the next restart. The answer is `status: true` with the
-/// key AND `saved: false` - the dashboard needs the key to keep talking to
-/// this daemon, and the durability flag to say so on screen rather than in
-/// a stdout line nobody reads on a NAS.
-///
-/// Pins the producer side of the contract the dashboard now consumes. Root
-/// ignores the permission bits, so it can only run unprivileged.
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn a_rotation_that_cannot_be_persisted_says_so() {
-    use std::os::unix::fs::PermissionsExt;
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("skipped: root writes into a read-only directory anyway");
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!("nzbfast-keyro-{}", std::process::id()));
-    let _scratch = scratch::ScratchDir::attach(&dir);
-    let cfg = dir.join("config.json");
-    std::fs::write(
-        &cfg,
-        format!(
-            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
-            free_port()
-        ),
-    )
-    .unwrap();
-    let d = serve(&dir, |port| {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
-        c.env("NZBFAST_NO_ENRICH", "1")
-            .arg("--config")
-            .arg(&cfg)
-            .arg("serve")
-            .arg("--bind")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--apikey")
-            .arg("fullkey")
-            .arg("--out")
-            .arg(dir.join("complete"));
-        c
-    })
-    .await;
-    let port = d.port;
-
-    let dir2 = dir.clone();
-    let (rot, ver, before, after) = tokio::task::spawn_blocking(move || {
-        // Everything the daemon still needs lives in .spool, whose own bits
-        // are untouched; only NEW files beside the config become impossible,
-        // which is exactly settings.json's atomic temp file.
-        let before = std::fs::read_to_string(dir2.join("settings.json")).unwrap_or_default();
-        std::fs::set_permissions(&dir2, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let rot = http(
-            port,
-            "/api?mode=apikey_new&apikey=fullkey&output=json",
-            Some(("application/json", b"")),
-        );
-        let new = rot
-            .split("\"apikey\":\"")
-            .nth(1)
-            .and_then(|s| s.split('"').next())
-            .unwrap_or_default()
-            .to_string();
-        let ver = http(
-            port,
-            &format!("/api?mode=version&apikey={new}&output=json"),
-            None,
-        );
-        let after = std::fs::read_to_string(dir2.join("settings.json")).unwrap_or_default();
-        // Restore before asserting, or the dir cannot be cleaned up.
-        let _ = std::fs::set_permissions(&dir2, std::fs::Permissions::from_mode(0o755));
-        (rot, ver, before, after)
-    })
-    .await
-    .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-
-    assert!(
-        rot.contains("\"status\":true"),
-        "a live rotation reported failure: {rot}"
-    );
-    assert!(
-        rot.contains("\"saved\":false"),
-        "the un-persisted rotation claimed to be durable: {rot}"
-    );
-    assert!(
-        ver.contains("\"nzbfast\""),
-        "the daemon is not on the key it handed out: {ver}"
-    );
-    assert_eq!(
-        before, after,
-        "settings.json changed under a read-only directory"
-    );
-}
-
-/// Security regression: the add-only `nzbkey` must not gain full control
-/// through the NZBGet `/jsonrpc` facade. `append`/`version`/`status` are
-/// allowed for it; queue/rate/config mutation (editqueue GroupFinalDelete,
-/// rate, pausedownload) is full-`apikey` only. Before the fix, /jsonrpc
-/// accepted either key with no tier check and the add-only key could wipe
-/// the queue.
-#[tokio::test(flavor = "multi_thread")]
-async fn jsonrpc_add_only_key_cannot_control_queue() {
-    let dir = std::env::temp_dir().join(format!("nzbfast-jrpc-tier-{}", std::process::id()));
-    let _scratch = scratch::ScratchDir::attach(&dir);
-    let cfg = dir.join("config.json");
-    std::fs::write(
-        &cfg,
-        format!(
-            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
-            free_port()
-        ),
-    )
-    .unwrap();
-    let d = serve(&dir, |port| {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
-        c.env("NZBFAST_OPEN", "1")
-            .env("NZBFAST_NO_ENRICH", "1")
-            .arg("--config")
-            .arg(&cfg)
-            .arg("serve")
-            .arg("--bind")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--apikey")
-            .arg("fullkey")
-            .arg("--nzbkey")
-            .arg("addkey")
-            .arg("--out")
-            .arg(dir.join("complete"));
-        c
-    })
-    .await;
-    let port = d.port;
-
-    let dir2 = dir.clone();
-    tokio::task::spawn_blocking(move || {
-        fn b64(data: &[u8]) -> String {
-            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            let mut out = String::new();
-            for c in data.chunks(3) {
-                let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
-                let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-                out.push(A[(n >> 18) as usize & 63] as char);
-                out.push(A[(n >> 12) as usize & 63] as char);
-                out.push(if c.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
-                out.push(if c.len() > 2 { A[n as usize & 63] as char } else { '=' });
-            }
-            out
-        }
-        // POST /jsonrpc with HTTP Basic `x:<pw>`; return the HTTP status code.
-        let rpc = |pw: &str, method: &str, params: &str| -> u16 {
-            let cred = b64(format!("x:{pw}").as_bytes());
-            let body = format!("{{\"method\":\"{method}\",\"params\":{params},\"id\":1}}");
-            let mut request = Vec::new();
-            write!(
-                request,
-                "POST /jsonrpc HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: Basic {cred}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            request.extend_from_slice(body.as_bytes());
-            let out = String::from_utf8_lossy(&raw(port, &request)).to_string();
-            out.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0)
-        };
-
-        // Add-only key: the permitted methods work...
-        assert_eq!(rpc("addkey", "version", "[]"), 200, "add-only version allowed");
-        // ...but every control method is refused with 403.
-        assert_eq!(
-            rpc("addkey", "editqueue", "[\"GroupFinalDelete\",[1]]"),
-            403,
-            "add-only key must NOT delete the queue via /jsonrpc"
-        );
-        assert_eq!(rpc("addkey", "rate", "[100]"), 403, "add-only rate must be forbidden");
-        assert_eq!(rpc("addkey", "pausedownload", "[]"), 403, "add-only pause must be forbidden");
-        assert_eq!(rpc("addkey", "config", "[]"), 403, "add-only config must be forbidden");
-
-        // Full key: control methods are NOT blocked (not 401/403).
-        assert_ne!(rpc("fullkey", "editqueue", "[\"GroupFinalDelete\",[1]]"), 403);
-        assert_ne!(rpc("fullkey", "editqueue", "[\"GroupFinalDelete\",[1]]"), 401);
-
-        // Wrong password: rejected outright.
-        assert_eq!(rpc("bogus", "version", "[]"), 401, "wrong key rejected");
     })
     .await
     .unwrap();
@@ -4705,10 +4528,18 @@ async fn pause_suspends_active_download() {
 
         // Wait for the transfer to actually start.
         // Slot-level status only: the queue-level "status" reads
-        // "Downloading" whenever ANY slot exists. A slot object renders
-        // "status":"...","timeleft":... (alphabetical keys), so anchor
-        // on that pair.
-        let slot_downloading = |q: &str| q.contains("\"status\":\"Downloading\",\"timeleft\"");
+        // "Downloading" whenever ANY slot exists. This used to anchor on
+        // the rendered pair `"status":"Downloading","timeleft"`, which
+        // depended on nothing ever sorting between those two keys -
+        // issue #34's SAB field parity added `time_added` and broke it.
+        // Read the slot instead.
+        let slot_status = |q: &str, want: &str| {
+            serde_json::from_str::<serde_json::Value>(q)
+                .ok()
+                .and_then(|v| v["queue"]["slots"].as_array().cloned())
+                .is_some_and(|s| s.iter().any(|s| s["status"] == want))
+        };
+        let slot_downloading = |q: &str| slot_status(q, "Downloading");
         let mut started = false;
         for _ in 0..50 {
             let q = http(port, "/api?mode=queue&output=json", None);
@@ -4730,7 +4561,9 @@ async fn pause_suspends_active_download() {
         let mut fast = false;
         for _ in 0..5 {
             let q = http(port, "/api?mode=queue&output=json", None);
-            if q.contains("\"status\":\"Paused\",\"timeleft\"") {
+            // Slot state, read rather than pattern-matched on rendered
+            // key order - see `slot_downloading` above.
+            if slot_status(&q, "Paused") {
                 fast = true;
                 break;
             }
@@ -5471,7 +5304,7 @@ async fn auto_retry_fires_once_after_cooldown() {
         );
         // …then the auto retry fires after ~2 s, runs, and fails again.
         let h = poll(
-            &|h: &str| h.contains("\"retry\":1") && h.contains("Failed"),
+            &|h: &str| h.contains("\"retries\":1") && h.contains("Failed"),
             "the automatic retry to run and fail",
         );
         assert!(h.contains("Failed"), "{h}");
@@ -5494,7 +5327,7 @@ async fn auto_retry_fires_once_after_cooldown() {
         std::thread::sleep(std::time::Duration::from_secs(5));
         let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
         assert!(
-            h.contains("\"retry\":1") && !h.contains("\"retry\":2"),
+            h.contains("\"retries\":1") && !h.contains("\"retries\":2"),
             "auto-retry must fire exactly once: {h}"
         );
     })
@@ -6232,7 +6065,7 @@ async fn retry_re_homes_off_a_completed_re_adds_folder() {
         // place, or every retry of a flaky post would climb .2, .3, .4.
         let r = http(port, &format!("/api?mode=retry&value={a_id}&output=json"), None);
         assert!(r.contains("\"status\":true"), "{r}");
-        let s = slot(&a_id, &|s| failed(s) && s["retry"] == 1, "the retried failure");
+        let s = slot(&a_id, &|s| failed(s) && s["retries"] == 1, "the retried failure");
         assert_eq!(folder(&s), "alpha", "an ordinary failed retry must reuse its own folder: {s}");
         assert!(
             !dir2.join("complete/alpha.2").exists(),
@@ -6254,7 +6087,7 @@ async fn retry_re_homes_off_a_completed_re_adds_folder() {
         // payload, so this download must go somewhere else.
         let r = http(port, &format!("/api?mode=retry&value={a_id}&output=json"), None);
         assert!(r.contains("\"status\":true"), "{r}");
-        let s = slot(&a_id, &|s| failed(s) && s["retry"] == 2, "the second retried failure");
+        let s = slot(&a_id, &|s| failed(s) && s["retries"] == 2, "the second retried failure");
         assert_eq!(
             folder(&s),
             "alpha.2",
@@ -7313,100 +7146,6 @@ async fn an_obfuscated_post_is_named_by_its_own_container() {
             found.iter().any(|f| f.starts_with("Example Movie")),
             "payload was not filed under the discovered name: {found:?}"
         );
-    })
-    .await
-    .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Security regression: the add-only `nzbkey` must not reach arbitrary
-/// config through the first-key bootstrap hatch.
-///
-/// The hatch exists so an admin who set the NZB key first is not locked
-/// out of ever setting a full API key. It authorises `mode=config` for the
-/// add-only key when it sees `name=apikey` - but it read that name from the
-/// QUERY string while the handler prefers the POST BODY, so
-/// `?name=apikey` + `{"name":"script"}` authorised one setting and wrote a
-/// different one. `script` is executed on the job tail and `addfile` is
-/// itself add-only, so that was an add-only credential escalating to code
-/// execution. Reproduced against the published 1.0.10 image before the fix.
-#[tokio::test(flavor = "multi_thread")]
-async fn bootstrap_hatch_cannot_write_a_setting_other_than_the_apikey() {
-    let dir = std::env::temp_dir().join(format!("nzbfast-bootstrap-{}", std::process::id()));
-    let _scratch = scratch::ScratchDir::attach(&dir);
-    let cfg = dir.join("config.json");
-    std::fs::write(
-        &cfg,
-        format!(
-            "{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{},\"tls\":false}}]}}",
-            free_port()
-        ),
-    )
-    .unwrap();
-    // NZBFAST_OPEN keeps first_run_apikey from minting one, which is what
-    // puts the daemon in the exact state the hatch serves: an add-only key
-    // set, no full apikey yet.
-    let d = serve(&dir, |port| {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
-        c.env("NZBFAST_OPEN", "1")
-            .env("NZBFAST_NO_ENRICH", "1")
-            .arg("--config")
-            .arg(&cfg)
-            .arg("serve")
-            .arg("--bind")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--nzbkey")
-            .arg("addkey")
-            .arg("--out")
-            .arg(dir.join("complete"));
-        c
-    })
-    .await;
-    let port = d.port;
-
-    let cfg2 = cfg.clone();
-    tokio::task::spawn_blocking(move || {
-        // POST /api?<query> with a JSON body; return the response body.
-        let post = |query: &str, body: &str| -> String {
-            let mut request = Vec::new();
-            write!(
-                request,
-                "POST /api?{query} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            request.extend_from_slice(body.as_bytes());
-            String::from_utf8_lossy(&raw(port, &request)).to_string()
-        };
-
-        // The escalation: the query names the one authorised setting, the
-        // body names a different one.
-        let out = post(
-            "mode=config&name=apikey&apikey=addkey",
-            "{\"name\":\"script\",\"value\":\"/tmp/pwn.sh\"}",
-        );
-        assert!(
-            !out.contains("\"status\":true"),
-            "add-only key wrote a non-apikey setting through the bootstrap hatch: {out}"
-        );
-
-        // ...and it really did not land.
-        let settings = cfg2.with_file_name("settings.json");
-        let saved = std::fs::read_to_string(&settings).unwrap_or_default();
-        assert!(
-            !saved.contains("pwn.sh"),
-            "the escalated setting was persisted anyway: {saved}"
-        );
-
-        // The hatch itself must still work, or an admin who set the NZB key
-        // first is locked out of ever setting a full key.
-        let ok = post(
-            "mode=config&name=apikey&apikey=addkey",
-            "{\"name\":\"apikey\",\"value\":\"thefullkey123\"}",
-        );
-        assert!(ok.contains("\"status\":true"), "the legitimate bootstrap broke: {ok}");
     })
     .await
     .unwrap();
@@ -8540,14 +8279,27 @@ async fn the_health_probe_stands_down_while_a_download_runs() {
         // Queued, nothing is downloading, and the prober's idle window
         // opens with the second job still there to probe.
         http(port, "/api?mode=pause&output=json", None);
+        // Wait for BOTH jobs to be badged, not just the second one. The
+        // pause parks the running job back into the queue unpaused, so it
+        // is queued-and-unsampled too, and the prober takes one job per
+        // tick. Sampling the counter with work still on its list leaves
+        // its own next tick free to land inside the render window below,
+        // where it reads as a probe the rendering caused.
         for _ in 0..300 {
-            if slot(&next_id)["health"].get("bucket").is_some() {
+            if slot(&slow_id)["health"].get("bucket").is_some()
+                && slot(&next_id)["health"].get("bucket").is_some()
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         let h = slot(&next_id)["health"].clone();
         assert_eq!(h["bucket"], "green", "an intact post on a live server: {h}");
+        assert!(
+            slot(&slow_id)["health"].get("bucket").is_some(),
+            "the parked job never got badged, so the prober still has work \
+             and the window below cannot attribute a STAT to rendering"
+        );
         let after_probe = stats.load(Ordering::Relaxed);
         assert!(after_probe > before, "the idle prober never ran");
         for _ in 0..6 {

@@ -1992,6 +1992,46 @@ async fn a_bare_430_defers_the_verdict_and_says_so() {
     );
 }
 
+/// The soft-430 recheck requeues at the FRONT of the queue, not the
+/// back. At the back the confirming repeat only dispatches as the queue
+/// empties, so the terminal Missing lands at drain-end - on a long
+/// download that defers the verdict by the WHOLE download and starves
+/// the M2c.5 speculative prefetch of the trigger it polls for (the
+/// 7 Aug nightly red). The fence armed by the first bare refusal proves
+/// alignment before any verdict is charged, so the early slot costs
+/// nothing on correctness.
+#[tokio::test]
+async fn the_bare_430_recheck_jumps_the_queue() {
+    let servers = vec![(server("s"), PoolConfig::default())];
+    let (sh, _) = Shared::new(fresh(&["<a@x>", "<b@x>"]), &servers);
+    let cfg = PoolConfig::default();
+    let ctx = ctx_for(&servers, 0);
+    let (tx, _rx) = mpsc::channel(8);
+    let dispatched = sh.queue.lock().await.pop_front().expect("the seeded work");
+    assert_eq!(dispatched.id, "<a@x>");
+    let mut inflight: VecDeque<Work> = [dispatched].into_iter().collect();
+    sh.charge_wire();
+
+    handle_missing(
+        &cfg,
+        ctx,
+        &sh,
+        &tx,
+        &mut inflight,
+        Vec::new(),
+        false,
+        &mut Default::default(),
+    )
+    .await;
+    let q = sh.queue.lock().await;
+    assert_eq!(q.len(), 2, "requeued for the recheck");
+    assert_eq!(
+        q.front().map(|w| w.id.as_str()),
+        Some("<a@x>"),
+        "the recheck must dispatch ahead of untouched work, not at drain-end"
+    );
+}
+
 /// §129 3g: the confirming repeat is a WINDOWED confirmation, not a
 /// one-time pass for the whole run. Two bare refusals only confirm each
 /// other while both were read off aligned sockets; when the session that

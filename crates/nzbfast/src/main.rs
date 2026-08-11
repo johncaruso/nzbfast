@@ -397,6 +397,32 @@ enum Command {
         #[arg(long, default_value = "index.db")]
         db: PathBuf,
     },
+    /// Posted-NZB ingestion rung: fetch the one-file `*.nzb` posts the
+    /// index already holds (uploaders drop the .nzb beside the
+    /// content), parse each, and join its payload message-ids against
+    /// the index. An imported name is only reported against a row when
+    /// MULTIPLE message-ids agree - identity by message-id only, never
+    /// time/size. Report-only until the identity claims layer lands.
+    #[cfg(feature = "indexer")]
+    NzbImport {
+        #[arg(long, default_value = "index.db")]
+        db: PathBuf,
+        /// Stop after this many objects (0 = walk them all).
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+        /// Resume cursor: only rows whose arrival ordinal
+        /// (`releases.arrival_seq`) is above this are considered.
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        /// Write the full per-object JSON report here.
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Write quorum joins as proven-name claims (provenance
+        /// nzb-import) through the identity claims layer. Default off:
+        /// measure first.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Fetch one spot's NZB payload (X-XML headers → alt.binaries.ftd
     /// segments → inflate) and write the NZB file.
     #[cfg(feature = "indexer")]
@@ -489,7 +515,12 @@ enum Command {
         /// rules}) - items passing the rules are auto-downloaded.
         #[arg(long)]
         feeds: Option<PathBuf>,
-        #[arg(long, default_value_t = 8)]
+        /// Connections per server (each server still capped by its own
+        /// configured count and by any measured auto-tune knee). 100 is
+        /// the allowance most providers sell; asking for the full
+        /// allowance and letting the tuner trim beats a low default
+        /// that quietly caps every fast server.
+        #[arg(long, default_value_t = 100)]
         connections: usize,
         #[arg(long, default_value_t = 4)]
         window: usize,
@@ -1015,6 +1046,14 @@ async fn run() -> Result<()> {
         Command::SpotSearch { query, db } => spot_search(&query, &db),
         #[cfg(feature = "indexer")]
         Command::SpotGet { msgid, nzb, db } => spot_get(&cli.config, &msgid, &nzb, &db).await,
+        #[cfg(feature = "indexer")]
+        Command::NzbImport {
+            db,
+            limit,
+            after,
+            report,
+            apply,
+        } => nzb_import(&cli.config, &db, limit, after, report.as_deref(), apply).await,
         Command::Setup => {
             if setup::run(&cli.config)? {
                 Ok(())

@@ -178,9 +178,12 @@ fn spawn_lane(
             let permit = permits.clone().acquire_owned().await;
             let d2 = d.clone();
             let j2 = job.clone();
-            let requeue = tokio::task::spawn_blocking(move || d2.mover_process(&j2))
-                .await
-                .unwrap_or(false);
+            let requeue = tokio::task::spawn_blocking(move || {
+                let _busy = d2.busy.hold("moving");
+                d2.mover_process(&j2)
+            })
+            .await
+            .unwrap_or(false);
             drop(permit);
             if requeue {
                 // Another actor holds this job's files (a recategorize
@@ -308,3 +311,449 @@ pub(super) fn mover_pacer(d: &Daemon) -> impl Fn(u64) + Send + Sync + '_ {
 
 #[cfg(test)]
 mod lane_tests;
+
+/// The `Daemon` half of the mover: where a finished job is allowed to
+/// go, what it may spend getting there, and the move itself.
+///
+/// Moved off `serve/daemon.rs` (TODO 106) to sit with the lanes that
+/// call it - `move_dest_root` in particular is the one lookup
+/// [`lane_key_for`] and [`Daemon::relocate_completed`] must agree on,
+/// and it now lives beside both. A sibling of `daemon` either way, so
+/// the moved methods keep their `pub(super)` exactly.
+impl Daemon {
+    /// The root a completed job in `cat` moves to, and whether it came
+    /// from the per-category override (`move_completed_cats`) rather
+    /// than the global completed folder. `None` = no destination is
+    /// configured for this category, which is the feature being off for
+    /// it.
+    ///
+    /// One lookup, three callers: the finalize gate
+    /// ([`Self::move_destination_configured`]), the move itself
+    /// ([`Self::relocate_completed`]) and the mover's lane key
+    /// ([`mover::lane_key_for`]). They must never disagree - a lane
+    /// keyed off a root the move does not use is a lane keyed off the
+    /// wrong device.
+    pub(super) fn move_dest_root(&self, cat: &str) -> Option<(PathBuf, bool)> {
+        // Per-category override wins, and applies even when the global
+        // destination is unset.
+        let cat_root = self
+            .move_completed_cats
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(c, _)| *c == cat)
+            .map(|(_, p)| p.clone());
+        match cat_root {
+            Some(p) => Some((p, true)),
+            None => self.move_completed.read_ok().clone().map(|p| (p, false)),
+        }
+    }
+
+    /// Is a move to a completed folder configured for this category?
+    /// The gate finalize uses to decide whether a finished job owes the
+    /// mover a visit.
+    pub(super) fn move_destination_configured(&self, cat: &str) -> bool {
+        self.move_dest_root(cat).is_some()
+    }
+
+    /// The mover's byte budget right now, in bytes/second. None = no
+    /// cap. Read per pacing decision, so a mode change or a download
+    /// starting mid-copy takes effect within one chunk.
+    ///
+    /// `wire_bps` is the caller's live measurement of what downloads
+    /// are pulling (the pacer samples the daemon's own progress
+    /// counter). Yield mode subtracts it from the line's capacity plus
+    /// a 10% margin: on most home setups downloads are receive and the
+    /// NAS copy is send, so the wire rarely contends - but CPU, disk
+    /// and the NAS itself do, and the download's own measured rate is
+    /// the one lever that tracks all of them.
+    pub(super) fn mover_budget_bps(&self, wire_bps: u64) -> Option<u64> {
+        let mode = self.move_pace.lock_ok().clone();
+        match mode.as_str() {
+            "full" => None,
+            "yield" | "" => {
+                // Idle queue: no cap. The threshold is generous so a
+                // trickling health probe does not throttle a 10 GbE
+                // copy to the floor.
+                if wire_bps < 1_000_000 {
+                    return None;
+                }
+                let line = match self.line_speed.load(Ordering::Relaxed) {
+                    0 => self.best_rate_bps.load(Ordering::Relaxed),
+                    l => l,
+                };
+                if line == 0 {
+                    // Nothing known about the line: fall back to a
+                    // fixed modest share rather than guessing zero.
+                    return Some(20_000_000);
+                }
+                Some((line.saturating_sub(wire_bps + line / 10)).max(5_000_000))
+            }
+            n => n.parse::<u64>().ok().map(|mb| mb.max(1) * 1_000_000),
+        }
+    }
+
+    /// Hand a finished job to the mover worker. Idempotent enough for
+    /// its callers: a job re-enqueued while already queued just gets
+    /// processed twice, and the second pass finds `move_pending` false
+    /// and does nothing.
+    pub(super) fn mover_enqueue(&self, job: &Arc<Mutex<Job>>) {
+        self.mover_q.lock_ok().push_back(job.clone());
+        self.mover_wake.notify_one();
+    }
+
+    /// One mover step: attempt the owed relocation for `job`. Runs on
+    /// the blocking pool (bulk I/O). Returns true when the job should
+    /// be RE-queued because another actor holds its files right now (a
+    /// recategorize mid-flight).
+    pub(super) fn mover_process(self: &Arc<Self>, job: &Arc<Mutex<Job>>) -> bool {
+        let (id, out_dir, cat) = {
+            let g = job.lock_ok();
+            if !g.move_pending || g.state != JobState::Completed || g.tombstone {
+                // Nothing owed (a delete or a second enqueue got here
+                // first). Clear the marker if it survived a tombstone,
+                // so a restart does not resurrect the move.
+                drop(g);
+                job.lock_ok().move_pending = false;
+                return false;
+            }
+            if g.finalizing {
+                // An unlock re-run owns the directory; it re-enqueues
+                // when it finishes.
+                return false;
+            }
+            (g.nzo_id.clone(), g.out_dir.clone(), g.category.clone())
+        };
+        // Same fence as recategorize and redrive: deletes and retries
+        // stand off while files are in flight.
+        if !self.moving.lock_ok().insert(id.clone()) {
+            return true; // busy - try again shortly
+        }
+        struct Fence(Arc<Daemon>, String);
+        impl Drop for Fence {
+            fn drop(&mut self) {
+                self.0.moving.lock_ok().remove(&self.1);
+            }
+        }
+        let _fence = Fence(self.clone(), id);
+        // Test-only: a move with visible width, so a test can watch the
+        // lanes overlap (and the fleet cap hold) on a machine with one
+        // volume, where every real move is an instant rename.
+        #[cfg(test)]
+        {
+            let ms = mover::TEST_MOVE_DELAY_MS.load(Ordering::Relaxed);
+            if ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
+        let (moved, split, failed) = self.relocate_completed(&out_dir, &cat, None);
+        let mut j = job.lock_ok();
+        j.move_pending = false;
+        j.move_failed = failed.unwrap_or_default();
+        j.move_split = match &split {
+            Some(src) => src.to_string_lossy().to_string(),
+            None => String::new(),
+        };
+        self.settle_move_attempt(&mut j);
+        if let Some(dest) = moved {
+            j.filed = j.tv_sort && is_season_dir(&dest);
+            j.out_dir = dest.clone();
+            drop(j);
+            // The modes go on after the payload stops moving (#20),
+            // rooted at the destination the files now live under.
+            let umask = self.out_umask.load(Ordering::Relaxed);
+            if umask <= 0o777 {
+                let root = self
+                    .move_dest_root(&cat)
+                    .map(|(r, _)| r)
+                    .unwrap_or_else(|| self.out_root.read_ok().clone());
+                crate::smart::apply_out_umask(&dest, Some(&root), umask);
+            }
+        } else {
+            drop(j);
+        }
+        // The record it just rewrote is a HISTORY record (movers run
+        // post-park) - its store line has to follow the bytes.
+        self.history_upsert_if_present(job);
+        self.save_queue();
+        false
+    }
+
+    /// Post-download synthesised naming (films): if the main video is
+    /// STILL nameless after every pass above, read its container facts
+    /// and ask a film catalogue what it is.
+    ///
+    /// Returns the note to record on the job - what the file said about
+    /// itself and what the catalogues offered - which is written whether
+    /// or not the rename happened. That is the point: the common outcome
+    /// is a decline, and a decline that tells the user "108 min, h264,
+    /// audio en, and here are the eight films it could be" is worth far
+    /// more than a silent one.
+    ///
+    /// Empty string means the ladder did not run at all (toggle off, or
+    /// nothing nameless to rename), which is not worth a note.
+    pub(super) fn identify_video(
+        &self,
+        out_dir: &std::path::Path,
+        job: &FinalizeJob<'_>,
+    ) -> String {
+        if !self.rename_identify.load(Ordering::Relaxed) {
+            return String::new();
+        }
+        // Cheapest question first: is there anything to fix? A payload
+        // whose video already carries a human's name is left alone, and
+        // costs no disk read and no request.
+        let Some(video) = crate::smart::nameless_video(out_dir) else {
+            return String::new();
+        };
+        let Some(facts) = nzbkit::media::probe(&video) else {
+            return String::new();
+        };
+        let tmdb = self.tmdb_key();
+        let outcome = crate::identify::identify(&facts, job.post_year, tmdb.as_deref());
+        let line = outcome.log_line();
+        match outcome.accepted_name() {
+            Some(title) => {
+                // The gate accepted, so the name has been earned by
+                // evidence rather than by grammar - which is why this
+                // takes the bare apply path rather than
+                // `rename_obfuscated_video`'s release-name one.
+                if crate::smart::rename_nameless_video(out_dir, &title) {
+                    info!(target: "identify", "{} -> {title}", video.display());
+                } else {
+                    info!(target: "identify", "{line} (but the rename could not be applied)");
+                }
+            }
+            None => info!(target: "identify", "{}: {line}", video.display()),
+        }
+        let mut note = line;
+        for c in &outcome.shortlist {
+            note.push('\n');
+            note.push_str(c);
+        }
+        note
+    }
+
+    /// The user's TMDB key, when they configured one. Read per call
+    /// rather than cached: it is a config-file value the user may add at
+    /// any time, and this is not a hot path (once per obfuscated job).
+    pub(super) fn tmdb_key(&self) -> Option<String> {
+        nzbkit::config::Config::load(&self.cfg_path)
+            .ok()?
+            .tmdb_key
+            .filter(|k| !k.is_empty())
+    }
+
+    /// Why a move destination could not be reached, when the OS error
+    /// on its own reads as something it is not.
+    ///
+    /// `create_dir_all` reports the failure of the deepest component it
+    /// could not create. On macOS an absent network volume makes that
+    /// component a child of `/Volumes`, which is owned by root - so the
+    /// mkdir is refused for want of PERMISSION and the daemon logs
+    /// "Permission denied (os error 13)" for a destination whose real
+    /// problem is that nothing is mounted there. That message sent one
+    /// investigation after a TCC grant that was never involved (8 Aug
+    /// 2026); the filesystem could have said so in one line, so now it
+    /// does.
+    ///
+    /// Only speaks when a component ABOVE the job's own folder is
+    /// missing. The leaf being absent is the ordinary case - the mover
+    /// creates it - and saying so on every failure would be noise.
+    pub(super) fn unreachable_dest_hint(dest: &std::path::Path) -> Option<String> {
+        // `ancestors` walks leaf-first, so the last one that does not
+        // exist is the SHALLOWEST missing component: the thing whose
+        // absence explains all the others.
+        let mut missing: Option<&std::path::Path> = None;
+        for a in dest.ancestors() {
+            if a.exists() {
+                break;
+            }
+            missing = Some(a);
+        }
+        let missing = missing.filter(|m| *m != dest)?;
+        // A mount point is a child of the platform's volume root, and
+        // that is the mounted-or-not question rather than an ordinary
+        // absent folder.
+        let at_volume_root = missing.parent().and_then(|p| p.to_str()).is_some_and(|p| {
+            matches!(p, "/Volumes" | "/media" | "/mnt") || p.eq_ignore_ascii_case("/net")
+        });
+        Some(if at_volume_root {
+            format!(
+                " - {} does not exist, so that volume is probably not mounted \
+                 (its parent belongs to root, which is why an absent volume \
+                 reports as a permission error)",
+                missing.display()
+            )
+        } else {
+            format!(" - {} does not exist", missing.display())
+        })
+    }
+
+    /// M33: relocate a finished job to the `move_completed` destination
+    /// (a NAS share etc.), keeping the category subfolder and whatever
+    /// renaming/Season-filing just produced. Returns the job's final
+    /// directory when it changed.
+    ///
+    /// A failed move is not one outcome but two, and they need opposite
+    /// answers. `move_tree` stages the cross-device case, so a NAS that
+    /// fills or drops leaves the payload whole where it was; but the
+    /// same-filesystem merge moves entry by entry, so a failure there can
+    /// leave the job split across both directories. We do not guess which
+    /// happened - we count the source before and after. Split reports the
+    /// destination, because those bytes exist nowhere else and the
+    /// alternative is a job record, a dashboard link and a history storage
+    /// path all pointing at a directory the files have left.
+    ///
+    /// Returns (the job's final directory when it changed, the SOURCE
+    /// directory that still holds part of the payload, why nothing
+    /// moved). The second is `Some` only for the split case - UX §18:
+    /// the split was logged and then thrown away, so history painted the
+    /// job green and named exactly one of the two folders it was now in.
+    /// The third is `Some` only for the nothing-moved failure, and it
+    /// exists for the same reason: the error was logged and then thrown
+    /// away, so a completed job whose files never left the download
+    /// folder looked exactly like one whose files did (7 Aug 2026 -
+    /// five of them, for hours). It feeds [`Job::move_failed`], and
+    /// with a destination configured this function now never declines
+    /// silently: every outcome is a log line, including "already
+    /// there".
+    pub(super) fn relocate_completed(
+        &self,
+        out_dir: &std::path::Path,
+        cat: &str,
+        renamed: Option<PathBuf>,
+    ) -> (Option<PathBuf>, Option<PathBuf>, Option<String>) {
+        // A per-category override IS that category's root, so the
+        // category component is not repeated inside it - which is what
+        // `from_cat` is for below.
+        let Some((root, from_cat)) = self.move_dest_root(cat) else {
+            // The one legitimately silent decline: the feature is off.
+            return (renamed, None, None);
+        };
+        let cur = renamed.clone().unwrap_or_else(|| out_dir.to_path_buf());
+        // Mirror the layout under the destination: the path relative to
+        // the download root already carries category/Show/Season NN. If
+        // the job predates a live out_dir swap, fall back to
+        // category + folder name.
+        let mut rel = cur
+            .strip_prefix(self.out_dir())
+            .map(|r| r.to_path_buf())
+            .unwrap_or_else(|_| {
+                let base = PathBuf::from(cur.file_name().unwrap_or_default());
+                if cat.is_empty() {
+                    base
+                } else {
+                    PathBuf::from(cat).join(base)
+                }
+            });
+        if from_cat
+            && !cat.is_empty()
+            && let Ok(r) = rel.strip_prefix(cat)
+        {
+            rel = r.to_path_buf();
+        }
+        let dest = root.join(&rel);
+        // Byte equality is not path identity. A destination that ALIASES
+        // the job's current folder - a case variant on APFS or NTFS, a
+        // symlinked parent, a trailing-dot or "." component - compared
+        // unequal here, so move_tree ran with dst == src. Its merge path
+        // then walked the directory finding every target "occupied" by
+        // the source file itself, and reserve_free_name renamed each real
+        // file to "Episode (2).mkv". For a TV-filed job `cur` is the
+        // SHARED season folder, so the user's already-filed siblings were
+        // mangled too, and every later completion compounded it
+        // ("Episode (2) (2).mkv"). Nothing is destroyed, but a whole
+        // season loses its filenames and its subtitle stem pairings.
+        //
+        // canonicalize resolves case, symlinks and oddities; it only
+        // works on paths that exist, so fall back to the byte compare
+        // when either side does not yet.
+        let same_place = dest == cur
+            || match (dest.canonicalize(), cur.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            };
+        if same_place {
+            // Not silent: with a destination configured, "no move
+            // happened" and "the move was not owed" have to be
+            // distinguishable from the outside. This is the line that
+            // was missing while five finished jobs sat in the download
+            // folder with nothing anywhere saying why.
+            info!(
+                target: "move",
+                "{} is already inside the completed folder - nothing to move",
+                cur.display()
+            );
+            return (renamed, None, None);
+        }
+        // One dirent walk of the job's own folder, so a failure can be
+        // told apart: nothing moved (the job is still where it was) or
+        // some of it did (the job is split, and `cur` is no longer the
+        // truth). Counting the DESTINATION instead would not answer it -
+        // it merges with what is already there, so a Season folder on a
+        // NAS looks non-empty whether our files reached it or not.
+        let before = file_count(&cur);
+        // Paced: the mover must never slow a live download (mode
+        // "yield", the default), and the pacer reads the mode live so
+        // a settings change lands within one chunk. The bucket behind
+        // it is the daemon's, shared by every lane copying right now.
+        let pace = mover::mover_pacer(self);
+        match crate::smart::move_tree_paced(&cur, &dest, Some(&pace)) {
+            Ok(()) => {
+                info!(target: "move", "completed → {}", dest.display());
+                (Some(dest), None, None)
+            }
+            Err(e) => {
+                // NOT the flat "leaving files in place" this used to say.
+                // The staged cross-device path usually does leave the
+                // payload whole, but the same-filesystem merge can stop
+                // half way through, and that message sent the user looking
+                // in exactly one of the two directories the job was now in.
+                // Say which case this was rather than assuming either.
+                let moved_some = file_count(&cur) < before;
+                // Composed once and carried into BOTH the log line and
+                // the job record: the record outlives the ring, and it
+                // is the one the dashboard shows.
+                let hint = Self::unreachable_dest_hint(&dest).unwrap_or_default();
+                error!(
+                    target: "move",
+                    "{} → {}: {e}{hint}\n\
+                     [move] {}",
+                    cur.display(),
+                    dest.display(),
+                    if moved_some {
+                        format!(
+                            "the payload is now SPLIT - some files moved before this failed. \
+                             Check both {} and {} before deleting either.",
+                            cur.display(),
+                            dest.display()
+                        )
+                    } else {
+                        format!("nothing moved - the download is still at {}", cur.display())
+                    }
+                );
+                // Report where the payload now is. The files that moved
+                // exist nowhere else, so keeping the old directory on the
+                // job record would send the dashboard, a later delete and
+                // the *arr import at a folder they have left.
+                // The source travels back beside it so the record can
+                // say the payload is in TWO places - the log line above
+                // is the only other witness, and it rolls out of the ring.
+                if moved_some {
+                    (Some(dest), Some(cur), None)
+                } else {
+                    // Destination + error, composed here because only
+                    // this moment has both. It becomes Job::move_failed:
+                    // the amber row, the drawer line and the auto-retry
+                    // all hang off it.
+                    (
+                        renamed,
+                        None,
+                        Some(format!("{}: {e}{hint}", dest.display())),
+                    )
+                }
+            }
+        }
+    }
+}

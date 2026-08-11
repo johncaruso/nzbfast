@@ -165,6 +165,19 @@ fn quarantine_rejected(
         n += 1;
         dest = qdir.join(format!("{} ({n}).nzb", name.trim_end_matches(".nzb")));
     }
+    if dest.exists() {
+        // The counter ran out with every candidate taken. Falling
+        // through renamed ONTO " (1000)" - POSIX replaces that
+        // incumbent (a different bad file the user has not seen),
+        // Windows errors and leaves this one re-scanned forever.
+        // Uniquify by clock instead; nanoseconds cannot collide with
+        // the counter names or realistically with each other.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        dest = qdir.join(format!("{} ({nanos}).nzb", name.trim_end_matches(".nzb")));
+    }
     std::fs::rename(p, &dest)?;
     // Best-effort: the move is the point; the note is a courtesy for
     // whoever opens the folder without the dashboard.
@@ -520,9 +533,9 @@ pub(in crate::serve) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                         wp.pop_front();
                                     }
                                 };
-                                match d
-                                    .enqueue(&bytes, &name, &category, -100, None, "watch", false)
-                                {
+                                match d.enqueue(
+                                    &bytes, &name, &category, -100, None, None, "watch", false,
+                                ) {
                                     // Delete the user's file only once the
                                     // queue record is DURABLE.
                                     //
@@ -697,4 +710,38 @@ pub(in crate::serve) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WATCH_REJECT_DIR, quarantine_rejected};
+
+    /// L4 sweep 10 Aug (Codex L3): with "bad.nzb" through "bad
+    /// (1000).nzb" all taken, the collision loop used to exit while the
+    /// chosen destination still existed - POSIX rename then REPLACED
+    /// that incumbent (a different rejected file the user had not
+    /// looked at), Windows errored and left the new file re-scanned
+    /// forever. Past the counter the name must still be unique.
+    #[test]
+    fn the_thousandth_collision_never_overwrites_an_incumbent() {
+        let root = std::env::temp_dir().join(format!("nzbfast-quar-{}", std::process::id()));
+        let qdir = root.join(WATCH_REJECT_DIR);
+        std::fs::create_dir_all(&qdir).unwrap();
+        std::fs::write(qdir.join("bad.nzb"), b"incumbent 1").unwrap();
+        for n in 2..=1000u32 {
+            std::fs::write(qdir.join(format!("bad ({n}).nzb")), b"incumbent").unwrap();
+        }
+        let src = root.join("bad.nzb");
+        std::fs::write(&src, b"the new reject").unwrap();
+        let dest = quarantine_rejected(&root, &src, "test").expect("quarantine");
+        assert!(!src.exists(), "source must have moved");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"the new reject");
+        // Every incumbent survives untouched.
+        assert_eq!(std::fs::read(qdir.join("bad.nzb")).unwrap(), b"incumbent 1");
+        assert_eq!(
+            std::fs::read(qdir.join("bad (1000).nzb")).unwrap(),
+            b"incumbent"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

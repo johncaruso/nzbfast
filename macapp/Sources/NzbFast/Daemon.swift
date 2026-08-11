@@ -75,6 +75,21 @@ final class Daemon {
     private(set) var child: Process?
     /// True when THIS app launched the engine - only then may quit stop it.
     private(set) var spawnedByUs = false
+    /// Did the last successful probe PROVE the listener's identity, via
+    /// the runtime.json token challenge? Legacy adoption - an
+    /// nzbfast-shaped reply with no runtime.json to hold it to - attaches
+    /// but stays `false`, and `keyBearingAllowed` then strips the stored
+    /// API key from every URL this wrapper builds: sending it to a
+    /// listener whose identity is only a reply shape hands any local
+    /// port-squatter daemon control and, through `mode=server_secret`,
+    /// the provider password (Codex sweep 10 Aug M10). A child we
+    /// spawned ourselves is covered by `spawnedByUs` instead.
+    private(set) var identityProven = false
+    /// May a URL we build carry the stored API key? See `identityProven`.
+    /// Unproven-and-not-ours means keyless calls: the engine refuses
+    /// them (harmless), and the dashboard prompts rather than being
+    /// handed the key.
+    private var keyBearingAllowed: Bool { identityProven || spawnedByUs }
     /// Set before any stop we initiate, so terminationHandler can tell a
     /// crash from a requested exit.
     private var deliberateStop = false
@@ -86,7 +101,65 @@ final class Daemon {
     /// Called on the main queue when the child dies on its own.
     var onUnexpectedExit: ((String) -> Void)?
 
-    var baseURL: URL { URL(string: "http://127.0.0.1:\(port)/")! }
+    /// The session every call to our own engine goes through.
+    ///
+    /// It differs from `URLSession.shared` in exactly one way: it accepts
+    /// the certificate on 127.0.0.1 (see `LoopbackTrust`). A shared
+    /// session cannot carry a delegate, which is why this exists at all.
+    static let loopback: URLSession = URLSession(
+        configuration: .ephemeral, delegate: LoopbackTrust(), delegateQueue: nil)
+
+    /// Accept whatever certificate our own engine presents on loopback.
+    ///
+    /// A TLS-enabled install points `tls_cert` at an operator-supplied
+    /// certificate: self-signed, and issued for the hostname the LAN or a
+    /// proxy reaches it by, never for 127.0.0.1. So a verifying client
+    /// refuses it - and refusing is precisely what left this wrapper
+    /// unable to manage a TLS engine at all.
+    ///
+    /// Accepting it gives nothing away, because the certificate was never
+    /// what identified this engine. The connection is to 127.0.0.1, which
+    /// nothing on the network can sit in the middle of; the threat is a
+    /// local process squatting the port, and that is what the
+    /// `runtime.json` token handshake answers - a challenge only the
+    /// engine that wrote a file this user alone can read can pass. The
+    /// API key still rides behind that proof, exactly as on plain HTTP.
+    ///
+    /// Scoped to 127.0.0.1 and to server trust: every other host and
+    /// every other kind of challenge falls through to the default
+    /// handling, so this cannot become a blanket opt-out.
+    private final class LoopbackTrust: NSObject, URLSessionDelegate {
+        func urlSession(
+            _ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+            completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+        ) {
+            let space = challenge.protectionSpace
+            guard space.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+                  space.host == "127.0.0.1",
+                  let trust = space.serverTrust
+            else {
+                completionHandler(.performDefaultHandling, nil)
+                return
+            }
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        }
+    }
+
+    /// Scheme + authority for everything this wrapper addresses at the
+    /// engine, and for the dashboard it loads into the web view.
+    ///
+    /// Saving a valid `tls_cert`/`tls_key` pair and restarting makes the
+    /// engine bind HTTPS. The wrapper used to probe `http://` regardless,
+    /// see a healthy listener answer nothing it recognised, classify its
+    /// own engine as foreign, and then be unable to open, stop, upgrade
+    /// or quit it. `runtime.json` carries the scheme (§129 2a); this is
+    /// the single place that turns it into a URL, so no call site can
+    /// drift back to a hardcoded one.
+    func origin(_ port: Int, tls: Bool) -> String {
+        "\(tls ? "https" : "http")://127.0.0.1:\(port)"
+    }
+
+    var baseURL: URL { URL(string: "\(origin(port, tls: runtimeTLS(forPort: port)))/")! }
 
     /// For QuitWatchdog's last resort ONLY: the pid of the engine WE
     /// spawned, readable from the watchdog's background thread. Nil when
@@ -172,9 +245,9 @@ final class Daemon {
 
     func apiURL(_ mode: String, _ extra: String = "") -> URL {
         var q = "mode=\(mode)"
-        if let k = apiKey { q += "&apikey=\(queryEscaped(k))" }
+        if keyBearingAllowed, let k = apiKey { q += "&apikey=\(queryEscaped(k))" }
         if !extra.isEmpty { q += "&\(extra)" }
-        return URL(string: "http://127.0.0.1:\(port)/api?\(q)")!
+        return URL(string: "\(origin(port, tls: runtimeTLS(forPort: port)))/api?\(q)")!
     }
 
     /// The dashboard URL to load, carrying the API key when we know one.
@@ -188,24 +261,47 @@ final class Daemon {
     /// after start() returns .attached/.spawned, never to a bare port
     /// number.
     var dashboardURL: URL {
-        guard let k = apiKey else { return baseURL }
-        return URL(string: "http://127.0.0.1:\(port)/?apikey=\(queryEscaped(k))") ?? baseURL
+        // Two independent gates: `keyBearingAllowed` decides whether the
+        // key may ride at all (M10), `origin` decides how to reach the
+        // listener (M1). An unproven TLS engine gets https WITHOUT a key.
+        guard keyBearingAllowed, let k = apiKey else { return baseURL }
+        let base = origin(port, tls: runtimeTLS(forPort: port))
+        return URL(string: "\(base)/?apikey=\(queryEscaped(k))") ?? baseURL
     }
 
     // MARK: probing
 
-    /// What `runtime.json` says about the engine we expect to find: the
-    /// port it bound, and the per-start secret it can prove it holds.
+    /// `runtime.json`, parsed, when it describes the engine on `port`.
     /// Written by the engine once its listener exists; absent for an
     /// engine older than the handshake, or one started elsewhere.
-    private func runtimeToken(forPort port: Int) -> String? {
+    private func runtimeFile(forPort port: Int) -> [String: Any]? {
         guard let data = try? Data(contentsOf: dataDir.appendingPathComponent("runtime.json")),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let filePort = obj["port"] as? Int, filePort == port,
+              let filePort = obj["port"] as? Int, filePort == port
+        else { return nil }
+        return obj
+    }
+
+    /// The per-start secret the engine on `port` can prove it holds.
+    private func runtimeToken(forPort port: Int) -> String? {
+        guard let obj = runtimeFile(forPort: port),
               let token = (obj["token"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !token.isEmpty
         else { return nil }
         return token
+    }
+
+    /// Does the engine on `port` speak TLS? Only `runtime.json` knows,
+    /// and only when it names THIS port - an engine from another data
+    /// dir, or one older than the key, leaves us guessing, and the probe
+    /// resolves that by trying both (see `isNzbfast`).
+    ///
+    /// The key is additive, so absent, non-boolean and false all have to
+    /// read as plain HTTP: assuming https for an engine that never bound
+    /// it would break the ordinary attach this whole change exists to
+    /// preserve.
+    func runtimeTLS(forPort port: Int) -> Bool {
+        (runtimeFile(forPort: port)?["tls"] as? Bool) ?? false
     }
 
     /// sha256("token:nonce") as lowercase hex - the answer the engine
@@ -235,6 +331,13 @@ final class Daemon {
     /// case. Only when there is no runtime.json for the port - the actual
     /// pre-handshake engine, or one from another data dir - is the reply
     /// shape alone accepted.
+    ///
+    /// The scheme comes from `runtime.json` too. When it names this port
+    /// its `tls` is authoritative - one request, as before. When it does
+    /// NOT, we no longer assume plain HTTP: a TLS listener answers a
+    /// plaintext GET with an alert and a close, which URLSession reports
+    /// as a transport error, so the wrapper called its own healthy engine
+    /// unreachable. Only that miss costs a second request.
     func isNzbfast(port: Int, timeout: TimeInterval = 1.5) async -> Bool {
         // Probe WITHOUT the key. Nothing has authenticated the far side yet, so
         // any unprivileged local process that binds this port first (6789 is
@@ -247,14 +350,33 @@ final class Daemon {
         // call, so a recorded answer cannot be replayed at us later.
         let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "")
         let q = "mode=version&hs=\(nonce)"
-        guard let url = URL(string: "http://127.0.0.1:\(port)/api?\(q)") else { return false }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = timeout
-        guard let (data, _) = try? await URLSession.shared.data(for: req),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return false }
+        let file = runtimeFile(forPort: port)
+        let ask: (Bool) async -> [String: Any]? = { tls in
+            guard let url = URL(string: "\(self.origin(port, tls: tls))/api?\(q)") else {
+                return nil
+            }
+            var req = URLRequest(url: url)
+            req.timeoutInterval = timeout
+            guard let (data, _) = try? await Daemon.loopback.data(for: req) else { return nil }
+            return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        }
+        let reply: [String: Any]?
+        if let file {
+            reply = await ask((file["tls"] as? Bool) ?? false)
+        } else if let plain = await ask(false) {
+            reply = plain
+        } else {
+            reply = await ask(true)
+        }
+        guard let obj = reply else { return false }
         guard Daemon.isNzbfastReply(obj) else { return false }
-        return Daemon.provesIdentity(obj, token: runtimeToken(forPort: port), nonce: nonce)
+        let token = runtimeToken(forPort: port)
+        guard Daemon.provesIdentity(obj, token: token, nonce: nonce) else { return false }
+        // Proven only when a token was actually challenged. The legacy
+        // arm (no runtime.json) attaches, but key-bearing URLs stay
+        // keyless for it - see `identityProven`.
+        identityProven = (token != nil)
+        return true
     }
 
     /// The identity half of the probe, split out so it is testable without
@@ -353,7 +475,7 @@ final class Daemon {
     private func remoteVersion() async -> EngineVersion? {
         var req = URLRequest(url: apiURL("version"))
         req.timeoutInterval = 3
-        guard let (data, _) = try? await URLSession.shared.data(for: req),
+        guard let (data, _) = try? await Daemon.loopback.data(for: req),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let v = obj["nzbfast"] as? String
         else { return nil }
@@ -378,7 +500,7 @@ final class Daemon {
         var req = URLRequest(url: apiURL("shutdown"))
         req.httpMethod = "POST"
         req.timeoutInterval = 5
-        _ = try? await URLSession.shared.data(for: req)
+        _ = try? await Daemon.loopback.data(for: req)
         for _ in 0..<160 { // 40 s
             if !portTaken(port) { return true }
             try? await Task.sleep(nanoseconds: 250_000_000)
@@ -638,7 +760,7 @@ final class Daemon {
             req.httpMethod = "POST"
             req.timeoutInterval = 2
             if bundleOrphanPIDs().isEmpty == false {
-                _ = try? await URLSession.shared.data(for: req)
+                _ = try? await Daemon.loopback.data(for: req)
                 for _ in 0..<50 {
                     if bundleOrphanPIDs().isEmpty { break }
                     try? await Task.sleep(nanoseconds: 100_000_000)
@@ -651,7 +773,7 @@ final class Daemon {
         var req = URLRequest(url: apiURL("shutdown"))
         req.httpMethod = "POST"
         req.timeoutInterval = 2
-        _ = try? await URLSession.shared.data(for: req)
+        _ = try? await Daemon.loopback.data(for: req)
         let deadline = Date().addingTimeInterval(5)
         while Date() < deadline {
             if !c.isRunning {
@@ -765,7 +887,7 @@ final class Daemon {
     func daemonVersion() async -> String? {
         var req = URLRequest(url: apiURL("version"))
         req.timeoutInterval = 2
-        guard let (data, _) = try? await URLSession.shared.data(for: req),
+        guard let (data, _) = try? await Daemon.loopback.data(for: req),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
         return obj["nzbfast"] as? String
@@ -788,7 +910,7 @@ final class Daemon {
         body.append(bytes)
         body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
         req.httpBody = body
-        guard let (data, _) = try? await URLSession.shared.data(for: req),
+        guard let (data, _) = try? await Daemon.loopback.data(for: req),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return "the daemon didn't answer" }
         if (obj["status"] as? Bool) == true { return nil }
@@ -807,7 +929,7 @@ final class Daemon {
     func addNzblnk(_ link: String) async -> String? {
         var req = URLRequest(url: apiURL("addnzblnk", "output=json&link=\(queryEscaped(link))"))
         req.timeoutInterval = 30
-        guard let (data, _) = try? await URLSession.shared.data(for: req),
+        guard let (data, _) = try? await Daemon.loopback.data(for: req),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return "the daemon didn't answer" }
         if (obj["status"] as? Bool) == true { return nil }

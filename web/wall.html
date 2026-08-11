@@ -303,6 +303,31 @@ select{background:var(--surface);color:var(--fg);border:1px solid var(--line);
 #dupeovl h3{margin:0 0 8px;font-size:16px}
 #dupeovl p{margin:0 0 16px;color:var(--dim);font-size:13px;line-height:1.5;overflow-wrap:anywhere}
 #dupeovl .acts{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}
+/* ---- API-key strip + modal (ported from the dashboard - see the markup
+   note there). Above everything else: nothing on a locked wall outranks
+   the way in. */
+#keynotice{display:none;padding:8px 16px;border-bottom:1px solid var(--line);
+  font-size:12px;color:var(--dim)}
+#keynotice.on{display:block}
+#keynotice button{margin-inline-start:6px}
+#keyov{position:fixed;inset:0;z-index:75;display:none;place-items:center;
+  background:color-mix(in srgb,#000 55%,transparent);backdrop-filter:blur(2px);padding:16px}
+#keyov.on{display:grid}
+#keymodal{background:var(--surface);border:1px solid var(--line);border-radius:14px;
+  width:min(460px,96vw);box-shadow:0 24px 70px rgba(0,0,0,.5);overflow:hidden}
+.khead{display:flex;align-items:center;gap:8px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.khead b{font-size:15px}
+.keybody{padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+.keybody p{margin:0;color:var(--dim);font-size:13px;line-height:1.5}
+.keyrow{display:flex;gap:6px}
+/* The key is an LTR token even in an RTL UI, like a filesystem path. */
+.keyrow>input{flex:1;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;
+  direction:ltr;padding:7px 10px;border-radius:8px;border:1px solid var(--line);
+  background:var(--surface-2);color:var(--fg);outline:none}
+.keyrow>input:focus{border-color:var(--acc)}
+.keyerr{color:var(--bad);font-size:12.5px;min-height:1.2em}
+.kfoot{display:flex;align-items:center;gap:10px;justify-content:flex-end;
+  padding:12px 16px;border-top:1px solid var(--line)}
 .sheet{max-width:880px;margin:5vh auto 6vh;background:var(--surface);border:1px solid var(--line);
   border-radius:var(--radius);overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.7)}
 .hero{position:relative;min-height:160px;background:var(--surface-2)}
@@ -457,6 +482,10 @@ button:active:not(:disabled){transform:scale(.94);filter:brightness(1.35)}
   border-radius:10px;font-size:13px;transition:transform .25s ease;z-index:30;
   box-shadow:0 8px 30px rgba(0,0,0,.55)}
 #toast.show{transform:translateX(-50%) translateY(0)}
+/* Off-screen but still in the accessibility tree: the live region and
+   any text that exists only to be spoken. Same rule as the dashboard. */
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip:rect(0,0,0,0);white-space:nowrap;border:0}
 /* ================= phone + touch layer - purely additive ================= */
 /* Tap targets ≥44px on touch screens (and in any phone-width window). */
 @media(pointer:coarse),(max-width:640px){
@@ -534,9 +563,6 @@ body.noidx #suggest,body.noidx #chips,body.noidx #affnote,
 body.noidx #scope,body.noidx #sort,body.noidx #lsort,
 body.noidx #densctl,body.noidx #zoomwrap,body.noidx #unmChip,body.noidx #hidChip,
 body.noidx #viewPop{display:none!important}
-/* ...unless spots are on: then the scope control has a second real
-   answer to offer and hiding it would take the spot list away with it. */
-body.noidx.hasspots #scope{display:inline-block!important}
 /* Nothing to search at all: built-in indexer off AND no indexer account.
    A class rather than inline styles because setView() runs after the
    boot block and sets #list's display itself - this has to outrank it,
@@ -658,6 +684,9 @@ body.nosearch #sortwrap,body.nosearch #more{display:none!important}
   <a class="pill" href="/manual#wall" target="_blank" rel="noopener" data-i18n-title="hdr.manual.title" title="User manual"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-manual"/></svg> <span data-i18n="hdr.manual">manual</span></a>
   </nav>
 </div>
+<!-- Way back in after "Not now" on the key modal - same contract as the
+     dashboard's strip. -->
+<div id="keynotice"></div>
 
 <!-- M30: genre + quality filter chips (grid views only). -->
 <div id="chips"></div>
@@ -703,12 +732,12 @@ body.nosearch #sortwrap,body.nosearch #more{display:none!important}
     <thead><tr>
       <th class="selcol"><input type="checkbox" id="selAll" data-i18n-title="wall.selall.title"
         title="Select every release on this page" aria-label="Select every release on this page"></th>
-      <th class="sortable" data-lsort="name" data-i18n="wall.col.release">Release</th>
-      <th class="sortable" data-lsort="kind" data-i18n="wall.lcol.cat">Category</th>
-      <th class="sortable" data-lsort="posted" data-i18n="wall.col.age">Age</th>
-      <th class="sortable" data-lsort="size" data-i18n="wall.col.size">Size</th>
-      <th class="sortable" data-lsort="files" id="lhFiles" data-i18n="wall.col.files">Files</th>
-      <th class="sortable" data-lsort="completeness" data-i18n="wall.lcol.avail">Availability</th>
+      <th class="sortable" tabindex="0" data-lsort="name" data-i18n="wall.col.release">Release</th>
+      <th class="sortable" tabindex="0" data-lsort="kind" data-i18n="wall.lcol.cat">Category</th>
+      <th class="sortable" tabindex="0" data-lsort="posted" data-i18n="wall.col.age">Age</th>
+      <th class="sortable" tabindex="0" data-lsort="size" data-i18n="wall.col.size">Size</th>
+      <th class="sortable" tabindex="0" data-lsort="files" id="lhFiles" data-i18n="wall.col.files">Files</th>
+      <th class="sortable" tabindex="0" data-lsort="completeness" data-i18n="wall.lcol.avail">Availability</th>
       <th style="text-align:end"></th>
     </tr></thead>
     <tbody id="lbody"></tbody>
@@ -729,7 +758,12 @@ body.nosearch #sortwrap,body.nosearch #more{display:none!important}
   Rating information courtesy of IMDb (<a href="https://www.imdb.com" style="color:var(--dim)">imdb.com</a>). Used with permission.
 </div>
 
-<div id="ovl"><div class="sheet" id="sheet"></div></div>
+<!-- The wall's one modal. #ovl is the backdrop, .sheet is the dialog -
+     same split as every dashboard overlay. Its name is whichever
+     heading the current renderer stamped `sheetTitle` on (card, person,
+     hidden panel, name candidates), because one sheet serves all four. -->
+<div id="ovl"><div class="sheet" id="sheet" role="dialog" aria-modal="true"
+  aria-labelledby="sheetTitle"></div></div>
 <!-- Asked before a hand-picked grab that would duplicate something the
      user already has. Its own overlay, stacked over the card sheet it is
      usually launched from. -->
@@ -741,10 +775,44 @@ body.nosearch #sortwrap,body.nosearch #more{display:none!important}
   </div>
 </div>
 <div class="vpback" id="vpBack" onclick="toggleViewMenu(false)"></div>
-<button id="newpill" onclick="showArrivals()"></button>
-<div id="toast"></div>
+<!-- `hidden` until arrivals exist: the pill is parked off-screen by a
+     transform, which does NOT take it out of the tab order, so an empty
+     unnamed button used to sit in the middle of the keyboard walk. -->
+<button id="newpill" onclick="showArrivals()" hidden></button>
+<div id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+<!-- The wall repaints itself constantly - search, filters, page turns,
+     arrivals - and every one of those was a silent change for anyone not
+     watching the grid. Same live region the dashboard uses. -->
+<div id="live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
 <!-- 24C: hover-preview popup for the Releases table. -->
 <div id="hovpop" aria-hidden="true"></div>
+
+<!-- API-key entry modal, ported from the dashboard (§129 phase 0b there):
+     one modal serves every concurrent auth-failed call. The old
+     window.prompt() path was refused outright by embedded webviews, and
+     it also only fired on "API Key Incorrect" - a daemon answering
+     "API Key Required" (rotated key, wall opened keyless) rendered a
+     silently empty wall with no way in at all. Backdrop click and Escape
+     both count as "not now"; the #keynotice strip is the way back. -->
+<div id="keyov" onclick="if(event.target===this)keyCancel()"><div id="keymodal" role="dialog" aria-modal="true" aria-labelledby="keytitle">
+  <div class="khead"><b id="keytitle" data-i18n="key.title">This nzbfast asks for its API key</b></div>
+  <div class="keybody">
+    <p id="keywhy"></p>
+    <div class="keyrow">
+      <input id="keyin" type="password" autocomplete="off" spellcheck="false"
+        data-i18n-placeholder="key.field" placeholder="Paste the API key" aria-label="Paste the API key"
+        onkeydown="if(event.key==='Enter'){event.preventDefault();keySubmit()}else if(event.key==='Escape'){event.preventDefault();keyCancel()}">
+      <button class="act ghost" id="keyshow" onclick="keyToggleShow()" data-i18n="set.sec.apikey.show" aria-pressed="false">Show</button>
+    </div>
+    <p id="keyerr" class="keyerr" role="alert" aria-live="assertive"></p>
+    <p data-i18n="key.where">Find it on the machine running nzbfast: Settings &gt; Security &gt; API key (Show), or in the daemon's startup log. Once it checks out it is remembered in this browser only.</p>
+    <p data-i18n="key.where2">If the key was just changed, the browser where that happened shows the new one. If no browser does, it is on the apikey line of settings.json, in nzbfast's settings folder.</p>
+  </div>
+  <div class="kfoot">
+    <button class="act ghost" onclick="keyCancel()" data-i18n="key.notnow">Not now</button>
+    <button class="act" id="keygo" onclick="keySubmit()" data-i18n="key.unlock">Unlock</button>
+  </div>
+</div></div>
 
 <script>
 "use strict";
@@ -766,7 +834,10 @@ const IDX_COUNT=+'__NZBFAST_INDEXERS__'||0;
 // from the built-in indexer. An unreplaced token means off - spots are
 // new, so there is no install anywhere that should assume otherwise.
 const SPOT_ON='__NZBFAST_SPOTS__'==='1';
-if(!IDX_ON) document.body.classList.add('noidx');
+// Spots are promoted into the release index as first-class named
+// cards, so while they are on there IS a wall to show even with the
+// header indexer off - which is the default install now.
+if(!IDX_ON&&!SPOT_ON) document.body.classList.add('noidx');
 if(SPOT_ON) document.body.classList.add('hasspots');
 const LOCALES=['en','fr','de','it','es','nl','pt','sv','da','nb','fi','tr','ro','ru','pl','cs','uk','el','ja','he','ar','fa','hu','sk','hr','sr','bg','sl'];
 // §5 2b: RTL locales - loader stamps dir="rtl" for Hebrew/Arabic/Persian.
@@ -894,27 +965,140 @@ let resSel = '', decSel = ''; // decade: 'min-max' ('0-1979' = older)
 // responses - each gets its own tab chip and section label.
 let customCats = [], _catsSig = '';
 
-// Cancelling this prompt used to do two harmful things at once: it wrote
-// the empty string over a key that may have been perfectly good, and it
-// re-entered api() immediately, so Cancel produced another prompt with no
-// delay at all and the page could not be escaped. Declining now sticks
-// for the session and leaves the request failed, which the callers
-// already render as an empty wall rather than a loop.
-let keyDeclined = false;
-async function askKey(){
-  if (keyDeclined) return false;
-  const v = prompt(t('prompt.apikey','API key:')) || '';
-  if (!v){ keyDeclined = true; return false; }   // never clobber a good key on cancel
-  key = v; localStorage.nzbfastKey = v;
-  return true;
+// The dashboard's key modal (§129 phase 0b there), ported - see the
+// markup note near #keyov for why prompt() had to go. Declining sticks
+// for the tab (sessionStorage, shared with the dashboard so one "not
+// now" covers both pages) and never clobbers a stored key; the strip
+// under the header is the way back.
+let keyDeclined = sessionStorage.nzbfastKeyDeclined === '1';
+let keyPrompt = null, keyResolve = null;
+// Both refusals the daemon sends: "Incorrect" (a key that is wrong) and
+// "Required" (no key sent at all). The old prompt() path matched only
+// Incorrect, so a daemon that GAINED a key - the regenerate lockout -
+// rendered an empty wall without ever asking.
+function authFail(j){ return !!j && (j.error === 'API Key Incorrect' || j.error === 'API Key Required'); }
+function keyNotice(on){
+  const el = document.getElementById('keynotice');
+  if (!el) return;
+  if (!on){ el.classList.remove('on'); el.innerHTML = ''; return; }
+  // Already up: don't rebuild the button under a click (the declined
+  // branch lands here on every failed call).
+  if (el.classList.contains('on')) return;
+  el.innerHTML = esc(t('key.needed', 'This daemon needs its API key before the dashboard can show anything. Settings > Security has it on the machine running nzbfast.'))
+    + ' <button class="act ghost" onclick="reenterKey()">' + esc(t('key.enter', 'Enter key')) + '</button>';
+  el.classList.add('on');
 }
-async function api(mode, extra){
+function reenterKey(){ keyDeclined = false; sessionStorage.removeItem('nzbfastKeyDeclined'); keyNotice(false); ensureKey(key); }
+function ensureKey(failedKey){
+  if (key !== failedKey) return Promise.resolve(true);   // another call already rotated it - just retry
+  if (keyDeclined){ keyNotice(true); return Promise.resolve(false); }
+  if (!keyPrompt){
+    keyPrompt = new Promise(resolve => {
+      keyResolve = resolve;
+      // Missing and wrong are different situations and say so - and the
+      // key is stamped as well as the text, so applyI18n retranslates it
+      // when the catalogue lands after a first-403-wins race.
+      const why = document.getElementById('keywhy');
+      why.dataset.i18n = failedKey ? 'key.why.wrong' : 'key.why.missing';
+      why.textContent = failedKey
+        ? t('key.why.wrong','The key saved in this browser was refused - the daemon has a different one now (it was changed, or this address now serves a different nzbfast).')
+        : t('key.why.missing','This browser has not connected to this nzbfast before. Its API key proves you are allowed in.');
+      document.getElementById('keyerr').textContent = '';
+      const inp = document.getElementById('keyin');
+      inp.value = '';
+      document.getElementById('keyov').classList.add('on');
+      // Trapped, like the dashboard's copy of this modal. The port
+      // landed before wall.html had modalOpen, so it only focused the
+      // field: Tab then walked out into a wall the user cannot use yet,
+      // and this is the one modal that is genuinely the only way in.
+      modalOpen(document.getElementById('keymodal'), inp);
+    });
+  }
+  return keyPrompt;
+}
+function keyFinish(ok){
+  document.getElementById('keyov').classList.remove('on');
+  modalClose(document.getElementById('keymodal'));
+  const r = keyResolve; keyResolve = null; keyPrompt = null;
+  if (r) r(ok);
+}
+function keyCancel(){
+  if (!keyPrompt) return;
+  keyDeclined = true; sessionStorage.nzbfastKeyDeclined = '1';
+  keyNotice(true);   // reversible via the strip
+  keyFinish(false);
+}
+function keyToggleShow(){
+  const inp = document.getElementById('keyin'), btn = document.getElementById('keyshow');
+  const show = inp.type === 'password';
+  inp.type = show ? 'text' : 'password';
+  btn.setAttribute('aria-pressed', String(show));
+  btn.textContent = show ? t('set.sec.apikey.hide','Hide') : t('set.sec.apikey.show','Show');
+  inp.focus();
+}
+async function keySubmit(){
+  const inp = document.getElementById('keyin'), err = document.getElementById('keyerr');
+  const go = document.getElementById('keygo');
+  const v = (inp.value || '').trim();
+  if (!v){ err.textContent = t('key.err.empty','Paste or type the key first.'); inp.focus(); return; }
+  go.disabled = true; const lbl = go.textContent; go.textContent = t('key.checking','Checking…');
+  try {
+    // Prove the key against a mode that REQUIRES it before adopting it,
+    // passed as the explicit one-shot credential so a wrong guess can
+    // never recurse back into this modal.
+    let j;
+    try { j = await api('queue', '&output=json', v); }
+    catch(e){ j = null; }
+    if (j == null || j.error === ERR_UNREACHABLE
+        || j.error === 'HTTP 502' || j.error === 'HTTP 503' || j.error === 'HTTP 504'){
+      err.textContent = t('key.err.unreachable','The daemon did not answer - is nzbfast still running at this address?');
+      return;
+    }
+    if (authFail(j)){
+      err.textContent = t('key.err.wrong','That key was refused. Settings > Security on the machine running nzbfast shows the current one.');
+      inp.select();
+      return;
+    }
+    if (j.status === false){ err.textContent = tErr(j.error) || String(j.error); return; }
+    key = v; localStorage.nzbfastKey = v;
+    keyDeclined = false; sessionStorage.removeItem('nzbfastKeyDeclined');
+    keyNotice(false);
+    // Resolving the promise lets every call that failed into this modal
+    // retry itself with the new key - the startup fetches included, so
+    // the wall fills in without a reload.
+    keyFinish(true);
+  } finally { go.disabled = false; go.textContent = lbl; }
+}
+// A request that never gets an answer - the daemon restarting, the
+// machine asleep, the network gone - REJECTS the fetch, and the onclick
+// handlers drop that promise, so a click during a restart used to do
+// nothing at all: no toast, no error, no clue. Same fix as the
+// dashboard: answer with the {status:false,error} shape every caller's
+// !j.status branch already reports. tErr() turns the phrase into the
+// reader's language at the display edge.
+const ERR_UNREACHABLE='could not reach nzbfast';
+function fetchFail(){ return {status:false, error:ERR_UNREACHABLE}; }
+async function api(mode, extra, authKey){
+  // While the modal is up, later callers wait on its outcome instead of
+  // racing more 403s past it - the daemon rate-limits bad keys per IP.
+  // An explicit one-shot credential (the modal's own probe) goes straight
+  // through.
+  if (authKey == null && keyPrompt && !(await keyPrompt))
+    return {status:false, error:'API Key Required'};
+  const sent = authKey != null ? authKey : key;
   // Issue #4: the key rides the X-Api-Key header, not the query string
   // (keeps it out of proxy logs / history / Referer). Navigation links
   // (/m3u, /getnzb) still use ?apikey= - links cannot carry headers.
-  const r = await fetch(`/api?mode=${mode}${extra||''}`, {headers: key?{'X-Api-Key': key}:{}});
-  const j = await r.json();
-  if (j.error === 'API Key Incorrect' && await askKey()) return api(mode, extra);
+  let r;
+  try {
+    r = await fetch(`/api?mode=${mode}${extra||''}`, {headers: sent?{'X-Api-Key': sent}:{}});
+  } catch(e){ return fetchFail(); }
+  // A non-JSON body (a reverse proxy's 502 page, a truncated answer)
+  // used to reject here and vanish the same way.
+  let j;
+  try { j = await r.json(); }
+  catch(e){ return {status:false, error:'HTTP '+r.status}; }
+  if (authFail(j) && authKey == null && await ensureKey(sent)) return api(mode, extra);
   return j;
 }
 // Escapes <, >, & AND both quote characters. Release names/stems come
@@ -1004,8 +1188,18 @@ document.addEventListener('error', e=>{
 // suffix wherever a placeholder carries it (boot, locale apply, and the
 // external-scope swap all funnel through here).
 function phq(s){ return matchMedia('(pointer:coarse)').matches ? s.replace(/\s*\( \/ \)\s*$/,'') : s; }
-function stripKbdHint(){ const q=document.getElementById('q'); if(q) q.placeholder=phq(q.placeholder); }
+function stripKbdHint(){
+  const q=document.getElementById('q'); if(!q) return;
+  q.placeholder=phq(q.placeholder);
+  // ...and the accessible name follows it, always without the hint: the
+  // search box had NO name but its placeholder, which is a name that
+  // disappears the moment someone types, and "open paren slash close
+  // paren" is not how an AT user reaches this field anyway.
+  q.dataset.lr='1';
+  q.setAttribute('aria-label', q.placeholder.replace(/\s*\( \/ \)\s*$/,''));
+}
 stripKbdHint();
+nameControls();   // the bar's controls; the sheet's are named as it opens
 
 function bestQuality(c){
   const order=['2160p REMUX','2160p','1080p REMUX','1080p','720p'];
@@ -1116,9 +1310,22 @@ function render(){
       :`${t('wall.empty.none','Nothing indexed yet. Choose which newsgroups to index and the wall fills itself.')}`+
        `<div style="margin-top:14px"><a class="chip" style="padding:7px 14px;font-size:13px" href="/#settings/indexing">`+
        `${t('wall.empty.cta','Choose newsgroups')}</a></div>`}</div>`;
+    sayResult(wall.textContent);
     return;
   }
   wall.innerHTML=cardsHtml(list);
+  sayResult(document.getElementById('count').textContent);
+}
+// What a repaint produced, said once. Search, a category tab, a genre
+// chip and the sort all swap the whole grid with no other signal than
+// the tiles themselves - and "no matches" is the answer people most
+// need and are least likely to notice. Repeats are dropped: the tip
+// poll and the scroll append both land here with an unchanged count.
+let _resultSaid='';
+function sayResult(text){
+  const s=(text||'').trim().replace(/\s+/g,' ');
+  if(!s || s===_resultSaid) return;
+  _resultSaid=s; announce(s);
 }
 
 function cardHtml(c){
@@ -1136,7 +1343,14 @@ function cardHtml(c){
     : (c.year||'');
   // Arrived since this page last caught up - see freshKeys.
   const fresh=freshKeys.has(c.key);
-  return `<div class="card${fresh?' fresh':''}" tabindex="0" data-key="${esc(c.key)}">
+  // role=button, and an EXPLICIT name rather than name-from-content: the
+  // tile owns a nested hide button, whose own label would otherwise be
+  // read out as part of the card's name. The name is what the caption
+  // shows, because that is what a sighted user is choosing between.
+  const cardName=[fixCase(c.title), String(sub||''), c.rating?`★ ${c.rating.toFixed(1)}`:'']
+    .filter(Boolean).join(' · ');
+  return `<div class="card${fresh?' fresh':''}" tabindex="0" role="button"
+    aria-label="${esc(cardName)}" data-key="${esc(c.key)}">
     <div class="poster">${img}
       ${fresh?`<span class="badge new" data-i18n-skip>${esc(t('wall.new.badge','NEW'))}</span>`:''}
       ${q?`<span class="badge">${esc(q)}</span>`:''}
@@ -1179,11 +1393,11 @@ function renderChips(){ setTimeout(chipFades,0);
   const DECADES=[['2020s','2020-2029'],['2010s','2010-2019'],['2000s','2000-2009'],
     ['90s','1990-1999'],['80s','1980-1989'],[t('wall.dec.older','Older'),'0-1979']];
   box.innerHTML=
-    GENRES.map(([lab,val])=>`<button class="chip${genreSel===val?' on':''}" data-genre="${val}">${lab}</button>`).join('')
+    GENRES.map(([lab,val])=>`<button class="chip${genreSel===val?' on':''}" aria-pressed="${genreSel===val}" data-genre="${val}">${lab}</button>`).join('')
     +`<span class="gsep"></span>`
-    +['2160p','1080p','720p'].map(r=>`<button class="chip${resSel===r?' on':''}" data-res="${r}">${r}</button>`).join('')
+    +['2160p','1080p','720p'].map(r=>`<button class="chip${resSel===r?' on':''}" aria-pressed="${resSel===r}" data-res="${r}">${r}</button>`).join('')
     +`<span class="gsep"></span>`
-    +DECADES.map(([lab,val])=>`<button class="chip${decSel===val?' on':''}" data-dec="${val}">${lab}</button>`).join('');
+    +DECADES.map(([lab,val])=>`<button class="chip${decSel===val?' on':''}" aria-pressed="${decSel===val}" data-dec="${val}">${lab}</button>`).join('');
 }
 document.getElementById('chips').addEventListener('click',e=>{
   const b=e.target.closest('button'); if(!b) return;
@@ -1282,6 +1496,141 @@ async function renderStrips(){
   }catch(e){ if(seq===stripSeq) box.innerHTML=''; }
 }
 
+// ---- accessibility plumbing (§129 phase 0d, wall half) -----------------
+//
+// The dashboard got this pass on 7 Aug and the wall was deferred to "the
+// next wall pass". This is it. Three things were missing, and they are
+// the three that a poster grid needs most: the page never SAID anything
+// (no live region, so a search that returned nothing, a page turn and a
+// batch of arrivals were all silent), the sheet was a modal in looks
+// only (no dialog role, no focus moved into it, Tab walked straight out
+// the back into the grid behind), and a handful of controls had no
+// accessible name at all.
+//
+// Speak a change that has no visible focus consequence. Same contract as
+// the dashboard's announce(): clear first, because most screen readers
+// treat an unchanged string as nothing to say, and the counts here
+// repeat constantly ("3 titles" after two different filters).
+function announce(text){
+  const el=document.getElementById('live'); if(!el) return;
+  el.textContent='';
+  setTimeout(()=>{ el.textContent=text; }, 60);
+}
+// ---- Modal focus: trap while open, hand it back on close --------------
+// Ported from the dashboard rather than re-derived - the wall has the
+// same two problems it fixed there. Tab used to leave the open sheet and
+// walk the grid behind it (which is still scroll-locked, so focus went
+// somewhere the user could not see), and closing the sheet dropped focus
+// on <body>, i.e. the top of the document, so dismissing a card sent a
+// keyboard user back to the header every time instead of to the card
+// they came from.
+const FOCUSABLE='a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),iframe,[tabindex]:not([tabindex="-1"])';
+const _modalPrev=new WeakMap(), _modalTrap=new WeakMap();
+function modalFocusables(box){
+  return [...box.querySelectorAll(FOCUSABLE)].filter(el=>el.offsetParent!==null||el.tagName==='IFRAME');
+}
+function modalOpen(box, first){
+  if(!box || _modalTrap.has(box)) return;
+  _modalPrev.set(box, document.activeElement);
+  const trap=e=>{
+    if(e.key!=='Tab') return;
+    const f=modalFocusables(box); if(!f.length) return;
+    const a=f[0], z=f[f.length-1];
+    if(e.shiftKey && (document.activeElement===a||!box.contains(document.activeElement))){
+      e.preventDefault(); z.focus();
+    } else if(!e.shiftKey && document.activeElement===z){ e.preventDefault(); a.focus(); }
+  };
+  _modalTrap.set(box, trap);
+  box.addEventListener('keydown', trap);
+  const to=first||modalFocusables(box)[0]||box;
+  if(to===box && !box.hasAttribute('tabindex')) box.tabIndex=-1;
+  try{ to.focus(); }catch(_){}
+}
+function modalClose(box){
+  if(!box) return;
+  const trap=_modalTrap.get(box);
+  if(!trap) return;
+  box.removeEventListener('keydown', trap); _modalTrap.delete(box);
+  const prev=_modalPrev.get(box); _modalPrev.delete(box);
+  if(prev && document.contains(prev) && prev!==document.body){ try{ prev.focus(); }catch(_){} }
+}
+// The sheet is repainted (not reopened) on hydration and on every
+// in-sheet navigation - person page, back to the card, the name-candidate
+// list. Re-arming the trap each time would drop the ORIGINAL opener, so
+// arming is idempotent and only closeOvl() releases it.
+let _sheetSaid='';
+function sheetOpen(){
+  const sheet=document.getElementById('sheet');
+  document.getElementById('ovl').classList.add('open');
+  document.body.style.overflow='hidden';
+  nameControls(sheet);
+  modalOpen(sheet);
+  // A repaint destroys whatever was focused inside the sheet - the
+  // person page's "Back to title" button is the everyday case - and
+  // focus then lands on <body>, which is OUTSIDE the trap, so the next
+  // Tab walks the page behind. modalOpen is idempotent by design and
+  // will not re-take focus, so the orphan is caught here instead.
+  if(!sheet.contains(document.activeElement)){
+    const f=modalFocusables(sheet);
+    try{ (f[0]||sheet).focus(); }catch(_){}
+  }
+  // Announce the heading, but only when it actually changed: openCard
+  // repaints itself when the hydration fetch lands, and saying the same
+  // film title twice a second apart is worse than saying it once.
+  const h=document.getElementById('sheetTitle');
+  const said=h?h.textContent.trim().replace(/\s+/g,' '):'';
+  if(said && said!==_sheetSaid){ _sheetSaid=said; announce(said); }
+}
+// A control whose only name is its placeholder is named until someone
+// types in it, and then it is not - and the sheet's Fix-match panel is
+// eight of them. This is the wall's answer to the dashboard's
+// labelRows(): the same idea (derive the missing name from the text the
+// design already puts next to the control), on the shape the wall
+// actually has. It runs at boot, after every locale switch, and after
+// every sheet paint, because the sheet's controls do not exist until
+// then. A hand-written aria-label is someone's deliberate choice and is
+// never overwritten - only names WE stamped carry data-lr.
+function nameControls(root){
+  // The strays with no placeholder to derive from. The two sort
+  // dropdowns share one name because they are never on screen together:
+  // #sort orders the poster grid, #lsort the releases table, and the
+  // view switch picks which one exists.
+  const NAMED={
+    sort:      ()=>t('wall.sort.aria','Sort order'),
+    lsort:     ()=>t('wall.sort.aria','Sort order'),
+    // Movie / TV show, in the sheet's Fix-match panel. "Category" is
+    // what the wall calls this everywhere else (the column, the chips).
+    fx_kind:   ()=>t('wall.rule.kind','Category'),
+    nr_field:  ()=>t('wall.rule.field','Filter by'),
+  };
+  for(const [id,name] of Object.entries(NAMED)){
+    const el=(root||document).querySelector('#'+id);
+    if(el){ el.dataset.lr='1'; el.setAttribute('aria-label', name()); }
+  }
+  (root||document).querySelectorAll('input[placeholder],textarea[placeholder]').forEach(el=>{
+    if(el.type==='hidden' || el.closest('label')) return;
+    if(el.hasAttribute('aria-labelledby')) return;
+    if(el.hasAttribute('aria-label') && !el.dataset.lr) return;
+    const ph=(el.getAttribute('placeholder')||'').trim();
+    if(!ph) return;
+    el.dataset.lr='1';
+    // Without the keyboard hint: a screen reader reading "open paren
+    // slash close paren" is noise, and "/" is not how an AT user reaches
+    // the field anyway. Same call the dashboard makes.
+    el.setAttribute('aria-label', ph.replace(/\s*\( \/ \)\s*$/,''));
+  });
+}
+// Every filter and layout control on this page is a toggle that says so
+// with one class and a colour. That is the whole affordance, which makes
+// it no affordance at all for anyone who cannot see the colour: nothing
+// announced whether "Movies" was the tab you were on or the tab you
+// could go to. One helper, so the class and the state cannot drift.
+function press(el, on){
+  if(!el) return;
+  el.classList.toggle('on', !!on);
+  el.setAttribute('aria-pressed', on?'true':'false');
+}
+
 function toast(msg){
   const t=document.getElementById('toast');
   t.textContent=msg; t.classList.add('show');
@@ -1298,6 +1647,9 @@ function toast(msg){
 let dupeResolve=null;
 function dupeClose(v){
   document.getElementById('dupeovl').classList.remove('open');
+  // Stacked over the card sheet, so handing focus back matters twice
+  // over: the sheet is still open behind it and still trapping.
+  modalClose(document.querySelector('#dupeovl .dlg'));
   const r=dupeResolve; dupeResolve=null; if(r) r(v);
 }
 // Returns 'existing' (play what we already downloaded), 'again'
@@ -1319,6 +1671,9 @@ function askDupe(info, play){
   document.getElementById('dupeActs').innerHTML=acts.map(([label,v,cls])=>
     `<button class="${cls}" data-v="${v}">${esc(label)}</button>`).join('');
   document.getElementById('dupeovl').classList.add('open');
+  // A question with no focus in it is a question nobody hears: this
+  // dialog is the one place the wall stops and waits for an answer.
+  modalOpen(document.querySelector('#dupeovl .dlg'));
   return new Promise(res=>{ dupeResolve=res; });
 }
 document.getElementById('dupeActs').addEventListener('click', e=>{
@@ -1435,7 +1790,11 @@ function toggleViewMenu(want){
       m.style.right=Math.max(8, innerWidth-r.right)+'px';
       m.style.left='auto';
     }
-    m.querySelector('button,input,select')?.focus();
+    modalOpen(m);
+  } else {
+    // Closing put focus nowhere, so Tab resumed from the top of the
+    // document rather than from the button the menu belongs to.
+    modalClose(m);
   }
   return false;
 }
@@ -1519,7 +1878,7 @@ function applyZoom(){
   w.classList.toggle('small', effTile()<120);
   document.getElementById('zoom').value = effTile();
   document.querySelectorAll('#densctl button').forEach(b=>
-    b.classList.toggle('on', !zoomPx && b.dataset.d===density));
+    press(b, !zoomPx && b.dataset.d===density));
   const grid = view==='wall';
   document.getElementById('zoomwrap').style.display = grid?'':'none';
   document.getElementById('densctl').style.display = grid?'':'none';
@@ -1548,7 +1907,7 @@ function renderDir(){
   // One arrow, rotated. Was two glyphs written with textContent, which
   // would now wipe the icon out of the button on the first render.
   b.classList.toggle('up', !curDesc());
-  b.classList.toggle('on', dirFlip);
+  press(b, dirFlip);
 }
 function setSortDir(flip){
   dirFlip=flip;
@@ -1562,7 +1921,7 @@ function setView(v){
   // table is not a preference, so remembering it would silently replace
   // the wall the user chose before switching the indexer off.
   view=v; if(IDX_ON) localStorage.nzbfastWallView2=v;
-  document.querySelectorAll('#views button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
+  document.querySelectorAll('#views button').forEach(b=>press(b, b.dataset.v===v));
   const rel=v==='releases';
   applyZoom();
   renderDir();
@@ -1582,7 +1941,7 @@ function setView(v){
   if(rel){ lpage=0; browseFetch(); } else wallFetch(true);
 }
 function syncTabs(){
-  document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('on',x.dataset.k===tab));
+  document.querySelectorAll('#tabs button').forEach(x=>press(x, x.dataset.k===tab));
 }
 // M30: friendly display name for a ROT13-rescued row - the raw stem is
 // rotated gibberish; the parser's decoded title/marker facts read fine.
@@ -1830,15 +2189,35 @@ function nameBadges(r){
   const b=[];
   if(r.par2) b.push(`<span class="nbadge" data-i18n-skip title="${esc(t('wall.badge.par2.title','Repair data posted alongside: damaged parts can be rebuilt'))}">PAR2</span>`);
   if(r.rescued) b.push(`<span class="nbadge">${t('wall.rot.decoded','decoded')}</span>`);
-  if(r.pre){
-    // Two different claims, and the badge must not blur them: "pre"
-    // means a relay paired this posted filename with its real title;
-    // "correlated" means we inferred the pairing from timing and size.
+  if(r.pre==='spot'||r.pre==='proven:msgid-set:spot'){
+    // A third kind of claim again: the person who posted it announced
+    // the title themselves and signed it. The proven: form is the
+    // dedup path - the spot's message-id set matched a release the
+    // scanner had already indexed.
+    b.push(`<span class="nbadge" data-i18n-skip title="${esc(t('wall.badge.spot.title','Named by a Spotnet announcement: the person who posted this release published its title and signed it.'))}">${esc(t('wall.badge.spot','spot'))}</span>`);
+  } else if(r.pre){
+    // The badge must not blur five different claims: "pre" means a
+    // relay paired this posted filename with its real title;
+    // "correlated" means we inferred the pairing from timing and size;
+    // "archive" means the name was read out of the posted bytes
+    // themselves (a 7z end header) - proven, not inferred, so it never
+    // wears the tentative correlated badge. The proven: prefix is the
+    // claims layer's provenance form (proven:body-probe:body/7z); the
+    // bare body/ form is the same lane before that layer. Any other
+    // proven: form (crc32-len, par2-set-id, hash16k-len, msgid-set for
+    // non-spot origins) is also proof from the release's own bytes, so
+    // it wears "verified" - never the announced-by-a-relay "pre" badge.
     const corr=/^predb\/(corr:|manual\+corr:)/.test(r.pre);
-    b.push(`<span class="nbadge" title="${esc(corr
+    const body=/^body\//.test(r.pre)||/^proven:body-probe\b/.test(r.pre);
+    const proven=!body&&/^proven:/.test(r.pre);
+    b.push(`<span class="nbadge" title="${esc(body
+      ? t('wall.badge.body.title','Named from the post itself: the real filename was read from inside the posted archive.')
+      : proven
+      ? t('wall.badge.verified.title','This name is proven: it was confirmed from the download or repair data of the release itself, not announced by a relay.')
+      : corr
       ? t('wall.badge.corr.title','This name was inferred: a pre announcement matched this post on timing and size. It only changes how the release is shown, and it is taken back off if a download proves it wrong.')
       : t('wall.badge.pre.title','Named by the pre feed: a relay announced this posted filename together with its real title.'))}">${
-      corr?t('wall.badge.corr','correlated'):t('wall.badge.pre','pre')}</span>`);
+      body?t('wall.badge.body','archive'):proven?t('wall.badge.verified','verified'):corr?t('wall.badge.corr','correlated'):t('wall.badge.pre','pre')}</span>`);
   }
   if(!r.pre && r.pre_hint && r.pre_hint.status==='suggested')
     b.push(`<span class="nbadge sugg" onclick="event.stopPropagation();openPreCand(${r.id})"
@@ -1979,6 +2358,13 @@ function pageFoot(){
     ltotal?`${ltotal?lpage*LPAGE+1:0}–${last} / ${ltotal}`:'';
   document.getElementById('lprev').disabled=lpage===0;
   document.getElementById('lnext').disabled=last>=ltotal;
+  // Both table renderers finish here, so this is the one place that sees
+  // every repaint of the Releases surface - a search, a column sort, a
+  // page turn. The range carries the page, which is the part a page turn
+  // actually changes; the count alone would say the same thing twice.
+  const c=document.getElementById('count').textContent.trim();
+  const r=document.getElementById('lrange').textContent.trim();
+  sayResult(ltotal ? [c,r].filter(Boolean).join(' · ') : t('wall.nomatch','No matches.'));
 }
 function renderList(rows){
   const body=document.getElementById('lbody');
@@ -2012,17 +2398,25 @@ function markSortHeads(){
   // the one the dropdown names.
   if(grpTitle && !GRP_REAL.has(cur)) cur='posted';
   document.querySelectorAll('#ltable th.sortable').forEach(th=>{
-    th.classList.toggle('on', th.dataset.lsort===cur
+    const on = th.dataset.lsort===cur
       // Age answers for both date sorts - posted is the column, seen
       // (recently added) rides the same header.
-      || (th.dataset.lsort==='posted' && cur==='seen'));
+      || (th.dataset.lsort==='posted' && cur==='seen');
+    th.classList.toggle('on', on);
     th.classList.toggle('asc', !curDesc());
+    // The sorted column and its direction were a ↓/↑ drawn by CSS
+    // ::after, which is decoration and reaches nobody who is not looking
+    // at it. aria-sort is the same fact in the accessibility tree, and
+    // it is also what tells a screen reader the column is sortable AT
+    // ALL - the headers carry no other hint that they can be clicked.
+    th.setAttribute('aria-sort', on ? (curDesc()?'descending':'ascending') : 'none');
   });
 }
 // ---- 24C: checkbox selection + bulk queue ---------------------------
 // Selection survives page turns (a Set of release ids); the header
 // checkbox covers the visible page.
 const lsel=new Set();
+let _selSaid=0;
 function updateSelBar(){
   const n=lsel.size;
   document.getElementById('selbar').style.display=n?'flex':'none';
@@ -2033,6 +2427,16 @@ function updateSelBar(){
   const some=boxes.some(c=>lsel.has(+c.dataset.sel));
   const h=document.getElementById('selAll');
   h.checked=all; h.indeterminate=!all&&some;
+  // The bulk bar appearing IS the feedback for a selection, and it
+  // appears somewhere other than where the click happened. "Select all"
+  // is the case that matters: one checkbox, fifty rows, no announcement.
+  if(n!==_selSaid){
+    _selSaid=n;
+    // `sel.none` is the dashboard's key for exactly this sentence; both
+    // pages share one catalogue, so it is reused rather than duplicated.
+    announce(n?document.getElementById('selcount').textContent
+              :t('sel.none','Selection cleared.'));
+  }
 }
 document.getElementById('lbody').addEventListener('change',e=>{
   const c=e.target.closest('[data-sel]'); if(!c) return;
@@ -2075,6 +2479,18 @@ document.getElementById('selQueue').addEventListener('click',async e=>{
   updateSelBar();
 });
 // Sortable headers drive the same server-side sort as the dropdown.
+// They are markup-only headers rather than the WAI-ARIA button-in-a-th
+// pattern on purpose: markSortHeads and the i18n applier both write the
+// header's FIRST TEXT NODE (grouped mode relabels Files to Releases that
+// way), and nesting a button under it would break both. tabindex plus
+// Enter/Space gets the keyboard there without moving that text.
+document.querySelector('#ltable thead').addEventListener('keydown',e=>{
+  if(e.key!=='Enter' && e.key!==' ') return;
+  const th=e.target.closest('th.sortable');
+  if(!th || e.target!==th) return;
+  e.preventDefault();
+  th.click();
+});
 document.querySelector('#ltable thead').addEventListener('click',e=>{
   if(e.target.closest('#selAll')) return;
   const th=e.target.closest('th.sortable'); if(!th) return;
@@ -2223,7 +2639,7 @@ async function openCard(k){
     <div class="body">
       <div class="pst">${c.poster?`<img src="${esc(c.poster)}" alt="">`:`<div class="ph" style="height:100%;${phStyle(c.title)}"><div class="t">${esc(fixCase(c.title))}</div></div>`}</div>
       <div class="info">
-        <h2>${esc(fixCase(c.title))} ${c.year?`<small>(${c.year})</small>`:''}
+        <h2><span id="sheetTitle">${esc(fixCase(c.title))} ${c.year?`<small>(${c.year})</small>`:''}</span>
           ${canWatch(c.kind)?`<button class="act ghost" style="margin-inline-start:8px;vertical-align:3px" onclick="watchThis()"
             title="${esc(watchTip(c.kind))}">☆ ${t('wall.watch','Watch')}</button>`:''}</h2>
         <div class="meta">${c.rating?`<span class="star">★</span> ${num(c.rating,1)}${c.votes?` <span style="opacity:.7">${t('wall.votes','({n} on IMDb)',{n:fmtVotes(c.votes)})}</span>`:''} · `:''}${esc(c.genres||'')}${seasons}</div>
@@ -2298,8 +2714,7 @@ async function openCard(k){
           </td>
         </tr>`).join('')}
       </tbody></table>${rels.length?'':`<div class="dim" style="padding:6px 2px 2px;font-size:12.5px">${t('wall.norel','No releases indexed for this title yet.')}</div>`}</div>`;
-  document.getElementById('ovl').classList.add('open');
-  document.body.style.overflow='hidden';
+  sheetOpen();
   loadCredits(k);
 }
 function closeOvl(){
@@ -2307,8 +2722,12 @@ function closeOvl(){
   // sheet the user just dismissed.
   openSeq++;
   openKey=null;
+  _sheetSaid='';
   document.getElementById('ovl').classList.remove('open');
   document.body.style.overflow='';
+  // Releases the trap AND puts focus back on whatever opened the sheet -
+  // the card, the ⓘ button, the cast tile.
+  modalClose(document.getElementById('sheet'));
 }
 
 // ---- correlated-name candidates -------------------------------------
@@ -2322,13 +2741,15 @@ function candGap(sec){
 }
 async function openPreCand(id){
   const sheet=document.getElementById('sheet');
-  sheet.innerHTML=`<div class="pbody"><div class="dim">${t('wall.person.loading','Loading…')}</div></div>`;
-  document.getElementById('ovl').classList.add('open');
-  document.body.style.overflow='hidden';
+  // The heading is only there to name the dialog while it is still
+  // empty - without it the sheet opens as an unnamed modal for as long
+  // as the fetch takes.
+  sheet.innerHTML=`<div class="pbody"><h2 id="sheetTitle" class="sr-only">${t('wall.person.loading','Loading…')}</h2><div class="dim">${t('wall.person.loading','Loading…')}</div></div>`;
+  sheetOpen();
   const j=await api('pre_candidates',`&id=${id}`).catch(()=>null);
   const cands=(j&&j.candidates)||[];
   sheet.innerHTML=`<div class="pbody">
-    <h3 style="margin:0 0 4px">${t('wall.cand.title','Which release is this?')}</h3>
+    <h3 id="sheetTitle" style="margin:0 0 4px">${t('wall.cand.title','Which release is this?')}</h3>
     <div class="dim" style="font-size:12.5px;margin-bottom:10px">${t('wall.cand.sub','Pre announcements whose timing and size fit this post, best first. Nothing is renamed on disk either way.')}</div>
     ${cands.length?cands.map(c=>`
       <div style="display:flex;align-items:center;gap:10px;padding:7px 2px;border-top:1px solid var(--line)">
@@ -2343,6 +2764,11 @@ async function openPreCand(id){
       <button class="act ghost" onclick="preReject(${id})">${t('wall.cand.notthese','None of these')}</button>
       <button class="act quiet" onclick="closeOvl()">${t('wall.close','Close')}</button>
     </div></div>`;
+  // Re-name and re-announce now the placeholder heading is gone - but
+  // only if the sheet is still open. Unlike openCard/openPerson this one
+  // carries no openSeq guard, so a dismissal during the fetch would
+  // otherwise be undone by sheetOpen putting the overlay back.
+  if(document.getElementById('ovl').classList.contains('open')) sheetOpen();
 }
 async function preAssign(id,pid){
   const j=await api('pre_assign',`&id=${id}&predb_id=${pid}`).catch(()=>({status:false}));
@@ -2416,9 +2842,11 @@ async function openPerson(id, backKey){
   personBack=backKey||null;
   openKey=null;
   const sheet=document.getElementById('sheet');
-  sheet.innerHTML=`<div class="pbody"><div class="dim">${t('wall.person.loading','Loading…')}</div></div>`;
-  document.getElementById('ovl').classList.add('open');
-  document.body.style.overflow='hidden';
+  // The heading is only there to name the dialog while it is still
+  // empty - without it the sheet opens as an unnamed modal for as long
+  // as the fetch takes, which on a cold person page is not brief.
+  sheet.innerHTML=`<div class="pbody"><h2 id="sheetTitle" class="sr-only">${t('wall.person.loading','Loading…')}</h2><div class="dim">${t('wall.person.loading','Loading…')}</div></div>`;
+  sheetOpen();
   document.getElementById('ovl').scrollTop=0;
   const j=await api('person',`&value=${encodeURIComponent(id)}`);
   if(seq!==openSeq) return;
@@ -2446,7 +2874,7 @@ async function openPerson(id, backKey){
     <div class="pbody">
       <div class="face">${faceHtml(j.name,j.photo)}</div>
       <div style="min-width:0;flex:1">
-        <h2 style="margin:0 0 4px;font-size:22px">${esc(j.name)}</h2>
+        <h2 id="sheetTitle" style="margin:0 0 4px;font-size:22px">${esc(j.name)}</h2>
         <div class="meta">${tn('wall.person.n',yours.length,'{n} title in your index','{n} titles in your index')}${
           j.born?' · '+esc(j.born):''}</div>
         ${j.bio?`<div class="plot">${esc(j.bio)}</div>`:''}
@@ -2463,6 +2891,9 @@ async function openPerson(id, backKey){
     ${section(t('wall.person.tv','TV in your index'),group('tv'))}
     ${yours.length?'':`<div class="prow"><span class="dim" style="font-size:12.5px">${t('wall.person.none','Nothing of theirs is in your index yet.')}</span></div>`}
     <div id="filmo" class="prow"></div>`;
+  // The paint above replaced the "Loading…" placeholder the dialog was
+  // named by, so re-run the naming and say whose page this is.
+  sheetOpen();
 }
 // The off-index half. Live provider calls, so it is a click and not
 // something the page does on its own.
@@ -2510,10 +2941,20 @@ async function loadFilmography(id, btn){
 // ---- M16 fix-match: re-search, pick a candidate, or scrub by hand ----
 let fixCands=[];
 async function apiPost(mode, body){
-  const r=await fetch(`/api?mode=${mode}`,
-    {method:'POST', body:JSON.stringify(body), headers: key?{'X-Api-Key': key}:{}});
-  const j=await r.json();
-  if(j.error==='API Key Incorrect' && await askKey()) return apiPost(mode,body);
+  // Same modal contract as api(): wait out an open prompt, catch both
+  // auth-refusal variants, retry once the key is re-paired.
+  if (keyPrompt && !(await keyPrompt))
+    return {status:false, error:'API Key Required'};
+  const sent = key;
+  let r;
+  try {
+    r=await fetch(`/api?mode=${mode}`,
+      {method:'POST', body:JSON.stringify(body), headers: sent?{'X-Api-Key': sent}:{}});
+  } catch(e){ return fetchFail(); }
+  let j;
+  try { j=await r.json(); }
+  catch(e){ return {status:false, error:'HTTP '+r.status}; }
+  if(authFail(j) && await ensureKey(sent)) return apiPost(mode,body);
   return j;
 }
 function fixToggle(){
@@ -2953,7 +3394,7 @@ async function openHidden(){
       <button class="x" onclick="closeOvl()" title="${esc(t('btn.close.title','Close this panel'))}"
         aria-label="${esc(t('btn.close.title','Close this panel'))}">✕</button></div>
     <div style="padding:0 24px 26px">
-      <h2 style="margin:0 0 6px">${t('wall.hid.h','Hidden & filters')}</h2>
+      <h2 id="sheetTitle" style="margin:0 0 6px">${t('wall.hid.h','Hidden & filters')}</h2>
       <div class="dim" style="font-size:12.5px;margin-bottom:8px">${t('wall.hid.sub','Hide a few similar titles and the wall learns: it will suggest a filter you can accept with one click.')}</div>
       <h4 style="${H4S}">${t('wall.rule.h','Active filters')}</h4>
       <div>${rules.map(r=>`<span class="rulechip">${fieldName(r.field)}: <b>${esc(r.value)}</b>
@@ -2979,8 +3420,7 @@ async function openHidden(){
         <button class="act ghost" data-unhide="${esc(h.key)}">${t('wall.unhide','Unhide')}</button>
       </div>`).join('')||`<div class="dim" style="font-size:12px">${t('wall.hid.none','Nothing hidden.')}</div>`}
     </div>`;
-  document.getElementById('ovl').classList.add('open');
-  document.body.style.overflow='hidden';
+  sheetOpen();
 }
 async function addRule(){
   const f=document.getElementById('nr_field').value, v=document.getElementById('nr_val').value.trim();
@@ -3062,16 +3502,14 @@ document.getElementById('onlyComplete').addEventListener('change', ()=>{
   const sc=document.getElementById('scope');
   const saved=localStorage.nzbfastWallScope;
   if(saved==='idx'||saved==='both'||(saved==='spots'&&SPOT_ON)) sc.value=saved;
-  // With the built-in indexer off, "this index" and "both" are the same
-  // as "indexers" with a wasted query, and a three-way choice with one
-  // real answer is just a control to read and dismiss. Pin it and hide
-  // it (see body.noidx in the stylesheet); the saved preference is left
-  // untouched, so it comes back when the indexer does.
-  //
-  // Spots change that sum: with the indexer off but spots on, there IS
-  // a second real answer, so the control stays.
+  // With the built-in indexer off AND spots off, "this index" and
+  // "both" are the same as "indexers" with a wasted query, and a
+  // three-way choice with one real answer is just a control to read
+  // and dismiss. Pin it and hide it (see body.noidx in the
+  // stylesheet); the saved preference is left untouched, so it comes
+  // back when a local source does. With spots on the local index is
+  // real again - spot promotion fills it - so nothing is pinned.
   if(!IDX_ON && !SPOT_ON) sc.value='idx';
-  else if(!IDX_ON && sc.value!=='spots') sc.value=IDX_COUNT?'idx':'spots';
   sc.addEventListener('change', ()=>{
     localStorage.nzbfastWallScope=sc.value;
     spotCtl();
@@ -3089,7 +3527,10 @@ document.getElementById('onlyComplete').addEventListener('change', ()=>{
 // elements lose their data-i18n markup here, so applyI18n cannot fix
 // them up later - the loader calls this again instead.
 function idxOffPage(){
-  if(IDX_ON) return;
+  // Spots keep the poster wall alive (they are promoted into the
+  // release index), so the page only degrades to a bare search when
+  // BOTH local sources are off.
+  if(IDX_ON||SPOT_ON) return;
   const pill=document.querySelector('.nav a[href="/wall"]');
   if(pill){
     const lbl=pill.querySelector('[data-i18n="hdr.wall"]');
@@ -3100,12 +3541,8 @@ function idxOffPage(){
   const q=document.getElementById('q');
   // phq() drops the keyboard hint on touch devices - it applies to
   // whichever placeholder this state calls for.
-  if(q) q.placeholder=phq(SPOT_ON&&!IDX_COUNT
-    ? t('wall.q.ph.spots','Search spots…  ( / )')
-    : t('wall.q.ph.ext','Search your indexers…  ( / )'));
-  // Spots are something to search, so the "nothing here" note is not
-  // true while they are on.
-  if(!IDX_COUNT&&!SPOT_ON){
+  if(q) q.placeholder=phq(t('wall.q.ph.ext','Search your indexers…  ( / )'));
+  if(!IDX_COUNT){
     document.body.classList.add('nosearch');   // see the stylesheet
     const n=document.getElementById('noidxnote');
     n.style.display='';
@@ -3239,8 +3676,20 @@ document.getElementById('grpTitle').addEventListener('change', e=>{
   localStorage.nzbfastWallGrpTitle=grpTitle?'on':'off';
   lpage=0; browseFetch();
 });
-document.getElementById('wall').addEventListener('keydown', e=>{
-  if(e.key==='Enter'){ const c=e.target.closest('.card'); if(c) openCard(c.dataset.key); }
+// Both containers, matching the click handler above. The discovery
+// strips render the same tiles and were focusable all along, but only
+// the grid answered the keyboard - so a Tab through the strips reached
+// cards that could not be opened without a mouse.
+for(const id of ['wall','strips']) document.getElementById(id).addEventListener('keydown', e=>{
+  // Space as well as Enter, because the tile now says it is a button and
+  // a button answers to both. The target guard is the same one the
+  // dashboard's history rows use: Enter on the card's own hide button
+  // must hide the title, not open it.
+  if(e.key!=='Enter' && e.key!==' ') return;
+  const c=e.target.closest('.card');
+  if(!c || e.target!==c) return;
+  e.preventDefault();
+  openCard(c.dataset.key);
 });
 document.getElementById('ovl').addEventListener('click', e=>{
   if(e.target.id==='ovl') closeOvl();
@@ -3297,11 +3746,18 @@ async function tipPoll(){
     if(scrollY<400 && !ovlOpen()) showArrivals(false); else renderPill();
   }catch(e){ /* daemon blip - the next tick retries */ }
 }
+let _pillSaid=0;
 function renderPill(){
   const p=document.getElementById('newpill');
-  if(!pendNew){ p.classList.remove('show'); return; }
+  if(!pendNew){ p.classList.remove('show'); p.hidden=true; _pillSaid=0; return; }
   p.textContent=tn('wall.new.pill',pendNew,'↑ {n} new arrival','↑ {n} new arrivals');
+  p.hidden=false;
   p.classList.add('show');
+  // The pill is the wall's one uninvited change, and it is deliberately
+  // quiet on screen (nothing reflows until it is clicked). Said once per
+  // new count, so it is not quiet to the point of invisible - and NOT on
+  // every 5 s poll, which would make the same number a metronome.
+  if(pendNew!==_pillSaid){ _pillSaid=pendNew; announce(p.textContent); }
 }
 // `explicit` = the user clicked the pill. Switching the wall to the
 // arrival order is right when they asked to see arrivals, and wrong when
@@ -3411,6 +3867,7 @@ if(LOCALE!=='en'){
     I18N=d||{};
     applyI18n();
     stripKbdHint();   // the catalogue restored the "( / )" hint; touch drops it again
+    nameControls();   // and the derived names follow the new language
     // The chip bar is a one-shot render that painted before the catalogue
     // arrived, and applyI18n can't reach it (the chips carry no data-i18n
     // markup) - rebuild it. render() runs whatever the view: in list mode the

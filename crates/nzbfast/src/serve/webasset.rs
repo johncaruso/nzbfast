@@ -31,11 +31,7 @@ pub(super) fn respond_page(req: tiny_http::Request, body: String, ctype: &str) {
     let mut if_none_match = false;
     for hdr in req.headers() {
         if hdr.field.equiv("Accept-Encoding") {
-            // Naive token scan; a client sending the pathological
-            // "gzip;q=0" gets a well-formed gzip response it is still
-            // required to decode-or-reject per its own header. Real
-            // browsers all send a plain token list.
-            accepts_gzip |= hdr.value.as_str().contains("gzip");
+            accepts_gzip |= gzip_accepted(hdr.value.as_str());
         } else if hdr.field.equiv("If-None-Match") {
             // May carry a list; substring match is exact enough because
             // our tags are fixed-width hex in quotes.
@@ -74,4 +70,62 @@ pub(super) fn respond_page(req: tiny_http::Request, body: String, ctype: &str) {
             .with_header(hdr("Vary", "Accept-Encoding"))
             .with_header(hdr("ETag", &etag)),
     );
+}
+
+/// Does this `Accept-Encoding` value permit a gzip body?
+///
+/// A token scan with the ONE quality value that changes the answer:
+/// `q=0` means "not acceptable", so a client that spells out
+/// `gzip;q=0` (or `*;q=0` with no gzip token of its own) must get
+/// identity. Plain `contains("gzip")` handed it a gzip body it had just
+/// said it would not take (L11, 10 Aug sweep). Any other q is a
+/// preference between encodings we do not have, and reads as plain
+/// acceptance.
+fn gzip_accepted(value: &str) -> bool {
+    let mut wildcard: Option<bool> = None;
+    for tok in value.split(',') {
+        let mut parts = tok.split(';').map(str::trim);
+        let name = parts.next().unwrap_or("");
+        if !name.eq_ignore_ascii_case("gzip") && name != "*" {
+            continue;
+        }
+        let ok = !parts.any(|p| {
+            p.strip_prefix("q=")
+                .or_else(|| p.strip_prefix("Q="))
+                .and_then(|q| q.trim().parse::<f32>().ok())
+                .is_some_and(|q| q <= 0.0)
+        });
+        // A gzip token of its own is the answer; `*` only decides when
+        // gzip is not named at all.
+        if name == "*" {
+            wildcard = Some(ok);
+        } else {
+            return ok;
+        }
+    }
+    wildcard.unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gzip_accepted;
+
+    /// `q=0` is a refusal, not a preference. The old substring scan
+    /// compressed for a client that had explicitly said it could not
+    /// take a compressed body (L11, 10 Aug sweep).
+    #[test]
+    fn a_zero_quality_gzip_is_a_refusal() {
+        assert!(gzip_accepted("gzip, deflate, br"));
+        assert!(gzip_accepted("gzip;q=1.0, identity;q=0.5"));
+        assert!(gzip_accepted("GZIP"));
+        assert!(gzip_accepted("*"));
+        assert!(!gzip_accepted("gzip;q=0"));
+        assert!(!gzip_accepted("deflate, gzip;q=0.0"));
+        assert!(!gzip_accepted("identity"));
+        assert!(!gzip_accepted(""));
+        assert!(!gzip_accepted("*;q=0"));
+        // A named gzip decides even when a wildcard disagrees.
+        assert!(gzip_accepted("*;q=0, gzip"));
+        assert!(!gzip_accepted("*, gzip;q=0"));
+    }
 }

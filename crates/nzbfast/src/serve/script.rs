@@ -35,18 +35,54 @@ use super::*;
 ///    the direct child is gone and a `join` on the drain threads blocked
 ///    until the descendant finished. That join ran on the daemon's
 ///    blocking pool, one leaked worker per completed job, and the pool
-///    is finite. The drains are therefore never joined - they are given
-///    a short grace and then abandoned, holding nothing but a bounded
-///    ring.
+///    is finite. The drains are therefore never joined.
+///
+///    They are not abandoned either (§144 item 4). Never joining them
+///    still left the thread, its 8 KB buffer and the pipe's read end
+///    alive for as long as the descendant lived - forever, for a script
+///    that daemonizes, and once per completed job. So on unix each
+///    drain polls a stop flag; the flag is set once the direct child
+///    has been reaped and the short grace below has passed, and the
+///    thread returns and drops its read end within one poll interval.
+///    The descendant is deliberately NOT killed: leaving a notifier or
+///    a media-server scan kick running is a legitimate thing for a
+///    post-script to do, and killing the process group on a CLEAN exit
+///    would break it. It simply stops costing us a thread and two FDs.
+///    A descendant that keeps writing gets EPIPE, which is what any
+///    process writing into a pipe nobody reads gets. Windows keeps the
+///    blocking drain - a pipe handle is not pollable without rewriting
+///    the reads as overlapped I/O, which is a bigger change than this
+///    fix warrants (the same reasoning as the kill path below).
 ///  - The same script when the deadline expires. `Child::kill` signals
 ///    the direct child alone, so on unix the child is given its own
 ///    process group and the whole group is signalled. Windows keeps the
 ///    single-process kill (a job object is the equivalent, and is a
 ///    bigger change than this fix warrants).
 pub(super) fn run_capped(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     secs: u64,
 ) -> std::io::Result<(Option<std::process::ExitStatus>, String)> {
+    let (status, _, stderr) = run_capped_inner(cmd, secs, false)?;
+    Ok((status, stderr))
+}
+
+/// §129 4a: `run_capped`, but the FIRST [`SCRIPT_OUT_HEAD`] bytes of
+/// stdout are kept too - the pre-queue verdict is stdout's opening
+/// lines, so the head is the interesting end (where stderr keeps its
+/// tail: the last words before death). Everything past the head is
+/// drained and dropped under the same never-join discipline.
+pub(super) fn run_capped_capture(
+    cmd: std::process::Command,
+    secs: u64,
+) -> std::io::Result<(Option<std::process::ExitStatus>, String, String)> {
+    run_capped_inner(cmd, secs, true)
+}
+
+fn run_capped_inner(
+    mut cmd: std::process::Command,
+    secs: u64,
+    capture_stdout: bool,
+) -> std::io::Result<(Option<std::process::ExitStatus>, String, String)> {
     use std::process::Stdio;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -61,14 +97,32 @@ pub(super) fn run_capped(
     }
     let mut child = cmd.spawn()?;
     let tail = Arc::new(Mutex::new(BoundedTail::default()));
-    // Detached on purpose: see the doc comment. Each thread owns its pipe
-    // and exits when the last writer closes it, whenever that is.
+    let head = Arc::new(Mutex::new(Vec::<u8>::new()));
+    // Detached on purpose, and leashed: see the doc comment. Each thread
+    // owns its pipe and exits when the last writer closes it OR when
+    // this flag says we have stopped caring, whichever comes first.
+    let stop = Arc::new(AtomicBool::new(false));
     if let Some(r) = child.stdout.take() {
-        std::thread::spawn(move || drain_to_nowhere(r));
+        let (stop, g) = (stop.clone(), DrainGuard::new());
+        if capture_stdout {
+            let head = head.clone();
+            std::thread::spawn(move || {
+                let _g = g;
+                drain_into_head(r, &stop, &head)
+            });
+        } else {
+            std::thread::spawn(move || {
+                let _g = g;
+                drain_to_nowhere(r, &stop)
+            });
+        }
     }
     if let Some(r) = child.stderr.take() {
-        let tail = tail.clone();
-        std::thread::spawn(move || drain_into(r, &tail));
+        let (stop, tail, g) = (stop.clone(), tail.clone(), DrainGuard::new());
+        std::thread::spawn(move || {
+            let _g = g;
+            drain_into(r, &stop, &tail)
+        });
     }
     let deadline = (secs > 0).then(|| Instant::now() + std::time::Duration::from_secs(secs));
     let status = loop {
@@ -94,10 +148,13 @@ pub(super) fn run_capped(
     };
     // The child is gone; its own writes are already in the ring or in
     // flight. A short grace collects the tail end without waiting on any
-    // descendant that may still hold the pipe open.
+    // descendant that may still hold the pipe open - and then the drains
+    // are released, because nothing reads what arrives after this point.
     std::thread::sleep(std::time::Duration::from_millis(50));
+    stop.store(true, Ordering::Release);
     let stderr = tail.lock_ok().tail_text();
-    Ok((status, stderr))
+    let stdout = String::from_utf8_lossy(&head.lock_ok()).into_owned();
+    Ok((status, stdout, stderr))
 }
 
 /// How much of a script's stderr is worth keeping. Enough for a stack
@@ -136,17 +193,261 @@ impl BoundedTail {
     }
 }
 
-pub(super) fn drain_into(mut r: impl std::io::Read, tail: &Mutex<BoundedTail>) {
+/// Drain threads alive right now, across every `run_capped` in flight.
+///
+/// The never-join discipline means nothing else can observe them, and
+/// the §144 item 4 invariant - a script that has returned costs us
+/// nothing, however long its descendants live - is exactly this coming
+/// back to where it started. The regression test reads it; two relaxed
+/// atomics per script run is what that costs.
+pub(super) static DRAIN_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts one live drain thread for as long as it exists. Made by the
+/// spawning side (so the count is never briefly wrong while a thread
+/// starts up) and moved into the thread, which drops it on every exit
+/// path.
+pub(super) struct DrainGuard;
+
+impl DrainGuard {
+    fn new() -> Self {
+        DRAIN_THREADS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        DRAIN_THREADS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The pipe end a drain thread owns. On unix it has to be pollable, so
+/// the drain can come back to its stop flag between reads; on Windows
+/// the drain is a plain blocking read and `Read` is all it needs.
+#[cfg(unix)]
+pub(super) trait PipeRead: std::io::Read + std::os::unix::io::AsRawFd {}
+#[cfg(unix)]
+impl<T: std::io::Read + std::os::unix::io::AsRawFd> PipeRead for T {}
+#[cfg(not(unix))]
+pub(super) trait PipeRead: std::io::Read {}
+#[cfg(not(unix))]
+impl<T: std::io::Read> PipeRead for T {}
+
+/// How long a drain waits for the next byte before looking at its stop
+/// flag again. Short enough that a finished script's thread and FD are
+/// gone before anyone could observe them, long enough that an idle
+/// drain costs 20 wakeups a second and nothing else.
+#[cfg(unix)]
+const DRAIN_POLL_MS: libc::c_int = 50;
+
+/// Read `r` until EOF, an error, or `stop`, handing every chunk to
+/// `sink`.
+#[cfg(unix)]
+fn drain(mut r: impl PipeRead, stop: &AtomicBool, mut sink: impl FnMut(&[u8])) {
+    // `AsRawFd` comes in with `PipeRead`, which requires it on unix.
+    let fd = r.as_raw_fd();
+    // Non-blocking, so the loop always comes back to the flag: a read
+    // that finds nothing returns WouldBlock instead of parking in the
+    // kernel until a descendant we no longer own decides to speak.
+    let pollable = unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        fl >= 0 && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) >= 0
+    };
+    if !pollable {
+        // fcntl on a pipe we opened ourselves does not fail in practice.
+        // If it ever did, a thread that outlives its script is a much
+        // better failure than one that spins on a non-blocking read.
+        return drain_blocking(r, sink);
+    }
+    let mut buf = [0u8; 8192];
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        match r.read(&mut buf) {
+            // Every writer closed: the ordinary end, and the only one
+            // that happens while the direct child is still running.
+            Ok(0) => return,
+            Ok(n) => {
+                sink(&buf[..n]);
+                // Straight back to the read - a chatty script must not
+                // pay a poll per 8 KB. The flag check at the top of the
+                // loop still bounds a writer that never stops.
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return,
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // A failed poll needs no handling: the next iteration re-checks
+        // the flag and re-reads, which is all a successful one buys.
+        unsafe { libc::poll(&mut pfd, 1, DRAIN_POLL_MS) };
+    }
+}
+
+/// The pre-§144 drain: ends only when the last writer closes the pipe.
+/// Windows keeps it (see [`run_capped`]), and unix falls back to it if
+/// the descriptor cannot be made non-blocking.
+#[cfg(not(unix))]
+fn drain(r: impl PipeRead, _stop: &AtomicBool, sink: impl FnMut(&[u8])) {
+    drain_blocking(r, sink)
+}
+
+fn drain_blocking(mut r: impl std::io::Read, mut sink: impl FnMut(&[u8])) {
     let mut buf = [0u8; 8192];
     while let Ok(n) = r.read(&mut buf) {
         if n == 0 {
             return;
         }
-        tail.lock_ok().push(&buf[..n]);
+        sink(&buf[..n]);
     }
 }
 
-pub(super) fn drain_to_nowhere(mut r: impl std::io::Read) {
-    let mut buf = [0u8; 8192];
-    while matches!(r.read(&mut buf), Ok(n) if n > 0) {}
+pub(super) fn drain_into(r: impl PipeRead, stop: &AtomicBool, tail: &Mutex<BoundedTail>) {
+    drain(r, stop, |bytes| tail.lock_ok().push(bytes));
+}
+
+pub(super) fn drain_to_nowhere(r: impl PipeRead, stop: &AtomicBool) {
+    drain(r, stop, |_| {});
+}
+
+/// How much of a captured stdout's HEAD is kept - the pre-queue verdict
+/// is seven short lines, so this is generous, and everything past it is
+/// drained to nowhere so a chatty script still cannot spend memory.
+pub(super) const SCRIPT_OUT_HEAD: usize = 8 << 10;
+
+pub(super) fn drain_into_head(r: impl PipeRead, stop: &AtomicBool, head: &Mutex<Vec<u8>>) {
+    drain(r, stop, |bytes| {
+        let mut h = head.lock_ok();
+        let room = SCRIPT_OUT_HEAD.saturating_sub(h.len());
+        h.extend_from_slice(&bytes[..bytes.len().min(room)]);
+        // Past the head: keep draining (the drop above), never store.
+    });
+}
+
+impl Daemon {
+    /// M14d: post-processing hook with SABnzbd's contract - the 8
+    /// positional args and SAB_* env vars that the existing script
+    /// ecosystem (notifiers, sorters, library refreshers) expects.
+    /// §129 4a adds the NZBGet side of the same ecosystem: NZBPP_* env
+    /// and the 93/94/95 exit-code vocabulary, as a documented mapping
+    /// (decision 5's rule - map, never silently ignore).
+    pub(super) fn run_script(&self, script: &std::path::Path, job: &Arc<Mutex<Job>>) {
+        let (out_dir, name, cat, status, fail_msg, nzo_id, bytes, failure_link, repaired, shape) = {
+            let j = job.lock_ok();
+            (
+                j.out_dir.clone(),
+                j.name.clone(),
+                j.category.clone(),
+                // SAB pp-status: 0 = OK, 1 = failed verification.
+                if j.state == JobState::Completed {
+                    "0"
+                } else {
+                    "1"
+                },
+                j.fail_message.clone(),
+                j.nzo_id.clone(),
+                j.total_bytes,
+                j.failure_link.clone(),
+                j.bad_blocks.unwrap_or(0) > 0,
+                j.archive_shape.clone(),
+            )
+        };
+        let ok = status == "0";
+        let mut cmd = std::process::Command::new(script);
+        cmd.arg(&out_dir) // 1 final dir
+            .arg(format!("{name}.nzb")) // 2 original nzb name
+            .arg(&name) // 3 clean job name
+            .arg("") // 4 indexer report number
+            .arg(if cat.is_empty() { "*" } else { &cat }) // 5 category
+            .arg("") // 6 group
+            .arg(status) // 7 pp status
+            // 8 failure URL. We have carried the X-DNZB failure link on
+            // the job since the FailureLink work and were passing an
+            // empty string here, so a SAB script that does its own dead-
+            // post reporting had nothing to report to.
+            .arg(&failure_link)
+            .env("SAB_COMPLETE_DIR", &out_dir)
+            .env("SAB_FINAL_NAME", &name)
+            .env("SAB_FILENAME", format!("{name}.nzb"))
+            .env("SAB_CAT", if cat.is_empty() { "*" } else { &cat })
+            .env("SAB_PP_STATUS", status)
+            .env(
+                "SAB_STATUS",
+                if status == "0" { "Completed" } else { "Failed" },
+            )
+            .env("SAB_FAIL_MSG", &fail_msg)
+            .env("SAB_NZO_ID", &nzo_id)
+            .env("SAB_BYTES", bytes.to_string())
+            .env("SAB_URL", &failure_link)
+            .env("SAB_VERSION", SAB_VERSION)
+            // The NZBGet dialect of the same facts, so a VideoSort-class
+            // extension script runs unmodified. PARSTATUS/UNPACKSTATUS
+            // describe the one-pass engine in NZBGet's vocabulary:
+            // repair and unpack happen inside the download, so a clean
+            // completion says "0" (no par-check was owed) and a repaired
+            // one says "2" (checked and repaired); unpack reports "2"
+            // only when an archive was actually unpacked.
+            .env("NZBPP_DIRECTORY", &out_dir)
+            .env("NZBPP_FINALDIR", &out_dir)
+            .env("NZBPP_NZBNAME", &name)
+            .env("NZBPP_NZBFILENAME", format!("{name}.nzb"))
+            .env("NZBPP_CATEGORY", &cat)
+            .env("NZBPP_TOTALSTATUS", if ok { "SUCCESS" } else { "FAILURE" })
+            .env(
+                "NZBPP_STATUS",
+                if ok { "SUCCESS/ALL" } else { "FAILURE/BAD" },
+            )
+            .env(
+                "NZBPP_PARSTATUS",
+                if !ok {
+                    "1"
+                } else if repaired {
+                    "2"
+                } else {
+                    "0"
+                },
+            )
+            .env(
+                "NZBPP_UNPACKSTATUS",
+                if ok && !shape.is_empty() { "2" } else { "0" },
+            );
+        let secs = self.script_timeout.load(Ordering::Relaxed);
+        match run_capped(cmd, secs) {
+            Ok((Some(st), _)) if st.success() => {
+                info!(target: "script", "{} ok for {nzo_id}", script.display());
+            }
+            // NZBGet extension scripts answer in exit codes: 93 =
+            // POSTPROCESS_SUCCESS, 95 = POSTPROCESS_NONE ("not for
+            // me"). Neither is a failure; 94 (POSTPROCESS_ERROR) and
+            // anything else falls through to the warn below.
+            Ok((Some(st), _)) if st.code() == Some(93) => {
+                info!(target: "script", "{} ok for {nzo_id} (exit 93, nzbget success)", script.display());
+            }
+            Ok((Some(st), _)) if st.code() == Some(95) => {
+                info!(target: "script", "{} declined {nzo_id} (exit 95, nzbget none)", script.display());
+            }
+            Ok((Some(st), stderr)) => {
+                warn!(
+                    target: "script",
+                    "{} exited {st} for {nzo_id}: {}",
+                    script.display(),
+                    stderr.trim()
+                );
+            }
+            // No exit status = we killed it at the deadline.
+            Ok((None, _)) => warn!(
+                target: "script",
+                "{} still running after {secs}s for {nzo_id} - killed. \
+                 Raise or clear script_timeout_secs if it needs longer.",
+                script.display()
+            ),
+            Err(e) => warn!(target: "script", "{} failed to launch: {e}", script.display()),
+        }
+    }
 }

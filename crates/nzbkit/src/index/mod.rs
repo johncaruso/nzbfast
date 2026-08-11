@@ -23,14 +23,20 @@ use crate::nntp::OverEntry;
 
 mod browse;
 mod cards;
+mod claims;
+mod encrypted;
 mod evict;
 mod ingest;
 mod maintenance;
+mod nzbimport;
+mod pesto;
 mod predb;
 #[cfg(test)]
 mod predb_tests;
+mod probe;
 mod query;
 mod schema;
+mod scoreboard;
 mod spots;
 #[cfg(test)]
 mod testutil;
@@ -38,9 +44,15 @@ mod titles;
 
 pub use browse::*;
 pub use cards::*;
+pub use claims::{MSGID_KEYS_PER_FILE, NameClaim, NameEvidence, ProvenOutcome, msgid_set_key};
+pub use encrypted::{ENC_CLASS, EncKind};
 pub use evict::*;
 pub use ingest::*;
 pub use maintenance::*;
+pub use nzbimport::*;
+pub use pesto::*;
+pub use probe::*;
+pub use scoreboard::*;
 pub use spots::*;
 pub use titles::*;
 

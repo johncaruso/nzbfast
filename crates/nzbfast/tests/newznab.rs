@@ -976,7 +976,14 @@ async fn the_indexer_switch_defaults_off_and_closes_the_facade() {
     .unwrap();
     // An existing install, but one that never chose anything to index:
     // the migration must NOT read that as "was using the indexer".
-    std::fs::write(cfg.with_file_name("settings.json"), "{}").unwrap();
+    // Spots are pinned off because they default ON since TODO 131 and
+    // the index database backs BOTH sources - this test guards the
+    // "with both sources off the file is never created" invariant.
+    std::fs::write(
+        cfg.with_file_name("settings.json"),
+        "{\"spot_enabled\": false}",
+    )
+    .unwrap();
 
     let d = serve(&dir, |port| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));

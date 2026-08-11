@@ -289,6 +289,62 @@ fn the_volume_trash_takes_over_when_finder_will_not() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A scratch path in `$TMPDIR` is never sent to the Trash, and a real
+/// download path still is.
+///
+/// The recoverable route exists to make a wrong guess about the USER's
+/// data survivable. `$TMPDIR` holds our own scratch and the test suites'
+/// fixtures, so binning it only hands the user junk to empty - and on
+/// macOS it misbehaves outright: the Finder call is bounded, whoever owns
+/// the scratch dir deletes it while Finder is still working, and Finder
+/// puts a modal "-43" on the desktop long after the run that caused it.
+/// Every integration test spawns a real `nzbfast` child against a
+/// `nzbfast-*` dir in `$TMPDIR`, and none of them are `cfg(test)` in the
+/// binary they drive, so this rule is the only thing covering them.
+///
+/// Pins `path_is_under` rather than `under_temp_dir`, which answers false
+/// under `cfg(test)` so the three tests above can still reach the Trash.
+/// The `/var` -> `/private/var` case is the one that matters on macOS: a
+/// caller holding the uncanonicalized path must not slip past.
+#[test]
+fn a_temp_path_is_never_worth_the_trash() {
+    let tmp = std::env::temp_dir();
+    let scratch = tmp.join(format!("nzbfast-tempgate-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let f = scratch.join("spent.par2");
+    std::fs::write(&f, b"x").unwrap();
+
+    assert!(
+        super::path_is_under(&f, &tmp),
+        "a file in the scratch dir must read as temp"
+    );
+
+    // macOS canonicalizes $TMPDIR to /private/var/folders/... while the
+    // same file is equally reachable as /var/folders/... - the symlink
+    // must not defeat the check. Built from the file that really exists,
+    // because canonicalize only resolves a path that is there; a name
+    // that is not falls back to itself by design (see `path_is_under`),
+    // and that case cannot exercise the symlink at all.
+    #[cfg(target_os = "macos")]
+    if let Ok(rest) = f.strip_prefix("/private") {
+        let twin = std::path::Path::new("/").join(rest);
+        assert!(twin.exists(), "the /var twin of a temp path must resolve");
+        assert!(
+            super::path_is_under(&twin, &tmp),
+            "the /private symlink must not slip a temp path past the gate"
+        );
+    }
+
+    // A download living somewhere real is untouched by this rule: it is
+    // the user's data and the Trash is exactly what it wants.
+    assert!(
+        !super::path_is_under(std::path::Path::new("/srv/media/downloads/m.mkv"), &tmp),
+        "a real download path must still be eligible for the Trash"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 // No test toggles TRASH any more, deliberately. Turning it on for even
 // one assertion turns it on for whatever sweep is running in parallel,
 // which empties that test's fixtures into the developer's real Trash.

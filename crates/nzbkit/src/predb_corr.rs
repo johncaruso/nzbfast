@@ -18,6 +18,27 @@
 //! writes that act on a score live in `index.rs`; the constants and the
 //! arithmetic live here so they can be argued about (and tested) in one
 //! place.
+//!
+//! # Correlation ships SUGGEST-ONLY. The bar for ever flipping auto
+//!
+//! (`predb_corr_auto`, default off - red-team of the indexer-
+//! competitive bundle, 10 Aug 2026.) The only precision evidence ever
+//! collected for auto-shaped candidates was ~22 hand-inspected rows
+//! judged on the scorer's own inputs - zero byte-level ground truth -
+//! and an independent audit showed the strong-suggestion pool was
+//! dominated by a lane (single-`.7z` reposts) whose true byte-recovered
+//! names provably differ from the correlated guesses. The download-time
+//! revoke oracle only fires when someone downloads; the wall and the
+//! newznab facade are exposed before that. So: suggestions are the
+//! product, auto is an unproven extra.
+//!
+//! Do not enable `predb_corr_auto` by default (or advise a user to)
+//! until a suggest-only production run has accumulated REAL
+//! `pre_corr` verdicts - order 300+ 'confirmed' against ~0 'rejected'
+//! (bounds the false-positive rate under ~1% at 95% confidence), PER
+//! size bucket, with the byte-probe-nameable lanes excluded from the
+//! population (they are, see `corr_naming_population`) - not another
+//! eyeballed sample. `predb_corr_stats` is the meter.
 
 use crate::release::Kind;
 

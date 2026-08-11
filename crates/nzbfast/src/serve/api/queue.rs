@@ -782,8 +782,12 @@ fn m_dashboard(
     } else {
         Value::Null
     };
-    let (events, reset) = match since {
-        None => (Vec::new(), false),
+    // The cursor comes back from `life_since` itself, read under the
+    // ring lock beside the batch: a separate load here could count an
+    // event this answer does not carry, and the client - which adopts
+    // whatever cursor it is handed - would never ask for it again.
+    let (events, reset, events_seq) = match since {
+        None => (Vec::new(), false, d.life_cursor()),
         Some(n) => d.life_since(n),
     };
     let stats = m_stats(d, req, params, ctx, api_body)?;
@@ -794,7 +798,7 @@ fn m_dashboard(
         "history": history,
         "stats": stats,
         "events": events,
-        "events_seq": d.life_seq.load(Ordering::Relaxed),
+        "events_seq": events_seq,
         "events_reset": reset,
     }))
 }
@@ -1028,6 +1032,10 @@ fn m_stats(
                 "disk_write_bytes": nzbkit::disk::bytes_written(),
             },
             "nested_prevalence": nested_prevalence,
+            // Status chip strip: background subsystems active right
+            // now, as short tokens the page maps to chip.* phrases.
+            // Queue-side states ride the slots, never this list.
+            "busy": d.busy.active(),
         })
     })
 }
@@ -1077,7 +1085,11 @@ fn m_addfile(
                 let stream = params.get("stream").map(String::as_str) == Some("1");
                 let prio = if stream { 2 } else { param_priority(params) };
                 let origin = api_origin(ctx.ua_hdr, origin_of(params));
-                match d.enqueue(&bytes, &fname, &cat, prio, pw, &origin, false) {
+                // The requested pp rides into enqueue so the pre-queue
+                // hook can see it (L6); record_add_params below still
+                // owns recording it on the job.
+                let pp = sab_pp_param(params.get("pp").map(String::as_str));
+                match d.enqueue(&bytes, &fname, &cat, prio, pp, pw, &origin, false) {
                     // §129 2b: pp=/script= used to be accepted and
                     // silently dropped; now they are recorded on the
                     // job (and the pp mapping logged - decision 5).
@@ -1146,7 +1158,9 @@ fn m_addurl(
                 let name = explicit
                     .or_else(|| name_from_fetch(&f, &url))
                     .unwrap_or_else(|| "download.nzb".to_string());
-                match d.enqueue_fetched(&f, &name, &cat, prio, pw.as_deref(), 0, &origin, false) {
+                let pp = sab_pp_param(params.get("pp").map(String::as_str));
+                match d.enqueue_fetched(&f, &name, &cat, prio, pp, pw.as_deref(), 0, &origin, false)
+                {
                     // §129 2b: same pp=/script= recording as addfile.
                     Ok(id) => {
                         d.record_add_params(
@@ -1284,19 +1298,27 @@ fn m_queue_save(
     _api_body: &mut Option<Vec<u8>>,
 ) -> Option<Value> {
     Some({
-        let saved = d.save_queue();
+        let queue_ok = d.save_queue();
         // "Save queue" is the remedy the durability errors name, and
         // since §129 1a the history record lives in its own store - a
         // full flush has to rewrite that too, or the remedy would not
-        // remedy a failed history write.
-        d.history_compact();
+        // remedy a failed history write. Its outcome is part of the
+        // answer: reporting success off save_queue alone told the user
+        // the remedy had worked while the half they were being told to
+        // remedy had failed again (H3, 10 Aug sweep).
+        let hist_ok = d.history_compact();
+        let saved = queue_ok && hist_ok;
         if saved {
             info!(target: "queue", "queue re-saved on request");
         }
         json!({"status": saved, "saved": saved,
-        "error": if saved { Value::Null } else {
-            json!("the queue still could not be written - check free space \
-                   and write permission on the data folder")
+        "error": match (queue_ok, hist_ok) {
+            (true, true) => Value::Null,
+            (true, false) => json!("the queue was written, but the history could \
+                   not be - check free space and write permission on the data \
+                   folder"),
+            _ => json!("the queue still could not be written - check free space \
+                   and write permission on the data folder"),
         }})
     })
 }
@@ -1507,6 +1529,15 @@ fn m_queue(
                 }
                 if count > 0 {
                     d.save_queue();
+                    // Deleting the last queued job empties the queue
+                    // without a park, so park's queue.idle would never
+                    // fire (M3). Not while an active download is
+                    // draining: it has left the queue but its pipeline
+                    // has not stopped, and its own park announces the
+                    // real transition a moment later.
+                    if !stopped_active {
+                        d.note_queue_idle();
+                    }
                 }
                 json!({"status": count > 0, "removed": count})
             }
@@ -1537,6 +1568,12 @@ fn m_queue(
                 }
                 if n > 0 {
                     d.save_queue();
+                    // Pausing the last runnable job is the other way the
+                    // queue goes idle without a park (M3). Resume takes
+                    // the same call deliberately: it re-arms nothing on
+                    // its own, and the latch keeps a still-idle queue
+                    // silent.
+                    d.note_queue_idle();
                 }
                 if n == 0 && finishing > 0 {
                     json!({"status": false, "error": "this job is still finishing"})

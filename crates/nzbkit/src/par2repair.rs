@@ -2151,10 +2151,6 @@ fn repair_mapped_inner(
     let touched: Vec<usize> = (0..files.len()).collect();
     let machine = std::thread::available_parallelism().map_or(4, |n| n.get());
     let threads = machine.min(touched.len()).max(1);
-    // Cores left over from the file fan-out drive block-parallel MD5
-    // inside each rebuilt file (§129): the self-prove of one big file
-    // no longer serialises on a single MD5 chain.
-    let inner = (machine / threads).max(1);
     let chunk = touched.len().div_ceil(threads);
     let mut results: Vec<Option<Result<(), RepairError>>> =
         (0..touched.len()).map(|_| None).collect();
@@ -2171,40 +2167,6 @@ fn repair_mapped_inner(
                     let md5_this = full_verify
                         || rebuilt_files.contains(&fi)
                         || f.blocks.len() as u64 != f.length.div_ceil(bs);
-                    let n_slices = f.length.div_ceil(bs) as usize;
-                    if md5_this
-                        && inner > 1
-                        && n_slices >= 2
-                        && f.blocks.len() >= n_slices
-                        && f.length >= HASH_PAR_MIN_BYTES
-                    {
-                        // The reread itself is untouched - every byte
-                        // still comes back through io.read AFTER the
-                        // patch (the load-bearing self-prove) - but the
-                        // proof is the per-block IFSC MD5s, hashed
-                        // across lanes, instead of one serial
-                        // whole-file chain. Same every-byte statement;
-                        // see hash_blocks_par.
-                        *r = Some(
-                            hash_blocks_par(
-                                &|off, b| io.read(fi, off, b),
-                                f.length,
-                                f.length,
-                                &f.blocks,
-                                block_size,
-                                true,
-                                inner,
-                            )
-                            .and_then(|(_, ok)| {
-                                if ok {
-                                    Ok(())
-                                } else {
-                                    Err(RepairError::VerifyFailed(f.name.clone()))
-                                }
-                            }),
-                        );
-                        continue;
-                    }
                     let one = (|| {
                         let mut hasher = Md5::new();
                         let mut crc = crc32fast::Hasher::new();
@@ -2771,14 +2733,37 @@ struct Target {
     exists: bool,
 }
 
+/// Ceiling on one packet file. Every consumer below reads a packet file
+/// WHOLE (`std::fs::read`, because `scan_packets` walks a slice and
+/// recovery slices are copied straight out of it), so this is the bound
+/// on how much attacker-chosen input one directory entry can turn into
+/// resident memory.
+///
+/// It applies by SIZE, never by name: the extension is chosen by the
+/// poster, so letting `*.par2` past a bound that extensionless volumes
+/// have to clear would make the bound optional - rename the file and it
+/// is gone (Codex sweep 10 Aug, M4). A real recovery volume is orders of
+/// magnitude under this; a file over it is either not a volume at all or
+/// one no repair could afford to load.
+pub const MAX_PACKET_FILE_BYTES: u64 = 1 << 30;
+
 /// Gather the PAR2 packet files in `dir`: `*.par2` by name, plus
 /// magic-sniffed files (obfuscated posts rename recovery volumes too, and
 /// par2cmdline - handed extra files - loads packets from them, so do we).
-/// Sniffing costs one 8-byte read per file; oversized sniff hits are
-/// skipped rather than slurped. Returns (sorted packet files, the subset
+/// Sniffing costs one 8-byte read per file. Oversized candidates are
+/// skipped rather than slurped, by name and by sniff alike - see
+/// [`MAX_PACKET_FILE_BYTES`]. Returns (sorted packet files, the subset
 /// found by sniff rather than name).
 fn collect_packet_files(dir: &Path) -> Result<(Vec<PathBuf>, HashSet<PathBuf>), RepairError> {
-    const MAX_SNIFFED_PACKET_BYTES: u64 = 1 << 30;
+    collect_packet_files_bounded(dir, MAX_PACKET_FILE_BYTES)
+}
+
+/// [`collect_packet_files`] with the ceiling spelled out, so a test can
+/// exercise the bound without writing a gigabyte.
+fn collect_packet_files_bounded(
+    dir: &Path,
+    max_bytes: u64,
+) -> Result<(Vec<PathBuf>, HashSet<PathBuf>), RepairError> {
     let mut packet_files: Vec<PathBuf> = Vec::new();
     let mut sniffed: HashSet<PathBuf> = HashSet::new();
     for e in std::fs::read_dir(dir)? {
@@ -2787,14 +2772,20 @@ fn collect_packet_files(dir: &Path) -> Result<(Vec<PathBuf>, HashSet<PathBuf>), 
             continue;
         }
         let p = e.path();
+        let len = e.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
         if p.extension()
             .is_some_and(|x| x.eq_ignore_ascii_case("par2"))
         {
+            if len > max_bytes {
+                warn!(
+                    file = %p.display(),
+                    bytes = len,
+                    "skipping oversized .par2 - past the packet-file ceiling"
+                );
+                continue;
+            }
             packet_files.push(p);
-        } else if e
-            .metadata()
-            .is_ok_and(|m| m.len() >= 64 && m.len() <= MAX_SNIFFED_PACKET_BYTES)
-        {
+        } else if (64..=max_bytes).contains(&len) {
             let mut head = [0u8; 8];
             let ok = File::open(&p)
                 .and_then(|mut f| f.read_exact(&mut head))
@@ -3680,9 +3671,6 @@ fn repair_dir_set_inner(
     if !checks.is_empty() {
         let machine = std::thread::available_parallelism().map_or(4, |n| n.get());
         let threads = machine.min(checks.len()).max(1);
-        // Leftover cores go to block-parallel hashing inside each file
-        // (§129) - a single big patched target uses the whole machine.
-        let inner = (machine / threads).max(1);
         let chunk = checks.len().div_ceil(threads);
         let mut results: Vec<Option<Result<bool, RepairError>>> =
             (0..checks.len()).map(|_| None).collect();
@@ -3691,7 +3679,7 @@ fn repair_dir_set_inner(
             for (cchunk, rchunk) in checks.chunks(chunk).zip(results.chunks_mut(chunk)) {
                 s.spawn(move || {
                     for ((path, ti), r) in cchunk.iter().zip(rchunk) {
-                        *r = Some(md5_matches(path, &targets_ref[*ti].file, bs, inner));
+                        *r = Some(md5_matches(path, &targets_ref[*ti].file));
                     }
                 });
             }
@@ -3804,25 +3792,41 @@ const HASH_CHUNK: usize = 4 << 20;
 const HASH_POOL_BYTES: usize = 64 << 20;
 /// Below this many readable bytes the thread fan-out is not worth its
 /// setup; the serial single-pass scanner keeps the small-file path.
+#[cfg(not(fuzzing))]
 const HASH_PAR_MIN_BYTES: u64 = 8 << 20;
+/// Under cargo-fuzz the gate drops to 8 KiB. `par2_verify_diff` exists to
+/// prove the two verify paths cannot disagree, and a gate it can only
+/// cross by writing 8 MiB per case would cost ~30 executions a second -
+/// the parallel branch would be fuzzed at a rate that finds nothing. The
+/// threshold is a performance choice, not part of the verdict rule, so
+/// lowering it changes which path answers and never what it answers.
+#[cfg(fuzzing)]
+const HASH_PAR_MIN_BYTES: u64 = 8 << 10;
 
-/// Hash every block of one file across a worker pool: per-block CRC32
-/// presence plus (optionally) the per-block IFSC MD5s.
+/// The pool gate, readable from outside the crate so `par2_verify_diff`
+/// can assert it is small enough for the files that target writes. The
+/// failure this guards is silent: if `--cfg fuzzing` ever stops reaching
+/// this crate, the gate goes back to 8 MiB, every generated case takes
+/// the serial path, and the differential keeps passing while proving
+/// nothing about the parallel one.
+#[doc(hidden)]
+pub fn hash_par_min_bytes() -> u64 {
+    HASH_PAR_MIN_BYTES
+}
+
+/// Per-block CRC32 presence for one file, across a worker pool.
 ///
-/// Returns `(crc_ok, all_md5_ok)`. `crc_ok[i]` reproduces the serial
-/// scanner's presence decision exactly: full blocks close at `bs`, the
-/// tail extends through its zero padding via `crc32_zeros`, and a block
-/// whose declared bytes are not all on disk is damage by definition and
-/// stays false. `all_md5_ok` says every block's IFSC MD5 (over the
-/// zero-padded block, per spec) matched.
+/// `crc_ok[i]` reproduces the serial scanner's presence decision
+/// exactly: full blocks close at `bs`, the tail extends through its
+/// zero padding via `crc32_zeros`, and a block whose declared bytes are
+/// not all on disk is damage by definition and stays false.
 ///
-/// Matching every padded block MD5 pins every byte of the declared
-/// length - the identical proof the whole-file MD5 makes, and exact for
-/// the same reason (both fail only through an MD5 collision, block
-/// scope vs file scope) - but block chains are INDEPENDENT, so they
-/// hash across cores where the whole-file chain is welded to one. That
-/// is the whole §129 win: soft MD5 at ~0.7 GB/s made an 8 GB verify a
-/// serial 11 s, twice per repair.
+/// PRESENCE only. This pool used to also check the per-block IFSC MD5s
+/// and hand back "every block matched" as a whole-file verdict (§129),
+/// which is a claim about the IFSC list, not about the FileDesc MD5 the
+/// contract names - see [`verify_pass1`] and [`md5_matches`] for why
+/// that stopped being a verdict (H7). Presence needs no such premise:
+/// it is defined by the IFSC CRC32s, so it is the pool's to answer.
 ///
 /// `limit` is how many bytes are readable (min of declared length and
 /// disk length); `threads` is this file's share of the machine, decided
@@ -3834,14 +3838,11 @@ fn hash_blocks_par(
     length: u64,
     blocks: &[BlockCheck],
     bs: usize,
-    want_md5: bool,
     threads: usize,
-) -> Result<(Vec<bool>, bool), RepairError> {
+) -> Result<Vec<bool>, RepairError> {
     let n_slices = length.div_ceil(bs as u64) as usize;
     if n_slices == 0 {
-        // A zero-length file has no blocks; "every block matched" is
-        // vacuous and must NOT stand in for the whole-file MD5.
-        return Ok((Vec::new(), false));
+        return Ok(Vec::new());
     }
     let mut crc_ok = vec![false; n_slices];
     let chunk_buf = bs.min(HASH_CHUNK);
@@ -3852,7 +3853,7 @@ fn hash_blocks_par(
     // Contiguous block ranges per worker: N sequential read streams,
     // not a random-access shuffle.
     let per = n_slices.div_ceil(workers);
-    let mut worker_out: Vec<Result<bool, RepairError>> = (0..workers).map(|_| Ok(true)).collect();
+    let mut worker_out: Vec<Result<(), RepairError>> = (0..workers).map(|_| Ok(())).collect();
     std::thread::scope(|s| {
         for (wi, (oks, res)) in crc_ok
             .chunks_mut(per)
@@ -3862,7 +3863,6 @@ fn hash_blocks_par(
             s.spawn(move || {
                 *res = (|| {
                     let mut buf = vec![0u8; chunk_buf];
-                    let mut all_md5 = true;
                     for (j, ok) in oks.iter_mut().enumerate() {
                         let bidx = wi * per + j;
                         let off = bidx as u64 * bs as u64;
@@ -3870,73 +3870,54 @@ fn hash_blocks_par(
                         let avail = limit.saturating_sub(off).min(bs as u64);
                         if avail < declared {
                             // Truncation: the serial pass never closes
-                            // this block's CRC either, and the file
-                            // cannot be clean.
-                            all_md5 = false;
+                            // this block's CRC either.
                             continue;
                         }
                         let mut crc = crc32fast::Hasher::new();
-                        let mut md5 = want_md5.then(Md5::new);
                         let mut p = 0u64;
                         while p < avail {
                             let take = ((avail - p) as usize).min(buf.len());
                             read_at(off + p, &mut buf[..take])?;
                             crc.update(&buf[..take]);
-                            if let Some(h) = md5.as_mut() {
-                                h.update(&buf[..take]);
-                            }
                             p += take as u64;
                         }
-                        let check = blocks.get(bidx);
-                        // Tail zero padding in O(log n) for the CRC,
-                        // exactly as the serial scanner does it.
+                        // Tail zero padding in O(log n), exactly as the
+                        // serial scanner does it.
                         let crc_val = if avail == bs as u64 {
                             crc.finalize()
                         } else {
                             crate::yenc_simd::crc32_zeros(crc.finalize(), bs as u64 - avail)
                         };
-                        *ok = check.is_some_and(|c| c.crc32 == crc_val);
-                        if let Some(mut h) = md5 {
-                            let mut pad = bs as u64 - avail;
-                            if pad > 0 {
-                                // MD5 has no zero-extension shortcut;
-                                // feed zeros through the bounded chunk.
-                                buf.fill(0);
-                                while pad > 0 {
-                                    let take = (pad as usize).min(buf.len());
-                                    h.update(&buf[..take]);
-                                    pad -= take as u64;
-                                }
-                            }
-                            let digest: [u8; 16] = h.finalize().into();
-                            if !check.is_some_and(|c| c.md5 == digest) {
-                                all_md5 = false;
-                            }
-                        }
+                        *ok = blocks.get(bidx).is_some_and(|c| c.crc32 == crc_val);
                     }
-                    Ok(all_md5)
+                    Ok(())
                 })();
             });
         }
     });
-    let mut all_md5_ok = want_md5;
     for r in worker_out {
-        all_md5_ok &= r?;
+        r?;
     }
-    Ok((crc_ok, all_md5_ok))
+    Ok(crc_ok)
 }
 
 /// What the verify pass learned about one target file.
-struct Pass1Out {
-    exists: bool,
-    intact: bool,
+///
+/// `#[doc(hidden)] pub` for the same reason [`SyndromeReport`] is: the
+/// `par2_verify_diff` fuzz target lives outside this crate and has to
+/// compare the verdicts of both verify paths against each other and
+/// against bytes it generated. Not part of the supported API surface.
+#[doc(hidden)]
+pub struct Pass1Out {
+    pub exists: bool,
+    pub intact: bool,
     /// Whole-file MD5 matched over the declared length: every block is
     /// present even if trailing junk keeps `intact` false.
-    clean: bool,
+    pub clean: bool,
     /// Per-block presence from the in-stream block CRC32s, for a
     /// damaged file with IFSC data (None when clean, absent, or the
     /// set has no IFSC packets - those fall back to all-false).
-    present: Option<Vec<bool>>,
+    pub present: Option<Vec<bool>>,
 }
 
 /// Target verification in ONE streaming pass: the whole-file MD5 and
@@ -3954,14 +3935,27 @@ struct Pass1Out {
 /// repair, never a wrong "Repaired". Same trade par2cmdline's own
 /// scanning makes, with a stronger backstop.
 ///
+/// The CLEAN verdict is the FileDesc whole-file MD5 and only that.
+/// "Every padded block MD5 matched" is a statement about the IFSC list,
+/// which is a SEPARATE claim in the same set - nothing binds the two,
+/// so a PAR2 pairing one file's FileDesc with another's IFSC under one
+/// file id passed the block proof and failed the MD5 (H7, 08-08 sweep;
+/// `ifsc_contradicting_the_filedesc_md5_is_rejected_by_both_paths`).
+/// Recomputing the spec's file id does not bind them either - it hashes
+/// hash16k, length and name, not the whole-file MD5 beside them.
+///
 /// `threads` is this file's share of the machine (see
-/// [`verify_all_targets`]). Above [`HASH_PAR_MIN_BYTES`], when the IFSC
-/// packets cover every slice, the pass runs block-parallel via
-/// [`hash_blocks_par`]: presence is the identical per-block CRC32
-/// decision, and the whole-file verdict comes from every padded block
-/// MD5 matching - the same every-byte proof, off the single-core MD5
-/// chain (§129).
-fn verify_pass1(
+/// [`verify_all_targets`]). It buys parallelism for one shape only: a
+/// file SHORT of its declared length cannot be clean whatever any hash
+/// says, so [`hash_blocks_par`]'s block-CRC32 presence scan is the
+/// whole answer there and runs across lanes. Everything else takes the
+/// serial pass below, which gets the whole-file MD5 and the per-block
+/// CRC32s out of one read.
+///
+/// `#[doc(hidden)] pub` for `par2_verify_diff` (see [`Pass1Out`]), which
+/// calls it at both thread counts over the same file.
+#[doc(hidden)]
+pub fn verify_pass1(
     path: &Path,
     file: &Par2File,
     bs: usize,
@@ -3985,27 +3979,23 @@ fn verify_pass1(
     if threads > 1
         && n_slices >= 2
         && file.blocks.len() >= n_slices
-        && file.length.min(disk_len) >= HASH_PAR_MIN_BYTES
+        && disk_len < file.length
+        && disk_len >= HASH_PAR_MIN_BYTES
     {
-        let limit = file.length.min(disk_len);
         let fref = &f;
-        let (crc_ok, all_md5) = hash_blocks_par(
+        let crc_ok = hash_blocks_par(
             &|off, buf| crate::disk::read_exact_at(fref, buf, off),
-            limit,
+            disk_len,
             file.length,
             &file.blocks,
             bs,
-            // A short file cannot be clean; skip the MD5 lanes and keep
-            // the CRC presence scan.
-            disk_len >= file.length,
             threads,
         )?;
-        let md5_ok = disk_len >= file.length && all_md5;
         return Ok(Pass1Out {
             exists: true,
-            intact: md5_ok && disk_len == file.length,
-            clean: md5_ok,
-            present: if md5_ok { None } else { Some(crc_ok) },
+            intact: false,
+            clean: false,
+            present: Some(crc_ok),
         });
     }
     let mut whole = Md5::new();
@@ -4146,38 +4136,18 @@ fn read_full(f: &mut File, mut buf: &mut [u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Whole-file proof for a patched target. With full IFSC coverage and
-/// enough bytes, the proof is every padded block MD5 matching, hashed
-/// block-parallel across `threads` lanes (see [`hash_blocks_par`] for
-/// why that is the same every-byte statement as the whole-file MD5);
-/// otherwise the serial whole-file chain.
-fn md5_matches(
-    path: &Path,
-    file: &Par2File,
-    bs: usize,
-    threads: usize,
-) -> Result<bool, RepairError> {
+/// Whole-file proof for a patched target: the FileDesc MD5 over the
+/// bytes as they will actually be read afterwards - M2c's self-proving
+/// contract, and nothing else stands in for it (H7).
+///
+/// `#[doc(hidden)] pub` for `par2_verify_diff` (see [`Pass1Out`]): the
+/// third verdict in the differential, and the one the other two must
+/// not contradict.
+#[doc(hidden)]
+pub fn md5_matches(path: &Path, file: &Par2File) -> Result<bool, RepairError> {
     let mut f = File::open(path)?;
     if f.metadata()?.len() != file.length {
         return Ok(false);
-    }
-    let n_slices = file.length.div_ceil(bs as u64) as usize;
-    if threads > 1
-        && n_slices >= 2
-        && file.blocks.len() >= n_slices
-        && file.length >= HASH_PAR_MIN_BYTES
-    {
-        let fref = &f;
-        let (_, all_md5) = hash_blocks_par(
-            &|off, buf| crate::disk::read_exact_at(fref, buf, off),
-            file.length,
-            file.length,
-            &file.blocks,
-            bs,
-            true,
-            threads,
-        )?;
-        return Ok(all_md5);
     }
     let mut hasher = Md5::new();
     let mut buf = vec![0u8; 1 << 20];

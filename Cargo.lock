@@ -1265,9 +1265,9 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lzma-rust2"
-version = "0.16.5"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca93e534d1142d1d0dcca6d25fe302508a5dfb40b302802904577725ea0b695b"
+checksum = "243cb2271683c2855cad62142cbf38199db439b1b1e1ccdd5a011342894dd7cc"
 
 [[package]]
 name = "md-5"
@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "nzbfast"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
  "anyhow",
  "clap",
@@ -1495,6 +1495,7 @@ dependencies = [
  "flate2",
  "getrandom 0.2.17",
  "hex",
+ "hmac 0.12.1",
  "image",
  "libc",
  "libmimalloc-sys",
@@ -1570,8 +1571,9 @@ dependencies = [
 
 [[package]]
 name = "nzbtray"
-version = "1.0.21"
+version = "1.0.22"
 dependencies = [
+ "rustls",
  "serde_json",
  "sha2 0.10.9",
  "ureq",
@@ -2078,9 +2080,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-rust2"
-version = "0.21.3"
+version = "0.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b5d71c87d24cb22976f3f6e6c2c9296ef1f6958394e2b868d56ca01b082798a"
+checksum = "20acd38118edb830eb5a0bfacaf83c687b9995f48d6983cdac3cb18ce1d571cc"
 dependencies = [
  "aes 0.9.1",
  "bzip2",

@@ -4,6 +4,26 @@
 //!
 //! Split out of serve/mod.rs by TODO 106 phase 4 - the code is verbatim,
 //! only visibility changed.
+//!
+//! Two tiers of guard live here, and which one a caller wants depends on
+//! who chose the URL:
+//!
+//! - [`fetch_url`] for a link the USER supplied (addurl, /watch). The
+//!   SSRF guard refuses cloud metadata and link-local and nothing else;
+//!   loopback and the LAN are legitimate targets for a self-hosted app.
+//! - [`fetch_url_from`] for a link a configured source's own RESPONSE
+//!   supplied (a newznab `<enclosure url>`, an RSS item link). Same
+//!   guard, plus the destination is bound to the origin that offered it,
+//!   so the loopback/LAN concession above cannot be borrowed by a
+//!   hostile indexer to reach a service it does not own. See
+//!   [`OriginBoundResolver`]; [`failure_link_allowed`] is the same idea
+//!   applied to a response HEADER.
+//!
+//! The origin a link is bound to is a [`SourceOrigin`]: the source's
+//! configured URL AND the addresses it actually answered the search
+//! from, captured by [`witness_resolution`]. Both halves are needed -
+//! see [`OriginBoundResolver`] for why the URL alone leaves a
+//! cross-request rebinding window open.
 
 use super::*;
 
@@ -48,6 +68,148 @@ pub(crate) fn is_forbidden_fetch_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// Is this address INSIDE the user's own network - the class
+/// [`is_forbidden_fetch_ip`] deliberately lets through because a
+/// self-hosted app's normal indexer lives there?
+///
+/// That function answers "never a legitimate target anywhere". This
+/// answers the softer question the enclosure rule needs: "would reaching
+/// this address let whatever answered a search pick a machine, or a
+/// port, on the user's LAN?" Loopback, RFC1918, CGNAT (Tailscale) and
+/// v6 ULA all qualify. The always-forbidden ranges are folded in too, so
+/// a caller that only consults this one gets the union, never less.
+pub(crate) fn is_private_fetch_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    if is_forbidden_fetch_ip(ip) {
+        return true;
+    }
+    match ip {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            a.is_loopback()
+                || a.is_private() // 10/8, 172.16/12, 192.168/16
+                // 100.64/10 CGNAT - Tailscale, and carrier NAT
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(a) => {
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return is_private_fetch_ip(IpAddr::V4(v4));
+            }
+            // fc00::/7 unique-local covers both fc00::/8 and fd00::/8.
+            a.is_loopback() || (a.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+// ---- Search-time address witness -----------------------------------
+//
+// ureq offers no way to ask a Response which address it was fetched
+// over, and the search agent is deliberately shared process-wide (the
+// Agent IS the connection pool). So the guard resolver records what it
+// handed back, into a THREAD-LOCAL armed only for the duration of one
+// fetch. ureq is blocking and resolves on the calling thread, so the
+// scope that arms it is exactly the scope that reads it back - no
+// cross-request table to bound, and no way for a concurrent search
+// against another indexer to leak an address into this one's answer.
+thread_local! {
+    /// `Some` only inside [`witness_resolution`]. Each entry is one
+    /// resolver call: the netloc asked for, and the addresses returned.
+    static WITNESS: std::cell::RefCell<Option<Vec<(String, Vec<std::net::IpAddr>)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Cap on recorded resolutions per witnessed fetch. One fetch resolves
+/// once per hop and the redirect cap is 10, so this is slack, not a
+/// policy: it exists only so a pathological redirect chain cannot grow
+/// the buffer without bound.
+const WITNESS_MAX: usize = 24;
+
+/// Note one resolver answer, when a witness scope is armed.
+fn note_resolution(netloc: &str, addrs: &[std::net::SocketAddr]) {
+    WITNESS.with(|w| {
+        if let Ok(mut w) = w.try_borrow_mut()
+            && let Some(seen) = w.as_mut()
+            && seen.len() < WITNESS_MAX
+        {
+            seen.push((
+                netloc.to_ascii_lowercase(),
+                addrs.iter().map(|a| a.ip()).collect(),
+            ));
+        }
+    });
+}
+
+/// Run one fetch with recording armed, and hand back every address
+/// `netloc` resolved to while it ran.
+///
+/// `netloc` is spelled the way [`url_netloc`] spells it, which is the
+/// way ureq spells it - the comparison is against what the resolver was
+/// asked for, so the two have to agree.
+///
+/// The result is the SEARCH-time truth that a later grab is checked
+/// against; see [`SourceOrigin`]. A fetch that resolved something else
+/// (a redirect hop, a sibling host) contributes nothing here.
+pub(crate) fn witness_resolution<T>(
+    netloc: &str,
+    f: impl FnOnce() -> T,
+) -> (T, Vec<std::net::IpAddr>) {
+    // Save and restore rather than assume no nesting: a future caller
+    // that wraps a witnessed fetch in another must not silently blank
+    // the outer one's record.
+    let prev = WITNESS.with(|w| w.borrow_mut().replace(Vec::new()));
+    let out = f();
+    let seen = WITNESS.with(|w| w.borrow_mut().take()).unwrap_or_default();
+    WITNESS.with(|w| *w.borrow_mut() = prev);
+    let want = netloc.to_ascii_lowercase();
+    let mut addrs: Vec<std::net::IpAddr> = Vec::new();
+    for (at, ips) in seen {
+        if at == want {
+            for ip in ips {
+                if !addrs.contains(&ip) {
+                    addrs.push(ip);
+                }
+            }
+        }
+    }
+    (out, addrs)
+}
+
+/// A configured source that supplied a link in its own RESPONSE, and
+/// where that source actually answered from.
+///
+/// `url` is what the user configured (an indexer's URL, an RSS feed's).
+/// `addrs` is what its netloc resolved to when the SEARCH was made -
+/// the fact a later grab is checked against, and the whole reason this
+/// is a struct rather than the bare string it used to be. See
+/// [`OriginBoundResolver`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SourceOrigin {
+    pub(crate) url: String,
+    pub(crate) addrs: Vec<std::net::IpAddr>,
+}
+
+impl SourceOrigin {
+    /// The origin of a link supplied by a response fetched at `addrs`.
+    /// Build it at SEARCH time, from [`witness_resolution`], and carry
+    /// it with the result: a rebuild at grab time re-resolves, which is
+    /// exactly the window being closed.
+    pub(crate) fn witnessed(url: &str, addrs: Vec<std::net::IpAddr>) -> Self {
+        Self {
+            url: url.to_string(),
+            addrs,
+        }
+    }
+
+    /// An origin with no witnessed address. Public targets are
+    /// unaffected; every PRIVATE one is refused, because there is
+    /// nothing to prove the source was ever there. Only for a caller
+    /// that genuinely has no search behind it.
+    #[cfg(test)]
+    pub(crate) fn unwitnessed(url: &str) -> Self {
+        Self::witnessed(url, Vec::new())
+    }
+}
+
 /// ureq resolver that refuses to hand back any internal address. Because
 /// ureq connects to exactly the SocketAddrs returned here (no second
 /// lookup), this closes the DNS-rebinding window AND re-checks on every
@@ -57,6 +219,7 @@ impl ureq::Resolver for SsrfGuardResolver {
     fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
         use std::net::ToSocketAddrs;
         let addrs: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
+        note_resolution(netloc, &addrs);
         if addrs.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -79,6 +242,152 @@ impl ureq::Resolver for SsrfGuardResolver {
 pub(crate) fn ssrf_safe_agent(redirects: u32, timeout_secs: u64) -> ureq::Agent {
     ureq::AgentBuilder::new()
         .resolver(SsrfGuardResolver)
+        .redirects(redirects)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+}
+
+/// The SSRF guard PLUS the origin rule for links a configured source
+/// handed back: a private/loopback destination is only reachable when it
+/// is the very socket the source itself lives on.
+///
+/// Why this exists: [`is_forbidden_fetch_ip`] deliberately permits
+/// loopback and the LAN, because a self-hosted downloader's indexer is
+/// normally right there. That concession is safe for a URL the USER
+/// typed and unsafe for one an indexer's search RESPONSE supplied - a
+/// compromised (or merely hostile) indexer could hand back
+/// `http://127.0.0.1:<other>/...` and make the daemon issue a blind GET
+/// against a different service on the user's own box. Binding the fetch
+/// to the origin is the same move [`failure_link_allowed`] already makes
+/// for response-supplied failure links, for the same reason.
+///
+/// Cross-origin is NOT refused outright: an indexer serving its NZBs
+/// from a sibling download host or a CDN is a real pattern, and those
+/// are public addresses. Only cross-origin PRIVATE targets are refused.
+///
+/// Port-strict, unlike the failure-link host check. There the question
+/// is whose server we call; here a neighbouring port on the same private
+/// host IS the pivot being described, and every indexer shape in the
+/// wild (Prowlarr, NZBHydra2, nzbfast's own newznab endpoint) serves its
+/// downloads from the port it answers searches on.
+///
+/// **Same netloc is not the same machine** (M9). The netloc is a name,
+/// and names are resolved fresh on every request. A hostile public
+/// indexer can answer the SEARCH from a public address and then repoint
+/// that hostname at loopback or the LAN before the GRAB: the resolver
+/// dials exactly the new answer and, comparing netlocs alone, calls it
+/// the source's own socket. So a private target must ALSO be one of the
+/// addresses the source answered the search from - the `addrs` half of
+/// [`SourceOrigin`], captured at search time and carried here.
+///
+/// Two dead ends, so they are not re-derived:
+///
+/// - Pinning the addresses when this resolver is BUILT does not help.
+///   It is built per grab, by which time a hostile DNS already answers
+///   privately. The address has to come from the earlier request.
+/// - Refusing same-origin private targets outright does not work
+///   either: a LAN NZBHydra or Prowlarr is a supported, common setup,
+///   and breaking it is worse than the hole.
+///
+/// An unwitnessed origin therefore refuses private targets. That fails
+/// closed, and safely: every producer of a `SourceOrigin` builds it
+/// from the search that supplied the link, so the only way to arrive
+/// here empty is a public source (unaffected) or a genuine renumber
+/// between search and grab, which the next search re-witnesses.
+pub(super) struct OriginBoundResolver {
+    /// `host:port` of the configured source, lowercased, with the
+    /// scheme's default port filled in - see [`url_netloc`]. Empty when
+    /// the source URL could not be parsed, which refuses every private
+    /// target rather than guessing: the safe direction.
+    origin: String,
+    /// The addresses that netloc answered the SEARCH from. A private
+    /// target outside this set is a rebind, not the source.
+    witnessed: Vec<std::net::IpAddr>,
+}
+
+impl OriginBoundResolver {
+    /// Bind to `origin` - the source's configured URL and the addresses
+    /// it answered the search from, not the link it handed back.
+    pub(super) fn new(origin: &SourceOrigin) -> Self {
+        Self {
+            origin: url_netloc(&origin.url),
+            witnessed: origin.addrs.clone(),
+        }
+    }
+}
+
+impl ureq::Resolver for OriginBoundResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
+        // Recorded here as well as in the plain guard so that
+        // `Fetched.addrs` means the same thing whichever tier fetched
+        // it: where the url we ASKED for resolved to.
+        note_resolution(netloc, &addrs);
+        if addrs.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no address",
+            ));
+        }
+        if addrs.iter().any(|a| is_forbidden_fetch_ip(a.ip())) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("refusing to fetch an internal address ({netloc})"),
+            ));
+        }
+        // ureq builds netloc as `host_str():port_or_known_default()`, so
+        // both sides carry an explicit port and a bracketed IPv6 literal
+        // is spelled the same way `url_netloc` spells it.
+        let same_origin = !self.origin.is_empty() && netloc.eq_ignore_ascii_case(&self.origin);
+        let private: Vec<std::net::IpAddr> = addrs
+            .iter()
+            .map(|a| a.ip())
+            .filter(|ip| is_private_fetch_ip(*ip))
+            .collect();
+        if !private.is_empty() && !same_origin {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing a link to {netloc}: it is inside this network \
+                     and is not the source that supplied it{}",
+                    if self.origin.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", self.origin)
+                    }
+                ),
+            ));
+        }
+        // Same netloc, private address: allowed only for an address the
+        // source answered the search from. EVERY private address in the
+        // answer has to qualify, not just one - ureq picks which of them
+        // to dial, so a resolver that returns the real public address
+        // beside a loopback one would otherwise smuggle the loopback in.
+        if let Some(bad) = private.iter().find(|ip| !self.witnessed.contains(ip)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing a link to {netloc}: it resolves to {bad} inside \
+                     this network, which is not an address it answered the \
+                     search from"
+                ),
+            ));
+        }
+        Ok(addrs)
+    }
+}
+
+/// An agent for fetching a link that `origin`'s RESPONSE supplied.
+/// Every hop - the link itself and each redirect - goes through
+/// [`OriginBoundResolver`].
+pub(crate) fn origin_bound_agent(
+    origin: &SourceOrigin,
+    redirects: u32,
+    timeout_secs: u64,
+) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .resolver(OriginBoundResolver::new(origin))
         .redirects(redirects)
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
@@ -129,6 +438,12 @@ pub struct Fetched {
     /// has a legitimate use for it.
     #[allow(dead_code)]
     pub category: String,
+    /// Every address the REQUESTED url's netloc resolved to during this
+    /// fetch (not the redirect chain's). A caller whose body supplies
+    /// further links - the RSS poller, whose feed body names item links
+    /// - carries this into [`SourceOrigin::witnessed`] so the later grab
+    /// can tell the source from a rebind. See [`OriginBoundResolver`].
+    pub addrs: Vec<std::net::IpAddr>,
     /// Filename from the response's `Content-Disposition`, or empty.
     /// This is where indexers put the real release name - a grab
     /// proxied by Prowlarr with its per-indexer Redirect setting
@@ -265,56 +580,29 @@ pub(super) fn pick_failure_link(canonical: &str, alias: &str) -> String {
     }
 }
 
-/// The host of an http(s) URL, lowercased, without userinfo and without
-/// the port - or empty when there isn't one. Deliberately port-blind: an
-/// indexer that serves NZBs on :9117 and reports failures on :9118 is
-/// still the same machine, and the check is about WHOSE server we call,
-/// not which socket.
+// The authority parsers behind these checks live in nzbkit::urlauth so
+// the fuzz harness can reach them: `url_authority_diff` pins them
+// differentially against the `url` crate - the parser ureq actually
+// dials with. They are still hand-rolled (the daemon links no URL
+// crate); see the module docs there for the parsing contract and the
+// backslash-authority trap.
+pub(super) use nzbkit::urlauth::{url_host, url_netloc};
+
+/// May a link that `origin_url`'s response supplied be fetched over
+/// plain http? Only when the origin was itself plain http, or the link
+/// names a DIFFERENT host (a sibling download host or CDN - which
+/// [`OriginBoundResolver`] still confines to public addresses).
 ///
-/// Hand-rolled because the daemon has no URL crate. It parses less than a
-/// real one, and everything it cannot parse comes back empty, which fails
-/// the origin match - the safe direction.
-pub(super) fn url_host(url: &str) -> String {
-    let rest = match url.split_once("://") {
-        Some((scheme, rest))
-            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
-        {
-            rest
-        }
-        _ => return String::new(),
-    };
-    // Authority ends at the first '/', '?', '#' - or '\', which for a
-    // special scheme (http/https both are) the WHATWG URL parser treats
-    // exactly like '/'. Leaving it out made this disagree with the
-    // parser that actually dials: ureq hands the string to `url`, whose
-    // userinfo scan and host scan BOTH break at a backslash, so
-    // `https://192.168.1.1\@indexer.example/x` connects to 192.168.1.1
-    // while this function - splitting only on '/?#', then taking the
-    // part after the last '@' - answered `indexer.example`. That is the
-    // whole failure-link origin check inverted: the one guard stopping
-    // an indexer aiming the daemon at an arbitrary LAN address (loopback
-    // and RFC1918 are deliberately allowed) passed a link that went
-    // somewhere else, and the refusal/report log lines printed the host
-    // it did NOT visit.
-    let auth = rest.split(['/', '?', '#', '\\']).next().unwrap_or("");
-    // `user:pass@host` - the LAST '@' separates them, so a password
-    // containing '@' cannot smuggle a fake host in front of the real one.
-    let hostport = match auth.rsplit_once('@') {
-        Some((_, h)) => h,
-        None => auth,
-    };
-    // `[::1]:8080` - the bracketed literal is the host; a bare IPv6 with
-    // no brackets is not a legal authority and drops out as empty below.
-    let host = if let Some(end) = hostport.find(']') {
-        if hostport.starts_with('[') {
-            &hostport[..=end]
-        } else {
-            ""
-        }
-    } else {
-        hostport.split(':').next().unwrap_or("")
-    };
-    host.to_ascii_lowercase()
+/// The one shape refused is the same-host downgrade, which is never
+/// legitimate and is the same rule [`failure_link_allowed`] applies: the
+/// user's indexer apikey rides that query string, and "the same indexer,
+/// in the clear" is a different party to everything on the path to it.
+pub(super) fn supplied_link_scheme_ok(link: &str, origin_url: &str) -> bool {
+    let is_https = |u: &str| u.len() >= 8 && u.as_bytes()[..8].eq_ignore_ascii_case(b"https://");
+    if !is_https(origin_url) {
+        return true;
+    }
+    is_https(link) || url_host(link) != url_host(origin_url)
 }
 
 /// May this job's `failure_link` be called? Only when it points back at
@@ -393,14 +681,35 @@ pub(super) const FETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The bit of [`fetch_url`] both it and [`ping_url`] share: scheme check,
 /// SSRF-guarded GET, and the indexer headers off the response.
-pub(super) fn fetch_head(url: &str) -> Result<(ureq::Response, String, String)> {
+///
+/// `origin` is `Some` when the link did not come from the user but out
+/// of a RESPONSE from a configured source - a Newznab `<enclosure url>`,
+/// an RSS item link - and names that source's own URL and search-time
+/// addresses. It binds the fetch to that origin; see
+/// [`OriginBoundResolver`].
+pub(super) fn fetch_head(
+    url: &str,
+    origin: Option<&SourceOrigin>,
+) -> Result<(ureq::Response, String, String)> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         anyhow::bail!("addurl: unsupported url {url}");
     }
     // Release assets redirect to a CDN host; follow the whole chain, but
     // every hop is SSRF-filtered so a public URL can't 302 into 127.0.0.1
     // or 169.254.169.254.
-    let resp = ssrf_safe_agent(10, 60).get(url).call()?;
+    let agent = match origin {
+        None => ssrf_safe_agent(10, 60),
+        Some(origin) => {
+            if !supplied_link_scheme_ok(url, &origin.url) {
+                anyhow::bail!(
+                    "{}: an https source may not hand back a plain-http link to itself",
+                    url_host(url)
+                );
+            }
+            origin_bound_agent(origin, 10, 60)
+        }
+    };
+    let resp = agent.get(url).call()?;
     let failure_link = pick_failure_link(
         &dnzb(&resp, "X-DNZB-Failure"),
         &dnzb(&resp, "X-DNZB-FailureLink"),
@@ -409,9 +718,30 @@ pub(super) fn fetch_head(url: &str) -> Result<(ureq::Response, String, String)> 
     Ok((resp, failure_link, category))
 }
 
+/// Fetch a link the USER supplied (addurl, /watch, a failure link that
+/// already passed [`failure_link_allowed`]). For one that a search
+/// response supplied, use [`fetch_url_from`] instead.
 pub(super) fn fetch_url(url: &str) -> Result<Fetched> {
+    fetch_url_inner(url, None)
+}
+
+/// Fetch a link that `origin`'s own response handed back - a Newznab
+/// enclosure, an RSS item link. Identical to [`fetch_url`] except that
+/// the destination is bound to the origin that offered it, so a
+/// compromised indexer cannot aim the daemon at another service on the
+/// user's LAN. See [`OriginBoundResolver`] for the exact rule.
+pub(super) fn fetch_url_from(url: &str, origin: &SourceOrigin) -> Result<Fetched> {
+    fetch_url_inner(url, Some(origin))
+}
+
+fn fetch_url_inner(url: &str, origin: Option<&SourceOrigin>) -> Result<Fetched> {
     use std::io::Read;
-    let (resp, failure_link, category) = fetch_head(url)?;
+    // Witnessed unconditionally: this is the one place that knows both
+    // the requested url and the resolver's answer, and a caller whose
+    // body will supply further links (the RSS poller) needs the answer
+    // even though the fetch itself may be plain `fetch_url`.
+    let (head, addrs) = witness_resolution(&url_netloc(url), || fetch_head(url, origin));
+    let (resp, failure_link, category) = head?;
     let filename = resp
         .header("Content-Disposition")
         .and_then(content_disposition_filename)
@@ -444,6 +774,7 @@ pub(super) fn fetch_url(url: &str) -> Result<Fetched> {
         https: url.starts_with("https://"),
         category,
         filename,
+        addrs,
     })
 }
 
@@ -454,6 +785,6 @@ pub(super) fn fetch_url(url: &str) -> Result<Fetched> {
 /// `Ok(None)` keeps the caller's one error arm (which is where the 404
 /// handling lives) doing the work for both modes.
 pub(super) fn ping_url(url: &str) -> Result<Option<Fetched>> {
-    fetch_head(url)?;
+    fetch_head(url, None)?;
     Ok(None)
 }

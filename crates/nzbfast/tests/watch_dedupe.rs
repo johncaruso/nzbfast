@@ -144,6 +144,17 @@ fn serve(dir: &Path, watch: &Path) -> Running {
         let child = Command::new(env!("CARGO_BIN_EXE_nzbfast"))
             .env("NZBFAST_NO_ENRICH", "1")
             .env("NZBFAST_OPEN", "1")
+            // Q1 of the 08-10 Codex sweep. Every assertion in this file
+            // reads the daemon's own log, so the filter has to be ours
+            // rather than whatever the shell happened to export:
+            // logging.rs honours RUST_LOG (second, after NZBFAST_LOG), and
+            // a developer or runner with RUST_LOG=warn set drops every
+            // INFO line these tests wait for - `wait_for` then spins its
+            // full 30 s and fails on a log that never had the line in it.
+            // `info` IS the default filter, so this pins the behaviour
+            // the tests were written against instead of changing it.
+            .env("NZBFAST_LOG", "info")
+            .env_remove("RUST_LOG")
             .arg("--config")
             .arg(dir.join("config.json"))
             .arg("serve")

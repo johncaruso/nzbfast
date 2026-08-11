@@ -82,6 +82,14 @@ pub struct Job {
     /// marker simply doesn't fire. Consumed (taken) at pick, so a job
     /// that goes back to Queued later can never replay a stale stamp.
     pub queued_at: Option<Instant>,
+    /// When this job entered the queue, in unix seconds - the wall-clock
+    /// twin of `queued_at`, and unlike it PERSISTED and never taken. The
+    /// monotonic one is process-local and is consumed at pick, so the
+    /// SAB facade's numeric `time_added` went null for every restored
+    /// row (and for every row that had already started), which is a
+    /// shape a strict client refuses to parse - the same class as the
+    /// `finished_unix` fix above.
+    pub queued_unix: Option<i64>,
     /// Snapshot at add time: was the runner free to take this job at
     /// once (nothing downloading, queue not paused, no runnable job
     /// ahead)? Only then is a slow pick evidence the runner itself was
@@ -418,7 +426,11 @@ pub struct Job {
     /// every server is not proof of anything. Persisted so a restart
     /// keeps the badge (and the failure-time evidence) instead of
     /// re-probing every queued job on every start.
-    pub health: Option<crate::health::PostHealth>,
+    /// `pub(crate)` unlike its siblings: [`crate::health::PostHealth`]
+    /// is crate-private, and this field is the narrower surface (Q5 -
+    /// nothing outside the crate reads it, and rustdoc warned on the
+    /// exposure).
+    pub(crate) health: Option<crate::health::PostHealth>,
     /// §76: what the main video actually IS, read from its own container
     /// header, plus anything the release name claims that those bytes
     /// deny. `None` until the prober has an answer - which for most jobs
@@ -554,7 +566,9 @@ impl Drop for IndexJobGuard {
 /// nothing is lost: the eventual primary run resumes from the journal.
 pub struct Sidecar {
     pub nzo_id: String,
-    pub hub: Arc<crate::StreamHub>,
+    /// `pub(crate)`: [`crate::StreamHub`] is crate-private, and the
+    /// field follows it (Q5, as with [`Job::health`]).
+    pub(crate) hub: Arc<crate::StreamHub>,
     /// Decoded bytes so far (dashboard shows prefetch progress).
     pub progress: Arc<AtomicU64>,
     /// Pre-armed cancel: the pipeline installs its own abort flag into
@@ -1369,6 +1383,16 @@ pub(crate) const SAB_DEFAULT_PRIORITY: i32 = -100;
 /// to tell an adder what actually happened to their job.
 pub(crate) const DUPE_PRIORITY: i32 = -3;
 
+/// A SAB `pp=` request param, validated: 0-3, anything else (junk, out
+/// of range, absent) = the add named none. One parse shared by the add
+/// handlers (which pass it to `enqueue` for the pre-queue hook) and
+/// `record_add_params` (which records it on the job afterwards), so the
+/// hook and the record can never disagree about what was asked.
+pub(crate) fn sab_pp_param(pp: Option<&str>) -> Option<i64> {
+    pp.and_then(|p| p.trim().parse::<i64>().ok())
+        .filter(|p| (0..=3).contains(p))
+}
+
 pub(crate) fn enqueue_priority(requested: i32, duplicate: bool) -> i32 {
     if duplicate {
         DUPE_PRIORITY
@@ -1862,7 +1886,10 @@ pub(super) fn merge_notify_tokens(
                 .any(|t| t.kind == p.kind && t.url == p.url && t.name == p.name)
         })
         .collect();
-    for t in list.iter_mut().filter(|t| t.token.is_empty()) {
+    for t in list
+        .iter_mut()
+        .filter(|t| t.token.is_empty() || t.secret.is_empty())
+    {
         let exact = old
             .iter()
             .find(|p| p.kind == t.kind && p.url == t.url && p.name == t.name);
@@ -1875,7 +1902,14 @@ pub(super) fn merge_notify_tokens(
             by_name.next().filter(|_| by_name.next().is_none())
         });
         if let Some(prev) = prev {
-            t.token = prev.token.clone();
+            // §129 4a: the webhook signing secret is a credential with
+            // the token's exact lifecycle - blank on save means KEEP.
+            if t.token.is_empty() {
+                t.token = prev.token.clone();
+            }
+            if t.secret.is_empty() {
+                t.secret = prev.secret.clone();
+            }
         }
     }
 }

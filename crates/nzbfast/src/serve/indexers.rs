@@ -47,6 +47,16 @@ pub(super) struct IndexerHit {
     pub(super) url: String,
     pub(super) title: String,
     pub(super) indexer: String,
+    /// The indexer that offered this result: its configured URL and the
+    /// addresses it answered the search from, kept beside the link
+    /// because `url` is an `<enclosure url>` the search RESPONSE chose.
+    /// The grab binds the fetch to this origin (M12/M9), so a hostile
+    /// indexer cannot point the daemon at another service on the user's
+    /// LAN, nor repoint its own name at one between search and grab.
+    /// Stored at search time rather than looked up by `indexer` at grab
+    /// time: the name is a label the user can rename or repoint between
+    /// the two, and the address is gone by then either way.
+    pub(super) origin: SourceOrigin,
     pub(super) at: Instant,
 }
 
@@ -97,9 +107,31 @@ pub(super) const INDEXER_CAPS_FAIL_TTL: std::time::Duration =
 /// The one agent every pull-search call goes out through: SSRF-guarded
 /// like every other daemon fetch, 15 s ceiling per call so a dead
 /// indexer costs one timeout, not a wedged search.
+///
+/// Idle connections are NOT kept, which is the one place this agent
+/// differs from [`shared_enrich_agent`]. A reused connection skips the
+/// resolver entirely, and the resolver is where a search learns the
+/// address its indexer answered from - the fact every later grab is
+/// checked against (M9, see [`OriginBoundResolver`]). Caps-then-search,
+/// or the scoreboard's seven sequential categories, would otherwise
+/// witness the first request and nothing after it, and a LAN indexer's
+/// grabs would start being refused.
+///
+/// The price is one connection setup per search request, against an
+/// endpoint that meters us per DAY: a handful of requests per user
+/// action, already paced by sleeps in the loops that repeat.
 pub(super) fn shared_indexer_agent() -> ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
-    AGENT.get_or_init(|| ssrf_safe_agent(4, 15)).clone()
+    AGENT
+        .get_or_init(|| {
+            ureq::AgentBuilder::new()
+                .resolver(SsrfGuardResolver)
+                .redirects(4)
+                .timeout(std::time::Duration::from_secs(15))
+                .max_idle_connections_per_host(0)
+                .build()
+        })
+        .clone()
 }
 
 /// GET one indexer API URL, capped. Transport-level limit answers (a
@@ -201,16 +233,34 @@ pub(super) fn indexer_fetch(
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// One search against one indexer.
+/// One search against one indexer: the results, and the [`SourceOrigin`]
+/// every link in them is bound to when grabbed.
+///
+/// The origin is built HERE, from this request's own resolution, and
+/// travels with the results. That is the point: at grab time the same
+/// hostname may answer differently, and comparing names alone would call
+/// the new answer the source's own socket (M9). See
+/// [`OriginBoundResolver`].
 pub(super) fn indexer_search_one(
     cfg: &crate::newznab::IndexerConfig,
     q: &crate::newznab::SearchQuery,
-) -> std::result::Result<Vec<crate::newznab::SearchResult>, crate::newznab::NewznabError> {
-    let body = indexer_fetch(&crate::newznab::search_url(cfg, q))?;
+) -> std::result::Result<
+    (Vec<crate::newznab::SearchResult>, SourceOrigin),
+    crate::newznab::NewznabError,
+> {
+    let url = crate::newznab::search_url(cfg, q);
+    // The netloc of the CONFIGURED url, which is what the grab compares
+    // against; `endpoint()` only ever adds a path, so it is the netloc
+    // this request is dialling too.
+    let (body, addrs) = witness_resolution(&url_netloc(&cfg.url), || indexer_fetch(&url));
+    let body = body?;
     if let Some(e) = crate::newznab::parse_error(&body) {
         return Err(e);
     }
-    Ok(crate::newznab::parse_results(&body))
+    Ok((
+        crate::newznab::parse_results(&body),
+        SourceOrigin::witnessed(&cfg.url, addrs),
+    ))
 }
 
 /// This indexer's caps, from the cache when fresh, else probed. A probe
@@ -388,6 +438,7 @@ pub(super) fn resolve_nzblnk(
             &name,
             cat,
             prio,
+            None,
             password,
             "nzblnk",
             dupe_ok,
@@ -478,21 +529,35 @@ pub(super) fn resolve_nzblnk(
             .join(" ")
     };
     let want = norm(&l.header);
-    let mut best: Option<(u8, i32, i64, crate::newznab::SearchResult, String)> = None;
+    /// The single result the ladder settles on, with the indexer that
+    /// offered it: the name for budgets and messages, and the origin the
+    /// enclosure fetch is bound to (M12/M9).
+    struct Pick {
+        key: (u8, i32, i64),
+        item: crate::newznab::SearchResult,
+        indexer: String,
+        origin: SourceOrigin,
+    }
+    let mut best: Option<Pick> = None;
     {
         let mut rt = d.indexer_rt.lock_ok();
         let now = Instant::now();
         for (cfg, outcome) in outcomes {
             match outcome {
-                Ok(items) => {
+                Ok((items, origin)) => {
                     for item in items {
-                        let k = (
+                        let key = (
                             u8::from(!norm(&item.title).contains(&want)),
                             cfg.priority,
                             -item.posted,
                         );
-                        if best.as_ref().is_none_or(|b| k < (b.0, b.1, b.2)) {
-                            best = Some((k.0, k.1, k.2, item, cfg.name.clone()));
+                        if best.as_ref().is_none_or(|b| key < b.key) {
+                            best = Some(Pick {
+                                key,
+                                item,
+                                indexer: cfg.name.clone(),
+                                origin: origin.clone(),
+                            });
                         }
                     }
                 }
@@ -506,7 +571,13 @@ pub(super) fn resolve_nzblnk(
             }
         }
     }
-    if let Some((_, _, _, item, indexer)) = best {
+    if let Some(Pick {
+        item,
+        indexer,
+        origin,
+        ..
+    }) = best
+    {
         let allowed = {
             let mut rt = d.indexer_rt.lock_ok();
             rt.usage.roll(unix_now());
@@ -525,10 +596,14 @@ pub(super) fn resolve_nzblnk(
             } else {
                 l.title.clone()
             };
-            match fetch_url(&item.link)
+            // fetch_url_from, not fetch_url: item.link is an
+            // `<enclosure url>` this indexer's search response chose, so
+            // it may not reach a private address other than the
+            // indexer's own socket (M12).
+            match fetch_url_from(&item.link, &origin)
                 .map_err(|e| e.to_string())
                 .and_then(|f| {
-                    d.enqueue_fetched(&f, &name, cat, prio, password, 0, "nzblnk", dupe_ok)
+                    d.enqueue_fetched(&f, &name, cat, prio, None, password, 0, "nzblnk", dupe_ok)
                         .map_err(|e| e.to_string())
                 }) {
                 Ok(nzo) => {

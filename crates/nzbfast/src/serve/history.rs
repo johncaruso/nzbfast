@@ -460,10 +460,12 @@ fn history_summary(d: &Daemon, j: &Job) -> Value {
         "category": if j.category.is_empty() { "*" } else { &j.category },
         "status": match j.state { JobState::Completed => "Completed", JobState::Failed => "Failed", _ => "Queued" },
         "bytes": j.total_bytes,
-        "size": format!("{:.1} MB", j.total_bytes as f64 / API_MB),
+        "size": format!("{}B", sab_units(j.total_bytes as f64)),
         "completed": j.finished_unix.unwrap_or(0),
         "origin": j.origin,
-        "retry": j.retries,
+        // Same rename as the facade row above: the count is `retries`
+        // in both, so one template reads either.
+        "retries": j.retries,
         "library": j.library,
         "fail_message": j.fail_message,
         "fail_kind": if j.state == JobState::Failed {
@@ -505,13 +507,89 @@ fn history_summary(d: &Daemon, j: &Job) -> Value {
     })
 }
 
+/// Downloaded bytes as `(total, month, week, day)`, off the M18b usage
+/// ledger - the four running totals SAB puts at the top of its history
+/// body, from the one place here that actually counts wire bytes.
+///
+/// The ledger is keyed `"YYYY-MM-DD" -> host -> bytes`, plus a
+/// `"lifetime"` bucket billed in parallel and a `"reliability"` bucket
+/// that holds try counts rather than bytes. Only keys that parse as a
+/// date are summed for the three windows; `"lifetime"` answers the
+/// total, so a pruned date bucket does not shrink it.
+fn usage_sums(d: &Daemon) -> (u64, u64, u64, u64) {
+    let today = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|t| (t.as_secs() / 86_400) as i64)
+        .unwrap_or(0);
+    let (ty, tm, _) = civil_from_days(today);
+    let u = d.usage.lock_ok();
+    let bytes_in = |v: &Value| -> u64 {
+        v.as_object()
+            .map(|m| m.values().filter_map(Value::as_u64).sum())
+            .unwrap_or(0)
+    };
+    let (mut month, mut week, mut day) = (0u64, 0u64, 0u64);
+    for (k, v) in u.iter() {
+        // "YYYY-MM-DD" and nothing else: "lifetime" and "reliability"
+        // are not days and must not be billed to one.
+        let parts: Vec<&str> = k.split('-').collect();
+        let (Some(Ok(y)), Some(Ok(m)), Some(Ok(dd))) = (
+            parts.first().map(|s| s.parse::<i64>()),
+            parts.get(1).map(|s| s.parse::<u32>()),
+            parts.get(2).map(|s| s.parse::<u32>()),
+        ) else {
+            continue;
+        };
+        let n = bytes_in(v);
+        let days = days_from_civil(y, m, dd);
+        if y == ty && m == tm {
+            month = month.saturating_add(n);
+        }
+        // The last seven days INCLUDING today, which is what SAB's
+        // week total means - not "since Monday".
+        if today - days < 7 && today >= days {
+            week = week.saturating_add(n);
+        }
+        if days == today {
+            day = day.saturating_add(n);
+        }
+    }
+    let total = u.get("lifetime").map(bytes_in).unwrap_or(0);
+    (total, month, week, day)
+}
+
 pub(super) fn history_json(
     d: &Daemon,
     params: &std::collections::HashMap<String, String>,
 ) -> Value {
     let q = HistQuery::from_params(params);
     let (slots, n, counts) = history_page(d, &q, false);
-    json!({"history": {"slots": slots, "noofslots": n, "counts": counts}})
+    let (total, month, week, day) = usage_sums(d);
+    json!({"history": {
+        "slots": slots, "noofslots": n, "counts": counts,
+        // --- SABnzbd history-body parity (issue #34) ----------------
+        //
+        // The keys real SAB puts beside `slots`, and the reason this
+        // whole pass exists: SAB 2.0 trimmed its history body, NZB360
+        // stopped showing history, and SAB's fix was to put `version`
+        // back (sabnzbd/sabnzbd#872). Ours never had it, and #34 is
+        // the same symptom on the same client.
+        "version": SAB_VERSION,
+        "total_size": sab_units(total as f64),
+        "month_size": sab_units(month as f64),
+        "week_size": sab_units(week as f64),
+        "day_size": sab_units(day as f64),
+        // Jobs sitting in a post-processing queue that is not the main
+        // queue. One-pass has no such queue - a job post-processes in
+        // the pipeline that downloaded it and stays a queue slot until
+        // it lands in history - so this is always 0.
+        "ppslots": 0,
+        // SAB's change token: a client may send it back as
+        // `last_history_update` to be told "nothing new". Our history
+        // revision counter is exactly that quantity, and it is bumped
+        // by every write in histstore.rs.
+        "last_history_update": d.history_rev.load(Ordering::Relaxed),
+    }})
 }
 
 /// The full SAB facade row - the pre-§129 key set, byte-stable for
@@ -619,7 +697,20 @@ fn history_row(d: &Daemon, j: &Job) -> Value {
             } else {
                 ""
             },
-            "retry": j.retries,
+            // SAB's `retry` is a BOOLEAN - "this one can be asked for
+            // again" - and ours was the try count under the same name.
+            // A client that declares the field as a bool throws on a
+            // number and never renders the list, which is the shape
+            // #34 reported. The count keeps its meaning under
+            // `retries`; the dashboard reads that.
+            "retry": j.state == JobState::Failed
+                && fail_action(
+                    fail_kind(&j.fail_message),
+                    fail_hint(&j.fail_message),
+                    &j.fail_message,
+                    j.password_required,
+                ) == "retry",
+            "retries": j.retries,
             // This job came out of the local index rather than from
             // an NZB the user holds. It matters on a failure: a
             // "gone" verdict here means the post rotted out of the
@@ -630,7 +721,7 @@ fn history_row(d: &Daemon, j: &Job) -> Value {
             "storage": j.out_dir.to_string_lossy(),
             "path": j.out_dir.to_string_lossy(),
             "bytes": j.total_bytes,
-            "size": format!("{:.1} MB", j.total_bytes as f64 / API_MB),
+            "size": format!("{}B", sab_units(j.total_bytes as f64)),
             // Stats (0 until a download actually ran): bytes ÷ secs
             // is the average network speed for this job.
             "downloaded_bytes": j.downloaded_bytes,
@@ -704,6 +795,99 @@ fn history_row(d: &Daemon, j: &Job) -> Value {
             // titles are not ours to translate, and the runtimes and
             // codecs in it are not words. See Job::identify.
             "identify": j.identify,
+            // --- SABnzbd history-slot parity (issue #34) ------------
+            //
+            // Real SAB's history row, key for key (sabnzbd/database.py
+            // unpack_history_info over the history table). Everything
+            // below was missing from ours. Same reasoning as the queue
+            // slot: a remote that deserializes the row into a declared
+            // type finds a null where it expects a value and stops
+            // before it renders the list.
+            //
+            // Where the concept does not exist in a one-pass
+            // downloader, the value is what SAB sends when its own
+            // feature is off, and the key says so.
+            //
+            // SAB's post-processing letter: R repair, U +unpack,
+            // D +delete. One-pass does all three unless the add asked
+            // for less.
+            "pp": match j.sab_pp {
+                Some(0) => "",
+                Some(1) => "R",
+                Some(2) => "U",
+                _ => "D",
+            },
+            // The script this job ran, by basename - the override, else
+            // the category's, else the global one (L4, 10 Aug sweep).
+            "script": super::sabcompat::sab_script_name(
+                &j.script_override,
+                &d.cat_meta
+                    .lock_ok()
+                    .get(&j.category)
+                    .map(|m| m.script.clone())
+                    .unwrap_or_default(),
+                d.script.lock_ok().as_deref(),
+            ),
+            // SAB reuses `report` to flag a URL-fetch job ("future")
+            // and leaves it empty otherwise; nothing here fetches by
+            // URL into history.
+            "report": "",
+            "url": "",
+            "url_info": "",
+            // Seconds on the wire, and seconds after it. One-pass has
+            // no separate post-processing pass to time - verify,
+            // repair and unpack all run inside the download - so the
+            // whole elapsed time is download time and SAB's second
+            // number is 0.
+            "download_time": j.elapsed_secs.round() as u64,
+            "postproc_time": 0,
+            // SAB's per-stage action log. Nothing here writes one, and
+            // an empty list is what SAB sends for a job that logged no
+            // stages.
+            "stage_log": Value::Array(Vec::new()),
+            "downloaded": j.downloaded_bytes,
+            // An unused column in SAB's own schema; it sends 0.
+            "completeness": 0,
+            "meta": Value::Null,
+            "series": "",
+            // SAB stores the NZB's md5. We keep a SHA of it instead
+            // (`nzb_sha`, in the duplicate ledger), so there is no md5
+            // to report and "" is SAB's own value for a row without
+            // one.
+            "md5sum": "",
+            // Always empty, deliberately: M24's contract is that the
+            // password itself never leaves the daemon, only the facts
+            // about it (`has_password` / `password_required` above).
+            "password": "",
+            // SAB's second-tier history. There is one history here, so
+            // nothing is ever archived out of it.
+            "archive": false,
+            // The postproc queue's live fields, which only SAB's
+            // in-flight rows carry.
+            "action_line": "",
+            "loaded": false,
+            // Unix seconds this job was added. Derived from the
+            // record's monotonic `queued_at` where it survived, and
+            // from the finish time less the elapsed download
+            // otherwise.
+            "time_added": j.queued_at
+                .map(|t| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|n| n.as_secs())
+                        .unwrap_or(0)
+                        .saturating_sub(t.elapsed().as_secs())
+                })
+                // The persisted stamp before the estimate: it is the
+                // add time itself, where finish-less-elapsed is only
+                // the download's own span (M10).
+                .or_else(|| j.queued_unix.map(|t| t.max(0) as u64))
+                .unwrap_or_else(|| {
+                    j.finished_unix
+                        .unwrap_or(0)
+                        .saturating_sub(j.elapsed_secs.round() as i64)
+                        .max(0) as u64
+                }),
             "script_line": if j.unpack_blocked_by.is_empty() {
                 String::new()
             } else {

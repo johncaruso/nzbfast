@@ -21,6 +21,24 @@ use super::*;
 /// configured apikey must match, and an install with ONLY an nzbkey
 /// (the lockout state) opens nothing. Players are unaffected - they
 /// carry the per-job `?t=` stream token, which is checked separately.
+/// Percent-encode one query VALUE for a URL the daemon generates.
+/// Generated hex keys pass through unchanged; a user-chosen key holding
+/// `&`, `+`, `%` or `#` sent raw changes the parsed query and breaks
+/// every link that carries it (Codex sweep 10 Aug L1). Everything
+/// outside the RFC 3986 unreserved set is encoded.
+pub(super) fn query_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
 fn full_key_ok(given: Option<&str>, apikey: &Option<String>, nzbkey: &Option<String>) -> bool {
     match (apikey, nzbkey) {
         (None, None) => true,
@@ -232,16 +250,17 @@ fn route_m3u(req: tiny_http::Request, d: &Arc<Daemon>, id: &str, query: &str) {
         });
         return;
     }
-    let host = req
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Host"))
-        .map(|h| h.value.as_str().to_string())
-        .unwrap_or_else(|| format!("127.0.0.1:{}", d.port));
+    // Scheme AND authority from `public_base`, not a bare Host with
+    // `http://` welded on: this playlist is handed to VLC/IINA/Infuse,
+    // which has no way to guess that the listener it came from speaks
+    // TLS. Behind a proxy the forwarded headers still win, and a direct
+    // native-TLS daemon now names its own https instead of pointing the
+    // player at plaintext on a socket that will reset it.
+    let base = public_base(&req, d);
     let target = if id.is_empty() {
-        format!("http://{host}/stream")
+        format!("{base}/stream")
     } else {
-        format!("http://{host}/stream/{id}?t={}", d.stream_token(id))
+        format!("{base}/stream/{id}?t={}", d.stream_token(id))
     };
     let _ = req.respond(
         tiny_http::Response::from_string(format!("#EXTM3U\n{target}\n"))
@@ -300,7 +319,7 @@ fn route_watch(req: tiny_http::Request, d: &Arc<Daemon>, query: &str) {
             .clone()
             .or_else(|| name_from_fetch(&f, &url))
             .unwrap_or_else(|| "watch.nzb".to_string());
-        d.enqueue_fetched(&f, &name, "", 2, None, 0, "url", false)
+        d.enqueue_fetched(&f, &name, "", 2, None, None, 0, "url", false)
     }) {
         Ok(id) => {
             // Reflect the key into the redirect ONLY when it really
@@ -750,11 +769,13 @@ fn handle_api(
         .find(|h| h.field.equiv("User-Agent"))
         .map(|h| h.value.as_str().to_string())
         .unwrap_or_default();
-    let key_q = given.map(|k| format!("?apikey={k}")).unwrap_or_default();
+    let key_q = given
+        .map(|k| format!("?apikey={}", query_escape(k)))
+        .unwrap_or_default();
     // Client-facing scheme+authority for handed-off links (stream/m3u):
     // forwarded headers win over the raw Host so a reverse-proxied
     // HTTPS deployment gets links its players can actually reach.
-    let base = public_base(&req, d.port);
+    let base = public_base(&req, d);
     let ctx = api::ApiCtx {
         cfg_path,
         host_hdr: &host_hdr,
@@ -991,7 +1012,7 @@ pub(super) fn spawn_http_workers(
                     });
                         continue;
                     }
-                    let base = public_base(&req, d.port);
+                    let base = public_base(&req, &d);
                     let key = params.get("apikey").cloned().unwrap_or_default();
                     let xml = newznab_xml(&d, &params, &base, &key);
                     let _ = req.respond(

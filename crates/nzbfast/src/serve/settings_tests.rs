@@ -152,6 +152,38 @@ fn set_index_gapfill_validates_and_stores() {
 }
 
 #[test]
+fn set_index_probe7z_budget_validates_and_stores() {
+    let (_t, d) = daemon_in("probe7z");
+    d.index_probe7z_budget.store(150, Ordering::Relaxed);
+    let e = set_index_probe7z_budget(&d, "index_probe7z_budget", "x").unwrap_err();
+    assert!(e.contains("not a number"), "{e}");
+    let e = set_index_probe7z_budget(&d, "index_probe7z_budget", "2001").unwrap_err();
+    assert!(e.contains("0-2000"), "{e}");
+    assert_eq!(d.index_probe7z_budget.load(Ordering::Relaxed), 150);
+    assert_eq!(
+        set_index_probe7z_budget(&d, "index_probe7z_budget", "0").unwrap(),
+        (true, json!(0))
+    );
+    assert_eq!(d.index_probe7z_budget.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn set_index_nzbimport_budget_validates_and_stores() {
+    let (_t, d) = daemon_in("nzbimport");
+    d.index_nzbimport_budget.store(300, Ordering::Relaxed);
+    let e = set_index_nzbimport_budget(&d, "index_nzbimport_budget", "x").unwrap_err();
+    assert!(e.contains("not a number"), "{e}");
+    let e = set_index_nzbimport_budget(&d, "index_nzbimport_budget", "2001").unwrap_err();
+    assert!(e.contains("0-2000"), "{e}");
+    assert_eq!(d.index_nzbimport_budget.load(Ordering::Relaxed), 300);
+    assert_eq!(
+        set_index_nzbimport_budget(&d, "index_nzbimport_budget", "0").unwrap(),
+        (true, json!(0))
+    );
+    assert_eq!(d.index_nzbimport_budget.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn set_bench_interval_validates_and_stores() {
     let (_t, d) = daemon_in("bench");
     d.bench_interval.store(3, Ordering::Relaxed);
@@ -225,6 +257,46 @@ fn set_spot_backfill_rejects_and_clamps() {
         (true, json!(50_000))
     );
     assert_eq!(d.spot_backfill.load(Ordering::Relaxed), 50_000);
+}
+
+/// The two halves of the catalogue-breadth rung, and the asymmetry
+/// between them: `spot_deepen` is a cheap OVER rate that may be 0, and
+/// `spot_resolve` is the one that spends a HEAD plus BODYs per spot, so
+/// it is capped two orders of magnitude lower. Neither has a floor -
+/// 0 is a real answer for both, and clamping it up would make the off
+/// switch silently on.
+#[test]
+fn the_spot_depth_settings_take_zero_and_cap_apart() {
+    let (_t, d) = daemon_in("spotdepth");
+    for (name, set) in [
+        (
+            "spot_deepen",
+            &set_spot_deepen as &dyn Fn(&Arc<Daemon>, &str, &str) -> _,
+        ),
+        ("spot_resolve", &set_spot_resolve),
+    ] {
+        let e = set(&d, name, "later").unwrap_err();
+        assert!(e.contains("expected a number"), "{name}: {e}");
+        assert_eq!(set(&d, name, "0").unwrap(), (true, json!(0)), "{name} off");
+    }
+    assert_eq!(d.spot_deepen.load(Ordering::Relaxed), 0);
+    assert_eq!(d.spot_resolve.load(Ordering::Relaxed), 0);
+
+    assert_eq!(
+        set_spot_deepen(&d, "spot_deepen", "99999999").unwrap(),
+        (true, json!(1_000_000)),
+        "the history rate is capped at one pass' worth of OVER"
+    );
+    assert_eq!(
+        set_spot_resolve(&d, "spot_resolve", "99999999").unwrap(),
+        (true, json!(1_000)),
+        "the fetch budget is capped far lower - it costs articles"
+    );
+    assert_eq!(
+        set_spot_deepen(&d, "spot_deepen", "20000").unwrap(),
+        (true, json!(20_000))
+    );
+    assert_eq!(d.spot_deepen.load(Ordering::Relaxed), 20_000);
 }
 
 // ---- word-list validators -----------------------------------------------
@@ -396,6 +468,52 @@ fn set_index_evict_kinds_validates_and_dedups() {
     assert_eq!(*d.index_evict_kinds.lock_ok(), vec!["movie", "tv"]);
 }
 
+/// Arming the size cap wakes the scan loop, because that loop is what
+/// enforces it (`evict_pass_and_republish`, once per pass) and its sleep
+/// is the full `index_interval_secs` on any install with something to
+/// scan. Spotnet going default-on (129f293e) gave every groupless
+/// install something to scan, which turned "switch on the cap" into a
+/// 15-minute wait and reddened the nightly `index_size_cap` suite.
+///
+/// A `Notify` with no waiter stores a permit, so "was the loop woken?"
+/// is readable after the fact: `notified()` returns at once iff a permit
+/// is banked. Checked before as well as after - the assertion means
+/// nothing if the fixture already had one.
+#[cfg(feature = "indexer")]
+#[test]
+fn arming_the_size_cap_wakes_the_scan_loop() {
+    let (_t, d) = daemon_in("evictwake");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let woken = |d: &Arc<Daemon>| {
+        rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(50), d.scan_now.notified())
+                .await
+                .is_ok()
+        })
+    };
+    assert!(!woken(&d), "the fixture starts with no permit banked");
+
+    // The cap alone, with the switch still off, deletes nothing - so it
+    // has no reason to wake anyone.
+    assert!(apply_setting(&d, "index_max_bytes", "1").is_ok());
+    assert!(!woken(&d), "a cap with eviction off must not wake the loop");
+
+    assert!(apply_setting(&d, "index_evict", "1").is_ok());
+    assert!(woken(&d), "the switch going on must wake the scan loop");
+
+    // ...and a cap CHANGED while the switch is already on is the same
+    // event arriving by the other door.
+    assert!(apply_setting(&d, "index_max_bytes", "2").is_ok());
+    assert!(woken(&d), "a cap set under a live switch must wake it too");
+
+    // Switching off is not urgent: nothing is waiting to be deleted.
+    assert!(apply_setting(&d, "index_evict", "0").is_ok());
+    assert!(!woken(&d), "switching eviction off must not wake the loop");
+}
+
 // ---- JSON-blob validators -----------------------------------------------
 
 #[test]
@@ -527,16 +645,28 @@ fn set_watchlist_instant_max_caps_at_3600() {
     assert_eq!(d.watchlist_instant_max.load(Ordering::Relaxed), 7);
 }
 
+/// The accepted threshold cannot exceed the evidence the breaker keeps.
+///
+/// It used to cap at a round 1000 while a target remembers at most
+/// `MAX_STEMS` (64) distinct failed stems, so every value from 65 up was
+/// a breaker that could never trip - accepted, echoed back, shown in the
+/// settings card, and silently equivalent to "off" (M13, 10 Aug sweep).
 #[test]
-fn set_arr_giveup_threshold_caps_at_1000() {
+fn set_arr_giveup_threshold_caps_at_the_evidence_cap() {
     let (_t, d) = daemon_in("giveupthr");
     let e = set_arr_giveup_threshold(&d, "arr_giveup_threshold", "x").unwrap_err();
     assert!(e.contains("not a number"), "{e}");
+    let cap = crate::serve::giveup::MAX_STEMS as u64;
     assert_eq!(
         set_arr_giveup_threshold(&d, "arr_giveup_threshold", "5000").unwrap(),
-        (true, json!(1000))
+        (true, json!(cap))
     );
-    assert_eq!(d.arr_giveup_threshold.load(Ordering::Relaxed), 1000);
+    assert_eq!(d.arr_giveup_threshold.load(Ordering::Relaxed), cap);
+    // ...and a reachable value is still taken verbatim.
+    assert_eq!(
+        set_arr_giveup_threshold(&d, "arr_giveup_threshold", "5").unwrap(),
+        (true, json!(5))
+    );
 }
 
 #[test]

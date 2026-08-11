@@ -199,32 +199,61 @@ pub(super) fn newznab_category(kind: &str, stem: &str) -> u32 {
 /// wins over `Host`, `X-Forwarded-Proto` picks the scheme, and each is
 /// a comma list when the request crossed more than one hop, of which the
 /// first entry is the client-facing one. An unrecognised scheme falls
-/// back to http rather than being echoed into a URL.
+/// back rather than being echoed into a URL.
 ///
 /// Not indexer-gated: playback/stream capability URLs (mobile contract,
 /// m3u handoffs) need the same client-facing authority in every build,
 /// or a TLS reverse proxy gets loopback links and permanent tokens ride
 /// cleartext http.
-pub(super) fn public_base(req: &tiny_http::Request, port: u16) -> String {
+///
+/// Without `X-Forwarded-Proto` the fallback is what THIS listener bound
+/// with ([`Daemon::scheme`]), not a hardcoded `http`. A direct native-TLS
+/// request has no proxy to correct the scheme for it, so the old default
+/// handed Prowlarr, Sonarr and every player an `http://` link to a socket
+/// that only speaks TLS.
+pub(super) fn public_base(req: &tiny_http::Request, d: &Daemon) -> String {
     let hdr = |name: &'static str| {
         req.headers()
             .iter()
             .find(|h| h.field.equiv(name))
             .map(|h| h.value.as_str().to_string())
     };
+    public_base_from(
+        hdr("X-Forwarded-Host"),
+        hdr("Host"),
+        hdr("X-Forwarded-Proto"),
+        d.scheme(),
+        d.port,
+    )
+}
+
+/// The header arithmetic behind [`public_base`], split off the request so
+/// it is testable without a socket - a native-TLS listener is otherwise
+/// only reachable through a whole daemon with a certificate on disk.
+fn public_base_from(
+    xf_host: Option<String>,
+    host: Option<String>,
+    xf_proto: Option<String>,
+    own_scheme: &str,
+    port: u16,
+) -> String {
     let first = |v: String| v.split(',').next().unwrap_or("").trim().to_string();
-    let host = hdr("X-Forwarded-Host")
+    let host = xf_host
         .map(first)
         .filter(|h| !h.is_empty())
-        .or_else(|| hdr("Host"))
+        .or(host)
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| format!("127.0.0.1:{port}"));
-    let scheme = hdr("X-Forwarded-Proto")
+    let scheme = xf_proto
         .map(first)
         .filter(|s| s == "http" || s == "https")
-        .unwrap_or_else(|| "http".into());
+        .unwrap_or_else(|| own_scheme.to_string());
     format!("{scheme}://{host}")
 }
+
+#[cfg(test)]
+#[path = "sabcompat_public_base_tests.rs"]
+mod public_base_tests;
 
 /// M12: the newznab facade - enough of the protocol for Sonarr/Radarr
 /// to use the built-in index as an indexer (caps, search, tvsearch,
@@ -415,7 +444,11 @@ pub(super) fn newznab_xml(
     };
     let mut items = String::new();
     for r in hits.iter() {
-        let link = format!("{base}/getnzb/{}.nzb?apikey={apikey}", r.id);
+        let link = format!(
+            "{base}/getnzb/{}.nzb?apikey={}",
+            r.id,
+            super::http::query_escape(apikey)
+        );
         // The name a *arr client parses, which for a release the pre
         // feed rescued is the real title rather than the random stem it
         // was posted under. Sonarr and Radarr match on this string and
@@ -593,6 +626,44 @@ pub(super) fn sab_units(n: f64) -> String {
     } else {
         format!("{:.1} G", n / (K * K * K))
     }
+}
+
+/// SAB's `script` field: the script that will ACTUALLY run for this job,
+/// by basename, or `"None"`.
+///
+/// The facade used to report `script_override` alone, so a job running
+/// its category's script - or the global one - was published to every
+/// SAB client as having no script at all, and a client's "which jobs run
+/// my script" view answered wrongly for the whole ordinary case (L4,
+/// 10 Aug sweep). The ladder is `resolve_script`'s: an explicit "none"
+/// suppresses everything, an override wins, then the category, then the
+/// global script. Basename because that is SAB's vocabulary - the same
+/// name `mode=get_scripts` lists and an add's `script=` sends back - and
+/// `script_override` may hold the resolved absolute path.
+pub(super) fn sab_script_name(
+    over: &str,
+    cat_script: &str,
+    global: Option<&std::path::Path>,
+) -> String {
+    let base = |s: &str| -> String {
+        std::path::Path::new(s)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| s.to_string())
+    };
+    if over.eq_ignore_ascii_case("none") {
+        return "None".into();
+    }
+    if !over.is_empty() {
+        return base(over);
+    }
+    if !cat_script.is_empty() {
+        return base(cat_script);
+    }
+    global
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "None".into())
 }
 
 /// The active download's counters as `(decoded, declared total, left)`,
@@ -781,6 +852,447 @@ fn watch_failed_json(d: &Daemon) -> Vec<Value> {
         .collect()
 }
 
+/// The queue payload's notice rings, built outside the `json!` literal.
+///
+/// Six lists that share one job - telling the user about something that
+/// happened while nobody was looking - and one shape: a ring the dashboard
+/// drains. Split out of `queue_json` for the size gate (TODO 106); they
+/// touch nothing else in that function, which is why they are the cut.
+///
+/// The first five are toast-once and narrate a moment that is over. The
+/// last is not: `delete_kept` describes a folder that is still on disk, so
+/// the page keeps showing it until the user dismisses it.
+struct QueueNotices {
+    watch_failed: Vec<Value>,
+    watch_picked: Vec<Value>,
+    auto_retried: Vec<Value>,
+    giveup_tripped: Vec<Value>,
+    watch_upgraded: Vec<Value>,
+    delete_kept: Vec<Value>,
+}
+
+fn queue_notices(d: &Daemon) -> QueueNotices {
+    let watch_failed = watch_failed_json(d);
+    // Recent watch-folder pickups, newest last. The dashboard toasts the
+    // ones stamped after its own first poll, so a page opened later never
+    // replays old events. Like watch_failed, built outside json!.
+    let watch_picked: Vec<Value> = d
+        .watch_picked
+        .lock_ok()
+        .iter()
+        .map(|(name, folder, at)| json!({"name": name, "folder": folder, "at": at}))
+        .collect();
+    // M32: automatic retries that have just re-queued. Same ring shape,
+    // same one-toast-each contract - see `Daemon::auto_retried`.
+    let auto_retried: Vec<Value> = d
+        .auto_retried
+        .lock_ok()
+        .iter()
+        .map(|(id, name, at)| json!({"nzo_id": id, "name": name, "at": at}))
+        .collect();
+    // §96.3: targets the give-up breaker has just stopped chasing,
+    // toasted the same way and for the same reason - the show stops
+    // arriving, and until now only a log line said so.
+    let giveup_tripped: Vec<Value> = d
+        .giveup_tripped
+        .lock_ok()
+        .iter()
+        .map(|(name, count, at)| json!({"name": name, "count": count, "at": at}))
+        .collect();
+    // Watchlist delete_old upgrades that removed the superseded copy,
+    // newest last - toasted the same way pickups are, because a whole
+    // completed download (and its history row) disappearing deserves at
+    // least one sentence in front of the user. `fate` picks between
+    // "went to the Trash", "was deleted" and "is still on disk" - the
+    // page must not promise a Trash the delete did not use, nor a delete
+    // the Trash refused to make.
+    let watch_upgraded: Vec<Value> = d
+    .watch_upgraded
+    .lock_ok()
+    .iter()
+    .map(|(name, old, oldq, fate, at)| {
+        json!({"name": name, "old": old, "oldq": oldq, "fate": fate, "at": at})
+    })
+    .collect();
+    // Deletes that removed the record but not the files. NOT a
+    // toast-once ring like the four above: those narrate a moment that
+    // is over, this one describes a folder that is still there, so the
+    // page keeps it until the user dismisses it
+    // (mode=delete_kept_dismiss).
+    let delete_kept: Vec<Value> = d
+        .delete_kept
+        .lock_ok()
+        .iter()
+        .map(|(name, path, why, at)| json!({"name": name, "path": path, "why": why, "at": at}))
+        .collect();
+    QueueNotices {
+        watch_failed,
+        watch_picked,
+        auto_retried,
+        giveup_tripped,
+        watch_upgraded,
+        delete_kept,
+    }
+}
+
+/// The once-per-payload snapshot every queue row is built against.
+///
+/// A struct rather than a dozen arguments, and read ONCE for the whole
+/// body rather than per row: that is the §91 contract these fields carry.
+/// Pairing one row with a fresh read of any of them is the bug that shipped
+/// the finishing job's ~98% bar onto the next job's row. Handing every row
+/// the same values makes "one instant" true by construction, because
+/// nothing downstream is able to re-read.
+struct SlotCtx {
+    /// The running job's live archive shape (owner, tag), straight off its
+    /// extractor; the latched `archive_shape` answers for every other row.
+    live_shape: Option<(String, String)>,
+    /// The owner tag of a download blocked on a password right now.
+    pw_wanted: Option<String>,
+    /// §77: whether the health sink is switched on at all.
+    health_defer: bool,
+    /// Free bytes on the output disk, for the per-row unpack-space check.
+    free_now: Option<u64>,
+    /// Wall-clock seconds, for deriving each row's absolute `time_added`
+    /// from its monotonic `queued_at` (issue #34).
+    now_unix: u64,
+    /// Live speed over the ~5 s rolling window, for `timeleft`.
+    speed_bps: f64,
+    /// Prefetch sidecar state (owner, bytes), matched per row.
+    sc: Option<(String, u64)>,
+    /// The pipeline's own activity token per job, plus the three reads the
+    /// fetching refinement needs: the hub owner, an open stall episode, and
+    /// the per-server pool view.
+    activity_map: std::collections::HashMap<String, &'static str>,
+    active_id: Option<String>,
+    stall: Option<(String, Instant)>,
+    pool_view: Vec<(String, usize, u64)>,
+    /// The post-processing script ladder as `(category -> script,
+    /// global script)`, snapshotted here for the same reason everything
+    /// else is: the row reports which script it will run (L4) and must
+    /// not reach back into the daemon under the queue lock to find out.
+    cat_scripts: std::collections::HashMap<String, String>,
+    global_script: Option<PathBuf>,
+}
+
+/// One SABnzbd queue slot, built from the row's own state and the payload
+/// snapshot beside it.
+///
+/// Split out of `queue_json` for the size gate (TODO 106): the row is a
+/// self-contained subject - it reads no daemon state of its own, only the
+/// `SlotCtx` its caller took once before the queue lock and the numbers
+/// that caller already derived under this slot's lock. Everything that has
+/// to be one instant stays one instant, because nothing here can re-read.
+#[allow(clippy::too_many_arguments)]
+fn slot_json(
+    ctx: &SlotCtx,
+    i: usize,
+    j: &Job,
+    phase: Option<&'static str>,
+    live: bool,
+    pct: u64,
+    left: u64,
+) -> Value {
+    let SlotCtx {
+        live_shape,
+        pw_wanted,
+        health_defer,
+        free_now,
+        now_unix,
+        speed_bps,
+        sc,
+        activity_map,
+        active_id,
+        stall,
+        pool_view,
+        cat_scripts,
+        global_script,
+    } = ctx;
+    let mbleft = left as f64 / API_MB;
+    // Only a job actually on the wire has a rate to divide by.
+    let timeleft = if live && phase.is_none() && *speed_bps > 1.0 {
+        sab_timeleft(left as f64 / *speed_bps)
+    } else {
+        "0:00:00".to_string()
+    };
+    // Live shape for the job that is actually downloading; the
+    // latched one otherwise (a queued job that already ran once,
+    // or a paused one).
+    let shape = live_shape
+        .as_ref()
+        .filter(|(owner, _)| *owner == j.nzo_id)
+        .map(|(_, tag)| tag.clone())
+        .unwrap_or_else(|| j.archive_shape.clone());
+    // "What is happening right now" for this row: a token the
+    // dashboard maps to an i18n phrase, an optional server-name
+    // detail (language-neutral by construction), and for an open
+    // stall episode the seconds since bytes last moved.
+    let (activity, activity_detail, activity_secs) = match j.state {
+        // The whole post-network tail: repair hand-off, unlock,
+        // rename, the move to the destination.
+        JobState::Completed => ("finalizing", String::new(), None),
+        // §129: the activity map still carries the REAL stage.
+        JobState::Finishing => (
+            activity_map.get(&j.nzo_id).copied().unwrap_or("finalizing"),
+            String::new(),
+            None,
+        ),
+        JobState::Downloading if !j.suspended => {
+            let tok = activity_map.get(&j.nzo_id).copied().unwrap_or("fetching");
+            if tok == "fetching" && active_id.as_deref() == Some(j.nzo_id.as_str()) {
+                let connected: usize = pool_view.iter().map(|(_, c, _)| *c).sum();
+                let bytes: u64 = pool_view.iter().map(|(_, _, b)| *b).sum();
+                let joined = |v: &[&str]| match v.len() {
+                    0 => String::new(),
+                    1 => v[0].to_string(),
+                    n => format!("{} +{}", v[0], n - 1),
+                };
+                if let Some((_, since)) = stall.as_ref().filter(|(sid, _)| *sid == j.nzo_id) {
+                    ("waiting", String::new(), Some(since.elapsed().as_secs()))
+                } else if !pool_view.is_empty() && connected == 0 {
+                    let all: Vec<&str> = pool_view.iter().map(|(h, _, _)| h.as_str()).collect();
+                    // Bytes already moved means the connections
+                    // dropped mid-run; none yet means first dial.
+                    let tok = if bytes > 0 {
+                        "reconnecting"
+                    } else {
+                        "connecting"
+                    };
+                    (tok, joined(&all), None)
+                } else {
+                    let up: Vec<&str> = pool_view
+                        .iter()
+                        .filter(|(_, c, _)| *c > 0)
+                        .map(|(h, _, _)| h.as_str())
+                        .collect();
+                    ("fetching", joined(&up), None)
+                }
+            } else {
+                (tok, String::new(), None)
+            }
+        }
+        _ => ("", String::new(), None),
+    };
+    // Unpack-space preflight: a shape whose volumes land on disk
+    // and unpack after the download needs room for the archive
+    // parts PLUS the extracted payload - roughly twice the set -
+    // and a disk that fits only the volumes fails at the very
+    // end, after every byte was spent. Warn the moment the shape
+    // is known instead. Bytes still short, not a boolean, so the
+    // row can say how much to free. `mixed-pass` overshoots (only
+    // part of it materializes) - an amber warning that is
+    // sometimes cautious beats a failure at 96%.
+    let space_short = free_now
+        .filter(|_| shape_unpacks_on_disk(&shape) && j.state != JobState::Completed)
+        .and_then(|free| {
+            // Volumes already fetched sit on the disk and are
+            // subtracted from `free` by their existence, so what
+            // is still owed is the unfetched remainder plus the
+            // whole extracted payload (approximated by the set
+            // size - archives on Usenet are near-incompressible
+            // media).
+            // The same remainder the row reports - a job whose
+            // volumes are already down and unpacking still needs
+            // room for the payload, but not for bytes it has.
+            // An encrypted set is counted a copy higher still:
+            // see `unpack_space_needed`.
+            let needed = unpack_space_needed(left, j.total_bytes, &shape);
+            needed.checked_sub(free).filter(|s| *s > 0)
+        })
+        .unwrap_or(0);
+    json!({
+        "nzo_id": j.nzo_id,
+        "filename": j.name,
+        // Ours, not SAB's: the *arrs ignore unknown keys, and
+        // "why is this here / where is its NZB" was unanswerable
+        // from the UI.
+        "origin": j.origin,
+        "nzb_path": j.nzb_path.to_string_lossy(),
+        "cat": if j.category.is_empty() { "*" } else { &j.category },
+        "status": match j.state {
+            // A pause-suspended job reads Paused the moment the
+            // user hits pause - not Downloading until the
+            // pipeline finishes unwinding and parks it.
+            JobState::Downloading if j.suspended => "Paused",
+            // The post-network tail, by the phase the pipeline
+            // says it is in. Same reasoning as `Moving` below:
+            // the record has no state for any of this (it says
+            // Downloading from the first article to the last
+            // extracted byte), and calling a verify pass a
+            // download meant a row that sat at "100%, 0 MB/s"
+            // for minutes with nothing to distinguish it from a
+            // pool that had died. These are SABnzbd's own state
+            // words, so the *arrs already read them as "busy,
+            // keep waiting".
+            JobState::Downloading if phase.is_some() => phase.unwrap_or("Downloading"),
+            JobState::Downloading => "Downloading",
+            // §129: SAB's own stage words; "Moving" for the
+            // finalize window - no new compat vocabulary.
+            JobState::Finishing => phase.unwrap_or("Moving"),
+            _ if j.paused => "Paused",
+            // `Completed` is set when the NETWORK leg ends, well
+            // before repair hand-off, unlock, rename and the move
+            // to the destination. Reporting that tail as "Queued"
+            // at 0% made a job that had just shown 100% appear to
+            // regress and sit stuck - a 90 GB move to a NAS reads
+            // as ten minutes of "Queued 0%", and users delete it
+            // mid-move. SAB reports the tail as its own states,
+            // which the *arrs know to keep waiting through.
+            JobState::Completed => "Moving",
+            _ => "Queued",
+        },
+        // Ours, not SAB's (additive): the dashboard's state
+        // word; `status` keeps SAB vocabulary for the *arrs.
+        "finishing": j.state == JobState::Finishing,
+        "index": i,
+        "percentage": format!("{pct}"),
+        "mb": format!("{:.2}", j.total_bytes as f64 / API_MB),
+        "mbleft": format!("{mbleft:.2}"),
+        "timeleft": timeleft,
+        // --- SABnzbd `build_queue` slot parity (issue #34) ---
+        // Every key below is in real SAB's queue slot and was
+        // missing from ours. A remote that deserializes the
+        // slot into a declared type gets a null where it
+        // expects a value and stops before it renders
+        // anything - which is the shape #34 reported, with
+        // mode=addfile (no slot parsing) working throughout.
+        // Names and formats mirror sabnzbd/api.py build_queue.
+        "size": format!("{}B", sab_units(j.total_bytes as f64)),
+        "sizeleft": format!("{}B", sab_units(left as f64)),
+        // SAB's post-processing level for the job as a
+        // string; `sab_pp` is what the add asked for, and 3
+        // (repair + unpack + delete) is what one-pass does
+        // when nothing named a level.
+        "unpackopts": j.sab_pp.unwrap_or(3).to_string(),
+        // The script this job will actually run, by basename - the
+        // override, else the category's, else the global one. See
+        // `sab_script_name`; the raw override alone told every client
+        // "None" for the ordinary category/global case.
+        "script": sab_script_name(
+            &j.script_override,
+            cat_scripts.get(&j.category).map(String::as_str).unwrap_or(""),
+            global_script.as_deref(),
+        ),
+        // Always empty, deliberately: M24's contract is that
+        // the password itself never leaves the daemon, only
+        // the facts about it (`has_password` above). SAB puts
+        // the value here; we put what SAB puts when there is
+        // none, and a client reads "no password" rather than
+        // failing to find the key at all.
+        "password": "",
+        // SAB's per-job label list (DUPLICATE, ALTERNATIVE,
+        // ...). Nothing here produces them yet, and an empty
+        // list is what SAB sends for a job with none.
+        "labels": Value::Array(Vec::new()),
+        // Average article age. We do not carry the post dates
+        // on the queue record, and "-" is SAB's own value for
+        // a job whose age it does not know.
+        "avg_age": "-",
+        // Unix seconds this job was added. Derived from the
+        // record's monotonic `queued_at` against the one
+        // `now_unix` read at the top of this payload, and from
+        // the persisted `queued_unix` when that Instant is gone
+        // - it is process-local AND consumed at pick, so this
+        // answered null both for every job that had started and
+        // for the whole queue after a restart, and SAB's own
+        // field is always a number (M10, 10 Aug sweep).
+        "time_added": j.queued_at
+            .map(|t| now_unix.saturating_sub(t.elapsed().as_secs()))
+            .or_else(|| j.queued_unix.map(|t| t.max(0) as u64))
+            .unwrap_or(0),
+        // Bytes the post is short. One-pass decides that at
+        // verify time, not while the queue row is live, so
+        // this is SAB's healthy-job value until it does.
+        "mbmissing": "0.00",
+        // SAB's direct-unpack progress line. One-pass unpacks
+        // in stream rather than as a separate direct-unpack
+        // pass, so there is no such line: null, which is what
+        // SAB sends with the feature off.
+        "direct_unpack": Value::Null,
+        // Ours, not SAB's, like `origin`: the active row's
+        // "what is happening right now" sub-line. Empty when
+        // there is nothing to say (queued, paused).
+        "activity": activity,
+        "activity_detail": activity_detail,
+        "activity_secs": activity_secs,
+        "priority": priority_name(j.priority),
+        // Truth-audit I: the canonical name an oracle gave this
+        // release, on the QUEUE row and not just in history. A
+        // retried obfuscated job already knew its own name - it
+        // survives the retry on the record - and still went back
+        // to showing a hash for the whole of its second
+        // download. Additive keys the *arrs ignore; the
+        // dashboard runs them through the same identName() the
+        // history row uses.
+        "identity_name": j.identity_name,
+        "identity_src": j.identity_src,
+        // ...and which Smart Folder rule chose this job's
+        // category, so a download that landed somewhere
+        // unexpected can say who sent it there. Empty when no
+        // rule matched.
+        "smart_rule": j.smart_rule,
+        "duplicate_key": j.dupe_key.as_deref().unwrap_or(""),
+        // §129 2b: the SAB pp level the add requested (null =
+        // none named) and the job's script= override - the
+        // drawer shows the one-pass mapping instead of the
+        // params silently vanishing.
+        "sab_pp": j.sab_pp,
+        "script_override": j.script_override,
+        // M24, ours like `origin`: the queue drawer's password
+        // control shows whether one is already attached. The
+        // value itself never leaves the daemon - history's
+        // has_password contract.
+        "has_password": j.password.is_some(),
+        // ...and whether the RUNNING download is blocked on one
+        // right now (the "ask at once" prompt trigger, and a 🔑
+        // badge in every mode).
+        "password_needed": pw_wanted.as_deref() == Some(j.nzo_id.as_str()),
+        "deferred": j.deferred,
+        "defer_reason": j.defer_reason,
+        // TODO §77 pre-flight verdict, ours like `origin` and
+        // `deferred` beside it - SAB has no such field and the
+        // *arrs ignore what they don't know. Null until the
+        // prober has sampled the job (and forever if the
+        // operator turned it off), which renders no badge.
+        //
+        // `sunk` is the verdict's only scheduling consequence,
+        // resolved here rather than in the client: whether the
+        // optional auto-defer is actually holding THIS job
+        // behind healthier ones depends on the live setting and
+        // on the job's own priority, and a queue row that has
+        // to explain why it is not starting must not have to
+        // guess at either.
+        "health": j.health.as_ref().map(|h| {
+            let mut v = crate::health::health_json(h);
+            if let Some(o) = v.as_object_mut() {
+                o.insert(
+                    "sunk".into(),
+                    json!(*health_defer && j.priority < 2 && h.sinks()),
+                );
+            }
+            v
+        }),
+        "zip_packed": j.zip_packed,
+        "archive_shape": shape,
+        // Ours, like the keys around it: bytes the output disk
+        // is short of what this set's download + unpack will
+        // take. 0 = fine (or the shape one-passes and needs no
+        // headroom). Advisory - nothing is held back by it.
+        "space_short": space_short,
+        // §76. Ours, not SAB's, like the keys above it: what the
+        // main video's own header says it is, and anything the
+        // name claims that those bytes deny. Null until the
+        // prober has an answer.
+        "media": j.media,
+        "prefetching": sc.as_ref().is_some_and(|(id, _)| *id == j.nzo_id),
+        "prefetched_mb": sc
+            .as_ref()
+            .filter(|(id, _)| *id == j.nzo_id)
+            .map(|(_, b)| format!("{:.2}", *b as f64 / API_MB))
+            .unwrap_or_default(),
+    })
+}
+
 pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, String>) -> Value {
     // The running job's live archive shape, straight off its extractor -
     // the badge updates the moment the first volume's headers parse, long
@@ -806,14 +1318,37 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
     // per-slot unpack-space check below. This is per-job arithmetic,
     // deliberately separate from the min_free floor (which holds the
     // whole queue and knows nothing about shapes).
-    let free_now = free_bytes(&d.out_dir());
+    //
+    // §91 again, and the reason this is the (free, total) walk rather
+    // than a bare `free_bytes`: SAB's header carries both numbers for
+    // the same disk, and a second statvfs of its own could report a
+    // total that its own free exceeds. `free_bytes` IS this walk with
+    // the total dropped, so nothing changes for the callers below.
+    let disk_now = disk_stat_walk(&d.out_dir());
+    let free_now = disk_now.map(|(free, _)| free);
+    // Wall-clock now, once per payload: the slots' `time_added` is
+    // derived from each job's monotonic `queued_at` against it (issue
+    // #34 - SAB carries an absolute add time and we kept only an
+    // Instant).
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     // Why nothing is starting, if the scheduler is holding the queue -
     // the dashboard renders this instead of an unexplained "idle".
-    let hold = d
-        .queue_hold
-        .lock_ok()
-        .as_ref()
-        .map(|(k, a, b)| hold_json(k, *a, *b));
+    // One read of the hold, two answers off it: the dashboard's own
+    // {kind, a, b} card, and - when the kind is "quota" - the GB
+    // already spent, which is the only live view this payload has of
+    // SAB's `left_quota`.
+    let (hold, hold_quota_spent) = {
+        let h = d.queue_hold.lock_ok();
+        (
+            h.as_ref().map(|(k, a, b)| hold_json(k, *a, *b)),
+            h.as_ref()
+                .filter(|(k, _, _)| k == "quota")
+                .map(|(_, spent, _)| *spent),
+        )
+    };
     let q = d.queue.lock_ok();
     // §91: the active job's progress is read fresh at every pairing with
     // a slot's state (see `active_left` below), never snapshotted up
@@ -921,7 +1456,37 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
     // finished (0 left) while its row, which excludes suspended jobs
     // from the tail, reported the whole set still to fetch. One walk
     // ends both.
+    // The snapshot every row below is built against - see `SlotCtx`. Each
+    // field is moved from the read above it, in the order it was taken, so
+    // building it changes nothing about WHEN anything was sampled;
+    // `free_now` and `speed_bps` are Copy and the header still reads them.
+    let ctx = SlotCtx {
+        live_shape,
+        pw_wanted,
+        health_defer,
+        free_now,
+        now_unix,
+        speed_bps,
+        sc,
+        activity_map,
+        active_id,
+        stall,
+        pool_view,
+        cat_scripts: d
+            .cat_meta
+            .lock_ok()
+            .iter()
+            .filter(|(_, m)| !m.script.is_empty())
+            .map(|(name, m)| (name.clone(), m.script.clone()))
+            .collect(),
+        global_script: d.script.lock_ok().clone(),
+    };
     let mut remaining_bytes: u64 = 0;
+    // ...and the whole queue's declared bytes, on the same walk and for
+    // the same reason - SAB's `mb` / `size` header pair is this total
+    // against the `mbleft` / `sizeleft` beside it, and two walks could
+    // report a total that its own remainder exceeds.
+    let mut total_bytes_all: u64 = 0;
     let slots: Vec<Value> = q
         .iter()
         .enumerate()
@@ -952,239 +1517,54 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
             // job, before the caller's view filter: the header describes
             // the whole queue, the rows describe the slice asked for.
             remaining_bytes = remaining_bytes.saturating_add(left);
+            total_bytes_all = total_bytes_all.saturating_add(j.total_bytes);
             if !cat_filter.is_none_or(|c| j.category == *c)
                 || !ids.as_ref().is_none_or(|s| s.contains(j.nzo_id.as_str()))
             {
                 return None;
             }
-            let mbleft = left as f64 / API_MB;
-            // Only a job actually on the wire has a rate to divide by.
-            let timeleft = if live.is_some() && phase.is_none() && speed_bps > 1.0 {
-                sab_timeleft(left as f64 / speed_bps)
-            } else {
-                "0:00:00".to_string()
-            };
-            // Live shape for the job that is actually downloading; the
-            // latched one otherwise (a queued job that already ran once,
-            // or a paused one).
-            let shape = live_shape
-                .as_ref()
-                .filter(|(owner, _)| *owner == j.nzo_id)
-                .map(|(_, tag)| tag.clone())
-                .unwrap_or_else(|| j.archive_shape.clone());
-            // "What is happening right now" for this row: a token the
-            // dashboard maps to an i18n phrase, an optional server-name
-            // detail (language-neutral by construction), and for an open
-            // stall episode the seconds since bytes last moved.
-            let (activity, activity_detail, activity_secs) = match j.state {
-                // The whole post-network tail: repair hand-off, unlock,
-                // rename, the move to the destination.
-                JobState::Completed => ("finalizing", String::new(), None),
-                // §129: the activity map still carries the REAL stage.
-                JobState::Finishing => (
-                    activity_map.get(&j.nzo_id).copied().unwrap_or("finalizing"),
-                    String::new(),
-                    None,
-                ),
-                JobState::Downloading if !j.suspended => {
-                    let tok = activity_map.get(&j.nzo_id).copied().unwrap_or("fetching");
-                    if tok == "fetching" && active_id.as_deref() == Some(j.nzo_id.as_str()) {
-                        let connected: usize = pool_view.iter().map(|(_, c, _)| *c).sum();
-                        let bytes: u64 = pool_view.iter().map(|(_, _, b)| *b).sum();
-                        let joined = |v: &[&str]| match v.len() {
-                            0 => String::new(),
-                            1 => v[0].to_string(),
-                            n => format!("{} +{}", v[0], n - 1),
-                        };
-                        if let Some((_, since)) = stall.as_ref().filter(|(sid, _)| *sid == j.nzo_id)
-                        {
-                            ("waiting", String::new(), Some(since.elapsed().as_secs()))
-                        } else if !pool_view.is_empty() && connected == 0 {
-                            let all: Vec<&str> =
-                                pool_view.iter().map(|(h, _, _)| h.as_str()).collect();
-                            // Bytes already moved means the connections
-                            // dropped mid-run; none yet means first dial.
-                            let tok = if bytes > 0 {
-                                "reconnecting"
-                            } else {
-                                "connecting"
-                            };
-                            (tok, joined(&all), None)
-                        } else {
-                            let up: Vec<&str> = pool_view
-                                .iter()
-                                .filter(|(_, c, _)| *c > 0)
-                                .map(|(h, _, _)| h.as_str())
-                                .collect();
-                            ("fetching", joined(&up), None)
-                        }
-                    } else {
-                        (tok, String::new(), None)
-                    }
-                }
-                _ => ("", String::new(), None),
-            };
-            // Unpack-space preflight: a shape whose volumes land on disk
-            // and unpack after the download needs room for the archive
-            // parts PLUS the extracted payload - roughly twice the set -
-            // and a disk that fits only the volumes fails at the very
-            // end, after every byte was spent. Warn the moment the shape
-            // is known instead. Bytes still short, not a boolean, so the
-            // row can say how much to free. `mixed-pass` overshoots (only
-            // part of it materializes) - an amber warning that is
-            // sometimes cautious beats a failure at 96%.
-            let space_short = free_now
-                .filter(|_| shape_unpacks_on_disk(&shape) && j.state != JobState::Completed)
-                .and_then(|free| {
-                    // Volumes already fetched sit on the disk and are
-                    // subtracted from `free` by their existence, so what
-                    // is still owed is the unfetched remainder plus the
-                    // whole extracted payload (approximated by the set
-                    // size - archives on Usenet are near-incompressible
-                    // media).
-                    // The same remainder the row reports - a job whose
-                    // volumes are already down and unpacking still needs
-                    // room for the payload, but not for bytes it has.
-                    // An encrypted set is counted a copy higher still:
-                    // see `unpack_space_needed`.
-                    let needed = unpack_space_needed(left, j.total_bytes, &shape);
-                    needed.checked_sub(free).filter(|s| *s > 0)
-                })
-                .unwrap_or(0);
-            Some(json!({
-                "nzo_id": j.nzo_id,
-                "filename": j.name,
-                // Ours, not SAB's: the *arrs ignore unknown keys, and
-                // "why is this here / where is its NZB" was unanswerable
-                // from the UI.
-                "origin": j.origin,
-                "nzb_path": j.nzb_path.to_string_lossy(),
-                "cat": if j.category.is_empty() { "*" } else { &j.category },
-                "status": match j.state {
-                    // A pause-suspended job reads Paused the moment the
-                    // user hits pause - not Downloading until the
-                    // pipeline finishes unwinding and parks it.
-                    JobState::Downloading if j.suspended => "Paused",
-                    // The post-network tail, by the phase the pipeline
-                    // says it is in. Same reasoning as `Moving` below:
-                    // the record has no state for any of this (it says
-                    // Downloading from the first article to the last
-                    // extracted byte), and calling a verify pass a
-                    // download meant a row that sat at "100%, 0 MB/s"
-                    // for minutes with nothing to distinguish it from a
-                    // pool that had died. These are SABnzbd's own state
-                    // words, so the *arrs already read them as "busy,
-                    // keep waiting".
-                    JobState::Downloading if phase.is_some() => phase.unwrap_or("Downloading"),
-                    JobState::Downloading => "Downloading",
-                    // §129: SAB's own stage words; "Moving" for the
-                    // finalize window - no new compat vocabulary.
-                    JobState::Finishing => phase.unwrap_or("Moving"),
-                    _ if j.paused => "Paused",
-                    // `Completed` is set when the NETWORK leg ends, well
-                    // before repair hand-off, unlock, rename and the move
-                    // to the destination. Reporting that tail as "Queued"
-                    // at 0% made a job that had just shown 100% appear to
-                    // regress and sit stuck - a 90 GB move to a NAS reads
-                    // as ten minutes of "Queued 0%", and users delete it
-                    // mid-move. SAB reports the tail as its own states,
-                    // which the *arrs know to keep waiting through.
-                    JobState::Completed => "Moving",
-                    _ => "Queued",
-                },
-                // Ours, not SAB's (additive): the dashboard's state
-                // word; `status` keeps SAB vocabulary for the *arrs.
-                "finishing": j.state == JobState::Finishing,
-                "index": i,
-                "percentage": format!("{pct}"),
-                "mb": format!("{:.2}", j.total_bytes as f64 / API_MB),
-                "mbleft": format!("{mbleft:.2}"),
-                "timeleft": timeleft,
-                // Ours, not SAB's, like `origin`: the active row's
-                // "what is happening right now" sub-line. Empty when
-                // there is nothing to say (queued, paused).
-                "activity": activity,
-                "activity_detail": activity_detail,
-                "activity_secs": activity_secs,
-                "priority": priority_name(j.priority),
-                // Truth-audit I: the canonical name an oracle gave this
-                // release, on the QUEUE row and not just in history. A
-                // retried obfuscated job already knew its own name - it
-                // survives the retry on the record - and still went back
-                // to showing a hash for the whole of its second
-                // download. Additive keys the *arrs ignore; the
-                // dashboard runs them through the same identName() the
-                // history row uses.
-                "identity_name": j.identity_name,
-                "identity_src": j.identity_src,
-                // ...and which Smart Folder rule chose this job's
-                // category, so a download that landed somewhere
-                // unexpected can say who sent it there. Empty when no
-                // rule matched.
-                "smart_rule": j.smart_rule,
-                "duplicate_key": j.dupe_key.as_deref().unwrap_or(""),
-                // §129 2b: the SAB pp level the add requested (null =
-                // none named) and the job's script= override - the
-                // drawer shows the one-pass mapping instead of the
-                // params silently vanishing.
-                "sab_pp": j.sab_pp,
-                "script_override": j.script_override,
-                // M24, ours like `origin`: the queue drawer's password
-                // control shows whether one is already attached. The
-                // value itself never leaves the daemon - history's
-                // has_password contract.
-                "has_password": j.password.is_some(),
-                // ...and whether the RUNNING download is blocked on one
-                // right now (the "ask at once" prompt trigger, and a 🔑
-                // badge in every mode).
-                "password_needed": pw_wanted.as_deref() == Some(j.nzo_id.as_str()),
-                "deferred": j.deferred,
-                "defer_reason": j.defer_reason,
-                // TODO §77 pre-flight verdict, ours like `origin` and
-                // `deferred` beside it - SAB has no such field and the
-                // *arrs ignore what they don't know. Null until the
-                // prober has sampled the job (and forever if the
-                // operator turned it off), which renders no badge.
-                //
-                // `sunk` is the verdict's only scheduling consequence,
-                // resolved here rather than in the client: whether the
-                // optional auto-defer is actually holding THIS job
-                // behind healthier ones depends on the live setting and
-                // on the job's own priority, and a queue row that has
-                // to explain why it is not starting must not have to
-                // guess at either.
-                "health": j.health.as_ref().map(|h| {
-                    let mut v = crate::health::health_json(h);
-                    if let Some(o) = v.as_object_mut() {
-                        o.insert(
-                            "sunk".into(),
-                            json!(health_defer && j.priority < 2 && h.sinks()),
-                        );
-                    }
-                    v
-                }),
-                "zip_packed": j.zip_packed,
-                "archive_shape": shape,
-                // Ours, like the keys around it: bytes the output disk
-                // is short of what this set's download + unpack will
-                // take. 0 = fine (or the shape one-passes and needs no
-                // headroom). Advisory - nothing is held back by it.
-                "space_short": space_short,
-                // §76. Ours, not SAB's, like the keys above it: what the
-                // main video's own header says it is, and anything the
-                // name claims that those bytes deny. Null until the
-                // prober has an answer.
-                "media": j.media,
-                "prefetching": sc.as_ref().is_some_and(|(id, _)| *id == j.nzo_id),
-                "prefetched_mb": sc
-                    .as_ref()
-                    .filter(|(id, _)| *id == j.nzo_id)
-                    .map(|(_, b)| format!("{:.2}", *b as f64 / API_MB))
-                    .unwrap_or_default(),
-            }))
+            Some(slot_json(&ctx, i, &j, phase, live.is_some(), pct, left))
         })
         .collect();
     let n = slots.len();
+    // Everything in the queue, before the caller's category / nzo_ids
+    // filter - SAB's `noofslots_total` beside the filtered `noofslots`.
+    let total_slots = q.len();
+    // The window the caller asked for, echoed back in the header the
+    // way SAB does. Same parse as `paginate` above, which is what
+    // actually applied it.
+    let win_start: usize = params
+        .get("start")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let win_limit: usize = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    // SAB's percentage-of-line-speed cap, as a string beside the
+    // absolute one. "0" when nothing is capped, or when the line speed
+    // is unknown and a percentage of it would mean nothing.
+    let speedlimit_pct = {
+        let line = d.line_speed.load(Ordering::Relaxed);
+        let abs = d.hub.rate.get();
+        if line > 0 && abs > 0 {
+            format!("{}", (abs as f64 * 100.0 / line as f64).round() as u64)
+        } else {
+            "0".to_string()
+        }
+    };
+    // What is left of the quota, in SAB's units: the cap less what the
+    // period has actually cost. `quota_spent` is the download runner's
+    // republished ledger total, so this falls as the bytes arrive; the
+    // queue hold (GB, and set only once the quota already holds the
+    // queue) is the fallback for the tick before the runner has
+    // published anything (L5, 10 Aug sweep).
+    let left_quota = {
+        let cap = d.quota.load(Ordering::Relaxed) as f64;
+        let spent = (d.quota_spent.load(Ordering::Relaxed) as f64)
+            .max(hold_quota_spent.unwrap_or(0.0) * 1e9);
+        format!("{}B", sab_units((cap - spent).max(0.0)))
+    };
     // Minutes until a timed pause auto-resumes (SAB's pause_int).
     let pause_int = d
         .pause_until
@@ -1217,59 +1597,7 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
     } else {
         *d.limit_source.lock_ok()
     };
-    let watch_failed = watch_failed_json(d);
-    // Recent watch-folder pickups, newest last. The dashboard toasts the
-    // ones stamped after its own first poll, so a page opened later never
-    // replays old events. Like watch_failed, built outside json!.
-    let watch_picked: Vec<Value> = d
-        .watch_picked
-        .lock_ok()
-        .iter()
-        .map(|(name, folder, at)| json!({"name": name, "folder": folder, "at": at}))
-        .collect();
-    // M32: automatic retries that have just re-queued. Same ring shape,
-    // same one-toast-each contract - see `Daemon::auto_retried`.
-    let auto_retried: Vec<Value> = d
-        .auto_retried
-        .lock_ok()
-        .iter()
-        .map(|(id, name, at)| json!({"nzo_id": id, "name": name, "at": at}))
-        .collect();
-    // §96.3: targets the give-up breaker has just stopped chasing,
-    // toasted the same way and for the same reason - the show stops
-    // arriving, and until now only a log line said so.
-    let giveup_tripped: Vec<Value> = d
-        .giveup_tripped
-        .lock_ok()
-        .iter()
-        .map(|(name, count, at)| json!({"name": name, "count": count, "at": at}))
-        .collect();
-    // Watchlist delete_old upgrades that removed the superseded copy,
-    // newest last - toasted the same way pickups are, because a whole
-    // completed download (and its history row) disappearing deserves at
-    // least one sentence in front of the user. `fate` picks between
-    // "went to the Trash", "was deleted" and "is still on disk" - the
-    // page must not promise a Trash the delete did not use, nor a delete
-    // the Trash refused to make.
-    let watch_upgraded: Vec<Value> = d
-        .watch_upgraded
-        .lock_ok()
-        .iter()
-        .map(|(name, old, oldq, fate, at)| {
-            json!({"name": name, "old": old, "oldq": oldq, "fate": fate, "at": at})
-        })
-        .collect();
-    // Deletes that removed the record but not the files. NOT a
-    // toast-once ring like the four above: those narrate a moment that
-    // is over, this one describes a folder that is still there, so the
-    // page keeps it until the user dismisses it
-    // (mode=delete_kept_dismiss).
-    let delete_kept: Vec<Value> = d
-        .delete_kept
-        .lock_ok()
-        .iter()
-        .map(|(name, path, why, at)| json!({"name": name, "path": path, "why": why, "at": at}))
-        .collect();
+    let notices = queue_notices(d);
     json!({"queue": {
         // §91: `paused_now` above, not a fresh load - this flag, the
         // `pause_source` / `resume_at` pair derived from it and the
@@ -1345,7 +1673,9 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         // the queue (a/b are free/floor or spent/cap, in GB). Null when
         // downloads can start. The *arrs ignore unknown keys.
         "hold": hold, "storage_pause": crate::serve::slowstore::payload(d),
-        "speedlimit_abs": d.hub.rate.get(),
+        // A STRING, as SAB sends it and as our own mode=status already
+        // did - the two disagreed on type for the same field name.
+        "speedlimit_abs": d.hub.rate.get().to_string(),
         // The configured line speed, bytes/sec, 0 when unset. Ours: the
         // header's limit menu offers percentage presets only once this
         // is known, because `apply_setting("speedlimit")` REFUSES a bare
@@ -1361,12 +1691,12 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         // wire. Tokens only; the dashboard owns the words.
         "whyslow": d.whyslow.payload(d),
         "auto_speed": d.auto_speed.load(Ordering::Relaxed),
-        "watch_failed": watch_failed,
-        "watch_picked": watch_picked,
-        "auto_retried": auto_retried,
-        "giveup_tripped": giveup_tripped,
-        "watch_upgraded": watch_upgraded,
-        "delete_kept": delete_kept,
+        "watch_failed": notices.watch_failed,
+        "watch_picked": notices.watch_picked,
+        "auto_retried": notices.auto_retried,
+        "giveup_tripped": notices.giveup_tripped,
+        "watch_upgraded": notices.watch_upgraded,
+        "delete_kept": notices.delete_kept,
         // Direct id selection bypasses the start/limit window (SAB
         // semantics; see nzo_ids_param).
         "slots": if ids.is_some() { slots } else { paginate(slots, params) },
@@ -1387,6 +1717,67 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         } else {
             "Downloading"
         },
+        // --- SABnzbd `build_header` parity (issue #34) ---------------
+        //
+        // Real SAB starts its queue body with build_header(), and every
+        // key below is in it and was missing from ours. It matters
+        // because a phone remote reads the header out of the queue and
+        // history bodies rather than calling mode=version for it: SAB
+        // 2.0 trimmed these same fields, NZB360's history stopped
+        // working, and SAB's own fix was to put `version` back
+        // (sabnzbd/sabnzbd#872). #34 is that shape again - queue and
+        // history both stuck at "Connecting" on a daemon where
+        // mode=addfile, which reads no header, worked fine.
+        //
+        // Mirrors sabnzbd/api.py build_header() key for key. Where a
+        // number is genuinely ours we send ours; where the concept does
+        // not exist in a one-pass downloader we send what SAB sends
+        // when the feature is off, and say so at the key.
+        "version": SAB_VERSION,
+        "paused_all": paused_now,
+        // We download and complete under one tree, so both of SAB's
+        // disks are the same filesystem, measured once above.
+        "diskspace2": format!("{:.2}", free_now.unwrap_or(0) as f64 / 1e9),
+        "diskspace1_norm": sab_units(free_now.unwrap_or(0) as f64),
+        "diskspace2_norm": sab_units(free_now.unwrap_or(0) as f64),
+        "diskspacetotal1": format!("{:.2}", disk_now.map(|(_, t)| t).unwrap_or(0) as f64 / 1e9),
+        "diskspacetotal2": format!("{:.2}", disk_now.map(|(_, t)| t).unwrap_or(0) as f64 / 1e9),
+        // SAB's percentage-of-line-speed cap, as a string beside the
+        // absolute one. 0 when nothing is capped, or when the line
+        // speed is unknown and a percentage has no meaning.
+        "speedlimit": speedlimit_pct,
+        // Count of warnings in SAB's GUI log. nzbfast keeps no such
+        // log: `mode=warnings` derives its list from conditions that
+        // are true right now, and deriving them here would put a
+        // config-file read on a once-a-second poll. "0" is what SAB
+        // sends when nothing has been logged; clients that want the
+        // list already call mode=warnings or mode=status for it.
+        "have_warnings": "0",
+        // No queue-complete action exists here, which is what null
+        // means in SAB too.
+        "finishaction": Value::Null,
+        // The download quota, in SAB's units. `left_quota` is the
+        // remainder the scheduler's own hold knows about: the hold
+        // carries (spent, cap) in GB while a spent quota is holding
+        // the queue, and nothing is spent from this facade's point of
+        // view until it does.
+        "quota": format!("{}B", sab_units(d.quota.load(Ordering::Relaxed) as f64)),
+        "have_quota": d.quota.load(Ordering::Relaxed) > 0,
+        "left_quota": left_quota,
+        // One-pass decodes straight into the output file and holds no
+        // article cache, so SAB's cache pair is zero by construction.
+        "cache_art": "0",
+        "cache_size": "0 B",
+        // The queue totals SAB puts beside `sizeleft` / `timeleft`,
+        // from the one walk above.
+        "mb": format!("{:.2}", total_bytes_all as f64 / API_MB),
+        "mbleft": format!("{:.2}", remaining_bytes as f64 / API_MB),
+        "size": format!("{}B", sab_units(total_bytes_all as f64)),
+        "noofslots_total": total_slots,
+        // The window this body answered for, echoed back as SAB does.
+        "start": win_start,
+        "limit": win_limit,
+        "finish": win_start + win_limit,
     }})
 }
 
@@ -1828,6 +2219,7 @@ fn jr_append(d: &Arc<Daemon>, params: &[Value], ua_hdr: &str) -> Value {
                 name,
                 category,
                 priority,
+                None,
                 None,
                 &api_origin(ua_hdr, "arr"),
                 false,
@@ -2412,7 +2804,7 @@ pub(super) fn handle_jsonrpc(
 
 #[cfg(test)]
 mod tail_truth_tests {
-    use super::{JobState, slot_progress};
+    use super::{JobState, sab_script_name, slot_progress};
 
     const GB: u64 = 1_000_000_000;
 
@@ -2535,5 +2927,30 @@ mod tail_truth_tests {
             ),
             (49, u64::MAX - u64::MAX / 2)
         );
+    }
+
+    /// SAB's `script` field is the script that RUNS, not just an
+    /// explicit per-job override.
+    ///
+    /// A job taking its category's script - or the global one - was
+    /// published to every SAB client as `"None"`, so a client's
+    /// "which jobs run my script" view was wrong for the ordinary case
+    /// (L4, 10 Aug sweep). Basename, because that is the vocabulary
+    /// `mode=get_scripts` and an add's `script=` both use.
+    #[test]
+    fn the_script_field_reports_the_script_that_will_run() {
+        use std::path::Path;
+        let global = Path::new("/opt/nzb/scripts/global.sh");
+        // The ladder, top down.
+        assert_eq!(
+            sab_script_name("/opt/nzb/scripts/job.py", "cat.sh", Some(global)),
+            "job.py"
+        );
+        assert_eq!(sab_script_name("", "cat.sh", Some(global)), "cat.sh");
+        assert_eq!(sab_script_name("", "", Some(global)), "global.sh");
+        assert_eq!(sab_script_name("", "", None), "None");
+        // SAB's own null suppresses the whole ladder.
+        assert_eq!(sab_script_name("None", "cat.sh", Some(global)), "None");
+        assert_eq!(sab_script_name("none", "", Some(global)), "None");
     }
 }

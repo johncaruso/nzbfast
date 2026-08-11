@@ -157,6 +157,136 @@ fn m_predb_stats(
     })
 }
 
+/// The byte-probe naming lane's readout (TODO 131 B3). Its own mode for
+/// the same reason predb_stats is: index_stats is polled every few
+/// seconds by every open dashboard, and this is read when someone is
+/// looking at the lane. The daily numbers are the point - this band is
+/// one automated reposter's output, and a cadence stop or header
+/// encryption appearing must be visible the day it happens.
+fn m_probe7z_stats(
+    d: &Arc<Daemon>,
+    _req: &mut tiny_http::Request,
+    _params: &std::collections::HashMap<String, String>,
+    _ctx: &ApiCtx<'_>,
+    _api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|t| t.as_secs() as i64)
+        .unwrap_or(0);
+    Some(json!({
+        "enabled": d.index_probe7z.load(Ordering::Relaxed),
+        "index_enabled": d.index_enabled.load(Ordering::Relaxed),
+        "budget": d.index_probe7z_budget.load(Ordering::Relaxed),
+        "stats": d.with_index_read(|ix| Some(ix.probe7z_stats(now))),
+    }))
+}
+
+/// The pesto tiny-PAR2 rung's readout (TODO 131 red-team 5a). Same
+/// rationale as probe7z_stats: the band is one poster tool's output,
+/// and the daily numbers ARE the early warning - `parsefail` rising
+/// means the tool changed shape (its own canary, distinct from
+/// `notpar2` noise), `named` falling to zero means the sidecars
+/// stopped or the MID grammar moved and the lane needs re-derivation.
+fn m_pesto_stats(
+    d: &Arc<Daemon>,
+    _req: &mut tiny_http::Request,
+    _params: &std::collections::HashMap<String, String>,
+    _ctx: &ApiCtx<'_>,
+    _api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|t| t.as_secs() as i64)
+        .unwrap_or(0);
+    Some(json!({
+        "enabled": d.index_pesto.load(Ordering::Relaxed),
+        "index_enabled": d.index_enabled.load(Ordering::Relaxed),
+        "budget": d.index_pesto_budget.load(Ordering::Relaxed),
+        "stats": d.with_index_read(|ix| Some(ix.pesto_stats(now))),
+    }))
+}
+
+fn m_scoreboard(
+    d: &Arc<Daemon>,
+    _req: &mut tiny_http::Request,
+    params: &std::collections::HashMap<String, String>,
+    _ctx: &ApiCtx<'_>,
+    _api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    Some({
+        // Rolling window, default 30 days of samples.
+        let days = params
+            .get("days")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(30)
+            .clamp(1, 365);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|t| t.as_secs() as i64)
+            .unwrap_or(0);
+        let since = now - days * 86_400;
+        let stats = d.with_index_read(|ix| ix.scoreboard_stats(since).ok());
+        let kv_num = |k: &str| {
+            d.with_index_read(|ix| ix.kv_get(k))
+                .and_then(|v| v.parse::<i64>().ok())
+        };
+        // The band's measured precision, from the opt-in calibration
+        // subset: how often the size+time presence estimate agreed
+        // with a subject-stem exact check. This is the error bar the
+        // coverage estimate must be quoted with - have_unnamed is an
+        // ESTIMATE, never a hard number.
+        let cal_total = kv_num("scoreboard_cal_total").unwrap_or(0);
+        let cal_ok = kv_num("scoreboard_cal_band_ok").unwrap_or(0);
+        // The chosen indexer-account reference, by name, and whether it
+        // resolves RIGHT NOW - the dashboard's instant answer, since the
+        // sampler's status line only updates on its five-minute poll.
+        // Truth lives in Daemon::scoreboard_reference; this mirrors its
+        // named-entry rule (exists AND enabled) for display.
+        let sb_source = d.scoreboard_source.lock_ok().clone();
+        let sb_source_ok = !sb_source.is_empty()
+            && d.indexers
+                .lock_ok()
+                .iter()
+                .any(|i| i.enabled && i.name == sb_source);
+        json!({
+            "enabled": d.scoreboard_enabled.load(Ordering::Relaxed),
+            "index_enabled": d.index_enabled.load(Ordering::Relaxed),
+            // The URL is safe to echo (the key is not, and never is).
+            "url": d.scoreboard_url.lock_ok().clone(),
+            "has_key": d.scoreboard_key.lock_ok().is_some(),
+            "source": sb_source,
+            "source_ok": sb_source_ok,
+            "calibrate": d.scoreboard_calibrate.load(Ordering::Relaxed),
+            "running": d.scoreboard_running.load(Ordering::Relaxed),
+            "status": d.scoreboard_status.lock_ok().clone(),
+            "last_run": kv_num("scoreboard_last_run"),
+            "cooling_until": kv_num("scoreboard_cooling").filter(|t| *t > now),
+            "window_days": days,
+            "categories": stats.map(|cats| cats.into_iter().map(|c| json!({
+                "category": c.category,
+                "total": c.total,
+                "have_named": c.have_named,
+                "have_unnamed": c.have_unnamed,
+                "missing": c.missing,
+                // Convenience percentages; the raw counts are above.
+                "named_pct": if c.total > 0 {
+                    (c.have_named as f64 * 100.0 / c.total as f64 * 10.0).round() / 10.0
+                } else { 0.0 },
+                "coverage_pct": if c.total > 0 {
+                    ((c.have_named + c.have_unnamed) as f64 * 100.0
+                        / c.total as f64 * 10.0).round() / 10.0
+                } else { 0.0 },
+                "lag_median_secs": c.lag_median_secs,
+            })).collect::<Vec<_>>()),
+            "calibration": json!({
+                "checked": cal_total,
+                "band_agreed": cal_ok,
+            }),
+        })
+    })
+}
+
 fn m_pre_candidates(
     d: &Arc<Daemon>,
     _req: &mut tiny_http::Request,
@@ -1382,7 +1512,16 @@ fn m_index_get(
         let dupe_ok = params.get("dupe_ok").map(String::as_str) == Some("1");
         match r {
             Some((xml, name)) => {
-                match d.enqueue(xml.as_bytes(), &name, "", prio, None, "dashboard", dupe_ok) {
+                match d.enqueue(
+                    xml.as_bytes(),
+                    &name,
+                    "",
+                    prio,
+                    None,
+                    None,
+                    "dashboard",
+                    dupe_ok,
+                ) {
                     Ok(nzo) => {
                         // M34: queued from the wall - protect the
                         // row from the size cap. The queue itself
@@ -1530,6 +1669,10 @@ fn m_indexer_search(
             struct Merged {
                 prio: i32,
                 indexer: String,
+                /// That indexer's configured URL and the addresses it
+                /// answered this search from - the origin its enclosure
+                /// link is bound to when grabbed (M12/M9).
+                origin: SourceOrigin,
                 item: crate::newznab::SearchResult,
             }
             let mut merged: std::collections::HashMap<String, Merged> =
@@ -1539,12 +1682,13 @@ fn m_indexer_search(
                 let now = Instant::now();
                 for (cfg, outcome) in outcomes {
                     match outcome {
-                        Ok(items) => {
+                        Ok((items, origin)) => {
                             for item in items {
                                 let key = crate::newznab::dedupe_key(&item.title, item.size);
                                 let cand = Merged {
                                     prio: cfg.priority,
                                     indexer: cfg.name.clone(),
+                                    origin: origin.clone(),
                                     item,
                                 };
                                 match merged.entry(key) {
@@ -1606,6 +1750,7 @@ fn m_indexer_search(
                             url: m.item.link.clone(),
                             title: m.item.title.clone(),
                             indexer: m.indexer.clone(),
+                            origin: m.origin.clone(),
                             at: now,
                         },
                     );
@@ -1695,6 +1840,112 @@ fn m_spot_search(
     })
 }
 
+/// Name one obfuscated multi-volume RAR release from its own volume
+/// headers, ON DEMAND (TODO 131 rung 5).
+///
+/// Deliberately not a background lane, and this is the whole reason it
+/// is an API mode instead of a worker: the continuation-volume pilot
+/// (research/RAR-continuation-pilot-2026-08-10) measured 24 of 26 RAR5
+/// sets header-encrypted - 98% of the band by bytes - and a real-name
+/// yield of ~1.2% by bytes on the readable remainder. That is not worth
+/// a scan-time fetch budget. It IS worth one to three articles on a row
+/// somebody is actually looking at.
+///
+/// Either way the row pays only once: a `-hp` verdict is written as the
+/// terminal `header_encrypted` classification, so this mode and every
+/// future byte lane skip it from then on. The answer comes back inline
+/// (block_on + a hard ceiling, exactly like `spot_grab`) because the
+/// caller asked a question and the work is three articles.
+fn m_rar_name(
+    d: &Arc<Daemon>,
+    _req: &mut tiny_http::Request,
+    params: &std::collections::HashMap<String, String>,
+    ctx: &ApiCtx<'_>,
+    _api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    Some({
+        let id = params
+            .get("id")
+            .or_else(|| params.get("value"))
+            .and_then(|v| v.parse::<i64>().ok())?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|t| t.as_secs() as i64)
+            .unwrap_or(0);
+        // Already known locked: answer from the classification, spend
+        // nothing. This is the line the whole rung exists to draw.
+        if d.with_index_read(|ix| Some(ix.header_encrypted(id))) == Some(true) {
+            return Some(json!({
+                "status": false,
+                "outcome": "encrypted",
+                "error": "this archive's headers are encrypted - no probe can read a name \
+                          out of it without the password",
+            }));
+        }
+        // Read pool, never the shared write handle: this arm is about
+        // to block_on a wire fetch, and parking an HTTP worker behind a
+        // scan batch first is how the 28 Jul all-workers wedge started.
+        // (The file rows are the 7z lane's accessor - the segment
+        // decode and bracket normalisation are container-agnostic.)
+        let files = d
+            .with_index_read(|ix| ix.probe7z_files(id).ok())
+            .unwrap_or_default();
+        if files.is_empty() {
+            return Some(json!({"status": false, "error": "no such release"}));
+        }
+        let cfg_path = ctx.cfg_path.to_path_buf();
+        let probed = tokio::runtime::Handle::current().block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                let cfg = nzbkit::config::Config::load(&cfg_path).map_err(|e| e.to_string())?;
+                let server = crate::scan_servers(&cfg)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "no enabled server".to_string())?;
+                let (mut conn, _) = nzbkit::nntp::Connection::connect(&server)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let r = super::super::tasks::run_rar_probe(&mut conn, &files)
+                    .await
+                    .map_err(|e| e.to_string());
+                conn.quit().await;
+                r
+            })
+            .await
+        });
+        match probed {
+            Err(_) => json!({"status": false, "error": "timed out reading that archive"}),
+            Ok(Err(e)) => json!({"status": false, "error": e}),
+            Ok(Ok(run)) => {
+                if let Some(kind) = run.enc_kind {
+                    // The pilot's most reusable output: 98%-by-bytes of
+                    // this band goes from "unknown, keep trying" to
+                    // "known dead, never fetch again" - revisably, by a
+                    // classifier generation nobody has to migrate.
+                    d.with_index(|ix| ix.probe7z_retire_encrypted(id, kind, now).ok());
+                }
+                let mut applied = Value::Null;
+                if let Some(name) = &run.name {
+                    let verdict = d
+                        .with_index_mut(|ix| {
+                            ix.apply_rar_named(id, name, run.key.as_deref(), now).ok()
+                        })
+                        .flatten();
+                    applied = json!(verdict.map(|v| format!("{v:?}")));
+                }
+                json!({
+                    "status": run.outcome == "named",
+                    "outcome": run.outcome,
+                    "name": run.name,
+                    "key": run.key,
+                    "applied": applied,
+                    "articles": run.articles,
+                    "bytes": run.bytes,
+                })
+            }
+        }
+    })
+}
+
 fn m_spot_grab(
     d: &Arc<Daemon>,
     _req: &mut tiny_http::Request,
@@ -1751,10 +2002,16 @@ fn m_spot_grab(
                                     "error": "timed out fetching that spot"}),
                     Ok(Err(e)) => json!({"status": false, "error": e}),
                     Ok(Ok((sx, nzb))) => {
-                        // Remember the payload segments so a
-                        // second grab of the same spot does
-                        // not re-walk the XML.
-                        d.with_index(|ix| ix.set_spot_nzb(&spot.msgid, &sx.nzb_segments).ok());
+                        // Remember the release payload ids (first
+                        // segment per file, bracketed) - the join
+                        // key against files.segments. The ftd
+                        // chunk ids in sx.nzb_segments are useless
+                        // downstream: they never appear in any
+                        // content group.
+                        d.with_index(|ix| {
+                            ix.set_spot_nzb(&spot.msgid, &nzbkit::spot::payload_msgids(&nzb))
+                                .ok()
+                        });
                         // The spot's own title is the name:
                         // it is signed, and it is the reason
                         // this source exists at all.
@@ -1763,7 +2020,7 @@ fn m_spot_grab(
                         } else {
                             sx.title.clone()
                         };
-                        match d.enqueue(&nzb, &name, &cat, prio, None, "spot", dupe_ok) {
+                        match d.enqueue(&nzb, &name, &cat, prio, None, None, "spot", dupe_ok) {
                             Ok(id) => {
                                 info!(target: "spots", "grabbed {name}");
                                 json!({"status": true, "nzo_ids": [id]})
@@ -1821,10 +2078,14 @@ fn m_indexer_grab(
                     json!({"status": false, "error":
                                     format!("{}: daily grab budget reached", h.indexer)})
                 } else {
-                    match fetch_url(&h.url) {
-                        Ok(f) => match d
-                            .enqueue_fetched(&f, &h.title, "", prio, None, 0, "indexer", dupe_ok)
-                        {
+                    // fetch_url_from: h.url is the `<enclosure url>` the
+                    // indexer's own search response supplied, so the
+                    // fetch is bound to that indexer's origin - a
+                    // private target it does not own is refused (M12).
+                    match fetch_url_from(&h.url, &h.origin) {
+                        Ok(f) => match d.enqueue_fetched(
+                            &f, &h.title, "", prio, None, None, 0, "indexer", dupe_ok,
+                        ) {
                             Ok(id) => {
                                 d.indexer_rt.lock_ok().usage.count_grab(&h.indexer);
                                 save_indexer_usage(d);
@@ -1871,6 +2132,16 @@ pub(in crate::serve) fn dispatch(
         // hang), and "not right now" is a perfectly good answer
         // for a counter.
         "predb_stats" => return m_predb_stats(d, _req, params, ctx, _api_body),
+        "probe7z_stats" => return m_probe7z_stats(d, _req, params, ctx, _api_body),
+        // Read one obfuscated multi-volume RAR's own headers for the
+        // inner filename. ON DEMAND by design - the pilot said NO-GO on
+        // a scan-time RAR lane and the verdict stands; see m_rar_name.
+        "rar_name" => return m_rar_name(d, _req, params, ctx, _api_body),
+        "pesto_stats" => return m_pesto_stats(d, _req, params, ctx, _api_body),
+        // The parity scoreboard's readout: per-category coverage% /
+        // named% / lag over a rolling window, plus the run state.
+        // Same non-blocking with_index_read contract as predb_stats.
+        "scoreboard" => return m_scoreboard(d, _req, params, ctx, _api_body),
         // Phase 2: the ranked candidate list for one release (the
         // pick-a-name view). Read-only and on demand.
         "pre_candidates" => return m_pre_candidates(d, _req, params, ctx, _api_body),

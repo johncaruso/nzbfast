@@ -29,470 +29,8 @@ pub(super) fn restore_runtime_state(
     // they need the daemon to exist.
     {
         let saved = load_settings(settings_path);
-        if let Some(v) = saved.get("smart_folders") {
-            match serde_json::from_value::<Vec<crate::smart::Rule>>(v.clone()) {
-                Ok(list) => *daemon.smart_folders.lock_ok() = list,
-                Err(e) => warn!(target: "smart", "ignoring saved smart_folders: {e}"),
-            }
-        }
-        if let Some(v) = saved.get("cleanup_exts") {
-            match serde_json::from_value::<Vec<String>>(v.clone()) {
-                Ok(list) => *daemon.cleanup_exts.lock_ok() = list,
-                Err(e) => warn!(target: "cleanup", "ignoring saved cleanup_exts: {e}"),
-            }
-        }
-        // SAB/NZBGet-parity passwords file. A saved path (adopted from a
-        // competitor import, or user-set) wins; empty/absent = the
-        // default next to the config.
-        if let Some(p) = saved
-            .get("password_file")
-            .and_then(Value::as_str)
-            .filter(|p| !p.trim().is_empty())
-        {
-            *daemon.password_file.lock_ok() = PathBuf::from(p.trim());
-        }
-        // One-shot migration: the short-lived `unpack_passwords` LIST
-        // setting (shipped and replaced the same day) seeds the file,
-        // but never overwrites one that already has content - the file
-        // is the operator's now.
-        if let Some(list) = saved
-            .get("unpack_passwords")
-            .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
-            .filter(|l| !l.is_empty())
-        {
-            let path = daemon.password_file.lock_ok().clone();
-            if !path.exists() {
-                let body = list.join("\n") + "\n";
-                if let Err(e) = crate::persist::write_atomic(&path, body.as_bytes()) {
-                    warn!(target: "unlock", "could not migrate unpack_passwords to {}: {e}", path.display());
-                } else {
-                    info!(target: "unlock", "moved {} saved password(s) into {}", list.len(), path.display());
-                }
-            }
-        }
-        // Make sure the file exists so "where do passwords go" has one
-        // answer: the path the settings page shows. 0600 like every
-        // credential-bearing file (write_atomic's mode).
-        {
-            let path = daemon.password_file.lock_ok().clone();
-            if !path.exists()
-                && let Err(e) = crate::persist::write_atomic(&path, b"")
-            {
-                warn!(target: "unlock", "could not create {}: {e}", path.display());
-            }
-            // Mirror for the in-stream probe (it holds a hub, not the
-            // daemon).
-            *daemon.hub.unpack_password_file.lock_ok() = Some(path);
-        }
-        if let Some(m) = saved.get("password_prompt").and_then(Value::as_str)
-            && matches!(m, "now" | "done" | "never")
-        {
-            *daemon.password_prompt.lock_ok() = m.to_string();
-        }
-        // TODO 101: the mode is read by the unpack ladder through
-        // `eatvol`, so mirror it whether it was saved or defaulted -
-        // same shape as fast_par below. Nothing is ever eaten under the
-        // "off" default, so a mirror of the default is a no-op that
-        // keeps the two stores from drifting.
-        if let Some(m) = saved
-            .get("unpack_eat_volumes")
-            .and_then(Value::as_str)
-            .and_then(crate::eatvol::EatMode::parse)
-        {
-            *daemon.unpack_eat_volumes.lock_ok() = m.as_str().to_string();
-        }
-        crate::eatvol::set_mode(
-            crate::eatvol::EatMode::parse(&daemon.unpack_eat_volumes.lock_ok().clone())
-                .unwrap_or_default(),
-        );
-        if let Some(on) = saved.get("par_cleanup").and_then(Value::as_bool) {
-            daemon.par_cleanup.store(on, Ordering::Relaxed);
-        }
-        // §129 lane width. settings.json only for now (no UI row until
-        // testers ask - a setting is three places). Clamped again at the
-        // read, so a hand-edited 0 or 99 cannot widen the lane.
-        if let Some(n) = saved.get("postproc_jobs").and_then(Value::as_u64) {
-            daemon.postproc_jobs.store(n.clamp(1, 4), Ordering::Relaxed);
-        }
-        // §129 3e. The switch is a real setting (UI + get_config); the
-        // detector's thresholds are settings.json only, under
-        // `slow_storage`, and every one of them is clamped on read - a
-        // hand-edited file must not be able to make this a hair trigger.
-        if let Some(on) = saved.get("slow_storage_pause").and_then(Value::as_bool) {
-            daemon.slow_storage.set_enabled(on);
-        }
-        if let Some(v) = saved.get("slow_storage") {
-            daemon
-                .slow_storage
-                .set_tune(crate::serve::slowstore::Tune::from_settings(v));
-        }
-        if let Some(on) = saved.get("watch_keep_nzb").and_then(Value::as_bool) {
-            daemon.watch_keep_nzb.store(on, Ordering::Relaxed);
-        }
-        if let Some(on) = saved.get("watch_recursive").and_then(Value::as_bool) {
-            daemon.watch_recursive.store(on, Ordering::Relaxed);
-        }
-        if let Some(on) = saved.get("watch_move_rejected").and_then(Value::as_bool) {
-            daemon.watch_move_rejected.store(on, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("cat_meta") {
-            match serde_json::from_value::<
-                std::collections::HashMap<String, crate::serve::daemon::CatMeta>,
-            >(v.clone())
-            {
-                Ok(m) => *daemon.cat_meta.lock_ok() = m,
-                Err(e) => warn!(target: "config", "ignoring saved cat_meta: {e}"),
-            }
-        }
-        if let Some(m) = saved.get("dupe_action").and_then(Value::as_str)
-            && matches!(m, "pause" | "discard" | "fail")
-        {
-            *daemon.dupe_action.lock_ok() = m.to_string();
-        }
-        if let Some(on) = saved.get("fast_par").and_then(Value::as_bool) {
-            daemon.fast_par.store(on, Ordering::Relaxed);
-        }
-        // Mirror into the repair library whether saved or defaulted
-        // (NZBFAST_NTT in the environment still overrides it there).
-        nzbkit::par2repair::set_fast_par_enabled(daemon.fast_par.load(Ordering::Relaxed));
-        if let Some(on) = saved.get("prefer_external_unrar").and_then(Value::as_bool) {
-            daemon.prefer_external_unrar.store(on, Ordering::Relaxed);
-        }
-        // Same shape as fast_par: mirrored whether saved or defaulted
-        // (NZBFAST_NO_NATIVE_UNRAR in the environment still forces it on
-        // inside nzbkit).
-        nzbkit::extract::set_prefer_external_unrar(
-            daemon.prefer_external_unrar.load(Ordering::Relaxed),
-        );
-        // TODO 24D user categories: validated on save, but re-validated
-        // here so a hand-edited settings.json can't smuggle a reserved
-        // or duplicate slug into the classifier.
-        if let Some(v) = saved.get("custom_categories") {
-            match serde_json::from_value::<Vec<nzbkit::categories::CustomCategory>>(v.clone()) {
-                Ok(mut list) => {
-                    // A slug that only became reserved in a LATER release
-                    // must not cost the user every OTHER category they set
-                    // up: validation rejects the list as a whole, and the
-                    // Err arm below discards all of it.
-                    let renamed = nzbkit::categories::migrate_reserved_slugs(&mut list);
-                    for (from, to) in &renamed {
-                        info!(
-                            target: "cats",
-                            "category slug {from:?} is now a built-in kind - renamed \
-                             to {to:?} so your other categories still load"
-                        );
-                    }
-                    if !renamed.is_empty() {
-                        save_settings(settings_path, &[("custom_categories", json!(&list))]);
-                    }
-                    match nzbkit::categories::validate(&list) {
-                        Ok(()) => *daemon.custom_categories.write_ok() = list,
-                        Err(e) => warn!(target: "cats", "ignoring saved custom_categories: {e}"),
-                    }
-                }
-                Err(e) => warn!(target: "cats", "ignoring saved custom_categories: {e}"),
-            }
-        }
-        // What the user asked the indexer to look for, and how much of
-        // that has already been turned into scanned groups. Both are
-        // read here rather than applied: applying needs the provider's
-        // group list, which the startup path below fetches.
-        if let Some(v) = saved.get("index_interests").and_then(Value::as_str) {
-            *daemon.index_interests.lock_ok() = crate::interests::parse(v).join(",");
-        }
-        if let Some(v) = saved.get("index_interests_applied").and_then(Value::as_str) {
-            *daemon.index_interests_applied.lock_ok() = v.to_string();
-        }
-        match saved.get("index_interest_groups") {
-            Some(v) => {
-                if let Ok(groups) = serde_json::from_value::<Vec<String>>(v.clone()) {
-                    *daemon.index_interest_groups.lock_ok() = groups;
-                }
-            }
-            // No provenance recorded: this install predates the key. Without
-            // a backfill, `owned` stays empty forever, `reconcile` finds
-            // nothing removable, and unticking a preset silently removes
-            // NOTHING. It does not self-heal either - re-ticking skips a
-            // group that is already present, so it never enters next_owned
-            // and the next untick fails the same way. The only escape was
-            // hand-editing index_groups.
-            //
-            // Reconstruct it the only honest way available: the groups the
-            // applied presets resolve to, intersected with what is actually
-            // being indexed. A group the user added by hand is therefore
-            // never claimed as preset-owned, which is the direction that
-            // errs toward keeping their groups rather than deleting them.
-            None => {
-                let applied = daemon.index_interests_applied.lock_ok().clone();
-                let keys = crate::interests::parse(&applied);
-                if !keys.is_empty() {
-                    let have = daemon.index_groups.lock_ok().clone();
-                    let owned = crate::interests::backfill_owned(&keys, &have);
-                    if !owned.is_empty() {
-                        info!(
-                            target: "interests",
-                            "recorded {} preset-owned group(s) for an install \
-                             that predates provenance tracking",
-                            owned.len()
-                        );
-                        save_settings(settings_path, &[("index_interest_groups", json!(&owned))]);
-                        *daemon.index_interest_groups.lock_ok() = owned;
-                    }
-                }
-            }
-        }
-        if let Some(v) = saved.get("failure_link").and_then(Value::as_str)
-            && matches!(v, "off" | "report" | "regrab")
-        {
-            *daemon.failure_link.lock_ok() = v.to_string();
-        }
-        if let Some(v) = saved.get("notify_targets") {
-            match serde_json::from_value::<Vec<crate::notify::Target>>(v.clone()) {
-                Ok(list) => *daemon.notify_targets.lock_ok() = list,
-                Err(e) => warn!(target: "notify", "ignoring saved notify_targets: {e}"),
-            }
-        }
-        // §96.3 give-up breaker: the threshold, the *arr instances it may
-        // act on, and the counters a previous run accumulated.
-        if let Some(n) = saved.get("arr_giveup_threshold").and_then(Value::as_u64) {
-            daemon.arr_giveup_threshold.store(n, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("arr_instances") {
-            match serde_json::from_value::<Vec<giveup::ArrInstance>>(v.clone()) {
-                Ok(list) => *daemon.arr_instances.lock_ok() = list,
-                Err(e) => warn!(target: "giveup", "ignoring saved arr_instances: {e}"),
-            }
-        }
-        let giveup_path = daemon.spool.join("giveup-state.json");
-        if let Some(v) = crate::persist::load_json_with_backup(&giveup_path) {
-            match serde_json::from_value(v) {
-                Ok(s) => *daemon.giveup.lock_ok() = s,
-                Err(e) => warn!(target: "giveup", "ignoring {}: {e}", giveup_path.display()),
-            }
-        }
-        // The kept-files notices outlive the process on purpose: each one
-        // names a folder whose history row is gone, so losing them at a
-        // restart leaves the payload on disk with nothing anywhere
-        // pointing at it. See `Daemon::save_delete_kept`.
-        let kept_path = daemon.spool.join("delete-kept.json");
-        if let Some(v) = crate::persist::load_json_with_backup(&kept_path) {
-            match serde_json::from_value(v) {
-                Ok(k) => *daemon.delete_kept.lock_ok() = k,
-                Err(e) => warn!(target: "queue", "ignoring {}: {e}", kept_path.display()),
-            }
-        }
-        if let Some(v) = saved.get("ui_locale").and_then(Value::as_str) {
-            *daemon.ui_locale.lock_ok() = v.to_string();
-        }
-        if let Some(v) = saved.get("wall_hide_adult").and_then(Value::as_bool) {
-            daemon.wall_hide_adult.store(v, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("auto_connections").and_then(Value::as_bool) {
-            daemon.auto_connections.store(v, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("live_tune").and_then(Value::as_bool) {
-            daemon.live_tune.store(v, Ordering::Relaxed);
-            daemon.hub.live_tune.store(v, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("auto_defer").and_then(Value::as_bool) {
-            daemon.auto_defer.store(v, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("post_health").and_then(Value::as_bool) {
-            daemon.post_health.store(v, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("post_health_defer").and_then(Value::as_bool) {
-            daemon.post_health_defer.store(v, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("auto_prefetch").and_then(Value::as_bool) {
-            daemon.auto_prefetch.store(v, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("oracle_route").and_then(Value::as_bool) {
-            daemon.oracle_route.store(v, Ordering::Relaxed);
-        }
-        for (key, field) in [
-            ("race_stragglers", &daemon.race_stragglers),
-            ("adaptive_timeouts", &daemon.adaptive_timeouts),
-            ("auto_rename", &daemon.auto_rename),
-            ("identity_lookup", &daemon.identity_lookup),
-            ("rename_resolution", &daemon.rename_resolution),
-            ("rename_vcodec", &daemon.rename_vcodec),
-            ("rename_acodec", &daemon.rename_acodec),
-            ("rename_source", &daemon.rename_source),
-            ("rename_group", &daemon.rename_group),
-            ("rename_year_parens", &daemon.rename_year_parens),
-            ("rename_quality_brackets", &daemon.rename_quality_brackets),
-            ("rename_extra_words", &daemon.rename_extra_words),
-            ("rename_identify", &daemon.rename_identify),
-            ("rename_episode_titles", &daemon.rename_episode_titles),
-            ("history_color_names", &daemon.history_color_names),
-            ("media_chip_color", &daemon.media_chip_color),
-            ("shape_chip_color", &daemon.shape_chip_color),
-            ("rename_junk", &daemon.rename_junk),
-            ("rename_media_only", &daemon.rename_media_only),
-        ] {
-            if let Some(v) = saved.get(key).and_then(Value::as_bool) {
-                field.store(v, Ordering::Relaxed);
-            }
-        }
-        // NOTE: a saved `auto_update` from pre-1.0.5 is deliberately
-        // IGNORED - self-update was removed in 1.0.5 (notify-only).
-        if let Some(v) = saved.get("update_checks").and_then(Value::as_bool) {
-            daemon.update_checks.store(v, Ordering::Relaxed);
-        }
-        // The anti-rollback ratchet. Restored as-is: a hand-edited value
-        // can only ever make this install FUSSIER about what it accepts
-        // (once enforcement lands), never more permissive, so there is
-        // nothing to validate or clamp here.
-        if let Some(v) = saved.get("update_serial_seen").and_then(Value::as_u64) {
-            daemon.update_serial_seen.store(v, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("unit_bits").and_then(Value::as_bool) {
-            daemon.unit_bits.store(v, Ordering::Relaxed);
-        }
-        // Saved empty string is meaningful: the user disabled update checks.
-        if let Some(v) = saved.get("update_url").and_then(Value::as_str) {
-            *daemon.update_url.lock_ok() = v.to_string();
-        }
-        if let Some(v) = saved.get("index_scan_par").and_then(Value::as_u64) {
-            daemon
-                .index_scan_par
-                .store(v.clamp(1, 8), Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("index_tip_secs").and_then(Value::as_u64) {
-            daemon
-                .index_tip_secs
-                .store(if v == 0 { 0 } else { v.max(5) }, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("watch_interval_secs").and_then(Value::as_u64) {
-            daemon
-                .watch_interval_secs
-                .store(v.clamp(1, 3600), Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("delete_to_trash").and_then(Value::as_bool) {
-            crate::smart::set_delete_to_trash(v);
-        }
-        if let Some(s) = saved.get("cleanup_delete_mode").and_then(Value::as_str) {
-            // Mirror the live setter (set_cleanup_delete_mode): lowercase
-            // first, and never let an unparseable value fall through in
-            // silence - the process default is Follow, which can resolve
-            // to permanent deletion, and a typo in a hand-edited
-            // settings.json must not silently select that. Trash is the
-            // recoverable stand-in until the value is fixed.
-            match crate::smart::CleanupMode::parse(&s.to_ascii_lowercase()) {
-                Some(m) => crate::smart::set_cleanup_mode(m),
-                None => {
-                    eprintln!(
-                        "⚠ settings.json: unknown cleanup_delete_mode {s:?} - \
-                         use follow, trash or delete; treating it as \"trash\" \
-                         (recoverable) until it is corrected"
-                    );
-                    crate::smart::set_cleanup_mode(crate::smart::CleanupMode::Trash);
-                }
-            }
-        }
-        // Nested-extraction depth cap shared by the in-stream child chain
-        // and the disk post-pass (a process-global in nzbkit). Clamp 1..=64:
-        // real nesting is 2-3 levels, the ceiling is a DoS backstop.
-        if let Some(v) = saved.get("nested_max_depth").and_then(Value::as_u64) {
-            nzbkit::extract::set_nested_depth_cap(v.clamp(1, 64) as usize);
-        }
-        // No create/writable check at startup: a NAS that is down at
-        // boot must not wipe the setting - the move path degrades to
-        // leave-in-place on its own.
-        if let Some(v) = saved.get("move_pace").and_then(Value::as_str)
-            && !v.is_empty()
-        {
-            *daemon.move_pace.lock_ok() = v.to_string();
-        }
-        if let Some(v) = saved.get("move_completed").and_then(Value::as_str)
-            && !v.is_empty()
-        {
-            *daemon.move_completed.write_ok() = Some(PathBuf::from(v));
-        }
-        if let Some(v) = saved.get("move_completed_cats").and_then(Value::as_str)
-            && let Ok(list) = parse_cat_dests(v)
-        {
-            *daemon.move_completed_cats.write_ok() = list;
-        }
-        if let Some(v) = saved.get("categories").and_then(Value::as_str) {
-            let mut set = daemon.cats.lock_ok();
-            for name in v.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-                let clean = nzbkit::disk::sanitize_filename(name);
-                if !clean.is_empty() {
-                    set.insert(clean);
-                }
-            }
-        }
-        if let Some(v) = saved.get("oracle_sample").and_then(Value::as_u64) {
-            daemon.oracle_sample.store(v.min(3600), Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("index_deepen").and_then(Value::as_u64) {
-            daemon.index_deepen.store(v, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("index_coverage").and_then(Value::as_bool) {
-            daemon.index_coverage.store(v, Ordering::Relaxed);
-        }
-        // Present in settings.json == the user answered the question, so
-        // the stored value wins over the indexers-configured default.
-        if let Some(v) = saved.get("watchlist_external").and_then(Value::as_bool) {
-            daemon.watchlist_external.store(v, Ordering::Relaxed);
-            daemon.watchlist_external_set.store(true, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("watchlist_instant").and_then(Value::as_bool) {
-            daemon.watchlist_instant.store(v, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("watchlist_instant_max").and_then(Value::as_u64) {
-            daemon
-                .watchlist_instant_max
-                .store(v.min(3600) as u32, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("index_gapfill").and_then(Value::as_u64) {
-            daemon.index_gapfill.store(v.min(100), Ordering::Relaxed);
-        }
-        #[cfg(feature = "indexer")]
-        if let Some(v) = saved.get("predb_max_rows").and_then(Value::as_u64) {
-            daemon.predb_max_rows.store(
-                v.clamp(
-                    predb_seed::PREDB_MAX_ROWS_MIN,
-                    predb_seed::PREDB_MAX_ROWS_MAX,
-                ),
-                Ordering::Relaxed,
-            );
-        }
-        if let Some(v) = saved.get("predb_seed_days").and_then(Value::as_u64) {
-            daemon
-                .predb_seed_days
-                .store(v.clamp(1, 366), Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("script_timeout_secs").and_then(Value::as_u64) {
-            daemon.script_timeout.store(v, Ordering::Relaxed);
-        }
-        if let Some(v) = saved.get("history_rows").and_then(Value::as_u64)
-            && (1..=200).contains(&v)
-        {
-            daemon.history_rows.store(v, Ordering::Relaxed);
-        }
-        // §129 D5: the optional retention knobs (0 = unlimited, the
-        // default). Seeded AFTER load_queue has restored the records,
-        // so enforce once here - the load-time pass ran with the knobs
-        // still at their unlimited defaults.
-        {
-            let mut retention_set = false;
-            if let Some(v) = saved.get("history_keep_count").and_then(Value::as_u64) {
-                daemon.history_keep_count.store(v, Ordering::Relaxed);
-                retention_set = v > 0;
-            }
-            if let Some(v) = saved.get("history_keep_days").and_then(Value::as_u64) {
-                daemon.history_keep_days.store(v, Ordering::Relaxed);
-                retention_set |= v > 0;
-            }
-            if retention_set {
-                daemon.history_enforce_retention();
-            }
-        }
-        if let Some(v) = saved.get("bench_interval").and_then(Value::as_u64) {
-            daemon.bench_interval.store(v, Ordering::Relaxed);
-        }
+        restore_job_settings(daemon, &saved, settings_path);
+        restore_ui_and_index_settings(daemon, &saved);
     }
 
     if let Some(v) = &speedlimit {
@@ -514,6 +52,521 @@ pub(super) fn restore_runtime_state(
     // wind-down the tray's Quit item has always had (issue #13).
     install_shutdown_signals(daemon);
     Ok(())
+}
+
+/// The saved settings that govern how a job is fetched, unpacked and
+/// reported: post-processing and unpack, the passwords file, the watch
+/// folder, categories, the indexer's interests, notifications and the
+/// *arr give-up breaker.
+///
+/// Split out of `restore_runtime_state` (TODO 106) with
+/// [`restore_ui_and_index_settings`], at the one boundary the block
+/// offered - the on-disk notices, which are files rather than settings.
+/// The reads are in their original order and stayed together: two of
+/// them WRITE a migrated value back through `settings_path`, so this
+/// half owns it.
+fn restore_job_settings(
+    daemon: &Arc<Daemon>,
+    saved: &serde_json::Map<String, Value>,
+    settings_path: &Path,
+) {
+    if let Some(v) = saved.get("smart_folders") {
+        match serde_json::from_value::<Vec<crate::smart::Rule>>(v.clone()) {
+            Ok(list) => *daemon.smart_folders.lock_ok() = list,
+            Err(e) => warn!(target: "smart", "ignoring saved smart_folders: {e}"),
+        }
+    }
+    if let Some(v) = saved.get("cleanup_exts") {
+        match serde_json::from_value::<Vec<String>>(v.clone()) {
+            Ok(list) => *daemon.cleanup_exts.lock_ok() = list,
+            Err(e) => warn!(target: "cleanup", "ignoring saved cleanup_exts: {e}"),
+        }
+    }
+    // SAB/NZBGet-parity passwords file. A saved path (adopted from a
+    // competitor import, or user-set) wins; empty/absent = the
+    // default next to the config.
+    if let Some(p) = saved
+        .get("password_file")
+        .and_then(Value::as_str)
+        .filter(|p| !p.trim().is_empty())
+    {
+        *daemon.password_file.lock_ok() = PathBuf::from(p.trim());
+    }
+    // One-shot migration: the short-lived `unpack_passwords` LIST
+    // setting (shipped and replaced the same day) seeds the file,
+    // but never overwrites one that already has content - the file
+    // is the operator's now.
+    if let Some(list) = saved
+        .get("unpack_passwords")
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+        .filter(|l| !l.is_empty())
+    {
+        let path = daemon.password_file.lock_ok().clone();
+        if !path.exists() {
+            let body = list.join("\n") + "\n";
+            if let Err(e) = crate::persist::write_atomic(&path, body.as_bytes()) {
+                warn!(target: "unlock", "could not migrate unpack_passwords to {}: {e}", path.display());
+            } else {
+                info!(target: "unlock", "moved {} saved password(s) into {}", list.len(), path.display());
+            }
+        }
+    }
+    // Make sure the file exists so "where do passwords go" has one
+    // answer: the path the settings page shows. 0600 like every
+    // credential-bearing file (write_atomic's mode).
+    {
+        let path = daemon.password_file.lock_ok().clone();
+        if !path.exists()
+            && let Err(e) = crate::persist::write_atomic(&path, b"")
+        {
+            warn!(target: "unlock", "could not create {}: {e}", path.display());
+        }
+        // Mirror for the in-stream probe (it holds a hub, not the
+        // daemon).
+        *daemon.hub.unpack_password_file.lock_ok() = Some(path);
+    }
+    if let Some(m) = saved.get("password_prompt").and_then(Value::as_str)
+        && matches!(m, "now" | "done" | "never")
+    {
+        *daemon.password_prompt.lock_ok() = m.to_string();
+    }
+    // TODO 101: the mode is read by the unpack ladder through
+    // `eatvol`, so mirror it whether it was saved or defaulted -
+    // same shape as fast_par below. Nothing is ever eaten under the
+    // "off" default, so a mirror of the default is a no-op that
+    // keeps the two stores from drifting.
+    if let Some(m) = saved
+        .get("unpack_eat_volumes")
+        .and_then(Value::as_str)
+        .and_then(crate::eatvol::EatMode::parse)
+    {
+        *daemon.unpack_eat_volumes.lock_ok() = m.as_str().to_string();
+    }
+    crate::eatvol::set_mode(
+        crate::eatvol::EatMode::parse(&daemon.unpack_eat_volumes.lock_ok().clone())
+            .unwrap_or_default(),
+    );
+    if let Some(on) = saved.get("par_cleanup").and_then(Value::as_bool) {
+        daemon.par_cleanup.store(on, Ordering::Relaxed);
+    }
+    // §129 lane width. settings.json only for now (no UI row until
+    // testers ask - a setting is three places). Clamped again at the
+    // read, so a hand-edited 0 or 99 cannot widen the lane.
+    if let Some(n) = saved.get("postproc_jobs").and_then(Value::as_u64) {
+        daemon.postproc_jobs.store(n.clamp(1, 4), Ordering::Relaxed);
+    }
+    // §129 3e. The switch is a real setting (UI + get_config); the
+    // detector's thresholds are settings.json only, under
+    // `slow_storage`, and every one of them is clamped on read - a
+    // hand-edited file must not be able to make this a hair trigger.
+    if let Some(on) = saved.get("slow_storage_pause").and_then(Value::as_bool) {
+        daemon.slow_storage.set_enabled(on);
+    }
+    if let Some(v) = saved.get("slow_storage") {
+        daemon
+            .slow_storage
+            .set_tune(crate::serve::slowstore::Tune::from_settings(v));
+    }
+    if let Some(on) = saved.get("watch_keep_nzb").and_then(Value::as_bool) {
+        daemon.watch_keep_nzb.store(on, Ordering::Relaxed);
+    }
+    if let Some(on) = saved.get("watch_recursive").and_then(Value::as_bool) {
+        daemon.watch_recursive.store(on, Ordering::Relaxed);
+    }
+    if let Some(on) = saved.get("watch_move_rejected").and_then(Value::as_bool) {
+        daemon.watch_move_rejected.store(on, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("cat_meta") {
+        match serde_json::from_value::<
+            std::collections::HashMap<String, crate::serve::daemon::CatMeta>,
+        >(v.clone())
+        {
+            Ok(m) => *daemon.cat_meta.lock_ok() = m,
+            Err(e) => warn!(target: "config", "ignoring saved cat_meta: {e}"),
+        }
+    }
+    if let Some(m) = saved.get("dupe_action").and_then(Value::as_str)
+        && matches!(m, "pause" | "discard" | "fail")
+    {
+        *daemon.dupe_action.lock_ok() = m.to_string();
+    }
+    if let Some(on) = saved.get("fast_par").and_then(Value::as_bool) {
+        daemon.fast_par.store(on, Ordering::Relaxed);
+    }
+    // Mirror into the repair library whether saved or defaulted
+    // (NZBFAST_NTT in the environment still overrides it there).
+    nzbkit::par2repair::set_fast_par_enabled(daemon.fast_par.load(Ordering::Relaxed));
+    if let Some(on) = saved.get("prefer_external_unrar").and_then(Value::as_bool) {
+        daemon.prefer_external_unrar.store(on, Ordering::Relaxed);
+    }
+    // Same shape as fast_par: mirrored whether saved or defaulted
+    // (NZBFAST_NO_NATIVE_UNRAR in the environment still forces it on
+    // inside nzbkit).
+    nzbkit::extract::set_prefer_external_unrar(
+        daemon.prefer_external_unrar.load(Ordering::Relaxed),
+    );
+    // TODO 24D user categories: validated on save, but re-validated
+    // here so a hand-edited settings.json can't smuggle a reserved
+    // or duplicate slug into the classifier.
+    if let Some(v) = saved.get("custom_categories") {
+        match serde_json::from_value::<Vec<nzbkit::categories::CustomCategory>>(v.clone()) {
+            Ok(mut list) => {
+                // A slug that only became reserved in a LATER release
+                // must not cost the user every OTHER category they set
+                // up: validation rejects the list as a whole, and the
+                // Err arm below discards all of it.
+                let renamed = nzbkit::categories::migrate_reserved_slugs(&mut list);
+                for (from, to) in &renamed {
+                    info!(
+                        target: "cats",
+                        "category slug {from:?} is now a built-in kind - renamed \
+                         to {to:?} so your other categories still load"
+                    );
+                }
+                if !renamed.is_empty() {
+                    save_settings(settings_path, &[("custom_categories", json!(&list))]);
+                }
+                match nzbkit::categories::validate(&list) {
+                    Ok(()) => *daemon.custom_categories.write_ok() = list,
+                    Err(e) => warn!(target: "cats", "ignoring saved custom_categories: {e}"),
+                }
+            }
+            Err(e) => warn!(target: "cats", "ignoring saved custom_categories: {e}"),
+        }
+    }
+    // What the user asked the indexer to look for, and how much of
+    // that has already been turned into scanned groups. Both are
+    // read here rather than applied: applying needs the provider's
+    // group list, which the startup path below fetches.
+    if let Some(v) = saved.get("index_interests").and_then(Value::as_str) {
+        *daemon.index_interests.lock_ok() = crate::interests::parse(v).join(",");
+    }
+    if let Some(v) = saved.get("index_interests_applied").and_then(Value::as_str) {
+        *daemon.index_interests_applied.lock_ok() = v.to_string();
+    }
+    match saved.get("index_interest_groups") {
+        Some(v) => {
+            if let Ok(groups) = serde_json::from_value::<Vec<String>>(v.clone()) {
+                *daemon.index_interest_groups.lock_ok() = groups;
+            }
+        }
+        // No provenance recorded: this install predates the key. Without
+        // a backfill, `owned` stays empty forever, `reconcile` finds
+        // nothing removable, and unticking a preset silently removes
+        // NOTHING. It does not self-heal either - re-ticking skips a
+        // group that is already present, so it never enters next_owned
+        // and the next untick fails the same way. The only escape was
+        // hand-editing index_groups.
+        //
+        // Reconstruct it the only honest way available: the groups the
+        // applied presets resolve to, intersected with what is actually
+        // being indexed. A group the user added by hand is therefore
+        // never claimed as preset-owned, which is the direction that
+        // errs toward keeping their groups rather than deleting them.
+        None => {
+            let applied = daemon.index_interests_applied.lock_ok().clone();
+            let keys = crate::interests::parse(&applied);
+            if !keys.is_empty() {
+                let have = daemon.index_groups.lock_ok().clone();
+                let owned = crate::interests::backfill_owned(&keys, &have);
+                if !owned.is_empty() {
+                    info!(
+                        target: "interests",
+                        "recorded {} preset-owned group(s) for an install \
+                         that predates provenance tracking",
+                        owned.len()
+                    );
+                    save_settings(settings_path, &[("index_interest_groups", json!(&owned))]);
+                    *daemon.index_interest_groups.lock_ok() = owned;
+                }
+            }
+        }
+    }
+    if let Some(v) = saved.get("failure_link").and_then(Value::as_str)
+        && matches!(v, "off" | "report" | "regrab")
+    {
+        *daemon.failure_link.lock_ok() = v.to_string();
+    }
+    if let Some(v) = saved.get("notify_targets") {
+        match serde_json::from_value::<Vec<crate::notify::Target>>(v.clone()) {
+            Ok(list) => *daemon.notify_targets.lock_ok() = list,
+            Err(e) => warn!(target: "notify", "ignoring saved notify_targets: {e}"),
+        }
+    }
+    // §96.3 give-up breaker: the threshold, the *arr instances it may
+    // act on, and the counters a previous run accumulated.
+    if let Some(n) = saved.get("arr_giveup_threshold").and_then(Value::as_u64) {
+        daemon.arr_giveup_threshold.store(n, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("arr_instances") {
+        match serde_json::from_value::<Vec<giveup::ArrInstance>>(v.clone()) {
+            Ok(list) => *daemon.arr_instances.lock_ok() = list,
+            Err(e) => warn!(target: "giveup", "ignoring saved arr_instances: {e}"),
+        }
+    }
+    let giveup_path = daemon.spool.join("giveup-state.json");
+    if let Some(v) = crate::persist::load_json_with_backup(&giveup_path) {
+        match serde_json::from_value(v) {
+            Ok(s) => *daemon.giveup.lock_ok() = s,
+            Err(e) => warn!(target: "giveup", "ignoring {}: {e}", giveup_path.display()),
+        }
+    }
+    // The kept-files notices outlive the process on purpose: each one
+    // names a folder whose history row is gone, so losing them at a
+    // restart leaves the payload on disk with nothing anywhere
+    // pointing at it. See `Daemon::save_delete_kept`.
+    let kept_path = daemon.spool.join("delete-kept.json");
+    if let Some(v) = crate::persist::load_json_with_backup(&kept_path) {
+        match serde_json::from_value(v) {
+            Ok(k) => *daemon.delete_kept.lock_ok() = k,
+            Err(e) => warn!(target: "queue", "ignoring {}: {e}", kept_path.display()),
+        }
+    }
+}
+
+/// The rest of the saved settings: presentation, the auto-tuning and
+/// health switches, the update ratchet, the move/completed paths, the
+/// indexer's budgets and history retention.
+///
+/// The other half of [`restore_job_settings`] - same order, same
+/// shape, and the same rule that a setting absent from settings.json
+/// leaves the daemon's own default alone.
+fn restore_ui_and_index_settings(daemon: &Arc<Daemon>, saved: &serde_json::Map<String, Value>) {
+    if let Some(v) = saved.get("ui_locale").and_then(Value::as_str) {
+        *daemon.ui_locale.lock_ok() = v.to_string();
+    }
+    if let Some(v) = saved.get("wall_hide_adult").and_then(Value::as_bool) {
+        daemon.wall_hide_adult.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("auto_connections").and_then(Value::as_bool) {
+        daemon.auto_connections.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("live_tune").and_then(Value::as_bool) {
+        daemon.live_tune.store(v, Ordering::Relaxed);
+        daemon.hub.live_tune.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("auto_defer").and_then(Value::as_bool) {
+        daemon.auto_defer.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("post_health").and_then(Value::as_bool) {
+        daemon.post_health.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("post_health_defer").and_then(Value::as_bool) {
+        daemon.post_health_defer.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("auto_prefetch").and_then(Value::as_bool) {
+        daemon.auto_prefetch.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("oracle_route").and_then(Value::as_bool) {
+        daemon.oracle_route.store(v, Ordering::Relaxed);
+    }
+    for (key, field) in [
+        ("race_stragglers", &daemon.race_stragglers),
+        ("adaptive_timeouts", &daemon.adaptive_timeouts),
+        ("auto_rename", &daemon.auto_rename),
+        ("identity_lookup", &daemon.identity_lookup),
+        ("rename_resolution", &daemon.rename_resolution),
+        ("rename_vcodec", &daemon.rename_vcodec),
+        ("rename_acodec", &daemon.rename_acodec),
+        ("rename_source", &daemon.rename_source),
+        ("rename_group", &daemon.rename_group),
+        ("rename_year_parens", &daemon.rename_year_parens),
+        ("rename_quality_brackets", &daemon.rename_quality_brackets),
+        ("rename_extra_words", &daemon.rename_extra_words),
+        ("rename_identify", &daemon.rename_identify),
+        ("rename_episode_titles", &daemon.rename_episode_titles),
+        ("history_color_names", &daemon.history_color_names),
+        ("media_chip_color", &daemon.media_chip_color),
+        ("shape_chip_color", &daemon.shape_chip_color),
+        ("rename_junk", &daemon.rename_junk),
+        ("rename_media_only", &daemon.rename_media_only),
+    ] {
+        if let Some(v) = saved.get(key).and_then(Value::as_bool) {
+            field.store(v, Ordering::Relaxed);
+        }
+    }
+    // NOTE: a saved `auto_update` from pre-1.0.5 is deliberately
+    // IGNORED - self-update was removed in 1.0.5 (notify-only).
+    if let Some(v) = saved.get("update_checks").and_then(Value::as_bool) {
+        daemon.update_checks.store(v, Ordering::Relaxed);
+    }
+    // The anti-rollback ratchet. Restored as-is: a hand-edited value
+    // can only ever make this install FUSSIER about what it accepts
+    // (once enforcement lands), never more permissive, so there is
+    // nothing to validate or clamp here.
+    if let Some(v) = saved.get("update_serial_seen").and_then(Value::as_u64) {
+        daemon.update_serial_seen.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("unit_bits").and_then(Value::as_bool) {
+        daemon.unit_bits.store(v, Ordering::Relaxed);
+    }
+    // Saved empty string is meaningful: the user disabled update checks.
+    if let Some(v) = saved.get("update_url").and_then(Value::as_str) {
+        *daemon.update_url.lock_ok() = v.to_string();
+    }
+    if let Some(v) = saved.get("index_scan_par").and_then(Value::as_u64) {
+        daemon
+            .index_scan_par
+            .store(v.clamp(1, 8), Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("index_tip_secs").and_then(Value::as_u64) {
+        daemon
+            .index_tip_secs
+            .store(if v == 0 { 0 } else { v.max(5) }, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("watch_interval_secs").and_then(Value::as_u64) {
+        daemon
+            .watch_interval_secs
+            .store(v.clamp(1, 3600), Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("delete_to_trash").and_then(Value::as_bool) {
+        crate::smart::set_delete_to_trash(v);
+    }
+    if let Some(s) = saved.get("cleanup_delete_mode").and_then(Value::as_str) {
+        // Mirror the live setter (set_cleanup_delete_mode): lowercase
+        // first, and never let an unparseable value fall through in
+        // silence - the process default is Follow, which can resolve
+        // to permanent deletion, and a typo in a hand-edited
+        // settings.json must not silently select that. Trash is the
+        // recoverable stand-in until the value is fixed.
+        match crate::smart::CleanupMode::parse(&s.to_ascii_lowercase()) {
+            Some(m) => crate::smart::set_cleanup_mode(m),
+            None => {
+                eprintln!(
+                    "⚠ settings.json: unknown cleanup_delete_mode {s:?} - \
+                     use follow, trash or delete; treating it as \"trash\" \
+                     (recoverable) until it is corrected"
+                );
+                crate::smart::set_cleanup_mode(crate::smart::CleanupMode::Trash);
+            }
+        }
+    }
+    // Nested-extraction depth cap shared by the in-stream child chain
+    // and the disk post-pass (a process-global in nzbkit). Clamp 1..=64:
+    // real nesting is 2-3 levels, the ceiling is a DoS backstop.
+    if let Some(v) = saved.get("nested_max_depth").and_then(Value::as_u64) {
+        nzbkit::extract::set_nested_depth_cap(v.clamp(1, 64) as usize);
+    }
+    // No create/writable check at startup: a NAS that is down at
+    // boot must not wipe the setting - the move path degrades to
+    // leave-in-place on its own.
+    if let Some(v) = saved.get("move_pace").and_then(Value::as_str)
+        && !v.is_empty()
+    {
+        *daemon.move_pace.lock_ok() = v.to_string();
+    }
+    if let Some(v) = saved.get("move_completed").and_then(Value::as_str)
+        && !v.is_empty()
+    {
+        *daemon.move_completed.write_ok() = Some(PathBuf::from(v));
+    }
+    if let Some(v) = saved.get("move_completed_cats").and_then(Value::as_str)
+        && let Ok(list) = parse_cat_dests(v)
+    {
+        *daemon.move_completed_cats.write_ok() = list;
+    }
+    if let Some(v) = saved.get("categories").and_then(Value::as_str) {
+        let mut set = daemon.cats.lock_ok();
+        for name in v.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            let clean = nzbkit::disk::sanitize_filename(name);
+            if !clean.is_empty() {
+                set.insert(clean);
+            }
+        }
+    }
+    if let Some(v) = saved.get("oracle_sample").and_then(Value::as_u64) {
+        daemon.oracle_sample.store(v.min(3600), Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("index_deepen").and_then(Value::as_u64) {
+        daemon.index_deepen.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("index_coverage").and_then(Value::as_bool) {
+        daemon.index_coverage.store(v, Ordering::Relaxed);
+    }
+    // Present in settings.json == the user answered the question, so
+    // the stored value wins over the indexers-configured default.
+    if let Some(v) = saved.get("watchlist_external").and_then(Value::as_bool) {
+        daemon.watchlist_external.store(v, Ordering::Relaxed);
+        daemon.watchlist_external_set.store(true, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("watchlist_instant").and_then(Value::as_bool) {
+        daemon.watchlist_instant.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("watchlist_instant_max").and_then(Value::as_u64) {
+        daemon
+            .watchlist_instant_max
+            .store(v.min(3600) as u32, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("index_gapfill").and_then(Value::as_u64) {
+        daemon.index_gapfill.store(v.min(100), Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("index_probe7z").and_then(Value::as_bool) {
+        daemon.index_probe7z.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("index_probe7z_budget").and_then(Value::as_u64) {
+        daemon
+            .index_probe7z_budget
+            .store(v.min(2000), Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("index_pesto").and_then(Value::as_bool) {
+        daemon.index_pesto.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("index_pesto_budget").and_then(Value::as_u64) {
+        daemon
+            .index_pesto_budget
+            .store(v.min(2000), Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("index_nzbimport").and_then(Value::as_bool) {
+        daemon.index_nzbimport.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = saved.get("index_nzbimport_budget").and_then(Value::as_u64) {
+        daemon
+            .index_nzbimport_budget
+            .store(v.min(2000), Ordering::Relaxed);
+    }
+    #[cfg(feature = "indexer")]
+    if let Some(v) = saved.get("predb_max_rows").and_then(Value::as_u64) {
+        daemon.predb_max_rows.store(
+            v.clamp(
+                predb_seed::PREDB_MAX_ROWS_MIN,
+                predb_seed::PREDB_MAX_ROWS_MAX,
+            ),
+            Ordering::Relaxed,
+        );
+    }
+    if let Some(v) = saved.get("predb_seed_days").and_then(Value::as_u64) {
+        daemon
+            .predb_seed_days
+            .store(v.clamp(1, 366), Ordering::Relaxed);
+    }
+    // Script knobs: script_timeout_secs + the §129 4a pre-queue pair.
+    daemon.restore_script_knobs(saved);
+    if let Some(v) = saved.get("history_rows").and_then(Value::as_u64)
+        && (1..=200).contains(&v)
+    {
+        daemon.history_rows.store(v, Ordering::Relaxed);
+    }
+    // §129 D5: the optional retention knobs (0 = unlimited, the
+    // default). Seeded AFTER load_queue has restored the records,
+    // so enforce once here - the load-time pass ran with the knobs
+    // still at their unlimited defaults.
+    {
+        let mut retention_set = false;
+        if let Some(v) = saved.get("history_keep_count").and_then(Value::as_u64) {
+            daemon.history_keep_count.store(v, Ordering::Relaxed);
+            retention_set = v > 0;
+        }
+        if let Some(v) = saved.get("history_keep_days").and_then(Value::as_u64) {
+            daemon.history_keep_days.store(v, Ordering::Relaxed);
+            retention_set |= v > 0;
+        }
+        if retention_set {
+            daemon.history_enforce_retention();
+        }
+    }
+    if let Some(v) = saved.get("bench_interval").and_then(Value::as_u64) {
+        daemon.bench_interval.store(v, Ordering::Relaxed);
+    }
 }
 
 pub(super) fn seed_index_retention(settings_path: &Path) -> std::sync::atomic::AtomicBool {
@@ -603,12 +656,67 @@ pub(super) fn seed_predb_corr_auto(settings_path: &Path) -> std::sync::atomic::A
     )
 }
 
+pub(super) fn seed_scoreboard_enabled(settings_path: &Path) -> std::sync::atomic::AtomicBool {
+    std::sync::atomic::AtomicBool::new(
+        load_settings(settings_path)
+            .get("scoreboard_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+}
+
+pub(super) fn seed_scoreboard_url(settings_path: &Path) -> Mutex<String> {
+    Mutex::new(
+        load_settings(settings_path)
+            .get("scoreboard_url")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+    )
+}
+
+pub(super) fn seed_scoreboard_source(settings_path: &Path) -> Mutex<String> {
+    Mutex::new(
+        load_settings(settings_path)
+            .get("scoreboard_source")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+    )
+}
+
+pub(super) fn seed_scoreboard_key(settings_path: &Path) -> Mutex<Option<String>> {
+    Mutex::new(
+        load_settings(settings_path)
+            .get("scoreboard_key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    )
+}
+
+pub(super) fn seed_scoreboard_calibrate(settings_path: &Path) -> std::sync::atomic::AtomicBool {
+    std::sync::atomic::AtomicBool::new(
+        load_settings(settings_path)
+            .get("scoreboard_calibrate")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+}
+
 pub(super) fn seed_spot_enabled(settings_path: &Path) -> std::sync::atomic::AtomicBool {
+    // Default ON (TODO 131, measured in E3): ~182 verified named
+    // releases a day with fetchable NZBs, promoted to first-class wall
+    // cards. A saved setting always wins - anyone who switched spots
+    // off stays off.
     std::sync::atomic::AtomicBool::new(
         load_settings(settings_path)
             .get("spot_enabled")
             .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .unwrap_or(true),
     )
 }
 
@@ -634,6 +742,32 @@ pub(super) fn seed_spot_backfill(settings_path: &Path) -> AtomicU64 {
             .and_then(Value::as_u64)
             .unwrap_or(50_000)
             .clamp(1_000, 1_000_000),
+    )
+}
+
+pub(super) fn seed_spot_deepen(settings_path: &Path) -> AtomicU64 {
+    // Default on. The deepening leg is OVER-only and it TERMINATES:
+    // free.pt's 4.43 M articles are ~2.3 days of passes at this rate,
+    // after which the mark sits on the group's first article and the
+    // leg costs one GROUP command a pass forever. The catalogue it
+    // reaches is 15 years of verified names with fetchable NZBs, in
+    // groups the header scanner never reads.
+    AtomicU64::new(
+        load_settings(settings_path)
+            .get("spot_deepen")
+            .and_then(Value::as_u64)
+            .unwrap_or(20_000)
+            .min(1_000_000),
+    )
+}
+
+pub(super) fn seed_spot_resolve(settings_path: &Path) -> AtomicU64 {
+    AtomicU64::new(
+        load_settings(settings_path)
+            .get("spot_resolve")
+            .and_then(Value::as_u64)
+            .unwrap_or(40)
+            .min(1_000),
     )
 }
 
@@ -823,6 +957,28 @@ pub(super) fn absolute_out_root(out_root: PathBuf) -> PathBuf {
         std::env::current_dir()
             .map(|c| c.join(&out_root))
             .unwrap_or(out_root)
+    }
+}
+
+// Size paydown, same move giveup.rs made: the accessor lives with the
+// code that DECIDES what it reports. `resolve_tls_pair` below settles
+// the pair, `announce_ready` prints the matching banner scheme, and
+// daemon.rs was over its ceiling.
+impl Daemon {
+    /// The scheme THIS listener answers on, for every link we hand a
+    /// client. Bind-time state like `port`, and the pair is
+    /// both-or-neither (see `resolve_tls_pair`), so `tls_cert` decides.
+    ///
+    /// Links used to say `http` unconditionally, which a reverse proxy
+    /// could correct with `X-Forwarded-Proto` but a DIRECT TLS listener
+    /// could not: `/m3u`, `.strm` and the newznab items all pointed at
+    /// plaintext on a TLS-only socket and got a reset.
+    pub fn scheme(&self) -> &'static str {
+        if self.tls_cert.is_some() {
+            "https"
+        } else {
+            "http"
+        }
     }
 }
 
@@ -1079,6 +1235,8 @@ pub(super) fn spawn_core_tasks(
     #[cfg(feature = "indexer")] index_db: &Path,
     mem_budget: nzbkit::mem::MemBudget,
 ) -> Result<()> {
+    hooks::spawn_dispatcher(daemon);
+
     tasks::spawn_scheduler(daemon, settings_path, schedule)?;
 
     tasks::spawn_watch_folder(daemon);
@@ -1112,6 +1270,30 @@ pub(super) fn spawn_core_tasks(
 
     #[cfg(feature = "indexer")]
     tasks::spawn_oracle_sampler(daemon, config);
+
+    // TODO 131 B3: the byte-probe naming lane. Gated like the
+    // enrichment workers: it spends real provider articles, so test
+    // and scratch daemons must be able to keep it entirely off the
+    // wire with one env var.
+    #[cfg(feature = "indexer")]
+    if std::env::var_os("NZBFAST_NO_ENRICH").is_none() {
+        tasks::spawn_probe7z(daemon, config);
+        // TODO 131 #6: the posted-NZB ingestion rung - same gate, for
+        // the same reason (it fetches posted objects off the fleet).
+        tasks::spawn_nzb_import(daemon, config);
+    }
+
+    // TODO 131 red-team 5a: the pesto tiny-PAR2 naming rung. Same
+    // wire-spend gate as the byte prober.
+    #[cfg(feature = "indexer")]
+    if std::env::var_os("NZBFAST_NO_ENRICH").is_none() {
+        tasks::spawn_pesto(daemon, config);
+    }
+
+    // The parity scoreboard's daily sampler - inert until the user has
+    // saved a reference indexer URL and switched it on.
+    #[cfg(feature = "indexer")]
+    tasks::spawn_scoreboard(daemon);
 
     tasks::spawn_health_prober(daemon, config);
 
@@ -1410,6 +1592,8 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         history_rev: AtomicU64::new(1),
         life_seq: AtomicU64::new(0),
         life_events: Mutex::new(VecDeque::new()),
+        queue_idle_latch: AtomicBool::new(true),
+        hooks_tx: Mutex::new(None),
         history_keep_count: AtomicU64::new(0),
         history_keep_days: AtomicU64::new(0),
         add_lock: Mutex::new(()),
@@ -1477,8 +1661,16 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         index_deepen: AtomicU64::new(200_000),
         index_coverage: std::sync::atomic::AtomicBool::new(true),
         index_gapfill: AtomicU64::new(4),
+        index_probe7z: std::sync::atomic::AtomicBool::new(true),
+        index_probe7z_budget: AtomicU64::new(150),
+        index_pesto: std::sync::atomic::AtomicBool::new(true),
+        index_pesto_budget: AtomicU64::new(120),
+        index_nzbimport: std::sync::atomic::AtomicBool::new(true),
+        index_nzbimport_budget: AtomicU64::new(300),
         bench_interval: AtomicU64::new(0),
         bench_last: AtomicU64::new(0),
+        bench_running: std::sync::atomic::AtomicBool::new(false),
+        bench_history_lock: Mutex::new(()),
         update_manifest: Mutex::new(None),
         update_serial_seen: std::sync::atomic::AtomicU64::new(0),
         // Notify-only: finding a newer version raises the dashboard
@@ -1599,11 +1791,23 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         predb_seed_running: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "indexer")]
         predb_seed_status: Mutex::new(String::new()),
+        // Parity scoreboard: OFF and sourceless unless the user saved
+        // their own reference indexer. No path samples anybody's API by
+        // accident, and no key or URL ever ships as a constant.
+        scoreboard_enabled: seed_scoreboard_enabled(&settings_path),
+        scoreboard_url: seed_scoreboard_url(&settings_path),
+        scoreboard_source: seed_scoreboard_source(&settings_path),
+        scoreboard_key: seed_scoreboard_key(&settings_path),
+        scoreboard_calibrate: seed_scoreboard_calibrate(&settings_path),
+        scoreboard_running: std::sync::atomic::AtomicBool::new(false),
+        scoreboard_status: Mutex::new(String::new()),
         // Spots are new, so there is no existing-install case to seed
         // from: nobody has one running today. Straight off until asked.
         spot_enabled: seed_spot_enabled(&settings_path),
         spot_groups: seed_spot_groups(&settings_path),
         spot_backfill: seed_spot_backfill(&settings_path),
+        spot_deepen: seed_spot_deepen(&settings_path),
+        spot_resolve: seed_spot_resolve(&settings_path),
         #[cfg(feature = "indexer")]
         index_generation: AtomicU64::new(0),
         index_jobs_active: Arc::new(AtomicUsize::new(0)),
@@ -1658,6 +1862,7 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         limit_source: std::sync::Mutex::new("user"),
         auto_retry_secs: seed_auto_retry_secs(&settings_path, auto_retry_mins),
         quota: AtomicU64::new(quota.unwrap_or(0)),
+        quota_spent: AtomicU64::new(0),
         quota_reset: AtomicBool::new(false),
         dupe_action: Mutex::new("pause".to_string()),
         cat_meta: Mutex::new(std::collections::HashMap::new()),
@@ -1692,6 +1897,8 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         group_desc_isc: std::sync::atomic::AtomicBool::new(opts.group_desc_isc),
         script: Mutex::new(script),
         script_timeout: AtomicU64::new(3600),
+        pre_queue_script: Mutex::new(None),
+        pre_queue_timeout: AtomicU64::new(30),
         notify_targets: Mutex::new(Vec::new()),
         notify_health: Mutex::new(Default::default()),
         failure_link: Mutex::new("off".to_string()),
@@ -1723,6 +1930,7 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         scan_progress: Mutex::new(Vec::new()),
         index_scan_par: AtomicU64::new(3),
         scan_active: std::sync::atomic::AtomicBool::new(false),
+        busy: Default::default(),
         index_tip_secs: AtomicU64::new(20),
         watch_interval_secs: AtomicU64::new(5),
         watch_scan_now: tokio::sync::Notify::new(),
@@ -1739,6 +1947,10 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         #[cfg(feature = "indexer")]
         taste_cache: Mutex::new(None),
     });
+    // Weakly, for the embedded host's reclamation test: one entry per
+    // run, and a generation that survives its own stop is a leak that
+    // shows up as a `Weak` still upgradable. Costs a pointer per run.
+    super::census_daemon(&daemon);
 
     Ok(Booted {
         daemon,

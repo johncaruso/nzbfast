@@ -399,6 +399,42 @@ pub fn fuzz_v4_encrypted_header(
     }
 }
 
+/// Fuzz entry point for the RAR4 PLAINTEXT header framing, past the
+/// header CRC16 - the same split, for the same reason, as
+/// [`fuzz_v4_encrypted_header`] is past the key schedule.
+///
+/// Since the M5 fix a plaintext block is refused unless its stored CRC16
+/// matches, and random bytes clear that one time in 65,536. Driving only
+/// the mapper would therefore leave every length and offset BEHIND the
+/// gate - `hsize`, `add_size`, the 64-bit high halves, the packed-name
+/// decoder - effectively unfuzzed, which is precisely the arithmetic
+/// that turns into `pwrite` destinations. The CRC is a fixed
+/// `crc32fast::hash` over a slice and is not what needs execs; the
+/// fields it protects are.
+///
+/// Returns `(advanced_to, blocked)` rather than the private
+/// `BlockResult`, matching the encrypted entry point.
+#[doc(hidden)]
+pub fn fuzz_v4_plain_header(bytes: &[u8], base: u64) -> (Option<u64>, bool) {
+    // `Some(hsize)` would be a lie about the span; feed the real
+    // plaintext shape and let the parser derive it, minus only the CRC
+    // check that `hdr_span.is_none()` would otherwise run.
+    if bytes.len() < 7 {
+        return (None, false);
+    }
+    let hsize = rd_u16(&bytes[5..]) as u64;
+    match parse_block_v4_at(bytes, base, Some(hsize)) {
+        BlockResult::Skip { next, .. } => (Some(next), false),
+        BlockResult::File { next, .. } => (Some(next), false),
+        BlockResult::V4EncryptedHeaders { next } => (Some(next), false),
+        BlockResult::Crypt { next, .. } => (Some(next), false),
+        BlockResult::End | BlockResult::NeedMore => (None, false),
+        BlockResult::Corrupt(_) | BlockResult::BadPassword | BlockResult::EncryptedHeaders => {
+            (None, true)
+        }
+    }
+}
+
 fn feed_headers_incrementally(f: &mut std::fs::File, size: u64, m: &mut VolumeMapper) {
     use std::io::{Read, Seek, SeekFrom};
     const CHUNK: usize = 64 * 1024;
@@ -1412,12 +1448,37 @@ fn parse_block_v4_at(h: &[u8], base: u64, hdr_span: Option<u64>) -> BlockResult 
     if a.len() < hsize {
         return BlockResult::NeedMore;
     }
+    // Every field below - the name, the flags, the geometry the
+    // extractor turns into pwrite destinations - is authoritative only
+    // if the header that carries them is intact, and RAR4 ships a CRC16
+    // saying so. The `-hp` path has always checked it (there it also
+    // adjudicates the password); RAR5 checks its own at both entry
+    // points. The plaintext RAR4 path did not, so damaged or crafted
+    // header bytes were trusted (Codex sweep 10 Aug, M5).
+    //
+    // Only on the plaintext entry: an encrypted block arrives here with
+    // `hdr_span` set, and `parse_block_v4_enc_with` has already checked
+    // the same CRC over the same bytes.
+    if hdr_span.is_none() && !v4_header_crc_ok(a) {
+        return BlockResult::Corrupt("v4 header CRC mismatch");
+    }
     let span = hdr_span.unwrap_or(hsize as u64);
+    // Every `next` below is arithmetic over attacker-declared fields, so
+    // it is CHECKED: `high_pack = 0xFFFF_FFFF` puts `data_len` within a
+    // few bytes of `u64::MAX` and the plain sum then panics in debug and
+    // wraps in release - a wrapped cursor being exactly the shape the
+    // mapper's strict-advance rule exists to catch. Found by the RAR4
+    // plaintext fuzz half added with the M5 CRC gate; the gate makes it
+    // unreachable by ACCIDENT, never by a poster, who can stamp a
+    // correct CRC over any fields at all.
+    let end_of = |data: u64| -> Option<u64> { base.checked_add(span)?.checked_add(data) };
     // NOTE: for file headers with the 0x100 flag, `add_size` here is only
     // the LOW 32 bits - the file branch recomputes `next` with the high
     // half once parsed (a >4 GiB RAR4 store piece would otherwise walk
     // the cursor into the data area and end in a Corrupt fallback).
-    let next = base + span + add_size;
+    let Some(next) = end_of(add_size) else {
+        return BlockResult::Corrupt("v4 block runs past the end of addressable space");
+    };
 
     match btype {
         0x73 => {
@@ -1512,6 +1573,11 @@ fn parse_block_v4_at(h: &[u8], base: u64, hdr_span: Option<u64>) -> BlockResult 
                 .then_some(EntryCrypt::Rar4(Rar4Crypt { salt }));
             let decryptable = crypt.is_some();
             let is_dir = flags & 0x00E0 == 0x00E0;
+            // The full 64-bit length, so this is the sum that can leave
+            // the address space - `next` above only carried the low 32.
+            let Some(data_end) = end_of(data_len) else {
+                return BlockResult::Corrupt("v4 data area runs past the end of addressable space");
+            };
             BlockResult::File {
                 entry: FileEntry {
                     name,
@@ -1553,7 +1619,7 @@ fn parse_block_v4_at(h: &[u8], base: u64, hdr_span: Option<u64>) -> BlockResult 
                     data_len,
                 },
                 // Full 64-bit data length, not the low-32 `add_size`.
-                next: base + span + data_len,
+                next: data_end,
             }
         }
         0x7b => BlockResult::End,
@@ -2336,11 +2402,9 @@ pub mod fixtures {
     pub fn rar4_encrypted_headers(pad: usize) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(super::SIG4);
-        out.extend_from_slice(&0u16.to_le_bytes()); // head crc (unchecked)
-        out.push(0x73);
-        out.extend_from_slice(&0x0080u16.to_le_bytes()); // MHD_PASSWORD
-        out.extend_from_slice(&13u16.to_le_bytes());
-        out.extend_from_slice(&[0u8; 6]); // reserved
+        // The main header stays PLAINTEXT even under MHD_PASSWORD, so it
+        // carries a real CRC like any other plaintext block.
+        out.extend_from_slice(&rar4_main_header(true));
         out.extend(std::iter::repeat_n(0xA5, pad));
         out
     }
@@ -2457,17 +2521,33 @@ pub mod fixtures {
         out
     }
 
+    /// Stamp a RAR4 block's header CRC16 over `h[2..]` - what a real
+    /// writer does, and since the M5 fix what the plaintext parser
+    /// insists on. Every RAR4 fixture here goes through it, so a fixture
+    /// can no longer accidentally stand in for a corrupt header.
+    pub fn stamp_v4_head_crc(h: &mut [u8]) {
+        let hc = (crc32fast::hash(&h[2..]) & 0xffff) as u16;
+        h[..2].copy_from_slice(&hc.to_le_bytes());
+    }
+
+    /// Restamp the RAR4 block header starting at `off` after a test has
+    /// poked one of its fields. Since the M5 fix the plaintext parser
+    /// checks the header CRC16, so a poke left unrestamped would test
+    /// the CRC gate instead of the field the test is about.
+    pub fn restamp_v4_block(vol: &mut [u8], off: usize) {
+        let hsize = u16::from_le_bytes(vol[off + 5..off + 7].try_into().unwrap()) as usize;
+        stamp_v4_head_crc(&mut vol[off..off + hsize]);
+    }
+
+    /// Where the first block after a RAR4 volume's signature + main
+    /// header starts: 7-byte marker, 13-byte main header.
+    pub const V4_FIRST_BLOCK: usize = 20;
+
     /// One store-mode RAR4 volume.
     pub fn rar4_volume(pieces: &[(&str, u64, &[u8], bool, bool)]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(super::SIG4);
-        // Main header: crc u16 (unchecked by our parser) type 0x73 flags 0 size 13.
-        let mh_size = 13u16;
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.push(0x73);
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&mh_size.to_le_bytes());
-        out.extend_from_slice(&[0u8; 6]); // reserved
+        out.extend_from_slice(&rar4_main_header(false));
         for &(name, total, piece, before, after) in pieces {
             let mut flags: u16 = 0x8000; // add size present
             if before {
@@ -2478,13 +2558,14 @@ pub mod fixtures {
             }
             let name_b = name.as_bytes();
             let hsize = (7 + 4 + 4 + 1 + 4 + 4 + 1 + 1 + 2 + 4 + name_b.len()) as u16;
-            out.extend_from_slice(&0u16.to_le_bytes()); // head crc (unchecked)
-            out.push(0x74);
-            out.extend_from_slice(&flags.to_le_bytes());
-            out.extend_from_slice(&hsize.to_le_bytes());
-            out.extend_from_slice(&(piece.len() as u32).to_le_bytes()); // add size
-            out.extend_from_slice(&(total as u32).to_le_bytes()); // unp size
-            out.push(0); // host
+            let mut h = Vec::with_capacity(hsize as usize);
+            h.extend_from_slice(&0u16.to_le_bytes()); // head crc, stamped below
+            h.push(0x74);
+            h.extend_from_slice(&flags.to_le_bytes());
+            h.extend_from_slice(&hsize.to_le_bytes());
+            h.extend_from_slice(&(piece.len() as u32).to_le_bytes()); // add size
+            h.extend_from_slice(&(total as u32).to_le_bytes()); // unp size
+            h.push(0); // host
             // Whole-file CRC32 (RAR4 header field). Only a complete, single
             // piece can carry it here - a split piece's real whole-file CRC
             // spans data this call doesn't hold, so leave those 0. The parser
@@ -2498,20 +2579,18 @@ pub mod fixtures {
             } else {
                 0
             };
-            out.extend_from_slice(&crc.to_le_bytes()); // crc
-            out.extend_from_slice(&0u32.to_le_bytes()); // time
-            out.push(29); // unp_ver
-            out.push(0x30); // method: store
-            out.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes()); // attr
-            out.extend_from_slice(name_b);
+            h.extend_from_slice(&crc.to_le_bytes()); // crc
+            h.extend_from_slice(&0u32.to_le_bytes()); // time
+            h.push(29); // unp_ver
+            h.push(0x30); // method: store
+            h.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+            h.extend_from_slice(&0u32.to_le_bytes()); // attr
+            h.extend_from_slice(name_b);
+            stamp_v4_head_crc(&mut h);
+            out.extend_from_slice(&h);
             out.extend_from_slice(piece);
         }
-        // ENDARC
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.push(0x7b);
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&7u16.to_le_bytes());
+        out.extend_from_slice(&rar4_end_block());
         out
     }
 
@@ -2853,9 +2932,17 @@ pub mod fixtures {
     }
 }
 
+// The RAR4 header-framing tests - a child module (the par2repair.rs
+// pattern) so rar.rs stays inside its size-gate entry while `super::*`
+// keeps the private parser reachable.
+#[cfg(test)]
+mod v4_header_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use fixtures::{V4_FIRST_BLOCK, restamp_v4_block};
 
     fn payload(n: usize, seed: u8) -> Vec<u8> {
         (0..n)
@@ -2885,11 +2972,13 @@ mod tests {
         // 20; flags at +3) → password required.
         let mut pwfile = store.clone();
         pwfile[23] |= 0x04;
+        restamp_v4_block(&mut pwfile, V4_FIRST_BLOCK);
         assert!(needs_password(&write("pwfile.rar", &pwfile)));
         // Compressed-but-not-encrypted (method byte at block base + 25)
         // must NOT ask for a password - unrar unpacks it alone.
         let mut comp = store.clone();
         comp[45] = 0x33;
+        restamp_v4_block(&mut comp, V4_FIRST_BLOCK);
         assert!(!needs_password(&write("comp.rar", &comp)));
         // Not a RAR / unreadable → no (nothing to unlock).
         assert!(!needs_password(&write("junk.rar", b"not a rar at all")));
@@ -3173,6 +3262,7 @@ mod tests {
         let m_off = 7 + 13 + 11 + 14;
         assert_eq!(v4[m_off], 0x30);
         v4[m_off] = 0x33;
+        restamp_v4_block(&mut v4, V4_FIRST_BLOCK);
         let mut m = VolumeMapper::new(v4.len() as u64);
         m.feed(0, &v4);
         assert_eq!(m.blocker, Some(MapBlocker::NotStore));
@@ -3182,49 +3272,6 @@ mod tests {
         let mut m5 = VolumeMapper::new(vol.len() as u64);
         m5.feed(0, &vol);
         assert!(matches!(m5.blocker, Some(MapBlocker::Corrupt(_))));
-    }
-
-    /// RAR4 >4 GiB store piece: `next` must use the full 64-bit packed
-    /// size (add_size + high_pack), not just the low 32 bits - otherwise
-    /// the cursor walks into the data area and ends in a Corrupt/NotStore
-    /// fallback.
-    #[test]
-    fn v4_large_piece_advances_cursor_past_full_data_len() {
-        // Hand-build a v4 file header claiming a 5 GiB piece (no actual
-        // data needed - we only check the returned cursor).
-        let name = b"huge.bin";
-        let data_len: u64 = 5 << 30; // 5 GiB
-        let hsize = (7 + 4 + 4 + 1 + 4 + 4 + 1 + 1 + 2 + 4 + 8 + name.len()) as u16;
-        let mut blk = Vec::new();
-        blk.extend_from_slice(&0u16.to_le_bytes()); // head crc (unchecked)
-        blk.push(0x74);
-        blk.extend_from_slice(&(0x8000u16 | 0x0100).to_le_bytes()); // add size + high fields
-        blk.extend_from_slice(&hsize.to_le_bytes());
-        blk.extend_from_slice(&((data_len & 0xFFFF_FFFF) as u32).to_le_bytes()); // add size lo
-        blk.extend_from_slice(&((data_len & 0xFFFF_FFFF) as u32).to_le_bytes()); // unp lo
-        blk.push(0); // host
-        blk.extend_from_slice(&0u32.to_le_bytes()); // crc
-        blk.extend_from_slice(&0u32.to_le_bytes()); // time
-        blk.push(29); // unp_ver
-        blk.push(0x30); // store
-        blk.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        blk.extend_from_slice(&0u32.to_le_bytes()); // attr
-        blk.extend_from_slice(&((data_len >> 32) as u32).to_le_bytes()); // high_pack
-        blk.extend_from_slice(&((data_len >> 32) as u32).to_le_bytes()); // high_unp
-        blk.extend_from_slice(name);
-        let base = 20u64;
-        match parse_block_v4(&blk, base) {
-            BlockResult::File { entry, next } => {
-                assert_eq!(entry.data_len, data_len);
-                assert_eq!(entry.unpacked_size, data_len);
-                assert_eq!(
-                    next,
-                    base + hsize as u64 + data_len,
-                    "cursor must skip the FULL piece"
-                );
-            }
-            _ => panic!("expected a file block"),
-        }
     }
 
     /// A RAR4 file header carrying `field` verbatim as its name area and
@@ -3247,6 +3294,7 @@ mod tests {
         blk.extend_from_slice(&(field.len() as u16).to_le_bytes());
         blk.extend_from_slice(&0u32.to_le_bytes()); // attr
         blk.extend_from_slice(field);
+        fixtures::stamp_v4_head_crc(&mut blk);
         blk
     }
 
@@ -3254,16 +3302,22 @@ mod tests {
     fn v4_volume_of(blocks: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(SIG4);
-        out.extend_from_slice(&0u16.to_le_bytes()); // main head crc
-        out.push(0x73);
-        out.extend_from_slice(&0u16.to_le_bytes()); // flags
-        out.extend_from_slice(&13u16.to_le_bytes());
-        out.extend_from_slice(&[0u8; 6]); // reserved
+        let mut main = Vec::new();
+        main.extend_from_slice(&0u16.to_le_bytes()); // main head crc
+        main.push(0x73);
+        main.extend_from_slice(&0u16.to_le_bytes()); // flags
+        main.extend_from_slice(&13u16.to_le_bytes());
+        main.extend_from_slice(&[0u8; 6]); // reserved
+        fixtures::stamp_v4_head_crc(&mut main);
+        out.extend_from_slice(&main);
         out.extend_from_slice(blocks);
-        out.extend_from_slice(&0u16.to_le_bytes()); // ENDARC
-        out.push(0x7b);
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&7u16.to_le_bytes());
+        let mut end = Vec::new();
+        end.extend_from_slice(&0u16.to_le_bytes()); // ENDARC
+        end.push(0x7b);
+        end.extend_from_slice(&0u16.to_le_bytes());
+        end.extend_from_slice(&7u16.to_le_bytes());
+        fixtures::stamp_v4_head_crc(&mut end);
+        out.extend_from_slice(&end);
         out
     }
 
@@ -3884,6 +3938,7 @@ mod tests {
         let unp_ver = 20 + 24;
         assert_eq!(vol[unp_ver], 29, "fixture layout moved");
         vol[unp_ver] = 20; // RAR 2.0
+        restamp_v4_block(&mut vol, V4_FIRST_BLOCK);
         let m = mapper_with(Some(PW), &vol);
         assert_eq!(m.blocker, Some(MapBlocker::NotStore));
         let e = &m.entries[0];

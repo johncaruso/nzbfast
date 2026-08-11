@@ -1237,6 +1237,7 @@ mod tests {
         let m_off = 7 + 13 + 11 + 14;
         assert_eq!(v4[m_off], 0x30);
         v4[m_off] = 0x33;
+        fixtures::restamp_v4_block(&mut v4, fixtures::V4_FIRST_BLOCK);
         assert_not_store(&v4);
         let outer = fixtures::rar5_volume(&[("inner.rar", v4.len() as u64, &v4, false, false)]);
         let ex = Extractor::new(&dir, 1, true);

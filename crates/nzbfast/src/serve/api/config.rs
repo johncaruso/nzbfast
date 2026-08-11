@@ -280,6 +280,13 @@ fn m_get_config(
         // First-run signal: the dashboard shows a welcome card
         // until a server exists.
         nzbfast.insert("servers_configured".into(), json!(!servers.is_empty()));
+        // §129 4c: the SECOND first-run signal. A configured server is
+        // not a working install - between the two comes a dashboard of
+        // cards that can only read zero, and the question the user
+        // actually has ("how do I start a download?") is answered
+        // nowhere on it. See `jobs_ever` for why this cannot simply ask
+        // whether the queue is empty.
+        nzbfast.insert("jobs_ever".into(), json!(d.jobs_ever()));
         nzbfast.insert("servers".into(), json!(servers));
         nzbfast.insert("pending".into(), Value::Object(pending));
         json!({

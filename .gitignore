@@ -34,6 +34,9 @@ packaging/windows/out/
 packaging/mac/build/
 settings.json.bak
 settings.json.corrupt
+# a bare key dumped out of settings.json to talk to a local daemon -
+# the one file in this list that is a live credential on its own
+apikey
 
 # field-repro NZBs (real message-ids - never publish)
 repro-nzbs/

@@ -2,14 +2,28 @@
 name = "nzbtray"
 # Keep in lockstep with crates/nzbfast (the version source of truth) -
 # the installer stamps that string on both exes' packaging.
-version = "1.0.21"
+version = "1.0.22"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-# Plain-HTTP only (the daemon is always 127.0.0.1) - no TLS stack.
-ureq = { version = "2", default-features = false }
+# The daemon is always 127.0.0.1, but it is not always plain HTTP: with
+# tls_cert/tls_key set it binds HTTPS, and a tray without a TLS stack
+# could not probe, open, stop, upgrade or quit its own engine (M1). So
+# `tls` is on - it brings rustls with RING only (ureq pins it
+# default-features = false), not aws-lc-sys, so nothing new has to build
+# for the Windows target.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# Declared directly for the custom loopback verifier in `loopback_tls` -
+# same version and the same ring-only feature set ureq asks for, so this
+# adds no crate the `tls` feature above did not already pull in.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "logging",
+    "std",
+    "tls12",
+] }
 serde_json = "1"
 # Launcher handshake: the tray proves the listener on a port is the daemon
 # whose runtime.json it just read, BEFORE handing over the stored API key.

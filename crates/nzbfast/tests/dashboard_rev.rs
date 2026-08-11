@@ -681,3 +681,153 @@ fn retention_knobs_off_by_default_and_enforced_when_set() {
         "the oldest rows were not purged: {h}"
     );
 }
+
+/// §129 4a: the lifecycle schema is versioned and the add-to-park arc
+/// emits its stages in order. One job on a serverless daemon walks
+/// job.added -> job.started -> job.failed -> queue.idle, every event
+/// stamped schema_version 1, and the added payload names its origin.
+#[test]
+fn the_lifecycle_arc_is_versioned_and_ordered() {
+    let dir = scratch("lifearc");
+    let d = serve(&dir);
+    let port = d.port;
+
+    let first = api(port, "mode=dashboard");
+    let seq0 = first["events_seq"].as_u64().expect("events_seq");
+
+    let nzb = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+        <nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\
+        <file poster=\"t@t\" date=\"1722000000\" subject=\"&quot;Arc.Test&quot; yEnc (1/1)\">\
+        <groups><group>alt.binaries.test</group></groups>\
+        <segments><segment bytes=\"5000\" number=\"1\">arc1@test</segment></segments>\
+        </file></nzb>";
+    let added = http_post_nzb(port, "arc-test.nzb", nzb);
+    assert_eq!(added["status"], true, "{added}");
+
+    // Collect until the arc has fully played out.
+    let mut evs: Vec<Value> = Vec::new();
+    for _ in 0..150 {
+        let r = api(port, &format!("mode=dashboard&events={seq0}"));
+        evs = r["events"].as_array().cloned().unwrap_or_default();
+        if evs.iter().any(|e| e["kind"] == "queue.idle") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let pos = |kind: &str| {
+        evs.iter()
+            .position(|e| e["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} event in {evs:?}"))
+    };
+    let (added, started, failed, idle) = (
+        pos("job.added"),
+        pos("job.started"),
+        pos("job.failed"),
+        pos("queue.idle"),
+    );
+    assert!(
+        added < started && started < failed && failed < idle,
+        "arc out of order: {evs:?}"
+    );
+    for e in &evs {
+        assert_eq!(e["schema_version"], 1, "unversioned event: {e}");
+        assert!(e["seq"].as_u64().is_some(), "{e}");
+        assert!(e["at"].as_u64().is_some(), "{e}");
+    }
+    let a = &evs[added];
+    assert_eq!(a["origin"], "dashboard", "{a}");
+    assert_eq!(a["duplicate"], false, "{a}");
+    assert!(a["name"].as_str().is_some_and(|s| !s.is_empty()), "{a}");
+    let s = &evs[started];
+    assert_eq!(s["resumed"], false, "{s}");
+
+    // queue.idle is a transition: a second quiet poll must not repeat it.
+    let last = evs.last().and_then(|e| e["seq"].as_u64()).unwrap();
+    let quiet = api(port, &format!("mode=dashboard&events={last}"));
+    assert_eq!(quiet["events"].as_array().map(Vec::len), Some(0), "{quiet}");
+}
+
+/// The header state rides the revisioned queue payload, so going offline
+/// (or pausing) has to bump the revision even though no job row moved.
+///
+/// It did not, and on an IDLE daemon - nothing downloading, so the
+/// `any_active` escape hatch does not fire either - the poll answered
+/// `"queue": null`, the page kept the queue object it had last applied,
+/// and `paintNet()` repainted "Online" a second after the click over a
+/// daemon that really was offline. Pause hid the same staleness only
+/// because it is normally pressed mid-download.
+#[test]
+fn offline_bumps_the_queue_revision_on_an_idle_daemon() {
+    let dir = scratch("offlinerev");
+    let d = serve(&dir);
+    let port = d.port;
+
+    let first = api(port, "mode=dashboard");
+    let qrev = first["queue_revision"].as_u64().expect("queue_revision");
+    assert_eq!(first["queue"]["offline"], false, "{first}");
+
+    // Nothing changed: the gate still holds (this is what made the bug
+    // invisible to a test that only checked the offline flag itself).
+    let idle = api(port, &format!("mode=dashboard&queue_rev={qrev}"));
+    assert!(idle["queue"].is_null(), "idle poll must stay empty: {idle}");
+
+    assert_eq!(api(port, "mode=offline")["offline"], true);
+    let after = api(port, &format!("mode=dashboard&queue_rev={qrev}"));
+    assert!(
+        after["queue_revision"].as_u64() != Some(qrev),
+        "going offline must bump the queue revision: {after}"
+    );
+    assert_eq!(
+        after["queue"]["offline"], true,
+        "the page has no other source for the header state: {after}"
+    );
+    // Offline pauses the queue, and that flag rides the same payload.
+    assert_eq!(after["queue"]["paused"], true, "{after}");
+
+    let qrev2 = after["queue_revision"].as_u64().unwrap();
+    assert_eq!(api(port, "mode=online")["offline"], false);
+    let back = api(port, &format!("mode=dashboard&queue_rev={qrev2}"));
+    assert_eq!(back["queue"]["offline"], false, "{back}");
+    assert_eq!(back["queue"]["paused"], false, "{back}");
+}
+
+/// The other half of the same defect: the header's speed-limit control.
+/// `speedlimit_abs` / `auto_speed` / `limit_source` ride the same payload,
+/// and a settings write bumped nothing - so on an idle daemon the
+/// dropdown snapped back to its old value exactly the way the Offline
+/// button did. Covers both seams: `apply_and_save` (this API, the
+/// settings page) and `set_speed_ceiling_from` (a schedule entry firing,
+/// the NZBGet `rate` facade).
+#[test]
+fn a_settings_change_bumps_the_queue_revision_on_an_idle_daemon() {
+    let dir = scratch("cfgrev");
+    let d = serve(&dir);
+    let port = d.port;
+
+    let mut rev = api(port, "mode=dashboard")["queue_revision"]
+        .as_u64()
+        .expect("queue_revision");
+    // Untouched: the poll must still answer empty, or this fix has just
+    // put the queue back on the wire every second.
+    let idle = api(port, &format!("mode=dashboard&queue_rev={rev}"));
+    assert!(idle["queue"].is_null(), "idle poll must stay empty: {idle}");
+
+    // (`speedlimit_abs` is a string in the payload - SAB's units are
+    // strings and the facade keeps them that way.)
+    for (setting, value, field, want) in [
+        ("speedlimit", "4M", "speedlimit_abs", json!("4000000")),
+        ("auto_speed", "1", "auto_speed", json!(true)),
+        ("auto_speed", "0", "auto_speed", json!(false)),
+        ("speedlimit", "0", "speedlimit_abs", json!("0")),
+    ] {
+        let set = api(port, &format!("mode=config&name={setting}&value={value}"));
+        assert_ne!(set["status"], false, "{setting}={value} refused: {set}");
+        let after = api(port, &format!("mode=dashboard&queue_rev={rev}"));
+        assert!(
+            !after["queue"].is_null(),
+            "{setting}={value} must resend the queue: {after}"
+        );
+        assert_eq!(after["queue"][field], want, "{setting}={value}: {after}");
+        rev = after["queue_revision"].as_u64().expect("queue_revision");
+    }
+}

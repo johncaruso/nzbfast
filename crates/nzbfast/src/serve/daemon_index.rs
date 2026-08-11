@@ -698,10 +698,28 @@ impl Daemon {
             }
             return (0, 0, 0, 0);
         }
-        self.index_stats_cache
-            .lock()
-            .unwrap()
-            .unwrap_or((0, 0, 0, 0))
+        if let Some(snap) = *self.index_stats_cache.lock_ok() {
+            return snap;
+        }
+        // The cache is only empty before the first successful read - the
+        // restart window. A scan batch that reclaims the write connection
+        // straight away used to make a 19 GB index report zero releases
+        // to every dashboard load until the batch finished; the pooled
+        // read-only connections run concurrently with that writer, so
+        // ask one of them instead. Busy/Unavailable still answer zeros:
+        // the pool's bounded wait is the whole point of it.
+        if let Reader::Got(ix) = self.index_read_acquire() {
+            let (total, complete) = ix.stats().unwrap_or((0, 0));
+            let snap = (
+                total,
+                complete,
+                ix.db_bytes().unwrap_or(0),
+                ix.live_bytes().unwrap_or(0),
+            );
+            *self.index_stats_cache.lock_ok() = Some(snap);
+            return snap;
+        }
+        (0, 0, 0, 0)
     }
 
     /// Mutable variant for the odd transaction-shaped call (IMDb
@@ -810,13 +828,131 @@ impl Daemon {
     /// once-in-an-install event, and up to `secs` of extra latency
     /// before the metadata lanes wake is invisible next to the scan pass
     /// that has to run first anyway.
+    ///
+    /// The park does wake on a stop request, though. The caller's own
+    /// `RunStop` decides what that means; this only makes sure a lane
+    /// parked for ten minutes is not still parked long after the
+    /// embedded host has reported stopped.
     #[cfg(feature = "indexer")]
     pub(in crate::serve) fn park_if_off(&self, secs: u64) -> bool {
         if self.indexer_off() {
-            std::thread::sleep(std::time::Duration::from_secs(secs));
+            crate::serve::sleep_until_stop_bump(std::time::Duration::from_secs(secs));
             return true;
         }
         false
+    }
+
+    /// C4-4 (§131 identity substrate): every NZB the daemon accepts -
+    /// watch folder, dashboard add, *arr handoff, RSS, spot grab - is a
+    /// (name, payload message-id set) pairing. When those message-ids
+    /// are rows we scanned, that is EXACT identity for what the user
+    /// just downloaded, so record it as a provenance-tagged MsgidSet
+    /// claim. Message-id identity only - never time/size.
+    ///
+    /// Quorum: [`nzbkit::nzbimport::MIN_MSGID_QUORUM`] distinct ids per
+    /// row, because a single id can be seeded (the NZB is untrusted
+    /// regardless of which surface delivered it). The reverse map keys
+    /// a bounded per-file sample in ascending part order, so the probe
+    /// set takes the LEADING ids of each file - and more than the
+    /// map's three per file, because a row scanned mid-post keys later
+    /// parts first and keeps them (append-only).
+    ///
+    /// Best-effort by design: it runs after the job is queued and
+    /// published, `with_index_mut` demotes off the async workers, and
+    /// a contended or closed index just means this pairing waits for a
+    /// future surface (the download tail names it again at PAR2/CRC
+    /// strength anyway).
+    #[cfg(feature = "indexer")]
+    pub(in crate::serve) fn record_nzb_pairing(
+        &self,
+        name: &str,
+        origin: &str,
+        nzb: &nzbkit::nzb::Nzb,
+    ) {
+        use nzbkit::index::msgid_set_key;
+        // The probe bounds are the lane-shared ones so this pairing and
+        // the posted-NZB rung mean the same thing by "quorum".
+        use nzbkit::nzbimport::{MIN_MSGID_QUORUM, PROBE_CAP, PROBES_PER_FILE};
+        let mut probes: Vec<&str> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> = Default::default();
+        let mut total_ids = 0usize;
+        for f in &nzb.files {
+            for (i, s) in f.segments.iter().enumerate() {
+                total_ids += 1;
+                if i < PROBES_PER_FILE
+                    && probes.len() < PROBE_CAP
+                    && seen.insert(s.message_id.as_str())
+                {
+                    probes.push(&s.message_id);
+                }
+            }
+        }
+        if total_ids < MIN_MSGID_QUORUM {
+            return;
+        }
+        debug_assert!(MIN_MSGID_QUORUM >= nzbkit::index::MSGID_KEYS_PER_FILE);
+        let source = if origin.is_empty() {
+            "nzb-add".to_string()
+        } else {
+            format!("nzb-{origin}")
+        };
+        let now = epoch_secs() as i64;
+        let applied = self.with_index_mut(|ix| {
+            // Probed one id at a time (same cost as the batch form,
+            // which loops internally) so each release's MATCHED id set
+            // is known: the canonical MsgidSet key digests the matched
+            // set per join - any other lane proving the same join then
+            // produces the same key and the claims dedupe instead of
+            // reading as independent evidence.
+            let mut per: std::collections::HashMap<i64, Vec<&str>> = Default::default();
+            for id in &probes {
+                for (rid, _) in ix
+                    .find_releases_by_msgids(std::iter::once(*id))
+                    .unwrap_or_default()
+                {
+                    per.entry(rid).or_default().push(id);
+                }
+            }
+            let mut out = Vec::new();
+            for (rid, mids) in per {
+                if mids.len() < MIN_MSGID_QUORUM {
+                    continue;
+                }
+                // Displacement policy lives IN apply_proven_name: a
+                // readable stem is a name the layer respects, so a
+                // season-pack add quorum-joining its per-episode rows
+                // comes back ProvenOutcome::Conflict (recorded, never
+                // applied) - expected for pack-shaped joins, not an
+                // error.
+                let claim = nzbkit::index::NameClaim {
+                    name: name.to_string(),
+                    evidence: nzbkit::index::NameEvidence::MsgidSet,
+                    key: msgid_set_key(&mids),
+                    source: source.clone(),
+                };
+                if let Ok(o) = ix.apply_proven_name(rid, &claim, now) {
+                    out.push((rid, mids.len(), o));
+                }
+            }
+            Some(out)
+        });
+        for (rid, matched, outcome) in applied.into_iter().flatten() {
+            info!(
+                target: "claims",
+                "release {rid}: msgid-set pairing ({matched} ids) from {source} \
+                 names it {name:?} -> {outcome:?}"
+            );
+        }
+    }
+
+    /// Slim build: accepting an NZB records nothing.
+    #[cfg(not(feature = "indexer"))]
+    pub(in crate::serve) fn record_nzb_pairing(
+        &self,
+        _name: &str,
+        _origin: &str,
+        _nzb: &nzbkit::nzb::Nzb,
+    ) {
     }
 }
 

@@ -5,6 +5,11 @@
 //! `serve` exactly as it did inline.
 
 use super::*;
+// Every test that reaches for these is `#[cfg(unix)]` - the process
+// plumbing they cover is a unix path. Ungated, the import is dead on
+// Windows and `-D warnings` turns that into a build error there.
+#[cfg(unix)]
+use script::{SCRIPT_ERR_TAIL, run_capped};
 
 /// M5 (Codex sweep 5 Aug): a recategorize that physically moved the
 /// payload and then could not write the queue file answered
@@ -357,22 +362,126 @@ fn stalled_holders_cannot_ratchet_the_pool_upward() {
 /// after the direct child is reaped - and the drain threads used to
 /// be JOINED, which parked the caller for the descendant's lifetime
 /// however short the configured deadline was.
+///
+/// Not joining them fixed the caller and left the cost: the thread
+/// and the pipe's read end lived as long as the descendant did, once
+/// per completed job, and `script_timeout_secs` never bounded it
+/// because nothing had timed out. §144 item 4 puts the drains on a
+/// stop flag instead, so this asserts all four halves - the caller
+/// returns at once, the descendant is STILL RUNNING (killing what a
+/// script deliberately backgrounded is the thing we chose not to do),
+/// and both the thread count and the open-pipe count come back to
+/// where they started over repeated runs.
+///
+/// The version of this test before §144 asserted only the first half
+/// and left its own `sleep` running, which is what marked the binary
+/// leaky under nextest.
 #[cfg(unix)]
 #[test]
-fn a_backgrounded_descendant_cannot_outlive_the_deadline() {
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg("-c").arg("sleep 60 & exit 0");
-    let t0 = Instant::now();
-    let (status, _) = run_capped(cmd, 5).unwrap();
-    let took = t0.elapsed();
+fn a_backgrounded_descendant_stops_costing_us_a_thread_and_a_pipe() {
+    use script::DRAIN_THREADS;
+
+    /// Pipe FDs this process holds open. Counted by `fstat` over the
+    /// descriptor space rather than by listing /dev/fd, so the count
+    /// does not itself depend on a directory read that opens an FD -
+    /// and so only PIPES are counted, which keeps the temp files and
+    /// sockets of tests running alongside this one out of the number.
+    fn open_pipes() -> usize {
+        (0..1024)
+            .filter(|&fd| {
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let ok = unsafe { libc::fstat(fd, &mut st) } == 0;
+                ok && st.st_mode & libc::S_IFMT == libc::S_IFIFO
+            })
+            .count()
+    }
+
+    fn alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    let dir = std::env::temp_dir().join(format!("nzbfast-drainleak-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A script that backgrounds a 60 s helper, records its pid so this
+    // test can clean up after itself, and exits 0. The helper inherits
+    // stdout and stderr, which is what holds the pipes open.
+    let run = |n: usize| -> i32 {
+        let pidfile = dir.join(format!("{n}.pid"));
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "sleep 60 & echo $! > {}; exit 0",
+            pidfile.display()
+        ));
+        let t0 = Instant::now();
+        let (status, _) = run_capped(cmd, 5).unwrap();
+        let took = t0.elapsed();
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "the script itself exited fine"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "waited {took:?} on a descendant holding the pipe"
+        );
+        std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+
+    /// Poll until both counts are back at their baseline, or give up.
+    /// A poll rather than one reading because the drains exit on their
+    /// own clock, and because other tests in this binary open and close
+    /// pipes of their own while this one runs.
+    fn settle(threads: usize, pipes: usize) -> (usize, usize) {
+        let end = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (t, p) = (DRAIN_THREADS.load(Ordering::Relaxed), open_pipes());
+            if (t <= threads && p <= pipes) || Instant::now() >= end {
+                return (t, p);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    // One warm run first, so the baseline is a steady state: the thread
+    // that ran it has retired and `sh` has been paged in.
+    let mut pids = vec![run(0)];
+    settle(0, 0);
+    let base_threads = DRAIN_THREADS.load(Ordering::Relaxed);
+    let base_pipes = open_pipes();
+
+    const RUNS: usize = 8;
+    for n in 1..=RUNS {
+        pids.push(run(n));
+    }
+    // Every descendant is still running: this fix does not kill what a
+    // post-script deliberately left behind.
+    for &pid in &pids {
+        assert!(alive(pid), "descendant {pid} was killed on a clean exit");
+    }
+
+    let (threads, pipes) = settle(base_threads, base_pipes);
     assert!(
-        status.is_some_and(|s| s.success()),
-        "the script itself exited fine"
+        threads <= base_threads,
+        "{RUNS} finished scripts left {threads} drain threads alive \
+         (baseline {base_threads}); their descendants outlive them, so \
+         the drains have to let go rather than wait for EOF"
     );
     assert!(
-        took < std::time::Duration::from_secs(5),
-        "waited {took:?} on a descendant holding the pipe"
+        pipes <= base_pipes,
+        "{RUNS} finished scripts left {pipes} pipe FDs open (baseline \
+         {base_pipes}); each drain owns a read end and must drop it"
     );
+
+    // Leave nothing behind - the whole point of the exercise.
+    for pid in pids {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Two workers registering different first-seen categories used to
@@ -1562,5 +1671,76 @@ fn mover_budget_follows_the_mode() {
     assert_eq!(d.mover_budget_bps(60_000_000), Some(80_000_000));
     *d.move_pace.lock_ok() = "full".to_string();
     assert_eq!(d.mover_budget_bps(60_000_000), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex sweep 10 Aug L1: a custom key like `a&b` authenticated direct
+/// calls but broke every URL the daemon generated with it, and `/watch`
+/// silently dropped other punctuation. Creation refuses the charset,
+/// and the generated-link boundaries encode whatever key they carry.
+#[test]
+fn custom_keys_are_charset_checked_and_links_encode_them() {
+    use settings::key_charset_ok;
+    assert!(key_charset_ok("abc123DEF-_"));
+    assert!(key_charset_ok("")); // clearing stays allowed
+    for bad in ["a&b", "a b", "a+b", "k%00", "k#f", "café", "a/b", "a?b"] {
+        assert!(!key_charset_ok(bad), "must refuse {bad:?}");
+    }
+    // Boundary encoding: hex keys unchanged, punctuation percent-coded.
+    assert_eq!(http::query_escape("0123abcdef"), "0123abcdef");
+    assert_eq!(http::query_escape("a&b c+d"), "a%26b%20c%2Bd");
+    assert_eq!(http::query_escape("k%00#"), "k%2500%23");
+}
+
+/// Codex sweep 10 Aug M14, half 1: the single-flight latch. Two tabs
+/// (or a manual run beside the schedule) must not run the benchmark
+/// workload concurrently; the second claim fails until the first
+/// guard drops - and a panic mid-run still releases it.
+#[test]
+fn system_benchmarks_are_single_flight() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-sysbench-single-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = crate::serve::testutil::test_daemon(&dir);
+    let first = d.bench_begin().expect("idle latch must claim");
+    assert!(d.bench_begin().is_none(), "second claim while running");
+    drop(first);
+    let again = d.bench_begin().expect("released latch must claim");
+    drop(again);
+    // Panic safety: a workload that dies must not wedge the latch.
+    let d2 = d.clone();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _running = d2.bench_begin().expect("claims before the panic");
+        panic!("workload died");
+    }));
+    assert!(d.bench_begin().is_some(), "a panic must release the latch");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex sweep 10 Aug M14, half 2: the history append is a
+/// load-modify-write, and unlocked, two concurrent appends both read
+/// the same file and one overwrote the other's row. Under the lock
+/// every row survives.
+#[test]
+fn concurrent_bench_appends_lose_no_rows() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-sysbench-append-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = crate::serve::testutil::test_daemon(&dir);
+    std::fs::create_dir_all(d.bench_history_path().parent().unwrap()).unwrap();
+    let threads: Vec<_> = (0..8)
+        .map(|t| {
+            let d = d.clone();
+            std::thread::spawn(move || {
+                for i in 0..25 {
+                    d.bench_append(json!({"ts": t * 1000 + i, "source": "test"}));
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(d.bench_history().len(), 200, "every appended row survives");
     let _ = std::fs::remove_dir_all(&dir);
 }

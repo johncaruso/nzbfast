@@ -27,6 +27,11 @@ repository = "https://github.com/nzbfast/nzbfast"
 # once the existing prose comments are converted to SAFETY: form.
 [workspace.lints.rust]
 clashing_extern_declarations = "deny"
+# `--cfg fuzzing` is set by cargo-fuzz for every crate in its build, and
+# par2repair reads it to lower the verify pool's byte gate so
+# par2_verify_diff can reach the parallel branch. Declared here or the
+# ordinary build warns it is unexpected, and CI's clippy runs -D warnings.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 # Burned down 1 Aug 2026 from 32 categories to these. CI runs clippy with
 # -D warnings and no -A escapes at all, so anything not listed here blocks

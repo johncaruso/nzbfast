@@ -47,6 +47,20 @@ pub(super) fn apply_setting_tail(
             d.index_scan_par.store(n, Ordering::Relaxed);
             (true, json!(n))
         }
+        // §129 4a: the pre-queue hook and its own deadline (an add
+        // blocks on this one, so it is NOT the post-processing hour).
+        "pre_queue_script" => {
+            let p = v.trim();
+            *d.pre_queue_script.lock_ok() = (!p.is_empty()).then(|| PathBuf::from(p));
+            (true, json!(p))
+        }
+        "pre_queue_timeout_secs" => {
+            let n: u64 = v.trim().parse().map_err(|_| {
+                "pre_queue_timeout_secs: a number of seconds, 0 = no limit".to_string()
+            })?;
+            d.pre_queue_timeout.store(n, Ordering::Relaxed);
+            (true, json!(n))
+        }
         "delete_to_trash" => set_delete_to_trash(d, name, v)?,
         "cleanup_delete_mode" => set_cleanup_delete_mode(d, name, v)?,
         "watch_interval_secs" => set_watch_interval_secs(d, name, v)?,
@@ -96,6 +110,21 @@ pub(super) fn apply_setting_tail(
             d.predb_seed_days.store(n, Ordering::Relaxed);
             (true, json!(n))
         }
+        "scoreboard_enabled" => set_scoreboard_enabled(d, name, v)?,
+        "scoreboard_url" => set_scoreboard_url(d, name, v)?,
+        "scoreboard_source" => set_scoreboard_source(d, name, v)?,
+        "scoreboard_calibrate" => {
+            let on = v == "1" || v.eq_ignore_ascii_case("true");
+            d.scoreboard_calibrate.store(on, Ordering::Relaxed);
+            (true, json!(on))
+        }
+        // Same shape as omdb_key below: clearing persists NULL, so
+        // save_setting REMOVES the key rather than storing "" forever.
+        "scoreboard_key" => {
+            let k = v.trim().to_string();
+            *d.scoreboard_key.lock_ok() = (!k.is_empty()).then(|| k.clone());
+            (true, if k.is_empty() { Value::Null } else { json!(k) })
+        }
         "predb_server" => set_predb_server(d, name, v)?,
         "predb_channels" => set_predb_channels(d, name, v)?,
         "predb_nick" => set_predb_nick(d, name, v)?,
@@ -106,20 +135,43 @@ pub(super) fn apply_setting_tail(
         "spot_enabled" => set_spot_enabled(d, name, v)?,
         "spot_groups" => set_spot_groups(d, name, v)?,
         "spot_backfill" => set_spot_backfill(d, name, v)?,
+        "spot_deepen" => set_spot_deepen(d, name, v)?,
+        "spot_resolve" => set_spot_resolve(d, name, v)?,
         // M34 size cap. Four settings, and only the last of them can
         // delete anything - see index_evict.
+        //
+        // The two that ARM the cap - the switch, and a cap set while the
+        // switch is already on - wake the scan loop, because that loop
+        // is what enforces it (`evict_pass_and_republish`, once per
+        // pass) and its idle sleep is 15 s only when there is nothing
+        // whatsoever to scan. Spotnet went default-on in 129f293e, so a
+        // groupless install now has a spot pass to do and sleeps the
+        // full `index_interval_secs` - 900 s by default - which turned
+        // "switch the cap on" into a quarter of an hour of apparently
+        // nothing. One extra pass per user action, not the
+        // four-a-minute free.pt walk the 15 s re-check was narrowed to
+        // avoid. Switching OFF is not urgent: nothing awaits deletion.
         "index_max_bytes" => {
             // SAB-style sizes, same as min_free/quota: "20G", "500M",
             // bare bytes. 0 = unlimited, the default.
             let n = size()?;
             d.index_max_bytes.store(n, Ordering::Relaxed);
+            if n > 0 && d.index_evict.load(Ordering::Relaxed) {
+                d.scan_now.notify_one();
+            }
             (true, json!(n))
         }
         #[cfg(feature = "indexer")]
         "index_evict_order" => set_index_evict_order(d, name, v)?,
         #[cfg(feature = "indexer")]
         "index_evict_kinds" => set_index_evict_kinds(d, name, v)?,
-        "index_evict" => set_index_evict(d, name, v)?,
+        "index_evict" => {
+            let applied = set_index_evict(d, name, v)?;
+            if d.index_evict.load(Ordering::Relaxed) {
+                d.scan_now.notify_one();
+            }
+            applied
+        }
         #[cfg(feature = "indexer")]
         "index_gates" => set_index_gates(d, name, v)?,
         // Clearing a key persists NULL, not "". save_setting REMOVES a
@@ -152,6 +204,9 @@ pub(super) fn apply_setting_tail(
         "apikey" => set_apikey(d, name, v)?,
         "nzbkey" => {
             let k = v.trim().to_string();
+            if !super::settings::key_charset_ok(&k) {
+                return Err(format!("nzbkey: {}", super::settings::KEY_CHARSET_ERR));
+            }
             *d.nzbkey.lock_ok() = (!k.is_empty()).then(|| k.clone());
             (true, if k.is_empty() { Value::Null } else { json!(k) })
         }

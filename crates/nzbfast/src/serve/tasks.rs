@@ -11,6 +11,8 @@ use super::*;
 mod enrich;
 #[cfg(feature = "indexer")]
 mod indexer;
+#[cfg(feature = "indexer")]
+mod scoreboard;
 mod stall;
 mod tuner;
 mod watchfolder;
@@ -19,6 +21,8 @@ mod watchfolder;
 pub(super) use enrich::*;
 #[cfg(feature = "indexer")]
 pub(super) use indexer::*;
+#[cfg(feature = "indexer")]
+pub(super) use scoreboard::*;
 pub(crate) use stall::*;
 pub(super) use tuner::*;
 pub(crate) use watchfolder::*;
@@ -389,103 +393,11 @@ pub(super) fn spawn_index_scan(
             }
             let groups = if scan_groups { groups } else { Vec::new() };
 
-            // Spotnet first. It is short (a 20k-article OVER walk is
-            // ~20 s against a live server) and a spots-only install
-            // should not sit behind a group pass that is not even
-            // running. Same gate, same preemption contract as the
-            // scans below: dropped promptly when a download starts,
-            // with the high-water mark left on the last whole chunk.
+            // Spotnet first - see `spot_pass` for why it leads.
             if scan_spots {
-                let spot_groups = daemon2.spot_groups.lock_ok().clone();
-                let backfill = daemon2.spot_backfill.load(Ordering::Relaxed);
-                for g in &spot_groups {
-                    if daemon2.spot_pause_reason().is_some() {
-                        break;
-                    }
-                    // The generation this pass runs under: if the
-                    // database is switched off or wiped while the
-                    // scan is in flight, its connection must be
-                    // dropped rather than handed back (which would
-                    // reopen, and after a wipe RECREATE, the file).
-                    let era = daemon2.index_era();
-                    let mut scratch = match nzbkit::index::Index::open(&db) {
-                        Ok(ix) => ix,
-                        Err(e) => {
-                            warn!(target: "spots", "open {}: {e}", db.display());
-                            break;
-                        }
-                    };
-                    let scan = crate::spot_scan_pass(&config, &mut scratch, g, backfill);
-                    let pause = async {
-                        loop {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            if daemon2.spot_pause_reason().is_some() {
-                                break;
-                            }
-                        }
-                    };
-                    match tokio::select! {
-                        result = scan => Some(result),
-                        _ = pause => None,
-                    } {
-                        Some(Ok(sum)) if sum.new > 0 => info!(
-                            target: "spots",
-                            "{g}: {} new spots ({} scanned, {} verified)",
-                            sum.new, sum.scanned, sum.valid
-                        ),
-                        Some(Ok(_)) => {}
-                        Some(Err(e)) => warn!(target: "spots", "{g}: {e}"),
-                        None => info!(target: "spots", "{g} paused for foreground job"),
-                    }
-                    drop(scratch);
-                    // Republish so queries see this pass's writes.
-                    if let Ok(fresh) = nzbkit::index::Index::open(&db) {
-                        daemon2.publish_index(era, fresh);
-                    }
-                    daemon2.drop_index_read();
-                }
+                spot_pass(&daemon2, &config, &db).await;
             }
-            // 24D: the category config changed (or first run since
-            // start) - reconcile stored rows before this pass, so a
-            // pass's own re-ingest touches never fight the sweep.
-            // Chunked + fingerprint-stamped, so this is a no-op when
-            // nothing actually changed.
-            if daemon2.reclassify_pending.swap(false, Ordering::Relaxed) {
-                let cats2 = cats.clone();
-                let db2 = db.clone();
-                let outcome = tokio::task::spawn_blocking(move || {
-                    let mut ix = nzbkit::index::Index::open(&db2)
-                        .map_err(|e| format!("open {}: {e}", db2.display()))?;
-                    ix.set_custom(cats2);
-                    ix.reclassify_custom().map_err(|e| e.to_string())
-                })
-                .await;
-                let changed = match outcome {
-                    Ok(Ok(n)) => n,
-                    Ok(Err(e)) => {
-                        warn!(target: "cats", "reclassify failed: {e} - will retry");
-                        daemon2.reclassify_pending.store(true, Ordering::Relaxed);
-                        0
-                    }
-                    Err(e) => {
-                        warn!(target: "cats", "reclassify task failed: {e} - will retry");
-                        daemon2.reclassify_pending.store(true, Ordering::Relaxed);
-                        0
-                    }
-                };
-                if changed > 0 {
-                    info!(target: "cats", "reclassified {changed} releases under the new category rules");
-                    // Freshly re-keyed cards need titles rows for the
-                    // wall; the seeder below only covers recent posts,
-                    // so republish + seed now.
-                    let era = daemon2.index_era();
-                    if let Ok(fresh) = nzbkit::index::Index::open(&db) {
-                        daemon2.publish_index(era, fresh);
-                    }
-                    daemon2.drop_index_read();
-                    let _ = daemon2.with_index(|ix| ix.seed_missing_titles(3650, 2000).ok());
-                }
-            }
+            reclassify_pending_rows(&daemon2, &db, &cats).await;
             // One-off deep-backfill override (index_scan_now&value=N).
             // Taking it with a swap consumes it, so a pass preempted
             // by a download that starts seconds after the user clicks
@@ -513,6 +425,7 @@ pub(super) fn spawn_index_scan(
                 .min(groups.len().max(1));
             let sem = Arc::new(tokio::sync::Semaphore::new(par));
             daemon2.scan_active.store(true, Ordering::Relaxed);
+            let _busy = daemon2.busy.hold("indexing");
             let mut set = tokio::task::JoinSet::new();
             for g in groups.clone() {
                 let sem = sem.clone();
@@ -711,192 +624,16 @@ pub(super) fn spawn_index_scan(
                     Err(e) => warn!(target: "gapfill", "open {}: {e}", db.display()),
                 }
             }
-            // M31a: retention prune - cap unbounded index growth.
-            // Throttled to once/hour (a kv timestamp), skipped while a
-            // download is active so it never fights for the write
-            // lock during a job. The stale-partial reaper runs
-            // whenever indexing is on; the age prune only when
-            // retention is enabled AND a max-age window is set.
+            // M31a retention prune + the planner-statistics refresh,
+            // both on their own clocks inside.
             if !groups.is_empty() && daemon2.index_maintenance_ok() {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|t| t.as_secs() as i64)
-                    .unwrap_or(0);
-                let last: i64 = daemon2
-                    .with_index(|ix| ix.kv_get("retention_at").and_then(|v| v.parse().ok()))
-                    .unwrap_or(0);
-                if now - last >= 3_600 {
-                    let max_age = daemon2.index_max_age_secs.load(Ordering::Relaxed) as i64;
-                    let retention = daemon2.index_retention.load(Ordering::Relaxed);
-                    let (aged, stale) = daemon2
-                        .with_index(|ix| {
-                            // Age prune (wall-visible content) is
-                            // opt-in via the retention setting + a
-                            // window; the stale-partial junk reaper
-                            // is always on (touches only junk-hidden
-                            // dead fragments).
-                            let aged = if retention && max_age > 0 {
-                                ix.prune_age(max_age, now).unwrap_or(0)
-                            } else {
-                                0
-                            };
-                            let stale = ix.prune_stale_partials(7 * 86_400, now).unwrap_or(0);
-                            let _ = ix.kv_set("retention_at", &now.to_string());
-                            Some((aged, stale))
-                        })
-                        .unwrap_or((0, 0));
-                    if aged + stale > 0 {
-                        info!(
-                            target: "index",
-                            "retention pruned {aged} old + {stale} stale-partial rows"
-                        );
-                        // Republish so queries see the smaller db.
-                        let era = daemon2.index_era();
-                        if let Ok(fresh) = nzbkit::index::Index::open(&index_db) {
-                            daemon2.publish_index(era, fresh);
-                        }
-                        daemon2.drop_index_read();
-                    }
-                }
-                // Query-planner statistics, on the same gate and a
-                // slower clock. Daily rather than hourly because the
-                // shape of the data - a few thousand titles against
-                // tens of millions of releases - is what the planner
-                // needs, and that ratio moves over weeks, not hours.
-                //
-                // Not optional maintenance: an index with no statistics
-                // plans `wall2` as a full scan of every release, which
-                // is how a 45 GB index came to spend 85s answering one
-                // card query (2 Aug). See `Index::optimize`.
-                let last_opt: i64 = daemon2
-                    .with_index(|ix| ix.kv_get("analyze_at").and_then(|v| v.parse().ok()))
-                    .unwrap_or(0);
-                if now - last_opt >= 86_400 {
-                    let started = std::time::Instant::now();
-                    // The first run on a big never-analyzed database is
-                    // minutes of synchronous work holding the write
-                    // connection, under the same pass gate a starting
-                    // download rendezvouses on - the exact stall §95
-                    // removed from compaction. Same cure: a blocking
-                    // thread, an interrupt handle, and a watcher that
-                    // aborts the statement the moment a job appears. An
-                    // aborted refresh is NOT stamped, so it retries at
-                    // the next idle hour.
-                    // The handle is taken INSIDE the blocking closure,
-                    // under the guard that runs the statement - see
-                    // MaintenanceArm. Taken out here (an earlier, since
-                    // released with_index) it belonged to a connection
-                    // some other writer could be using by the time the
-                    // watcher fired.
-                    let arm = Arc::new(super::daemon::MaintenanceArm::default());
-                    let done = Arc::new(AtomicBool::new(false));
-                    let watch = {
-                        let jobs = daemon2.index_jobs_active.clone();
-                        let done = done.clone();
-                        let arm = arm.clone();
-                        tokio::spawn(abort_compact_when_job_starts(jobs, done, move || {
-                            arm.abort();
-                        }))
-                    };
-                    let d3 = daemon2.clone();
-                    let done2 = done.clone();
-                    let arm2 = arm.clone();
-                    let outcome = tokio::task::spawn_blocking(move || {
-                        d3.with_index(|ix| {
-                            if !arm2.arm(ix.interrupt_handle()) {
-                                // A download started before we got the
-                                // guard: do not begin at all.
-                                done2.store(true, Ordering::Release);
-                                return None;
-                            }
-                            let r = ix.optimize();
-                            arm2.disarm();
-                            // Inside the closure for the same reason as
-                            // the VACUUM path: the watcher must never
-                            // see "running" on a connection somebody
-                            // else has already started using.
-                            done2.store(true, Ordering::Release);
-                            Some(r)
-                        })
-                    })
-                    .await;
-                    done.store(true, Ordering::Release);
-                    let aborted = matches!(watch.await, Ok(true));
-                    match outcome {
-                        _ if aborted => {
-                            info!(
-                                target: "index",
-                                "statistics refresh stood down for a download - \
-                                 it will run again at the next idle hour"
-                            );
-                        }
-                        Ok(Some(Ok(()))) => {
-                            let _ = daemon2
-                                .with_index(|ix| ix.kv_set("analyze_at", &now.to_string()).ok());
-                            // Only worth a line when it actually took
-                            // time - the daily no-op pass is silent.
-                            if started.elapsed() >= std::time::Duration::from_secs(1) {
-                                info!(
-                                    target: "index",
-                                    "query planner statistics refreshed in {:.1}s",
-                                    started.elapsed().as_secs_f64()
-                                );
-                            }
-                        }
-                        Ok(Some(Err(e))) => {
-                            // Stamped even on error: a database that
-                            // cannot be analyzed must not retry it
-                            // every hour forever.
-                            let _ = daemon2
-                                .with_index(|ix| ix.kv_set("analyze_at", &now.to_string()).ok());
-                            warn!(target: "index", "ANALYZE: {e}");
-                        }
-                        Ok(None) | Err(_) => {}
-                    }
-                }
+                retention_and_statistics(&daemon2, &index_db).await;
             }
-            // M34: hold the database under its size cap. BETWEEN
-            // passes, never inside one - the JoinSet above is fully
-            // drained here, so no scan task is holding the write
-            // lock or about to re-insert what we just deleted.
-            //
-            // evict_pass is a no-op (two atomic loads) unless the
-            // user turned eviction on AND set a cap, so the common
-            // install pays nothing for this. It never compacts:
-            // reclaiming the freed pages is a VACUUM, and that waits
-            // for the idle window in compact_loop below.
-            {
-                let d3 = daemon2.clone();
-                // The prune is synchronous SQLite work on a shared
-                // connection - off the async worker.
-                let outcome = tokio::task::spawn_blocking(move || d3.evict_pass()).await;
-                // Record a trim that actually removed something, so the
-                // DB card can say what happened to the releases that
-                // disappeared. `Nothing`/`Unavailable` removed nothing
-                // and must not overwrite the last real answer.
-                if let Ok(crate::serve::daemon::EvictOutcome::Ran(rep, _)) = &outcome
-                    && rep.removed > 0
-                {
-                    *daemon2.last_auto_trim.lock_ok() = Some((
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0),
-                        rep.removed as u64,
-                    ));
-                }
-                if daemon2.compact_pending.load(Ordering::Relaxed) {
-                    // Republish so queries see the smaller db (the
-                    // file is still big - the pages are free, not
-                    // returned - but the rows are gone).
-                    let era = daemon2.index_era();
-                    if let Ok(fresh) = nzbkit::index::Index::open(&index_db) {
-                        daemon2.publish_index(era, fresh);
-                    }
-                    daemon2.drop_index_read();
-                }
-            }
+            evict_pass_and_republish(&daemon2, &index_db).await;
             drop(index_pass);
+            // The chip covers the whole pass (scan + gapfill + prune),
+            // never the interval sleep below.
+            drop(_busy);
             let interval = daemon2.index_interval_secs.load(Ordering::Relaxed).max(30);
             // Interval sleep, cut short by mode=index_scan_now (a
             // notify during a pass leaves a permit - the next wait
@@ -1341,7 +1078,14 @@ pub(super) fn spawn_rss_poller(
                         // arm below, not be recorded as a healthy feed
                         // with nothing new (Codex sweep 2, 3 Aug ML1).
                         let body = fetch_url(&url)?;
+                        // The addresses the FEED answered from travel
+                        // with its items: an item link is bound to the
+                        // feed as an origin, and a name that resolved
+                        // publicly here may resolve to the LAN by the
+                        // time the grab runs (M9).
+                        let origin = SourceOrigin::witnessed(&url, body.addrs);
                         crate::rss::parse_feed_checked(&String::from_utf8_lossy(&body.bytes))
+                            .map(|items| (items, origin))
                             .map_err(|e| anyhow::anyhow!("{url}: {e}"))
                     }
                 })
@@ -1352,12 +1096,14 @@ pub(super) fn spawn_rss_poller(
                 // genuinely nothing new were the same event to everyone
                 // downstream - including the user, whose settings row
                 // said nothing either way.
+                let mut feed_origin = SourceOrigin::default();
                 let items = match polled {
-                    Ok(Ok(items)) => {
+                    Ok(Ok((items, origin))) => {
                         d.feed_health.lock_ok().insert(
                             feed.url.clone(),
                             crate::rss::FeedHealth::ok(unix_now(), items.len()),
                         );
+                        feed_origin = origin;
                         items
                     }
                     Ok(Err(e)) => {
@@ -1416,7 +1162,17 @@ pub(super) fn spawn_rss_poller(
                         it.size as f64 / 1e9
                     );
                     let link = it.link.clone();
-                    let nzb = tokio::task::spawn_blocking(move || fetch_url(&link)).await;
+                    // fetch_url_from, not fetch_url: the item link is
+                    // whatever the FEED's body said, and the feed is the
+                    // origin it is allowed to point into. Same rule the
+                    // newznab enclosure grabs follow (M12) - a feed may
+                    // redirect a grab to a public sibling host, but
+                    // never to a private address it does not own, nor to
+                    // one its own name only started answering from after
+                    // the poll (M9).
+                    let origin = feed_origin.clone();
+                    let nzb =
+                        tokio::task::spawn_blocking(move || fetch_url_from(&link, &origin)).await;
                     // The guid is marked seen only AFTER the grab
                     // sticks: marking before the fetch meant one
                     // transient 503 permanently dropped the release
@@ -1428,6 +1184,7 @@ pub(super) fn spawn_rss_poller(
                                 &format!("{}.nzb", it.title),
                                 &category,
                                 priority,
+                                None,
                                 None,
                                 0,
                                 // The feed's own name, so history says
@@ -1528,6 +1285,7 @@ pub(super) fn spawn_watchlist_watcher(daemon: &Arc<Daemon>, settings_path: &std:
             // SQLite matching + enqueue (and the calendar's TVmaze
             // refresh) are blocking work.
             let _ = tokio::task::spawn_blocking(move || {
+                let _busy = d2.busy.hold("watchlist");
                 // The calendar caches its episode lists in the index
                 // database, so with no database every lookup looks
                 // stale and it would re-fetch the same shows from
@@ -1702,6 +1460,15 @@ pub(super) fn spawn_download_worker(
                     // §129 2e: targets routed onto "disk" hear about it
                     // too - the same transition-only edge as the marker.
                     d.notify_event("disk", &msg);
+                    // §129 4a: the schema's disk.low, same edge.
+                    d.life_emit(
+                        "disk.low",
+                        json!({
+                            "message": msg,
+                            "free_bytes": free,
+                            "min_bytes": min,
+                        }),
+                    );
                     d.note_event("disk", msg);
                 }
                 // Refreshed every pass, not just on entry: the free
@@ -1771,6 +1538,13 @@ pub(super) fn spawn_download_worker(
                     ledger = Some(QuotaLedger::open(&d.spool, period));
                 }
             }
+            // Publish what the period has cost so far, whether or not a
+            // cap is set: the facade's `left_quota` needs the running
+            // total, not just the exhausted case (L5).
+            d.quota_spent.store(
+                ledger.as_mut().map(|l| l.spent()).unwrap_or(0),
+                Ordering::Relaxed,
+            );
             if let (Some(led), true) = (ledger.as_mut(), quota > 0)
                 && led.spent() >= quota
             {
@@ -1790,6 +1564,15 @@ pub(super) fn spawn_download_worker(
                     );
                     // §129 2e: same transition-only edge as the marker.
                     d.notify_event("quota", &msg);
+                    // §129 4a: the schema's quota.reached, same edge.
+                    d.life_emit(
+                        "quota.reached",
+                        json!({
+                            "message": msg,
+                            "spent_bytes": led.bytes,
+                            "quota_bytes": quota,
+                        }),
+                    );
                     d.note_event("quota", msg);
                 }
                 *d.queue_hold.lock_ok() =
@@ -1846,6 +1629,20 @@ pub(super) fn spawn_download_worker(
             let (nzb_path, out_dir, total, library, nzo_id, name, prio, job_password, eat_ok) = {
                 let mut j = job.lock_ok();
                 j.state = JobState::Downloading;
+                // §129 4a: the pick is the "started" moment. A job that
+                // re-enters the runner after a demotion, disk hold or
+                // retry starts again - `resumed` carries the difference.
+                d.queue_idle_latch.store(false, Ordering::Relaxed);
+                d.life_emit(
+                    "job.started",
+                    json!({
+                        "nzo_id": j.nzo_id,
+                        "name": j.name,
+                        "category": j.category,
+                        "total_bytes": j.total_bytes,
+                        "resumed": j.downloaded_bytes > 0,
+                    }),
+                );
                 // Late-pick marker: the runner was free when this job
                 // arrived, yet took over 2 s to start it - the signature
                 // of the fixed runner-starvation bug, named so any
@@ -1941,6 +1738,7 @@ pub(super) fn spawn_download_worker(
                             if let Err(e) = write_strm(
                                 &out_dir,
                                 &name,
+                                d.scheme(),
                                 d.port,
                                 &nzo_id,
                                 &d.stream_token(&nzo_id),
@@ -2583,15 +2381,18 @@ pub(super) fn spawn_enrichment_workers(daemon: &Arc<Daemon>, tmdb_key: &Option<S
                     "TVmaze + Wikidata/Wikipedia + AniList (keyless)"
                 }
             );
-            std::thread::spawn(move || wall_enricher(d, key));
+            let stop = super::RunStop::current();
+            super::spawn_aux("wall-enrich", move || wall_enricher(d, key, stop));
         }
         {
             let d = daemon.clone();
-            std::thread::spawn(move || imdb_ratings_refresher(d));
+            let stop = super::RunStop::current();
+            super::spawn_aux("imdb-ratings", move || imdb_ratings_refresher(d, stop));
         }
         {
             let d = daemon.clone();
-            std::thread::spawn(move || person_photo_fetcher(d));
+            let stop = super::RunStop::current();
+            super::spawn_aux("person-photos", move || person_photo_fetcher(d, stop));
         }
     }
 }
@@ -2601,11 +2402,20 @@ pub(super) fn spawn_enrichment_workers(daemon: &Arc<Daemon>, tmdb_key: &Option<S
 /// nothing more - the daemon never downloads or replaces its own
 /// binary. Turn checks off entirely with the update_checks setting
 /// (or an empty update_url).
+///
+/// Weak, not `Arc`: the six-hour sleep is far longer than an embedded
+/// host's whole start/stop cycle, so a strong handle here pinned the
+/// entire daemon graph of every generation. Upgraded per pass, dropped
+/// before the next sleep.
 pub(super) fn spawn_update_checker(daemon: &Arc<Daemon>) {
-    let d = daemon.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(90));
+    let d = Arc::downgrade(daemon);
+    let stop = super::RunStop::current();
+    super::spawn_aux("update-check", move || {
+        if !stop.sleep(std::time::Duration::from_secs(90)) {
+            return;
+        }
         loop {
+            let Some(d) = d.upgrade() else { return };
             if d.update_checks.load(Ordering::Relaxed) {
                 match check_update(&d) {
                     Ok(Some(m)) => {
@@ -2620,7 +2430,10 @@ pub(super) fn spawn_update_checker(daemon: &Arc<Daemon>) {
                     Err(e) => info!(target: "update", "{e}"),
                 }
             }
-            std::thread::sleep(std::time::Duration::from_secs(6 * 3600));
+            drop(d);
+            if !stop.sleep(std::time::Duration::from_secs(6 * 3600)) {
+                return;
+            }
         }
     });
 }
@@ -2629,21 +2442,33 @@ pub(super) fn spawn_update_checker(daemon: &Arc<Daemon>) {
 /// 0 = off). Runs only while the queue is idle - a benchmark that
 /// comes due mid-download waits and re-checks each minute. Every run
 /// appends to .spool/bench_history.json (mode=bench_history).
+///
+/// Weak like the update checker, and for the same reason - plus one of
+/// its own: `rt` is THIS run's runtime handle, and `measure_system`
+/// block_on's it. A generation that outlived its stop would be calling
+/// into a runtime that had already been shut down.
 pub(super) fn spawn_scheduled_bench(daemon: &Arc<Daemon>, config: &std::path::Path) {
-    let d = daemon.clone();
+    let dw = Arc::downgrade(daemon);
     let cfg_path = config.to_path_buf();
     let rt = tokio::runtime::Handle::current();
-    std::thread::spawn(move || {
+    let stop = super::RunStop::current();
+    super::spawn_aux("sched-bench", move || {
         // Seed last-run from history so a restart doesn't re-run early.
-        if let Some(ts) = d
-            .bench_history()
-            .last()
-            .and_then(|e| e.get("ts").and_then(Value::as_u64))
         {
-            d.bench_last.store(ts, Ordering::Relaxed);
+            let Some(d) = dw.upgrade() else { return };
+            if let Some(ts) = d
+                .bench_history()
+                .last()
+                .and_then(|e| e.get("ts").and_then(Value::as_u64))
+            {
+                d.bench_last.store(ts, Ordering::Relaxed);
+            }
         }
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
+            if !stop.sleep(std::time::Duration::from_secs(60)) {
+                return;
+            }
+            let Some(d) = dw.upgrade() else { return };
             let hrs = d.bench_interval.load(Ordering::Relaxed);
             if hrs == 0 {
                 continue;
@@ -2661,6 +2486,19 @@ pub(super) fn spawn_scheduled_bench(daemon: &Arc<Daemon>, config: &std::path::Pa
             if busy {
                 continue; // never disturb a download; re-check in a minute
             }
+            // Last look before a minute of network and disk work on a
+            // runtime this run may be about to lose. Before the permit,
+            // so a run that is going away does not take one on its way
+            // out.
+            if stop.stopping() {
+                return;
+            }
+            // Single-flight with the manual mode=sysbench run (Codex
+            // sweep 10 Aug M14): if one is in flight, re-check in a
+            // minute rather than running a second workload beside it.
+            let Some(_running) = d.bench_begin() else {
+                continue;
+            };
             info!(target: "bench", "scheduled system benchmark (every {hrs} h)");
             d.bench_last.store(now, Ordering::Relaxed);
             match measure_system(&d, &cfg_path, &rt) {

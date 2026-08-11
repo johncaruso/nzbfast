@@ -1372,7 +1372,7 @@ pub fn cleanup(dir: &Path, exts: &[String]) -> (usize, usize) {
 /// change - or, in the test suite, another test's `set_delete_to_trash` -
 /// landed halfway through a sweep and split it between the two behaviours.
 pub fn remove_user_file(path: &Path, recoverable: bool) -> std::io::Result<Removed> {
-    if recoverable {
+    if recoverable_wanted(recoverable, path) {
         return match trash_attempt(path) {
             TrashVerdict::Took => Ok(Removed::Trashed),
             TrashVerdict::TookButGone | TrashVerdict::NotFound => Ok(Removed::Gone),
@@ -1409,7 +1409,7 @@ pub fn remove_user_file(path: &Path, recoverable: bool) -> std::io::Result<Remov
 /// who ASKED for recoverable deletes. The directory is left alone and the
 /// caller says so instead.
 pub fn remove_user_dir(path: &Path, recoverable: bool) -> std::io::Result<Removed> {
-    if recoverable {
+    if recoverable_wanted(recoverable, path) {
         return match trash_attempt(path) {
             TrashVerdict::Took => Ok(Removed::Trashed),
             TrashVerdict::TookButGone | TrashVerdict::NotFound => Ok(Removed::Gone),
@@ -1615,6 +1615,83 @@ fn refusal(why: &str) -> std::io::Error {
          to the Trash\" in Settings if you want files removed outright \
          rather than left alone"
     ))
+}
+
+/// `NZBFAST_NO_TRASH=1` forces every recoverable delete down the plain
+/// permanent-delete branch, as if `delete_to_trash` were off - the
+/// explicit override for anything outside [`under_temp_dir`]'s rule,
+/// whose doc carries the Finder "-43" story both of them exist to stop.
+///
+/// It also closes a hole `cfg(test)` could not: the `TRASH` flag defaults
+/// off under `cfg(test)` so cleanup suites do not empty their fixtures
+/// into the developer's real ~/.Trash, but `cfg!(test)` is evaluated when
+/// the LIBRARY is compiled and an integration test links the ordinary
+/// non-test build, so every test under `tests/` got the flag ON.
+///
+/// Read once and cached: this sits under per-file cleanup sweeps.
+fn trash_disabled_by_env() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::env::var("NZBFAST_NO_TRASH").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Nothing under the OS temp directory is ever worth a recoverable
+/// delete, and asking for one there is actively harmful. The Trash exists
+/// so a WRONG GUESS about the user's data survives, and a path in
+/// `$TMPDIR` is not the user's data by construction - it is our own
+/// scratch, or a test's fixtures, which the OS may reclaim at any moment.
+/// Binning it only leaves the user junk to empty, named after something
+/// they never had.
+///
+/// It is also where the recoverable route MISBEHAVES. On macOS the Trash
+/// is scripted through Finder and the call is bounded ([`trash_attempt`]),
+/// so we give up waiting, the owner of the scratch directory removes it,
+/// and Finder arrives to find nothing there: a modal "-43" dialog on the
+/// desktop, minutes after the run that caused it and attributed to
+/// nothing. The integration suites hit this constantly - each drives a
+/// real `nzbfast` child against a `nzbfast-*` scratch dir in `$TMPDIR`,
+/// where the library-side `cfg(test)` default that keeps the UNIT tests
+/// off Finder cannot reach a spawned binary - so fixing it here fixes all
+/// 122 child-spawn sites at once, and the next test someone writes.
+///
+/// Compared by canonical path so the macOS `/var` -> `/private/var`
+/// symlink cannot slip a temp path past the check. An uncanonicalizable
+/// path (already gone, unreadable parent) falls back to the path as
+/// given: this is a "make it permanent" decision, and the safe direction
+/// when unsure is to leave the caller's recoverable request alone.
+fn under_temp_dir(path: &Path) -> bool {
+    // The library's OWN unit tests are the one place a temp path must
+    // still reach the Trash: `trash_tests` proves the recoverable route
+    // works and its fixtures can only live in `$TMPDIR`. They are safe
+    // there for the reason the integration suites are not - `TRASH`
+    // defaults OFF under `cfg(test)`, so those three serialized,
+    // self-cleaning tests are the only callers that ever arrive here
+    // recoverable. This gate is aimed squarely at the build they cannot
+    // cover: the binary a test spawns, where `cfg!(test)` is false.
+    if cfg!(test) {
+        return false;
+    }
+    path_is_under(path, &std::env::temp_dir())
+}
+
+/// The prefix test behind [`under_temp_dir`], split out so it is testable:
+/// `under_temp_dir` answers false under `cfg(test)` by design, so a unit
+/// test can never reach the comparison through it.
+fn path_is_under(path: &Path, base: &Path) -> bool {
+    fn real(p: &Path) -> std::path::PathBuf {
+        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    }
+    real(path).starts_with(real(base))
+}
+
+/// Fold the overrides into a caller's `recoverable` request. Applied at
+/// the two public entry points rather than inside [`trash_attempt`],
+/// because they have to mean "delete it permanently", not "refuse and
+/// leave it" - a refusal would leave every affected file on disk, which
+/// for a temp path is the opposite of what anyone wants.
+fn recoverable_wanted(recoverable: bool, path: &Path) -> bool {
+    recoverable && !trash_disabled_by_env() && !under_temp_dir(path)
 }
 
 /// One recoverable attempt against the Trash.

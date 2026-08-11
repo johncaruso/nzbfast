@@ -614,6 +614,7 @@ pub(super) fn measure_system(
     cfg_path: &std::path::Path,
     rt: &tokio::runtime::Handle,
 ) -> std::result::Result<nzbkit::sysbench::SystemReport, String> {
+    let _busy = d.busy.hold("measuring");
     let compute = nzbkit::sysbench::compute(128);
     let disk = nzbkit::sysbench::disk_write(&d.out_dir(), 512).unwrap_or(0.0);
     // Every enabled server, at the connection counts downloads actually

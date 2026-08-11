@@ -378,7 +378,12 @@ fn default_true() -> bool {
     true
 }
 fn default_connections() -> u32 {
-    8
+    // The allowance most providers sell. Jobs use min(global setting,
+    // this cap, measured knee), so a big default costs nothing on a
+    // provider that grants less - the grant probe and knee trim it -
+    // while a small one quietly starves every fast server (10 Aug: a
+    // 100-conn xsnews account held to 32 read as "slow provider").
+    100
 }
 
 /// Password OBFUSCATION - deliberately not encryption.

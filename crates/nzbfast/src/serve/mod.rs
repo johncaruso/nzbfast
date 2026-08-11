@@ -30,6 +30,8 @@ pub use job::*;
 /// repair path shares this default without a startup call.
 pub use nzbkit::par2repair::FAST_PAR_DEFAULT;
 
+mod busy;
+
 mod daemon;
 use daemon::*;
 
@@ -42,6 +44,7 @@ mod tasks;
 mod probeids;
 
 mod mover;
+mod naming;
 mod postproc;
 use postproc::*;
 
@@ -358,6 +361,20 @@ static STOP_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// and `request_stop` is never called there).
 static STOP_BASELINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Set by [`arm_embedded_stop`], i.e. true exactly when a host app owns
+/// this process rather than the CLI owning it. Latches on: a process
+/// that has hosted the engine once keeps hosting it.
+static EMBEDDED: AtomicBool = AtomicBool::new(false);
+
+/// True when an embedded host owns the process. The paths that care are
+/// the ones that would end it: an embedded stop must not take the host
+/// app down with it.
+// dead_code: the bin root never embeds.
+#[allow(dead_code)]
+pub(crate) fn is_embedded() -> bool {
+    EMBEDDED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Arm the next embedded run: snapshot the stop epoch so a leftover
 /// stop request from a previous run cannot fell this one. Must be
 /// called by the embedded host BEFORE spawning the engine thread and
@@ -368,6 +385,7 @@ static STOP_BASELINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 // caller; see request_stop below.
 #[allow(dead_code)]
 pub fn arm_embedded_stop() {
+    EMBEDDED.store(true, std::sync::atomic::Ordering::SeqCst);
     STOP_BASELINE.store(
         STOP_EPOCH.load(std::sync::atomic::Ordering::SeqCst),
         std::sync::atomic::Ordering::SeqCst,
@@ -379,6 +397,193 @@ fn stop_notify() -> &'static tokio::sync::Notify {
     N.get_or_init(tokio::sync::Notify::new)
 }
 
+/// The blocking half of the stop signal. `stop_notify` only reaches
+/// tasks on a runtime; the auxiliary lanes are plain OS threads asleep
+/// in `thread::sleep`, and a condvar is what wakes those.
+fn stop_gate() -> &'static (Mutex<()>, std::sync::Condvar) {
+    static G: std::sync::OnceLock<(Mutex<()>, std::sync::Condvar)> = std::sync::OnceLock::new();
+    G.get_or_init(|| (Mutex::new(()), std::sync::Condvar::new()))
+}
+
+/// A run's stop token: what every long-lived auxiliary thread carries so
+/// an embedded stop actually reaches it.
+///
+/// The CLI daemon never arms and never stops, so for it [`stopping`] is
+/// permanently false and [`sleep`] is exactly `thread::sleep` - the
+/// behaviour these lanes have always had. An embedded host, though, runs
+/// a NEW daemon generation per `nzbfast_start`, and `nzbfast_stop` only
+/// joins the engine thread: before this token, every generation's update
+/// checker, scheduled bench, auto-tuner and metadata lanes stayed alive
+/// holding an `Arc<Daemon>`, so N start/stop cycles left N whole daemon
+/// graphs - and their threads - still running, still touching config and
+/// the network, after the host API had reported stopped.
+///
+/// [`stopping`]: RunStop::stopping
+/// [`sleep`]: RunStop::sleep
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RunStop {
+    baseline: u64,
+}
+
+impl RunStop {
+    /// Bind to the run that is live now. Called while spawning, i.e.
+    /// after the host armed this run's baseline and before the next
+    /// start can re-arm it (that happens under the host's engine lock,
+    /// which a next start can only take once this run's stop has
+    /// joined).
+    pub(crate) fn current() -> Self {
+        RunStop {
+            baseline: STOP_BASELINE.load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    /// True once this run has been asked to stop. The epoch is
+    /// monotonic, so a later generation re-arming cannot un-stop us.
+    pub(crate) fn stopping(self) -> bool {
+        STOP_EPOCH.load(std::sync::atomic::Ordering::SeqCst) > self.baseline
+    }
+
+    /// Sleep up to `dur`, waking the moment this run is asked to stop.
+    /// `false` means stop: the caller must return, which is what drops
+    /// its `Arc<Daemon>`.
+    ///
+    /// A plain `thread::sleep(6h)` is why this exists. The update
+    /// checker sleeps six hours between passes; a host that starts and
+    /// stops the engine a dozen times in that window used to accumulate
+    /// a dozen checkers, none of which had looked at a stop flag yet.
+    #[must_use]
+    pub(crate) fn sleep(self, dur: std::time::Duration) -> bool {
+        let deadline = Instant::now() + dur;
+        let (lock, cv) = stop_gate();
+        let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            // Re-read the epoch HOLDING the lock, and before waiting.
+            // `request_stop` bumps it under this same lock, so the two
+            // orderings are covered: a stop that lands before we park is
+            // seen here, and one that lands while we hold the lock is
+            // blocked until `wait_timeout` releases it and therefore
+            // reaches us as a wake. Checking only after the wait would
+            // lose the first case - and a lost wake on a six-hour sleep
+            // IS the leak, arrived at from the other direction.
+            if self.stopping() {
+                return false;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            let (next, _) = cv.wait_timeout(g, left).unwrap_or_else(|p| p.into_inner());
+            g = next;
+        }
+    }
+}
+
+/// Sleep up to `dur`, waking early on ANY stop request. For the few
+/// parks that are not run-scoped (`Daemon::park_if_off`): the caller's
+/// own [`RunStop`] check decides whether the wake means "exit", this
+/// only makes sure a stop is not slept through.
+pub(crate) fn sleep_until_stop_bump(dur: std::time::Duration) {
+    let epoch = STOP_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+    let deadline = Instant::now() + dur;
+    let (lock, cv) = stop_gate();
+    let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || STOP_EPOCH.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+            return;
+        }
+        let (next, _) = cv.wait_timeout(g, left).unwrap_or_else(|p| p.into_inner());
+        g = next;
+    }
+}
+
+/// Long-lived auxiliary threads alive right now, across every
+/// generation, counted per lane name. Named rather than merely counted
+/// so a failed reclamation says WHICH lane is still running - a bare
+/// "expected 0, got 2" is a day of bisecting.
+///
+/// Entered before the spawn, cleared by a guard the thread body owns, so
+/// a panicking lane still clears its token and the census cannot stick
+/// high.
+static AUX_THREADS: Mutex<std::collections::BTreeMap<&'static str, usize>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+struct AuxCensus(&'static str);
+
+impl Drop for AuxCensus {
+    fn drop(&mut self) {
+        let mut g = AUX_THREADS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = g.get_mut(self.0) {
+            *n -= 1;
+            if *n == 0 {
+                g.remove(self.0);
+            }
+        }
+    }
+}
+
+/// Spawn a named auxiliary thread and count it while it runs.
+///
+/// Every lane that outlives a single unit of work goes through here, so
+/// [`live_aux_threads`] is a complete census of what a stop has to
+/// reclaim - which is what makes the leak provable rather than asserted.
+pub(crate) fn spawn_aux(name: &'static str, body: impl FnOnce() + Send + 'static) {
+    *AUX_THREADS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(name)
+        .or_default() += 1;
+    let spawned = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let _census = AuxCensus(name);
+            body();
+        });
+    if let Err(e) = spawned {
+        drop(AuxCensus(name));
+        warn!(target: "serve", "{name} thread failed to start: {e}");
+    }
+}
+
+/// Live auxiliary lanes (see [`spawn_aux`]) as `name x count`, empty
+/// when everything has been reclaimed. Exposed for the embedded host's
+/// reclamation test; nothing in the product reads it.
+// dead_code: test-only reader, and it lives in another crate.
+#[allow(dead_code)]
+pub fn live_aux_threads() -> Vec<(String, usize)> {
+    AUX_THREADS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), *v))
+        .collect()
+}
+
+/// Every `Arc<Daemon>` this process has built, held weakly.
+///
+/// A generation that fails to wind up keeps its `Weak` upgradable, which
+/// is precisely the leak this exists to detect: one entry per run, and
+/// after a stop only the live run may still upgrade.
+static DAEMON_CENSUS: Mutex<Vec<std::sync::Weak<Daemon>>> = Mutex::new(Vec::new());
+
+/// Enrol a freshly built daemon. Called at the one production
+/// construction site, right after the `Arc`.
+pub(crate) fn census_daemon(d: &Arc<Daemon>) {
+    let mut g = DAEMON_CENSUS.lock().unwrap_or_else(|p| p.into_inner());
+    g.retain(|w| w.strong_count() > 0);
+    g.push(Arc::downgrade(d));
+}
+
+/// Daemon generations still alive. Exposed for the embedded host's
+/// reclamation test; nothing in the product reads it.
+// dead_code: test-only reader, and it lives in another crate.
+#[allow(dead_code)]
+pub fn live_daemons() -> usize {
+    let mut g = DAEMON_CENSUS.lock().unwrap_or_else(|p| p.into_inner());
+    g.retain(|w| w.strong_count() > 0);
+    g.len()
+}
+
 /// In-process stop for embedded builds (the iOS staticlib, where exec
 /// and process exit are not available): [`serve`] returns instead of
 /// parking and the HTTP workers wind up, closing the listener. This is
@@ -387,13 +592,115 @@ fn stop_notify() -> &'static tokio::sync::Notify {
 /// the background tasks. Safe to call before serve() reaches its park
 /// loop or more than once per run: the epoch bump is permanent and a
 /// Notify permit is held until consumed.
+///
+/// Stopping the runtime is NOT enough on its own: the auxiliary lanes
+/// are plain OS threads, invisible to `shutdown_timeout`, so this also
+/// wakes the blocking [`stop_gate`] every [`RunStop::sleep`] waits on.
 // dead_code: only the embedded crate root (lib.rs, `ffi` feature) has a
 // caller; the CLI daemon stops by process exit. The module compiles
 // under both roots, so the bin build sees this as dead.
 #[allow(dead_code)]
 pub fn request_stop() {
-    STOP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    {
+        // The bump happens UNDER the gate's lock, which is what makes
+        // the auxiliary lanes' park race-free: a lane either reads the
+        // new epoch before it parks, or it is already parked and gets
+        // the notify. See `RunStop::sleep`.
+        let (lock, cv) = stop_gate();
+        let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
+        STOP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        cv.notify_all();
+    }
     stop_notify().notify_one();
+}
+
+/// The stop seam itself, at unit speed. `crates/nzbfast-ffi/tests/
+/// reclaim.rs` proves the whole generation is reclaimed; these three
+/// pin the primitive it rests on, including the ordering that a
+/// full-daemon test could only catch by flaking.
+#[cfg(test)]
+mod stop_seam_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// `STOP_EPOCH` is process-global, so these run one at a time. They
+    /// deliberately do NOT call `arm_embedded_stop` - that latches the
+    /// EMBEDDED flag for the whole binary - and take their baseline off
+    /// the epoch directly instead, which is all arming does anyway.
+    static SEAM: Mutex<()> = Mutex::new(());
+
+    fn arm_here() -> RunStop {
+        RunStop {
+            baseline: STOP_EPOCH.load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    #[test]
+    fn a_stop_wakes_a_parked_lane_instead_of_waiting_out_its_interval() {
+        let _seam = SEAM.lock().unwrap_or_else(|p| p.into_inner());
+        let stop = arm_here();
+        let lane = std::thread::spawn(move || {
+            let at = Instant::now();
+            (stop.sleep(Duration::from_secs(3600)), at.elapsed())
+        });
+        // Long enough for the lane to be parked on the condvar.
+        std::thread::sleep(Duration::from_millis(100));
+        request_stop();
+        let (keep_going, took) = lane.join().expect("lane");
+        assert!(!keep_going, "sleep must report the stop");
+        assert!(
+            took < Duration::from_secs(30),
+            "the lane slept {took:?} of its hour - the wake was lost"
+        );
+    }
+
+    /// The interleaving a condvar makes easy to get wrong: the epoch
+    /// moves while the lane is between "checked for a stop" and
+    /// "parked". A condvar has no memory, so by the time the lane waits
+    /// the notify is already spent - and it would sit out its full
+    /// interval (six hours, for the update checker) still holding the
+    /// generation it was told to release.
+    ///
+    /// Driven deterministically rather than by racing threads: the test
+    /// holds the gate lock, which pins the lane in exactly that window,
+    /// and moves the epoch with no notify at all. Waking from THAT is
+    /// the contract - `sleep` must re-read the epoch under the lock
+    /// before it waits, not only after.
+    #[test]
+    fn a_stop_that_lands_in_the_park_window_is_not_lost() {
+        let _seam = SEAM.lock().unwrap_or_else(|p| p.into_inner());
+        let stop = arm_here();
+        let held = stop_gate().0.lock().unwrap_or_else(|p| p.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Passes its own stop check, then blocks on the gate lock.
+            let _ = tx.send(stop.sleep(Duration::from_secs(3600)));
+        });
+        // Let it reach the lock, then stop it without any notify.
+        std::thread::sleep(Duration::from_millis(100));
+        STOP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(held);
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(keep_going) => assert!(!keep_going, "sleep must report the stop"),
+            Err(e) => panic!("the lane never woke ({e}) - the stop was lost in the park window"),
+        }
+    }
+
+    #[test]
+    fn an_unstopped_run_still_sleeps_out_its_interval() {
+        let _seam = SEAM.lock().unwrap_or_else(|p| p.into_inner());
+        let stop = arm_here();
+        let at = Instant::now();
+        assert!(stop.sleep(Duration::from_millis(150)), "no stop pending");
+        // The CLI daemon's lanes must keep their pacing: a token that
+        // returned early would turn every "check every 6 h" into a hot
+        // loop. Slack for a coarse timer.
+        assert!(
+            at.elapsed() >= Duration::from_millis(120),
+            "woke after only {:?}",
+            at.elapsed()
+        );
+    }
 }
 
 mod http;
@@ -407,7 +714,9 @@ mod sabcompat;
 use sabcompat::*;
 
 mod script;
-use script::*;
+
+mod hooks;
+mod prequeue;
 
 mod apiutil;
 use apiutil::*;

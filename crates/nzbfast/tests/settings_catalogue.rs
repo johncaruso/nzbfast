@@ -50,7 +50,13 @@ use std::process::{Child, Command, Stdio};
 /// instead and the value never leaves the daemon. `index_interests_applied`
 /// is a one-shot marker recording that the interest presets were expanded
 /// into scan groups - it has no control on the settings page.
-const SETTABLE_NOT_ECHOED: &[&str] = &["apikey", "nzbkey", "omdb_key", "index_interests_applied"];
+const SETTABLE_NOT_ECHOED: &[&str] = &[
+    "apikey",
+    "nzbkey",
+    "omdb_key",
+    "scoreboard_key",
+    "index_interests_applied",
+];
 
 /// Echoed by `get_config`, but not settable through `mode=config`.
 ///
@@ -72,6 +78,9 @@ const ECHOED_READ_ONLY: &[&str] = &[
     // ride the settings allowlist), and this is its first-run signal.
     "servers",
     "servers_configured",
+    // Derived from the queue, the history and the usage store: has this
+    // install ever downloaded anything (§129 4c's second empty state).
+    "jobs_ever",
     // Saved-but-not-yet-applied values, computed by diffing settings.json
     // against the running daemon.
     "pending",
@@ -79,6 +88,7 @@ const ECHOED_READ_ONLY: &[&str] = &[
     "has_apikey",
     "has_nzbkey",
     "has_omdb",
+    "has_scoreboard_key",
     // How many passwords the passwords file currently holds - display
     // only; the file itself (not this row) is what you edit.
     "password_file_count",

@@ -44,6 +44,39 @@ enum Class {
     Crowded,
     /// A REPACK of the same title in the same window.
     Sibling,
+    /// A clean pair whose candidate window is stuffed past CAND_LIMIT
+    /// with size-IMPLAUSIBLE pres (R2/E1 harness gap 1, release side).
+    /// Before the corr_eval size prefilter this read `saturated` and
+    /// auto failed closed on a false signal; with the prefilter the
+    /// noise never enters the window and the pair auto-applies. This
+    /// class is what makes that lift a VISIBLE recall number: revert
+    /// the prefilter and the auto-recall floor fails.
+    FloodedWindow,
+    /// A clean pair whose PRE's forward window holds >= CORR_WINDOW
+    /// size-PLAUSIBLE releases (R2/E1 harness gap 1, pre side). The
+    /// mutual-best gate cannot prove a maximum over a truncated sample,
+    /// so it fails closed: suggestion, never auto. The decoys sit well
+    /// inside every band ever proposed ([0.90, 1.15]x wire), so a
+    /// future ratio-band narrowing alone cannot un-saturate this
+    /// window - the class pins the fail-closed behaviour itself.
+    ForwardCrowded,
+    /// The same release posted twice by the same poster (byte-exact
+    /// crosspost, R2 harness gap 2). Under today's gate the twin is
+    /// counted as a competitor, the margin self-vetoes, and the pair is
+    /// suggestion-only - a RECALL loss this class makes visible. A
+    /// tight twin collapse (byte-exact + same poster, R2 option 3)
+    /// would flip this class to auto; whoever ships it must move this
+    /// expectation and the floors in that commit, with the rationale.
+    TwinCrosspost,
+    /// A DIFFERENT-poster release at near-identical size and time (the
+    /// 6,703-pair coincidence population R2 measured, vs 31 genuine
+    /// same-poster reposts). It must suppress auto on the true pair
+    /// (margin) and must NEVER be named itself. A LOOSE twin key
+    /// (size+time, poster-blind) would collapse the true pair out of
+    /// this decoy's mutual-best window and auto-apply the pre's name to
+    /// the WRONG release - that regression fails the 1.0 precision
+    /// floor here.
+    TwinCoincidence,
 }
 
 /// Deterministic stem generator. No `rand` dependency, and the same
@@ -97,10 +130,16 @@ fn pre(title: &str, size: u64, pt: i64) -> PreLine {
 }
 
 fn over(stem: &str, bytes: u64, posted: i64) -> OverEntry {
+    over_as(stem, "poster@calib", bytes, posted)
+}
+
+/// Same, with the poster in hand - the twin classes are ABOUT poster
+/// identity, so the corpus has to be able to vary it.
+fn over_as(stem: &str, from: &str, bytes: u64, posted: i64) -> OverEntry {
     OverEntry {
         number: 0,
         subject: format!("\"{stem}.part01.rar\" yEnc (1/1)"),
-        from: "poster@calib".into(),
+        from: from.into(),
         message_id: format!("<{stem}@calib>"),
         bytes,
         date: posted,
@@ -142,16 +181,33 @@ const N_CLEAN: usize = 72;
 const N_SLOW: usize = 12;
 const N_CROWDED: usize = 12;
 const N_SIBLING: usize = 12;
-const N_PAIRS: usize = N_CLEAN + N_SLOW + N_CROWDED + N_SIBLING;
+const N_FLOODED: usize = 4;
+const N_FWDCROWD: usize = 2;
+const N_TWINX: usize = 6;
+const N_TWINC: usize = 6;
+const N_PAIRS: usize =
+    N_CLEAN + N_SLOW + N_CROWDED + N_SIBLING + N_FLOODED + N_FWDCROWD + N_TWINX + N_TWINC;
+
+/// Noise pres per FloodedWindow pair: past `corr_eval`'s CAND_LIMIT
+/// (4000), so the un-prefiltered window is provably saturated.
+const FLOOD_PRES: usize = 4_100;
+/// Decoy releases per ForwardCrowded pair: past CORR_WINDOW (200), so
+/// the pre-side window is provably saturated.
+const FWD_DECOYS: usize = 205;
+/// Non-pair release rows the corpus adds (the backlog walks these too):
+/// the forward-window decoys, one crosspost twin row per TwinCrosspost
+/// pair, one coincidence decoy row per TwinCoincidence pair.
+const N_EXTRA_RELEASES: usize = N_FWDCROWD * FWD_DECOYS + N_TWINX + N_TWINC;
 
 /// Build the corpus and run the real release-driven walk over it with the
-/// auto tier on. Returns (pairs, applied names by stem, suggested names
-/// by stem).
+/// auto tier on. Returns (pairs, decoy release stems, applied names by
+/// stem, suggested names by stem).
 #[allow(clippy::type_complexity)]
 fn run_corpus(
     ix: &mut Index,
 ) -> (
     Vec<Pair>,
+    Vec<String>,
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, (String, String)>,
 ) {
@@ -159,6 +215,10 @@ fn run_corpus(
     let mut pairs: Vec<Pair> = Vec::with_capacity(N_PAIRS);
     let mut lines: Vec<PreLine> = Vec::new();
     let mut entries: Vec<(String, OverEntry)> = Vec::new();
+    // Release rows that are not pairs: forward-window decoys and the
+    // coincidence twins. They have no truth; ANY name applied to one is
+    // a precision failure.
+    let mut decoys: Vec<String> = Vec::new();
 
     for i in 0..N_PAIRS {
         let class = if i < N_CLEAN {
@@ -167,8 +227,16 @@ fn run_corpus(
             Class::Slow
         } else if i < N_CLEAN + N_SLOW + N_CROWDED {
             Class::Crowded
-        } else {
+        } else if i < N_CLEAN + N_SLOW + N_CROWDED + N_SIBLING {
             Class::Sibling
+        } else if i < N_CLEAN + N_SLOW + N_CROWDED + N_SIBLING + N_FLOODED {
+            Class::FloodedWindow
+        } else if i < N_CLEAN + N_SLOW + N_CROWDED + N_SIBLING + N_FLOODED + N_FWDCROWD {
+            Class::ForwardCrowded
+        } else if i < N_PAIRS - N_TWINC {
+            Class::TwinCrosspost
+        } else {
+            Class::TwinCoincidence
         };
         let size = SIZES[i % SIZES.len()];
         let delta = match class {
@@ -198,6 +266,59 @@ fn run_corpus(
                 size + size / 300,
                 pt + 600,
             )),
+            // Stuff the release's candidate window past CAND_LIMIT with
+            // pres at a THIRD of the release's size - far outside
+            // [est/RATIO_MAX, est/RATIO_MIN], so the corr_eval size
+            // prefilter drops every one before the cap is counted. The
+            // pts walk back ~11.4 days from the post, inside its
+            // 14-day window and clear of the neighbouring pairs
+            // (SPACING is 20 days).
+            Class::FloodedWindow => {
+                for k in 0..FLOOD_PRES {
+                    lines.push(pre(
+                        &format!("Calib.Floodrow.{i:03}.K{k:04}.2026.1080p.BluRay.x264-NOISE"),
+                        size / 3,
+                        pt + delta - 3_600 - (k as i64) * 240,
+                    ));
+                }
+            }
+            // Stuff the PRE's forward window past CORR_WINDOW with
+            // size-plausible junk releases ([0.90, 1.15]x the true
+            // pair's wire bytes, minutes after the pre).
+            Class::ForwardCrowded => {
+                for k in 0..FWD_DECOYS {
+                    let dstem = rng.stem();
+                    let w = wire(size) * (90 + (k as u64 % 26)) / 100;
+                    entries.push((
+                        "alt.binaries.x264".into(),
+                        over(&dstem, w, pt + 700 + (k as i64) * 7),
+                    ));
+                    decoys.push(dstem);
+                }
+            }
+            // The SAME bytes from the SAME poster in a second group,
+            // seconds later: a crosspost. One release, two rows.
+            Class::TwinCrosspost => {
+                entries.push((
+                    "alt.binaries.hdtv".into(),
+                    over(&stem, wire(size), pt + delta + 30),
+                ));
+            }
+            // A DIFFERENT poster lands near-identical bytes ten minutes
+            // later: R2's coincidence population, NOT a repost.
+            Class::TwinCoincidence => {
+                let dstem = rng.stem();
+                entries.push((
+                    "alt.binaries.x264".into(),
+                    over_as(
+                        &dstem,
+                        "rival@calib",
+                        wire(size) + wire(size) / 250,
+                        pt + delta + 600,
+                    ),
+                ));
+                decoys.push(dstem);
+            }
             _ => {}
         }
 
@@ -225,19 +346,21 @@ fn run_corpus(
     }
 
     // The walk itself, auto on, one stride (the corpus is far inside
-    // STRIDE) and a budget above the row count.
+    // STRIDE) and a budget above the row count. The decoy releases are
+    // walked too - they are junk-scored, unnamed rows like any other.
+    let n_rows = N_PAIRS + N_EXTRA_RELEASES;
     let (examined, _, _) = ix
-        .predb_corr_backlog(N_PAIRS as u32 * 2, 0, true, now)
+        .predb_corr_backlog(n_rows as u32 * 2, 0, true, now)
         .unwrap();
     assert_eq!(
-        examined, N_PAIRS,
+        examined, n_rows,
         "every corpus release must be obfuscated (junk>=70) and unnamed - \
          a corpus the walk skips measures nothing"
     );
 
     let mut applied = std::collections::HashMap::new();
     let mut suggested = std::collections::HashMap::new();
-    for r in ix.search("", (N_PAIRS * 4) as u32).unwrap() {
+    for r in ix.search("", (n_rows * 4) as u32).unwrap() {
         if !r.pre_title.is_empty() {
             applied.insert(r.stem.clone(), r.pre_title.clone());
         }
@@ -245,7 +368,7 @@ fn run_corpus(
             suggested.insert(r.stem.clone(), (h.1.clone(), h.5.clone()));
         }
     }
-    (pairs, applied, suggested)
+    (pairs, decoys, applied, suggested)
 }
 
 fn dir(tag: &str) -> std::path::PathBuf {
@@ -262,7 +385,7 @@ fn dir(tag: &str) -> std::path::PathBuf {
 fn correlation_tiers_hold_their_precision_floors() {
     let d = dir("tiers");
     let mut ix = Index::open(&d.join("index.db")).unwrap();
-    let (pairs, applied, suggested) = run_corpus(&mut ix);
+    let (pairs, decoys, applied, suggested) = run_corpus(&mut ix);
 
     // --- Tier: auto. Precision is the safety property, and its floor is
     // exactly 1.0: a wrong name is worse than no name, so a single wrong
@@ -280,27 +403,49 @@ fn correlation_tiers_hold_their_precision_floors() {
         auto_wrong.is_empty(),
         "auto-tier precision floor is 1.0 - wrong names applied: {auto_wrong:?}"
     );
+    // Decoy rows have no truth AT ALL - a coincidence twin or a
+    // forward-window filler wearing any applied name is the exact shape
+    // a loose twin key or a saturation-blind gate would produce.
+    let decoy_named: Vec<(String, String)> = decoys
+        .iter()
+        .filter_map(|s| applied.get(s).map(|n| (s.clone(), n.clone())))
+        .collect();
+    assert!(
+        decoy_named.is_empty(),
+        "decoy releases must never be auto-named: {decoy_named:?}"
+    );
 
-    // --- Tier: auto, recall over the clean-fast population. These are
-    // sized, tight, uncontested and fast: if correlation does not name
-    // these it names nothing, and the feature is not earning its cost.
-    let clean = pairs.iter().filter(|p| p.class == Class::CleanFast).count();
+    // --- Tier: auto, recall over the population auto is EXPECTED to
+    // name: clean-fast pairs, plus the flooded-window pairs whose
+    // saturation is false (10 Aug 2026: the corr_eval size prefilter is
+    // what lifts it - reverting the prefilter fails this floor, which
+    // is the point of the FloodedWindow class). Floor stays 0.95: the
+    // population widened by 4 rows that behave exactly like clean-fast
+    // once the noise is filtered, so the measured value stays 1.0.
+    let expect_auto = |c: Class| matches!(c, Class::CleanFast | Class::FloodedWindow);
+    let clean = pairs.iter().filter(|p| expect_auto(p.class)).count();
     let clean_named = pairs
         .iter()
-        .filter(|p| p.class == Class::CleanFast && applied.contains_key(&p.stem))
+        .filter(|p| expect_auto(p.class) && applied.contains_key(&p.stem))
         .count();
     let recall = clean_named as f64 / clean as f64;
     assert!(
         recall >= 0.95,
-        "auto recall over clean-fast pairs fell to {recall:.3} ({clean_named}/{clean}); \
-         floor is 0.95"
+        "auto recall over clean-fast + flooded-window pairs fell to {recall:.3} \
+         ({clean_named}/{clean}); floor is 0.95"
     );
 
     // --- The gates, corpus-wide. Each of these has a unit test of its
     // own; asserted here because a population is where a gate that
-    // stopped firing shows up as a silent precision loss.
+    // stopped firing shows up as a silent precision loss. ForwardCrowded
+    // pins mutual-best's fail-closed saturation; TwinCrosspost pins
+    // "a byte-exact same-poster twin self-vetoes the margin" (flipping
+    // it to auto is what a tight twin collapse would legitimately do -
+    // move the expectation and the floors in that commit, with why);
+    // TwinCoincidence pins that a different-poster near-twin keeps
+    // suppressing auto on the true pair.
     for p in &pairs {
-        if p.class != Class::CleanFast {
+        if !expect_auto(p.class) {
             assert!(
                 !applied.contains_key(&p.stem),
                 "{:?} pair {} must never auto-apply (got {:?})",
@@ -332,7 +477,12 @@ fn correlation_tiers_hold_their_precision_floors() {
     // floor and punish a future change for breaking a tie differently.
     let uncontested: Vec<&Pair> = pairs
         .iter()
-        .filter(|p| matches!(p.class, Class::CleanFast | Class::Slow))
+        .filter(|p| {
+            matches!(
+                p.class,
+                Class::CleanFast | Class::Slow | Class::FloodedWindow
+            )
+        })
         .collect();
     let top1_right = uncontested
         .iter()

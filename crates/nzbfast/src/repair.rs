@@ -468,10 +468,17 @@ pub(crate) async fn try_mapped_repair(
     let mut recovery: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut sources: Vec<PathBuf> = Vec::new();
     for e in std::fs::read_dir(out_dir)? {
-        let p = e?.path();
+        let e = e?;
+        let p = e.path();
         if p.is_file()
             && p.extension()
                 .is_some_and(|x| x.eq_ignore_ascii_case("par2"))
+            // Same ceiling the sniffed volumes clear, for the same
+            // reason: each of these is read WHOLE below and its slices
+            // copied into `recovery`, and the poster picks the name, so
+            // a bound only the extensionless files honour is no bound
+            // (Codex sweep 10 Aug, M4).
+            && e.metadata().is_ok_and(|m| m.len() <= nzbkit::par2repair::MAX_PACKET_FILE_BYTES)
         {
             sources.push(p);
         }
@@ -721,70 +728,87 @@ pub(crate) async fn fetch_and_repair(
 
     // par2cmdline fallback - the escape hatch for anything the native
     // path declines (see par2repair.rs module docs).
-    let Some(main_par2) = main_par2 else {
-        println!("⚠ no main .par2 on disk - cannot invoke par2cmdline");
-        return Ok(false);
-    };
-    let t0 = Instant::now();
-    // Sibling binary, else PATH (see tools.rs).
-    let par2_bin = tools::resolve("par2");
-    // par2cmdline 1.2.0 rejects absolute par2 paths ("failed to set the
-    // main par file") - pass the bare name and set cwd.
-    let par2_name = main_par2
-        .file_name()
-        .map(|n| n.to_owned())
-        .unwrap_or_else(|| main_par2.clone().into_os_string());
-    // Every non-par2 file in the dir rides along as an extra file so
-    // par2cmdline's sliding scan can adopt misnamed/shifted data - bare
-    // `par2 repair <set>` never looks at files it wasn't told about.
     //
-    // Our OWN bookkeeping is excluded (`.nzbfast*`, the house convention for
-    // internal names - see disk.rs). `.nzbfast.journal` is the live record of
-    // what is still missing and it is held open for the whole download: naming
-    // it here made par2 try to open it, fail on Windows, and print a scary
-    // "could not access" line about a file that was never a repair candidate.
-    // It cannot contribute blocks either - it is not in the recovery set.
-    let extra_files: Vec<std::ffi::OsString> = std::fs::read_dir(out_dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| {
-            let e = e.ok()?;
-            let p = e.path();
-            let name = p.file_name()?.to_owned();
-            (e.file_type().ok()?.is_file()
-                && !name.to_string_lossy().starts_with(".nzbfast")
-                && !p
-                    .extension()
-                    .is_some_and(|x| x.eq_ignore_ascii_case("par2")))
-            .then_some(name)
-        })
-        .take(1000)
-        .collect();
-    // par2cmdline parses any leading-dash argument as a SWITCH, and both the
-    // set name and every extra filename are attacker-controlled (they come
-    // from yEnc/subject names; sanitize_filename keeps a leading '-'). A file
-    // named `-p` would trigger "purge", `-B<path>` would redirect the
-    // basepath, etc. Prefix each with `./` (platform-correct via Path::join,
-    // cwd is out_dir) so they can only ever be read as paths.
-    let dot = std::path::Path::new(".");
-    let par2_arg = dot.join(&par2_name);
-    let extra_args: Vec<std::path::PathBuf> = extra_files.iter().map(|f| dot.join(f)).collect();
-    match run_external_par2(&par2_bin, &par2_arg, &extra_args, out_dir, extractor)? {
-        Ok(st) if st.success() => {
-            println!("repair complete in {:.2?} ✔", t0.elapsed());
-            return Ok(true);
-        }
-        Ok(st) => println!("⚠ par2 repair exited with {st}"),
-        Err(e) => {
-            // par2 is no longer embedded - native repair covers real
-            // sets, so reaching this needs both an exotic failure AND
-            // no external par2 on PATH or next to the executable.
-            println!(
-                "⚠ this set needs an external par2 (native repair could not handle it), \
-                 but none was runnable ({e}) - install par2cmdline (e.g. brew install par2) \
-                 or place a par2 binary next to nzbfast"
-            );
-            return Ok(false);
+    // It is OPTIONAL, and neither of its two absences may return from
+    // here: the escalation below is the NATIVE path's second chance
+    // (every remaining recovery volume on disk, then `repair_dir`
+    // again), and it is reached by falling through this block. Bailing
+    // out because an unrelated external tool is missing failed sets a
+    // native-only install could repair (Codex sweep 10 Aug, M3).
+    let t0 = Instant::now();
+    // `external` is Some only while par2cmdline is still worth trying:
+    // taken for each attempt, put back only when it actually ran.
+    let mut external = main_par2.as_ref().map(|main_par2| {
+        // Sibling binary, else PATH (see tools.rs).
+        let par2_bin = tools::resolve("par2");
+        // par2cmdline 1.2.0 rejects absolute par2 paths ("failed to set the
+        // main par file") - pass the bare name and set cwd.
+        let par2_name = main_par2
+            .file_name()
+            .map(|n| n.to_owned())
+            .unwrap_or_else(|| main_par2.clone().into_os_string());
+        // Every non-par2 file in the dir rides along as an extra file so
+        // par2cmdline's sliding scan can adopt misnamed/shifted data - bare
+        // `par2 repair <set>` never looks at files it wasn't told about.
+        //
+        // Our OWN bookkeeping is excluded (`.nzbfast*`, the house convention for
+        // internal names - see disk.rs). `.nzbfast.journal` is the live record of
+        // what is still missing and it is held open for the whole download: naming
+        // it here made par2 try to open it, fail on Windows, and print a scary
+        // "could not access" line about a file that was never a repair candidate.
+        // It cannot contribute blocks either - it is not in the recovery set.
+        let extra_files: Vec<std::ffi::OsString> = std::fs::read_dir(out_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let p = e.path();
+                let name = p.file_name()?.to_owned();
+                (e.file_type().ok()?.is_file()
+                    && !name.to_string_lossy().starts_with(".nzbfast")
+                    && !p
+                        .extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case("par2")))
+                .then_some(name)
+            })
+            .take(1000)
+            .collect();
+        // par2cmdline parses any leading-dash argument as a SWITCH, and both the
+        // set name and every extra filename are attacker-controlled (they come
+        // from yEnc/subject names; sanitize_filename keeps a leading '-'). A file
+        // named `-p` would trigger "purge", `-B<path>` would redirect the
+        // basepath, etc. Prefix each with `./` (platform-correct via Path::join,
+        // cwd is out_dir) so they can only ever be read as paths.
+        let dot = std::path::Path::new(".");
+        let par2_arg = dot.join(&par2_name);
+        let extra_args: Vec<std::path::PathBuf> = extra_files.iter().map(|f| dot.join(f)).collect();
+        (par2_bin, par2_arg, extra_args)
+    });
+    if external.is_none() {
+        println!("⚠ no main .par2 on disk - cannot invoke par2cmdline");
+    }
+    if let Some((bin, arg, extras)) = external.take() {
+        match run_external_par2(&bin, &arg, &extras, out_dir, extractor)? {
+            Ok(st) if st.success() => {
+                println!("repair complete in {:.2?} ✔", t0.elapsed());
+                return Ok(true);
+            }
+            Ok(st) => {
+                println!("⚠ par2 repair exited with {st}");
+                external = Some((bin, arg, extras));
+            }
+            Err(e) => {
+                // par2 is no longer embedded - native repair covers real
+                // sets, so reaching this needs both an exotic failure AND
+                // no external par2 on PATH or next to the executable.
+                // Left as None: a binary that could not be spawned will
+                // not spawn on the second pass either.
+                println!(
+                    "⚠ no external par2 was runnable ({e}) - install par2cmdline \
+                     (e.g. brew install par2) or place a par2 binary next to nzbfast; \
+                     continuing with native repair alone"
+                );
+            }
         }
     }
 
@@ -806,16 +830,15 @@ pub(crate) async fn fetch_and_repair(
     if native_repair() {
         return Ok(true);
     }
-    match run_external_par2(&par2_bin, &par2_arg, &extra_args, out_dir, extractor)? {
-        Ok(st) if st.success() => {
-            println!("repair complete (second pass) ✔");
-            Ok(true)
-        }
-        _ => {
-            println!("⚠ repair failed even with every recovery volume");
-            Ok(false)
-        }
+    if let Some((bin, arg, extras)) = external
+        && let Ok(st) = run_external_par2(&bin, &arg, &extras, out_dir, extractor)?
+        && st.success()
+    {
+        println!("repair complete (second pass) ✔");
+        return Ok(true);
     }
+    println!("⚠ repair failed even with every recovery volume");
+    Ok(false)
 }
 
 /// Indexes into `vols` = (file, slices, bytes) minimizing downloaded bytes

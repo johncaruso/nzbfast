@@ -29,6 +29,12 @@ pub(in crate::serve) fn job_json(j: &Job) -> Value {
         "elapsed_secs": j.elapsed_secs,
         // Wall clock, so history ages survive a restart.
         "finished_unix": j.finished_unix,
+        // The other wall clock, for the same reason: `queued_at` is a
+        // monotonic Instant that cannot cross a process (and is taken at
+        // pick), so every restored queue row answered SAB's numeric
+        // `time_added` with null and a strict client stopped parsing the
+        // queue there (M10, 10 Aug sweep).
+        "queued_unix": j.queued_unix,
         "nzb_sha": j.nzb_sha,
         "finalizing": j.finalizing,
         "deferred": j.deferred,
@@ -154,6 +160,9 @@ pub(in crate::serve) fn job_from_json(v: &Value) -> Option<Job> {
         // Monotonic like finished_at, so a restart clears it - the
         // late-pick marker measures THIS process's reaction time.
         queued_at: None,
+        // ...and the wall-clock twin that does survive, which is what
+        // the SAB facade reports as `time_added`.
+        queued_unix: v.get("queued_unix").and_then(Value::as_i64),
         idle_at_add: false,
         retries: v.get("retries").and_then(Value::as_u64).unwrap_or(0) as u32,
         dupe_key: s("dupe_key"),

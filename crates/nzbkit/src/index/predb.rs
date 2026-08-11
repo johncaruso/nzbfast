@@ -140,6 +140,11 @@ fn pre_source_label(source: &str) -> String {
     if s == "predb" || s.starts_with("predb/") {
         return s.to_string();
     }
+    // §131: a byte-proven name (the claims layer) is not a predb fact
+    // and must not be dressed as one - its label passes through.
+    if s.starts_with("proven:") {
+        return s.to_string();
+    }
     if s.is_empty() {
         "predb".to_string()
     } else {
@@ -551,11 +556,31 @@ impl Index {
     /// Attach a fed name to one release and re-derive everything the old
     /// name determined. Returns false when the row was already named or
     /// has since vanished.
-    fn apply_pre_name(
+    pub(super) fn apply_pre_name(
         &self,
         rid: i64,
         title: &str,
         source: &str,
+        now: i64,
+    ) -> rusqlite::Result<bool> {
+        self.apply_named(rid, title, &pre_source_label(source), now)
+    }
+
+    /// The seam every out-of-band naming source funnels through: attach
+    /// `title` to one release with `label` written to `pre_source`
+    /// VERBATIM, and re-derive everything the old name determined
+    /// (kind, res, title_key, junk, langs, codecs), so a release named
+    /// here is indistinguishable from one named at ingest. The predb
+    /// paths reach it via `apply_pre_name` (which stamps their
+    /// `predb/...` label); spot promotion and the byte probes pass their
+    /// own label (`spot`, `body/7z`). Returns false when the row was
+    /// already named or has vanished - an existing name is never
+    /// overwritten.
+    pub(crate) fn apply_named(
+        &self,
+        rid: i64,
+        title: &str,
+        label: &str,
         now: i64,
     ) -> rusqlite::Result<bool> {
         let title = title.trim();
@@ -590,7 +615,7 @@ impl Index {
             rusqlite::params![
                 rid,
                 title,
-                pre_source_label(source),
+                label,
                 now,
                 kind_str(&p.kind),
                 p.res.as_deref().unwrap_or_default(),
@@ -727,7 +752,52 @@ impl Index {
         };
         let lo = facts.first_posted - crate::predb_corr::DELTA_MAX;
         let hi = facts.first_posted - crate::predb_corr::DELTA_MIN;
-        let pres: Vec<CorrPreRow> = {
+        // Size-band the candidate window when the release has a usable
+        // size estimate (E1's separable prefilter, adopted suggest-only
+        // per the 10 Aug red-team). Without this the window is EVERY
+        // pre in a 14-day span; once a sized seed lands that is 3k-23k
+        // rows (measured), always over CAND_LIMIT, so `saturated` reads
+        // true for every release regardless of how crowded its actual
+        // size neighbourhood is. A sized pre outside
+        // [est/RATIO_MAX, est/RATIO_MIN] is vetoed by `corr_score`
+        // anyway (it scores None and is filtered below), so banding the
+        // SQL changes no best/runner-up/sibling outcome - it stops
+        // size-IMPLAUSIBLE pres from filling the cap ahead of the
+        // plausible ones, i.e. it is a false-saturation and cost fix.
+        // Sizeless pres (size=0) are always kept: they carry the
+        // suggestion tail and the sibling gate's population.
+        //
+        // Honesty note (red-team §1a): lifting false saturation is NOT
+        // "removing candidates only" - `saturated` fails closed in the
+        // auto gate, so this change would ENABLE auto-applies the old
+        // window blocked. That is exactly why auto ships OFF: see the
+        // module docs in `predb_corr.rs` for the evidence bar an auto
+        // flip requires. No naming-yield claim is made for this change.
+        let est = facts.est_content;
+        let pres: Vec<CorrPreRow> = if est > 0 {
+            let blo = (est as f64 / crate::predb_corr::RATIO_MAX) as i64;
+            let bhi = (est as f64 / crate::predb_corr::RATIO_MIN) as i64;
+            let mut stmt = self.db.prepare_cached(
+                "SELECT id, title, category, source, size, files, nuked, pt, fnkey<>''
+                   FROM predb WHERE pt BETWEEN ?1 AND ?2
+                    AND (size=0 OR size BETWEEN ?3 AND ?4)
+                  ORDER BY pt DESC LIMIT 4000",
+            )?;
+            stmt.query_map(rusqlite::params![lo, hi, blo, bhi], |r| {
+                Ok(CorrPreRow {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    category: r.get(2)?,
+                    source: r.get(3)?,
+                    size: r.get::<_, i64>(4)?.max(0) as u64,
+                    files: r.get::<_, i64>(5)?.max(0) as u32,
+                    nuked: r.get(6)?,
+                    pt: r.get(7)?,
+                    has_fn: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        } else {
             let mut stmt = self.db.prepare_cached(
                 "SELECT id, title, category, source, size, files, nuked, pt, fnkey<>''
                    FROM predb WHERE pt BETWEEN ?1 AND ?2
@@ -760,6 +830,113 @@ impl Index {
         Ok(Some((facts, cands, saturated)))
     }
 
+    /// The Pesto poster-tool Message-ID grammar:
+    /// `<16-hex>.<hex counter>.<16-hex>@host` (10 Aug 2026 census:
+    /// 8,947 moovee/teevee releases match, counters monotonic per
+    /// session). A matching release has a tiny real-name PAR2 posted
+    /// adjacent under the same counter grammar, so a ~kilobyte byte
+    /// probe reads its EXACT name in-band. Stored ids keep their angle
+    /// brackets; accept both shapes.
+    pub(super) fn pesto_msgid(id: &str) -> bool {
+        let id = id.trim().trim_start_matches('<');
+        let Some((local, _host)) = id.split_once('@') else {
+            return false;
+        };
+        let mut parts = local.split('.');
+        let (Some(a), Some(b), Some(c), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        let hex = |s: &str| !s.is_empty() && s.chars().all(|ch| ch.is_ascii_hexdigit());
+        a.len() == 16 && c.len() == 16 && hex(a) && hex(c) && b.len() <= 16 && hex(b)
+    }
+
+    /// Is `name` a 7-Zip archive file (`x.7z`, `x.7z.001`, …)? The
+    /// single-file 7z shape is the B3 lane: the archive's own header
+    /// carries the real inner filename, readable by a ~1 MB byte probe.
+    pub(super) fn seven_zip_family(name: &str) -> bool {
+        let n = name.trim().to_ascii_lowercase();
+        if n.ends_with(".7z") {
+            return true;
+        }
+        // "x.7z.001" - a numeric split suffix after the .7z.
+        if let Some((head, tail)) = n.rsplit_once('.') {
+            return head.ends_with(".7z")
+                && !tail.is_empty()
+                && tail.chars().all(|c| c.is_ascii_digit());
+        }
+        false
+    }
+
+    /// Does this release belong to the correlation NAMING population?
+    ///
+    /// Two requirements, both from the 10 Aug 2026 red-team of the
+    /// indexer-competitive bundle:
+    ///
+    /// 1. The stem must be actually OBFUSCATED, not merely junk>=70 -
+    ///    Kind::Other scores 70 for unparseable-but-readable names, and
+    ///    correlation must not guess over a name a human can read.
+    /// 2. No in-band byte probe may be able to read the EXACT name:
+    ///    identified PAR2 (FileDesc packets carry real filenames), the
+    ///    single-`.7z` shape (B3: the archive header carries it), and
+    ///    the Pesto Message-ID grammar (a real-name tiny PAR2 sits one
+    ///    counter away). Codex's audit showed those lanes DOMINATED the
+    ///    suggestion pool while byte probes of the same rows prove the
+    ///    correlated guesses are exact-wrong - a guess is strictly
+    ///    worse than the probe, so those rows are not correlation's.
+    ///
+    /// Scope: this gates what correlation may NAME (suggestions
+    /// included). Excluded rows still count as mutual-best COMPETITORS
+    /// - removing a rival from the margin arithmetic would make auto
+    /// MORE permissive, the failure direction that renames wrongly -
+    /// and the human `pre_candidates` picker stays unrestricted.
+    fn corr_naming_population(&self, rid: i64) -> rusqlite::Result<bool> {
+        let stem: Option<String> = self
+            .db
+            .prepare_cached("SELECT stem FROM releases WHERE id=?1")?
+            .query_row([rid], |r| r.get(0))
+            .optional()?;
+        let Some(stem) = stem else {
+            return Ok(false);
+        };
+        let parsed = crate::categories::classify(&stem, &self.custom);
+        if !super::ingest::stem_obfuscated(&stem, &parsed) {
+            return Ok(false);
+        }
+        // In-band PAR2: the releases flag or an identified .par2 file.
+        let par2: bool = self
+            .db
+            .prepare_cached(
+                "SELECT has_par2 OR EXISTS(SELECT 1 FROM files
+                    WHERE release_id=?1 AND LOWER(filename) LIKE '%.par2')
+                   FROM releases WHERE id=?1",
+            )?
+            .query_row([rid], |r| r.get(0))?;
+        if par2 {
+            return Ok(false);
+        }
+        // File shapes: a handful of rows answers both remaining
+        // questions - the single-7z test needs to see there is exactly
+        // one file, and the Pesto grammar shows on any file's first
+        // segment id.
+        let rows: Vec<(String, String)> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT filename, COALESCE(json_extract(segments,'$[0][1]'),'')
+                   FROM files WHERE release_id=?1 LIMIT 4",
+            )?;
+            stmt.query_map([rid], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if rows.len() == 1 && Self::seven_zip_family(&rows[0].0) {
+            return Ok(false);
+        }
+        if rows.iter().any(|(_, id)| Self::pesto_msgid(id)) {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Evaluate one release and act on the outcome: store/refresh the
     /// suggestion, and auto-apply when every gate agrees. Returns what
     /// happened.
@@ -775,6 +952,11 @@ impl Index {
             .query_row([rid], |r| r.get(0))
             .optional()?;
         if matches!(settled.as_deref(), Some(s) if s != "suggested") {
+            return Ok(CorrOutcome::Nothing);
+        }
+        // Every naming path - backlog, live sweep, catch-up - funnels
+        // through here, so the population gate sits here too.
+        if !self.corr_naming_population(rid)? {
             return Ok(CorrOutcome::Nothing);
         }
         let Some((facts, cands, saturated)) = self.corr_eval(rid)? else {
@@ -978,47 +1160,72 @@ impl Index {
         self.kv_set("predb_corr_idx_v1", "1")
     }
 
-    /// One pre against its forward window: probe the plausible posts
-    /// and hand floor-clearing pairs to the full release-driven
-    /// evaluation (so the stored suggestion carries honest competition
-    /// data). Shared by the live rotation and the catch-up pass.
-    fn corr_probe_pre(
+    /// One batch of pres against their forward windows, in two phases:
+    /// phase 1 scores every (pre, release) edge cheaply and keeps the
+    /// BEST touching pair per release; phase 2 runs the full
+    /// release-driven evaluation once per release, strongest pairing
+    /// first. Shared by the live rotation and the catch-up pass.
+    ///
+    /// Why two phases and not pre-by-pre with a `seen` set (the shape
+    /// this replaces): dense windows are the whole cost story -
+    /// sibling pres in one batch share most of their candidates, and
+    /// the full evaluation each one triggers scans a 4000-row window
+    /// (measured live 2 Aug: unthrottled, a 150-pre tick held the
+    /// write lock ~40 s). The `seen` set kept the one-evaluation-per-
+    /// release bound but made the FIRST floor-clearing pre in batch
+    /// order the trigger, so which releases got evaluated - and the
+    /// order auto-applies landed in, each apply removing its release
+    /// from every later mutual-best competitor set - depended on batch
+    /// order and boundaries (E1 follow-up 1, 10 Aug 2026). Driving
+    /// phase 2 off the best pair per release keeps the cost bound and
+    /// removes the order dependence at the root.
+    fn corr_probe_batch(
         &mut self,
-        p: &CorrPreRow,
+        pres: &[CorrPreRow],
         auto: bool,
         now: i64,
-        seen: &mut std::collections::HashSet<i64>,
     ) -> rusqlite::Result<(usize, usize)> {
+        use std::collections::HashMap;
+        // Phase 1: cheap pair scores only. Release facts are cached
+        // per batch - the old shape re-read them once per touching pre.
+        let mut facts: HashMap<i64, Option<CorrRelFacts>> = HashMap::new();
+        let mut best: HashMap<i64, i32> = HashMap::new();
+        for p in pres {
+            for rid in self.corr_forward_ids(p)? {
+                let cached = match facts.entry(rid) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        let f = self.corr_release_facts(rid)?;
+                        v.insert(f)
+                    }
+                };
+                let Some(f) = cached.as_ref() else {
+                    continue;
+                };
+                let Some(pair) = self.corr_score_pair(f, p) else {
+                    continue;
+                };
+                if pair.total < crate::predb_corr::FLOOR {
+                    continue;
+                }
+                let e = best.entry(rid).or_insert(0);
+                *e = (*e).max(pair.total);
+            }
+        }
+        // Phase 2: strongest pairing first (id as the deterministic
+        // tie-break), one full evaluation per release.
+        let mut order: Vec<(i64, i32)> = best.into_iter().collect();
+        order.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let (mut suggested, mut applied) = (0usize, 0usize);
-        for rid in self.corr_forward_ids(p)? {
-            // Dense windows are the whole cost story: sibling pres in
-            // one batch share most of their candidates, and the full
-            // release-driven evaluation each one triggers scans a
-            // 4000-row window. Measured live (2 Aug, the first seed
-            // catch-up): without these two skips a 150-pre tick held
-            // the write lock for ~40 s and the pass projected to half
-            // a day. First skip: one release, one evaluation per
-            // batch.
-            if seen.contains(&rid) {
-                continue;
-            }
-            let Some(f) = self.corr_release_facts(rid)? else {
-                continue;
-            };
-            let Some(pair) = self.corr_score_pair(&f, p) else {
-                continue;
-            };
-            if pair.total < crate::predb_corr::FLOOR {
-                continue;
-            }
-            // Second skip: a stored suggestion is already the best of a
-            // FULL evaluation. A pair that cannot beat it cannot change
-            // the stored row - and a settled row (applied/rejected/...)
-            // is not ours to reopen. The auto caveat: a stored
-            // STRONG-range suggestion may only be sitting unapplied
-            // because auto was off (or a gate has since cleared), so
-            // with auto on those few rows keep earning a fresh look
-            // until they settle one way or the other.
+        for (rid, top) in order {
+            // A stored suggestion is already the best of a FULL
+            // evaluation. A batch whose best pair cannot beat it cannot
+            // change the stored row - and a settled row (applied/
+            // rejected/...) is not ours to reopen. The auto caveat: a
+            // stored STRONG-range suggestion may only be sitting
+            // unapplied because auto was off (or a gate has since
+            // cleared), so with auto on those few rows keep earning a
+            // fresh look until they settle one way or the other.
             let stored: Option<(String, i64)> = self
                 .db
                 .prepare_cached("SELECT status, score FROM pre_corr WHERE release_id=?1")?
@@ -1027,22 +1234,13 @@ impl Index {
             match &stored {
                 Some((st, _)) if st != "suggested" => continue,
                 Some((_, sc))
-                    if *sc >= i64::from(pair.total)
+                    if *sc >= i64::from(top)
                         && (!auto || *sc < i64::from(crate::predb_corr::STRONG)) =>
                 {
                     continue;
                 }
                 _ => {}
             }
-            // Marked seen HERE, where the expensive thing actually
-            // happens, not at the top of the loop. The skip exists to
-            // stop one release paying for a full 4000-row evaluation
-            // once per sibling pre in a batch; marking it before the
-            // floor test spent that budget on a pre that was then
-            // thrown away, so a weak pre with a higher id consumed the
-            // release and the tight 80+ pre behind it skipped straight
-            // past. Everything above this line is per-pair and cheap.
-            seen.insert(rid);
             match self.corr_consider(rid, auto, now)? {
                 CorrOutcome::Suggested => suggested += 1,
                 CorrOutcome::Applied => applied += 1,
@@ -1194,12 +1392,8 @@ impl Index {
             return Ok((0, 0, 0));
         }
         self.ensure_corr_index()?;
-        let (mut suggested, mut applied) = (0usize, 0usize);
-        let mut seen = std::collections::HashSet::new();
+        let (suggested, applied) = self.corr_probe_batch(&pres, auto, now)?;
         for p in &pres {
-            let (s2, a2) = self.corr_probe_pre(p, auto, now, &mut seen)?;
-            suggested += s2;
-            applied += a2;
             // Keep asking while the window is open, then retire.
             self.db.execute(
                 "UPDATE predb SET tried_at=CASE WHEN ?2 < pt + ?3 THEN ?2 ELSE ?4 END
@@ -1272,13 +1466,7 @@ impl Index {
             })?
             .collect::<rusqlite::Result<_>>()?
         };
-        let (mut suggested, mut applied) = (0usize, 0usize);
-        let mut seen = std::collections::HashSet::new();
-        for p in &pres {
-            let (s2, a2) = self.corr_probe_pre(p, auto, now, &mut seen)?;
-            suggested += s2;
-            applied += a2;
-        }
+        let (suggested, applied) = self.corr_probe_batch(&pres, auto, now)?;
         // Fewer rows than asked for = the walk fell off the bottom of
         // the table; park at 0 so later ticks cost one kv read.
         let next = if pres.len() as u32 >= budget {

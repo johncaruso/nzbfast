@@ -87,6 +87,36 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate,
         setOverlay(visible: false)
     }
 
+    /// Load the dashboard even when the engine serves it over TLS with a
+    /// certificate WebKit will not vouch for.
+    ///
+    /// A TLS install points `tls_cert` at an operator-supplied
+    /// certificate - self-signed, and issued for whatever hostname the
+    /// LAN reaches it by, never for 127.0.0.1. In a browser the user
+    /// clicks through that warning; a WKWebView has no such affordance
+    /// and simply fails the navigation, leaving this window stuck on the
+    /// "starting…" overlay with no way forward.
+    ///
+    /// Same reasoning as `Daemon.LoopbackTrust`, and the same narrow
+    /// scope: server trust on 127.0.0.1 only. The certificate was never
+    /// what identified this engine - the `runtime.json` token handshake
+    /// is, and `Daemon.start()` has already passed it before any URL
+    /// reaches this window. Everything else gets default handling.
+    func webView(
+        _ webView: WKWebView, didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        let space = challenge.protectionSpace
+        guard space.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              space.host == "127.0.0.1",
+              let trust = space.serverTrust
+        else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        completionHandler(.useCredential, URLCredential(trust: trust))
+    }
+
     /// Regular navigations that leave localhost (a clicked external link)
     /// go to the default browser; the wrapper only ever shows the
     /// dashboard.

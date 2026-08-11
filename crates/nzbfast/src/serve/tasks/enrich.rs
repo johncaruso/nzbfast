@@ -32,13 +32,17 @@ use super::*;
 /// movie crawl - and MusicBrainz's hard 1 request/second would have put
 /// an album backlog in front of every new episode had it shared a lane.
 #[cfg(feature = "indexer")]
-pub(in crate::serve) fn wall_enricher(d: Arc<Daemon>, api_key: Option<String>) {
+pub(in crate::serve) fn wall_enricher(
+    d: Arc<Daemon>,
+    api_key: Option<String>,
+    stop: crate::serve::RunStop,
+) {
     use nzbkit::index::Lane;
     for lane in [Lane::Movies, Lane::MusicBooks] {
         let (d2, k2) = (d.clone(), api_key.clone());
-        std::thread::spawn(move || wall_enrich_lane(d2, k2, lane));
+        crate::serve::spawn_aux("wall-enrich", move || wall_enrich_lane(d2, k2, lane, stop));
     }
-    wall_enrich_lane(d, api_key, Lane::Shows);
+    wall_enrich_lane(d, api_key, Lane::Shows, stop);
 }
 
 /// The `titles.kind` string as the wall's enum. Music and books used to
@@ -61,6 +65,7 @@ pub(in crate::serve) fn wall_enrich_lane(
     d: Arc<Daemon>,
     api_key: Option<String>,
     lane: nzbkit::index::Lane,
+    stop: crate::serve::RunStop,
 ) {
     let art = d.spool.join("art");
     let _ = std::fs::create_dir_all(&art);
@@ -90,6 +95,12 @@ pub(in crate::serve) fn wall_enrich_lane(
             )
     };
     loop {
+        // This lane holds a strong `Arc<Daemon>` throughout - it reads
+        // the daemon on nearly every line - so returning here is what
+        // reclaims the generation under an embedded host.
+        if stop.stopping() {
+            return;
+        }
         if d.park_if_off(30) {
             continue;
         }
@@ -162,9 +173,12 @@ pub(in crate::serve) fn wall_enrich_lane(
                 .take(6)
                 .collect();
             if back.is_empty() {
-                std::thread::sleep(std::time::Duration::from_secs(15));
+                if !stop.sleep(std::time::Duration::from_secs(15)) {
+                    return;
+                }
                 continue;
             }
+            let _busy = d.busy.hold("enriching");
             if !said_backfilling {
                 said_backfilling = true;
                 info!(
@@ -208,6 +222,7 @@ pub(in crate::serve) fn wall_enrich_lane(
             }
             continue;
         }
+        let _busy = d.busy.hold("enriching");
         for row in batch {
             let kind = lane_kind(&row.kind);
             let now = std::time::SystemTime::now()
@@ -479,7 +494,7 @@ pub(in crate::serve) const PERSON_ART_CAP_BYTES: u64 = 192 * 1024 * 1024;
 /// rate-limit budget - and a photo arriving late costs nothing, whereas a
 /// card without a poster is visible.
 #[cfg(feature = "indexer")]
-pub(in crate::serve) fn person_photo_fetcher(d: Arc<Daemon>) {
+pub(in crate::serve) fn person_photo_fetcher(d: Arc<Daemon>, stop: crate::serve::RunStop) {
     let art = d.spool.join("art");
     let _ = std::fs::create_dir_all(&art);
     // Rows whose URL answered nothing this run. Kept in memory rather
@@ -495,6 +510,9 @@ pub(in crate::serve) fn person_photo_fetcher(d: Arc<Daemon>) {
     let mut got_any = false;
     let mut idle_secs = 60u64;
     loop {
+        if stop.stopping() {
+            return;
+        }
         // Before prune_person_art, which is a directory walk: an idle
         // walk of the art cache is exactly the disk work the switch
         // promises not to do.
@@ -516,10 +534,13 @@ pub(in crate::serve) fn person_photo_fetcher(d: Arc<Daemon>) {
                 (idle_secs * 2).min(900)
             };
             got_any = false;
-            std::thread::sleep(std::time::Duration::from_secs(idle_secs));
+            if !stop.sleep(std::time::Duration::from_secs(idle_secs)) {
+                return;
+            }
             continue;
         }
         after = batch.last().map(|(id, _)| *id).unwrap_or(after);
+        let _busy = d.busy.hold("enriching");
         for (id, url) in batch {
             if failed.contains(&id) {
                 continue;
@@ -541,7 +562,9 @@ pub(in crate::serve) fn person_photo_fetcher(d: Arc<Daemon>) {
             // A courtesy gap. Nothing here is urgent and a burst of image
             // requests at a provider's CDN is exactly the behaviour that
             // gets an anonymous client throttled.
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            if !stop.sleep(std::time::Duration::from_millis(250)) {
+                return;
+            }
         }
         // Cheap to check mid-round, and it bounds the cache even when the
         // queue never empties.
@@ -611,8 +634,11 @@ pub(in crate::serve) fn prune_person_art(dir: &std::path::Path, cap: u64) {
 /// joins titles.imdb → imdb_ratings at query time, so every card with a
 /// resolved tconst shows the real IMDb rating + vote count, offline.
 #[cfg(feature = "indexer")]
-pub(in crate::serve) fn imdb_ratings_refresher(d: Arc<Daemon>) {
+pub(in crate::serve) fn imdb_ratings_refresher(d: Arc<Daemon>, stop: crate::serve::RunStop) {
     loop {
+        if stop.stopping() {
+            return;
+        }
         // MUST come before the staleness read. With no database the
         // `kv_get` below answers None, which this loop reads as "never
         // fetched" - so an indexer that is switched off would pull the
@@ -630,6 +656,7 @@ pub(in crate::serve) fn imdb_ratings_refresher(d: Arc<Daemon>) {
             .and_then(|s| s.parse::<i64>().ok())
             .is_none_or(|t| now - t > 20 * 3600);
         if stale {
+            let _busy = d.busy.hold("enriching");
             match crate::wall::imdb_ratings_fetch() {
                 Some(rows) => {
                     let n = rows.len();
@@ -648,7 +675,9 @@ pub(in crate::serve) fn imdb_ratings_refresher(d: Arc<Daemon>) {
                 None => info!(target: "wall", "IMDb ratings snapshot download failed - will retry"),
             }
         }
-        std::thread::sleep(std::time::Duration::from_secs(6 * 3600));
+        if !stop.sleep(std::time::Duration::from_secs(6 * 3600)) {
+            return;
+        }
     }
 }
 
@@ -798,6 +827,7 @@ pub(in crate::serve) fn spawn_predb_feed(daemon: &Arc<Daemon>) {
                 let batch: Vec<nzbkit::predb::PreLine> =
                     std::mem::take(&mut *daemon2.predb_pending.lock_ok());
                 if !batch.is_empty() {
+                    let _busy = daemon2.busy.hold("predb");
                     let n = batch.len();
                     let stored = daemon2.with_index_mut(|ix| ix.predb_store(&batch, now).ok());
                     match stored {
@@ -834,6 +864,10 @@ pub(in crate::serve) fn spawn_predb_feed(daemon: &Arc<Daemon>) {
                 // naming it IS an arrival. Installed once for the whole
                 // tick and drained at the end of it - every naming leg
                 // below funnels through the same seam inside the index.
+                // Covers the correlation sweeps below to the end of the
+                // tick; the 20 s sleep sits at the loop top, so the
+                // chip can never span the idle wait.
+                let _busy = daemon2.busy.hold("predb");
                 let matcher = daemon2.instant_matcher();
                 daemon2.with_index_mut(|ix| {
                     install_instant_watch(ix, matcher);

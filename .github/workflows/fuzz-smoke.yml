@@ -54,12 +54,37 @@ jobs:
         working-directory: crates/nzbkit/fuzz
         run: |
           mkdir -p corpus/rar_extract corpus/par2_parse corpus/mkv_parse corpus/zip_parse
-          mkdir -p corpus/rar_map corpus/rar_recovery_scan
+          mkdir -p corpus/rar_map corpus/rar_recovery_scan corpus/sevenz_name_probe
+          # rar_name_probe takes a bare volume head - no selector byte,
+          # unlike rar_map - so real .rar files seed it verbatim.
+          mkdir -p corpus/rar_name_probe
+          cp ../testdata/rar4/*.rar ../testdata/rar5/*.rar \
+             ../../../vendor/rars/tests/fixtures/rar*/*.rar \
+             corpus/rar_name_probe/ 2>/dev/null || true
+          # sevenz seeds include a header-bomb container (a kEncodedHeader
+          # declaring 512 MiB decoded from 16 pack bytes) - the probe's
+          # declared-size gate must keep rejecting it within the low rss
+          # limit this target runs under.
+          cp ../tests/fixtures/sevenz/* corpus/sevenz_name_probe/ 2>/dev/null || true
           cp ../../../vendor/rars/tests/fixtures/rar*/*.rar corpus/rar_extract/ 2>/dev/null || true
           cp ../tests/fixtures/par2/*.par2 corpus/par2_parse/ 2>/dev/null || true
           cp ../tests/fixtures/mkv/*.mkv corpus/mkv_parse/ 2>/dev/null || true
           cp ../tests/fixtures/zip/*.zip corpus/zip_parse/ 2>/dev/null || true
           cp ../../../vendor/rars/tests/fixtures/rar*/*.rar corpus/rar_recovery_scan/ 2>/dev/null || true
+          # url_authority_diff needs the scheme prefix in the corpus:
+          # "http://" is a 7-byte magic that coverage feedback alone is
+          # slow to discover, and everything interesting is behind it.
+          mkdir -p corpus/url_authority_diff
+          i=0
+          for u in 'http://indexer.example/api?t=get' \
+                   'https://Indexer.Example:8443/api' \
+                   'http://user:p@ss@127.0.0.1:9696/x' \
+                   'http://[::1]:5076/api' \
+                   'https://192.168.1.1\@indexer.example/x' \
+                   'http://0x7f.1/' 'https://b%C3%BCcher.example/'; do
+            printf '%s' "$u" > "corpus/url_authority_diff/seed-$i"
+            i=$((i+1))
+          done
           # rar_map reads byte 0 as a feed-shape selector, so every seed
           # carries one: 0x09 = whole-file spans WITH a password, which is
           # what reaches the encrypted paths. Without the prefix each seed
@@ -75,19 +100,35 @@ jobs:
         working-directory: crates/nzbkit/fuzz
         run: |
           set -e
-          # All eleven targets. mediaprobe and zip_stream landed 2 Aug, after
-          # this list was last touched on 31 Jul, and were simply never added
-          # - not an exclusion. Both want covering: zip_stream is the chase's
-          # call order over an in-memory source, and mediaprobe runs over a
-          # file still arriving off Usenet, before PAR2 has verified anything.
+          # All sixteen targets (sevenz_name_probe runs separately below
+          # with its own rss limit). Targets that land after this list was
+          # last touched belong here too - absence is an accident, not an
+          # exclusion: zip_stream is the chase's call order over an
+          # in-memory source, mediaprobe runs over a file still arriving
+          # off Usenet before PAR2 has verified anything, pesto_msgid and
+          # sevenz_name_probe parse bytes anonymous posters chose, and
+          # par2_verify_diff is the only one that fuzzes a VERDICT rather
+          # than a parser (TODO 133.3 - H7's input parsed fine), and
+          # rar_name_probe is the layer above rar_map: the blocker
+          # mapping whose EncryptedHeader answer writes a TERMINAL
+          # classification (TODO 131 rung 5).
           for t in yenc_decode nzb_parse nzblnk_parse par2_parse rar_extract \
                    rar_map rar_recovery_scan mkv_parse zip_parse zip_stream \
-                   mediaprobe; do
+                   mediaprobe pesto_msgid par2_verify_diff url_authority_diff \
+                   rar_name_probe; do
             echo "::group::fuzz $t"
             cargo +nightly fuzz run "$t" -- \
               -max_total_time=60 -rss_limit_mb=4096 -timeout=10
             echo "::endgroup::"
           done
+          # sevenz_name_probe runs under a deliberately LOW rss limit: a
+          # legitimate probe peaks at a few MiB, so a header decompression
+          # bomb slipping past the declared-size gate shows up as an OOM
+          # here instead of hiding under the 4 GiB ceiling.
+          echo "::group::fuzz sevenz_name_probe"
+          cargo +nightly fuzz run sevenz_name_probe -- \
+            -max_total_time=60 -rss_limit_mb=512 -timeout=10
+          echo "::endgroup::"
       - name: upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

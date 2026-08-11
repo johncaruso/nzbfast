@@ -1007,19 +1007,33 @@ pub fn restore(out_dir: &Path, resume: &ResumeState, password: Option<&str>) -> 
     for a in meta_missing {
         article_ok[a] = false;
     }
-    // Which destinations already existed, taken BEFORE phase A: phase A
+    // How long each destination already was, taken BEFORE phase A: phase A
     // opens every crypto slot's destination with `create(true)` + `set_len`,
     // so a file that was deleted between runs (user cleanup, or a spent-
-    // volume sweep) is recreated as a hole and phase B's `dest_existed`
-    // probe then reads true. Its identity fragments - "the bytes are already
-    // where the resume expects them" - are zeros, and they are accepted
+    // volume sweep) is recreated as a hole and a phase-B existence probe
+    // would then read true. Its identity fragments - "the bytes are already
+    // where the resume expects them" - are zeros, and they would be accepted
     // instead of refetched, so with no PAR2 behind the job those zeros ship.
-    // `identity_without_existing_file_refetches` is the test for the intent.
-    let pre_existing: std::collections::HashSet<&str> = resume
+    //
+    // The LENGTH, not just the existence, because a file that survived but
+    // was truncated (a partial write, an interrupted move, an external tool)
+    // fails the same way one step in: the path is there, so presence alone
+    // says yes, but the bytes an identity fragment names are past the end.
+    // `seed_slot` grows the file back to the recorded size and marks those
+    // spans covered, so the hole ships. An identity fragment is trusted only
+    // when the pre-restore file reached past the end of its span.
+    // `identity_without_existing_file_refetches` and
+    // `identity_against_truncated_file_refetches` are the tests for the intent.
+    let pre_len: HashMap<&str, u64> = resume
         .slots
         .values()
-        .filter(|r| !r.name.is_empty() && out_dir.join(&r.name).exists())
-        .map(|r| r.name.as_str())
+        .filter(|r| !r.name.is_empty())
+        .filter_map(|r| {
+            Some((
+                r.name.as_str(),
+                std::fs::metadata(out_dir.join(&r.name)).ok()?.len(),
+            ))
+        })
         .collect();
     restore_crypto(out_dir, resume, password, jobs_by_file, &mut article_ok);
     let crypto_verdict: HashMap<(usize, &str), bool> = article_ids
@@ -1033,7 +1047,9 @@ pub fn restore(out_dir: &Path, resume: &ResumeState, password: Option<&str>) -> 
             continue;
         }
         let dest_path = out_dir.join(&rec.name);
-        let dest_existed = pre_existing.contains(rec.name.as_str());
+        // `None` = no such file before this restore; `Some(n)` = it was n
+        // bytes long, the ceiling an identity fragment has to fit under.
+        let dest_len = pre_len.get(rec.name.as_str()).copied();
         let mut dest: Option<File> = None; // opened lazily, only for copies
         let mut srcs: HashMap<&str, Option<File>> = HashMap::new();
         let mut spans: Vec<(u64, u64)> = Vec::new();
@@ -1059,9 +1075,12 @@ pub fn restore(out_dir: &Path, resume: &ResumeState, password: Option<&str>) -> 
                 }
                 let identity = f.file == rec.name && f.file_off == f.vol_off;
                 if identity {
-                    // Bytes are already where the resume run expects them
-                    // - nothing to move, but only if the file predates us.
-                    if !dest_existed {
+                    // Bytes are already where the resume run expects them -
+                    // nothing to move, but only if the file predates us AND
+                    // was long enough to hold the span. A shorter file cannot
+                    // be holding these bytes, whatever the journal says.
+                    let held = dest_len.is_some_and(|n| f.file_off.saturating_add(f.len) <= n);
+                    if !held {
                         all_ok = false;
                         break;
                     }
@@ -1492,6 +1511,84 @@ mod tests {
         let restored = restore(&dir, &resume, None);
         assert!(restored.ids.is_empty());
         assert!(!dir.join("data.bin").exists(), "restore must not create it");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The path surviving is not the bytes surviving. A destination that
+    /// was truncated between runs (a partial write, an interrupted move, an
+    /// external tool) still passes an existence probe, so presence alone
+    /// would accept its identity fragments; `seed_slot` then grows the file
+    /// back to the recorded size and marks those spans covered, and with no
+    /// PAR2 behind the job the zeros ship. Refetch instead.
+    #[test]
+    fn identity_against_truncated_file_refetches() {
+        let dir =
+            std::env::temp_dir().join(format!("nzbfast-journal-trunc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let nzb = b"<nzb>trunc</nzb>";
+        // Run 1 placed two identity articles into a 1,000-byte data.bin.
+        std::fs::write(dir.join("data.bin"), vec![7u8; 1_000]).unwrap();
+        let (j, _) = Journal::open(&dir, nzb).unwrap();
+        j.record_placed(
+            0,
+            "<a@x>",
+            Some(("data.bin".to_string(), 1_000)),
+            "",
+            0,
+            &[frag("data.bin", 0, 0, 400)],
+        );
+        j.record_placed(
+            0,
+            "<b@x>",
+            Some(("data.bin".to_string(), 1_000)),
+            "",
+            0,
+            &[frag("data.bin", 400, 400, 600)],
+        );
+        drop(j);
+
+        // Between runs the file is truncated to 400 bytes: only the first
+        // article's span survives.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("data.bin"))
+            .unwrap()
+            .set_len(400)
+            .unwrap();
+        let (_j2, resume) = Journal::open(&dir, nzb).unwrap();
+        let restored = restore(&dir, &resume, None);
+        assert!(
+            restored.ids.contains("<a@x>"),
+            "a span the file still holds stays restored"
+        );
+        assert!(
+            !restored.ids.contains("<b@x>"),
+            "a span past the end of the file must refetch"
+        );
+        // Nothing past the truncation is handed to `seed_slot` as covered.
+        let seeded: Vec<(u64, u64)> = restored
+            .seeds
+            .iter()
+            .flat_map(|s| s.spans.iter().copied())
+            .collect();
+        assert_eq!(seeded, vec![(0, 400)]);
+        assert!(
+            seeded.iter().all(|&(off, len)| off + len <= 400),
+            "no uncovered byte may be marked complete"
+        );
+        assert_eq!(
+            std::fs::metadata(dir.join("data.bin")).unwrap().len(),
+            400,
+            "restore must not grow the file back"
+        );
+
+        // Truncated to nothing at all is the same verdict for both.
+        std::fs::write(dir.join("data.bin"), b"").unwrap();
+        let (_j3, resume) = Journal::open(&dir, nzb).unwrap();
+        let restored = restore(&dir, &resume, None);
+        assert!(restored.ids.is_empty(), "an empty file holds no span");
+        assert!(restored.seeds.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

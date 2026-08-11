@@ -573,6 +573,7 @@ fn a_blank_token_keeps_the_stored_one() {
         events: Vec::new(),
         email_to: String::new(),
         email_from: String::new(),
+        secret: String::new(),
     };
     let old = vec![
         t("Plex", Kind::Plex, "http://nas:32400", "PLEXTOKEN"),
@@ -634,6 +635,7 @@ fn a_token_is_never_carried_onto_a_second_target_of_the_same_name() {
         events: Vec::new(),
         email_to: String::new(),
         email_from: String::new(),
+        secret: String::new(),
     };
     // One stored Plex server.
     let old = vec![t("Living Room", Kind::Plex, "http://a:32400", "TOKEN-A")];
@@ -1279,6 +1281,7 @@ fn name_from_fetch_strips_the_query() {
         https: false,
         category: String::new(),
         filename: String::new(),
+        addrs: Vec::new(),
     };
     assert_eq!(
         super::name_from_fetch(&f, "https://x/api?t=get&id=abc").as_deref(),
@@ -1327,6 +1330,379 @@ fn ssrf_guard_blocks_metadata_but_allows_local() {
         let ip: IpAddr = s.parse().unwrap();
         assert!(!super::is_forbidden_fetch_ip(ip), "should allow {s}");
     }
+}
+
+/// The other half of the SSRF picture (M12): which addresses count as
+/// INSIDE the user's network, and so may only be reached by the source
+/// that owns them. The always-forbidden set is folded in - a caller
+/// consulting only this one must never get a weaker answer.
+#[test]
+fn private_fetch_ips_cover_the_lan_and_the_forbidden_set() {
+    use std::net::IpAddr;
+    let private = [
+        "127.0.0.1",
+        "127.0.0.53", // the other loopback service this rule is about
+        "10.0.0.5",
+        "192.168.1.10",
+        "172.16.9.9",
+        "172.31.255.254",
+        "100.64.0.1",  // Tailscale CGNAT
+        "100.127.0.1", // still 100.64/10
+        "::1",
+        "fc00::1",
+        "fd12:3456::9",        // ULA
+        "::ffff:192.168.1.10", // v4-mapped LAN
+        "169.254.169.254",     // forbidden outright, private too
+        "fe80::1",
+    ];
+    for s in private {
+        let ip: IpAddr = s.parse().unwrap();
+        assert!(super::is_private_fetch_ip(ip), "{s} is inside the network");
+    }
+    // Public - a sibling download host or CDN, which an indexer is
+    // allowed to redirect a grab to.
+    let public = [
+        "8.8.8.8",
+        "1.1.1.1",
+        "172.32.0.1",  // just outside 172.16/12
+        "100.63.0.1",  // just below the CGNAT block
+        "100.128.0.1", // just above it
+        "2606:4700:4700::1111",
+        "::ffff:8.8.8.8",
+    ];
+    for s in public {
+        let ip: IpAddr = s.parse().unwrap();
+        assert!(!super::is_private_fetch_ip(ip), "{s} is public");
+    }
+}
+
+/// `url_netloc` has to spell a URL the way ureq spells it for its
+/// resolver (`host:port`, scheme default filled in), or the origin
+/// comparison never matches and every private target is refused.
+#[test]
+fn url_netloc_matches_ureqs_spelling() {
+    let n = super::url_netloc;
+    assert_eq!(n("http://indexer.example/api?t=get"), "indexer.example:80");
+    assert_eq!(n("https://indexer.example/api"), "indexer.example:443");
+    assert_eq!(
+        n("http://indexer.example:9696/1/api"),
+        "indexer.example:9696"
+    );
+    assert_eq!(n("https://Indexer.Example:8443/"), "indexer.example:8443");
+    assert_eq!(n("http://127.0.0.1:9117"), "127.0.0.1:9117");
+    assert_eq!(n("http://[::1]:5076/api"), "[::1]:5076");
+    assert_eq!(n("https://[fd00::1]/api"), "[fd00::1]:443");
+    // userinfo is not the host - the LAST '@' separates it.
+    assert_eq!(n("http://user:p@ss@127.0.0.1:9696/x"), "127.0.0.1:9696");
+    // The backslash trap `url_host` documents: ureq dials 192.168.1.1,
+    // so this must not answer `indexer.example`.
+    assert_eq!(
+        n("https://192.168.1.1\\@indexer.example/x"),
+        "192.168.1.1:443"
+    );
+    // Unparseable - and an empty origin refuses every private target.
+    assert_eq!(n("ftp://indexer.example/x"), "");
+    assert_eq!(n(""), "");
+}
+
+/// An https indexer may not hand back a plain-http link to ITSELF: the
+/// user's account apikey rides that query string. A different host is
+/// left alone here - the origin rule confines it to public addresses.
+#[test]
+fn a_supplied_link_may_not_downgrade_its_own_origin() {
+    let ok = super::supplied_link_scheme_ok;
+    assert!(!ok(
+        "http://indexer.example/getnzb/1",
+        "https://indexer.example/api"
+    ));
+    assert!(!ok(
+        "http://Indexer.Example:80/getnzb/1",
+        "https://indexer.example/api"
+    ));
+    assert!(ok(
+        "https://indexer.example/getnzb/1",
+        "https://indexer.example/api"
+    ));
+    // A plain-http indexer was never carrying the key in the clear to
+    // begin with; nothing to downgrade.
+    assert!(ok(
+        "http://indexer.example/getnzb/1",
+        "http://indexer.example/api"
+    ));
+    // Sibling download host / CDN: not this rule's business.
+    assert!(ok(
+        "http://cdn.example/getnzb/1",
+        "https://indexer.example/api"
+    ));
+}
+
+/// M12, the rule itself: a link an indexer's RESPONSE supplied may reach
+/// a private address only when that address IS the indexer. Cross-origin
+/// public stays allowed (sibling download hosts and CDNs are real);
+/// cross-origin private is the pivot being refused.
+#[test]
+fn an_enclosure_may_not_reach_a_private_address_its_indexer_does_not_own() {
+    use ureq::Resolver;
+    // Every origin here is a literal address, so what it answered the
+    // search from is that same literal - the M9 half of the rule is
+    // satisfied throughout and only the M12 half is under test.
+    let bound = |url: &str, at: &str| {
+        super::OriginBoundResolver::new(&super::SourceOrigin::witnessed(
+            url,
+            vec![at.parse().unwrap()],
+        ))
+    };
+    let r = bound("http://127.0.0.1:9696/api", "127.0.0.1");
+    // The indexer's own socket.
+    assert!(r.resolve("127.0.0.1:9696").is_ok());
+    // The finding's exact case: another service on the same loopback.
+    assert!(r.resolve("127.0.0.1:9697").is_err());
+    assert!(r.resolve("127.0.0.1:8080").is_err());
+    // A different machine on the LAN.
+    assert!(r.resolve("192.168.1.9:80").is_err());
+    assert!(r.resolve("10.0.0.5:443").is_err());
+    // Tailscale peers are inside the network too.
+    assert!(r.resolve("100.64.0.1:80").is_err());
+    // Public is fine - an indexer may serve its NZBs from elsewhere.
+    assert!(r.resolve("8.8.8.8:443").is_ok());
+    // ...but never from the metadata endpoint, guard unchanged.
+    assert!(r.resolve("169.254.169.254:80").is_err());
+
+    // A LAN indexer owns its own socket and nothing else.
+    let lan = bound("http://192.168.1.9:5076/api", "192.168.1.9");
+    assert!(lan.resolve("192.168.1.9:5076").is_ok());
+    assert!(lan.resolve("192.168.1.9:5077").is_err());
+    assert!(lan.resolve("127.0.0.1:5076").is_err());
+
+    // The scheme's default port counts: an https indexer with no
+    // explicit port owns :443.
+    let dflt = bound("https://192.168.1.9/api", "192.168.1.9");
+    assert!(dflt.resolve("192.168.1.9:443").is_ok());
+    assert!(dflt.resolve("192.168.1.9:80").is_err());
+
+    // An origin we could not parse refuses every private target rather
+    // than guessing - the safe direction.
+    let blind = bound("not a url", "127.0.0.1");
+    assert!(blind.resolve("127.0.0.1:9696").is_err());
+    assert!(blind.resolve("8.8.8.8:443").is_ok());
+}
+
+/// M9, the residual the origin rule alone left open: the netloc is a
+/// NAME, and a name is resolved again at grab time. A source that
+/// answered the search from a public address may not be followed to a
+/// private one under that same name, however exactly the netlocs match.
+///
+/// The paired case is the one that must keep working: a LAN indexer
+/// answers the search from its LAN address and is grabbed from it.
+#[test]
+fn a_source_may_not_move_inside_the_network_between_search_and_grab() {
+    use ureq::Resolver;
+    let at = |ip: &str| vec![ip.parse::<std::net::IpAddr>().unwrap()];
+    let bound = |o: &super::SourceOrigin| super::OriginBoundResolver::new(o);
+
+    // A LAN indexer, witnessed where it lives: unchanged, still works.
+    let lan = super::SourceOrigin::witnessed("http://192.168.1.9:5076/api", at("192.168.1.9"));
+    assert!(bound(&lan).resolve("192.168.1.9:5076").is_ok());
+
+    // The same netloc, but the search was answered from a PUBLIC
+    // address. The name now points inside the network: refused, and the
+    // refusal says which half of the rule failed.
+    let moved = super::SourceOrigin::witnessed("http://192.168.1.9:5076/api", at("203.0.113.7"));
+    let Err(e) = bound(&moved).resolve("192.168.1.9:5076") else {
+        panic!("a rebound source was followed inside the network");
+    };
+    assert!(
+        e.to_string().contains("answered the search from"),
+        "the refusal has to name the reason: {e}"
+    );
+
+    // A different private address at the same netloc is a rebind too -
+    // the witness is per address, not per network.
+    let neighbour =
+        super::SourceOrigin::witnessed("http://192.168.1.9:5076/api", at("192.168.1.10"));
+    assert!(bound(&neighbour).resolve("192.168.1.9:5076").is_err());
+
+    // Nothing witnessed at all: private is refused, public is not.
+    let blind = super::SourceOrigin::unwitnessed("http://192.168.1.9:5076/api");
+    assert!(bound(&blind).resolve("192.168.1.9:5076").is_err());
+    let pubsrc = super::SourceOrigin::unwitnessed("https://indexer.example/api");
+    assert!(bound(&pubsrc).resolve("8.8.8.8:443").is_ok());
+}
+
+/// M12 end to end over real sockets: two loopback listeners, one
+/// standing in for the indexer and one for the service next door. The
+/// indexer's own enclosure is fetched; the neighbour's is refused before
+/// a byte is read, so nothing on the box can be poked by a search
+/// response.
+#[test]
+fn an_indexer_enclosure_fetch_stops_at_the_indexer() {
+    use std::io::{Read, Write};
+    let indexer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // Bound, never served: the refusal happens at resolve time, so the
+    // neighbour must not even be connected to. A listener that accepts
+    // nothing proves it - a connection attempt would hang the fetch out
+    // to its timeout instead of returning at once.
+    let neighbour = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = super::SourceOrigin::witnessed(
+        &format!("http://{}/api", indexer.local_addr().unwrap()),
+        vec!["127.0.0.1".parse().unwrap()],
+    );
+    let mine = format!("http://{}/getnzb/abc", indexer.local_addr().unwrap());
+    let theirs = format!("http://{}/getnzb/abc", neighbour.local_addr().unwrap());
+    // Same host, different port: the two links differ ONLY in the way
+    // the old code did not look at.
+    assert_ne!(super::url_netloc(&theirs), super::url_netloc(&origin.url));
+
+    let t = std::thread::spawn(move || {
+        let (mut sock, _) = indexer.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf);
+        let body = r#"<?xml version="1.0"?><nzb></nzb>"#;
+        let _ = sock.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    });
+    let f = super::fetch_url_from(&mine, &origin).expect("the indexer's own link");
+    t.join().unwrap();
+    assert!(super::is_nzb_body(&f.bytes));
+
+    let Err(e) = super::fetch_url_from(&theirs, &origin) else {
+        panic!("the service next door was fetched");
+    };
+    let msg = e.to_string();
+    assert!(
+        msg.contains("inside this network"),
+        "the refusal has to name the reason: {msg}"
+    );
+}
+
+/// M9 end to end, the two-resolution case: ONE netloc, answered from a
+/// public address at search time and from loopback at grab time. The
+/// first grab is refused without a byte being sent; the second, whose
+/// witness is where the socket actually is, is served. Both run against
+/// the same real listener, so the only thing that differs is what the
+/// search recorded.
+#[test]
+fn an_indexer_that_moves_inside_the_network_after_its_search_is_refused() {
+    use std::io::{Read, Write};
+    let indexer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = indexer.local_addr().unwrap();
+    let url = format!("http://{at}/api");
+    let link = format!("http://{at}/getnzb/abc");
+    let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+    // Public at search time, loopback now. Same netloc either way, so
+    // the origin rule alone would wave this through. Nothing is served
+    // on the listener here on purpose: a refusal that happened after
+    // the connect would hang out to the fetch timeout, not return.
+    let moved = super::SourceOrigin::witnessed(&url, vec!["203.0.113.7".parse().unwrap()]);
+    let Err(e) = super::fetch_url_from(&link, &moved) else {
+        panic!("a source that moved onto loopback after its search was fetched");
+    };
+    let msg = e.to_string();
+    assert!(
+        msg.contains("answered the search from"),
+        "the refusal has to name the reason: {msg}"
+    );
+
+    // The supported LAN shape: the search was answered from the address
+    // the grab dials, so the grab goes through.
+    let t = std::thread::spawn(move || {
+        let (mut sock, _) = indexer.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf);
+        let body = r#"<?xml version="1.0"?><nzb></nzb>"#;
+        let _ = sock.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    });
+    let here = super::SourceOrigin::witnessed(&url, vec![loopback]);
+    let f = super::fetch_url_from(&link, &here).expect("the indexer where it actually answered");
+    t.join().unwrap();
+    assert!(super::is_nzb_body(&f.bytes));
+    // ...and the fetch reports where it went, which is what a body full
+    // of further links (an RSS feed) carries into ITS grabs.
+    assert_eq!(f.addrs, vec![loopback]);
+}
+
+/// The capture end of the same rule: a search records the address its
+/// indexer answered from, and hands it back on the origin the grab is
+/// bound to. Without this the grab side is checking against nothing.
+///
+/// TWO searches, deliberately. A pooled connection skips the resolver,
+/// so an agent that keeps idle connections witnesses the first request
+/// and nothing after it - caps-then-search is exactly that shape, and it
+/// refused a real loopback indexer's grab in `pull_search` before
+/// `shared_indexer_agent` stopped pooling.
+#[test]
+fn every_search_carries_the_address_its_indexer_answered_from() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = listener.local_addr().unwrap();
+    // Keep-alive on purpose: this server will serve BOTH searches on one
+    // connection if the client offers it, which is the shape that
+    // silently skips the resolver. An unpooled client comes back for a
+    // second connection instead, and the outer loop accepts it.
+    let t = std::thread::spawn(move || {
+        let mut served = 0;
+        while served < 2 {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+            while served < 2 {
+                let mut buf = [0u8; 4096];
+                match sock.read(&mut buf) {
+                    Ok(n) if n > 0 => {}
+                    _ => break,
+                }
+                let body = concat!(
+                    r#"<?xml version="1.0"?><rss><channel><item>"#,
+                    "<title>Show.S01E02.1080p.WEB</title>",
+                    r#"<enclosure url="http://x/getnzb/abc" length="10"/>"#,
+                    "</item></channel></rss>"
+                );
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                served += 1;
+            }
+        }
+    });
+    let cfg = crate::newznab::IndexerConfig {
+        name: "loopback".into(),
+        url: format!("http://{at}"),
+        apikey: "K1".into(),
+        enabled: true,
+        priority: 0,
+        hits_per_day: 0,
+        grabs_per_day: 0,
+    };
+    let q = crate::newznab::SearchQuery::default();
+    let loopback = vec!["127.0.0.1".parse::<std::net::IpAddr>().unwrap()];
+    let (items, first) = super::indexer_search_one(&cfg, &q).expect("first search");
+    let (_, second) = super::indexer_search_one(&cfg, &q).expect("second search");
+    t.join().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(first.url, cfg.url);
+    assert_eq!(first.addrs, loopback);
+    assert_eq!(
+        second.addrs, loopback,
+        "a second search must witness too, or a pooled connection has \
+         silently skipped the resolver"
+    );
 }
 
 // A deterministic ephemeral keypair (fixed seed) drives the crypto-path

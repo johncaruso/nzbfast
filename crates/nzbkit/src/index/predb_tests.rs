@@ -1553,6 +1553,92 @@ fn a_named_fragment_blocks_its_groups_merge() {
     teardown(&d, ix);
 }
 
+/// Codex sweep 10 Aug M6: a fold moves the fragments' FILES onto the
+/// kept row, so it has to move their message-id identity too. The
+/// `rel_identity_ad` delete trigger drops `msgid_map` for every source
+/// release, and without an explicit remap the fold silently destroys
+/// the §131 substrate: a posted NZB carrying those exact articles would
+/// stop resolving to the release that still holds them.
+#[test]
+fn a_split_fold_carries_every_fragments_message_ids() {
+    let d = dir("split-merge-msgid");
+    let mut ix = Index::open(&d.join("index.db")).unwrap();
+    let mut ids: Vec<Vec<String>> = Vec::new();
+    for (i, part) in ["008", "010", "011"].iter().enumerate() {
+        ix.db
+            .execute(
+                "INSERT INTO releases(stem, poster, grp, total_bytes, files, complete,
+                                      has_par2, first_posted, first_seen, kind, junk)
+                 VALUES(?1, 'p@x', 'alt.binaries.x264', 1000000, 1, 1, 0, ?2, 5000,
+                        'other', 75)",
+                rusqlite::params![format!("mSg7XrT4q.7z.{part}"), 4600 + i as i64],
+            )
+            .unwrap();
+        let rid = ix.db.last_insert_rowid();
+        ix.db
+            .execute(
+                "INSERT INTO files(release_id, filename, total_parts, bytes)
+                 VALUES(?1, ?2, 1, 1000000)",
+                rusqlite::params![rid, format!("mSg7XrT4q.7z.{part}")],
+            )
+            .unwrap();
+        // Three keys per file, the substrate's own bound - a quorum
+        // caller can never ask for more than the row holds.
+        let mine: Vec<String> = (0..3).map(|s| format!("frag{part}-{s}@news")).collect();
+        claims::msgid_map_insert(&ix.db, rid, mine.iter().map(|s| s.as_str())).unwrap();
+        ids.push(mine);
+    }
+    let (groups, folded, _) = ix.split_merge(6000, WALK).unwrap();
+    assert_eq!((groups, folded), (1, 2));
+    let kept = ix.search("mSg7XrT4q", 10).unwrap();
+    assert_eq!(kept.len(), 1);
+    let kept = kept[0].id;
+    for (part, mine) in ["008", "010", "011"].iter().zip(&ids) {
+        // The NZB form (no angle brackets) on purpose: the map is
+        // bracket-normalized, and a fold must not change that either.
+        let hits = ix.find_releases_by_msgids(mine).unwrap();
+        assert_eq!(
+            hits,
+            vec![(kept, 3)],
+            "fragment {part}'s articles lost their release"
+        );
+    }
+    teardown(&d, ix);
+}
+
+/// The same for the par2-sidecar fold: the twin's par2 volumes are
+/// still indexed under the container, so the ids that name them must
+/// still resolve - a PAR2 sidecar is exactly the object the pesto rung
+/// looks up by message-id.
+#[test]
+fn a_par2_sidecar_fold_carries_the_twins_message_ids() {
+    let d = dir("sidecar-fold-msgid");
+    let mut ix = Index::open(&d.join("index.db")).unwrap();
+    let cid = sidecar_row(&ix, "wKb51NpZ8.7z", 75, 4700, 3, 1_000_000_000, |i| {
+        format!("wKb51NpZ8.7z.{:03}", i + 1)
+    });
+    let tid = sidecar_row(&ix, "wKb51NpZ8", 75, 4650, 2, 100_000_000, |i| {
+        format!("wKb51NpZ8.vol{i:02}+02.par2")
+    });
+    let twin: Vec<String> = (0..3).map(|s| format!("<par2-{s}@news>")).collect();
+    let cont: Vec<String> = (0..3).map(|s| format!("<cont-{s}@news>")).collect();
+    claims::msgid_map_insert(&ix.db, tid, twin.iter().map(|s| s.as_str())).unwrap();
+    claims::msgid_map_insert(&ix.db, cid, cont.iter().map(|s| s.as_str())).unwrap();
+    assert!(ix.split_merge(6000, WALK).unwrap().2);
+    assert_eq!(ix.par2_sidecar_fold(WALK).unwrap(), (1, 2, true));
+    assert_eq!(
+        ix.find_releases_by_msgids(&twin).unwrap(),
+        vec![(cid, 3)],
+        "the twin's par2 articles lost their release"
+    );
+    assert_eq!(
+        ix.find_releases_by_msgids(&cont).unwrap(),
+        vec![(cid, 3)],
+        "the container's own ids are untouched"
+    );
+    teardown(&d, ix);
+}
+
 /// Insert one release row with `nfiles` files of `each` bytes,
 /// named by `namer(i)`. Returns the release id.
 fn sidecar_row(
@@ -1906,5 +1992,337 @@ fn manual_assign_carries_manual_provenance() {
     let r = &ix.search("", 10).unwrap()[0];
     assert_eq!(r.pre_title, "Picked.Film.2026.1080p.WEB.H264-GRP");
     assert_eq!(r.pre_source, "predb/manual+corr:seed:predb.net");
+    teardown(&d, ix);
+}
+
+// ---- suggest-only hardening (red-team 10 Aug 2026) ---------------
+
+/// The naming population gate, negative half: a junk>=70 stem that a
+/// human can READ ("misfits-wegedeutschensd" parses as nothing, but it
+/// is words) is not obfuscated, and correlation must not guess a name
+/// over it - suggestions included.
+#[test]
+fn the_naming_population_requires_semantic_obfuscation() {
+    let d = dir("corr-pop-semantic");
+    let mut ix = Index::open(&d.join("index.db")).unwrap();
+    ix.predb_store(
+        &[tpre(
+            "Some.Film.2026.1080p.WEB.H264-GRP",
+            "X264-HD",
+            4_900_000_000,
+            1000,
+        )],
+        1000,
+    )
+    .unwrap();
+    // Inserted with the junk score pinned at 75: how a readable stem
+    // ENDS UP at junk>=70 is the scorer's business (R6 found real
+    // ones); the property under test is that the gate does not trust
+    // junk alone.
+    ix.db
+        .execute(
+            "INSERT INTO releases(stem, poster, grp, total_bytes, files, complete,
+                                  has_par2, first_posted, first_seen, kind, junk)
+             VALUES('misfits-wegedeutschensd', 'p@x', 'alt.binaries.x264',
+                    5_000_000_000, 1, 1, 0, 4600, 4600, 'other', 75)",
+            [],
+        )
+        .unwrap();
+    let (examined, suggested, applied) = ix.predb_corr_backlog(100, 0, true, 5000).unwrap();
+    assert_eq!(
+        (examined, suggested, applied),
+        (1, 0, 0),
+        "a readable stem must be walked but never suggested for"
+    );
+    let n: i64 = ix
+        .db
+        .query_row("SELECT COUNT(*) FROM pre_corr", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
+    teardown(&d, ix);
+}
+
+/// The naming population gate, byte-probe half: shapes whose EXACT
+/// name a ~1-article probe reads in-band (single-`.7z`, identified
+/// PAR2, the Pesto Message-ID grammar) are excluded from correlation
+/// naming entirely; a control row of the plain single-RAR shape still
+/// gets its suggestion.
+#[test]
+fn the_naming_population_excludes_byte_probe_nameable_shapes() {
+    let d = dir("corr-pop-probe");
+    let mut ix = Index::open(&d.join("index.db")).unwrap();
+    // Four windows, 20 days apart, one sized pre each.
+    for (i, title) in [
+        "Control.Film.2026.1080p.WEB.H264-GRP",
+        "Sevenz.Film.2026.1080p.WEB.H264-GRP",
+        "Partwo.Film.2026.1080p.WEB.H264-GRP",
+        "Pesto.Film.2026.1080p.WEB.H264-GRP",
+    ]
+    .iter()
+    .enumerate()
+    {
+        ix.predb_store(
+            &[tpre(
+                title,
+                "X264-HD",
+                4_900_000_000,
+                1000 + i as i64 * 1_728_000,
+            )],
+            1000,
+        )
+        .unwrap();
+    }
+    let t = |i: i64| 4600 + i * 1_728_000;
+    // Control: single RAR, plain message-id.
+    ix.ingest(
+        "alt.binaries.x264",
+        &[overd(
+            r#""aQ3xY7Bm2ZpK4L.part01.rar" yEnc (1/1)"#,
+            "c1",
+            5_000_000_000,
+            t(0),
+        )],
+        t(0),
+    )
+    .unwrap();
+    // The B3 shape: one file, a 7z archive - its own header names it.
+    ix.ingest(
+        "alt.binaries.x264",
+        &[overd(
+            r#""qQ7wE2rT9uI3oP.7z" yEnc (1/1)"#,
+            "c2",
+            5_000_000_000,
+            t(1),
+        )],
+        t(1),
+    )
+    .unwrap();
+    // Identified PAR2 alongside: FileDesc carries the real filenames.
+    ix.ingest(
+        "alt.binaries.x264",
+        &[
+            overd(
+                r#""kK9mN3bV7cX1z.part01.rar" yEnc (1/1)"#,
+                "c3",
+                5_000_000_000,
+                t(2),
+            ),
+            overd(r#""kK9mN3bV7cX1z.par2" yEnc (1/1)"#, "c4", 1_000_000, t(2)),
+        ],
+        t(2),
+    )
+    .unwrap();
+    // The Pesto grammar: a real-name tiny PAR2 sits one counter away.
+    ix.ingest(
+        "alt.binaries.x264",
+        &[overd(
+            r#""zW5xC8vB2nM6k.part01.rar" yEnc (1/1)"#,
+            "0123456789abcdef.52b12.fedcba9876543210@wZq",
+            5_000_000_000,
+            t(3),
+        )],
+        t(3),
+    )
+    .unwrap();
+    // Suggest-only, the shipped posture.
+    let (examined, suggested, applied) = ix.predb_corr_backlog(100, 0, false, t(3) + 400).unwrap();
+    assert_eq!(examined, 4, "all four rows are junk>=70 and walked");
+    assert_eq!(
+        (suggested, applied),
+        (1, 0),
+        "only the control row may enter the naming population"
+    );
+    let (rid, n): (i64, i64) = ix
+        .db
+        .query_row("SELECT MIN(release_id), COUNT(*) FROM pre_corr", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(n, 1);
+    let stem: String = ix
+        .db
+        .query_row("SELECT stem FROM releases WHERE id=?1", [rid], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stem, "aQ3xY7Bm2ZpK4L");
+    // The human picker stays unrestricted: candidates still rank for
+    // an excluded row on demand.
+    let sevenz: i64 = ix
+        .db
+        .query_row(
+            "SELECT id FROM releases WHERE stem LIKE 'qQ7wE2rT9uI3oP%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !ix.pre_candidates(sevenz, 8).unwrap().is_empty(),
+        "pre_candidates is the human's view and must not be gated"
+    );
+    teardown(&d, ix);
+}
+
+/// The two shape matchers behind the byte-probe exclusion, pinned.
+#[test]
+fn the_probe_shape_matchers_read_the_right_shapes() {
+    for id in [
+        "0123456789abcdef.52b12.fedcba9876543210@wZq",
+        "<0123456789abcdef.1.fedcba9876543210@x>",
+        "DEADBEEFDEADBEEF.ffff.CAFEBABECAFEBABE@host.tld",
+    ] {
+        assert!(Index::pesto_msgid(id), "{id} must match the Pesto grammar");
+    }
+    for id in [
+        "aQ3xY7Bm2ZpK4L@calib",                                   // no counter triple
+        "0123456789abcdef.52b12@x",                               // two parts
+        "0123456789abcde.52b12.fedcba9876543210@x",               // 15-hex head
+        "0123456789abcdef.z2b12.fedcba9876543210@x",              // non-hex counter
+        "0123456789abcdef.52b12.fedcba9876543210",                // no @
+        "0123456789abcdef.0123456789abcdef01.fedcba9876543210@x", // counter too long
+    ] {
+        assert!(!Index::pesto_msgid(id), "{id} must NOT match");
+    }
+    for n in ["x.7z", "X.7Z", "x.7z.001", "x.7z.042"] {
+        assert!(Index::seven_zip_family(n), "{n} is 7z-family");
+    }
+    for n in ["x.rar", "x.part01.rar", "x.7z.txt", "x.zip", "7z"] {
+        assert!(!Index::seven_zip_family(n), "{n} is not 7z-family");
+    }
+}
+
+/// E1 follow-up 1 (10 Aug 2026): which pre touches a release first
+/// within a batch must not matter. Two sized pres fit one release -
+/// a weaker floor-clearing one and a tighter one - inserted in both
+/// id orders on two fresh indexes; the stored suggestion must name
+/// the tighter pre with the same score either way.
+#[test]
+fn corr_batch_outcome_is_independent_of_pre_order() {
+    let strong = tpre(
+        "Strong.Film.2026.1080p.WEB.H264-GRP",
+        "X264-HD",
+        4_900_000_000,
+        1000,
+    );
+    let weak = tpre(
+        "Weak.Film.2026.1080p.WEB.H264-GRP",
+        "X264-HD",
+        4_500_000_000,
+        1000,
+    );
+    let mut results = Vec::new();
+    for (tag, order) in [
+        ("wf", [weak.clone(), strong.clone()]),
+        ("sf", [strong.clone(), weak.clone()]),
+    ] {
+        let d = dir(&format!("corr-order-{tag}"));
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        // One row per store call so predb ids follow insert order -
+        // the catch-up walks ids DESCENDING, so the two runs touch
+        // the release in opposite pre order.
+        for p in &order {
+            ix.predb_store(std::slice::from_ref(p), 1000).unwrap();
+        }
+        ix.ingest(
+            "alt.binaries.x264",
+            &[overd(
+                r#""aQ3xY7Bm2ZpK4L.part01.rar" yEnc (1/1)"#,
+                "c1",
+                5_000_000_000,
+                4600,
+            )],
+            5000,
+        )
+        .unwrap();
+        // Seed generation bump opens the catch-up cursor.
+        ix.kv_set("predb_seed_gen", "1").unwrap();
+        let (_, s, _) = ix.predb_corr_catchup(100, false, 5000).unwrap();
+        assert_eq!(s, 1, "one suggestion per run ({tag})");
+        let row: (String, i64) = ix
+            .db
+            .query_row(
+                "SELECT p.title, c.score FROM pre_corr c JOIN predb p ON p.id=c.predb_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        results.push(row);
+        teardown(&d, ix);
+    }
+    assert_eq!(
+        results[0], results[1],
+        "batch order changed the stored suggestion"
+    );
+    assert_eq!(results[0].0, "Strong.Film.2026.1080p.WEB.H264-GRP");
+}
+
+/// A future quality_vN bump must not clobber rows named AFTER ingest.
+/// `apply_named` (predb sweep, spot promotion, byte probes) derived
+/// junk/title_key/kind - and res/langs/codecs - from pre_title, and the
+/// row's stem is an obfuscated hash. The retro pass therefore parses
+/// the effective name, COALESCE(NULLIF(pre_title,''), stem), same as
+/// ingest and the card queries: a re-run reproduces the applied answer
+/// instead of reverting the row to the junk>=70 no-card stem answer,
+/// which nothing would ever heal (the naming seam refuses rows whose
+/// pre_title is already set).
+#[test]
+fn a_quality_bump_rerun_keeps_names_applied_after_ingest() {
+    let d = dir("vbump-named");
+    let mut ix = Index::open(&d.join("index.db")).unwrap();
+    ix.ingest(
+        "alt.binaries.boneless",
+        &[over(
+            r#""x7Qq0FvGpZk2R9sT.part01.rar" yEnc (1/1)"#,
+            "p@x",
+            "q1",
+            4 << 30,
+        )],
+        1000,
+    )
+    .unwrap();
+    let rid = ix.search("", 10).unwrap()[0].id;
+    assert!(
+        ix.apply_named(rid, "Some.Film.2026.1080p.WEB-DL.x264-GRP", "spot", 2000)
+            .unwrap()
+    );
+
+    let snap = |ix: &Index| -> (i64, String, String, String, String) {
+        ix.db
+            .query_row(
+                "SELECT junk, title_key, kind, res, vcodec
+                   FROM releases WHERE id=?1",
+                [rid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap()
+    };
+    let before = snap(&ix);
+    assert!(
+        before.0 < 50,
+        "named row starts below the junk bar: {before:?}"
+    );
+    assert!(
+        before.1.starts_with("m:some film"),
+        "named row starts on a real card: {before:?}"
+    );
+
+    // Simulate the next bump: un-stamp the pass and reopen, so the
+    // migration body re-parses every row from scratch.
+    ix.db
+        .execute(
+            "DELETE FROM kv WHERE k IN ('quality_v8','quality_v8_cursor')",
+            [],
+        )
+        .unwrap();
+    drop(ix);
+    let ix = Index::open(&d.join("index.db")).unwrap();
+    let stamped: String = ix
+        .db
+        .query_row("SELECT v FROM kv WHERE k='quality_v8'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stamped, "1", "the re-run completed");
+    assert_eq!(
+        snap(&ix),
+        before,
+        "a retro re-parse must reproduce the applied-name answer, not the stem's"
+    );
     teardown(&d, ix);
 }

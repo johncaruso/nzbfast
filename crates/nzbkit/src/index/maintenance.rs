@@ -90,13 +90,15 @@ impl Index {
     }
 
     /// What we last called a release carrying any of these member
-    /// fingerprints. Returns `(name, title_key)` for the first hash that
-    /// is on file, in the order given - a set's volumes all belong to
-    /// one release, so one hit answers for the set.
+    /// fingerprints. Returns `(hash16k, name, title_key)` for the first
+    /// hash that is on file, in the order given - a set's volumes all
+    /// belong to one release, so one hit answers for the set. The
+    /// matched hash comes back with the name because it is the proving
+    /// key the §131 claims layer records beside the answer.
     pub fn par_hash_lookup(
         &self,
         pairs: &[(String, String)],
-    ) -> rusqlite::Result<Option<(String, String)>> {
+    ) -> rusqlite::Result<Option<(String, String, String)>> {
         let mut stmt = self
             .db
             .prepare_cached("SELECT name, title_key FROM par_hashes WHERE hash16k = ?1")?;
@@ -106,8 +108,8 @@ impl Index {
                     Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
                 })
                 .optional()?;
-            if hit.is_some() {
-                return Ok(hit);
+            if let Some((name, title_key)) = hit {
+                return Ok(Some((hash.clone(), name, title_key)));
             }
         }
         Ok(None)
@@ -162,7 +164,11 @@ impl Index {
             // index-grab as a 0-day-old post).
             xml.push_str(&format!(
                 "  <file poster=\"{}\" date=\"{posted}\" subject=\"{}\">\n    <groups><group>{}</group></groups>\n    <segments>\n",
-                xml_escape(&poster),
+                // The stored poster may carry promote_spot's generation
+                // discriminator (it lives in `poster` because the
+                // UNIQUE is a table constraint); the NZB gets the real
+                // From.
+                xml_escape(spots::base_poster(&poster)),
                 xml_escape(&format!("\"{fname}\" yEnc (1/{total})")),
                 xml_escape(&grp)
             ));
@@ -445,6 +451,18 @@ impl Index {
         // size) is wrong by construction now.
         tx.execute(
             &format!("DELETE FROM pre_corr WHERE release_id IN ({list}) OR release_id=?1"),
+            [keep],
+        )?;
+        // §131 identity substrate: the message-id keys move WITH the
+        // files. `rel_identity_ad` drops every source row's `msgid_map`
+        // on the delete below, and a fold that skipped this would
+        // destroy the strongest naming evidence the index holds - the
+        // articles are still in the kept release, so a later posted-NZB
+        // or spot lookup must still resolve them (and still reach
+        // quorum) rather than miss a release that visibly survived.
+        // OR IGNORE: the kept row may already hold the same key.
+        tx.execute(
+            &format!("UPDATE OR IGNORE msgid_map SET release_id=?1 WHERE release_id IN ({list})"),
             [keep],
         )?;
         tx.execute(&format!("DELETE FROM releases WHERE id IN ({list})"), [])?;
@@ -750,6 +768,14 @@ impl Index {
         // par2_identified flag that are both wrong now.
         tx.execute(
             "DELETE FROM pre_corr WHERE release_id IN (?1, ?2)",
+            [cont.id, twin.id],
+        )?;
+        // The twin's message-id keys move with its par2 files, for the
+        // reason spelled out in `split_merge_group`: `rel_identity_ad`
+        // would otherwise drop them on the delete below and the fold
+        // would erase identity for articles that are still indexed.
+        tx.execute(
+            "UPDATE OR IGNORE msgid_map SET release_id=?1 WHERE release_id=?2",
             [cont.id, twin.id],
         )?;
         // rel_fts_ad covers this deletion; the kept stem is untouched,
@@ -1127,10 +1153,12 @@ mod tests {
             3
         );
         // A repost whose sidecar shares ONE volume fingerprint is the
-        // same bytes, and one hit answers for the whole set.
+        // same bytes, and one hit answers for the whole set - and the
+        // answer says WHICH fingerprint proved it.
         assert_eq!(
             ix.par_hash_lookup(&pairs(&["zz", "cc"])).unwrap(),
             Some((
+                "cc".into(),
                 "Example.Movie.2019.1080p-GRP".into(),
                 "m:example movie:2019".into()
             ))
@@ -1146,7 +1174,7 @@ mod tests {
             "a later download rewrote a fingerprint it did not name"
         );
         assert_eq!(
-            ix.par_hash_lookup(&pairs(&["aa"])).unwrap().unwrap().0,
+            ix.par_hash_lookup(&pairs(&["aa"])).unwrap().unwrap().1,
             "Example.Movie.2019.1080p-GRP"
         );
 

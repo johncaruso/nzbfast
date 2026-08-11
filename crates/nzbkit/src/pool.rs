@@ -4716,3 +4716,6 @@ mod unit_tests;
 
 #[cfg(test)]
 mod rig_tests;
+
+#[cfg(test)]
+mod fault_rigs;

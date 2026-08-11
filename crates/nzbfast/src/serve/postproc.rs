@@ -109,6 +109,17 @@ impl PostprocLane {
         {
             let mut j = t.job.lock_ok();
             j.state = JobState::Finishing;
+            // §129 4a: the per-stage transition the schema promises -
+            // the download is done, the tail (verify remainder, unlock,
+            // rename, move, scripts) begins.
+            self.d.life_emit(
+                "job.finishing",
+                json!({
+                    "nzo_id": j.nzo_id,
+                    "name": j.name,
+                    "category": j.category,
+                }),
+            );
         }
         // Durable before visible-anywhere-else: a crash right here
         // restores the job as Queued (the wildcard state arm) and the

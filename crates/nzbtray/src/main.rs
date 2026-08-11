@@ -87,8 +87,41 @@ mod probe_body {
         from_settings().or_else(from_keyfile)
     }
 
-    /// An API URL that already has a query string, plus our credential.
-    pub fn keyed_url(mut url: String, data_dir: &Path) -> String {
+    /// Did the last successful probe PROVE the listener's identity - a
+    /// matching runtime.json token challenge, or a child this tray
+    /// spawned itself? Legacy adoption (an nzbfast-shaped reply with no
+    /// runtime.json to hold it to) attaches but stays `false`: sending
+    /// the stored API key to a listener whose identity is only a reply
+    /// shape hands any local port-squatter daemon control and, through
+    /// `mode=server_secret`, the provider password (Codex sweep 10 Aug
+    /// M10). Every key-bearing URL passes this through `keyed_url` /
+    /// `dash_url`; unproven means the calls go keyless and the
+    /// dashboard prompts instead.
+    // App-side only: the tests exercise `keyed_url`/`dash_url` with an
+    // explicit `proven` argument instead of this process-wide latch.
+    #[cfg(windows)]
+    pub static IDENTITY_PROVEN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(windows)]
+    pub fn identity_proven() -> bool {
+        IDENTITY_PROVEN.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(windows)]
+    pub fn set_identity_proven(v: bool) {
+        IDENTITY_PROVEN.store(v, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// An API URL that already has a query string, plus our credential -
+    /// but ONLY for a listener whose identity is proven (see
+    /// [`IDENTITY_PROVEN`]). A legacy-adopted listener gets the keyless
+    /// URL: the daemon refuses, which is strictly better than
+    /// disclosing the key to something we cannot tell from an impostor.
+    pub fn keyed_url(mut url: String, data_dir: &Path, proven: bool) -> String {
+        if !proven {
+            return url;
+        }
         if let Some(k) = apikey(data_dir) {
             url.push_str("&apikey=");
             url.push_str(&query_value(&k));
@@ -96,14 +129,37 @@ mod probe_body {
         url
     }
 
-    /// Dashboard URL, carrying the API key when we know one. The page
-    /// adopts it into localStorage and strips it from the address bar, so
-    /// the tray's own "Open dashboard" does not land the user on a prompt
-    /// for a key that was generated for them and never shown.
-    pub fn dash_url(port: u16, data_dir: &Path) -> String {
-        match apikey(data_dir) {
-            Some(k) => format!("http://127.0.0.1:{port}/?apikey={}", query_value(&k)),
-            None => format!("http://127.0.0.1:{port}/"),
+    /// Scheme + authority for everything the tray addresses at the
+    /// daemon: its own API calls, and the dashboard URL it hands the
+    /// browser.
+    ///
+    /// `tls` comes from `runtime.json` (see [`Runtime`]), which the
+    /// daemon writes once its listener exists. Saving a valid
+    /// certificate pair and restarting makes the daemon bind HTTPS; the
+    /// tray used to keep probing `http://`, classify its own healthy
+    /// engine as a stranger, and then be unable to open, stop, upgrade
+    /// or quit it. One place decides the scheme so no call site can
+    /// drift back to a hardcoded one.
+    ///
+    /// Orthogonal to `proven` below: this decides how to REACH the
+    /// listener, that decides what we are willing to SAY to it.
+    pub fn origin(port: u16, tls: bool) -> String {
+        let scheme = if tls { "https" } else { "http" };
+        format!("{scheme}://127.0.0.1:{port}")
+    }
+
+    /// Dashboard URL, carrying the API key when we know one AND the
+    /// listener proved its identity (same rule as [`keyed_url`]). The
+    /// page adopts the key into localStorage and strips it from the
+    /// address bar, so the tray's own "Open dashboard" does not land the
+    /// user on a prompt for a key that was generated for them and never
+    /// shown. Unproven, the plain URL: the dashboard prompts, and the
+    /// user pastes the key only if they trust what they see.
+    pub fn dash_url(port: u16, tls: bool, data_dir: &Path, proven: bool) -> String {
+        let base = origin(port, tls);
+        match apikey(data_dir).filter(|_| proven) {
+            Some(k) => format!("{base}/?apikey={}", query_value(&k)),
+            None => format!("{base}/"),
         }
     }
 
@@ -240,11 +296,16 @@ mod probe_body {
     }
 
     /// What `runtime.json` tells us about the daemon we expect to find:
-    /// the port it bound and the per-start secret it will prove it holds.
-    /// Absent for an older daemon, or a data dir it never started from.
+    /// the port it bound, the scheme it bound with, and the per-start
+    /// secret it will prove it holds. Absent for an older daemon, or a
+    /// data dir it never started from.
     pub struct Runtime {
         pub port: u16,
         pub token: String,
+        /// §129 2a: does that listener speak TLS? Additive on the daemon
+        /// side, so a `runtime.json` written before the key existed just
+        /// reads false - which is what those daemons were.
+        pub tls: bool,
     }
 
     pub fn runtime(data_dir: &Path) -> Option<Runtime> {
@@ -255,7 +316,19 @@ mod probe_body {
             .ok()
             .filter(|p| *p != 0)?;
         let token = stored_key(v.get("token")?.as_str()?)?;
-        Some(Runtime { port, token })
+        // Missing or non-boolean = plain HTTP. Only `true` opts in, so a
+        // malformed file cannot talk the tray into a scheme the daemon
+        // is not serving.
+        let tls = v.get("tls").and_then(Value::as_bool).unwrap_or(false);
+        Some(Runtime { port, token, tls })
+    }
+
+    /// Does the daemon on `port` speak TLS? `runtime.json` is the only
+    /// answer we have, and only when it names THIS port - an engine from
+    /// another data dir, or one older than the key, leaves us guessing,
+    /// and the probe resolves that by trying both (see `probe`).
+    pub fn tls_for(port: u16, data_dir: &Path) -> bool {
+        runtime(data_dir).is_some_and(|r| r.port == port && r.tls)
     }
 
     /// A nonce for one probe. Not a secret and not a key - it only has to
@@ -499,21 +572,110 @@ mod probe_body {
         fn urls_carry_the_key_escaped() {
             let d = data_dir("url", Some(r#"{"apikey":"a b&c"}"#), None);
             assert_eq!(
-                keyed_url("http://127.0.0.1:6789/api?mode=queue".into(), &d),
+                keyed_url("http://127.0.0.1:6789/api?mode=queue".into(), &d, true),
                 "http://127.0.0.1:6789/api?mode=queue&apikey=a%20b%26c"
             );
             assert_eq!(
-                dash_url(6789, &d),
+                dash_url(6789, false, &d, true),
                 "http://127.0.0.1:6789/?apikey=a%20b%26c"
             );
 
             // Keyless: no empty parameter left dangling on either URL.
             let d = data_dir("urlnone", None, None);
             assert_eq!(
-                keyed_url("http://127.0.0.1:6789/api?mode=queue".into(), &d),
+                keyed_url("http://127.0.0.1:6789/api?mode=queue".into(), &d, true),
                 "http://127.0.0.1:6789/api?mode=queue"
             );
-            assert_eq!(dash_url(6789, &d), "http://127.0.0.1:6789/");
+            assert_eq!(dash_url(6789, false, &d, true), "http://127.0.0.1:6789/");
+        }
+
+        /// M1: a TLS daemon is addressed as https everywhere, or the tray
+        /// cannot manage its own engine. `origin` is the single decider,
+        /// so pinning it pins every URL the tray builds.
+        ///
+        /// The two flags are independent, and the last case here says so:
+        /// `tls` picks the scheme, `proven` picks whether the key rides
+        /// along. An unproven TLS listener gets https WITHOUT the key.
+        #[test]
+        fn a_tls_daemon_is_addressed_as_https() {
+            use super::origin;
+            assert_eq!(origin(6789, true), "https://127.0.0.1:6789");
+            assert_eq!(origin(6789, false), "http://127.0.0.1:6789");
+
+            let d = data_dir("urltls", Some(r#"{"apikey":"a b&c"}"#), None);
+            assert_eq!(
+                dash_url(6789, true, &d, true),
+                "https://127.0.0.1:6789/?apikey=a%20b%26c"
+            );
+            assert_eq!(dash_url(6789, true, &d, false), "https://127.0.0.1:6789/");
+            let d = data_dir("urltlsnone", None, None);
+            assert_eq!(dash_url(6789, true, &d, true), "https://127.0.0.1:6789/");
+        }
+
+        /// Where that flag comes from: `runtime.json`, and only when the
+        /// file names the port we are about to talk to.
+        ///
+        /// The default matters as much as the true case. `tls` is
+        /// additive - a daemon older than §129 2a wrote a runtime.json
+        /// without it - so anything that is not literally `true` has to
+        /// read as plain HTTP, or the tray would upgrade a scheme the
+        /// engine never bound and lose the very attach this fixes.
+        #[test]
+        fn the_scheme_comes_from_runtime_json_for_this_port_only() {
+            use super::tls_for;
+            let write = |name: &str, body: &str| {
+                let d = data_dir(name, None, None);
+                std::fs::write(d.join("runtime.json"), body).unwrap();
+                d
+            };
+            let tok = r#""token":"aaaaaaaaaaaaaaaa""#;
+
+            assert!(tls_for(
+                6789,
+                &write("rt-tls", &format!(r#"{{"port":6789,{tok},"tls":true}}"#))
+            ));
+            // Another port's daemon tells us nothing about this one.
+            assert!(!tls_for(
+                6790,
+                &write(
+                    "rt-otherport",
+                    &format!(r#"{{"port":6789,{tok},"tls":true}}"#)
+                )
+            ));
+            // Explicitly plain, pre-§129 2a (absent), and malformed all
+            // mean http.
+            assert!(!tls_for(
+                6789,
+                &write("rt-plain", &format!(r#"{{"port":6789,{tok},"tls":false}}"#))
+            ));
+            assert!(!tls_for(
+                6789,
+                &write("rt-old", &format!(r#"{{"port":6789,{tok}}}"#))
+            ));
+            assert!(!tls_for(
+                6789,
+                &write("rt-junk", &format!(r#"{{"port":6789,{tok},"tls":"yes"}}"#))
+            ));
+            // No file at all: nothing to read a scheme off.
+            assert!(!tls_for(6789, &data_dir("rt-missing", None, None)));
+        }
+
+        /// Codex sweep 10 Aug M10: legacy adoption (a listener accepted
+        /// on reply shape alone, with no runtime.json token to
+        /// challenge) must be NON-SECRET-BEARING. A local port-squatter that
+        /// printed our JSON used to receive the stored full API key on
+        /// the very next keyed call; unproven identity now strips the
+        /// key from every generated URL, and the daemon-side refusal
+        /// (or the dashboard prompt) is the worst that can happen.
+        #[test]
+        fn an_unproven_listener_never_receives_the_stored_key() {
+            let d = data_dir("unproven", Some(r#"{"apikey":"SECRETKEY123"}"#), None);
+            let url = keyed_url("http://127.0.0.1:6789/api?mode=queue".into(), &d, false);
+            assert_eq!(url, "http://127.0.0.1:6789/api?mode=queue");
+            assert!(!url.contains("SECRETKEY123"));
+            assert_eq!(dash_url(6789, false, &d, false), "http://127.0.0.1:6789/");
+            // Proven, the same data dir carries the key as before.
+            assert!(keyed_url("http://x/api?mode=queue".into(), &d, true).contains("SECRETKEY123"));
         }
 
         /// The launcher handshake, which is what stands between "something
@@ -733,21 +895,114 @@ mod app {
 
     // ---- small helpers ------------------------------------------------
 
-    fn agent(timeout_ms: u64) -> ureq::Agent {
-        ureq::AgentBuilder::new()
-            .timeout(Duration::from_millis(timeout_ms))
-            .build()
+    /// The TLS settings for talking to OUR OWN daemon over loopback.
+    ///
+    /// It presents whatever certificate the operator configured, which in
+    /// every real deployment is self-signed and issued for a public
+    /// hostname rather than for 127.0.0.1 - so a verifying client refuses
+    /// it, and refusing is what left the tray unable to manage a
+    /// TLS-enabled daemon at all.
+    ///
+    /// Accepting it costs nothing here, because the certificate was never
+    /// what identified this daemon. The connection is to 127.0.0.1, which
+    /// no host on the network can sit in the middle of; the threat is a
+    /// local process squatting the port, and that is what the
+    /// `runtime.json` token handshake is for - a challenge only the engine
+    /// that wrote a file our user alone can read is able to answer. The
+    /// API key still rides behind that proof, exactly as on plain HTTP.
+    /// So nothing we were relying on is given up here, and TLS keeps
+    /// doing its real job: encrypting the hop, and letting the tray reach
+    /// the same socket the LAN does.
+    #[derive(Debug)]
+    struct LoopbackCerts(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+    impl rustls::client::danger::ServerCertVerifier for LoopbackCerts {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        // The signature checks stay REAL: they prove the peer holds the
+        // key for the certificate it just presented, which is what stops
+        // the handshake being replayed from a recording. Only the "is
+        // this certificate trusted for this name" question is waived.
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
     }
 
-    use crate::probe_body::{dash_url, keyed_url, query_value};
+    /// Built once and shared: the handshake config is immutable and
+    /// assembling it per request would re-do the provider setup on every
+    /// menu click.
+    fn loopback_tls() -> std::sync::Arc<rustls::ClientConfig> {
+        static CFG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> =
+            std::sync::OnceLock::new();
+        CFG.get_or_init(|| {
+            // The provider is named, never defaulted: a process that links
+            // more than one panics inside a provider-less `builder()`, and
+            // ring is the one ureq's own rustls feature brings in.
+            let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+            let cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .expect("ring provider supports the default protocol versions")
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(LoopbackCerts(provider)))
+                .with_no_client_auth();
+            std::sync::Arc::new(cfg)
+        })
+        .clone()
+    }
+
+    fn agent(timeout_ms: u64, tls: bool) -> ureq::Agent {
+        let b = ureq::AgentBuilder::new().timeout(Duration::from_millis(timeout_ms));
+        if tls { b.tls_config(loopback_tls()) } else { b }.build()
+    }
+
+    use crate::probe_body::{dash_url, keyed_url, origin, query_value, tls_for};
 
     /// GET an API mode; None on any transport/JSON failure.
     fn api_get(port: u16, data_dir: &Path, mode: &str, timeout_ms: u64) -> Option<Value> {
+        let tls = tls_for(port, data_dir);
         let url = keyed_url(
-            format!("http://127.0.0.1:{port}/api?mode={mode}&output=json"),
+            format!("{}/api?mode={mode}&output=json", origin(port, tls)),
             data_dir,
+            crate::probe_body::identity_proven(),
         );
-        let body = agent(timeout_ms)
+        let body = agent(timeout_ms, tls)
             .get(&url)
             .call()
             .ok()?
@@ -775,6 +1030,14 @@ mod app {
     /// too old to answer the challenge is accepted as before - refusing
     /// would break attaching across the upgrade - and everything else that
     /// fails the proof is a stranger.
+    ///
+    /// The scheme comes from `runtime.json` too. When it names this port
+    /// its `tls` is authoritative - one request, as before. When it does
+    /// NOT (an engine from another data dir, or one older than the key),
+    /// we no longer assume plain HTTP: a TLS listener answers a plaintext
+    /// GET with an alert and a close, which reads as a transport failure,
+    /// so the tray called its own healthy engine a stranger and refused
+    /// to attach. Only that miss costs a second request.
     fn probe(port: u16, data_dir: &Path) -> Probe {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_err() {
@@ -782,13 +1045,22 @@ mod app {
         }
         let rt = crate::probe_body::runtime(data_dir).filter(|r| r.port == port);
         let nonce = crate::probe_body::probe_nonce();
-        let url = format!("http://127.0.0.1:{port}/api?mode=version&output=json&hs={nonce}");
-        let Some(body) = agent(900)
-            .get(&url)
-            .call()
-            .ok()
-            .and_then(|r| r.into_string().ok())
-        else {
+        let ask = |tls: bool| {
+            let url = format!(
+                "{}/api?mode=version&output=json&hs={nonce}",
+                origin(port, tls)
+            );
+            agent(900, tls)
+                .get(&url)
+                .call()
+                .ok()
+                .and_then(|r| r.into_string().ok())
+        };
+        let body = match rt.as_ref() {
+            Some(r) => ask(r.tls),
+            None => ask(false).or_else(|| ask(true)),
+        };
+        let Some(body) = body else {
             return Probe::Other;
         };
         if !crate::probe_body::is_nzbfast(&body) {
@@ -798,6 +1070,11 @@ mod app {
         // `probe_body::identity_ok`. It used to be waived for a reply that
         // simply omitted `hs_proof`, which any impostor can do.
         if crate::probe_body::identity_ok(&body, rt.as_ref().map(|r| r.token.as_str()), &nonce) {
+            // Proven only when a runtime.json token was actually
+            // challenged. The legacy `None` arm attaches but must not
+            // carry the stored key (Codex sweep 10 Aug M10); a spawn we
+            // performed ourselves overrides this at the spawn site.
+            crate::probe_body::set_identity_proven(rt.is_some());
             Probe::Nzbfast
         } else {
             Probe::Other
@@ -955,11 +1232,14 @@ mod app {
         let Some(mine) = crate::probe_body::bundled_version() else {
             return false;
         };
+        let tls = tls_for(port, data_dir);
+        let base = origin(port, tls);
         let url = keyed_url(
-            format!("http://127.0.0.1:{port}/api?mode=version&output=json"),
+            format!("{base}/api?mode=version&output=json"),
             data_dir,
+            crate::probe_body::identity_proven(),
         );
-        let Some(running) = agent(3000)
+        let Some(running) = agent(3000, tls)
             .get(&url)
             .call()
             .ok()
@@ -972,10 +1252,11 @@ mod app {
             return false;
         }
         let url = keyed_url(
-            format!("http://127.0.0.1:{port}/api?mode=shutdown&output=json"),
+            format!("{base}/api?mode=shutdown&output=json"),
             data_dir,
+            crate::probe_body::identity_proven(),
         );
-        let _ = agent(5000).post(&url).send_string("");
+        let _ = agent(5000, tls).post(&url).send_string("");
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(40) {
             if matches!(probe(port, data_dir), Probe::Free) {
@@ -1047,6 +1328,11 @@ mod app {
         let mut child = child;
         while t0.elapsed() < Duration::from_secs(15) {
             if matches!(probe(port, data_dir), Probe::Nzbfast) {
+                // Our own child on a port we just found free: identity
+                // is established by the spawn itself, even if its
+                // runtime.json write has not landed yet when the first
+                // probe answers.
+                crate::probe_body::set_identity_proven(true);
                 return (port, Some(child));
             }
             std::thread::sleep(Duration::from_millis(250));
@@ -1084,11 +1370,13 @@ mod app {
         );
         body.extend_from_slice(&bytes);
         let _ = write!(body, "\r\n--{boundary}--\r\n");
+        let tls = tls_for(port, data_dir);
         let url = keyed_url(
-            format!("http://127.0.0.1:{port}/api?mode=addfile&output=json"),
+            format!("{}/api?mode=addfile&output=json", origin(port, tls)),
             data_dir,
+            crate::probe_body::identity_proven(),
         );
-        let resp = agent(10_000)
+        let resp = agent(10_000, tls)
             .post(&url)
             .set(
                 "Content-Type",
@@ -1119,14 +1407,17 @@ mod app {
     /// round of searches against the user's indexers, where posting an
     /// .nzb is a local write.
     fn post_nzblnk(port: u16, data_dir: &Path, link: &str) -> Result<String, String> {
+        let tls = tls_for(port, data_dir);
         let url = keyed_url(
             format!(
-                "http://127.0.0.1:{port}/api?mode=addnzblnk&output=json&link={}",
+                "{}/api?mode=addnzblnk&output=json&link={}",
+                origin(port, tls),
                 query_value(link)
             ),
             data_dir,
+            crate::probe_body::identity_proven(),
         );
-        let resp = agent(45_000)
+        let resp = agent(45_000, tls)
             .get(&url)
             .call()
             .map_err(|e| format!("addnzblnk: {e}"))?;
@@ -1218,11 +1509,13 @@ mod app {
         if let Some(port) = crate::probe_body::load_port(data_dir)
             && matches!(probe(port, data_dir), Probe::Nzbfast)
         {
+            let tls = tls_for(port, data_dir);
             let url = keyed_url(
-                format!("http://127.0.0.1:{port}/api?mode=shutdown&output=json"),
+                format!("{}/api?mode=shutdown&output=json", origin(port, tls)),
                 data_dir,
+                crate::probe_body::identity_proven(),
             );
-            let _ = agent(2000).post(&url).send_string("");
+            let _ = agent(2000, tls).post(&url).send_string("");
             let t0 = Instant::now();
             while t0.elapsed() < Duration::from_secs(8) {
                 if matches!(probe(port, data_dir), Probe::Free) {
@@ -1465,7 +1758,12 @@ mod app {
 
     fn handle_command(hwnd: HWND, cmd: u16, port: u16, data_dir: &Path) {
         match cmd {
-            ID_DASH => open_url(&dash_url(port, data_dir)),
+            ID_DASH => open_url(&dash_url(
+                port,
+                tls_for(port, data_dir),
+                data_dir,
+                crate::probe_body::identity_proven(),
+            )),
             ID_DOWNLOADS => {
                 // Prefer the daemon's live out_dir (an attached daemon may
                 // download somewhere other than our default).
@@ -1487,7 +1785,7 @@ mod app {
                 }
             }
             ID_AUTOSTART => set_autostart(!autostart_enabled()),
-            ID_MANUAL => open_url(&format!("http://127.0.0.1:{port}/manual")),
+            ID_MANUAL => open_url(&format!("{}/manual", origin(port, tls_for(port, data_dir)))),
             ID_RESTART => restart_daemon(hwnd),
             ID_QUIT => quit(hwnd),
             _ => {}
@@ -1523,14 +1821,13 @@ mod app {
             if let Some(child) = app.child.as_mut()
                 && child.try_wait().ok().flatten().is_none()
             {
+                let tls = tls_for(app.port, &app.data_dir);
                 let url = keyed_url(
-                    format!(
-                        "http://127.0.0.1:{}/api?mode=shutdown&output=json",
-                        app.port
-                    ),
+                    format!("{}/api?mode=shutdown&output=json", origin(app.port, tls)),
                     &app.data_dir,
+                    crate::probe_body::identity_proven(),
                 );
-                let _ = agent(2000).post(&url).send_string("");
+                let _ = agent(2000, tls).post(&url).send_string("");
                 let t0 = Instant::now();
                 while t0.elapsed() < Duration::from_secs(5) {
                     if child.try_wait().ok().flatten().is_some() {
@@ -1567,7 +1864,12 @@ mod app {
                                 let app = b.as_ref().unwrap();
                                 (app.port, app.data_dir.clone())
                             });
-                            open_url(&dash_url(port, &data_dir));
+                            open_url(&dash_url(
+                                port,
+                                tls_for(port, &data_dir),
+                                &data_dir,
+                                crate::probe_body::identity_proven(),
+                            ));
                         }
                         WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
                         _ => {}
@@ -1742,7 +2044,12 @@ mod app {
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 let port = crate::probe_body::load_port(&data_dir).unwrap_or(BASE_PORT);
                 if args.is_empty() && links.is_empty() {
-                    open_url(&dash_url(port, &data_dir));
+                    open_url(&dash_url(
+                        port,
+                        tls_for(port, &data_dir),
+                        &data_dir,
+                        crate::probe_body::identity_proven(),
+                    ));
                 } else {
                     for p in &args {
                         if let Err(e) = post_nzb(port, &data_dir, p) {
@@ -1847,7 +2154,12 @@ mod app {
         // actually seen. ensure_daemon has already confirmed the daemon
         // answers on this port, so the page can't land on a dead socket.
         if first_run || open_ui {
-            open_url(&dash_url(port, &data_dir));
+            open_url(&dash_url(
+                port,
+                tls_for(port, &data_dir),
+                &data_dir,
+                crate::probe_body::identity_proven(),
+            ));
         }
 
         // SAFETY: MSG is windows-sys's #[repr(C)] mirror of the

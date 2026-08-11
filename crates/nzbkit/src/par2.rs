@@ -53,7 +53,7 @@ pub(crate) const TYPE_RECVSLIC: &[u8; 16] = b"PAR 2.0\0RecvSlic";
 /// Header size of every packet.
 const HEADER_LEN: u64 = 64;
 /// MD5 of the first this-many bytes of a file = the FileDesc "hash16k" field.
-const HASH16K_LEN: usize = 16384;
+pub(crate) const HASH16K_LEN: usize = 16384;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Par2Error {

@@ -537,27 +537,37 @@ pub(crate) async fn get_with_progress(
     // enough for the queue row even on jobs that skip them all, since
     // those reach the finish within moments.
     // The disk-unpack tail (eat-arm, unrar ladder, nested pass): see
-    // get/tail.rs.
+    // get/tail.rs. Off the scheduler core (Codex sweep 8 Aug H11): the
+    // tail is minutes of synchronous unrar work plus parked waits for
+    // the heavy-CPU permit and the §129 disk admission, and all of it
+    // used to run directly on this task's runtime worker - freezing
+    // sockets, timers and the API for the duration, and deadlocking
+    // outright when the permit holder needed the same worker to
+    // finish. `off_worker` (block_in_place, not spawn_blocking) keeps
+    // the tail on THIS thread, which the eat-arm's and the need
+    // ledger's thread-locals both rely on.
     let UnpackVerdict {
         all_good,
         reextract_failed,
-    } = unpack_tail(
-        &extractor,
-        &slots,
-        &restored,
-        &ex_report,
-        &final_shape,
-        &outer_vol_stems,
-        out_dir,
-        password.as_deref(),
-        resuming,
-        no_extract,
-        resume_map,
-        eat_consent,
-        &note_activity,
-        all_good,
-        reextract_failed,
-    )?;
+    } = crate::lanegate::off_worker(|| {
+        unpack_tail(
+            &extractor,
+            &slots,
+            &restored,
+            &ex_report,
+            &final_shape,
+            &outer_vol_stems,
+            out_dir,
+            password.as_deref(),
+            resuming,
+            no_extract,
+            resume_map,
+            eat_consent,
+            &note_activity,
+            all_good,
+            reextract_failed,
+        )
+    })?;
     // M15 memory summary - the line benchmarks quote and budgets tune.
     let (pp_peak, pp_spilled) = verifier.partials_stats();
     println!(

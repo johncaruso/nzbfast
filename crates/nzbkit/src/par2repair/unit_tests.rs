@@ -130,6 +130,46 @@ fn tmpdir(tag: &str) -> PathBuf {
 const BS: usize = 64;
 const SET: [u8; 16] = [9u8; 16];
 
+/// Codex sweep 10 Aug M4: the packet-file ceiling is a bound on how much
+/// attacker-chosen input one directory entry becomes in memory, and every
+/// packet file below is read WHOLE. The extension is the poster's choice,
+/// so a bound only extensionless volumes had to clear was no bound at
+/// all - renaming the file to `*.par2` walked straight past it.
+///
+/// Driven through the private bounded form rather than a real gigabyte:
+/// the predicate is what regressed, and the constant only picks where it
+/// sits.
+#[test]
+fn the_packet_file_ceiling_binds_by_size_not_by_name() {
+    let dir = tmpdir("packet-ceiling");
+    let a = payload(200, 1);
+    let files: &[(&str, &[u8])] = &[("a.bin", &a)];
+    let index = par2_index(SET, BS, files);
+    let vol = par2_volume(SET, BS, files, &[0]);
+    // The same oversized volume twice: once named, once bare. Both are
+    // past the ceiling, and neither may be collected.
+    std::fs::write(dir.join("set.par2"), &index).unwrap();
+    std::fs::write(dir.join("big.par2"), &vol).unwrap();
+    std::fs::write(dir.join("bigbare"), &vol).unwrap();
+    let cap = (index.len().min(vol.len()) - 1) as u64;
+    assert!(cap >= 64, "the sniff floor still has to be clearable");
+    let (collected, sniffed) = collect_packet_files_bounded(&dir, cap).expect("walk");
+    assert!(
+        collected.is_empty() && sniffed.is_empty(),
+        "an oversized file was collected: {collected:?}"
+    );
+    // ...and under a ceiling they clear, both come back - so the test
+    // above is the bound talking, not a name or a parse failure.
+    let (collected, sniffed) = collect_packet_files_bounded(&dir, u64::MAX).expect("walk");
+    assert_eq!(
+        collected.len(),
+        3,
+        "all three are packet files: {collected:?}"
+    );
+    assert_eq!(sniffed.len(), 1, "only the bare one needs a sniff");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn clean_set_reads_no_damage_and_names_its_files() {
     let dir = tmpdir("clean");
@@ -390,12 +430,14 @@ fn meta_for(name: &str, data: &[u8], bs: usize) -> Par2File {
     }
 }
 
-/// The worker pool must reproduce the serial scanner's verdicts exactly
-/// across damage shapes: pristine, mid-file damage, damaged tail,
-/// trailing junk (still clean), truncation. Small file, so this drives
-/// `hash_blocks_par` directly - the size gate is exercised separately.
+/// The worker pool must reproduce the serial scanner's PRESENCE bitmap
+/// exactly across damage shapes: pristine, mid-file damage, damaged
+/// tail, trailing junk (still clean), truncation. Small file, so this
+/// drives `hash_blocks_par` directly - the size gate is exercised
+/// separately. Presence is all the pool decides; the clean verdict is
+/// the FileDesc MD5's alone (H7).
 #[test]
-fn block_hash_pool_matches_serial_scanner_verdicts() {
+fn block_hash_pool_matches_serial_scanner_presence() {
     let dir = tmpdir("hashpool");
     let pristine = payload(BS * 37 + 9, 21);
     let meta = meta_for("h.bin", &pristine, BS);
@@ -423,33 +465,29 @@ fn block_hash_pool_matches_serial_scanner_verdicts() {
         let f = File::open(&p).unwrap();
         let disk_len = bytes.len() as u64;
         let limit = meta.length.min(disk_len);
-        let (crc_ok, all_md5) = hash_blocks_par(
+        let crc_ok = hash_blocks_par(
             &|off, buf| crate::disk::read_exact_at(&f, buf, off),
             limit,
             meta.length,
             &meta.blocks,
             BS,
-            disk_len >= meta.length,
             4,
         )
         .unwrap();
-        let md5_ok = disk_len >= meta.length && all_md5;
-        assert_eq!(md5_ok, serial.clean, "{tag}: clean verdict");
-        if serial.clean {
-            assert!(crc_ok.iter().all(|&b| b), "{tag}: clean means every block");
-        } else {
-            let want = serial
-                .present
-                .expect("serial pass tracks blocks on a damaged file");
-            assert_eq!(crc_ok, want, "{tag}: presence bitmap");
+        match serial.present {
+            None => {
+                assert!(serial.clean, "{tag}: only a clean file drops the bitmap");
+                assert!(crc_ok.iter().all(|&b| b), "{tag}: clean means every block");
+            }
+            Some(want) => assert_eq!(crc_ok, want, "{tag}: presence bitmap"),
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Above HASH_PAR_MIN_BYTES `verify_pass1` and `md5_matches` switch to
-/// the pool; the full verdict must agree with the serial pass on
-/// pristine, damaged and truncated shapes.
+/// Above HASH_PAR_MIN_BYTES a truncated target routes `verify_pass1`
+/// through the pool; the verdict must agree with the serial pass on
+/// pristine, damaged and truncated shapes alike.
 #[test]
 fn parallel_gate_agrees_with_serial_above_threshold() {
     let dir = tmpdir("hashgate");
@@ -480,12 +518,121 @@ fn parallel_gate_agrees_with_serial_above_threshold() {
         assert_eq!(par.clean, serial.clean, "{tag}: clean");
         assert_eq!(par.present, serial.present, "{tag}: presence bitmap");
         assert_eq!(
-            md5_matches(&p, &meta, bs, 8).unwrap(),
-            md5_matches(&p, &meta, bs, 1).unwrap(),
+            md5_matches(&p, &meta).unwrap(),
+            serial.intact,
             "{tag}: md5_matches verdict"
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// H7 (08-08 sweep, closed 10 Aug): a PAR2 whose FileDesc and IFSC
+/// describe DIFFERENT bytes under one file id. Both packets are
+/// well-formed and the entry count agrees with the declared length, so
+/// every structural gate in par2.rs passes them; only hashing the data
+/// can tell them apart. Bytes B are on disk, so the IFSC is satisfied
+/// and the FileDesc whole-file MD5 is not.
+///
+/// The two verify paths must not disagree about that. Before the fix
+/// the pool branch answered "every padded block MD5 matched" and called
+/// the file clean, while the serial branch computed the FileDesc MD5
+/// and called it damaged - one verdict per file size and per core
+/// count, from identical metadata.
+#[test]
+fn ifsc_contradicting_the_filedesc_md5_is_rejected_by_both_paths() {
+    let dir = tmpdir("h7split");
+    let bs = 4096usize;
+    let len = (HASH_PAR_MIN_BYTES as usize) + bs * 2 + 77;
+    let a = payload(len, 61);
+    let b = payload(len, 62); // same length: the count gate cannot see it
+    let desc_a = meta_for("split.bin", &a, bs);
+    let ifsc_b = meta_for("split.bin", &b, bs);
+    let meta = Par2File {
+        blocks: ifsc_b.blocks,
+        ..desc_a
+    };
+    let p = dir.join("split.bin");
+    std::fs::write(&p, &b).unwrap();
+
+    let serial = verify_pass1(&p, &meta, bs, 1).unwrap();
+    let par = verify_pass1(&p, &meta, bs, 8).unwrap();
+    assert!(
+        !serial.clean,
+        "the bytes on disk do not carry the FileDesc MD5"
+    );
+    assert_eq!(par.clean, serial.clean, "clean verdict");
+    assert_eq!(par.intact, serial.intact, "intact verdict");
+    assert!(
+        !md5_matches(&p, &meta).unwrap(),
+        "a repair may not report success on bytes the FileDesc MD5 denies"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Why recomputing the spec's file id at parse time does NOT close H7,
+/// recorded so it stops being re-proposed. The id is
+/// `MD5(hash16k ‖ length ‖ name)` - it binds the descriptor's IDENTITY
+/// triple and says nothing about the whole-file MD5 beside it, nor
+/// about which IFSC list travels under that id. A poster who picks the
+/// triple first can compute the matching id and still ship a FileDesc
+/// MD5 for A with an IFSC for B, exactly the fixture above. Recomputing
+/// is worth doing for garbled descriptors; it is not the H7 fix, which
+/// has to be a verdict rule (see `md5_matches`).
+#[test]
+fn spec_file_id_does_not_bind_the_ifsc_to_the_filedesc() {
+    let bs = 4096usize;
+    let a = payload(bs * 3 + 11, 71);
+    let b = payload(a.len(), 72);
+    let name = "split.bin";
+    let md5_16k: [u8; 16] = Md5::digest(&a[..a.len().min(16384)]).into();
+
+    // The PAR2 2.0 file id, computed exactly as the spec defines it.
+    let mut idsrc = md5_16k.to_vec();
+    idsrc.extend_from_slice(&(a.len() as u64).to_le_bytes());
+    idsrc.extend_from_slice(name.as_bytes());
+    let file_id: [u8; 16] = Md5::digest(&idsrc).into();
+
+    let mut main = Vec::new();
+    main.extend_from_slice(&(bs as u64).to_le_bytes());
+    main.extend_from_slice(&1u32.to_le_bytes());
+    main.extend_from_slice(&file_id);
+
+    let mut desc = Vec::new();
+    desc.extend_from_slice(&file_id);
+    desc.extend_from_slice(&<[u8; 16]>::from(Md5::digest(&a))); // A's whole-file MD5
+    desc.extend_from_slice(&md5_16k);
+    desc.extend_from_slice(&(a.len() as u64).to_le_bytes());
+    let mut nb = name.as_bytes().to_vec();
+    while !nb.len().is_multiple_of(4) {
+        nb.push(0);
+    }
+    desc.extend_from_slice(&nb);
+
+    let mut ifsc = file_id.to_vec(); // B's blocks, under A's id
+    for chunk in b.chunks(bs) {
+        let mut padded = chunk.to_vec();
+        padded.resize(bs, 0);
+        ifsc.extend_from_slice(&<[u8; 16]>::from(Md5::digest(&padded)));
+        ifsc.extend_from_slice(&crc32fast::hash(&padded).to_le_bytes());
+    }
+
+    let mut buf = pkt(SET, par2::TYPE_MAIN, &main);
+    buf.extend(pkt(SET, par2::TYPE_FILEDESC, &desc));
+    buf.extend(pkt(SET, par2::TYPE_IFSC, &ifsc));
+
+    let set = par2::Par2Set::parse(&[&buf]).expect("well-formed packets");
+    let f = &set.files[0];
+    assert_eq!(f.file_id, file_id, "the id is the spec's own value");
+    assert_eq!(f.md5, <[u8; 16]>::from(Md5::digest(&a)));
+    assert_eq!(
+        f.blocks[0].md5,
+        <[u8; 16]>::from(Md5::digest(&{
+            let mut p = b[..bs].to_vec();
+            p.resize(bs, 0);
+            p
+        })),
+        "a spec-correct file id still carries the other file's blocks"
+    );
 }
 
 /// End to end above the gate: a big damaged file goes through the
@@ -524,14 +671,13 @@ fn big_damaged_file_repairs_identically_through_the_pool() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The mapped driver's self-prove takes the pool branch for a big
-/// rebuilt file (full IFSC, above the gate): the repair must succeed,
-/// the bytes must land identical, and a write that corrupts a byte
-/// outside the rebuilt blocks must still fail the prove - the per-block
-/// proof covers EVERY byte, exactly like the whole-file MD5 it stands
-/// in for.
+/// The mapped driver's self-prove on a big rebuilt file (full IFSC,
+/// above the pool gate): the repair must succeed, the bytes must land
+/// identical, and a write that corrupts a byte OUTSIDE the rebuilt
+/// blocks must still fail the prove - the FileDesc MD5 covers every
+/// byte, not just the patched ones.
 #[test]
-fn mapped_self_prove_pool_branch_proves_and_fails() {
+fn mapped_self_prove_covers_bytes_outside_the_rebuilt_blocks() {
     let bs = 4096usize;
     let len = (HASH_PAR_MIN_BYTES as usize) + 3 * bs + 501;
     let big = payload(len, 51);

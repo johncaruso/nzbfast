@@ -3,9 +3,16 @@ use super::*;
 /// The library pointer Jellyfin/Emby index: a one-line .strm whose URL
 /// plays (and on first play, downloads) the job. 127.0.0.1 is a
 /// placeholder - the daemon only knows its own port, not its public host.
+///
+/// `scheme` is not a placeholder, though: it is what this run's listener
+/// actually bound ([`Daemon::scheme`]). There is no request here to read
+/// a forwarded scheme off - the file is written at finalize and read back
+/// by Jellyfin possibly months later - so a hardcoded `http` on a TLS
+/// daemon wrote a pointer that could never play.
 pub(super) fn write_strm(
     out_dir: &std::path::Path,
     name: &str,
+    scheme: &str,
     port: u16,
     nzo_id: &str,
     token: &str,
@@ -14,7 +21,7 @@ pub(super) fn write_strm(
     let path = out_dir.join(nzbkit::disk::sanitize_filename(&format!("{name}.strm")));
     std::fs::write(
         &path,
-        format!("http://127.0.0.1:{port}/stream/{nzo_id}?t={token}\n"),
+        format!("{scheme}://127.0.0.1:{port}/stream/{nzo_id}?t={token}\n"),
     )?;
     info!(target: "library", "wrote {}", path.display());
     Ok(())
@@ -1488,5 +1495,31 @@ mod range_header_tests {
                 assert!(start < end && end <= 1_000, "{v} -> {start}..{end}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod strm_tests {
+    use super::write_strm;
+
+    /// M2: the library pointer Jellyfin plays months later. There is no
+    /// request to read a forwarded scheme off, so a hardcoded `http` on
+    /// a TLS daemon wrote a .strm that could never play - the daemon's
+    /// own bound scheme is the only answer available, and it has to
+    /// reach the file.
+    #[test]
+    fn the_pointer_carries_the_daemons_own_scheme() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-strm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        write_strm(&dir, "Cat.Show.S01E01", "https", 6789, "nzo_1", "tok").unwrap();
+        let body = std::fs::read_to_string(dir.join("Cat.Show.S01E01.strm")).unwrap();
+        assert_eq!(body, "https://127.0.0.1:6789/stream/nzo_1?t=tok\n");
+
+        write_strm(&dir, "Cat.Show.S01E02", "http", 6789, "nzo_2", "tok").unwrap();
+        let body = std::fs::read_to_string(dir.join("Cat.Show.S01E02.strm")).unwrap();
+        assert_eq!(body, "http://127.0.0.1:6789/stream/nzo_2?t=tok\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

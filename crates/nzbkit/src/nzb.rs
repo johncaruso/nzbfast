@@ -94,7 +94,11 @@ impl Nzb {
     #[allow(deprecated)]
     pub fn parse(xml: &[u8]) -> Result<Nzb, NzbError> {
         let mut reader = Reader::from_reader(xml);
-        reader.config_mut().trim_text(true);
+        // NOT trim_text(true): quick-xml would trim each text EVENT, and
+        // entities split one value into several events - the spaces
+        // around `&amp;` in a password vanished. Every consuming arm
+        // below trims for itself instead (meta as a whole at </meta>).
+        reader.config_mut().trim_text(false);
 
         let mut files: Vec<NzbFile> = Vec::new();
         let mut meta: Vec<(String, String)> = Vec::new();
@@ -153,13 +157,24 @@ impl Nzb {
                 },
                 Event::Text(t) => {
                     let text = t.xml10_content()?;
+                    // Meta values keep their fragments UNTRIMMED and are
+                    // trimmed once as a whole at </meta>: entities split
+                    // the text into separate events, and per-fragment
+                    // trimming ate the spaces around them - a password
+                    // of `secret &amp; more` decoded to `secret&more`
+                    // and extraction used the wrong password.
+                    if cur_segment.is_none()
+                        && let Some((_, v)) = cur_meta.as_mut()
+                    {
+                        v.push_str(&text);
+                        buf.clear();
+                        continue;
+                    }
                     let text = text.trim();
                     if text.is_empty() {
                         // nothing
                     } else if let Some(seg) = cur_segment.as_mut() {
                         seg.message_id.push_str(text);
-                    } else if let Some((_, v)) = cur_meta.as_mut() {
-                        v.push_str(text);
                     } else if in_group
                         && let Some(f) = cur_file.as_mut()
                         && is_wire_safe(text)
@@ -174,13 +189,20 @@ impl Nzb {
                     // is silently dropped and the article never fetched.
                     // CDATA content is literal - no entity unescaping.
                     let raw = String::from_utf8_lossy(&c);
+                    // Same rule as Text above: meta fragments stay
+                    // untrimmed until </meta>.
+                    if cur_segment.is_none()
+                        && let Some((_, v)) = cur_meta.as_mut()
+                    {
+                        v.push_str(&raw);
+                        buf.clear();
+                        continue;
+                    }
                     let text = raw.trim();
                     if text.is_empty() {
                         // nothing
                     } else if let Some(seg) = cur_segment.as_mut() {
                         seg.message_id.push_str(text);
-                    } else if let Some((_, v)) = cur_meta.as_mut() {
-                        v.push_str(text);
                     } else if in_group
                         && let Some(f) = cur_file.as_mut()
                         && is_wire_safe(text)
@@ -224,11 +246,14 @@ impl Nzb {
                     }
                     b"group" => in_group = false,
                     b"meta" => {
-                        if let Some((ty, val)) = cur_meta.take()
-                            && !ty.is_empty()
-                            && !val.is_empty()
-                        {
-                            meta.push((ty, val));
+                        if let Some((ty, val)) = cur_meta.take() {
+                            // One whole-value trim, replacing the old
+                            // per-fragment trims: element-formatting
+                            // whitespace goes, interior spaces stay.
+                            let val = val.trim().to_string();
+                            if !ty.is_empty() && !val.is_empty() {
+                                meta.push((ty, val));
+                            }
                         }
                     }
                     b"segment" => {
@@ -432,6 +457,36 @@ POST]]></segment>
         // has to learn two declared segments can never be fetched, or a
         // hostile NZB completes green with a zero-filled file.
         assert_eq!(f.dropped_segments, 2);
+    }
+
+    /// XML entities split a meta value into separate text events, and
+    /// trimming each fragment ate the spaces AROUND the entity: a
+    /// password of `secret &amp; more` decoded to `secret&more`, and
+    /// extraction then used a password that never existed. Only the
+    /// whole assembled value may be trimmed.
+    #[test]
+    fn entities_in_meta_values_keep_their_neighbouring_spaces() {
+        let xml = br#"<?xml version="1.0"?>
+<nzb>
+  <head>
+    <meta type="password">  secret &amp; more </meta>
+    <meta type="title">a &lt;b&gt; c</meta>
+  </head>
+  <file subject="x" poster="p" date="1700000000">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment bytes="1" number="1">clean@example.com</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let nzb = Nzb::parse(xml).expect("parses");
+        assert_eq!(nzb.password(), Some("secret & more"));
+        let title = nzb
+            .meta
+            .iter()
+            .find(|(t, _)| t == "title")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(title, Some("a <b> c"));
     }
 
     /// A file whose EVERY segment is refused still parses (the NZB is

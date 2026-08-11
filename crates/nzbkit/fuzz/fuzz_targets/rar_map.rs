@@ -28,6 +28,13 @@
 //!    execs/s) and fuzz the KDF, which is fixed-size arithmetic already
 //!    pinned by known-answer tests. The interesting bytes are the
 //!    DECRYPTED length fields, and this reaches them at full speed.
+//! 3. The RAR4 PLAINTEXT header framing, through `fuzz_v4_plain_header`.
+//!    Since the M5 fix (Codex sweep 10 Aug) the mapper refuses a
+//!    plaintext block whose CRC16 misses, which random bytes clear one
+//!    time in 65,536 - so half 1 alone would leave the arithmetic BEHIND
+//!    that gate essentially unfuzzed. Same split, same reason, as half 2:
+//!    the check is cheap fixed-size work, the fields it guards are the
+//!    ones that become `pwrite` destinations.
 use libfuzzer_sys::fuzz_target;
 
 use nzbkit::rar::{ArchiveMap, VolumeMapper};
@@ -60,7 +67,11 @@ fuzz_target!(|data: &[u8]| {
     // Sometimes lie about the volume size: 0 means "unknown" (a yEnc span
     // with no `size=`), which switches OFF the volume-bounds check and is
     // the weaker of the two configurations.
-    let declared = if mode & 0x04 != 0 { 0 } else { body.len() as u64 };
+    let declared = if mode & 0x04 != 0 {
+        0
+    } else {
+        body.len() as u64
+    };
     let password = (mode & 0x08 != 0).then_some("testpw123");
 
     let mut m = VolumeMapper::with_password(declared, password.map(std::sync::Arc::from));
@@ -94,7 +105,10 @@ fuzz_target!(|data: &[u8]| {
         // will assemble ciphertext for and decrypt at finish, so it MUST
         // carry parameters to decrypt with.
         if m.blocker.is_none() && e.encrypted {
-            assert!(e.crypt.is_some(), "mappable encrypted entry with no key material");
+            assert!(
+                e.crypt.is_some(),
+                "mappable encrypted entry with no key material"
+            );
         }
     }
     // `mapped_through` gates the hold list: bytes past it are retained in
@@ -116,7 +130,10 @@ fuzz_target!(|data: &[u8]| {
             let mut keyed =
                 VolumeMapper::with_password(declared, password.map(std::sync::Arc::from));
             keyed.feed(0, body);
-            assert!(keyed.blocker.is_none(), "a password blocked a plaintext volume");
+            assert!(
+                keyed.blocker.is_none(),
+                "a password blocked a plaintext volume"
+            );
             assert_eq!(
                 keyed.entries.len(),
                 plain.entries.len(),
@@ -138,7 +155,10 @@ fuzz_target!(|data: &[u8]| {
         let e = &m.entries[ei];
         // A base plus its piece length is where the extractor writes; it
         // must not wrap into a low offset.
-        assert!(base.checked_add(e.data_len).is_some(), "inner-file offset wraps");
+        assert!(
+            base.checked_add(e.data_len).is_some(),
+            "inner-file offset wraps"
+        );
     }
 
     // Half 2: the RAR4 `-hp` framing, past the key schedule. The key is a
@@ -155,10 +175,25 @@ fuzz_target!(|data: &[u8]| {
         // The mapper refuses any block that does not strictly advance, and
         // this is the value it checks. A header claiming to end at or
         // before its own start is the shape that spun the parse loop.
-        assert!(next > u64::from(mode) * 16, "encrypted header does not advance");
+        assert!(
+            next > u64::from(mode) * 16,
+            "encrypted header does not advance"
+        );
         if declared > 0 {
             assert!(next <= declared, "encrypted header runs past the volume");
         }
+    } else {
+        let _ = blocked;
+    }
+
+    // Half 3: the PLAINTEXT v4 framing, past the header CRC gate. Same
+    // cursor contract - a block that does not strictly advance is the
+    // shape that spun the parse loop, and `next` is the value the
+    // mapper's own bounds are all derived from.
+    let base = u64::from(mode) * 16;
+    let (next, blocked) = nzbkit::rar::fuzz_v4_plain_header(body, base);
+    if let Some(next) = next {
+        assert!(next > base, "plaintext header does not advance");
     } else {
         let _ = blocked;
     }

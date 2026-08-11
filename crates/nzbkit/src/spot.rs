@@ -578,13 +578,11 @@ pub fn parse_spot_xml(xml: &str) -> Option<SpotXml> {
     if xml.len() > MAX_SPOT_XML {
         return None;
     }
-    let title = xml_unescape(tag_text(xml, "Title")?);
+    let title = decode_text(tag_text(xml, "Title")?);
     let description = tag_text(xml, "Description")
-        .map(xml_unescape)
+        .map(decode_text)
         .unwrap_or_default();
-    let poster = tag_text(xml, "Poster")
-        .map(xml_unescape)
-        .unwrap_or_default();
+    let poster = tag_text(xml, "Poster").map(decode_text).unwrap_or_default();
     let cat_scope = tag_text(xml, "Category").unwrap_or("");
     let category = cat_scope
         .trim_start()
@@ -627,8 +625,7 @@ fn tag_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
         match xml[after..].chars().next() {
             Some('>') => {
                 let start = after + 1;
-                let end = start + xml[start..].find(&format!("</{tag}>"))?;
-                return Some(&xml[start..end]);
+                return Some(&xml[start..close_at(xml, start, tag)?]);
             }
             Some(c) if c.is_whitespace() => {
                 let gt = after + xml[after..].find('>')?;
@@ -636,12 +633,85 @@ fn tag_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
                     return None; // self-closing
                 }
                 let start = gt + 1;
-                let end = start + xml[start..].find(&format!("</{tag}>"))?;
-                return Some(&xml[start..end]);
+                return Some(&xml[start..close_at(xml, start, tag)?]);
             }
             _ => search = after, // e.g. <NZBx…> while looking for <NZB>
         }
     }
+}
+
+/// Where `</tag>` closes the element that starts at `start`, skipping
+/// over any CDATA section on the way.
+///
+/// A literal `</Title>` inside `<![CDATA[…]]>` is legal XML and means
+/// nothing to the parser, but a plain `find` would stop there - which
+/// is a free title-truncation primitive for a hostile spot, since the
+/// spot XML is attacker-supplied and its title becomes a wall card.
+///
+/// An UNTERMINATED `<![CDATA[` is not that attack, it is just broken
+/// markup, and refusing the element there would throw away a spot whose
+/// `<NZB>` segments parse perfectly well. So it degrades to the plain
+/// scan: the first close tag after the opener wins, as it did before
+/// this function existed.
+fn close_at(xml: &str, start: usize, tag: &str) -> Option<usize> {
+    let close = format!("</{tag}>");
+    let mut i = start;
+    loop {
+        let rest = &xml[i..];
+        let end = rest.find(&close).map(|p| i + p);
+        match rest.find(CDATA_OPEN).map(|p| i + p) {
+            // A CDATA section opens before the next close tag: jump the
+            // whole section, or give up on CDATA if it never closes.
+            Some(cd) if end.is_none_or(|e| cd < e) => {
+                let body = cd + CDATA_OPEN.len();
+                match xml[body..].find(CDATA_CLOSE) {
+                    Some(p) => i = body + p + CDATA_CLOSE.len(),
+                    None => return end,
+                }
+            }
+            _ => return end,
+        }
+    }
+}
+
+const CDATA_OPEN: &str = "<![CDATA[";
+const CDATA_CLOSE: &str = "]]>";
+
+/// One element's text with XML's two ways of writing the same string
+/// collapsed into one: `<![CDATA[…]]>` sections are literal, everything
+/// outside them is entity-escaped.
+///
+/// spotweb writes titles both ways depending on its vintage, and the
+/// CDATA form used to reach the wall verbatim - live cards named
+/// `<![CDATA[Shark Night (2011) R5 LiNE XviD - MiSTERE]]>`, 54 of them
+/// on a live index and a larger share the further back the feed is read
+/// (the 2011 depth sample is CDATA throughout). The `spots` table was
+/// never affected: its title comes from the OVER subject, and only the
+/// resolver's full-spot XML title takes this path.
+fn decode_text(inner: &str) -> String {
+    if !inner.contains(CDATA_OPEN) {
+        return xml_unescape(inner).trim().to_string();
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut rest = inner;
+    while let Some(p) = rest.find(CDATA_OPEN) {
+        out.push_str(&xml_unescape(&rest[..p]));
+        let body = &rest[p + CDATA_OPEN.len()..];
+        match body.find(CDATA_CLOSE) {
+            Some(e) => {
+                out.push_str(&body[..e]);
+                rest = &body[e + CDATA_CLOSE.len()..];
+            }
+            // Unterminated: the remainder is content, not markup.
+            None => {
+                out.push_str(body);
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(&xml_unescape(rest));
+    out.trim().to_string()
 }
 
 /// All `<tag>…</tag>` inner texts within `scope`, in order.
@@ -729,6 +799,12 @@ pub struct SpotScanSummary {
     pub new: u64,
     /// Valid key-id-7 spots whose hashcash PoW failed (warning only).
     pub hashcash_warn: u64,
+    /// Articles this pass read BELOW the low-water mark, i.e. history
+    /// the forward scan would never have reached.
+    pub deepened: u64,
+    /// Articles still below the low-water mark once this pass finished.
+    /// 0 means the group is scanned to its first article.
+    pub depth_left: u64,
 }
 
 /// Incremental OVER scan of a Spotnet group into the index DB. Resumes from
@@ -753,6 +829,7 @@ pub async fn scan_spots(
     group: &str,
     server_host: &str,
     backfill: u64,
+    deepen: u64,
 ) -> Result<SpotScanSummary, SpotError> {
     let g = conn.group(group).await?;
     let mark_key = format!("spots:{group}");
@@ -761,81 +838,159 @@ pub async fn scan_spots(
     // break on the final chunk stop a near-u64::MAX `high` from overflowing
     // (debug panic; in release it wraps to 0, rescans forever, and persists a
     // poisoned high-water mark that re-triggers next run).
+    let backfill_floor = g.high.saturating_sub(backfill).max(g.low);
     let mut low = if mark > 0 {
         mark.saturating_add(1)
     } else {
-        g.high.saturating_sub(backfill).max(g.low)
+        backfill_floor
     };
     let mut sum = SpotScanSummary::default();
     while low <= g.high {
-        let hi = low.saturating_add(9_999).min(g.high);
+        let hi = low.saturating_add(OVER_CHUNK - 1).min(g.high);
         let entries = conn.over(low, hi).await?;
-        for e in &entries {
-            sum.scanned += 1;
-            let Some(h) = parse_spot_from(&e.from) else {
-                sum.invalid += 1;
-                continue;
-            };
-            let v = verify_spot(&h, &e.subject, &e.message_id);
-            if !v.signature_ok {
-                sum.invalid += 1;
-                sum.unverified += 1;
-                continue;
-            }
-            sum.valid += 1;
-            if !v.hashcash_ok {
-                sum.hashcash_warn += 1;
-            }
-            // Spotnet's moderation traffic is posted to the same group in
-            // the same envelope, and it verifies exactly like content
-            // does - it is a takedown request naming another spot, not a
-            // description of a posting. There is no NZB behind one, so a
-            // stored moderation record is a row that reads like a release
-            // and cannot be downloaded. 1,345 of 16,603 verified records
-            // in a live 20,000-header pass, so it is 8% of the table.
-            //
-            // Matched on spotweb's own marker rather than the key regime:
-            // most of these are the self-signed "personal dispose" branch
-            // (see candidate_keys), so key-id alone does not separate them.
-            if is_moderation(&e.subject) {
-                sum.moderation += 1;
-                continue;
-            }
-            let spot = Spot {
-                id: 0,
-                msgid: e.message_id.clone(),
-                // The title the signature covered, not the raw subject.
-                // Some spotters sign the subject whole, `| ClubNZB` and
-                // all; others sign up to the `|` and append a tag after
-                // it. Only the verifier knows which, so storing the
-                // subject put one poster's tag inside everyone's title.
-                title: v.title.clone().unwrap_or_else(|| e.subject.clone()),
-                category: h.category,
-                subcats: h.subcats.join(","),
-                size: h.size,
-                date: h.date,
-                // Only a self-signed key identifies a spotter; a master-key
-                // spot's user-part is a random number, so hashing it would
-                // mint a fresh "identity" for every post.
-                spotter_id: match v.key_source {
-                    Some(SpotKeySource::SelfSigned) => spotter_id(&h.modulus),
-                    _ => String::new(),
-                },
-                verified: true,
-                hashcash_ok: v.hashcash_ok,
-                nzb_msgids: Vec::new(),
-            };
-            if ix.insert_spot(&spot)? {
-                sum.new += 1;
-            }
-        }
+        ingest_over(ix, &entries, &mut sum)?;
         ix.set_high_water(&mark_key, server_host, hi)?;
         if hi >= g.high {
             break;
         }
         low = hi + 1;
     }
+
+    // The deepening leg. Without it the spot catalogue is whatever the
+    // first backfill happened to reach plus the live trickle - on a live
+    // index, 26,552 spots over 141 days against a group holding 4.43 M
+    // articles back to 2011, all of it verified and, measured at five
+    // depths, all of it still fetchable. That history is the catalogue
+    // breadth the header scanner structurally cannot reach: spot NZBs
+    // target a.b.misc / boneless / nl / test, which we never scan.
+    //
+    // Cheap on purpose - OVER only, no bodies. Promotion to wall cards
+    // is the expensive half and stays budgeted and newest-first in
+    // `spot_resolve_pass`, so a deep backlog never delays a live spot.
+    if deepen == 0 {
+        return Ok(sum);
+    }
+    // An install that scanned before this existed has no low-water mark.
+    // Seeding it at today's backfill floor re-reads a band we already
+    // hold (insert_spot is ON CONFLICT DO NOTHING, so that costs OVER
+    // traffic once and nothing else) and, because `g.high` only ever
+    // rises, that floor is at or above the one the first backfill used
+    // - so the walk down passes through it and no band is skipped.
+    let floor = match ix.low_water(&mark_key, server_host) {
+        0 => backfill_floor,
+        n => n,
+    };
+    if floor <= g.low {
+        return Ok(sum); // the whole group is scanned
+    }
+    let stop = floor.saturating_sub(deepen).max(g.low);
+    for (lo, hi) in deepen_chunks(floor, stop) {
+        let entries = conn.over(lo, hi).await?;
+        ingest_over(ix, &entries, &mut sum)?;
+        sum.deepened += hi - lo + 1;
+        // Persist per chunk, not per pass, so an interrupted deepen
+        // keeps what it read - and DOWNWARD, so every write is lower
+        // than the last and the mark is always the deepest article
+        // fully read.
+        ix.set_low_water(&mark_key, server_host, lo)?;
+    }
+    sum.depth_left = stop.saturating_sub(g.low);
     Ok(sum)
+}
+
+/// OVER entries per request. Shared by both legs so the deepening walk
+/// has the same wire shape as the forward one.
+const OVER_CHUNK: u64 = 10_000;
+
+/// The deepening slice `[stop, floor)` cut into OVER-sized inclusive
+/// ranges, **deepest last**.
+///
+/// The direction is the whole point. The low-water mark is persisted
+/// after each chunk, so the last write is the one that survives, and it
+/// has to be the deepest article actually read. Walking upward writes
+/// the HIGHEST chunk start last, which re-reads the tail of the slice
+/// every pass: measured live at OVER_CHUNK = 10,000 with deepen =
+/// 20,000, the mark landed 10,000 articles above the deepest article
+/// read. With `deepen <= OVER_CHUNK` that never advances at all - one
+/// slice, re-read forever.
+fn deepen_chunks(floor: u64, stop: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut end = floor; // exclusive
+    while end > stop {
+        let lo = end.saturating_sub(OVER_CHUNK).max(stop);
+        out.push((lo, end - 1));
+        end = lo;
+    }
+    out
+}
+
+/// Parse, verify and store one OVER batch. Both scan legs run this;
+/// only the article range and the mark they move differ.
+fn ingest_over(
+    ix: &mut Index,
+    entries: &[crate::nntp::OverEntry],
+    sum: &mut SpotScanSummary,
+) -> Result<(), SpotError> {
+    for e in entries {
+        sum.scanned += 1;
+        let Some(h) = parse_spot_from(&e.from) else {
+            sum.invalid += 1;
+            continue;
+        };
+        let v = verify_spot(&h, &e.subject, &e.message_id);
+        if !v.signature_ok {
+            sum.invalid += 1;
+            sum.unverified += 1;
+            continue;
+        }
+        sum.valid += 1;
+        if !v.hashcash_ok {
+            sum.hashcash_warn += 1;
+        }
+        // Spotnet's moderation traffic is posted to the same group in
+        // the same envelope, and it verifies exactly like content
+        // does - it is a takedown request naming another spot, not a
+        // description of a posting. There is no NZB behind one, so a
+        // stored moderation record is a row that reads like a release
+        // and cannot be downloaded. 1,345 of 16,603 verified records
+        // in a live 20,000-header pass, so it is 8% of the table.
+        //
+        // Matched on spotweb's own marker rather than the key regime:
+        // most of these are the self-signed "personal dispose" branch
+        // (see candidate_keys), so key-id alone does not separate them.
+        if is_moderation(&e.subject) {
+            sum.moderation += 1;
+            continue;
+        }
+        let spot = Spot {
+            id: 0,
+            msgid: e.message_id.clone(),
+            // The title the signature covered, not the raw subject.
+            // Some spotters sign the subject whole, `| ClubNZB` and
+            // all; others sign up to the `|` and append a tag after
+            // it. Only the verifier knows which, so storing the
+            // subject put one poster's tag inside everyone's title.
+            title: v.title.clone().unwrap_or_else(|| e.subject.clone()),
+            category: h.category,
+            subcats: h.subcats.join(","),
+            size: h.size,
+            date: h.date,
+            // Only a self-signed key identifies a spotter; a master-key
+            // spot's user-part is a random number, so hashing it would
+            // mint a fresh "identity" for every post.
+            spotter_id: match v.key_source {
+                Some(SpotKeySource::SelfSigned) => spotter_id(&h.modulus),
+                _ => String::new(),
+            },
+            verified: true,
+            hashcash_ok: v.hashcash_ok,
+            nzb_msgids: Vec::new(),
+        };
+        if ix.insert_spot(&spot)? {
+            sum.new += 1;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -900,6 +1055,27 @@ pub async fn fetch_spot_nzb(
     }
     let nzb = unspecial_zip(&packed).ok_or_else(|| err("could not inflate the NZB payload"))?;
     Ok((sx, nzb))
+}
+
+/// The release payload message-ids inside an inflated spot NZB: the
+/// first segment of each file, bracketed the way OVER (and the index's
+/// `files.segments`) stores them.
+///
+/// These are the ids the release's own articles carry in the target
+/// group, so they can join a header-scanned index. The ids in
+/// `SpotXml::nzb_segments` cannot: those name the armored deflate
+/// chunks the NZB itself rides on alt.binaries.ftd, which never appear
+/// in any content group.
+pub fn payload_msgids(nzb: &[u8]) -> Vec<String> {
+    let Ok(parsed) = crate::nzb::Nzb::parse(nzb) else {
+        return Vec::new();
+    };
+    parsed
+        .files
+        .iter()
+        .filter_map(|f| f.segments.iter().min_by_key(|s| s.number))
+        .map(|s| format!("<{}>", s.message_id))
+        .collect()
 }
 
 /// Concatenate the values of every `X-XML:` header (in order). Spotweb eats
@@ -1403,6 +1579,153 @@ mod tests {
         assert!(parse_spot_xml(&big).is_none());
     }
 
+    /// spotweb writes titles either entity-escaped or CDATA-wrapped, and
+    /// the CDATA form used to reach the wall as markup: 54 live cards
+    /// were literally named `<![CDATA[…]]>`, and the deeper the feed is
+    /// read the larger that share gets (the 2011 depth sample is CDATA
+    /// throughout). CDATA content is LITERAL - entities inside it are
+    /// text, not escapes.
+    #[test]
+    fn cdata_titles_are_unwrapped_not_stored_as_markup() {
+        let sx =
+            parse_spot_xml("<Title><![CDATA[Shark Night (2011) R5 LiNE XviD - MiSTERE]]></Title>")
+                .unwrap();
+        assert_eq!(sx.title, "Shark Night (2011) R5 LiNE XviD - MiSTERE");
+
+        // Literal, so `&amp;` inside CDATA stays five characters, and a
+        // `<` needs no escape.
+        let sx = parse_spot_xml("<Title><![CDATA[A &amp; B <raw>]]></Title>").unwrap();
+        assert_eq!(sx.title, "A &amp; B <raw>");
+
+        // Mixed content: escaped outside, literal inside.
+        let sx = parse_spot_xml("<Title>Tom &amp; <![CDATA[Jerry & Co]]> 1080p</Title>").unwrap();
+        assert_eq!(sx.title, "Tom & Jerry & Co 1080p");
+
+        // Description and Poster take the same path.
+        let sx = parse_spot_xml(
+            "<Title>t</Title><Description><![CDATA[line<br>two]]></Description>\
+             <Poster><![CDATA[Nick <nick@x>]]></Poster>",
+        )
+        .unwrap();
+        assert_eq!(sx.description, "line<br>two");
+        assert_eq!(sx.poster, "Nick <nick@x>");
+
+        // A close tag written INSIDE CDATA is text. Without the
+        // CDATA-aware close scan this truncates to "cut here", which is
+        // a free title-truncation primitive on attacker-supplied XML.
+        let sx = parse_spot_xml("<Title><![CDATA[cut here</Title>and here]]></Title>").unwrap();
+        assert_eq!(sx.title, "cut here</Title>and here");
+
+        // Unterminated CDATA is broken markup, not the truncation
+        // attack, and refusing the element there would throw away a
+        // spot whose NZB segments parse fine. It degrades to the plain
+        // close-tag scan and the rest of the document still reads.
+        let sx = parse_spot_xml("<Title><![CDATA[no end</Title><Size>7</Size>").unwrap();
+        assert_eq!(sx.title, "no end");
+        assert_eq!(sx.size, 7);
+    }
+
+    /// The chunk walk runs DEEPEST LAST, because the low-water mark is
+    /// persisted per chunk and the surviving write must be the deepest
+    /// article read.
+    ///
+    /// Found on the wire, not in review: a live pass with deepen =
+    /// 20,000 left the mark 10,000 articles above the floor it had
+    /// actually reached, so the next pass would re-read that band - and
+    /// with `deepen <= OVER_CHUNK` the walk would never advance at all.
+    /// The multi-chunk case is what breaks, and the single-chunk test
+    /// below cannot see it.
+    #[test]
+    fn the_deepening_walk_persists_the_deepest_article_last() {
+        // Two and a half chunks below the floor.
+        let chunks = deepen_chunks(100_000, 75_000);
+        assert_eq!(
+            chunks,
+            vec![(90_000, 99_999), (80_000, 89_999), (75_000, 79_999),]
+        );
+        // Every article in the slice, once, and the LAST mark written
+        // is the bottom of the slice.
+        let covered: u64 = chunks.iter().map(|(lo, hi)| hi - lo + 1).sum();
+        assert_eq!(covered, 25_000);
+        assert_eq!(chunks.last().unwrap().0, 75_000);
+        for w in chunks.windows(2) {
+            assert!(w[1].0 < w[0].0, "marks must descend: {w:?}");
+            assert_eq!(w[1].1 + 1, w[0].0, "no gap between chunks");
+        }
+        // Sub-chunk and empty slices.
+        assert_eq!(deepen_chunks(1_000, 999), vec![(999, 999)]);
+        assert!(deepen_chunks(500, 500).is_empty());
+    }
+
+    /// The deepening leg walks BELOW the first backfill's floor, one
+    /// bounded slice a pass, and stops at the group's first article.
+    ///
+    /// Without it the spot catalogue is frozen at whatever the first
+    /// backfill reached plus the live trickle: on the live index, 26,552
+    /// spots over 141 days against a free.pt holding 4.43 M articles
+    /// back to 2011 - all verified, and all still fetchable when probed
+    /// at five depths.
+    #[tokio::test]
+    async fn deepening_walks_below_the_backfill_floor_and_stops_at_the_start() {
+        let key = test_key();
+        // Six spots at articles 1..=6, so GROUP reports low=1 high=6.
+        // Distinct titles keep the signatures distinct; distinct
+        // message-ids keep them distinct rows (hashcash is unmined
+        // here, which warns but stores - this is testing the walk).
+        let overview: Vec<OverRow> = (1..=6u64)
+            .map(|n| {
+                let title = format!("Deep Release {n}");
+                let s = make_spot(&key, &title, 7, false);
+                OverRow {
+                    number: n,
+                    subject: title,
+                    from: s.from,
+                    message_id: format!("<deep{n}@spot.net>"),
+                    bytes: 500,
+                }
+            })
+            .collect();
+        let srv =
+            MockServer::start_full(HashMap::new(), HashMap::new(), overview, Chaos::default())
+                .await;
+        let (mut conn, _) = Connection::connect(&srv.server_config()).await.unwrap();
+        let dir = std::env::temp_dir().join(format!("nzbfast-spotdeep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+
+        // Forward only, backfill 2: articles 4..6, and nothing below.
+        let sum = scan_spots(&mut conn, &mut ix, "free.pt", "mock", 2, 0)
+            .await
+            .unwrap();
+        assert_eq!((sum.scanned, sum.new, sum.deepened), (3, 3, 0));
+
+        // First deepening pass: 2 articles of history (2..3). The
+        // forward mark is untouched, so nothing is re-read at the tip.
+        let sum = scan_spots(&mut conn, &mut ix, "free.pt", "mock", 2, 2)
+            .await
+            .unwrap();
+        assert_eq!((sum.scanned, sum.new, sum.deepened), (2, 2, 2));
+        assert_eq!(sum.depth_left, 1, "article 1 is still below the floor");
+
+        // Second: the last article, and the walk reports itself done.
+        let sum = scan_spots(&mut conn, &mut ix, "free.pt", "mock", 2, 2)
+            .await
+            .unwrap();
+        assert_eq!((sum.new, sum.deepened, sum.depth_left), (1, 1, 0));
+        assert_eq!(ix.spot_stats().unwrap(), 6, "the whole group is indexed");
+
+        // Third: exhausted. A deepen pass over a fully scanned group
+        // costs one GROUP command and reads nothing, forever.
+        let sum = scan_spots(&mut conn, &mut ix, "free.pt", "mock", 2, 2)
+            .await
+            .unwrap();
+        assert_eq!((sum.scanned, sum.deepened), (0, 0));
+
+        conn.quit().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Full pipeline against the mock NNTP server: OVER scan → SQLite →
     /// search → HEAD (X-XML) → payload BODYs → byte-identical NZB.
     #[tokio::test]
@@ -1461,13 +1784,13 @@ mod tests {
         let mut ix = Index::open(&dir.join("index.db")).unwrap();
 
         // Scan: one header, one valid spot.
-        let sum = scan_spots(&mut conn, &mut ix, "free.pt", "mock", 1000)
+        let sum = scan_spots(&mut conn, &mut ix, "free.pt", "mock", 1000, 0)
             .await
             .unwrap();
         assert_eq!((sum.scanned, sum.valid, sum.invalid, sum.new), (1, 1, 0, 1));
         assert_eq!(sum.hashcash_warn, 0);
         // Re-scan is a no-op (high-water mark).
-        let sum2 = scan_spots(&mut conn, &mut ix, "free.pt", "mock", 1000)
+        let sum2 = scan_spots(&mut conn, &mut ix, "free.pt", "mock", 1000, 0)
             .await
             .unwrap();
         assert_eq!(sum2.scanned, 0);
@@ -1489,10 +1812,15 @@ mod tests {
         assert_eq!(sx.nzb_segments, seg_ids);
         assert_eq!(nzb, nzb_xml.as_bytes());
 
-        // Cache the segment list back into the DB.
-        ix.set_spot_nzb(&s.msgid, &sx.nzb_segments).unwrap();
+        // Cache the release payload ids (first segment per file,
+        // bracketed) back into the DB - NOT sx.nzb_segments: those are
+        // the ftd deflate-chunk ids, which never appear in any content
+        // group and so could never join a header-scanned index.
+        let payload = payload_msgids(&nzb);
+        assert_eq!(payload, vec!["<data1@x>".to_string()]);
+        ix.set_spot_nzb(&s.msgid, &payload).unwrap();
         let again = ix.spot_by_msgid(&s.msgid).unwrap().unwrap();
-        assert_eq!(again.nzb_msgids, seg_ids);
+        assert_eq!(again.nzb_msgids, payload);
 
         conn.quit().await;
         // The index must close before its directory goes: SQLite opens

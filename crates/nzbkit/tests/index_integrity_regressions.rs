@@ -78,6 +78,14 @@ fn category_sort_ranks_resolution_by_quality_not_lexicographically() {
 /// so the release is marked complete and its NZB mixes message-ids
 /// from two incompatible rar sets. The user downloads a "complete"
 /// release that extracts corrupt.
+///
+/// The expectation here CHANGED when TODO 136's scanner half landed.
+/// The original guard's answer was to drop the conflicting batch, so
+/// one row survived and the second generation was never indexed at all;
+/// this asserted `rows.len() == 1`. `ingest` now routes the second
+/// generation to its own release row, so the assertion is two rows,
+/// neither complete, neither NZB mixing generations - which is what the
+/// old single row could only approximate by throwing articles away.
 #[test]
 fn rerar_with_reused_filenames_must_not_mark_a_mixed_generation_complete() {
     let (mut ix, _dir) = temp_index("d3");
@@ -137,23 +145,30 @@ fn rerar_with_reused_filenames_must_not_mark_a_mixed_generation_complete() {
     )
     .unwrap();
 
+    // Both generations are now indexed, side by side, under one stem.
     let rows = ix.search("", 10).unwrap();
-    assert_eq!(rows.len(), 1);
-    let rel = &rows[0];
-    // Sanity: the defect's mechanism really is present - the emitted NZB
-    // mixes message-ids from both generations of the archive.
-    let nzb = ix.make_nzb(rel.id).unwrap();
-    let mixed = nzb.contains("gen1-p4") && nzb.contains("gen2-p1");
+    assert_eq!(rows.len(), 2, "the second generation was not indexed");
     // No coherent single-generation part set exists (gen2 is missing its
-    // part 3; gen1 is missing parts 1 and 2), so the release must not be
-    // reported complete. Today `total_parts` takes the last batch's 3,
-    // the unioned 5 part numbers satisfy nsegs >= total_parts, and the
-    // release flips to complete with a corrupt mixed-generation NZB.
-    assert!(
-        !rel.complete,
-        "release marked complete from two incompatible rar generations \
-         (mixed-generation NZB: {mixed})"
-    );
+    // part 3; gen1 is missing parts 1 and 2), so NEITHER row may be
+    // reported complete. Before the fix `total_parts` took the last
+    // batch's 3, the unioned 5 part numbers satisfied
+    // nsegs >= total_parts, and the single row flipped to complete.
+    for rel in &rows {
+        assert!(
+            !rel.complete,
+            "release {} marked complete from an incomplete generation",
+            rel.id
+        );
+        // The corruption itself: one NZB carrying articles from two
+        // incompatible rar sets, which is what "complete" would have
+        // handed the user.
+        let nzb = ix.make_nzb(rel.id).unwrap();
+        assert!(
+            !(nzb.contains("gen1-p4") && nzb.contains("gen2-p1")),
+            "release {}'s NZB mixes message-ids from both generations",
+            rel.id
+        );
+    }
 }
 
 /// Finding D2: `person_upsert`'s name fallback only refused rows whose
@@ -310,4 +325,237 @@ fn person_upsert_separates_two_people_who_differ_on_the_imdb_id() {
         bare == a || bare == b,
         "a handle-less credit forked a new row"
     );
+}
+
+// ---- TODO 136's scanner half: the generation split in `ingest` -------
+//
+// §136 fixed the repost collision in `promote_spot` and left it live in
+// the scanner, on the understanding that the D3 guard at least limited
+// the damage there. It does not - see the first test, which is the shape
+// D3 cannot see at all.
+//
+// Four of these five fail on the pre-fix code. The fifth
+// (`an_ordinary_release_arriving_in_chunks_stays_one_release`) passes
+// BOTH ways on purpose: it is the no-regression half, and what it
+// catches is somebody "tightening" the adopt rule from "contradicted?"
+// to "proven the same?", which would fork a card per scan chunk for
+// every release in the index.
+
+/// The case the D3 guard cannot see at all, and the reason "limits the
+/// damage to one file" overstated what it did: when the re-rar keeps the
+/// SAME volume size, `total_parts` agrees, the guard never fires, and
+/// the two article sets union into one file row - part 2 silently
+/// rewritten from generation 1's message-id to generation 2's. The union
+/// then satisfies `nsegs >= total_parts` and the release goes COMPLETE
+/// carrying one article from one posting and two from another.
+#[test]
+fn a_same_size_rerar_does_not_complete_a_release_out_of_two_postings() {
+    let (mut ix, _dir) = temp_index("gen-same-total");
+    let fname = "Golf.Film.2024.1080p.BluRay.x264-GRP.part1.rar";
+    let poster = "poster@example.com";
+    let batch = |a: (&str, u32), b: (&str, u32)| {
+        [
+            entry(
+                &format!("\"{fname}\" yEnc ({}/3)", a.1),
+                poster,
+                a.0,
+                750_000,
+            ),
+            entry(
+                &format!("\"{fname}\" yEnc ({}/3)", b.1),
+                poster,
+                b.0,
+                750_000,
+            ),
+        ]
+    };
+    // Generation 1: parts 1 and 2 of 3.
+    ix.ingest(
+        "alt.binaries.test",
+        &batch(("gen1-p1", 1), ("gen1-p2", 2)),
+        1_000,
+    )
+    .unwrap();
+    // Generation 2, re-rarred at the same volume size: parts 2 and 3.
+    // Part 2 is the collision - same file, same part number, a different
+    // message-id, which is proof and not a guess.
+    ix.ingest(
+        "alt.binaries.test",
+        &batch(("gen2-p2", 2), ("gen2-p3", 3)),
+        2_000,
+    )
+    .unwrap();
+
+    let rows = ix.search("", 10).unwrap();
+    assert_eq!(rows.len(), 2, "the repost did not get its own release row");
+    for rel in &rows {
+        assert!(
+            !rel.complete,
+            "release {} is 2 of 3 parts and was called complete",
+            rel.id
+        );
+        let nzb = ix.make_nzb(rel.id).unwrap();
+        assert!(
+            !(nzb.contains("gen1-p1") && nzb.contains("gen2-p3")),
+            "release {}'s NZB mixes articles from both postings",
+            rel.id
+        );
+    }
+}
+
+/// The chunk-stability property the whole design turns on. A spot can
+/// key its generation off a digest of the payload because it holds the
+/// complete manifest; the scanner sees arbitrary slices, so a digest of
+/// the slice would mint a fresh row per slice. Membership is decided by
+/// AGREEMENT with what is stored instead: generation 2's later batches
+/// share no part with generation 1 but also contradict nothing in
+/// generation 2's own row, so they land on it.
+///
+/// Without this the ~0.6% repost case would fork a new card per scan
+/// chunk - a worse failure than the one being fixed.
+#[test]
+fn later_batches_of_a_repost_land_on_the_row_it_already_minted() {
+    let (mut ix, _dir) = temp_index("gen-chunk-stable");
+    let stem = "Hotel.Film.2024.1080p.BluRay.x264-GRP";
+    let poster = "poster@example.com";
+    let art = |f: &str, part: u32, id: &str| {
+        entry(
+            &format!("\"{stem}.{f}\" yEnc ({part}/2)"),
+            poster,
+            id,
+            750_000,
+        )
+    };
+    // Generation 1, complete: two files of two parts each.
+    ix.ingest(
+        "alt.binaries.test",
+        &[
+            art("part1.rar", 1, "g1-a1"),
+            art("part1.rar", 2, "g1-a2"),
+            art("part2.rar", 1, "g1-b1"),
+            art("part2.rar", 2, "g1-b2"),
+        ],
+        1_000,
+    )
+    .unwrap();
+    assert_eq!(ix.search("", 10).unwrap().len(), 1);
+
+    // Generation 2 arrives in two chunks. The FIRST contradicts
+    // generation 1 (part1.rar part 1 under a new id) and mints a row.
+    ix.ingest(
+        "alt.binaries.test",
+        &[art("part1.rar", 1, "g2-a1"), art("part1.rar", 2, "g2-a2")],
+        2_000,
+    )
+    .unwrap();
+    let after_first = ix.search("", 10).unwrap();
+    assert_eq!(after_first.len(), 2, "the repost did not fork a row");
+
+    // The SECOND chunk covers a file the new row has never seen, so it
+    // shares no part number with EITHER row. It must still land on the
+    // row its own generation minted rather than forking a third.
+    ix.ingest(
+        "alt.binaries.test",
+        &[art("part2.rar", 1, "g2-b1"), art("part2.rar", 2, "g2-b2")],
+        3_000,
+    )
+    .unwrap();
+    let rows = ix.search("", 10).unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "a later chunk of the same repost minted a third card"
+    );
+    // And it landed on the right one: generation 2's row is now the
+    // complete four-article set, with nothing of generation 1 in it.
+    let g2 = rows
+        .iter()
+        .find(|r| ix.make_nzb(r.id).unwrap().contains("g2-a1"))
+        .expect("generation 2's row vanished");
+    let nzb = ix.make_nzb(g2.id).unwrap();
+    for id in ["g2-a1", "g2-a2", "g2-b1", "g2-b2"] {
+        assert!(nzb.contains(id), "{id} did not reach generation 2's row");
+    }
+    for id in ["g1-a1", "g1-a2", "g1-b1", "g1-b2"] {
+        assert!(!nzb.contains(id), "{id} leaked into generation 2's row");
+    }
+}
+
+/// The in-memory half. `clusters` merges by part number BEFORE the
+/// database is consulted, so both generations inside ONE OVER window -
+/// what a backfill leg spanning the weeks between a post and its repost
+/// routinely returns - used to lose one article per colliding part
+/// without any code ever seeing a conflict. The pass defers what it
+/// cannot place and re-drives it against the rows it just committed, so
+/// there is one arbiter rather than two.
+#[test]
+fn one_over_window_holding_both_generations_keeps_every_article() {
+    let (mut ix, _dir) = temp_index("gen-one-window");
+    let fname = "India.Film.2024.1080p.BluRay.x264-GRP.part1.rar";
+    let poster = "poster@example.com";
+    // A single batch carrying both postings of the same two parts.
+    ix.ingest(
+        "alt.binaries.test",
+        &[
+            entry(&format!("\"{fname}\" yEnc (1/2)"), poster, "g1-p1", 750_000),
+            entry(&format!("\"{fname}\" yEnc (2/2)"), poster, "g1-p2", 750_000),
+            entry(&format!("\"{fname}\" yEnc (1/2)"), poster, "g2-p1", 750_000),
+            entry(&format!("\"{fname}\" yEnc (2/2)"), poster, "g2-p2", 750_000),
+        ],
+        1_000,
+    )
+    .unwrap();
+    let rows = ix.search("", 10).unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "both generations arrived in one window and were folded into one row"
+    );
+    // Every article survived, and each row holds exactly one posting.
+    let nzbs: Vec<String> = rows.iter().map(|r| ix.make_nzb(r.id).unwrap()).collect();
+    for id in ["g1-p1", "g1-p2", "g2-p1", "g2-p2"] {
+        assert!(
+            nzbs.iter().any(|n| n.contains(id)),
+            "{id} was dropped by the in-memory clustering"
+        );
+    }
+    for nzb in &nzbs {
+        assert!(
+            !(nzb.contains("g1-p1") && nzb.contains("g2-p2")),
+            "one row mixes both postings"
+        );
+    }
+}
+
+/// The other half of the "unkeyed means unknown" rule §136 settled for
+/// spots, and the reason the adopt test asks about CONTRADICTION rather
+/// than about proof of sameness. An ordinary release that arrives over
+/// many scan chunks shares no part number between chunks, so a rule
+/// demanding positive evidence of sameness would fork a card per chunk
+/// for every release in the index. Silence adopts.
+#[test]
+fn an_ordinary_release_arriving_in_chunks_stays_one_release() {
+    let (mut ix, _dir) = temp_index("gen-no-false-fork");
+    let stem = "Juliet.Film.2024.1080p.BluRay.x264-GRP";
+    let poster = "poster@example.com";
+    for (n, id) in [(1, "c1"), (2, "c2"), (3, "c3"), (4, "c4")] {
+        ix.ingest(
+            "alt.binaries.test",
+            &[entry(
+                &format!("\"{stem}.part{n}.rar\" yEnc (1/1)"),
+                poster,
+                id,
+                750_000,
+            )],
+            1_000 + n as i64,
+        )
+        .unwrap();
+    }
+    let rows = ix.search("", 10).unwrap();
+    assert_eq!(rows.len(), 1, "a chunked arrival forked into several cards");
+    assert!(rows[0].complete, "the release did not converge on complete");
+    let nzb = ix.make_nzb(rows[0].id).unwrap();
+    for id in ["c1", "c2", "c3", "c4"] {
+        assert!(nzb.contains(id), "{id} did not reach the release");
+    }
 }

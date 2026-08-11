@@ -383,7 +383,16 @@ fn dupe_action_discard_and_fail_change_what_a_duplicate_becomes() {
             )
         };
         let add = |seg: &str, name: &str, allow: bool| {
-            d.enqueue(nzb(seg).as_bytes(), name, "", -100, None, "test", allow)
+            d.enqueue(
+                nzb(seg).as_bytes(),
+                name,
+                "",
+                -100,
+                None,
+                None,
+                "test",
+                allow,
+            )
         };
         // A name with a derivable identity (SxxEyy) so dupe_key exists.
         add("one", "Show.S01E02.1080p.nzb", false).unwrap();
@@ -414,6 +423,80 @@ fn dupe_action_discard_and_fail_change_what_a_duplicate_becomes() {
         let ok = add("five", "Show.S01E02.HDR.nzb", true).unwrap();
         assert!(!d.held_as_duplicate(&ok));
         assert_eq!(d.queue.lock_ok().len(), 3);
+    });
+}
+
+/// §129 4a: an add announces itself on the event ring BEFORE the job
+/// can be picked, so no consumer ever sees a job start before it
+/// exists. The runner picks under the queue lock (`pick_job`), which is
+/// the lock `enqueue` emits under - a picker spinning as fast as it can
+/// must still land behind the job.added. Regression: the emit used to
+/// sit after the push and after `save_queue`, and a loaded box really
+/// did put job.started on the ring first (seq 1, 54 ms early).
+#[test]
+fn an_add_is_on_the_event_ring_before_the_job_can_be_picked() {
+    with_daemon("addbeforepick", |d| {
+        let picker = {
+            let d = d.clone();
+            std::thread::spawn(move || {
+                // Stands in for the runner's pick arm: spin on pick_job
+                // and emit job.started the moment one appears, the same
+                // order tasks.rs uses (claim the job, then emit).
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::time::Instant::now() < deadline {
+                    if let Some(j) = d.pick_job(false) {
+                        let mut g = j.lock_ok();
+                        g.state = JobState::Downloading;
+                        d.life_emit("job.started", serde_json::json!({"nzo_id": g.nzo_id}));
+                        return true;
+                    }
+                    std::thread::yield_now();
+                }
+                false
+            })
+        };
+        let nzb = "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\
+                   <file poster=\"x\" date=\"0\" subject=\"&quot;a.bin&quot; yEnc (1/1)\">\
+                   <groups><group>g</group></groups><segments>\
+                   <segment bytes=\"1000\" number=\"1\">ord1@x</segment>\
+                   </segments></file></nzb>";
+        d.enqueue(
+            nzb.as_bytes(),
+            "Order.Test.nzb",
+            "",
+            0,
+            None,
+            None,
+            "test",
+            false,
+        )
+        .expect("enqueue");
+        assert!(picker.join().expect("picker thread"), "nothing was picked");
+
+        let ring: Vec<(String, u64)> = d
+            .life_events
+            .lock_ok()
+            .iter()
+            .map(|e| {
+                (
+                    e["kind"].as_str().unwrap_or_default().to_string(),
+                    e["seq"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect();
+        let at = |kind: &str| {
+            ring.iter()
+                .position(|(k, _)| k == kind)
+                .unwrap_or_else(|| panic!("no {kind} on the ring: {ring:?}"))
+        };
+        let (added, started) = (at("job.added"), at("job.started"));
+        assert!(added < started, "job.started outran job.added: {ring:?}");
+        // Ring order and seq order are the same claim; a fix that
+        // reserved a seq early but pushed late would break this half.
+        assert!(
+            ring[added].1 < ring[started].1,
+            "seq out of order: {ring:?}"
+        );
     });
 }
 
@@ -463,6 +546,7 @@ fn cat_meta_priority_dir_and_script_apply() {
                 "tv",
                 -100,
                 None,
+                None,
                 "test",
                 false,
             )
@@ -474,6 +558,7 @@ fn cat_meta_priority_dir_and_script_apply() {
                 "Beta.2026.nzb",
                 "tv",
                 -1,
+                None,
                 None,
                 "test",
                 false,
@@ -528,6 +613,16 @@ fn cat_meta_priority_dir_and_script_apply() {
         // is what a SAB client sends back from mode=get_scripts, so it
         // resolves through known_scripts to the real path - stored
         // verbatim it became a cwd-relative path that ran nothing.
+        // (§129 4a: record_add_params FILLS, never clobbers - at add
+        // time these fields are empty unless the pre-queue hook set
+        // them, and the hook outranks the request. Clear the values the
+        // resolve_script cases above planted.)
+        {
+            let g = job_by(d, &id);
+            let mut g = g.lock_ok();
+            g.script_override = String::new();
+            g.sab_pp = None;
+        }
         d.record_add_params(&id, Some("1"), Some("tv.py"), false);
         {
             let g = job_by(d, &id);
@@ -541,9 +636,23 @@ fn cat_meta_priority_dir_and_script_apply() {
         assert_eq!(names, ["global.py", "tv.py"]);
         // An unknown name is a logged compatibility note, never a
         // stored override - the category/global ladder stays in charge.
+        // (Also the fill-only rule doing its other job: refusing can
+        // never become a way to CLEAR an existing override.)
         d.record_add_params(&id, None, Some("ghost.py"), false);
         assert_eq!(job_by(d, &id).lock_ok().script_override, "/scripts/tv.py");
+        // §129 4a: fill-only in general - once set (at add time that
+        // means the pre-queue hook set it), the request's own script=
+        // does not displace it. The hook outranks the request, SAB
+        // pre-queue semantics.
+        d.record_add_params(&id, None, Some("/elsewhere/mine.py"), false);
+        assert_eq!(
+            job_by(d, &id).lock_ok().script_override,
+            "/scripts/tv.py",
+            "a planted override survives the request's script="
+        );
+        let clear = || job_by(d, &id).lock_ok().script_override = String::new();
         // A path-bearing value is operator intent and stays as written.
+        clear();
         d.record_add_params(&id, None, Some("/elsewhere/mine.py"), false);
         assert_eq!(
             job_by(d, &id).lock_ok().script_override,
@@ -564,12 +673,48 @@ fn cat_meta_priority_dir_and_script_apply() {
         );
         // A configured name is still fine on the add-only key: it can
         // only select something the operator already installed.
+        clear();
         d.record_add_params(&id, None, Some("tv.py"), true);
         assert_eq!(job_by(d, &id).lock_ok().script_override, "/scripts/tv.py");
         // SAB's own null still suppresses the whole ladder.
+        clear();
         d.record_add_params(&id, None, Some("None"), false);
         assert_eq!(job_by(d, &id).lock_ok().script_override, "None");
         assert_eq!(d.resolve_script(&job_by(d, &id)), None);
+    });
+}
+
+/// A job that never reached the QUEUE still keeps the add's `pp=` and
+/// `script=`.
+///
+/// A pre-queue reject and dupe_action="fail" both answer the add with an
+/// id and file the record straight to history, and `record_add_params`
+/// searched the queue alone - so those two paths dropped the caller's
+/// post-processing parameters on the floor. The record is what a History
+/// retry brings back, so it has to carry them (M15, 10 Aug sweep).
+#[test]
+fn add_params_reach_a_job_that_went_straight_to_history() {
+    with_daemon("addparams-history", |d| {
+        let job = jv("hist-1", "Rejected.Release", serde_json::json!({}));
+        {
+            let mut g = job.lock_ok();
+            g.state = JobState::Failed;
+            g.fail_message = "rejected by the pre-queue script".into();
+        }
+        d.history.lock_ok().push(job.clone());
+
+        d.record_add_params("hist-1", Some("2"), Some("/scripts/mine.py"), false);
+        {
+            let g = job.lock_ok();
+            assert_eq!(g.sab_pp, Some(2), "pp= was lost on the history path");
+            assert_eq!(g.script_override, "/scripts/mine.py");
+        }
+        // ...and it reached the store, not just the in-memory record.
+        let stored = std::fs::read_to_string(d.history_store_path()).unwrap_or_default();
+        assert!(
+            stored.contains("/scripts/mine.py"),
+            "the history record was not persisted: {stored:?}"
+        );
     });
 }
 
@@ -791,6 +936,51 @@ fn enabled_indexers_counts_only_enabled_and_drives_the_tri_state() {
     });
 }
 
+#[test]
+fn scoreboard_reference_prefers_the_named_account_and_never_falls_through() {
+    with_daemon("sbref", |d| {
+        let mk = |name: &str, enabled: bool| crate::newznab::IndexerConfig {
+            name: name.into(),
+            url: "https://geek.test".into(),
+            apikey: "k1".into(),
+            enabled,
+            priority: 0,
+            hits_per_day: 0,
+            grabs_per_day: 0,
+        };
+        // Nothing configured at all: the ask-the-user message.
+        assert!(d.scoreboard_reference().is_err());
+
+        // Manual pair only - the pre-existing shape still works.
+        *d.scoreboard_url.lock_ok() = "https://manual.test".into();
+        *d.scoreboard_key.lock_ok() = Some("mk".into());
+        assert_eq!(
+            d.scoreboard_reference(),
+            Ok(("https://manual.test".into(), "mk".into()))
+        );
+
+        // A named account wins over the manual pair, key included.
+        d.indexers.lock_ok().push(mk("geek", true));
+        *d.scoreboard_source.lock_ok() = "geek".into();
+        assert_eq!(
+            d.scoreboard_reference(),
+            Ok(("https://geek.test".into(), "k1".into()))
+        );
+
+        // Disabled or deleted, the named pick is an ERROR - never a
+        // silent fall-through to the manual pair, and never traffic to
+        // an account the user turned off.
+        d.indexers.lock_ok()[0].enabled = false;
+        assert!(d.scoreboard_reference().unwrap_err().contains("turned off"));
+        d.indexers.lock_ok().clear();
+        assert!(
+            d.scoreboard_reference()
+                .unwrap_err()
+                .contains("no longer in your indexer list")
+        );
+    });
+}
+
 // -- evict policy / predb config --------------------------------------------
 
 #[cfg(feature = "indexer")]
@@ -863,6 +1053,45 @@ fn usage_ledger_accumulates_and_skips_zero_entries() {
         d.add_usage(&[("s1.example".into(), 50)]);
         assert_eq!(d.usage_lifetime("s1.example"), 150);
         assert!(d.spool.join("usage.json").exists(), "persisted to spool");
+    });
+}
+
+/// §129 4c: the second empty state must not come back once a job has
+/// run. Clearing history is the case that broke a naive "is the queue
+/// empty right now" check, so the sticky term is asserted on its own -
+/// with the queue and history both empty, which is exactly the state a
+/// user who cleared everything is in.
+#[test]
+fn jobs_ever_is_sticky_across_a_cleared_history() {
+    with_daemon("jobsever", |d| {
+        assert!(!d.jobs_ever(), "a fresh install has never downloaded");
+        // A completed download bills the lifetime bucket...
+        d.add_usage(&[("s1.example".into(), 4096)]);
+        assert!(d.jobs_ever(), "billed bytes say a job has run");
+        // ...and the bucket outlives an emptied queue and history.
+        d.queue.lock_ok().clear();
+        d.history.lock_ok().clear();
+        assert!(
+            d.jobs_ever(),
+            "clearing history must not send a working install back to onboarding"
+        );
+    });
+}
+
+/// The other half: a job that failed before it billed a single byte
+/// still ends the empty state, because it is in history.
+#[test]
+fn jobs_ever_answers_off_history_alone() {
+    with_daemon("jobsever-hist", |d| {
+        assert!(!d.jobs_ever());
+        let j = crate::serve::tests_jobs::job(serde_json::json!({
+            "nzo_id": "abc", "name": "Some.Show.S01E01", "nzb_path": "/spool/a.nzb",
+            "state": "Failed", "out_dir": "/dl/a",
+        }));
+        d.history
+            .lock_ok()
+            .push(std::sync::Arc::new(std::sync::Mutex::new(j)));
+        assert!(d.jobs_ever(), "a failed job never bills usage, but it ran");
     });
 }
 
@@ -1197,5 +1426,132 @@ fn retry_keeps_an_out_dir_that_is_still_under_the_current_root() {
         );
         // Its journal is intact at that folder, so its progress is kept.
         assert_eq!(g.downloaded_bytes, 4096);
+    });
+}
+
+/// C4-4 (§131 identity substrate): an accepted NZB is a (name, payload
+/// message-id set) pairing. When its payload ids are rows the scanner
+/// holds, the add records a MsgidSet claim against them, provenance-
+/// tagged with the add's origin - and a sub-quorum overlap records
+/// nothing, because a single message-id can be seeded.
+#[cfg(feature = "indexer")]
+#[test]
+fn an_accepted_nzb_pairs_its_msgids_onto_scanned_rows() {
+    with_daemon("nzbpair", |d| {
+        d.index_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Two dark scanned rows, three articles each.
+        d.with_index_mut(|ix| {
+            let row = |stem: &str, tag: &str| -> Vec<nzbkit::nntp::OverEntry> {
+                (1..=3u64)
+                    .map(|n| nzbkit::nntp::OverEntry {
+                        number: n,
+                        subject: format!(r#""{stem}.part1.rar" yEnc ({n}/3)"#),
+                        from: "p@x".into(),
+                        message_id: format!("<{tag}{n}@test>"),
+                        bytes: 1000,
+                        date: 1_700_000_000,
+                    })
+                    .collect()
+            };
+            ix.ingest("a.b.dark", &row("jumbled77aa", "pair"), 1_700_000_001)
+                .ok()?;
+            ix.ingest("a.b.dark", &row("jumbled77bb", "sub"), 1_700_000_001)
+                .ok()
+        })
+        .expect("seed index");
+        let nzb = |ids: &[&str]| {
+            let segs: String = ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    format!(
+                        r#"<segment bytes="1000" number="{}">{id}@test</segment>"#,
+                        i + 1
+                    )
+                })
+                .collect();
+            format!(
+                "<?xml version=\"1.0\"?><nzb><file poster=\"x\" date=\"0\" \
+                 subject=\"&quot;a.bin&quot; yEnc (1/{})\"><groups><group>g</group>\
+                 </groups><segments>{segs}</segments></file></nzb>",
+                ids.len()
+            )
+        };
+        // All three of the first row's ids: quorum, claim recorded.
+        d.enqueue(
+            nzb(&["pair1", "pair2", "pair3"]).as_bytes(),
+            "Real.Show.S01E01.1080p-GRP.nzb",
+            "",
+            -100,
+            None,
+            None,
+            "watch",
+            false,
+        )
+        .unwrap();
+        // Only two of the second row's: under quorum, nothing recorded.
+        d.enqueue(
+            nzb(&["sub1", "sub2"]).as_bytes(),
+            "Wrong.Name.S09E09.720p-BAD.nzb",
+            "",
+            -100,
+            None,
+            None,
+            "watch",
+            true,
+        )
+        .unwrap();
+        let (paired, sub) = d
+            .with_index(|ix| {
+                let rid = |posted: &str| {
+                    ix.release_ids_by_stem(posted)
+                        .unwrap()
+                        .first()
+                        .copied()
+                        .expect("seeded row")
+                };
+                let paired = ix.name_claims(rid("jumbled77aa.part1.rar")).unwrap();
+                let sub = ix.name_claims(rid("jumbled77bb.part1.rar")).unwrap();
+                Some((paired, sub))
+            })
+            .expect("index open");
+        assert_eq!(paired.len(), 1, "{paired:?}");
+        let (name, tier, _key, source, _at) = &paired[0];
+        assert_eq!(name, "Real.Show.S01E01.1080p-GRP");
+        assert_eq!(tier, "msgid-set");
+        assert_eq!(source, "nzb-watch");
+        assert!(sub.is_empty(), "sub-quorum must record nothing: {sub:?}");
+    });
+}
+
+/// The restart window the 10 Aug audit flagged: the stats cache is
+/// empty until the first successful read, and a scan batch can hold the
+/// write connection from the moment the daemon comes up - index_stats
+/// answered (0,0,0,0) and the dashboard told whoever loaded the page
+/// that a populated index was empty. The pooled read-only connections
+/// run concurrently with that writer, so a busy write lock must not
+/// read as an empty index.
+#[cfg(feature = "indexer")]
+#[test]
+fn index_stats_answer_from_the_read_pool_while_the_writer_is_busy() {
+    with_daemon("statsro", |d| {
+        d.index_enabled.store(true, Ordering::Relaxed);
+        // Create the database (and run migrations) through the write
+        // connection, exactly as startup's first ingest would.
+        d.with_index(|_ix| Some(())).expect("index open");
+        assert!(
+            d.index_stats_cache.lock_ok().is_none(),
+            "precondition: no successful stats read has seeded the cache"
+        );
+        // A scan batch owns the write connection for the whole window.
+        let _writer = d.index.lock_ok();
+        let snap = d.index_stats_snapshot();
+        assert!(
+            snap.2 > 0,
+            "a busy write lock must not read as an empty index: {snap:?}"
+        );
+        // And the answer seeds the cache for the next busy poll.
+        assert_eq!(*d.index_stats_cache.lock_ok(), Some(snap));
     });
 }

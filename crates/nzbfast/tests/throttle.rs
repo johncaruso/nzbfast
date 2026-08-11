@@ -300,9 +300,12 @@ async fn speedlimit_paces_and_lifts_live() {
     let fast_xml = nzb_xml("fast.bin", &fast_segs);
     let dir2 = dir.clone();
     tokio::task::spawn_blocking(move || {
-        // The CLI-set cap is visible before anything downloads.
+        // The CLI-set cap is visible before anything downloads. A
+        // STRING since issue #34: SABnzbd sends this field as one, and
+        // our own mode=status always did - the queue body was the odd
+        // one out.
         let q = http(port, "/api?mode=queue&output=json", None);
-        assert!(q.contains("\"speedlimit_abs\":500000"), "{q}");
+        assert!(q.contains("\"speedlimit_abs\":\"500000\""), "{q}");
 
         // ~2 MB (≈2.05 MB raw yEnc actually charged) at 500 KB/s must take
         // ≥ 4 s of reading - assert a generous ≥ 3 s lower bound only.
@@ -327,7 +330,7 @@ async fn speedlimit_paces_and_lifts_live() {
         );
         assert!(r.contains("\"status\":true"), "{r}");
         let q = http(port, "/api?mode=queue&output=json", None);
-        assert!(q.contains("\"speedlimit_abs\":0"), "{q}");
+        assert!(q.contains("\"speedlimit_abs\":\"0\""), "{q}");
 
         // Bad values are rejected without touching the cap.
         let r = http(
@@ -337,7 +340,7 @@ async fn speedlimit_paces_and_lifts_live() {
         );
         assert!(r.contains("\"status\":false"), "{r}");
         let q = http(port, "/api?mode=queue&output=json", None);
-        assert!(q.contains("\"speedlimit_abs\":0"), "{q}");
+        assert!(q.contains("\"speedlimit_abs\":\"0\""), "{q}");
 
         // Uncapped, the same-sized post completes fast (loose bound - this
         // took ≥ 4 s while capped).
@@ -426,7 +429,7 @@ async fn auto_speed_governor_smoke() {
         assert!(r.contains("\"status\":true"), "{r}");
         let q = http(port, "/api?mode=queue&output=json", None);
         assert!(q.contains("\"auto_speed\":false"), "{q}");
-        assert!(q.contains("\"speedlimit_abs\":0"), "{q}");
+        assert!(q.contains("\"speedlimit_abs\":\"0\""), "{q}");
         // And back on.
         let r = http(
             port,

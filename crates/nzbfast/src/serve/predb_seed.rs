@@ -156,6 +156,7 @@ pub(super) fn spawn_seed_import(daemon: Arc<Daemon>, days: u32) -> bool {
         .name("predb-seed".into())
         .spawn(move || {
             let sink = DaemonSink(daemon.clone());
+            let _busy = daemon.busy.hold("predb");
             match run(&sink, days) {
                 Ok(msg) => {
                     info!(target: "predb", "seed import done: {msg}");

@@ -59,6 +59,11 @@ pub(super) enum CandSrc {
     External {
         url: String,
         indexer: String,
+        /// `indexer`'s configured URL and the addresses it answered the
+        /// search from. `url` is an `<enclosure url>` that indexer's
+        /// search response chose, so the grab binds the fetch to this
+        /// origin (M12/M9).
+        origin: SourceOrigin,
     },
 }
 
@@ -618,6 +623,7 @@ pub(super) fn watchlist_pass(d: &Arc<Daemon>) {
                         src: CandSrc::External {
                             url: r.link,
                             indexer: r.indexer,
+                            origin: r.origin,
                         },
                         posted: r.posted,
                         stem: r.title,
@@ -1026,11 +1032,16 @@ pub(super) fn watchlist_grab(
                 category,
                 -100,
                 None,
+                None,
                 "watchlist",
                 false,
             )
         }
-        CandSrc::External { url, indexer } => {
+        CandSrc::External {
+            url,
+            indexer,
+            origin,
+        } => {
             {
                 let mut rt = d.indexer_rt.lock_ok();
                 rt.usage.roll(unix_now());
@@ -1046,7 +1057,10 @@ pub(super) fn watchlist_grab(
                     return None;
                 }
             }
-            let fetched = match fetch_url(url) {
+            // fetch_url_from: the link is an `<enclosure url>` this
+            // indexer's search response chose, so it may not reach a
+            // private address the indexer does not own (M12).
+            let fetched = match fetch_url_from(url, origin) {
                 Ok(f) => f,
                 Err(e) => {
                     // redact_url_creds: fetch_url names the URL it failed
@@ -1062,7 +1076,17 @@ pub(super) fn watchlist_grab(
                     return None;
                 }
             };
-            let r = d.enqueue_fetched(&fetched, stem, category, -100, None, 0, "watchlist", false);
+            let r = d.enqueue_fetched(
+                &fetched,
+                stem,
+                category,
+                -100,
+                None,
+                None,
+                0,
+                "watchlist",
+                false,
+            );
             if r.is_ok() {
                 let mut rt = d.indexer_rt.lock_ok();
                 rt.usage.count_grab(indexer);
@@ -1104,6 +1128,12 @@ pub(super) struct ExtCand {
     size: u64,
     posted: i64,
     indexer: String,
+    /// That indexer's configured URL and search-time addresses, carried
+    /// beside its name so the grab can bind the enclosure fetch to the
+    /// origin that offered it (M12/M9) without a by-name lookup the user
+    /// may have renamed away, and without a re-resolution a hostile DNS
+    /// would answer differently.
+    origin: SourceOrigin,
 }
 
 /// Ask every enabled, in-budget indexer about one watchlist item.
@@ -1200,7 +1230,7 @@ pub(super) fn watchlist_external_candidates(
     let mut refused: Vec<String> = Vec::new();
     for (name, r) in results {
         match r {
-            Ok(items) => {
+            Ok((items, origin)) => {
                 asked_ok += 1;
                 for it in items {
                     out.push(ExtCand {
@@ -1209,6 +1239,7 @@ pub(super) fn watchlist_external_candidates(
                         size: it.size,
                         posted: it.posted,
                         indexer: name.clone(),
+                        origin: origin.clone(),
                     });
                 }
             }

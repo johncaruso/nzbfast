@@ -4,6 +4,13 @@ use super::*;
 mod settings_apply;
 use settings_apply::apply_setting_tail;
 
+#[path = "settings_index.rs"]
+mod settings_index;
+// Globbed rather than listed: six of these validators are
+// `#[cfg(feature = "indexer")]`, and an explicit list would need the same
+// cfg maze a second time.
+use settings_index::*;
+
 /// Everything `get_config` needs to read the live daemon, so a table row
 /// can be a plain `fn` pointer instead of a closure over locals.
 pub(super) struct ConfigCtx<'a> {
@@ -204,6 +211,17 @@ pub(super) const fn rw_opaque(name: &'static str, read: fn(&ConfigCtx) -> Value)
 }
 
 /// Reported to the UI, but there is nothing to set.
+/// A row `get_config` builds itself and nothing may write: the server
+/// list, the two first-run signals, the pending-restart diff.
+pub(super) const fn assembled(name: &'static str) -> Setting {
+    Setting {
+        name,
+        expose: Expose::Assembled,
+        write: Write::No,
+        log: Log::Plain,
+    }
+}
+
 pub(super) const fn ro(name: &'static str, read: fn(&ConfigCtx) -> Value) -> Setting {
     Setting {
         name,
@@ -259,6 +277,12 @@ pub(super) const PATHS: &[Setting] = &[
     rw("script", |c| json!(path_str(&c.d.script.lock_ok()))),
     rw("script_timeout_secs", |c| {
         json!(c.d.script_timeout.load(Ordering::Relaxed))
+    }),
+    rw("pre_queue_script", |c| {
+        json!(path_str(&c.d.pre_queue_script.lock_ok()))
+    }),
+    rw("pre_queue_timeout_secs", |c| {
+        json!(c.d.pre_queue_timeout.load(Ordering::Relaxed))
     }),
     #[cfg(feature = "indexer")]
     rw("index_db", |c| json!(c.d.index_db.to_string_lossy())),
@@ -464,6 +488,15 @@ pub(super) const INDEXING: &[Setting] = &[
     rw("spot_backfill", |c| {
         json!(c.d.spot_backfill.load(Ordering::Relaxed))
     }),
+    // TODO 131 item 7 (Spotnet as catalogue breadth): how much of the
+    // feed's HISTORY each pass reads below the low-water mark, and how
+    // many of those spots the resolver turns into wall cards.
+    rw("spot_deepen", |c| {
+        json!(c.d.spot_deepen.load(Ordering::Relaxed))
+    }),
+    rw("spot_resolve", |c| {
+        json!(c.d.spot_resolve.load(Ordering::Relaxed))
+    }),
     rw("library_cats", |c| {
         json!(c.d.library_cats.lock_ok().clone())
     }),
@@ -505,6 +538,30 @@ pub(super) const INDEXING: &[Setting] = &[
     }),
     rw("index_gapfill", |c| {
         json!(c.d.index_gapfill.load(Ordering::Relaxed))
+    }),
+    // TODO 131 B3: the byte-probe naming lane's kill switch and its
+    // article budget (per hour, 0 = off).
+    rw("index_probe7z", |c| {
+        json!(c.d.index_probe7z.load(Ordering::Relaxed))
+    }),
+    rw("index_probe7z_budget", |c| {
+        json!(c.d.index_probe7z_budget.load(Ordering::Relaxed))
+    }),
+    // TODO 131 red-team 5a: the pesto tiny-PAR2 naming rung's kill
+    // switch and its article budget (per hour, 0 = off).
+    rw("index_pesto", |c| {
+        json!(c.d.index_pesto.load(Ordering::Relaxed))
+    }),
+    rw("index_pesto_budget", |c| {
+        json!(c.d.index_pesto_budget.load(Ordering::Relaxed))
+    }),
+    // §131 #6: the posted-NZB ingestion rung's kill switch and its
+    // article budget (per hour, 0 = off).
+    rw("index_nzbimport", |c| {
+        json!(c.d.index_nzbimport.load(Ordering::Relaxed))
+    }),
+    rw("index_nzbimport_budget", |c| {
+        json!(c.d.index_nzbimport_budget.load(Ordering::Relaxed))
     }),
     rw("group_desc_isc", |c| {
         json!(c.d.group_desc_isc.load(Ordering::Relaxed))
@@ -570,6 +627,23 @@ pub(super) const INDEXING: &[Setting] = &[
     #[cfg(feature = "indexer")]
     rw("predb_seed_days", |c| {
         json!(c.d.predb_seed_days.load(Ordering::Relaxed))
+    }),
+    // Parity scoreboard. Off by default and inert without a reference
+    // URL; the API key is a credential and lives in KEYS below.
+    rw("scoreboard_enabled", |c| {
+        json!(c.d.scoreboard_enabled.load(Ordering::Relaxed))
+    }),
+    rw("scoreboard_url", |c| {
+        json!(c.d.scoreboard_url.lock_ok().clone())
+    }),
+    // Which of the user's indexer accounts is the reference; empty =
+    // the manual URL+key pair. A NAME, never a credential - the url
+    // and key are resolved from the `indexers` entry at run time.
+    rw("scoreboard_source", |c| {
+        json!(c.d.scoreboard_source.lock_ok().clone())
+    }),
+    rw("scoreboard_calibrate", |c| {
+        json!(c.d.scoreboard_calibrate.load(Ordering::Relaxed))
     }),
 ];
 
@@ -723,6 +797,7 @@ pub(super) const AUTOMATION: &[Setting] = &[
                             "email_to": t.email_to,
                             "email_from": t.email_from,
                             "has_token": !t.token.is_empty(),
+                            "has_secret": !t.secret.is_empty(),
                             "last_send": health.get(&crate::notify::target_key(t)),
                         })
                     })
@@ -800,35 +875,33 @@ pub(super) const KEYS: &[Setting] = &[
         write: Write::Setting,
         log: Log::Masked,
     },
+    Setting {
+        name: "scoreboard_key",
+        expose: Expose::Hidden,
+        write: Write::Setting,
+        log: Log::Masked,
+    },
     ro("has_apikey", |c| json!(c.d.apikey.lock_ok().is_some())),
     ro("has_nzbkey", |c| json!(c.d.nzbkey.lock_ok().is_some())),
     ro("has_omdb", |c| json!(c.d.omdb_key.lock_ok().is_some())),
+    ro("has_scoreboard_key", |c| {
+        json!(c.d.scoreboard_key.lock_ok().is_some())
+    }),
 ];
 
 /// Rows `get_config` fills in itself, plus the SAB-compatible actions
 /// that go through `mode=config` without being settings at all.
 pub(super) const RUNTIME: &[Setting] = &[
-    // The usenet servers, secrets masked - built alongside the
-    // first-run signal that says whether any exist yet.
-    Setting {
-        name: "servers",
-        expose: Expose::Assembled,
-        write: Write::No,
-        log: Log::Plain,
-    },
-    Setting {
-        name: "servers_configured",
-        expose: Expose::Assembled,
-        write: Write::No,
-        log: Log::Plain,
-    },
+    // The usenet servers, secrets masked - built alongside the two
+    // first-run signals: whether any server exists yet, and (§129 4c)
+    // whether anything has ever been downloaded. The second is derived
+    // from the queue, the history AND the usage store, which is why it
+    // is assembled here rather than read off any one of them.
+    assembled("servers"),
+    assembled("servers_configured"),
+    assembled("jobs_ever"),
     // Saved-but-not-yet-applied values for the restart-only settings.
-    Setting {
-        name: "pending",
-        expose: Expose::Assembled,
-        write: Write::No,
-        log: Log::Plain,
-    },
+    assembled("pending"),
     // SAB parity: `config&name=set_pause&value=<minutes>`. Handled
     // before apply_setting ever sees it, and stores nothing.
     Setting {
@@ -1040,6 +1113,74 @@ fn set_index_gapfill(
             return Err("index_gapfill: 0-100 releases per pass".into());
         }
         d.index_gapfill.store(n, Ordering::Relaxed);
+        (true, json!(n))
+    })
+}
+
+fn set_index_probe7z_budget(
+    d: &Arc<Daemon>,
+    name: &str,
+    v: &str,
+) -> std::result::Result<(bool, Value), String> {
+    let uint = || {
+        v.trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{name}: not a number"))
+    };
+    Ok({
+        // B3: probe articles per hour across all releases; 0 = off.
+        // 2000/h is ~13x the default and already past the point where
+        // the lane outruns the band's daily inflow.
+        let n = uint()?;
+        if n > 2000 {
+            return Err("index_probe7z_budget: 0-2000 articles per hour".into());
+        }
+        d.index_probe7z_budget.store(n, Ordering::Relaxed);
+        (true, json!(n))
+    })
+}
+
+fn set_index_pesto_budget(
+    d: &Arc<Daemon>,
+    name: &str,
+    v: &str,
+) -> std::result::Result<(bool, Value), String> {
+    let uint = || {
+        v.trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{name}: not a number"))
+    };
+    Ok({
+        // Pesto rung articles per hour; 0 = off. A named set costs ~2
+        // articles, so even the default 120 outruns the band's inflow.
+        let n = uint()?;
+        if n > 2000 {
+            return Err("index_pesto_budget: 0-2000 articles per hour".into());
+        }
+        d.index_pesto_budget.store(n, Ordering::Relaxed);
+        (true, json!(n))
+    })
+}
+
+fn set_index_nzbimport_budget(
+    d: &Arc<Daemon>,
+    name: &str,
+    v: &str,
+) -> std::result::Result<(bool, Value), String> {
+    let uint = || {
+        v.trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{name}: not a number"))
+    };
+    Ok({
+        // Posted-NZB fetch articles per hour; 0 = off. Most candidates
+        // are one article; the 32 MiB decode cap bounds the largest at
+        // ~48, and 2000/h is far past the walk's own 3-a-minute pace.
+        let n = uint()?;
+        if n > 2000 {
+            return Err("index_nzbimport_budget: 0-2000 articles per hour".into());
+        }
+        d.index_nzbimport_budget.store(n, Ordering::Relaxed);
         (true, json!(n))
     })
 }
@@ -1460,375 +1601,24 @@ fn set_nested_max_depth(
     })
 }
 
-fn set_predb_enabled(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        let on = v == "1" || v.eq_ignore_ascii_case("true");
-        let was = d.predb_enabled.swap(on, Ordering::Relaxed);
-        if on != was {
-            // The listener polls this flag; say what changed rather
-            // than leaving an outbound connection to appear in
-            // somebody's firewall log unexplained.
-            *d.predb_status.lock_ok() = String::new();
-            if on {
-                info!(
-                    target: "predb",
-                    "pre feed ON - connecting to {} and listening on {}",
-                    d.predb_server.lock_ok(),
-                    d.predb_channels.lock_ok()
-                );
-            } else {
-                info!(target: "predb", "pre feed off - the connection closes and nothing is fetched");
-            }
-        }
-        (true, json!(on))
-    })
+/// The charset a stored key may use: letters, digits, `-` and `_`.
+/// The `/watch` handler already drops anything outside this set before
+/// echoing a key into a header, and characters like `&`, `+`, `%` or
+/// `#` sent raw change the parsed query of every generated link - so a
+/// key holding them authenticates direct calls but breaks the URLs the
+/// daemon writes. Refuse at creation instead of failing later.
+pub(super) fn key_charset_ok(k: &str) -> bool {
+    k.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
-fn set_predb_corr_enabled(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        let on = v == "1" || v.eq_ignore_ascii_case("true");
-        let was = d.predb_corr_enabled.swap(on, Ordering::Relaxed);
-        if on != was {
-            info!(
-                target: "predb",
-                "correlation {} - obfuscated posts {} suggested names from pre timing+size",
-                if on { "ON" } else { "off" },
-                if on { "get" } else { "no longer get" }
-            );
-        }
-        (true, json!(on))
-    })
-}
-
-fn set_predb_corr_auto(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        let on = v == "1" || v.eq_ignore_ascii_case("true");
-        let was = d.predb_corr_auto.swap(on, Ordering::Relaxed);
-        if on != was {
-            info!(
-                target: "predb",
-                "auto-apply {} - strong unique correlations {}",
-                if on { "ON" } else { "off" },
-                if on {
-                    "become display names without a click (revocable, never renames files)"
-                } else {
-                    "stay suggestions"
-                }
-            );
-        }
-        (true, json!(on))
-    })
-}
-
-#[cfg(feature = "indexer")]
-fn set_predb_max_rows(
-    d: &Arc<Daemon>,
-    name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    let uint = || {
-        v.trim()
-            .parse::<u64>()
-            .map_err(|_| format!("{name}: not a number"))
-    };
-    Ok({
-        // Clamped rather than rejected: this is a capacity knob, and
-        // a number outside the sane range is a typo, not a request.
-        let n = uint()?.clamp(
-            super::predb_seed::PREDB_MAX_ROWS_MIN,
-            super::predb_seed::PREDB_MAX_ROWS_MAX,
-        );
-        d.predb_max_rows.store(n, Ordering::Relaxed);
-        info!(target: "predb", "feed table capped at {n} pre row(s)");
-        (true, json!(n))
-    })
-}
-
-fn set_predb_server(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        // `host` or `host:port`. Validated only for shape: the set of
-        // networks carrying a relay is not ours to enumerate.
-        let s = v.trim().to_string();
-        if s.contains(char::is_whitespace) {
-            return Err("predb_server: expected a host or host:port".into());
-        }
-        if let Some((_, port)) = s.rsplit_once(':')
-            && port.parse::<u16>().is_err()
-        {
-            return Err("predb_server: the part after ':' must be a port number".into());
-        }
-        *d.predb_server.lock_ok() = if s.is_empty() {
-            nzbkit::predb::DEFAULT_HOST.to_string()
-        } else {
-            s.clone()
-        };
-        (true, json!(d.predb_server.lock_ok().clone()))
-    })
-}
-
-fn set_predb_channels(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        let chans: Vec<String> = v
-            .split(',')
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            // A channel name may not contain a space, a comma or a
-            // control character - a malformed one would be sent
-            // verbatim in a JOIN, which is the one place this client
-            // writes to somebody else's server.
-            .map(|c| {
-                c.chars()
-                    .filter(|ch| !ch.is_whitespace() && !ch.is_control() && *ch != ',')
-                    .collect::<String>()
-            })
-            .filter(|c| !c.is_empty())
-            .collect();
-        let joined = if chans.is_empty() {
-            nzbkit::predb::DEFAULT_CHANNELS.join(",")
-        } else {
-            chans.join(",")
-        };
-        *d.predb_channels.lock_ok() = joined.clone();
-        (true, json!(joined))
-    })
-}
-
-fn set_predb_nick(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        // Nick charset per RFC 2812, minus the leading-digit rule
-        // (the random suffix is appended, so the base only has to be
-        // safe). Empty falls back to the default rather than sending
-        // a bare suffix.
-        let n: String = v
-            .trim()
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || "[]\\`_^{|}-".contains(*c))
-            .take(12)
-            .collect();
-        let n = if n.is_empty() {
-            nzbkit::predb::DEFAULT_NICK.to_string()
-        } else {
-            n
-        };
-        *d.predb_nick.lock_ok() = n.clone();
-        (true, json!(n))
-    })
-}
-
-fn set_index_paused(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        let on = v == "1" || v.eq_ignore_ascii_case("true");
-        d.index_paused.store(on, Ordering::Relaxed);
-        // Resuming should not wait out the rest of the interval -
-        // the user just asked for it.
-        if !on {
-            d.scan_now.notify_one();
-        }
-        (true, json!(on))
-    })
-}
-
-#[cfg(feature = "indexer")]
-fn set_index_enabled(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        let on = v == "1" || v.eq_ignore_ascii_case("true");
-        d.index_enabled.store(on, Ordering::Relaxed);
-        if on {
-            // Switching on mid-run: turn any interests the wizard
-            // recorded into groups (a no-op if that already
-            // happened) and scan straight away rather than after a
-            // full interval of an empty wall.
-            apply_interests(d);
-            d.scan_now.notify_one();
-            info!(target: "index", "indexer switched on");
-        } else {
-            // Order matters: stop the workers reaching for the
-            // database before closing it, so the next `with_index`
-            // cannot re-open what we just dropped. The atomic above
-            // is what both of those read.
-            d.close_index();
-            info!(target: "index", "indexer switched off - nothing is scanned, fetched or stored");
-        }
-        (true, json!(on))
-    })
-}
-
-#[cfg(feature = "indexer")]
-fn set_spot_enabled(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        let on = v == "1" || v.eq_ignore_ascii_case("true");
-        d.spot_enabled.store(on, Ordering::Relaxed);
-        if on {
-            // Same reasoning as the indexer switch: scan now rather
-            // than after a full interval of an empty list.
-            d.scan_now.notify_one();
-            info!(target: "spots", "Spotnet spots switched on");
-        } else {
-            // A no-op while the indexer still wants the database.
-            d.close_index();
-            info!(target: "spots", "Spotnet spots switched off - no spot group is scanned");
-        }
-        (true, json!(on))
-    })
-}
-
-fn set_spot_groups(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        let groups: Vec<String> = v
-            .split(&[',', ' ', '\n'][..])
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        *d.spot_groups.lock_ok() = groups.clone();
-        d.scan_now.notify_one();
-        (true, json!(groups))
-    })
-}
-
-fn set_spot_backfill(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        // A first pass walks back this many articles; later passes
-        // resume from the high-water mark, so this only ever costs
-        // once per group. Capped: free.pt holds ~4.4M articles and
-        // asking for all of them is minutes of OVER for spots that
-        // are years stale.
-        let n: u64 = v
-            .trim()
-            .parse()
-            .map_err(|_| "spot_backfill: expected a number".to_string())?;
-        let n = n.clamp(1_000, 1_000_000);
-        d.spot_backfill.store(n, Ordering::Relaxed);
-        (true, json!(n))
-    })
-}
-
-#[cfg(feature = "indexer")]
-fn set_index_evict_order(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        let o = v.trim().to_ascii_lowercase();
-        if parse_evict_order(&o).is_none() {
-            return Err(format!(
-                "index_evict_order: expected one of {}",
-                EVICT_ORDERS.join(", ")
-            ));
-        }
-        *d.index_evict_order.lock_ok() = o.clone();
-        (true, json!(o))
-    })
-}
-
-#[cfg(feature = "indexer")]
-fn set_index_evict_kinds(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        // Restriction list, not an exclusion list: empty = every
-        // kind may be evicted. Validated because a typo would
-        // restrict eviction to a kind no row carries, leaving a cap
-        // that silently never frees a byte.
-        let kinds = parse_evict_kinds(v).map_err(|e| format!("index_evict_kinds: {e}"))?;
-        *d.index_evict_kinds.lock_ok() = kinds.clone();
-        (true, json!(kinds))
-    })
-}
-
-fn set_index_evict(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        // The one switch that lets the daemon delete indexed rows on
-        // its own. Default OFF and it stays off until the user says
-        // otherwise - see the field doc on Daemon::index_evict.
-        let on = v == "1" || v.eq_ignore_ascii_case("true");
-        d.index_evict.store(on, Ordering::Relaxed);
-        if on {
-            let cap = d.index_max_bytes.load(Ordering::Relaxed);
-            info!(
-                target: "index",
-                "automatic eviction ON{}",
-                if cap == 0 {
-                    " - but index_max_bytes is 0 (unlimited), so nothing will be evicted"
-                        .to_string()
-                } else {
-                    format!(" - cap {:.0} MB", cap as f64 / (1u64 << 20) as f64)
-                }
-            );
-        }
-        (true, json!(on))
-    })
-}
-
-#[cfg(feature = "indexer")]
-fn set_index_gates(
-    d: &Arc<Daemon>,
-    _name: &str,
-    v: &str,
-) -> std::result::Result<(bool, Value), String> {
-    Ok({
-        let text = v.trim().to_string();
-        let parsed = if text.is_empty() {
-            None
-        } else {
-            Some(crate::gates::Gates::from_json(&text).map_err(|e| format!("gates: {e}"))?)
-        };
-        *d.index_gates.lock_ok() = (text.clone(), parsed);
-        (true, json!(text))
-    })
-}
+pub(super) const KEY_CHARSET_ERR: &str =
+    "keys may use letters, digits, '-' and '_' only - other characters break generated links";
 
 fn set_apikey(d: &Arc<Daemon>, _name: &str, v: &str) -> std::result::Result<(bool, Value), String> {
+    if !key_charset_ok(v.trim()) {
+        return Err(format!("apikey: {KEY_CHARSET_ERR}"));
+    }
     Ok({
         let k = v.trim().to_string();
         *d.apikey.lock_ok() = (!k.is_empty()).then(|| k.clone());
@@ -2255,9 +2045,14 @@ fn set_arr_giveup_threshold(
     };
     Ok({
         // §96.3: distinct failed releases per target before the
-        // give-up fires. 0 = off. Capped loosely - a huge value is a
-        // breaker that never trips, which is just "off" spelt long.
-        let n = uint()?.min(1000);
+        // give-up fires. 0 = off.
+        //
+        // Capped at the evidence store's own cap, not at a round 1000:
+        // a target remembers at most `MAX_STEMS` distinct failed stems,
+        // so a threshold above that is a condition that can never become
+        // true - "off", but spelt as a number the user believes will
+        // fire (M13, 10 Aug sweep). Clamping says what actually happens.
+        let n = uint()?.min(super::giveup::MAX_STEMS as u64);
         d.arr_giveup_threshold.store(n, Ordering::Relaxed);
         (true, json!(n))
     })
@@ -2599,6 +2394,24 @@ pub(super) fn apply_setting(
             (true, json!(d.index_coverage.load(Ordering::Relaxed)))
         }
         "index_gapfill" => set_index_gapfill(d, name, v)?,
+        "index_probe7z" => {
+            // TODO 131 B3: the byte-probe naming lane's kill switch.
+            d.index_probe7z.store(flag(), Ordering::Relaxed);
+            (true, json!(d.index_probe7z.load(Ordering::Relaxed)))
+        }
+        "index_probe7z_budget" => set_index_probe7z_budget(d, name, v)?,
+        "index_pesto" => {
+            // TODO 131 red-team 5a: the pesto rung's kill switch.
+            d.index_pesto.store(flag(), Ordering::Relaxed);
+            (true, json!(d.index_pesto.load(Ordering::Relaxed)))
+        }
+        "index_pesto_budget" => set_index_pesto_budget(d, name, v)?,
+        "index_nzbimport" => {
+            // §131 #6: the posted-NZB ingestion rung's kill switch.
+            d.index_nzbimport.store(flag(), Ordering::Relaxed);
+            (true, json!(d.index_nzbimport.load(Ordering::Relaxed)))
+        }
+        "index_nzbimport_budget" => set_index_nzbimport_budget(d, name, v)?,
         "bench_interval" => set_bench_interval(d, name, v)?,
         "auto_prefetch" => set_auto_prefetch(d, name, v)?,
         "race_stragglers" => set_race_stragglers(d, name, v)?,
@@ -2803,6 +2616,21 @@ pub(super) fn apply_and_save(
         // guards is the ordering, not an invariant a panic can corrupt.
         .then(|| CREDENTIAL_TX.lock_ok());
     let (live, persist) = apply_setting(d, name, v)?;
+    // Same rule as `save_queue` and `persist_pause`: the dashboard's
+    // revisioned poll only resends the queue payload when this handle
+    // moves, and several settings ARE that payload - speedlimit_abs,
+    // auto_speed, limit_source, quota, password_prompt,
+    // unpack_eat_volumes. Without a bump the page keeps the object it
+    // last applied, so on an idle daemon the header limit dropdown
+    // snapped back to its old value a second after it was changed, the
+    // way the Offline button did.
+    //
+    // Deliberately blunt - every setting, not the payload-borne few. A
+    // list here would be a second copy of `queue_json`'s field set, and
+    // the two would drift the moment either is edited; the cost of being
+    // wrong in this direction is one extra queue payload on a poll that
+    // was going to answer anyway.
+    d.queue_rev.fetch_add(1, Ordering::Relaxed);
     // The write result is the only signal that the change is DURABLE, and
     // it used to be dropped: on a full disk or a read-only settings dir
     // the live key became B and B was returned as a success while

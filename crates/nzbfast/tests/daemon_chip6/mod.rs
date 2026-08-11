@@ -47,15 +47,42 @@ fn upload(port: u16, xml: &str) -> String {
         .unwrap()
 }
 
-fn poll_until(port: u16, pred: &dyn Fn(&str) -> bool, what: &str, tries: usize) -> String {
+fn poll_endpoint(
+    port: u16,
+    path: &str,
+    pred: &dyn Fn(&str) -> bool,
+    what: &str,
+    tries: usize,
+) -> String {
+    let mut last = String::new();
     for _ in 0..tries {
-        let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
-        if pred(&h) {
-            return h;
+        last = http(port, path, None);
+        if pred(&last) {
+            return last;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    panic!("timed out waiting for {what}");
+    panic!("timed out waiting for {what}\n--- last response ---\n{last}");
+}
+
+fn poll_until(port: u16, pred: &dyn Fn(&str) -> bool, what: &str, tries: usize) -> String {
+    poll_endpoint(
+        port,
+        "/api?mode=history&apikey=sekrit&output=json",
+        pred,
+        what,
+        tries,
+    )
+}
+
+fn poll_queue_until(port: u16, pred: &dyn Fn(&str) -> bool, what: &str, tries: usize) -> String {
+    poll_endpoint(
+        port,
+        "/api?mode=queue&apikey=sekrit&output=json",
+        pred,
+        what,
+        tries,
+    )
 }
 
 fn build_cmd(cfg: std::path::PathBuf, dir: std::path::PathBuf) -> impl Fn(u16) -> Command {
@@ -93,8 +120,24 @@ async fn pause_inside_an_outage_window_then_resume_completes() {
     let data = payload(240_000, 23);
     let mut articles = HashMap::new();
     let segs = make_file_articles("po.bin", &data, 40_000, "po", &mut articles);
-    // 2.5 s of hard connect refusals from mock start: the daemon's
-    // fleet exhausts its ladder and parks well inside it.
+    // The daemon comes up BEFORE the mock exists, against an empty
+    // server list, because `refuse_connect_ms` is measured from the
+    // mock's own birth (mock.rs, against `ThrottleState::started`) and
+    // daemon startup is not free: measured here at ~215 ms warm but
+    // 2,805 ms on a cold binary, which is longer than the whole 2.5 s
+    // window. When startup ate the window the fleet never parked at
+    // all, so this rig quietly became a healthy-path download - and
+    // then failed on the pause it exists to make, the queue rightly
+    // refusing a job that had already finished. Nothing is dialled
+    // until a job is queued, and the download path re-reads the config
+    // per job (tasks.rs, get_with_progress), so the real server is
+    // written in below and the window starts with the daemon already up.
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[]}").unwrap();
+    let d = serve(&dir, build_cmd(cfg.clone(), dir.clone())).await;
+    let port = d.port;
+    // 2.5 s of hard connect refusals from HERE: the daemon's fleet
+    // exhausts its ladder and parks well inside it.
     let srv = MockServer::start(
         articles,
         Chaos {
@@ -103,7 +146,10 @@ async fn pause_inside_an_outage_window_then_resume_completes() {
         },
     )
     .await;
-    let cfg = dir.join("config.json");
+    // Taken after start() returns, so it is a hair LATER than the
+    // mock's internal epoch - the safe direction for the resume wait
+    // below, which must land after the window has genuinely closed.
+    let outage_ends = std::time::Instant::now() + std::time::Duration::from_millis(2_500);
     std::fs::write(
         &cfg,
         format!(
@@ -113,23 +159,45 @@ async fn pause_inside_an_outage_window_then_resume_completes() {
         ),
     )
     .unwrap();
-    let d = serve(&dir, build_cmd(cfg.clone(), dir.clone())).await;
-    let port = d.port;
     let dir2 = dir.clone();
     tokio::task::spawn_blocking(move || {
         let xml = nzb_for("po.bin", &segs);
         let id = upload(port, &xml);
-        // Let the fleet hit the outage and park, then pause the job
-        // while everything is parked.
-        std::thread::sleep(std::time::Duration::from_millis(800));
+        // Wait for the fleet to ACTUALLY park in the outage rather than
+        // sleeping at it. `connecting` is the queue's own word for this
+        // job owning the pool with zero connections up and zero bytes
+        // moved (sabcompat.rs) - a first dial that is getting nowhere,
+        // which is precisely the state this test wants to pause.
+        poll_queue_until(
+            port,
+            &|q: &str| q.contains("\"activity\":\"connecting\""),
+            "the fleet to park behind the outage",
+            100,
+        );
         let r = http(
             port,
             &format!("/api?mode=queue&name=pause&value={id}&apikey=sekrit&output=json"),
             None,
         );
         assert!(r.contains("\"status\":true"), "pause refused: {r}");
-        // Outage clears at 2.5 s; resume after it.
-        std::thread::sleep(std::time::Duration::from_millis(2_200));
+        // And it has to be VISIBLE, not merely acknowledged: the row
+        // reads Paused (sabcompat.rs) once the flag is set and the
+        // transfer wound down. Checked because the whole failure this
+        // rig just had was a silent one - it stopped exercising the
+        // outage at all and still looked like a passing test.
+        poll_queue_until(
+            port,
+            &|q: &str| q.contains("\"status\":\"Paused\""),
+            "the paused job to read Paused",
+            25,
+        );
+        // Resume only once the outage has genuinely cleared, timed off
+        // the window's own end rather than off however long the pause
+        // above happened to take to arrange.
+        let now = std::time::Instant::now();
+        if outage_ends > now {
+            std::thread::sleep(outage_ends - now);
+        }
         let r = http(
             port,
             &format!("/api?mode=queue&name=resume&value={id}&apikey=sekrit&output=json"),

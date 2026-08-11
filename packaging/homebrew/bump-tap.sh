@@ -145,7 +145,19 @@ fi
 [ "$PUSH" = yes ] || { echo "not pushing (pass --push)"; exit 0; }
 
 echo "publishing to $TAP_REPO ..."
-git clone -q "https://github.com/$TAP_REPO.git" "$WORK/tap"
+# ANONYMITY, enforced structurally: a fresh clone has no local git config,
+# so the machine-wide credential helper (osxkeychain, holding the personal
+# login) would serve the push. Blank the helper list and pin gh's - gh
+# resolves against GH_CONFIG_DIR, exported above, so the only credential
+# this clone can ever use is the release account's. Found the hard way on
+# v1.0.21: the bare push here went out under the personal login and was
+# 403'd by the tap repo's permissions - the last line of defence, not one
+# to lean on.
+anon_git() {
+    git -c credential.helper= \
+        -c 'credential.helper=!gh auth git-credential' "$@"
+}
+anon_git clone -q "https://github.com/$TAP_REPO.git" "$WORK/tap"
 mkdir -p "$WORK/tap/Formula"
 cp "$FORMULA" "$WORK/tap/Formula/nzbfast.rb"
 # The tap's README and CI live here too, so a change to either ships with the
@@ -162,5 +174,5 @@ fi
 git add -A
 git -c user.name=nzbfast -c user.email=releases@nzbfast.com \
     commit -qm "nzbfast $VERSION"
-git push -q origin HEAD:main
+anon_git push -q origin HEAD:main
 echo "pushed $VERSION to $TAP_REPO"

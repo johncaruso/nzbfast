@@ -121,7 +121,9 @@ pub fn decide_name(f: &Facts) -> Option<(String, &'static str)> {
     {
         return Some(got);
     }
-    if !release::looks_obfuscated(posted) {
+    // The whole-stem verdict: `blob.7z` is not a name, and reading it
+    // as one skipped the two recoveries below entirely (M7, 10 Aug).
+    if release::stem_is_a_name(posted) {
         return None;
     }
     if let Some((name, _)) = &f.remembered
@@ -154,7 +156,7 @@ pub fn xrel_query(name: &str, known_imdb: &str) -> Option<String> {
         return None;
     }
     let name = name.trim();
-    if release::looks_obfuscated(name) || release::group_of(name).is_none() {
+    if !release::stem_is_a_name(name) || release::group_of(name).is_none() {
         return None;
     }
     let p = release::parse_release(name);
@@ -168,23 +170,32 @@ pub fn xrel_query(name: &str, known_imdb: &str) -> Option<String> {
     })
 }
 
-/// Read the PAR2 sidecars sitting beside a finished download and return
-/// their member fingerprints.
+/// What a finished download's PAR2 sidecar says about its identity:
+/// the Recovery Set ID (the set's own strong identity - the §131
+/// claims layer's `par2-set-id` proving key) and the member-file
+/// fingerprints the repost table keys on.
+#[cfg(feature = "indexer")]
+pub struct ParSidecar {
+    /// Lowercase hex of the 16-byte Recovery Set ID.
+    pub set_id: String,
+    /// `(hash16k hex, member name)` per outer volume.
+    pub pairs: Vec<(String, String)>,
+}
+
+/// Read the PAR2 sidecars sitting beside a finished download.
 ///
 /// Sidecars only, and only the top level: `.par2` files are what the
 /// post shipped, and the recovery volumes repeat the same critical
 /// packets, so the index alone answers. Called BEFORE the cleanup sweep,
 /// which is what deletes them.
 #[cfg(feature = "indexer")]
-pub fn par_fingerprints(dir: &std::path::Path) -> Vec<(String, String)> {
+pub fn par_sidecar(dir: &std::path::Path) -> Option<ParSidecar> {
     // A main index is small (tens of KB); a `.vol000+50.par2` is not,
     // and reading a 700 MB recovery volume to learn what its first
     // packet already said would stall the tail. Read the smallest few
     // candidates and stop as soon as one set parses.
     const MAX_READ: u64 = 8 << 20;
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
+    let rd = std::fs::read_dir(dir).ok()?;
     let mut cands: Vec<(u64, std::path::PathBuf)> = rd
         .flatten()
         .map(|e| e.path())
@@ -204,11 +215,14 @@ pub fn par_fingerprints(dir: &std::path::Path) -> Vec<(String, String)> {
         if let Ok(set) = nzbkit::par2::Par2Set::parse(&[&bytes]) {
             let pairs = set.member_hash16k();
             if !pairs.is_empty() {
-                return pairs;
+                return Some(ParSidecar {
+                    set_id: nzbkit::par2::hex16(&set.recovery_set_id),
+                    pairs,
+                });
             }
         }
     }
-    Vec::new()
+    None
 }
 
 /// The Matroska Title of a finished download's main video, with the
@@ -385,28 +399,29 @@ mod tests {
 
     #[cfg(feature = "indexer")]
     #[test]
-    fn par_fingerprints_read_a_real_sidecar_and_shrug_at_everything_else() {
+    fn par_sidecar_reads_a_real_set_and_shrugs_at_everything_else() {
         // The same checked-in par2cmdline output nzbkit's parser tests
         // use, so the two cannot drift.
         const MAIN: &[u8] = include_bytes!("../../nzbkit/tests/fixtures/par2/testset.par2");
         let d = tmpdir("par");
         assert!(
-            par_fingerprints(&d).is_empty(),
+            par_sidecar(&d).is_none(),
             "an empty directory has no sidecar"
         );
         std::fs::write(d.join("notes.txt"), b"not a par2").unwrap();
         std::fs::write(d.join("broken.par2"), b"PAR2\0PKTnonsense").unwrap();
-        assert!(
-            par_fingerprints(&d).is_empty(),
-            "garbage must not parse as a set"
-        );
+        assert!(par_sidecar(&d).is_none(), "garbage must not parse as a set");
         std::fs::write(d.join("testset.par2"), MAIN).unwrap();
-        let prints = par_fingerprints(&d);
-        assert_eq!(prints.len(), 1, "{prints:?}");
-        assert_eq!(prints[0].1, "beta.bin");
-        assert_eq!(prints[0].0.len(), 32);
+        let sc = par_sidecar(&d).unwrap();
+        assert_eq!(sc.pairs.len(), 1, "{:?}", sc.pairs);
+        assert_eq!(sc.pairs[0].1, "beta.bin");
+        assert_eq!(sc.pairs[0].0.len(), 32);
+        // The Recovery Set ID - the strong proving key the claims
+        // layer records - comes out as 32 lowercase hex chars.
+        assert_eq!(sc.set_id.len(), 32);
+        assert!(sc.set_id.chars().all(|c| c.is_ascii_hexdigit()));
         // A directory that does not exist is not an error worth having.
-        assert!(par_fingerprints(&d.join("gone")).is_empty());
+        assert!(par_sidecar(&d.join("gone")).is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 

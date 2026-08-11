@@ -619,14 +619,26 @@ pub(in crate::serve) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &st
     // ever reachable from here - a record-time guard cannot revisit
     // them.
     crate::conntune::reopen_for_install(config, d.connections.load(Ordering::Relaxed));
-    std::thread::spawn(move || {
+    // Weak from here on: the probe lane outlives nothing but itself, and
+    // an embedded host that stops mid-settle must not be left holding a
+    // whole daemon generation (nor a thread that would go on dialling
+    // the user's provider afterwards). `rt` is this run's runtime too.
+    let dw = Arc::downgrade(&d);
+    drop(d);
+    let stop = crate::serve::RunStop::current();
+    crate::serve::spawn_aux("auto-conn", move || {
         // In-memory failure backoff so an unreachable server is
         // retried in hours, not every minute.
         let mut attempted: std::collections::HashMap<String, u64> = Default::default();
         // Let startup settle before the first probe.
-        std::thread::sleep(std::time::Duration::from_secs(120));
+        if !stop.sleep(std::time::Duration::from_secs(120)) {
+            return;
+        }
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
+            if !stop.sleep(std::time::Duration::from_secs(60)) {
+                return;
+            }
+            let Some(d) = dw.upgrade() else { return };
             if !d.auto_connections.load(Ordering::Relaxed) {
                 continue;
             }
@@ -758,7 +770,15 @@ pub(in crate::serve) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &st
             let Some(_permit) = crate::serve::daemon::LadderPermit::try_take(&d) else {
                 continue;
             };
+            // Last look before up to four minutes of real provider
+            // traffic on a runtime this run may be about to lose. A
+            // ladder that outlives its own daemon is billed to the
+            // user's account for a knee nothing will ever read.
+            if stop.stopping() {
+                return;
+            }
             attempted.insert(srv.host.clone(), now);
+            let _busy = d.busy.hold("measuring");
             // Real-content articles from the install's own downloads,
             // STAT-verified on THIS provider (design doc 12.1) - the
             // synthetic probe group undermeasured a provider 17x and

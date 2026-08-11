@@ -203,34 +203,61 @@ async fn a_blackholed_first_candidate_is_bounded_not_fatal() {
 
 /// The walk is bounded, not a scan: `MAX_DIAL_CANDIDATES` stops it.
 ///
-/// Three refusing candidates followed by a blackhole. If the cap holds,
-/// the dial ends on the third refusal - instantly. If it walked the
-/// whole answer it would pay the blackhole's slice of CONNECT_TIMEOUT,
-/// which is the seconds this asserts it does not spend. The refusing
-/// three are the same address repeated because macOS assigns exactly
-/// one loopback v4 (see `dns::refused_v4`), and a resolver answer is
-/// data the client must accept whatever shape it comes in.
-#[tokio::test(flavor = "multi_thread")]
+/// Three refusing candidates followed by a blackhole that never answers
+/// at all. If the cap holds, the dial ends on the third refusal and the
+/// fourth address is never touched.
+///
+/// This asserted on the clock until 10 Aug 2026 - three refusals are
+/// instant, so "the dial finished inside two seconds" meant "it did not
+/// pay the blackhole's slice of CONNECT_TIMEOUT". It measured runner
+/// load as much as the cap, and it failed the Windows job at 6.06 s
+/// with the cap working perfectly. The dialer's invocation count is the
+/// same proof with no clock in it, and it is how the positive case
+/// (`dial_race_tests::the_walk_reaches_a_live_third_candidate`) has
+/// always been stated. Synthetic addresses for the same reason that
+/// file uses them: what is under test is which addresses the walk hands
+/// to the dialer, not what a socket does with them.
+#[tokio::test(start_paused = true)]
 async fn the_candidate_walk_stops_at_the_cap() {
-    let host = dns::unique_host("all-dead");
-    dns::shared().zone(&host).set_addrs(vec![
-        dns::refused_v4(),
-        dns::refused_v4(),
-        dns::refused_v4(),
-        dns::blackhole_v4(),
-    ]);
-    let mut sc = crate::mock::MockServer::start(HashMap::new(), crate::mock::Chaos::default())
-        .await
-        .server_config();
-    sc.host = host.clone();
-    sc.port = 1; // nothing listens here on any of them
-    let t0 = Instant::now();
-    let r = Connection::connect(&sc).await;
+    use std::sync::{Arc, Mutex};
+
+    // TEST-NET-1, one per candidate - the walk must be able to tell
+    // them apart, so unlike the old resolver-fed version these are four
+    // distinct addresses rather than one repeated.
+    let cands: Vec<std::net::SocketAddr> = (1..=4)
+        .map(|n| std::net::SocketAddr::from(([192, 0, 2, n], 119)))
+        .collect();
+    let blackhole = cands[3];
+
+    let dialed = Arc::new(Mutex::new(Vec::new()));
+    let seen = dialed.clone();
+    let one = move |target: std::net::SocketAddr| {
+        let dialed = dialed.clone();
+        Box::pin(async move {
+            dialed.lock().unwrap().push(target);
+            if target == blackhole {
+                // A hole swallows the SYN: no RST, no answer, ever.
+                std::future::pending::<()>().await;
+                unreachable!("the blackhole never answers");
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+        })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = std::io::Result<std::net::SocketAddr>> + Send>,
+            >
+    };
+
+    let r = dial_in_order(&cands, one).await;
     assert!(r.is_err(), "an all-dead candidate list must not connect");
-    assert!(
-        t0.elapsed() < Duration::from_secs(2),
-        "the walk went past the cap and into the blackhole: {:?}",
-        t0.elapsed()
+    let walked = seen.lock().unwrap().clone();
+    // The literal three, NOT `MAX_DIAL_CANDIDATES` - an expectation
+    // written in terms of the constant it is pinning moves with it, and
+    // passes just as happily at a cap of four.
+    assert_eq!(
+        walked.as_slice(),
+        &cands[..3],
+        "the walk went past the cap and into the blackhole"
     );
 }
 

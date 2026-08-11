@@ -682,7 +682,9 @@ pub(super) fn is_kind_slug(k: &str) -> bool {
 pub(super) fn open_dashboard(port: u16, tls: bool, key: Option<String>) {
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let q = key.map(|k| format!("?apikey={k}")).unwrap_or_default();
+        let q = key
+            .map(|k| format!("?apikey={}", super::http::query_escape(&k)))
+            .unwrap_or_default();
         let scheme = if tls { "https" } else { "http" };
         let url = format!("{scheme}://localhost:{port}/{q}");
         #[cfg(target_os = "macos")]

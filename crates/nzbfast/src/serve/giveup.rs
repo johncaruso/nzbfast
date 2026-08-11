@@ -34,6 +34,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use tracing::{info, warn};
+
+// For the Daemon impl moved in from daemon.rs (§129 4a paydown).
+use super::{Daemon, Job, JobState};
+use crate::MutexExt;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use crate::wall::{Kind, Parsed};
 
@@ -119,7 +126,7 @@ const EXPIRE_SECS: i64 = 45 * 24 * 3600;
 /// Stems kept per target. Only the count up to the threshold ever
 /// decides anything; the cap stops a pathological storm growing one
 /// entry without bound.
-const MAX_STEMS: usize = 64;
+pub(super) const MAX_STEMS: usize = 64;
 
 /// The target keys a release counts against - empty when the name
 /// carries no identity worth counting (obfuscated, unparsed, music).
@@ -706,6 +713,177 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+// §129 4a size paydown: moved verbatim from daemon.rs - the breaker's
+// terminal-outcome observer lives with the breaker.
+impl Daemon {
+    /// §96.3: one terminal job outcome, seen by the give-up breaker.
+    ///
+    /// Only the two automated grab loops count - a job the user added by
+    /// hand failing says nothing an automation should act on. A
+    /// completed download clears its target's counters (the content was
+    /// obtainable); a FINAL failure records the release stem, and at the
+    /// threshold the target is given up: logged for both paths, and for
+    /// an *arr-originated job the configured instances are asked to
+    /// unmonitor-then-blocklist (in that order - see the giveup module
+    /// note). Caller has already excluded tombstones and holds no locks.
+    pub(super) fn giveup_note_outcome(&self, job: &Arc<Mutex<Job>>, armed_auto_retry: bool) {
+        let threshold = self.arr_giveup_threshold.load(Ordering::Relaxed);
+        if threshold == 0 {
+            return;
+        }
+        let (name, nzo_id, origin, state) = {
+            let g = job.lock_ok();
+            (g.name.clone(), g.nzo_id.clone(), g.origin.clone(), g.state)
+        };
+        let from_arr = origin == "arr" || origin.starts_with("arr:");
+        if !from_arr && origin != "watchlist" {
+            return;
+        }
+        let p = crate::wall::parse_release(&name);
+        let keys = target_keys(&p);
+        if keys.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        // `token` names the incarnation of each target this decision was
+        // made about, snapshotted under the same lock as the latch. The
+        // spawned worker below carries it and re-checks it before every
+        // destructive *arr call, so a "Try again" pressed while Sonarr
+        // is slow cannot be undone by work that was already in flight
+        // (Codex sweep 2, 3 Aug M3).
+        let (fire, dirty, token) = {
+            let mut st = self.giveup.lock_ok();
+            match state {
+                JobState::Completed => (false, st.record_success(&keys), Vec::new()),
+                JobState::Failed if !armed_auto_retry => {
+                    let count = st.record_failure(&keys, &name, now);
+                    // The latch makes one storm one action (and one log
+                    // line); a later success re-arms it.
+                    let fire = count >= threshold as usize && st.latch_action(&keys);
+                    let token = if fire {
+                        st.action_token(&keys)
+                    } else {
+                        Vec::new()
+                    };
+                    (fire, true, token)
+                }
+                _ => return, // not terminal for the breaker's purposes
+            }
+        };
+        if dirty {
+            self.save_giveup();
+        }
+        if !fire {
+            return;
+        }
+        warn!(
+            target: "giveup",
+            "{name}: {threshold} distinct releases have now failed for this \
+             target - giving it up (the watchlist stops pursuing it{})",
+            if from_arr { "; asking the *arr to unmonitor it" } else { "" }
+        );
+        // ...and say it somewhere a user actually looks. An open
+        // dashboard toasts this on its next poll and the Watchlist card
+        // lists it from `giveup_status` afterwards, so the moment a show
+        // stops being chased is visible and reversible.
+        {
+            let mut ring = self.giveup_tripped.lock_ok();
+            ring.push_back((name.clone(), threshold, now));
+            while ring.len() > 8 {
+                ring.pop_front();
+            }
+        }
+        // §129 4a: the same trip on the event ring, for hooks that want
+        // to act on "this target is being given up" (the audits' answer
+        // to *arr-side cleanup scripts).
+        self.life_emit(
+            "giveup.tripped",
+            json!({
+                "name": name,
+                "threshold": threshold,
+                "asked_arr": from_arr,
+            }),
+        );
+        if !from_arr {
+            return;
+        }
+        let instances: Vec<ArrInstance> = self
+            .arr_instances
+            .lock_ok()
+            .iter()
+            .filter(|i| i.enabled)
+            .cloned()
+            .collect();
+        // A plain thread, not the tokio blocking pool: park runs on both
+        // async and sync paths, and this fires a handful of times per
+        // install lifetime. The latch was taken above; if no instance
+        // proves ownership and acts, but at least one attempt FAILED
+        // (offline *arr, bad apikey), the latch is released so the next
+        // final failure of this target tries again - a logged error is
+        // not an unmonitor, and leaving the latch set would suppress the
+        // retry forever while the *arr keeps re-grabbing dead releases.
+        let giveup = self.giveup.clone();
+        let spool = self.spool.clone();
+        std::thread::spawn(move || {
+            let mut acted = false;
+            let mut errored = false;
+            let mut stood_down = false;
+            // Re-read under the lock every time it is asked, so the
+            // answer is about the target as it is NOW, not as it was
+            // when the thread started.
+            let still_wanted = {
+                let giveup = giveup.clone();
+                let token = token.clone();
+                move || giveup.lock_ok().action_current(&token)
+            };
+            for inst in &instances {
+                if !still_wanted() {
+                    stood_down = true;
+                    info!(
+                        target: "giveup",
+                        "{name}: the target was reset while this was in flight - \
+                         standing down, nothing was changed in any *arr"
+                    );
+                    break;
+                }
+                match arr_give_up(inst, &nzo_id, &name, &still_wanted) {
+                    Ok(Some(what)) => {
+                        acted = true;
+                        info!(target: "giveup", "{name}: {what}");
+                    }
+                    // The ordinary answer from every instance but the
+                    // owner: no history record for our downloadId.
+                    Ok(None) => {
+                        info!(target: "giveup", "{name}: {}: not the sender, left alone", inst.name)
+                    }
+                    Err(e) => {
+                        errored = true;
+                        warn!(target: "giveup", "{name}: {}: {e}", inst.name);
+                    }
+                }
+            }
+            // A stand-down is not a failed call: the latch belongs to
+            // whatever generation the target is on now, and re-arming
+            // it here would undo the reset the user just performed.
+            if !acted && errored && !stood_down {
+                giveup.lock_ok().clear_action(&token);
+                let path = spool.join("giveup-state.json");
+                if let Ok(text) = serde_json::to_string_pretty(&*giveup.lock_ok()) {
+                    let _ = crate::persist::write_atomic(&path, text.as_bytes());
+                }
+                info!(
+                    target: "giveup",
+                    "{name}: no *arr acted and at least one call failed - \
+                     will retry at the next final failure"
+                );
+            }
+        });
+    }
 }
 
 #[cfg(test)]

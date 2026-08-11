@@ -4,7 +4,7 @@
 
 use crate::*;
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
 // index / search - the built-in indexer (M12)
@@ -1005,7 +1005,8 @@ pub(crate) async fn spots_scan(config: &Path, group: &str, backfill: u64, db: &P
     let (mut conn, _) = Connection::connect(&server).await?;
     let t0 = Instant::now();
     let _ = ix.adopt_legacy_marks(&server.host);
-    let sum = nzbkit::spot::scan_spots(&mut conn, &mut ix, group, &server.host, backfill).await?;
+    let sum =
+        nzbkit::spot::scan_spots(&mut conn, &mut ix, group, &server.host, backfill, 0).await?;
     conn.quit().await;
     let total = ix.spot_stats()?;
     let records = sum.valid + sum.unverified;
@@ -1049,6 +1050,7 @@ pub(crate) async fn spot_scan_pass(
     ix: &mut nzbkit::index::Index,
     group: &str,
     backfill: u64,
+    deepen: u64,
 ) -> Result<nzbkit::spot::SpotScanSummary> {
     let cfg = Config::load(config)?;
     let server = scan_servers(&cfg)
@@ -1057,9 +1059,113 @@ pub(crate) async fn spot_scan_pass(
         .context("no enabled server to scan spots from")?;
     let (mut conn, _) = Connection::connect(&server).await?;
     let _ = ix.adopt_legacy_marks(&server.host);
-    let sum = nzbkit::spot::scan_spots(&mut conn, ix, group, &server.host, backfill).await;
+    let sum = nzbkit::spot::scan_spots(&mut conn, ix, group, &server.host, backfill, deepen).await;
     conn.quit().await;
     Ok(sum?)
+}
+
+/// What one spot-NZB resolver pass did.
+#[derive(Debug, Default)]
+pub(crate) struct SpotResolveSummary {
+    pub(crate) fetched: u32,
+    pub(crate) promoted: u32,
+    pub(crate) upgraded: u32,
+    pub(crate) unusable: u32,
+    pub(crate) failed: u32,
+}
+
+/// One budgeted spot-NZB resolver pass (E3 / TODO 131): fetch the NZB
+/// for spots that have no release row yet and fold each into the index -
+/// a fresh named release normally, an upgrade of the row our scanner
+/// already holds for the ~0.6% that overlap. `stop` is polled between
+/// spots so a starting download preempts promptly.
+///
+/// Each spot costs one HEAD plus a handful of BODYs on the first scan
+/// server, so a pass is bounded at `budget` such fetches; the backlog
+/// after a first backfill drains over a few passes, newest first.
+pub(crate) async fn spot_resolve_pass(
+    config: &Path,
+    ix: &mut nzbkit::index::Index,
+    budget: u32,
+    stop: impl Fn() -> bool,
+) -> Result<SpotResolveSummary> {
+    use nzbkit::index::SpotPromotion;
+    let mut sum = SpotResolveSummary::default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|t| t.as_secs() as i64)
+        .unwrap_or(0);
+    // One-shot, kv-guarded, and cheap enough to sit in front of the
+    // pass: cards named with the spot XML's raw `<![CDATA[…]]>` markup
+    // (54 live) get the title that was inside it.
+    match ix.repair_cdata_spot_titles(now) {
+        Ok(n) if n > 0 => info!(target: "spots", "repaired {n} spot cards named with XML markup"),
+        Ok(_) => {}
+        Err(e) => warn!(target: "spots", "CDATA title repair: {e}"),
+    }
+    // Likewise one-shot: spot cards promoted before the fresh branch
+    // wrote a claims row get their ledger entry and the arbitrable
+    // `proven:msgid-set:spot` label, so a byte proof can correct a
+    // wrong spot title on them the way it can on new ones.
+    match ix.relabel_spot_names(now) {
+        Ok(n) if n > 0 => {
+            info!(target: "spots", "put {n} spot-named releases on the claims ledger")
+        }
+        Ok(_) => {}
+        Err(e) => warn!(target: "spots", "spot claim backfill: {e}"),
+    }
+    let pending = ix.spots_unresolved(budget)?;
+    if pending.is_empty() {
+        return Ok(sum);
+    }
+    let cfg = Config::load(config)?;
+    let server = scan_servers(&cfg)
+        .into_iter()
+        .next()
+        .context("no enabled server to fetch spot NZBs from")?;
+    let (mut conn, _) = Connection::connect(&server).await?;
+    // A dead connection fails every remaining fetch identically; a
+    // missing article fails one. The breaker tells them apart so a
+    // mid-pass disconnect does not burn a retry on every pending spot.
+    let mut consecutive_failures = 0u32;
+    for s in &pending {
+        if stop() || consecutive_failures >= 3 {
+            break;
+        }
+        match nzbkit::spot::fetch_spot_nzb(&mut conn, &s.msgid).await {
+            Ok((sx, bytes)) => {
+                consecutive_failures = 0;
+                sum.fetched += 1;
+                // The signed full-spot title outranks the header title,
+                // same precedence as a grab.
+                let title = if sx.title.is_empty() {
+                    s.title.clone()
+                } else {
+                    sx.title
+                };
+                match nzbkit::nzb::Nzb::parse(&bytes) {
+                    Ok(nzb) => match ix.promote_spot(&s.msgid, &title, &nzb, now)? {
+                        SpotPromotion::Promoted(_) => sum.promoted += 1,
+                        SpotPromotion::Upgraded(_) => sum.upgraded += 1,
+                        SpotPromotion::Unusable => sum.unusable += 1,
+                    },
+                    // Inflated but unparseable: deterministic, so the
+                    // retry cap writes it off after a few passes.
+                    Err(_) => {
+                        sum.unusable += 1;
+                        ix.spot_nzb_failed(&s.msgid)?;
+                    }
+                }
+            }
+            Err(_) => {
+                consecutive_failures += 1;
+                sum.failed += 1;
+                ix.spot_nzb_failed(&s.msgid)?;
+            }
+        }
+    }
+    conn.quit().await;
+    Ok(sum)
 }
 
 pub(crate) fn spot_search(query: &str, db: &Path) -> Result<()> {
@@ -1094,14 +1200,17 @@ pub(crate) async fn spot_get(config: &Path, msgid: &str, nzb: &Path, db: &Path) 
     let (sx, bytes) = nzbkit::spot::fetch_spot_nzb(&mut conn, msgid).await?;
     conn.quit().await;
     std::fs::write(nzb, &bytes)?;
-    // Cache the segment list on the indexed spot, if we have it.
+    // Cache the release payload message-ids on the indexed spot, if we
+    // have it. NOT sx.nzb_segments: those are the alt.binaries.ftd
+    // deflate-chunk ids the NZB rides on, which never appear in any
+    // content group and so can never join a header-scanned index.
     let mid = if msgid.starts_with('<') {
         msgid.to_string()
     } else {
         format!("<{msgid}>")
     };
     if let Ok(ix) = nzbkit::index::Index::open(db) {
-        let _ = ix.set_spot_nzb(&mid, &sx.nzb_segments);
+        let _ = ix.set_spot_nzb(&mid, &nzbkit::spot::payload_msgids(&bytes));
     }
     println!(
         "wrote {} ({} bytes, {} payload segments) - {}",
@@ -1118,8 +1227,320 @@ pub(crate) async fn spot_get(config: &Path, msgid: &str, nzb: &Path, db: &Path) 
 }
 
 // ---------------------------------------------------------------------------
-// make-release-nzb - find one complete release (data + par2) via OVER
+// nzb-import - posted-NZB ingestion rung (research REDTEAM 5c, §131)
 // ---------------------------------------------------------------------------
+
+/// Fetch every one-file `*.nzb` post the index holds, parse each, and
+/// join its payload message-ids against the index. Prints (and
+/// optionally writes as JSON) the parse-success rate and the exact
+/// multi-message-id overlap - the rung's measured deliverable. Names
+/// come only from message-id identity; never from time/size.
+///
+/// Report-only: the write side (proven-name claims with provenance
+/// `nzb-import`) goes through the identity substrate's
+/// `apply_proven_name` when that lands.
+pub(crate) async fn nzb_import(
+    config: &Path,
+    db: &Path,
+    limit: usize,
+    after: i64,
+    report: Option<&Path>,
+    apply: bool,
+) -> Result<()> {
+    let cfg = Config::load(config)?;
+    let servers = scan_servers(&cfg);
+    anyhow::ensure!(!servers.is_empty(), "no enabled server to fetch from");
+    let mut ix = nzbkit::index::Index::open(db)?;
+
+    #[derive(serde::Serialize)]
+    struct ObjReport {
+        release_id: i64,
+        stem: String,
+        grp: String,
+        junk: i64,
+        articles: usize,
+        fetch: String,
+        parse: String,
+        files: usize,
+        segments: usize,
+        matched_ids: usize,
+        inner_stem: Option<String>,
+        meta_title: Option<String>,
+        joins: Vec<JoinReport>,
+    }
+    #[derive(serde::Serialize)]
+    struct JoinReport {
+        release_id: i64,
+        stem: String,
+        matched: usize,
+        row_nsegs: u32,
+        quorum: bool,
+    }
+
+    let mut conns: std::collections::HashMap<String, Connection> = Default::default();
+    let mut objs: Vec<ObjReport> = Vec::new();
+    // (report slot, this NZB's ids) - joined in one batch at the end.
+    let mut parsed: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut cursor = after;
+    'outer: loop {
+        let cands = ix.posted_nzb_candidates(cursor, 200)?;
+        if cands.is_empty() {
+            break;
+        }
+        for c in cands {
+            // The walk's cursor is an arrival ordinal, not a release id
+            // (ids are recycled - see `posted_nzb_candidates`).
+            cursor = c.arrival_seq;
+            if limit > 0 && objs.len() >= limit {
+                break 'outer;
+            }
+            let mut fetch: Result<Vec<u8>, String> = Err("no server had it".into());
+            for s in &servers {
+                if !conns.contains_key(&s.host) {
+                    match Connection::connect(s).await {
+                        Ok((conn, _)) => {
+                            conns.insert(s.host.clone(), conn);
+                        }
+                        Err(e) => {
+                            info!(target: "nzbimport", "{}: connect: {e}", s.host);
+                            continue;
+                        }
+                    }
+                }
+                let conn = conns.get_mut(&s.host).expect("just inserted");
+                let attempt = tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    nzbkit::nzbimport::fetch_posted_nzb(conn, &c.segs),
+                )
+                .await;
+                match attempt {
+                    Ok(Ok(bytes)) => {
+                        fetch = Ok(bytes);
+                        break;
+                    }
+                    Ok(Err(nzbkit::nzbimport::NzbImportError::Missing(mid))) => {
+                        // Retention/propagation differs per backbone -
+                        // the next server may still hold it.
+                        fetch = Err(format!("missing {mid}"));
+                    }
+                    Ok(Err(nzbkit::nzbimport::NzbImportError::Nntp(e))) => {
+                        // Connection-level: drop the session, next
+                        // server (this one reconnects next object).
+                        fetch = Err(format!("nntp: {e}"));
+                        conns.remove(&s.host);
+                    }
+                    Ok(Err(e)) => {
+                        // Content property (yEnc damage, cap, holes):
+                        // identical bytes everywhere - stop trying.
+                        fetch = Err(e.to_string());
+                        break;
+                    }
+                    Err(_) => {
+                        fetch = Err("timeout".into());
+                        conns.remove(&s.host);
+                    }
+                }
+            }
+            let mut rep = ObjReport {
+                release_id: c.release_id,
+                stem: c.stem.clone(),
+                grp: c.grp.clone(),
+                junk: c.junk,
+                articles: c.segs.len(),
+                fetch: String::new(),
+                parse: String::new(),
+                files: 0,
+                segments: 0,
+                matched_ids: 0,
+                inner_stem: None,
+                meta_title: None,
+                joins: Vec::new(),
+            };
+            match fetch {
+                Err(e) => rep.fetch = e,
+                Ok(bytes) => {
+                    rep.fetch = "ok".into();
+                    match nzbkit::nzbimport::nzb_identity(&bytes) {
+                        Err(e) => rep.parse = e.to_string(),
+                        Ok(id) => {
+                            rep.parse = "ok".into();
+                            rep.files = id.files;
+                            rep.segments = id.segments;
+                            rep.inner_stem = id.inner_stem.clone();
+                            rep.meta_title = id.meta_title.clone();
+                            parsed.push((objs.len(), id.msgids));
+                        }
+                    }
+                }
+            }
+            objs.push(rep);
+            if objs.len().is_multiple_of(25) {
+                println!(
+                    "… {} objects ({} fetched, {} parsed)",
+                    objs.len(),
+                    objs.iter().filter(|o| o.fetch == "ok").count(),
+                    objs.iter().filter(|o| o.parse == "ok").count()
+                );
+            }
+        }
+    }
+    for c in conns.into_values() {
+        c.quit().await;
+    }
+
+    // One batched reverse lookup for every parsed NZB's ids, grouped
+    // back per NZB so match counts never conflate.
+    let all_ids: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        parsed
+            .iter()
+            .flat_map(|(_, ids)| ids.iter())
+            .filter(|id| seen.insert((*id).clone()))
+            .cloned()
+            .collect()
+    };
+    println!(
+        "joining {} distinct payload message-ids against the index …",
+        all_ids.len()
+    );
+    let rows = ix.msgid_lookup(&all_ids)?;
+    // (report slot, target release) → the matched ids themselves. The
+    // canonical MsgidSet key digests the MATCHED set, per join, so the
+    // ids ride beside the report rather than inside it.
+    let mut join_ids: std::collections::HashMap<(usize, i64), Vec<String>> = Default::default();
+    for (slot, ids) in &parsed {
+        let hits = nzbkit::nzbimport::group_hits(ids, &rows);
+        let rep = &mut objs[*slot];
+        rep.matched_ids = hits.iter().map(|h| h.matched).sum();
+        rep.joins = hits
+            .into_iter()
+            // Self-joins carry no information: the posted .nzb cannot
+            // name itself.
+            .filter(|h| h.release_id != rep.release_id)
+            .map(|h| {
+                join_ids.insert((*slot, h.release_id), h.ids);
+                JoinReport {
+                    release_id: h.release_id,
+                    stem: h.stem.clone(),
+                    matched: h.matched,
+                    row_nsegs: h.row_nsegs,
+                    quorum: nzbkit::nzbimport::quorum(h.matched, h.row_nsegs),
+                }
+            })
+            .collect();
+    }
+
+    // Write side: quorum joins become MsgidSet claims through the
+    // identity substrate. The name ladder prefers the name the .nzb
+    // was POSTED under (that is the uploader speaking); an obfuscated
+    // post name falls back to the NZB's own meta title, then to the
+    // dominant inner filename stem - and if all three are junk there
+    // is no name worth claiming, however exact the join.
+    let mut applied = 0usize;
+    if apply {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|t| t.as_secs() as i64)
+            .unwrap_or(0);
+        for (slot, _ids) in &parsed {
+            let rep = &objs[*slot];
+            if !rep.joins.iter().any(|j| j.quorum) {
+                continue;
+            }
+            let posted = nzbkit::nzbimport::strip_nzb_suffix(&rep.stem).to_string();
+            // `stem_is_a_name`, not the raw verdict: every one of
+            // these three is a whole stem, and a whole stem can carry a
+            // trailing `.7z`/`.zip`/`.mkv` that makes the raw function
+            // read a blob as two readable tokens (M7, 10 Aug sweep).
+            let name = if nzbkit::release::stem_is_a_name(&posted) {
+                Some(posted)
+            } else if let Some(t) = rep
+                .meta_title
+                .as_ref()
+                .filter(|t| nzbkit::release::stem_is_a_name(t))
+            {
+                Some(t.clone())
+            } else {
+                rep.inner_stem
+                    .as_ref()
+                    .filter(|s| nzbkit::release::stem_is_a_name(s))
+                    .cloned()
+            };
+            let Some(name) = name else { continue };
+            for j in rep.joins.iter().filter(|j| j.quorum) {
+                // Displacement policy is the claims layer's
+                // (apply_proven_name respects a readable stem): a
+                // season-pack NZB joining its per-episode rows comes
+                // back Conflict - recorded, never applied. Expected.
+                // Canonical key = digest of the MATCHED set for THIS
+                // join (not the whole NZB), so any other lane proving
+                // the same join produces the same key and the claims
+                // dedupe instead of reading as independent evidence.
+                let Some(mids) = join_ids.get(&(*slot, j.release_id)) else {
+                    continue;
+                };
+                let claim = nzbkit::index::NameClaim {
+                    name: name.clone(),
+                    evidence: nzbkit::index::NameEvidence::MsgidSet,
+                    key: nzbkit::index::msgid_set_key(mids),
+                    source: "posted-nzb".into(),
+                };
+                match ix.apply_proven_name(j.release_id, &claim, now) {
+                    Ok(o) => {
+                        applied += 1;
+                        println!(
+                            "  claim #{} {:?} <- {name:?} ({}/{} ids) -> {o:?}",
+                            j.release_id, j.stem, j.matched, j.row_nsegs
+                        );
+                    }
+                    Err(e) => println!("  claim #{} failed: {e}", j.release_id),
+                }
+            }
+        }
+    }
+
+    let fetched = objs.iter().filter(|o| o.fetch == "ok").count();
+    let parsed_ok = objs.iter().filter(|o| o.parse == "ok").count();
+    let with_join = objs.iter().filter(|o| !o.joins.is_empty()).count();
+    let with_quorum = objs
+        .iter()
+        .filter(|o| o.joins.iter().any(|j| j.quorum))
+        .count();
+    let quorum_rows: usize = objs
+        .iter()
+        .flat_map(|o| o.joins.iter())
+        .filter(|j| j.quorum)
+        .count();
+    println!("posted-NZB ingestion census:");
+    println!("  candidates walked   {}", objs.len());
+    println!(
+        "  fetched             {fetched} ({:.1}%)",
+        100.0 * fetched as f64 / objs.len().max(1) as f64
+    );
+    println!(
+        "  parsed as NZB       {parsed_ok} ({:.1}% of fetched)",
+        100.0 * parsed_ok as f64 / fetched.max(1) as f64
+    );
+    println!("  with any index join {with_join}");
+    println!("  with quorum join    {with_quorum} (naming {quorum_rows} index rows)");
+    if apply {
+        println!("  claims written      {applied}");
+    }
+    for o in objs.iter().filter(|o| o.joins.iter().any(|j| j.quorum)) {
+        let named = nzbkit::nzbimport::strip_nzb_suffix(&o.stem).to_string();
+        for j in o.joins.iter().filter(|j| j.quorum) {
+            println!(
+                "    {} → #{} {} ({}/{} ids)",
+                named, j.release_id, j.stem, j.matched, j.row_nsegs
+            );
+        }
+    }
+    if let Some(path) = report {
+        std::fs::write(path, serde_json::to_vec_pretty(&objs)?)?;
+        println!("report written to {}", path.display());
+    }
+    Ok(())
+}
 
 /// Strip release-file suffixes down to the shared stem:
 /// `x.part01.rar`/`x.r00`/`x.vol000+01.par2`/`x.par2`/`x.rar` → `x`.

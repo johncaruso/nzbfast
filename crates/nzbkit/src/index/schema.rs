@@ -210,7 +210,97 @@ fn create_base_schema(db: &Connection) -> rusqlite::Result<()> {
             -- The wall's identity for it, when the name parsed to
             -- one ('' when it did not).
             title_key TEXT NOT NULL DEFAULT '',
-            at INTEGER NOT NULL);",
+            at INTEGER NOT NULL);
+         -- §131 identity substrate: every naming lane's proof about a
+         -- release, kept as COMPETING claims with provenance rather
+         -- than a first-writer-wins name. `tier` is the evidence
+         -- strength (see index::claims::NameEvidence), `key` the
+         -- proving value (a PAR2 set id, a crc32, a hash16k, a
+         -- message-id-set digest), `source` which lane produced it.
+         -- The UNIQUE doubles as the release_id index (leftmost
+         -- column), so re-claims are idempotent and the delete
+         -- trigger below stays cheap.
+         CREATE TABLE IF NOT EXISTS name_claims(
+            id INTEGER PRIMARY KEY,
+            release_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            tier TEXT NOT NULL,
+            key TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            at INTEGER NOT NULL,
+            UNIQUE(release_id, tier, key, name));
+         -- Reverse message-id lookup: 64-bit hash of a segment
+         -- message-id -> the release that carries it, so a set of
+         -- message-ids (a posted NZB, a spot NZB, an *arr handoff)
+         -- can join to dark scan rows. Only the 3 lowest-numbered
+         -- segments of each file are keyed (the query side may probe
+         -- every id it has - extra probes just miss), which bounds
+         -- the table at ~3 rows per file instead of one per segment.
+         -- WITHOUT ROWID: the (h, release_id) pair IS the row.
+         CREATE TABLE IF NOT EXISTS msgid_map(
+            h INTEGER NOT NULL,
+            release_id INTEGER NOT NULL,
+            PRIMARY KEY(h, release_id)) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS idx_msgid_map_rel ON msgid_map(release_id);
+         -- Both tables reference release rowids, and SQLite reuses the
+         -- highest rowid after an eviction deletes it - a stale row
+         -- would then attach someone else's identity to a brand-new
+         -- release. A trigger catches every delete path (retention
+         -- prune, size-cap evict, twin dedupe, wall fix-up) including
+         -- ones added later; both deletes are indexed.
+         CREATE TRIGGER IF NOT EXISTS rel_identity_ad AFTER DELETE ON releases BEGIN
+           DELETE FROM name_claims WHERE release_id=old.id;
+           DELETE FROM msgid_map WHERE release_id=old.id;
+         END;
+         -- Pesto tiny-PAR2 rung (TODO 131, red-team 5a): one row per
+         -- PAR2 Recovery Set parsed out of the family's tiny sidecar
+         -- objects. Keyed on the set id because dedupe is mandatory -
+         -- the census's 617 fetched objects collapsed to 489 sets
+         -- (127 sets had multiple descriptor objects). `base_ctr` is
+         -- the smallest message-id counter among the set's objects
+         -- (the backward-link key C); `files` is the FileDesc list as
+         -- JSON (name, exact length, full MD5, first-16k MD5).
+         CREATE TABLE IF NOT EXISTS pesto_sets(
+            set_id TEXT PRIMARY KEY NOT NULL,
+            grp TEXT NOT NULL,
+            base_ctr INTEGER NOT NULL,
+            sum_len INTEGER NOT NULL,
+            files TEXT NOT NULL,
+            first_seen INTEGER NOT NULL,
+            -- pending | named | conflict | junkname | unresolved | nopayload
+            status TEXT NOT NULL DEFAULT 'pending',
+            release_id INTEGER NOT NULL DEFAULT 0,
+            tries INTEGER NOT NULL DEFAULT 0,
+            at INTEGER NOT NULL DEFAULT 0);
+         CREATE INDEX IF NOT EXISTS idx_pesto_status ON pesto_sets(status, at);
+         -- Parity scoreboard (build-order #8): one row per reference
+         -- release sampled from a user-configured newznab indexer,
+         -- with the verdict of whether OUR index has that post and
+         -- whether it is NAMED (exact title/episode parity, not mere
+         -- presence). Aggregated by GROUP BY over a rolling window;
+         -- volume is hundreds of rows a day, so no rollup table.
+         CREATE TABLE IF NOT EXISTS scoreboard_samples(
+            id INTEGER PRIMARY KEY,
+            -- Reference host, so two sources never collide on a guid.
+            source TEXT NOT NULL,
+            category TEXT NOT NULL,
+            ref_guid TEXT NOT NULL,
+            ref_name TEXT NOT NULL,
+            ref_size INTEGER NOT NULL DEFAULT 0,
+            -- The reference's usenetdate (upload time), unix.
+            ref_posted INTEGER NOT NULL DEFAULT 0,
+            ref_group TEXT NOT NULL DEFAULT '',
+            -- have_named | have_unnamed | missing
+            verdict TEXT NOT NULL,
+            matched_release_id INTEGER NOT NULL DEFAULT 0,
+            -- stem | band | subject_stem ('' when missing)
+            key_used TEXT NOT NULL DEFAULT '',
+            -- our first_seen - ref_posted for hits, floored at 0.
+            lag_secs INTEGER NOT NULL DEFAULT 0,
+            at INTEGER NOT NULL,
+            UNIQUE(source, ref_guid));
+         CREATE INDEX IF NOT EXISTS idx_sb_at ON scoreboard_samples(at);
+         CREATE INDEX IF NOT EXISTS idx_sb_cat ON scoreboard_samples(category, at);",
     )?;
     Ok(())
 }
@@ -303,9 +393,70 @@ fn additive_migrations(db: &Connection) {
         // correlation window range-scans it and an expression over
         // two columns cannot use one index.
         "ALTER TABLE predb ADD COLUMN pt INTEGER NOT NULL DEFAULT 0",
+        // Byte-probe naming lane (TODO 131 B3): when the prober last
+        // touched this row (0 = never, oldest-first rotation like
+        // oracle_at/gapfill_at) and how many attempts it has spent.
+        // Tries saturate at the give-up cap so a row that cannot be
+        // probed (scrambled order, missing head, packed-out-of-reach
+        // header) drops out of the pick instead of being chased -
+        // chasing is the 779-fetch livelock the lane exists to avoid.
+        "ALTER TABLE releases ADD COLUMN probe_at INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE releases ADD COLUMN probe_tries INTEGER NOT NULL DEFAULT 0",
+        // Terminal header-encryption classification (TODO 131 rung 5,
+        // research/RAR-continuation-pilot-2026-08-10): the archive's own
+        // bytes say a password is required, so NO byte probe at any
+        // budget will ever read a name out of it. 0 = never classified.
+        //
+        // A GENERATION number, not a boolean, and that is load-bearing:
+        // only `enc_class == index::ENC_CLASS` counts as terminal, so
+        // bumping that constant un-retires every row a wrong classifier
+        // stamped, with no migration. See index/encrypted.rs for why a
+        // terminal stamp is defensible here when the byte-probe lanes'
+        // saturating probe_tries was not.
+        "ALTER TABLE releases ADD COLUMN enc_class INTEGER NOT NULL DEFAULT 0",
+        // Which container and which signature earned the stamp
+        // ('rar5/head-crypt', 'rar4/mhd-password', '7z/aes-header') -
+        // the evidence a later generation is argued from.
+        "ALTER TABLE releases ADD COLUMN enc_kind TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE releases ADD COLUMN enc_at INTEGER NOT NULL DEFAULT 0",
+        // Pesto family (TODO 131, red-team 5a): the decoded message-id
+        // counter range and earliest clock of a release whose articles
+        // match the pesto grammar, persisted at scan time. NULL = not
+        // pesto. The counter is the per-session key the tiny-PAR2 rung
+        // links backward through; the randomized Date header is NEVER
+        // used for association (census, 10 Aug 2026). Nullable on
+        // purpose - 0 is a legal counter value.
+        "ALTER TABLE releases ADD COLUMN pesto_ctr_min INTEGER",
+        "ALTER TABLE releases ADD COLUMN pesto_ctr_max INTEGER",
+        "ALTER TABLE releases ADD COLUMN pesto_clock INTEGER",
+        // Spot promotion (TODO 131): the release row this spot became
+        // (or was found to duplicate); 0 = not resolved yet. Set once
+        // the spot's NZB has been fetched and folded into `releases`,
+        // so it doubles as the resolver's "done" marker.
+        "ALTER TABLE spots ADD COLUMN release_id INTEGER NOT NULL DEFAULT 0",
+        // NZB fetch attempts for the resolver's retry cap. A spot
+        // whose payload articles are gone stops being retried after a
+        // few passes instead of burning the budget forever.
+        "ALTER TABLE spots ADD COLUMN nzb_tried INTEGER NOT NULL DEFAULT 0",
     ] {
         let _ = db.execute(ddl, []);
     }
+    // The pesto backward-link's candidate query is a (grp, counter)
+    // range probe; partial so the millions of non-pesto rows cost
+    // nothing. Lives after the ALTERs that guarantee the column.
+    let _ = db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rel_pesto
+           ON releases(grp, pesto_ctr_min) WHERE pesto_ctr_min IS NOT NULL",
+        [],
+    );
+    // The header-encryption stats group by kind over a band that is a
+    // rounding error next to the whole table; partial so the millions of
+    // never-classified rows cost nothing to store or maintain.
+    let _ = db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rel_enc
+           ON releases(enc_class) WHERE enc_class>0",
+        [],
+    );
     // The pt index and its one-shot backfill live here, after the
     // ALTER above has guaranteed the column on every install. The
     // kv flag keeps the UPDATE from re-running on every open of a
@@ -780,6 +931,18 @@ fn retroactive_backfills(db: &mut Connection, fts: bool) {
             tx.commit()
         })();
     }
+    // §131 identity substrate: key existing files rows into msgid_map
+    // (rows only pass through ingest when a scan touches them, which
+    // for finished uploads is never). Same chunked, time-bounded,
+    // cursor-resumed shape as the nsegs fill above, for the same
+    // reasons: the live table is millions of rows, a single UPDATE
+    // loses the write lock to a running scanner, and an unbounded
+    // loop would stall daemon startup. Resumes on the next open.
+    super::claims::msgid_map_backfill(db);
+    // Pesto counter/clock fill for rows scanned before the columns
+    // existed - same chunked, time-bounded, cursor-resumed shape, for
+    // the same reasons.
+    super::pesto::pesto_backfill(db);
     // quality_v8 (26 Jul, was junk_v7): junk_v6's rules plus a full
     // re-parse - title_key/kind/res so ROT13 rescues that the parser
     // newly decodes regroup under their real titles, and now
@@ -787,7 +950,7 @@ fn retroactive_backfills(db: &mut Connection, fts: bool) {
     // existed have never carried. The kv key names the CURRENT
     // version; bumping it re-parses every row exactly once, which is
     // what backfills the new columns - free, because this pass
-    // already parses every stem. CHUNKED with a
+    // already parses every row's effective name. CHUNKED with a
     // persisted id cursor - the
     // one-big-tx shape could never win the write lock against
     // parallel scanners on a live daemon (SQLITE_BUSY → silently
@@ -817,9 +980,19 @@ fn retroactive_backfills(db: &mut Connection, fts: bool) {
                     db,
                     rusqlite::TransactionBehavior::Immediate,
                 )?;
+                // The effective name, NOT the raw stem: a row named
+                // after ingest (`apply_named` - predb sweep, spot
+                // promotion, byte probes) derived every classification
+                // column from pre_title, and its stem is an obfuscated
+                // hash. Re-parsing the stem here would clobber the row
+                // back to the junk>=70 no-card answer, and nothing
+                // would ever heal it - the naming seam refuses rows
+                // whose pre_title is already set. Same COALESCE the
+                // ingest and card paths use.
                 let rows: Vec<(i64, String, i64, bool)> = {
                     let mut sel = tx.prepare_cached(&format!(
-                        "SELECT id, stem, total_bytes,
+                        "SELECT id, COALESCE(NULLIF(pre_title,''), stem),
+                                total_bytes,
                                 EXISTS(SELECT 1 FROM files
                                        WHERE release_id=releases.id AND {EXE_FILE_SQL})
                          FROM releases WHERE id > ?1 ORDER BY id LIMIT 10000"
@@ -875,8 +1048,8 @@ fn retroactive_backfills(db: &mut Connection, fts: bool) {
                                         'software','other','')
                            AND (junk<>?2 OR title_key<>?3 OR kind<>?4)",
                     )?;
-                    for (id, stem, bytes, has_exe) in &rows {
-                        let p = crate::release::parse_release(stem);
+                    for (id, name, bytes, has_exe) in &rows {
+                        let p = crate::release::parse_release(name);
                         upd.execute(rusqlite::params![
                             id,
                             p.langs.join(" "),
@@ -887,7 +1060,7 @@ fn retroactive_backfills(db: &mut Connection, fts: bool) {
                         ])?;
                         upd_class.execute(rusqlite::params![
                             id,
-                            junk_score(stem, &p, *bytes as u64, *has_exe),
+                            junk_score(name, &p, *bytes as u64, *has_exe),
                             p.key,
                             kind_str(&p.kind)
                         ])?;

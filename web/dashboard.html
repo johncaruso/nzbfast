@@ -89,6 +89,16 @@ a.pill:focus-visible{outline:1px solid var(--acc);outline-offset:2px}
   background:var(--ok);margin-inline-end:6px;vertical-align:middle;animation:pulse 2s infinite}
 .pill.stale::before{background:var(--dim);animation:none}
 .pill.down::before{background:var(--bad);animation:none}
+/* Status chip strip: one chip per active BACKGROUND subsystem
+   (stats.busy). The statusPill stays the queue's authority; these are
+   the work that used to be invisible. Dot color says the kind: accent
+   = metadata (indexing/enriching/feed/watchlist), green = payload on
+   the move, dim = upkeep and measurement. */
+.bchip{display:inline-flex;align-items:center;white-space:nowrap}
+.bchip::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;
+  background:var(--dim);margin-inline-end:6px;vertical-align:middle}
+.bchip.b-meta::before{background:var(--acc)}
+.bchip.b-net::before{background:var(--ok)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 /* An update chip styled like every other dim outline pill reads as page
    furniture and gets missed. Paint it solid amber, and ring it for a few
@@ -244,6 +254,56 @@ button.warn:hover{background:color-mix(in srgb,var(--warn) 12%,transparent)}
    user's saved card layout and left it there forever. */
 body.firstrun #dashview>.card:not(#welcomeCard),
 body.firstrun #tiles,body.firstrun #layoutTip,body.firstrun #hiddenBar{display:none}
+/* §129 4c: the SECOND empty state. A configured server is not a working
+   install - between "no server" and "downloading" sits a dashboard whose
+   cards can only read zero, with the one question the user actually has
+   ("how do I start a download?") answered nowhere on it.
+   Only the three blocks that are structurally incapable of saying
+   anything until a job has run go: four zeroed tiles, a pipeline with no
+   stages, a usage card billing nobody. The hero stays even though it
+   reads zero - it is the anchor of the page, it goes live the instant a
+   job starts, and a dashboard with no headline reads as broken. Queue
+   and History stay because they are where the answer appears, and both
+   already carry a real empty line.
+   Same body-class technique and the same reason as .firstrun above:
+   nothing may be written into the user's saved card layout. And the
+   class is removed for good the moment a job exists - TODO §129 4c's
+   contract is that telemetry, once shown, is never taken away again. */
+body.nojobs #tiles,body.nojobs #usageCard,body.nojobs #pipecard{display:none}
+/* §129 4c. One row shape for both halves: a start route and a settings
+   recommendation are the same thing on screen - a title, a line of why,
+   and one control - so they share it rather than drifting apart. */
+.orow{display:flex;gap:9px;align-items:flex-start;padding:8px 0;
+  border-bottom:1px solid var(--line)}
+.orow:last-of-type{border-bottom:0}
+.orow>input{margin-top:3px;flex:0 0 auto}
+/* A column, not a bare block: the three parts are <span>s (so the whole
+   row can be a <label> that names its own checkbox), and inline spans
+   ran the title, the reason and the values together into one sentence. */
+.orow .ob{flex:1;min-width:0;display:flex;flex-direction:column}
+.orow .ol{font-size:13px;font-weight:600}
+.orow .oh{font-size:12.5px;line-height:1.55;color:var(--dim);margin-top:2px}
+.orow .ov{font-size:12px;color:var(--dim);margin-top:3px}
+.orow .ov b{color:var(--fg);font-weight:600}
+.orow .oa{margin-top:7px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.orow code{font-size:11.5px;word-break:break-all;background:var(--surface-2);
+  border-radius:5px;padding:2px 5px}
+/* The file picker reuses .idlepick for its handler, and .idlepick is a
+   bare-link style that strips a button back to text - correct where it
+   sits (inside an empty table row, inside the hero), wrong beside the
+   real buttons here. Specificity, not order: .idlepick is defined much
+   further down the sheet. */
+.orow button.ghost.idlepick{border:1px solid var(--line);padding:5px 11px;
+  color:var(--fg)}
+.orow button.ghost.idlepick:hover{background:var(--surface-2)}
+/* Role presets. Rendered into two hosts (the welcome card and the
+   Getting-started settings card) by one renderer, with the tick state
+   held in JS - so both copies always agree and neither one owns it. */
+.rolepick{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 0}
+.rolepick button.on{border-color:var(--acc);color:var(--acc)}
+.rolerecs{margin:12px 0 0;border-top:1px solid var(--line);padding-top:4px}
+.roledone{font-size:12.5px;color:var(--dim);padding:6px 0 0}
+.rolelinks{display:flex;flex-wrap:wrap;gap:6px 14px;margin:10px 0 0;font-size:12.5px}
 /* Built-in indexer switched off. Same technique and the same reason as
    .firstrun above: half this UI exists to show an index, and showing it
    permanently empty is worse than not showing it. Hidden by a body class
@@ -1255,6 +1315,10 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
        nothing on screen saying so. -->
   <button class="ghost" id="idxPill" onclick="toggleIdxPaused()" style="display:none"></button>
   <span class="pill live" id="statusPill" data-i18n="status.connecting">connecting</span>
+  <!-- Background-subsystem chips (stats.busy). Rendered by
+       renderBusyChips; empty span costs nothing when the daemon is
+       doing nothing in the background. -->
+  <span id="busyChips" style="display:contents"></span>
   <button class="ghost" id="pauseBtn" onclick="togglePause()" data-i18n-title="hdr.pause.title" title="Pause - lets in-flight article downloads finish, then stops. Nothing is re-downloaded on resume." data-i18n="hdr.pause">Pause</button>
   <button class="ghost mini" id="pauseNowBtn" onclick="pauseNow()" style="display:none" data-i18n-title="hdr.pausenow.title" title="Pause now - stops instantly and frees the line; the few in-flight articles re-download on resume." data-i18n="hdr.pausenow">now</button>
   <!-- Offline is not a louder Pause. Pause stops the QUEUE and leaves
@@ -1278,6 +1342,12 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
        step that is already satisfied shows as done rather than asking
        again. -->
   <ol class="setupsteps" id="setupSteps"></ol>
+  <!-- §129 4c: state B. The checklist above is answered by the time a
+       server exists, and what replaces it is the question nothing else
+       on the page answers - how do I actually start a download? Every
+       route is rendered from live config, so none is offered that
+       cannot be taken. -->
+  <div id="startHere" style="display:none"></div>
   <p class="dim" id="welcomeDirs" style="margin:12px 0 0;display:none"></p>
   <!-- First-run look chooser: minimal or the works, per card. The boxes
        call the same hideCard() the ✕ buttons do, so this is one
@@ -1294,6 +1364,9 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     </p>
     <div id="welcomeLookBoxes" style="display:flex;flex-wrap:wrap;gap:6px 18px"></div>
   </div>
+  <!-- §129 4c role presets. Same renderer as the Getting-started
+       settings card writes into; nothing is applied by choosing a role. -->
+  <div id="roleWelcome" style="margin:16px 0 4px"></div>
   <button id="showAll" onclick="showAllCards()" data-i18n="setup.showall">Show the full dashboard anyway</button>
 </div>
 
@@ -1610,6 +1683,16 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <span><button class="ghost" onclick="resetAppearance()" data-i18n="set.look.reset.btn">Reset appearance to defaults</button></span></div>
 </div>
 
+<!-- §129 4c role presets, second host. The welcome card only exists
+     until the first download, and these recommendations stay useful
+     after it - somebody who switches to running everything from Sonarr
+     six months in should still be able to ask what that shape is. Same
+     renderer, same tick state; neither host owns it. -->
+<div class="card set" data-sg="start" data-sk="role">
+  <h3 data-i18n="set.role.title">Recommended settings for how you use it</h3>
+  <div id="roleSettings"></div>
+</div>
+
 <div class="card set" data-sg="start" data-sk="servers">
   <h3 data-i18n="set.srv.title">Usenet servers <span class="badge next" data-i18n="badge.next">applies from the next download</span>
     <span class="dim" id="srvcount" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h3>
@@ -1638,7 +1721,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <div class="row"><label data-i18n="set.srv.pass">Password<span class="hint" id="sv_passhint">from your provider's welcome email</span></label>
       <span style="display:flex;gap:8px;align-items:center;justify-content:flex-end;width:100%"><input class="txt" type="password" id="sv_pass" autocomplete="new-password"><a href="#" id="sv_reveal" class="dim" style="display:none;font-size:12px;white-space:nowrap" onclick="revealServerPass();return false" data-i18n="set.srv.reveal">reveal stored password</a></span></div>
     <div class="row"><label data-i18n="set.srv.conns">Connections<span class="hint" data-i18n="set.srv.conns.hint">max your plan allows</span></label>
-      <input class="txt sm" type="number" min="1" max="999" id="sv_conns" value="20"></div>
+      <input class="txt sm" type="number" min="1" max="999" id="sv_conns" value="100"></div>
     <div class="row"><label data-i18n="set.srv.pin">Use exactly this many<span class="hint" data-i18n="set.srv.pin.hint">auto-tuning still measures this server and still reports what it found, but the number above wins. Turn this on when you have timed real downloads yourself and the tuner disagrees with you</span></label>
       <input type="checkbox" id="sv_pin"></div>
     <div class="row"><label data-i18n="set.srv.level">Tier / level<span class="hint" data-i18n="set.srv.level.hint">0 = primary; a level-N server only fetches articles every lower level missed: fill/backup economics</span></label>
@@ -1792,7 +1875,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input class="txt sm" id="s_out_umask" data-i18n-placeholder="set.disk.outperm.ph" placeholder="off" onchange="setCfg('out_umask',this.value)"></div>
   <div class="row"><label data-i18n="set.disk.minfree">Minimum free space<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.minfree.hint">pause new jobs below this, e.g. 25G. Defaults to 2G so the disk never fills completely; 0 = off</span></label>
     <input class="txt sm" id="s_min_free" onchange="setCfg('min_free',this.value)"></div>
-  <div class="row"><label>Pause when the disk cannot keep up<span class="badge live" data-i18n="badge.live">live</span><span class="hint">a drive that has started to fail often still accepts writes - it just takes minutes over them. The download then crawls, the graph sawtooths, and it all looks like a network problem. With this on, several minutes of stalled writes pause the queue with the reason and the folder named, keeping everything downloaded so far, and downloads start again by themselves once the drive answers normally. A brief busy spell never triggers it</span></label>
+  <div class="row"><label data-i18n="set.disk.slowpause">Pause when the disk cannot keep up<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.slowpause.hint">a drive that has started to fail often still accepts writes - it just takes minutes over them. The download then crawls, the graph sawtooths, and it all looks like a network problem. With this on, several minutes of stalled writes pause the queue with the reason and the folder named, keeping everything downloaded so far, and downloads start again by themselves once the drive answers normally. A brief busy spell never triggers it</span></label>
     <input type="checkbox" id="s_slow_storage_pause" onchange="setCfg('slow_storage_pause',this.checked?1:0)"></div>
   <div class="row"><label data-i18n="set.disk.quota">Download quota<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.disk.quota.hint">byte budget per period, e.g. 500G; 0 = off. Force-priority jobs bypass it</span></label>
     <input class="txt sm" id="s_quota" onchange="setCfg('quota',this.value)"></div>
@@ -1819,6 +1902,10 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <div class="pathrow"><input class="txt" id="s_script" onchange="setCfg('script',this.value)"><button class="mini" onclick="browseDir('script','file')" data-i18n-title="btn.browsefile.title" title="Browse for a script file" data-i18n="btn.browse">Browse…</button><button class="mini" onclick="openDir('script')" data-i18n-title="set.watchdir.openscript.title" title="Open the folder containing this script" aria-label="Open the folder containing this script">📂</button></div></div>
   <div class="row" data-adv="1"><label data-i18n="set.watchdir.scripttimeout">Give the script at most<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.scripttimeout.hint">a script still running after this is killed, and a line saying so goes in the log; the download itself is unaffected either way. Seconds; 0 = wait as long as it takes, which is what a long transcode wants. Default 3600. With no limit, one script that hangs holds a thread for as long as nzbfast runs, and every job that finishes after it holds another</span></label>
     <input class="txt sm" type="number" min="0" max="604800" id="s_script_timeout_secs" onchange="setCfg('script_timeout_secs',this.value)"></div>
+  <div class="row" data-adv="1"><label data-i18n="set.watchdir.prequeue">Pre-queue script<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.prequeue.hint">runs before every add with SABnzbd's pre-queue args + SAB_* env vars, and can rename, recategorize, reprioritize or reject the download before it queues; a rejected add goes to history with the reason. Empty = off. A script that fails or answers nonsense never blocks the add</span></label>
+    <div class="pathrow"><input class="txt" id="s_pre_queue_script" onchange="setCfg('pre_queue_script',this.value)"><button class="mini" onclick="browseDir('pre_queue_script','file')" data-i18n-title="btn.browsefile.title" title="Browse for a script file" data-i18n="btn.browse">Browse…</button></div></div>
+  <div class="row" data-adv="1"><label data-i18n="set.watchdir.prequeuetimeout">Give the pre-queue script at most<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.prequeuetimeout.hint">an add waits on this script, so its budget is short. A script still over it is killed and the add proceeds untouched. Seconds; 0 = no limit; default 30</span></label>
+    <input class="txt sm" type="number" min="0" max="3600" id="s_pre_queue_timeout_secs" onchange="setCfg('pre_queue_timeout_secs',this.value)"></div>
   <div class="row"><label data-i18n="set.watchdir.parclean">Delete recovery files<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.parclean.hint">a download's .par2 repair files have done their job once everything verifies, so they are removed when it completes successfully. Turn off to keep them in the download folder</span></label>
     <input type="checkbox" id="s_par_cleanup" onchange="setCfg('par_cleanup',this.checked?1:0)"></div>
   <div class="row"><label data-i18n="set.watchdir.cleanup">Cleanup after download<span class="hint" data-i18n="set.watchdir.cleanup.hint">file extensions deleted from a job's folder once it completes successfully, e.g. sfv, srr, url; empty = off. Recovery files have their own switch above</span></label>
@@ -1866,7 +1953,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
 <div class="card set" data-sg="alerts" data-sk="giveup">
   <h3 data-i18n="set.giveup.title">Give up on dead content <span class="badge live" data-i18n="badge.live">live</span></h3>
   <div class="row"><label data-i18n="set.giveup.threshold">Give up after this many failed releases<span class="hint" data-i18n="set.giveup.threshold.hint">0 = off, the default. When this many different releases have all finally failed for the same episode or movie, stop chasing it: the item is unmonitored in the Sonarr or Radarr that sent it (and the watchlist stops picking new copies of it), instead of downloading yet another dead copy. Below the threshold nothing changes - a failed grab is blocklisted and searched again as normal. A finished download for the item clears its count</span></label>
-    <input class="txt sm" type="number" min="0" max="1000" step="1" id="s_arr_giveup_threshold" onchange="setCfg('arr_giveup_threshold',this.value)"></div>
+    <input class="txt sm" type="number" min="0" max="64" step="1" id="s_arr_giveup_threshold" onchange="setCfg('arr_giveup_threshold',this.value)"></div>
   <div class="row" style="grid-template-columns:1fr"><label data-i18n="set.giveup.instances">Sonarr and Radarr it may act on<span class="hint" data-i18n="set.giveup.instances.hint">unmonitoring happens inside your Sonarr or Radarr, so each one needs its URL and API key here (in the *arr: Settings, General). The on box pauses an instance without forgetting its stored key; removing the row forgets the key too. Watchlist items need no entry - the watchlist is handled by nzbfast itself</span></label></div>
   <div id="arrrows"></div>
   <div class="savebar">
@@ -2013,6 +2100,22 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input type="checkbox" id="s_index_coverage" onchange="setCfg('index_coverage',this.checked?1:0)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.idx.gapfill">Re-hunt incomplete releases<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.gapfill.hint">each scan pass picks this many incomplete releases and asks the other providers for headers around their posting time, filling gaps the scanning provider never received; 0 = off</span></label>
     <input class="txt sm" type="number" min="0" max="100" id="s_index_gapfill" onchange="setCfg('index_gapfill',this.value)"></div>
+  <div class="row"><label data-i18n="set.idx.probe7z">Read names from inside 7z posts<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.probe7z.hint">many obfuscated posts carry their real name inside the posted archive itself. This peeks at two or three articles of each such post and reads the name from the 7z index, so the wall can show what the post really is. Works on unencrypted single-archive 7z posts; prepaid block accounts are never used</span></label>
+    <input type="checkbox" id="s_index_probe7z" onchange="setCfg('index_probe7z',this.checked?1:0)"></div>
+  <div class="row" data-adv="1"><label data-i18n="set.idx.probe7z.budget">Peek budget (articles per hour)<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.probe7z.budget.hint">each peeked post costs a few articles (about 1-2 MB). The default 150 keeps up with the typical daily flow of these posts; 0 = off</span></label>
+    <input class="txt sm" type="number" min="0" max="2000" id="s_index_probe7z_budget" onchange="setCfg('index_probe7z_budget',this.value)"></div>
+  <div class="row"><label data-i18n="set.idx.probe7z.state">Peek results<span class="hint" data-i18n="set.idx.probe7z.state.hint">nearly all of these posts currently come from a single uploader, so the daily numbers here are the early warning: if they fall to zero or locked headers appear, that uploader changed something and this source is drying up</span></label>
+    <span id="probe7zState" class="dim" style="font-size:12.5px;line-height:1.5"></span></div>
+  <div class="row"><label data-i18n="set.idx.pesto">Read names from tiny PAR2 posts<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.pesto.hint">one widely used posting tool uploads fully obfuscated posts and then posts their real name inside a small PAR2 file right after the data. This fetches that small file and only accepts the name when its hashes match the post it points to, so the wall can show what the post really is. A near miss is dropped rather than guessed; prepaid block accounts are never used</span></label>
+    <input type="checkbox" id="s_index_pesto" onchange="setCfg('index_pesto',this.checked?1:0)"></div>
+  <div class="row" data-adv="1"><label data-i18n="set.idx.pesto.budget">Fetch budget (articles per hour)<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.pesto.budget.hint">each checked post costs a few small articles (well under 1 MB). The default 120 keeps up with the typical daily flow of these posts; 0 = off</span></label>
+    <input class="txt sm" type="number" min="0" max="2000" id="s_index_pesto_budget" onchange="setCfg('index_pesto_budget',this.value)"></div>
+  <div class="row"><label data-i18n="set.idx.pesto.state">PAR2 name results<span class="hint" data-i18n="set.idx.pesto.state.hint">these posts all come from one posting tool, so the daily numbers here are the early warning: if named falls to zero or PAR2 files stop parsing, that tool changed something and this source is drying up</span></label>
+    <span id="pestoState" class="dim" style="font-size:12.5px;line-height:1.5"></span></div>
+  <div class="row"><label data-i18n="set.idx.nzbimport">Read posted NZB files<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.nzbimport.hint">some uploaders post the NZB file for a release next to the release itself. This fetches those small posted files and uses the message-ids inside them to confirm or recover the real name of an obfuscated post; prepaid block accounts are never used</span></label>
+    <input type="checkbox" id="s_index_nzbimport" onchange="setCfg('index_nzbimport',this.checked?1:0)"></div>
+  <div class="row" data-adv="1"><label data-i18n="set.idx.nzbimport.budget">Read budget (articles per hour)<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.nzbimport.budget.hint">most posted NZB files cost a single article; a large one is capped at about 48. The default 300 keeps up with the typical daily flow of these posts; 0 = off</span></label>
+    <input class="txt sm" type="number" min="0" max="2000" id="s_index_nzbimport_budget" onchange="setCfg('index_nzbimport_budget',this.value)"></div>
   <div class="row"><label data-i18n="set.idx.scannow">Scan now<span class="hint" data-i18n="set.idx.scannow.hint">run a scan pass immediately; with a depth, one-off deep backfill: rescan that many recent headers per group even where already scanned (e.g. 500000)</span></label>
     <span><input class="txt sm" type="number" min="0" id="s_scan_depth" data-i18n-placeholder="set.idx.depth.ph" placeholder="depth (optional)">
     <button class="ghost" onclick="scanNow(this, +document.getElementById('s_scan_depth').value||0)" data-i18n="set.idx.scannow.btn">Scan now</button></span></div>
@@ -2050,6 +2153,27 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <span style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <button class="btn" id="predbSeedBtn" data-i18n="set.idx.seedbtn" onclick="startPredbSeed()">Import history</button>
       <span id="predbSeedState" class="dim" style="font-size:12.5px;line-height:1.5"></span></span></div>
+  <!-- The parity scoreboard: the yardstick every naming lane is measured
+       by. It asks an indexer the user already has an account with what
+       THAT indexer found, and scores our own index against the answer.
+       There is no shipped source on purpose: the only reference is the
+       user's own URL and key, riding their own quota. -->
+  <div class="row"><label data-i18n="set.idx.sb">Parity scoreboard<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.sb.hint">off unless you turn it on. Once a day this asks an indexer you already have an account with for its newest releases in four categories, then scores our own index against the answer: do we have each post, do we show the same name, and how far behind were we. The table below is the result. Four small requests a day, on your own account, and nothing is ever sent anywhere else</span></label>
+    <input type="checkbox" id="s_scoreboard_enabled" onchange="setCfg('scoreboard_enabled',this.checked?1:0);setTimeout(refreshScoreboard,400)"></div>
+  <div class="row sb-sub" style="padding-left:16px"><label data-i18n="set.idx.sbsrc">Measure against<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.sbsrc.hint">pick one of the indexer accounts you already added, and its saved address and key are reused - nothing to type twice, and a new key entered there carries over here. Or choose to enter a different account below, for a reference you do not otherwise search</span></label>
+    <select class="sel" id="s_scoreboard_source" style="max-width:300px" onchange="setCfg('scoreboard_source',this.value);sbToggles();setTimeout(refreshScoreboard,400)"></select></div>
+  <div class="row sb-sub" style="padding-left:16px"><label data-i18n="set.idx.sburl">Reference indexer<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.sburl.hint">the base address of the indexer to measure against, like https://api.example.org. Address only: anything with a ? in it is refused, so a pasted key can never ride along into a log. The key has its own box below</span></label>
+    <input class="txt" id="s_scoreboard_url" autocomplete="off" placeholder="https://api.example.org" onchange="setCfg('scoreboard_url',this.value);setTimeout(refreshScoreboard,400)"></div>
+  <div class="row sb-sub" style="padding-left:16px"><label data-i18n="set.idx.sbkey">Its API key<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.sbkey.hint">your key from that indexer's account page. It is stored, never shown again, and only ever sent to the indexer it belongs to</span></label>
+    <input class="txt" id="s_scoreboard_key" type="password" value="" autocomplete="new-password" onchange="setCfg('scoreboard_key',this.value);setTimeout(refreshScoreboard,400)"></div>
+  <div class="row sb-sub" style="padding-left:16px"><label data-i18n="set.idx.sbcal">Spot-check the estimate<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.sbcal.hint">a post uploaded with its name taken out can only be matched by size and timing, which is a guess. This checks up to 5 of those guesses exactly each day by fetching their NZBs from the reference, which spends up to 5 of that account's daily downloads. The result is the error bar under the table. Off unless you can spare the downloads</span></label>
+    <input type="checkbox" id="s_scoreboard_calibrate" onchange="setCfg('scoreboard_calibrate',this.checked?1:0)"></div>
+  <div class="row sb-sub" style="padding-left:16px"><label data-i18n="set.idx.sbstat">How it is going<span class="hint" data-i18n="set.idx.sbstat.hint">what the last daily sample did. A run that hit trouble says so here rather than pretending nothing happened</span></label>
+    <span id="sbState" class="dim" style="font-size:12.5px;line-height:1.5"></span></div>
+  <div class="row sb-sub" id="sbTblRow" style="grid-template-columns:1fr;padding-left:16px;display:none">
+    <table id="sbTbl"><thead><tr><th data-i18n="sb.col.cat">Category</th><th data-i18n="sb.col.named">Named the same</th><th data-i18n="sb.col.have">Have, roughly</th><th data-i18n="sb.col.lag">Behind by</th></tr></thead><tbody></tbody></table>
+    <div class="dim" id="sbCalNote" style="font-size:12px;margin-top:4px"></div>
+  </div>
   <div class="row"><label data-i18n="set.idx.omdb">OMDb key<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.omdb.hint">optional: richer movie metadata on the wall (exact matches, cast, posters, IMDb ids) and ~4× faster movie enrichment. Free tier is 1,000 lookups/day. Empty = fully keyless</span></label>
     <input class="txt" id="s_omdb_key" autocomplete="off" onchange="setCfg('omdb_key',this.value)"></div>
   <div class="row"><label data-i18n="set.idx.omdbget">Get a free OMDb key<span class="hint" data-i18n="set.idx.omdbget.hint">only needs an email address: we submit the signup for you; OMDb emails you the key with an activation link. Or do it yourself at omdbapi.com/apikey.aspx</span></label>
@@ -2102,7 +2226,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
      a posting; a spot is somebody publishing what they posted. -->
 <div class="card set" data-sg="organise" data-sk="spots">
   <h3 data-i18n="set.spot.title">Spotnet spots</h3>
-  <div class="row"><label data-i18n="set.spot.enabled">Scan spots<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.spot.enabled.hint">off unless you turn it on. Spotnet is a public feed where people announce what they have posted and sign it with their own key. Each spot carries the real title and the NZB, so it names releases a header scan cannot see. It works with the built-in indexer off.</span></label>
+  <div class="row"><label data-i18n="set.spot.enabled">Scan spots<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.spot.enabled.hint">on by default. Spotnet is a public feed where people announce what they have posted and sign it with their own key. Each spot carries the real title and the NZB, so it names releases a header scan cannot see. It works with the built-in indexer off.</span></label>
     <input type="checkbox" id="s_spot_enabled" onchange="setCfg('spot_enabled',this.checked?1:0)"></div>
   <div class="idxnote">
     <div data-i18n-html="set.spot.what"><b>What it finds:</b> around 170 to 200 new spots a day.
@@ -2110,18 +2234,24 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     checked against the signature of the person who posted it before it is stored, and one that
     does not check out is thrown away.</div>
     <div data-i18n-html="set.spot.cant"><b>What it is not:</b> a replacement for an indexer
-    account. It is a small feed with no back catalogue, so it holds what has been spotted recently
-    rather than everything ever posted. Spots also only cover what somebody chose to announce.</div>
+    account. Spots only cover what somebody chose to announce, which is a fraction of what gets
+    posted.</div>
     <div data-i18n-html="set.spot.adult">Roughly a third of spots are filed as adult by the people
     who posted them. Those are left out of Browse unless you tick <b>Include adult</b> there.</div>
-    <div data-i18n-html="set.spot.where">Spots appear in <b>Browse</b> under their own
-    <b>Spots</b> option, kept separate from your own index so it is always clear which is which.
-    Downloading one fetches the NZB it points at and queues it like any other download.</div>
+    <div data-i18n-html="set.spot.where">Spots land on the <b>wall</b> as named cards next to
+    everything else you index, each carrying a <b>spot</b> badge so it is always clear where the
+    name came from. Browse also keeps a raw <b>Spots</b> list, which is where adult spots stay
+    unless you ask for them. Downloading one fetches the NZB it points at and queues it like any
+    other download.</div>
   </div>
   <div class="row"><label data-i18n="set.spot.groups">Spot groups<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.spot.groups.hint">comma-separated. free.pt is the one active Spotnet group; there is rarely a reason to change this</span></label>
     <input class="txt" id="s_spot_groups" onchange="setCfg('spot_groups',this.value)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.spot.backfill">Backfill articles<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.spot.backfill.hint">how far back to read on the first pass. Later passes carry on from where the last one stopped, so this is paid once</span></label>
     <input class="txt sm" type="number" min="1000" max="1000000" id="s_spot_backfill" onchange="setCfg('spot_backfill',this.value)"></div>
+  <div class="row" data-adv="1"><label data-i18n="set.spot.deepen">History per pass<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.spot.deepen.hint">articles of older Spotnet history to read each pass, on top of the new ones. The feed goes back to 2011 and the walk stops by itself once it reaches the start, so this is temporary work with a lasting result. 0 turns it off</span></label>
+    <input class="txt sm" type="number" min="0" max="1000000" id="s_spot_deepen" onchange="setCfg('spot_deepen',this.value)"></div>
+  <div class="row" data-adv="1"><label data-i18n="set.spot.resolve">Spots to open per pass<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.spot.resolve.hint">opening a spot fetches the NZB behind it and turns it into a card, so this is the part that costs traffic. Newest spots go first, so a deep backlog never holds up today's. 0 turns it off</span></label>
+    <input class="txt sm" type="number" min="0" max="1000" id="s_spot_resolve" onchange="setCfg('spot_resolve',this.value)"></div>
 </div>
 
 <!-- .idxon: this whole card is about the index database, so it goes with
@@ -2379,6 +2509,11 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     </div>
     <p id="keyerr" class="keyerr" role="alert" aria-live="assertive"></p>
     <p class="dim" data-i18n="key.where">Find it on the machine running nzbfast: Settings &gt; Security &gt; API key (Show), or in the daemon's startup log. Once it checks out it is remembered in this browser only.</p>
+    <!-- The rotation lockout (Aug 2026): after "Create new" in another
+         browser, both pointers above are dead ends - Settings needs the
+         key itself, and the startup log predates the rotation. Point at
+         the two places the new key actually is. -->
+    <p class="dim" data-i18n="key.where2">If the key was just changed, the browser where that happened shows the new one. If no browser does, it is on the apikey line of settings.json, in nzbfast's settings folder.</p>
   </div>
   <div class="fsfoot">
     <span class="grow"></span>
@@ -2562,6 +2697,11 @@ const DAEMON_LOCALE='__NZBFAST_LOCALE__';   // serve.rs replaces this token
 // hidden, so the fallback can never hide a working feature.
 const IDX_ON='__NZBFAST_INDEX__'!=='0';
 const IDX_COUNT=+'__NZBFAST_INDEXERS__'||0;
+// Spotnet spots are promoted into the release index as named wall
+// cards, so while they are on the wall exists and the watchlist has
+// arrivals to match - even with the header indexer off, which is the
+// default install.
+const SPOT_ON='__NZBFAST_SPOTS__'==='1';
 // This script runs after the markup but DURING parsing, so <body> and
 // the nav already exist and nothing has painted yet: the class lands on
 // body (what the stylesheet keys on) with no flash of the hidden UI.
@@ -2570,10 +2710,10 @@ const IDX_COUNT=+'__NZBFAST_INDEXERS__'||0;
 // either. Relabelling it waits for t(); see idxNavPill().
 // The watchlist survives the built-in indexer being off as long as some
 // indexer account remains for it to ask.
-const WATCH_OK = IDX_ON || IDX_COUNT>0;
+const WATCH_OK = IDX_ON || IDX_COUNT>0 || SPOT_ON;
 if(!IDX_ON){
   document.body.classList.add('noidx');
-  if(!IDX_COUNT){
+  if(!IDX_COUNT&&!SPOT_ON){
     document.getElementById('navWall').style.display='none';
     document.body.classList.add('nowatch');
   }
@@ -2706,6 +2846,10 @@ function applyI18n(){
     // the English one after a locale switch.
     if(el.hasAttribute('aria-label')) el.setAttribute('aria-label',tr);
   });
+  // The busy chips are JS-built, so the data-i18n pass above cannot
+  // reach them: drop the memo and let the next poll repaint them in
+  // the new language.
+  busyShown=' ';
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el=>{
     const tr=I18N[el.dataset.i18nPlaceholder]; if(tr!=null) el.placeholder=tr;
     // Same rule as the titles above. A placeholder is not a name - it is
@@ -2724,6 +2868,9 @@ function applyI18n(){
   }
   stripKbdHint();   // the catalogue just restored the "( / )" hint
   labelRows();      // re-derive control names in the new language
+  // The settings rail is built from JS strings, not data-i18n markup, so
+  // the sweep above cannot reach it. Re-render it if the shell exists.
+  if(typeof initSetShell!=='undefined' && initSetShell.done) buildSetRail();
 }
 // Programmatic names for the settings-style rows (TODO §129 phase 0d).
 // Every row is "<label>Name<span class=hint>…</span></label><control>",
@@ -2884,10 +3031,19 @@ let key = localStorage.nzbfastKey || '';
 // credential they have never seen (it was printed to a log the .app and
 // installer users never look at). Adopt it, then strip it from the URL so
 // it doesn't sit in history or travel in a copied link.
+// The launcher's copy can also be STALE: it caches the key it minted at
+// first run and never re-reads, so a "Create new" pressed since then has
+// rotated the daemon away from it - and unconditional adoption meant
+// every app launch clobbered a working stored key with the stale one and
+// locked the page out. A URL key therefore never displaces a stored key
+// up front: it is kept aside, and api() adopts it only after the stored
+// key is actually refused.
+let urlKey = '';
 (function(){
   const q = new URLSearchParams(location.search), k = q.get('apikey');
   if(!k) return;
-  key = k; localStorage.nzbfastKey = k;
+  if(!key){ key = k; localStorage.nzbfastKey = k; }
+  else if(k !== key) urlKey = k;
   q.delete('apikey');
   const qs = q.toString();
   history.replaceState(null, '', location.pathname + (qs ? '?' + qs : '') + location.hash);
@@ -2964,17 +3120,25 @@ let keyPrompt = null;
 // most often) had no way out of the page at all. Declining now silences
 // the prompt for the session and leaves a strip that offers the way back
 // in, so the choice is reversible without being repeated at anyone.
-let keyDeclined = false;
+// Persisted for the tab (sessionStorage): page-lifetime state meant every
+// reload re-opened the modal, which after a key rotation the user cannot
+// satisfy reads as "it keeps reminding me and nothing stops it". A new
+// tab or a browser restart still asks afresh.
+let keyDeclined = sessionStorage.nzbfastKeyDeclined === '1';
 function authFail(j){ return !!j && (j.error === 'API Key Incorrect' || j.error === 'API Key Required'); }
 function keyNotice(on){
   const el = document.getElementById('keynotice');
   if (!el) return;
   if (!on){ el.classList.remove('on'); el.innerHTML = ''; return; }
+  // Already up: leave it alone. The declined branch re-shows it on every
+  // failed poll (1 Hz), and rebuilding the button under the cursor would
+  // eat the very click it exists for.
+  if (el.classList.contains('on')) return;
   el.innerHTML = esc(t('key.needed', 'This daemon needs its API key before the dashboard can show anything. Settings > Security has it on the machine running nzbfast.'))
     + ' <button class="ghost mini" onclick="reenterKey()">' + esc(t('key.enter', 'Enter key')) + '</button>';
   el.classList.add('on');
 }
-function reenterKey(){ keyDeclined = false; keyNotice(false); ensureKey(key); }
+function reenterKey(){ keyDeclined = false; sessionStorage.removeItem('nzbfastKeyDeclined'); keyNotice(false); ensureKey(key); }
 
 // ---- Durability notice -------------------------------------------------
 // `saved:false` from the daemon means the value is LIVE but settings.json
@@ -3083,6 +3247,7 @@ async function openApiFix(btn){ await busy(btn, t('busy.working','Working…'), 
   const el = document.getElementById('opennotice');
   openBarLatched = true;
   el.innerHTML = esc(t('open.done','Key created. Paste it into Sonarr, Radarr and any phone app, and they will connect again.'))
+    + ' ' + esc(t('key.repair','Other browsers and devices that open this dashboard will ask for the new key.'))
     + ' <span class="k" id="openkey"></span>'
     + ' <button class="ghost mini" onclick="openApiCopy()">' + esc(t('open.copy','Copy')) + '</button>'
     + ' <button class="ghost mini" onclick="openApiDone()">' + esc(t('open.dismiss','Done')) + '</button>';
@@ -3119,7 +3284,10 @@ function openApiDone(){
 let keyResolve = null;
 function ensureKey(failedKey){
   if (key !== failedKey) return Promise.resolve(true);   // another call already rotated it - just retry
-  if (keyDeclined) return Promise.resolve(false);        // asked once, told no - the strip is the way back
+  // Asked once, told no - the strip is the way back. Re-shown here (not
+  // at load) so a persisted decline against a daemon that no longer wants
+  // a key leaves no stale strip: it only appears when a call still fails.
+  if (keyDeclined){ keyNotice(true); return Promise.resolve(false); }
   if (!keyPrompt){
     keyPrompt = new Promise(resolve => {
       keyResolve = resolve;
@@ -3155,7 +3323,8 @@ function keyFinish(ok){
 }
 function keyCancel(){
   if (!keyPrompt) return;
-  keyDeclined = true; keyNotice(true);   // reversible via the strip
+  keyDeclined = true; sessionStorage.nzbfastKeyDeclined = '1';
+  keyNotice(true);   // reversible via the strip
   keyFinish(false);
 }
 function keyToggleShow(){
@@ -3178,7 +3347,8 @@ async function keySubmit(){
     let j;
     try { j = await api('queue', '&output=json', v); }
     catch(e){ j = null; }
-    if (j == null || j.error === 'HTTP 502' || j.error === 'HTTP 503' || j.error === 'HTTP 504'){
+    if (j == null || j.error === ERR_UNREACHABLE
+        || j.error === 'HTTP 502' || j.error === 'HTTP 503' || j.error === 'HTTP 504'){
       err.textContent = t('key.err.unreachable','The daemon did not answer - is nzbfast still running at this address?');
       return;
     }
@@ -3188,7 +3358,9 @@ async function keySubmit(){
       return;
     }
     if (j.status === false){ err.textContent = tErr(j.error) || String(j.error); return; }
-    key = v; localStorage.nzbfastKey = v; keyNotice(false);
+    key = v; localStorage.nzbfastKey = v;
+    keyDeclined = false; sessionStorage.removeItem('nzbfastKeyDeclined');
+    keyNotice(false);
     keyFinish(true);
   });
 }
@@ -3196,11 +3368,20 @@ async function keySubmit(){
 // body, so callers all test j.status. A failure it CANNOT answer that way -
 // a 414 on an over-long request line, a 502 from a reverse proxy, a
 // truncated body - used to reject the promise instead, and since the
-// onclick handlers drop the promise (busy() has no catch, and there is no
-// unhandledrejection handler), the save simply vanished with no toast.
+// onclick handlers drop the promise, the save simply vanished with no
+// toast.
 // Turning it into the same shape means the existing !j.status branch
 // reports it, for all ~60 callers at once.
 function httpFail(r){ return {status:false, error:'HTTP '+r.status}; }
+// The other half of that hole: a request that never gets an answer at
+// all - the daemon restarting, the machine asleep, the network gone -
+// REJECTS the fetch, and the same dropped promises swallowed it. So
+// during the seconds a restart takes, most buttons visibly did nothing:
+// no toast, no error, no clue. Same failure shape as httpFail, reported
+// by the same !j.status branch the callers already have. tErr() turns
+// the phrase into the reader's language at the display edge.
+const ERR_UNREACHABLE='could not reach nzbfast';
+function fetchFail(){ return {status:false, error:ERR_UNREACHABLE}; }
 async function readJson(r){
   // Auth refusals are 403 with the same JSON error body (SAB parity);
   // authFail() needs the phrase from that body, not a bare HTTP code.
@@ -3224,12 +3405,26 @@ async function api(mode, extra, authKey, post){
   // so it stays out of reverse-proxy access logs, browser history and
   // Referer headers. Navigations (the /m3u player handoff) still use
   // ?apikey= - a location.href cannot carry a header.
-  const r = await fetch(`/api?mode=${mode}${extra||''}`,
-    {method: post?'POST':'GET', headers: sent?{'X-Api-Key': sent}:{}});
+  let r;
+  try {
+    r = await fetch(`/api?mode=${mode}${extra||''}`,
+      {method: post?'POST':'GET', headers: sent?{'X-Api-Key': sent}:{}});
+  } catch(e) { return fetchFail(); }
   const j = await readJson(r);
   // authKey set = an explicit one-shot credential (the apikey bootstrap):
   // never prompt for it, surface the error instead.
-  if (authFail(j) && authKey == null && await ensureKey(sent)) return api(mode, extra, undefined, post);
+  if (authFail(j) && authKey == null){
+    // Stored key refused and a different one arrived on the launch URL:
+    // adopt that one and retry before involving the user. This is the
+    // silent re-pair after a rotation (stored key stale, launcher fresh);
+    // if the URL key is the stale one instead it burns this one retry and
+    // the modal is next.
+    if (urlKey && urlKey !== sent){
+      key = urlKey; localStorage.nzbfastKey = urlKey; urlKey = '';
+      return api(mode, extra, undefined, post);
+    }
+    if (await ensureKey(sent)) return api(mode, extra, undefined, post);
+  }
   return j;
 }
 // Instant click feedback: disable the button and show a status label while
@@ -3238,6 +3433,17 @@ async function api(mode, extra, authKey, post){
 async function busy(btn, label, fn){
   if(btn){ btn.dataset.lbl = btn.textContent; btn.disabled = true; btn.textContent = label; }
   try { return await fn(); }
+  catch(e){
+    // Last resort: onclick handlers drop this promise, so anything the
+    // action throws used to disappear and the click just looked
+    // ignored. api() answers its own failures now, so what lands here
+    // is a real fault - say so, keep the detail for a bug report, and
+    // re-throw so the caller's remaining steps stay skipped exactly as
+    // before.
+    console.error(e);
+    toast(e&&e.message?e.message:tErr('unknown'), true);
+    throw e;
+  }
   finally { if(btn){ btn.disabled = false; btn.textContent = btn.dataset.lbl; } }
 }
 async function togglePause(){
@@ -3270,6 +3476,12 @@ function paintNet(){
   const b=document.getElementById('netBtn'), x=document.getElementById('netTxt');
   if(!b||!x) return;
   document.body.classList.toggle('offline', offline);
+  // The i18n keys move with the text, like portLockNotice(): applyI18n()
+  // re-reads data-i18n on every locale change, and the static markup says
+  // "online" - so switching language while offline would otherwise put
+  // "Online" back over an offline daemon.
+  x.dataset.i18n = offline?'hdr.offline':'hdr.online';
+  b.dataset.i18nTitle = offline?'hdr.offline.title':'hdr.online.title';
   x.textContent = offline?t('hdr.offline','Offline'):t('hdr.online','Online');
   b.title = offline
     ? t('hdr.offline.title','Offline - not connected to any provider, and your account is free for other machines. Click to come back online and resume.')
@@ -3390,19 +3602,18 @@ async function refreshIdxPill(){
     const groups=(s.groups||[]).length;
     if(!groups){ el.style.display='none'; return; }   // indexing not set up
     IDX_PAUSED=!!s.paused;
-    const scanning=!!s.scanning;
     // Only states that SAY something get header space. "indexing idle"
     // sat beside the engine's own "Idle" pill and the pair read as a
-    // stutter; the quiet state now stays off the header (the Browse
-    // index card still reports it). Paused - the state the comment
-    // above exists for - and actively-scanning still show.
-    el.style.display=(IDX_PAUSED||scanning)?'':'none';
-    el.textContent = IDX_PAUSED ? t('hdr.idx.paused','indexing off')
-                   : t('hdr.idx.scanning','indexing');
+    // stutter; the quiet state stays off the header (the Browse index
+    // card still reports it). SCANNING is no longer this pill's job
+    // either - the busy chip strip reports every running subsystem now,
+    // and this pill was printing the same word beside it. What is left
+    // is the state the pill was written for: indexing switched OFF,
+    // which is a warning, not activity.
+    el.style.display=IDX_PAUSED?'':'none';
+    el.textContent = t('hdr.idx.paused','indexing off');
     el.classList.toggle('warn', IDX_PAUSED);
-    el.title = IDX_PAUSED
-      ? t('hdr.idx.paused.title','Indexing is OFF. Anything posted while it is off is not picked up later - click to resume.')
-      : t('hdr.idx.on.title','Indexing is on. Click to pause it.');
+    el.title = t('hdr.idx.paused.title','Indexing is OFF. Anything posted while it is off is not picked up later - click to resume.');
   }catch(e){ el.style.display='none'; }
 }
 async function toggleIdxPaused(){
@@ -4065,6 +4276,98 @@ function histWindowExtra(){
   if(histSearch) x+='&hist_search='+encodeURIComponent(histSearch);
   return x;
 }
+// Header status chip strip: one chip per active BACKGROUND subsystem
+// (stats.busy tokens). The statusPill next to it stays the queue's
+// authority; a token missing from this map still renders (dim, raw
+// token) so a newer daemon never hides work from an older page.
+// Label is ONE or TWO words: this strip shares the header with the nav
+// and the Pause/Online controls, and full phrases ("fetching metadata",
+// "measuring connections") wrapped the header onto a second line and
+// shoved those controls down the moment two subsystems ran at once.
+// The sentence moved to the tooltip, which is where the explanation
+// belongs anyway.
+const BUSY_META={
+  indexing:  ['chip.indexing','indexing','chip.indexing.hint','indexing','b-meta'],
+  enriching: ['chip.enriching','metadata','chip.enriching.hint','fetching metadata','b-meta'],
+  predb:     ['chip.predb','release feed','chip.predb.hint','syncing release feed','b-meta'],
+  watchlist: ['chip.watchlist','watchlist','chip.watchlist.hint','checking watchlist','b-meta'],
+  moving:    ['chip.moving','moving','chip.moving.hint','moving files','b-net'],
+  maintenance:['chip.maintenance','upkeep','chip.maintenance.hint','database upkeep',''],
+  measuring: ['chip.measuring','measuring','chip.measuring.hint','measuring connections',''],
+};
+// How many chips fit is a question about THIS window, not a constant:
+// the header's fixed furniture (logo, nav, both selects, the pill, and
+// the Pause/Online controls) leaves ~180px at a 1280px viewport - two
+// chips - and far more on a wide display. A hard cap would waste that
+// room on the big screen and still wrap the header on the laptop,
+// dropping Pause and Online onto a second row. So render everything,
+// then fold from the end until the header is one row again, and show
+// the remainder as a "+N" chip that names them in its tooltip. Nothing
+// is hidden, only folded.
+let busyShown='', busyAll=[], busyFoldPending=false;
+function busyLabel(tok){
+  const [k,fb]=BUSY_META[tok]||['',tok];
+  return k?t(k,fb):fb;
+}
+function busyChipHtml(shown,rest){
+  let html=shown.map(tok=>{
+    const [k,fb,hk,hfb,cls]=BUSY_META[tok]||['',tok,'','',''];
+    const lbl=k?t(k,fb):fb, hint=hk?t(hk,hfb):'';
+    return `<span class="pill bchip ${cls}"${hint?` title="${esc(hint)}"`:''}>${esc(lbl)}</span>`;
+  }).join('');
+  if(rest.length)
+    html+=`<span class="pill bchip" title="${esc(rest.map(busyLabel).join(', '))}">+${rest.length}</span>`;
+  return html;
+}
+// Has the header spilled onto a second row? Compared against the logo,
+// which is always on the first one.
+function headerWrapped(){
+  const h=document.querySelector('header'), l=document.getElementById('pauseBtn');
+  if(!h||!l) return false;
+  return Math.round(l.getBoundingClientRect().y) > Math.round(h.firstElementChild.getBoundingClientRect().y);
+}
+function foldBusyChips(){
+  const box=document.getElementById('busyChips'), h=document.querySelector('header');
+  if(!box||!h) return;
+  // A page rendered while HIDDEN (loaded in a background tab, or the
+  // app's own pane while another view is up) has no resolved layout:
+  // every width reads 0, so every fit test says "wrapped" and the fold
+  // below would fold the strip away against geometry that does not
+  // exist - and stay that way, because the poll memo sees no change.
+  // Show everything and re-fold when the page is actually visible.
+  if(!h.getBoundingClientRect().width){
+    box.innerHTML=busyChipHtml(busyAll,[]);
+    busyFoldPending=true;
+    return;
+  }
+  busyFoldPending=false;
+  box.innerHTML='';
+  // A narrow window wraps this header on its own, with no chips at all
+  // (the phone layout). Folding cannot fix that and would only fold
+  // everything away, so leave the chips alone and wrap with the rest.
+  if(headerWrapped()){ box.innerHTML=busyChipHtml(busyAll,[]); return; }
+  for(let n=busyAll.length;n>=0;n--){
+    box.innerHTML=busyChipHtml(busyAll.slice(0,n),busyAll.slice(n));
+    if(!headerWrapped()) return;
+  }
+}
+function renderBusyChips(list){
+  const key=(list||[]).join(',');
+  if(key===busyShown) return;         // no DOM churn on unchanged polls
+  busyShown=key; busyAll=list||[];
+  foldBusyChips();
+}
+// The fit changes with the window, and the chip set may not - re-fold
+// on resize (debounced; the poll would otherwise never revisit it).
+addEventListener('resize',()=>{
+  clearTimeout(window.__busyFoldT);
+  window.__busyFoldT=setTimeout(foldBusyChips,150);
+});
+// ...and once the page is actually on screen, if the fold above had to
+// give up on an unlaid-out header.
+addEventListener('visibilitychange',()=>{
+  if(!document.hidden && busyFoldPending) foldBusyChips();
+});
 async function tick(){
   if(ticking) return;                 // never stack overlapping polls
   ticking=true;
@@ -4107,6 +4410,7 @@ async function tick(){
     const st=r.stats;
     const q=lastQFull;
     if(!q||!st) throw new Error('empty dashboard payload');
+    renderBusyChips(st.busy);
     paused=q.paused;
     // Server state wins. The daemon persists offline across restarts and
     // a second browser tab can flip it, so the optimistic paint in
@@ -4115,6 +4419,13 @@ async function tick(){
     paintNet();
     const pill=document.getElementById('statusPill');
     const pmin=parseInt(q.pause_int)||0;
+    // §129 4c: the first job ends the second empty state, and it ends it
+    // HERE - the poll is what sees it arrive. checkWelcome re-reads the
+    // daemon's own sticky `jobs_ever` rather than this page guessing
+    // from one payload, and it can only ever remove .nojobs, so this
+    // fires once and never puts anything back.
+    if(document.body.classList.contains('nojobs')
+       && ((q.slots||[]).length || (q.noofslots|0))) checkWelcome();
     // The queue's own `status` is the SABnzbd-compat field, and there a
     // non-empty queue reads "Downloading" whether or not anything is
     // moving - so a single paused or dedupe-held row left this pill
@@ -4452,6 +4763,9 @@ async function tick(){
 
     pipeline(st,mbps,q.slots.length,done,failed);
   }catch(e){
+    // An unreachable daemon's last-known chips would be a claim about
+    // work nobody can verify - clear them with the pill.
+    renderBusyChips([]);
     document.getElementById('statusPill').textContent=t('status.unreachable','unreachable');
     // "daemon unreachable" and then nothing: the page IS still polling
     // (every PERIOD seconds, and it recovers by itself the moment the
@@ -4478,7 +4792,6 @@ const HIST_BUCKETS=[
   ['locked', s=>!!s.password_required],
 ];
 let lastHistSlots=[];
-function histBucket(k){ return (HIST_BUCKETS.find(([n])=>n===k)||HIST_BUCKETS[0])[1]; }
 function histFilter(){
   const v=localStorage.histFilter;
   return HIST_BUCKETS.some(([k])=>k===v) ? v : 'all';
@@ -5132,7 +5445,9 @@ async function toggleHistRow(tr){
     // "attempt 3" beside the reason. `retry` counts RETRIES and has been
     // on the wire since M32 without ever being rendered, so a job that
     // had already been through this twice looked like a first failure.
-    const att=s.retry>0?` <span class="dim">${esc(t('hist.attempt','attempt {n}',{n:s.retry+1}))}</span>`:'';
+    // `retries` is the count: `retry` is SABnzbd's boolean "this one
+    // can be asked for again", which the facade row now answers with.
+    const att=s.retries>0?` <span class="dim">${esc(t('hist.attempt','attempt {n}',{n:s.retries+1}))}</span>`:'';
     rows.push([t('hist.why','Reason'), esc(s.fail_message)+att]);
   }
   // M32: the daemon has already decided to try again, and it decided the
@@ -6879,6 +7194,10 @@ async function loadWatchlist(){
         // The switch that fixes this is the checkbox at the bottom of
         // this very card, so point at it rather than send anyone away.
         :t('watch.extoff','the built-in indexer is off, so there is no local index to match against. Tick “Also search my indexer accounts” below and this watchlist works off your indexer accounts instead.'))
+      :!IDX_ON&&SPOT_ON
+      // Spot promotions land as arrivals, so the watchlist has real
+      // matter to match even with the header indexer off.
+      ?t('watch.spotsonly','matches new Spotnet spots as they are announced · min = floor · upgrade-to = ceiling')
       :`⚠ ${t('watch.idxoff','indexing is off, so the watchlist has nothing to match against.')} <button class="ghost mini" onclick="goSetting('indexing')">${t('idx.choose','Choose what to index')}</button> ${t('watch.idxoff2','or pick newsgroups in ⚙ settings → Indexing.')}`);
   }catch(e){}
 }
@@ -7354,6 +7673,14 @@ function selClear(list){
 // Bulk pause/resume: ONE call - the daemon's queue arms already honour
 // SAB's comma-separated value= convention.
 async function qBulk(op){
+  // renderQueue stops repainting while anything in this bar has focus,
+  // and pause/resume KEEP the selection - so the bar stays up with the
+  // pressed button still focused and the live queue froze for good.
+  // (The other bulk actions release by accident: they clear the
+  // selection, which hides the bar and so drops its focus.) Same
+  // release qBulkPrio/qBulkCat do on their selects; keyed on the bar
+  // rather than on the button so it holds however the op was fired.
+  const f=document.querySelector('#qselbar :focus'); if(f) f.blur();
   const ids=[...qSel]; if(!ids.length) return;
   const j=await api('queue',`&name=${op}&value=${ids.join(',')}`);
   if(!j.status) toast(tErr(j.error)||t('toast.nochange','Nothing to change. The item may have just finished.'), true);
@@ -9520,16 +9847,15 @@ const setCards=()=>[...document.querySelectorAll('#setMain .card.set')]
   .filter(c=>IDX_ON||!c.classList.contains('idxon'));
 const setSmooth=()=>matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth';
 
-function initSetShell(){
-  if(initSetShell.done) return; initSetShell.done=true;
-  setRowHints();
-  const main=document.getElementById('setMain'), rail=document.getElementById('setRail');
-  // Document order followed implementation history - Appearance first,
-  // Security and Run state last - so reorder once to match the rail.
-  // #setpaths is a footer, not a card, and stays last.
-  const paths=document.getElementById('setpaths');
-  SETGROUPS.forEach(g=>setCards().filter(c=>c.dataset.sg===g.k).forEach(c=>main.appendChild(c)));
-  if(paths) main.appendChild(paths);
+// The rail is the ONE part of the settings shell that carries translated
+// text, and initSetShell runs once - it used to render the rail inline, so
+// whenever the shell was built before the catalogue fetch resolved (a load
+// straight into the settings view, every time) the seven group names stuck
+// on English in all 27 locales for the life of the page, and a locale
+// switch did not shift them either. Split out so applyI18n can re-render it.
+function buildSetRail(){
+  const rail=document.getElementById('setRail');
+  if(!rail) return;
   rail.innerHTML=SETGROUPS.map(g=>{
     const n=setCards().filter(c=>c.dataset.sg===g.k).length;
     return `<button type="button" data-g="${g.k}" onclick="setGoGroup('${g.k}')">`+
@@ -9537,6 +9863,24 @@ function initSetShell(){
   }).join('')+'<hr>'+
     `<button type="button" data-g="*" onclick="setGoGroup('*')">`+
     `<span>${esc(t('set.g.all','All settings'))}</span></button>`;
+  // setGoGroup marks the active button; re-rendering dropped that class.
+  if(typeof setGroup!=='undefined' && setGroup){
+    const b=rail.querySelector(`button[data-g="${setGroup}"]`);
+    if(b) b.classList.add('on');
+  }
+}
+
+function initSetShell(){
+  if(initSetShell.done) return; initSetShell.done=true;
+  setRowHints();
+  const main=document.getElementById('setMain');
+  // Document order followed implementation history - Appearance first,
+  // Security and Run state last - so reorder once to match the rail.
+  // #setpaths is a footer, not a card, and stays last.
+  const paths=document.getElementById('setpaths');
+  SETGROUPS.forEach(g=>setCards().filter(c=>c.dataset.sg===g.k).forEach(c=>main.appendChild(c)));
+  if(paths) main.appendChild(paths);
+  buildSetRail();
   // Essential mode is remembered per browser and defaults OFF: hiding a
   // control someone was looking for is worse than a longer page.
   const ess=localStorage.nzbfastSetEssential==='1';
@@ -9740,7 +10084,7 @@ async function apiPost(mode, body, authKey){
 // special-character bug: those requests worked perfectly and disclosed
 // the secret anyway.
 const SECRET_CFG = new Set(['apikey','nzbkey','omdb_key','notify_targets',
-  'arr_instances','indexers','feeds','unraid_key']);
+  'arr_instances','indexers','feeds','unraid_key','scoreboard_key']);
 // Auto-rename settings group: grey out the "include …" sub-toggles when
 // the master switch is off, and keep the live example in sync.
 function renameToggles(){
@@ -9865,19 +10209,36 @@ async function newApiKey(){
   // This page authenticates with the key too, so adopt it right away or
   // every request after this one fails.
   key=j.apikey; localStorage.nzbfastKey=j.apikey;
+  // An old-key poll can 403 and open the shared key modal in the
+  // window between "regenerate" and this response; every later call
+  // then awaits that modal (see api()). The page now HOLDS a valid
+  // key, so resolve the modal instead of leaving the user staring at
+  // a prompt for a key they cannot know - the reported "keeps asking
+  // for a key and nothing stops it" loop.
+  if(keyPrompt) keyFinish(true);
   const el=document.getElementById('s_apikey');
   el.value=j.apikey;
   // The write failed, so this key is memory-only: say that instead of
   // "paste it into Sonarr", which is exactly the advice that hurts here.
   const lost = j.saved === false;
   if(lost) durNotice('apikey', t('set.sec.apikey','API key')); else durNoticeSaved('apikey');
+  // The re-pair note rides every success variant: the rotation just
+  // invalidated the key EVERY OTHER browser and webview has stored, and
+  // each of them is about to ask for this value - say so while it is on
+  // screen and on the clipboard, not after the lockout reports come in.
+  const repair = ' ' + t('key.repair','Other browsers and devices that open this dashboard will ask for the new key.');
   const ok = lost ? t('toast.savedNotDurable','“{n}” is live now, but it could not be written to disk - it reverts when nzbfast restarts.',{n:t('set.sec.apikey','API key')})
-                  : t('set.sec.apikey.new.ok','New API key created. Paste it into Sonarr, Radarr or anything else that connects to nzbfast.');
-  try{ await navigator.clipboard.writeText(j.apikey); toast(lost?ok:t('set.sec.apikey.newcopied','New API key created and copied. Paste it into Sonarr, Radarr or anything else that connects to nzbfast.'), lost); }
+                  : t('set.sec.apikey.new.ok','New API key created. Paste it into Sonarr, Radarr or anything else that connects to nzbfast.') + repair;
+  try{ await navigator.clipboard.writeText(j.apikey); toast(lost?ok:t('set.sec.apikey.newcopied','New API key created and copied. Paste it into Sonarr, Radarr or anything else that connects to nzbfast.') + repair, lost); }
   catch(e){ toast(ok, lost); }
   const b=document.getElementById('s_apikey_show');
   if(b){ b.dataset.shown='1'; setHtml(b, t('set.sec.apikey.hide','Hide')); }
-  loadSettings();
+  // loadSettings blanks the key box (it treats the field as write-only),
+  // which on a LAN http origin - where the clipboard API does not exist -
+  // wiped the ONLY copy of the fresh key before the user could read it.
+  // Reload, then put the minted value back while the Show state is on.
+  await loadSettings();
+  el.value=j.apikey;
 }
 
 // Same two buttons for the add-only NZB key (a Reddit ask: NZB Donkey
@@ -9908,6 +10269,9 @@ async function newNzbKey(){
   const j=await api('nzbkey_new', undefined, undefined, true);
   if(!j || j.status===false || !j.nzbkey){ toast(tErr(j&&j.error)||t('set.sec.apikey.err','Could not read the key.'), true); return; }
   nzbkeyMem=j.nzbkey;  // authorizes an apikey bootstrap this session, same as typing one
+  // Same modal-resolve as newApiKey: a rotation must never leave an
+  // open key prompt awaiting a value the page already holds.
+  if(keyPrompt) keyFinish(true);
   const el=document.getElementById('s_nzbkey');
   el.value=j.nzbkey;
   const lost = j.saved === false;
@@ -9918,7 +10282,10 @@ async function newNzbKey(){
   catch(e){ toast(ok, lost); }
   const b=document.getElementById('s_nzbkey_show');
   if(b){ b.dataset.shown='1'; setHtml(b, t('set.sec.apikey.hide','Hide')); }
-  loadSettings();
+  // Same as newApiKey: keep the minted value on screen after the
+  // reload - the clipboard write is not guaranteed to have worked.
+  await loadSettings();
+  el.value=j.nzbkey;
 }
 
 // Settings backup: one JSON file with everything a lost /config takes
@@ -10059,6 +10426,8 @@ async function loadSettings(){
   put('s_watch', c.watch); put('s_script', c.script);
   put('s_watch_interval_secs', c.watch_interval_secs??5);
   put('s_script_timeout_secs', c.script_timeout_secs??3600);
+  put('s_pre_queue_script', c.pre_queue_script);
+  put('s_pre_queue_timeout_secs', c.pre_queue_timeout_secs??30);
   put('s_cleanup_exts', (c.cleanup_exts||[]).join(', '));
   put('s_password_prompt', c.password_prompt||'done');
   put('s_unpack_eat_volumes', c.unpack_eat_volumes||'off');
@@ -10106,6 +10475,8 @@ async function loadSettings(){
   if(spEn&&document.activeElement!==spEn) spEn.checked=!!c.spot_enabled;
   put('s_spot_groups', (c.spot_groups||[]).join(', '));
   put('s_spot_backfill', c.spot_backfill);
+  put('s_spot_deepen', c.spot_deepen??20000);
+  put('s_spot_resolve', c.spot_resolve??40);
   if(!document.querySelector('#interestRows :focus')) loadInterests();
   // Same focus guard as the other checkboxes: a poll must not yank a
   // control out from under someone mid-click.
@@ -10118,6 +10489,15 @@ async function loadSettings(){
   const cov=document.getElementById('s_index_coverage');
   if(cov&&document.activeElement!==cov) cov.checked=c.index_coverage!==false;
   put('s_index_gapfill', c.index_gapfill??4);
+  const p7z=document.getElementById('s_index_probe7z');
+  if(p7z&&document.activeElement!==p7z) p7z.checked=c.index_probe7z!==false;
+  put('s_index_probe7z_budget', c.index_probe7z_budget??150);
+  const pst=document.getElementById('s_index_pesto');
+  if(pst&&document.activeElement!==pst) pst.checked=c.index_pesto!==false;
+  put('s_index_pesto_budget', c.index_pesto_budget??120);
+  const nzi=document.getElementById('s_index_nzbimport');
+  if(nzi&&document.activeElement!==nzi) nzi.checked=c.index_nzbimport!==false;
+  put('s_index_nzbimport_budget', c.index_nzbimport_budget??300);
   put('s_index_max_age', Math.round((c.index_max_age_secs||0)/86400));
   const ret=document.getElementById('s_index_retention');
   if(ret&&document.activeElement!==ret) ret.checked=c.index_retention!==false;
@@ -10145,6 +10525,29 @@ async function loadSettings(){
     const n=document.getElementById(el);
     if(n&&document.activeElement!==n) n.checked=c[key]===true;
   }
+  // Parity scoreboard. Opt-IN, so === true; the key is never echoed,
+  // only has_scoreboard_key - the box stays blank and the placeholder
+  // says whether one is stored.
+  const sbe=document.getElementById('s_scoreboard_enabled');
+  if(sbe&&document.activeElement!==sbe) sbe.checked=c.scoreboard_enabled===true;
+  // The reference picker: the user's enabled indexer accounts by name,
+  // plus the manual another-account option as value "". A stored pick
+  // whose account has vanished stays listed so the box shows the truth
+  // instead of silently reading as the manual option.
+  const sbs=document.getElementById('s_scoreboard_source');
+  if(sbs&&document.activeElement!==sbs){
+    const names=(Array.isArray(c.indexers)?c.indexers:[]).filter(i=>i.enabled).map(i=>String(i.name));
+    const cur=c.scoreboard_source||'';
+    if(cur&&!names.includes(cur)) names.push(cur);
+    sbs.innerHTML='<option value=""></option>'+names.map(n=>`<option>${esc(n)}</option>`).join('');
+    sbs.options[0].textContent=t('sb.src.other','another account, entered below');
+    sbs.value=cur;
+  }
+  put('s_scoreboard_url', c.scoreboard_url||'');
+  const sbk=document.getElementById('s_scoreboard_key');
+  if(sbk&&document.activeElement!==sbk){ sbk.value=''; sbk.placeholder=c.has_scoreboard_key?t('ph.keyset','set: paste a new key to replace'):t('ph.unset','not set'); }
+  const sbc=document.getElementById('s_scoreboard_calibrate');
+  if(sbc&&document.activeElement!==sbc) sbc.checked=c.scoreboard_calibrate===true;
   const ok=document.getElementById('s_omdb_key');
   if(document.activeElement!==ok){ ok.value=''; ok.placeholder=c.has_omdb?t('ph.keyset','set: paste a new key to replace'):t('ph.omdbunset','not set: paste your key here'); }
   put('s_index_db', c.index_db);
@@ -10160,7 +10563,7 @@ async function loadSettings(){
   EVICT_KIND_BOXES
     .forEach(([k,id])=>{ const el=document.getElementById(id);
       if(el&&document.activeElement!==el) el.checked=!ekinds.length||ekinds.includes(k); });
-  evictToggles(); refreshDbState(); predbToggles(); refreshPredb(); refreshPredbCorr();
+  evictToggles(); refreshDbState(); predbToggles(); refreshPredb(); refreshPredbCorr(); refreshProbe7z(); refreshPesto(); refreshScoreboard();
   put('s_library_cats', (c.library_cats||[]).join(', '));
   put('s_library_recheck_secs', c.library_recheck_secs);
   put('s_port', c.port);
@@ -10750,6 +11153,7 @@ function notifyRowHtml(n){
     <input class="txt" data-k="email_to" value="${escA(n.email_to||'')}" placeholder="to@example.com"${kind==='email'?'':' hidden'}>
     <input class="txt" data-k="email_from" value="${escA(n.email_from||'')}" placeholder="${escA(t('set.notify.emailfrom.ph','from (empty = nzbfast@localhost)'))}"${kind==='email'?'':' hidden'}>
     <input class="txt" data-k="events" value="${escA((n.events||[]).join(', '))}" placeholder="${escA(t('set.notify.events.ph','events: completed, failed, repaired, disk, quota - empty = finished downloads (plus fails, if ticked)'))}" title="${escA(t('set.notify.events.title','route this target onto specific events. Leave empty for the classic behavior: every finished download, plus failures when the box is ticked. Naming events replaces both: only what is listed fires. repaired = a finished download that needed repair; disk / quota = the matching guard pausing the queue'))}">
+    <input class="txt" type="password" autocomplete="new-password" data-k="secret"${n.has_secret?' data-stored="1"':''} value="" placeholder="${escA(n.has_secret?t('set.srv.pass.keep','stored: leave blank to keep'):t('set.notify.secret.ph','signing secret: requests carry X-NzbFast-Signature (HMAC-SHA256) when set'))}" title="${escA(t('set.notify.secret.title','optional shared secret. Every request to this webhook then carries X-NzbFast-Signature: sha256=<hex HMAC-SHA256 of the body>, so the receiver can verify the sender. Blank keeps the stored secret'))}"${kind==='webhook'?'':' hidden'}>
     ${notifyHealthHtml(n)}
   </div>`;
 }
@@ -10774,6 +11178,7 @@ function notifyKindChanged(sel){
   body.placeholder=notifyBodyPh(kind);
   row.querySelector('[data-k=email_to]').hidden = kind!=='email';
   row.querySelector('[data-k=email_from]').hidden = kind!=='email';
+  row.querySelector('[data-k=secret]').hidden = kind!=='webhook';
 }
 function renderNotify(list){ setHtml('notifyrows', list.map(notifyRowHtml).join('')||`<div class="dim">${t('set.notify.none','no targets: nothing is notified when a download finishes')}</div>`); }
 function addNotifyRow(){
@@ -10789,7 +11194,7 @@ function notifyRowData(r){
   return { name:g('name'), kind:g('kind'), url:g('url'), token:g('token'),
     body:g('body'), category:g('category'), on_failure:g('on_failure'), enabled:true,
     events:g('events').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean),
-    email_to:g('email_to'), email_from:g('email_from') };
+    email_to:g('email_to'), email_from:g('email_from'), secret:g('secret') };
 }
 async function testNotify(btn){ await busy(btn,t('busy.testing','Testing…'), async()=>{
   const el=btn.closest('.notifyrow'), row=notifyRowData(el);
@@ -10949,10 +11354,30 @@ function renderServers(){
     // A SUSPECT knee is recorded state, not applied state - jobs ignore
     // it until a second probe agrees. Showing it as "auto-tuned to 6"
     // told the user their downloads were capped when they were not.
+    //
+    // "Auto-tuned" is only an honest label when the tuner MEASURED a
+    // knee below what a job would otherwise ask for - and jobs ask for
+    // min(global Connections setting, this server's count), not the
+    // server's count. A knee sitting AT that ceiling means the ladder
+    // ran out of headroom, not that more was slower: a 100-connection
+    // xsnews account under a global setting of 32 got a knee of 32 and
+    // a row claiming auto-tune had measured 32 as fastest (10 Aug).
+    // That case is the global setting's doing, and the row must send
+    // the user to the right knob.
     const kn0=srvTuned[s.host];
     const tv=(srvAutoConn&&kn0&&!kn0.suspect&&kn0.connections>0)?kn0.connections:0;
+    const asked0=srvAsked[s.host]||0;
     // dim, not warn: a measured optimum is a fact, not a problem to fix.
-    const tuneNote=(tv&&tv<s.connections)?` · <span class="dim" title="${escA(t('set.srv.tuned.title','auto-connections measured this provider is fastest at {n} sockets: more were slower. Turn off auto-connections (Connection tuning) to use your set value.',{n:tv}))}">${t('set.srv.tuned','auto-tuned to {n}',{n:tv})}</span>`:'';
+    // A pinned server never has its knee applied (the pin is a statement
+    // from the person watching the link), so "auto-tuned" would be a lie
+    // there - same exclusion the CLI's cap note makes. The global
+    // Connections setting still caps a pinned server, so that branch stays.
+    let tuneNote='';
+    if(tv&&!s.pin_connections&&tv<asked0){
+      tuneNote=` · <span class="dim" title="${escA(t('set.srv.tuned.title','auto-connections measured this provider is fastest at {n} sockets: more were slower. Turn off auto-connections (Connection tuning) to use your set value.',{n:tv}))}">${t('set.srv.tuned','auto-tuned to {n}',{n:tv})}</span>`;
+    }else if(asked0&&asked0<s.connections){
+      tuneNote=` · <span class="dim" title="${escA(t('set.srv.capset.title','downloads use at most {n} connections per server, from the Connections setting in Settings; this account allows {m}. Raise Connections to use more of its allowance.',{n:asked0,m:s.connections}))}">${t('set.srv.capset','capped at {n} by the Connections setting',{n:asked0})}</span>`;
+    }
     return `
     <div class="srvrow" id="srvrow${i}"${en?'':' style="opacity:.45"'}>
       <span>${esc(s.host)}:${s.port}${s.tls?` <span class="dim" title="${escA(t('set.srv.tls.title','Encrypted connection to this server'))}"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-lock"/></svg></span>`:''}${en?'':` <span class="warn">· ${t('set.srv.disabled','disabled')}</span>`}${s.level>0?` <span class="dim">· ${t('set.srv.fill','fill level {n}',{n:s.level})}</span>`:''}${s.block_account?` <span class="dim" title="${escA(t('set.srv.paid.chip.title','every byte from this server is billed, so nzbfast never sends it traffic of its own: no automatic connection tests, no benchmark traffic, no header scans'))}">· ${t('set.srv.paid.chip','billed per byte')}</span>`:''}${s.group?` <span class="dim">· ${esc(s.group)}</span>`:''}${block}${comp}
@@ -11061,7 +11486,10 @@ async function importServers(btn){ await busy(btn,t('busy.scanning','Scanning…
 }); }
 function editServer(i){
   srvEditIdx=i;
-  const s=i>=0?srvList[i]:{port:563,tls:true,connections:20,level:0,retention_days:0};
+  // connections: 100 is the allowance most providers sell; the grant
+  // probe and auto-tune knee trim a provider that grants less, so a big
+  // default is free where a small one quietly caps every fast server.
+  const s=i>=0?srvList[i]:{port:563,tls:true,connections:100,level:0,retention_days:0};
   const put=(id,v)=>document.getElementById(id).value=v;
   put('sv_host',s.host||''); put('sv_port',s.port||563);
   document.getElementById('sv_tls').checked=s.tls!==false;
@@ -11070,7 +11498,7 @@ function editServer(i){
   document.getElementById('sv_passhint').textContent=
     i>=0&&s.has_password?t('set.srv.pass.keep','stored: leave blank to keep'):t('set.srv.pass.hint',"from your provider's welcome email");
   document.getElementById('sv_reveal').style.display=(i>=0&&s.has_password)?'':'none';
-  put('sv_conns',s.connections||20); put('sv_level',s.level||0);
+  put('sv_conns',s.connections||100); put('sv_level',s.level||0);
   document.getElementById('sv_pin').checked=!!s.pin_connections;
   put('sv_group',s.group||''); put('sv_ret',s.retention_days||0);
   put('sv_block',Math.round((s.block_bytes||0)/1e9));
@@ -11137,7 +11565,7 @@ function srvFormData(){
   return { host:g('sv_host'), port:+g('sv_port')||563,
     tls:document.getElementById('sv_tls').checked,
     username:g('sv_user'), password:document.getElementById('sv_pass').value,
-    connections:+g('sv_conns')||8, level:+g('sv_level')||0,
+    connections:+g('sv_conns')||100, level:+g('sv_level')||0,
     pin_connections:document.getElementById('sv_pin').checked,
     group:g('sv_group'), retention_days:+g('sv_ret')||0,
     block_bytes:(+g('sv_block')||0)*1e9,
@@ -11266,6 +11694,53 @@ async function refreshPredb(){
     setHtml('predbState', parts.join(' · '));
   }catch(e){}
 }
+// The byte-peek lane's daily readout. The numbers are the point: this
+// band of posts is effectively one uploader's output, so a sudden zero
+// or the first locked header IS the news, and it must be visible the
+// day it happens rather than buried in a log.
+async function refreshProbe7z(){
+  const el=document.getElementById('probe7zState'); if(!el) return;
+  try{
+    const s=await api('probe7z_stats');
+    if(!s.index_enabled){ setHtml('probe7zState', t('predb.idxoff','the indexer is off, so there is nothing to name.')); return; }
+    if(!s.enabled||!(+s.budget)){ setHtml('probe7zState', t('probe7z.off','off.')); return; }
+    const st=s.stats||{}, td=st.today||{}, yd=st.yesterday||{};
+    const n=v=>(+(v||0)).toLocaleString(LOCALE);
+    const parts=[
+      t('probe7z.today','today {p} peeked, {named} named',{p:n(td.attempts),named:n(td.named)}),
+      t('probe7z.yday','yesterday {p} peeked, {named} named',{p:n(yd.attempts),named:n(yd.named)})
+    ];
+    if(st.eligible!=null) parts.push(t('probe7z.behind','{n} posts waiting',{n:n(st.eligible)}));
+    const locked=(+(td.encrypted||0))+(+(yd.encrypted||0));
+    if(locked) parts.push('<span style="color:var(--warn)">'+t('probe7z.locked','{n} locked headers seen',{n:n(locked)})+'</span>');
+    const clash=(+(td.conflict||0))+(+(yd.conflict||0));
+    if(clash) parts.push('<span style="color:var(--warn)">'+t('probe7z.conflict','{n} disagreed with an existing name',{n:n(clash)})+'</span>');
+    setHtml('probe7zState', parts.join(' · '));
+  }catch(e){}
+}
+// The tiny-PAR2 naming lane's daily readout. Same logic as probe7z:
+// one poster tool's output, so `named` falling to zero or `parsefail`
+// appearing IS the news, and it must be visible the day it happens.
+async function refreshPesto(){
+  const el=document.getElementById('pestoState'); if(!el) return;
+  try{
+    const s=await api('pesto_stats');
+    if(!s.index_enabled){ setHtml('pestoState', t('predb.idxoff','the indexer is off, so there is nothing to name.')); return; }
+    if(!s.enabled||!(+s.budget)){ setHtml('pestoState', t('pesto.off','off.')); return; }
+    const st=s.stats||{}, td=st.today||{}, yd=st.yesterday||{};
+    const n=v=>(+(v||0)).toLocaleString(LOCALE);
+    const parts=[
+      t('pesto.today','today {p} checked, {named} named',{p:n(td.attempts),named:n(td.named)}),
+      t('pesto.yday','yesterday {p} checked, {named} named',{p:n(yd.attempts),named:n(yd.named)})
+    ];
+    if(st.sets_pending!=null) parts.push(t('pesto.behind','{n} sets waiting',{n:n(st.sets_pending)}));
+    const pf=(+(td.parsefail||0))+(+(yd.parsefail||0));
+    if(pf) parts.push('<span style="color:var(--warn)">'+t('pesto.parsefail','{n} PAR2 files would not parse',{n:n(pf)})+'</span>');
+    const clash=(+(td.conflict||0))+(+(yd.conflict||0));
+    if(clash) parts.push('<span style="color:var(--warn)">'+t('pesto.conflict','{n} disagreed with an existing name',{n:n(clash)})+'</span>');
+    setHtml('pestoState', parts.join(' · '));
+  }catch(e){}
+}
 // The correlation half of the card: the status-by-status counters ARE
 // the precision meter (confirmed against rejected is the number that
 // earns keeping auto-apply on), and the seed importer reports here.
@@ -11295,6 +11770,69 @@ async function startPredbSeed(){
   const j=await api('predb_seed_start').catch(()=>({status:false}));
   if(j&&j.status===false&&j.seed_status) setHtml('predbSeedState', esc(j.seed_status));
   setTimeout(refreshPredbCorr,600);
+}
+// ---- Parity scoreboard ----
+// The scoreboard rows only mean anything while the switch is on -
+// greyed rather than hidden, like the relay settings above them.
+function sbToggles(){
+  const on=(document.getElementById('s_scoreboard_enabled')||{}).checked;
+  document.querySelectorAll('.sb-sub input,.sb-sub select').forEach(el=>{ el.disabled=!on; });
+  // With an account picked from the list, the manual address and key
+  // boxes are not in use - greyed so nobody edits a field that does
+  // nothing, exactly like the whole block when the switch is off.
+  const src=(document.getElementById('s_scoreboard_source')||{}).value;
+  if(on&&src) ['s_scoreboard_url','s_scoreboard_key'].forEach(id=>{
+    const el=document.getElementById(id); if(el) el.disabled=true;
+  });
+}
+// The readout keeps the numbers' honesty markers: "named" is an exact
+// name-for-name comparison, "have" leans on a size-and-timing guess and
+// wears a ~ for it, and the note under the table is that guess's
+// measured error bar (or an admission that nothing has measured it).
+async function refreshScoreboard(){
+  const el=document.getElementById('sbState'); if(!el) return;
+  sbToggles();
+  const row=document.getElementById('sbTblRow');
+  const showTbl=v=>{ if(row) row.style.display=v?'':'none'; };
+  try{
+    const s=await api('scoreboard');
+    if(!s.index_enabled){ setHtml('sbState', t('sb.idxoff','the indexer is off, so there is nothing to measure.')); showTbl(false); return; }
+    if(!s.enabled){ setHtml('sbState', t('sb.off','off.')); showTbl(false); return; }
+    // Two ways to have a reference: an account picked from the indexer
+    // list (source, checked live by the daemon), or the manual pair.
+    if(s.source){ if(!s.source_ok){ setHtml('sbState', t('sb.badsrc','the account picked as the reference is no longer in your indexer list, or is turned off there. Pick another one.')); showTbl(false); return; } }
+    else if(!s.url||!s.has_key){ setHtml('sbState', t('sb.noidx','enter a reference indexer address and your API key first: the sample is drawn from your own account.')); showTbl(false); return; }
+    const parts=[];
+    if(s.status) parts.push(esc(s.status));
+    const now=Math.floor(Date.now()/1000);
+    if(s.last_run) parts.push(t('sb.last','last sample {ago} ago',{ago:fmtEta(Math.max(1,now-s.last_run))}));
+    else if(!s.status) parts.push(t('sb.waiting','waiting for the first daily sample.'));
+    if(s.cooling_until) parts.push(t('sb.cooling','asked to slow down; next try after {time}',{time:fmtClock(s.cooling_until)}));
+    setHtml('sbState', parts.join(' · '));
+    const cats=s.categories||[];
+    if(!cats.length){ showTbl(false); return; }
+    const NAMES={movies:t('sb.cat.movies','Films'),tv:t('sb.cat.tv','TV shows'),
+                 audio:t('sb.cat.audio','Music'),books:t('sb.cat.books','Books')};
+    setHtml(document.querySelector('#sbTbl tbody'), cats.map(c=>{
+      // A category where nothing was found has no lag to report - a
+      // "0s" there would read as "instant", which is the opposite of
+      // the truth.
+      const present=(c.have_named||0)+(c.have_unnamed||0);
+      const lag=(!present||c.lag_median_secs==null)?'-'
+        :(c.lag_median_secs<=0?'0s':fmtEta(c.lag_median_secs));
+      return `<tr><td>${esc(NAMES[c.category]||c.category)}</td>`+
+        `<td>${num(c.named_pct||0,0)}%</td>`+
+        `<td>~${num(c.coverage_pct||0,0)}%</td>`+
+        `<td>${esc(lag)}</td></tr>`;
+    }).join(''));
+    const cal=s.calibration||{};
+    const note=(+cal.checked>0)
+      ? t('sb.cal.done','"have" is partly an estimate from size and timing. Spot-checked {n} times so far, and the guess was right {ok} times ({pct}%).',
+          {n:num(+cal.checked,0),ok:num(+cal.band_agreed||0,0),pct:num((+cal.band_agreed||0)*100/+cal.checked,0)})
+      : t('sb.cal.none','"have" is partly an estimate from size and timing, and nothing has measured that guess yet. The spot-check switch above puts an error bar on it.');
+    setHtml('sbCalNote', note);
+    showTbl(true);
+  }catch(e){}
 }
 // ---- Index database size: the cap, the eviction pass, the file itself ----
 // The size limit is a setting; deleting to honour it is a SEPARATE switch
@@ -11620,16 +12158,283 @@ function applyPreset(which){
                :t('preset.full.done','Full dashboard restored: graphs and extra cards are back.'));
 }
 
+// ======================================================== §129 4c ========
+// The second empty state, and the role presets.
+//
+// State A (no server yet) is the .firstrun checklist above, shipped in
+// Stage 3. State B is a configured server with nothing ever downloaded:
+// the checklist is answered by then, and what replaces it - "how do I
+// actually start a download?" - was answered nowhere on the page, which
+// was a dashboard of cards that could only read zero. See the .nojobs
+// CSS block for which of them are hidden and why the rest stay.
+
+// A route is offered only when it can be taken, so nothing here points
+// at a feature the install does not have.
+function renderStartRoutes(c){
+  const host=document.getElementById('startHere'); if(!host) return;
+  const row=(lbl,hint,act)=>`<div class="orow"><span class="ob">`
+    +`<span class="ol">${esc(lbl)}</span>`
+    +`<span class="oh">${esc(hint)}</span>`
+    +(act?`<span class="oa">${act}</span>`:'')+`</span></div>`;
+  const out=[];
+  // 1. The file picker. Deliberately the same .idlepick class the
+  //    queue's own empty row uses - one delegated handler, one label
+  //    for "choose a .nzb", no second way to open the picker.
+  out.push(row(
+    t('start.drop','Drop an .nzb file on this page'),
+    t('start.drop.hint','A folder of them works, and so does a zip. An nzblnk link works too: paste it anywhere on this page.'),
+    `<button type="button" class="ghost idlepick">${esc(t('start.drop.cta','Choose a file'))}</button>`));
+  // 2. The watch folder. Named when set, offered when not - the same
+  //    setting either way, so there is one place it is edited.
+  out.push(c.watch
+    ? row(t('start.watch','Save .nzb files to your watch folder'),
+          t('start.watch.at','Anything that lands in {p} is queued within seconds.',{p:c.watch}),
+          `<button class="ghost" onclick="goSetting('watch')">${esc(t('start.watch.change','Change the folder'))}</button>`)
+    : row(t('start.watch.none','Set a watch folder'),
+          t('start.watch.hint','Pick a folder and every .nzb saved into it is queued automatically - which is how a browser download, a phone app or a script hands work over.'),
+          `<button class="ghost" onclick="goSetting('watch')">${esc(t('start.watch.set','Set one up'))}</button>`));
+  // 3. The *arr route. The address, never the key: a credential in a
+  //    query string is a credential in somebody's proxy log, so the key
+  //    keeps its own row with its own reveal and copy controls.
+  out.push(row(
+    t('start.arr','Let Sonarr, Radarr or an app add downloads'),
+    t('start.arr.hint','They already speak this: add nzbfast as a SABnzbd download client, at the address below, with your API key.'),
+    `<code>${esc(location.origin)}</code>`
+    +`<button class="ghost mini" onclick="copyStartUrl(this)">${esc(t('start.arr.copy','Copy the address'))}</button>`
+    +`<button class="ghost mini" onclick="goSetting('security')">${esc(t('start.arr.key','Where the API key is'))}</button>`
+    +`<a class="ghost mini" style="text-decoration:none" target="_blank" rel="noopener" href="${escA(manualUrl('arr'))}">${esc(t('start.arr.manual','How to set it up ↗'))}</a>`));
+  // 4. The wall, only with the built-in indexer on. Off, it is empty by
+  //    construction and pointing at it would be a dead end.
+  if(IDX_ON) out.push(row(
+    t('start.wall','Browse what your servers carry'),
+    t('start.wall.hint','The wall fills from the groups you chose to index; click a poster to download it.'),
+    `<a class="ghost mini" style="text-decoration:none" href="/wall">${esc(t('start.wall.cta','Open the wall'))}</a>`));
+  host.innerHTML=`<p style="margin:0 0 4px"><b>${esc(t('start.title','Start your first download'))}</b><br>`
+    +`<span class="dim">${esc(t('start.hint','Your server is set up. Any of these puts a download in the queue - the graphs and totals appear with it.'))}</span></p>`
+    +out.join('');
+}
+async function copyStartUrl(btn){
+  try{ await navigator.clipboard.writeText(location.origin); toast(t('start.arr.copied','Address copied.')); }
+  catch(_){ toast(t('start.arr.copyfail','Could not reach the clipboard - select the address and copy it by hand.'), true); }
+}
+
+// ---- Role presets -------------------------------------------------------
+// Who actually arrives, from the competitive audit's switcher list:
+// people moving from SABnzbd, people moving from NZBGet, and people who
+// never open this page because Sonarr and Radarr drive everything.
+//
+// NOTHING is applied by choosing a role. A role renders a review list -
+// each recommendation with the setting's own label, its current value,
+// the recommended value, one line of why, and a tick - and an explicit
+// Apply runs only the ticked rows, through the SAME setCfg() the
+// settings row itself uses. There is no second write path to keep
+// honest (a setting lives in the settings table, its apply arm and the
+// startup restore block, and a bulk writer that misses one leaves the
+// daemon disagreeing with its own settings page), and no role is
+// stored anywhere: applying one equals ticking those rows by hand, and
+// every part can be changed back individually afterwards. Same contract
+// as applyPreset above, which stores no "current look".
+let roleSel='', roleTicks={};
+// Both value columns are read out of the settings control itself, so a
+// select's options give their own translated words and there is no
+// second table of labels to keep in step with the rows.
+function roleValueText(id,v){
+  const el=document.getElementById(id);
+  if(el && el.tagName==='SELECT'){
+    const o=[...el.options].find(o=>o.value===String(v));
+    if(o) return o.textContent.trim();
+  }
+  if(el && el.type==='checkbox') return (v===1||v===true||v==='1')
+    ? t('role.on','on') : t('role.off','off');
+  const s=(v===null||v===undefined)?'':String(v);
+  return s===''? t('role.unset','not set') : s;
+}
+// The row's own label, which labelRows() has already derived and stamped
+// onto the control as its accessible name - in the active locale, and
+// re-derived on every locale switch. One source, no third copy.
+function roleRowLabel(id,fallback){
+  const el=document.getElementById(id);
+  const n=el&&el.getAttribute('aria-label');
+  return (n&&n.trim())||fallback;
+}
+// Current value as get_config reports it, normalised to the shape the
+// control writes: a checkbox row compares as 0/1, everything else as a
+// string, so "already set" is never decided by 1 !== "1".
+function roleCurrent(c,r){
+  const el=document.getElementById(r.id);
+  const raw=c[r.k];
+  if(el && el.type==='checkbox') return (raw===1||raw===true||raw==='1')?1:0;
+  return raw===null||raw===undefined?'':String(raw);
+}
+function roleWant(r){
+  const el=document.getElementById(r.id);
+  if(el && el.type==='checkbox') return r.v?1:0;
+  return String(r.v);
+}
+// Only real settings, and only claims the setting's own hint already
+// makes. `when` lets a row stay out of the list when it would be noise -
+// telling somebody to switch off an indexer they never switched on is
+// not a recommendation.
+function roleDefs(){ return [
+  {id:'arr', label:t('role.arr','Sonarr, Radarr or another app drives it'),
+   blurb:t('role.arr.blurb','Downloads arrive over the API and the results are handed to something else. These four make that handover behave the way those apps expect.'),
+   recs:[
+     {k:'dupe_action', id:'s_dupe_action', v:'fail',
+      why:t('role.arr.dupe','Failing a duplicate straight into History is what Sonarr and Radarr expect: it lets them pick a different release themselves instead of waiting on a copy that is being held for them.')},
+     {k:'out_umask', id:'s_out_umask', v:'002',
+      why:t('role.arr.umask','Finished files are left group-readable, so an app running as a different user in the same group can import them. Without it a systemd install keeps everything owner-only and the import silently finds nothing.')},
+     {k:'arr_giveup_threshold', id:'s_arr_giveup_threshold', v:'3',
+      why:t('role.arr.giveup','After three different releases of the same episode have all failed, the item is unmonitored instead of a fourth dead copy being fetched.')},
+     {k:'index_enabled', id:'s_index_enabled', v:0,
+      when:c=>!!c.index_enabled,
+      why:t('role.arr.index','The built-in index feeds the wall, which is a browsing surface an app-driven install never opens. Switching it off stops the scanning and the disk it uses.')},
+   ],
+   links:[['categories',t('role.link.cats','Categories')],
+          ['giveup',t('role.link.arr','Sonarr and Radarr instances')],
+          ['security',t('role.link.key','Your API key')]]},
+  {id:'sab', label:t('role.sab','Moving from SABnzbd'), imp:'sab',
+   blurb:t('role.sab.blurb','The move itself is one button: nzbfast reads the configuration already on this machine and brings over the servers, the categories and their folders, and the passwords file. Nothing you have here is replaced - servers already present are skipped.'),
+   recs:[],
+   links:[['servers',t('role.link.srv','Usenet servers')],
+          ['categories',t('role.link.cats','Categories')],
+          ['watch',t('role.link.watch','Watch folder, post-processing script and passwords file')]]},
+  {id:'nzbget', label:t('role.nzbget','Moving from NZBGet'), imp:'nzbget',
+   blurb:t('role.nzbget.blurb','The same one button: nzbfast reads the nzbget.conf already on this machine and brings over the servers, the categories and their folders, and the passwords file. Post-processing scripts keep working - they are given the NZBPP_ variables and the 93/95 exit codes they expect.'),
+   recs:[],
+   links:[['servers',t('role.link.srv','Usenet servers')],
+          ['categories',t('role.link.cats','Categories')],
+          ['watch',t('role.link.watch','Watch folder, post-processing script and passwords file')]]},
+  {id:'solo', label:t('role.solo','Just me, from this dashboard'),
+   blurb:t('role.solo.blurb','Nothing needs changing - this is what a fresh install already does. The one thing worth switching on is the part of it that is off by default.'),
+   recs:[
+     {k:'index_enabled', id:'s_index_enabled', v:1,
+      when:c=>!c.index_enabled,
+      why:t('role.solo.index','Indexing the groups you choose fills a browsable wall of posters, the way a media library does, and it is what the watchlist matches against. Nothing is scanned until you pick what to index.')},
+   ],
+   links:[['watch',t('role.link.watch2','Watch folder')],
+          ['indexing',t('role.link.idx','What to index')],
+          ['rename',t('role.link.rename','Auto-rename')]]},
+]; }
+function pickRole(id){
+  roleSel = roleSel===id ? '' : id;
+  roleTicks={};
+  renderRoles();
+}
+function roleTick(k,on){ roleTicks[k]=!!on; }
+// Both hosts get the same markup from the same call, so the welcome card
+// and the settings card can never show different answers. Nothing inside
+// carries an id - two copies of one id is a broken document.
+function renderRoles(){
+  const hosts=['roleWelcome','roleSettings'].map(id=>document.getElementById(id)).filter(Boolean);
+  if(!hosts.length) return;
+  const c=window._lastCfg||{};
+  const defs=roleDefs();
+  const head=`<p style="margin:0 0 4px"><b>${esc(t('role.title','How do you plan to use nzbfast?'))}</b><br>`
+    +`<span class="dim">${esc(t('role.hint','Each answer is a short list of recommendations with the reason for each one. Nothing changes until you press Apply, and every row is an ordinary setting you can change back on its own afterwards.'))}</span></p>`
+    +`<div class="rolepick">`+defs.map(d=>
+      `<button class="ghost${d.id===roleSel?' on':''}" aria-pressed="${d.id===roleSel}" onclick="pickRole('${d.id}')">${esc(d.label)}</button>`).join('')
+    +`</div>`;
+  let body='';
+  const d=defs.find(x=>x.id===roleSel);
+  if(d){
+    const rows=d.recs.filter(r=>!r.when||r.when(c));
+    const open=rows.filter(r=>roleCurrent(c,r)!==roleWant(r));
+    body='<div class="rolerecs">'
+      +`<p class="dim" style="margin:8px 0 2px;font-size:12.5px">${esc(d.blurb)}</p>`;
+    // The importer is the real migration for a switcher, and it already
+    // exists - this puts it in front of the person it is for instead of
+    // leaving it a button inside the server list.
+    if(d.imp) body+=`<div class="orow"><span class="ob"><span class="ol">${
+        esc(t('role.import','Bring your settings across'))}</span><span class="oh">${
+        esc(t('role.import.hint','Scans this machine for the configuration, shows you what it found, and asks before writing anything.'))
+      }</span><span class="oa"><button class="ghost" onclick="importServers(this)">${
+        esc(t('role.import.cta','Look for it now'))}</button></span></span></div>`;
+    body+=open.map(r=>{
+      const cur=roleValueText(r.id, c[r.k]), want=roleValueText(r.id, r.v);
+      if(!(r.k in roleTicks)) roleTicks[r.k]=true;
+      return `<label class="orow"><input type="checkbox" ${roleTicks[r.k]?'checked':''} `
+        +`onchange="roleTick('${r.k}',this.checked)"><span class="ob">`
+        +`<span class="ol">${esc(roleRowLabel(r.id,r.k))}</span>`
+        +`<span class="oh">${esc(r.why)}</span>`
+        +`<span class="ov">${t('role.change','now <b>{a}</b>, recommended <b>{b}</b>',
+            {a:esc(cur), b:esc(want)})}</span></span></label>`;
+    }).join('');
+    if(open.length) body+=`<p class="oa" style="margin-top:12px"><button onclick="applyRole(this)">${
+      esc(t('role.apply','Apply the ticked settings'))}</button></p>`;
+    else if(rows.length) body+=`<p class="roledone">${esc(t('role.allset','Every recommendation for this is already how you have it.'))}</p>`;
+    if(d.links.length) body+='<div class="rolelinks"><span class="dim">'
+      +esc(t('role.where','Where these live:'))+'</span>'
+      +d.links.map(([sk,lbl])=>`<a href="#" onclick="return goSetting('${sk}')">${esc(lbl)}</a>`).join('')
+      +'</div>';
+    body+='</div>';
+  }
+  hosts.forEach(h=>{ h.innerHTML=head+body; });
+}
+async function applyRole(btn){
+  const c=window._lastCfg||{};
+  const d=roleDefs().find(x=>x.id===roleSel); if(!d) return;
+  const rows=d.recs.filter(r=>(!r.when||r.when(c))
+    && roleCurrent(c,r)!==roleWant(r) && roleTicks[r.k]!==false);
+  if(!rows.length){ toast(t('role.none','Nothing ticked.'), true); return; }
+  await busy(btn, t('role.applying','Applying…'), async()=>{
+    let n=0, bad=0;
+    // One at a time and in order: these go through the settings
+    // allowlist exactly as the rows themselves do, and a refusal must
+    // be reported rather than swallowed by a parallel batch.
+    for(const r of rows){
+      try{
+        const j=await api('config',`&name=${encodeURIComponent(r.k)}&value=${encodeURIComponent(r.v)}`);
+        if(j && j.error){ bad++; toast(tErr(j.error), true); } else n++;
+      }catch(_){ bad++; }
+    }
+    if(bad) toast(t('role.partial','{n} applied, {b} refused by the daemon.',{n,b:bad}), true);
+    else toast(tn('role.done',n,'{n} setting applied.','{n} settings applied.'));
+    // IDX_ON is decided at page boot and half the UI hangs off it, which
+    // is why setIndexEnabled reloads too. Anything else just re-reads.
+    if(n && rows.some(r=>r.k==='index_enabled')){ setTimeout(()=>location.reload(), 900); return; }
+    if(n){ loadSettings&&loadSettings(); checkWelcome(); }
+  });
+}
+
 async function checkWelcome(){
   try{
     const c=((await api('get_config')).config||{}).nzbfast||{};
+    // Shared with the role presets and the setup checklist, which both
+    // read the live config rather than being handed a copy of it.
+    window._lastCfg=c;
     const first = c.servers_configured===false;
-    document.getElementById('welcomeCard').style.display = first ? '' : 'none';
-    if(first){ renderSetupSteps(c); renderWelcomeLook(); }
+    // §129 4c: state B - a server exists, nothing has ever downloaded.
+    // `jobs_ever` is a STICKY daemon fact (queue, history, or a nonzero
+    // lifetime usage bucket), not "is the queue empty right now", so
+    // clearing history cannot drop a working install back into
+    // onboarding. Older daemons do not send it; undefined must read as
+    // "has run" so a dashboard served by one never hides cards it
+    // cannot bring back.
+    const ready = !first && c.jobs_ever===false;
+    document.getElementById('welcomeCard').style.display = (first||ready) ? '' : 'none';
+    // The checklist and the start routes are the two halves of one card:
+    // one asks the setup questions, the other answers the question that
+    // replaces them. Exactly one is on screen at a time.
+    document.getElementById('setupSteps').style.display = first ? '' : 'none';
+    document.getElementById('startHere').style.display = ready ? '' : 'none';
+    if(first) renderSetupSteps(c);
+    if(ready) renderStartRoutes(c);
+    if(first||ready) renderWelcomeLook();
+    // Unconditional: the role presets' other host is a settings card that
+    // outlives onboarding, and somebody who moves to running everything
+    // from Sonarr six months in should still be able to ask what that
+    // shape is. Both hosts are written by this one call.
+    renderRoles();
     // Only ADD the class here. showAllCards() removes it for the session,
     // and a re-poll must not undo that while the user is looking around.
     if(!first) document.body.classList.remove('firstrun');
     else if(!showAllCards.used) document.body.classList.add('firstrun');
+    // Same rule for .nojobs, and one more on top: once a job exists the
+    // class is gone for good. TODO §129 4c's contract is that telemetry,
+    // once it has appeared, is never taken away again - so this may only
+    // ever run in the removing direction after the first time.
+    if(!ready){ document.body.classList.remove('nojobs'); checkWelcome.ran=true; }
+    else if(!showAllCards.used && !checkWelcome.ran) document.body.classList.add('nojobs');
     // Show where things happen, from the daemon's real config - so the
     // first thing a new user learns is "save .nzb files there, finished
     // files appear here".
@@ -11802,6 +12607,23 @@ addEventListener('resize', redrawCanvases);
 // treat that as "unknown", not "phone"; pointer:coarse still guards.
 const LAYOUT_EDIT = !(matchMedia('(pointer:coarse)').matches
   || (innerWidth>0 && innerWidth<=640));
+// Queue and history are the tables with a leading selection checkbox;
+// browse has none, so its saved indexes already mean what they say. The
+// checkbox's own entry drops out - it is not a column any more.
+function colShiftV4(cols){
+  for(const id of ['queue','hist']){
+    const c=cols[id]; if(!c||typeof c!=='object') continue;
+    if(Array.isArray(c.ord)) c.ord=c.ord.filter(ci=>Number.isInteger(ci)&&ci>0).map(ci=>ci-1);
+    if(c.w&&typeof c.w==='object'){
+      const w={};
+      // >1, not >0: what was column 1 becomes the flexible column 0,
+      // which carries no width at all - keeping it would be dead data.
+      for(const [k,v] of Object.entries(c.w)) if(+k>1) w[+k-1]=v;
+      c.w=w;
+    }
+  }
+  return cols;
+}
 function layoutPrefs(){
   try{
     const p=JSON.parse(localStorage.layoutPrefs);
@@ -11812,9 +12634,14 @@ function layoutPrefs(){
     // v2 → v3 adds per-table column order/widths. Same migrate-don't-
     // discard rule as v1 → v2.
     if(p && p.v===2){ p.v=3; p.cols={}; saveLayoutPrefs(p); }
-    if(p && p.v===3){ p.density=p.density||{}; p.cols=p.cols||{}; return p; }
+    // v3 → v4: the selection checkbox left the column model, so every
+    // saved index on the two tables that carry one shifts down by one.
+    // Migrate, don't discard - an arrangement someone made by hand would
+    // otherwise come back one column out.
+    if(p && p.v===3){ p.v=4; p.cols=colShiftV4(p.cols||{}); saveLayoutPrefs(p); }
+    if(p && p.v===4){ p.density=p.density||{}; p.cols=p.cols||{}; return p; }
   }catch(e){}
-  return {v:3, order:[], hidden:[], chartH:{}, density:{}, cols:{}};
+  return {v:4, order:[], hidden:[], chartH:{}, density:{}, cols:{}};
 }
 function saveLayoutPrefs(p){ localStorage.layoutPrefs=JSON.stringify(p); }
 function resetLayout(){ delete localStorage.layoutPrefs; toast(t('toast.layoutReset','Layout reset.')); setTimeout(()=>location.reload(), 300); }
@@ -12135,9 +12962,11 @@ function persistChartH(){
 // Reset layout carry it for free. The renderers keep emitting cells in
 // their natural order; a MutationObserver re-applies the saved
 // permutation to whatever a render just produced, so none of the three
-// renderers know any of this exists. Name (original column 0) stays the
-// flexible column: once the user resizes anything every OTHER column is
-// pinned in pixels and Name absorbs the remainder, which keeps the
+// renderers know any of this exists. Name (the first REAL column, ci 0:
+// the selection checkbox sitting ahead of it is not part of the model at
+// all, see colTable) stays the flexible column - once the user resizes
+// anything every OTHER column is pinned in pixels and Name absorbs the
+// remainder, which keeps the
 // table exactly as wide as its card (the capped-card wrapper clips
 // overflow-x, so a wider table would lose its action buttons).
 // The ≤640px stacked layout labels cells by nth-child and has no
@@ -12165,10 +12994,22 @@ function colOrder(id, n){
   for(let i=0;i<n;i++) if(!seen.has(i)) ord.push(i);
   return ord;
 }
+// The leading selection checkbox (§129 2f) is NOT a user column: it is a
+// fixed 26px control strip with no heading, nothing to reorder and
+// nothing to resize. It is excluded from the whole subsystem - including
+// the data-ci stamping - so `ci` 0 is the first REAL column (Name, the
+// flexible one). Leaving it in made the 26px checkbox the flexible
+// column that absorbs the table's remainder, made it draggable, and
+// gave its empty heading Name's accessible label.
+function colReal(row){ return [...row.cells].filter(c=>!c.classList.contains('selcol')); }
 function colTable(id){
   const tb=document.getElementById(id);
   const hr=tb&&tb.tHead&&tb.tHead.rows[0];
-  return hr?{tb, hr, n:hr.cells.length}:null;
+  if(!hr) return null;
+  const cells=colReal(hr);
+  // `lead` = the fixed cells ahead of the model. They never move, so
+  // they stay at the front of the row and of the colgroup.
+  return {tb, hr, cells, lead:hr.cells.length-cells.length, n:cells.length};
 }
 // Paint order + widths. `wOver` lets a live drag paint straight from an
 // in-memory object so localStorage is written once, on release - the
@@ -12179,7 +13020,7 @@ function applyCols(id, wOver){
   const stacked=COL_STACKED.matches;
   // Headers travel physically (they are display:none while stacked, so
   // they can stay permuted); handles and listeners move with them.
-  const ths=[...s.hr.cells];
+  const ths=s.cells;
   for(const ci of ord) s.hr.appendChild(ths.find(th=>+th.dataset.ci===ci));
   // Widths ride a colgroup in VISUAL order. fixed layout starts only
   // once a width exists: until then the table keeps the auto layout it
@@ -12187,9 +13028,12 @@ function applyCols(id, wOver){
   let cg=s.tb.querySelector(':scope>colgroup.usercols');
   if(Object.keys(w).length && !stacked){
     if(!cg){ cg=document.createElement('colgroup'); cg.className='usercols'; s.tb.insertBefore(cg, s.tb.firstChild); }
-    while(cg.children.length>s.n) cg.lastChild.remove();
-    while(cg.children.length<s.n) cg.appendChild(document.createElement('col'));
-    ord.forEach((ci,vi)=>{ cg.children[vi].style.width = (ci!==0&&w[ci]) ? Math.round(w[ci])+'px' : ''; });
+    // The lead cells get a <col> each so the model's columns line up,
+    // but never a width: their own CSS width (26px) rides through the
+    // fixed layout from the header cell, exactly as it does today.
+    while(cg.children.length>s.n+s.lead) cg.lastChild.remove();
+    while(cg.children.length<s.n+s.lead) cg.appendChild(document.createElement('col'));
+    ord.forEach((ci,vi)=>{ cg.children[vi+s.lead].style.width = (ci!==0&&w[ci]) ? Math.round(w[ci])+'px' : ''; });
     s.tb.style.tableLayout='fixed';
   } else { if(cg) cg.remove(); s.tb.style.tableLayout=''; }
   colApplyRows(id);
@@ -12206,7 +13050,9 @@ function colApplyRows(id){
     if(tr.__cord===key) continue;
     if(!tr.__c0){
       if(!key) { tr.__cord=key; continue; }        // natural order already
-      const cells=[...tr.cells];
+      // The selection cell is not in the model and never moves, so it is
+      // filtered out here too - the permutation is over real cells only.
+      const cells=colReal(tr);
       // Drawer and empty-state rows span the full width: leave them be.
       if(cells.length!==s.n||cells.some(td=>td.colSpan>1)) continue;
       tr.__c0=cells;
@@ -12231,7 +13077,7 @@ function colReorder(id, from, ins){
 function colSnapshotW(id){
   const s=colTable(id), cp=colPrefs(id);
   if(!Object.keys(cp.w).length)
-    for(const th of s.hr.cells){
+    for(const th of s.cells){
       const ci=+th.dataset.ci;
       // The 36 floor also covers a header measured while it is not
       // rendered (width 0), which would otherwise pin real columns at
@@ -12247,6 +13093,10 @@ function colClampW(id, cp, ci, px){
   const s=colTable(id);
   let others=0;
   for(const [k,v] of Object.entries(cp.w)) if(+k!==ci) others+=v;
+  // The lead cells carry no entry in cp.w but do eat table width, so
+  // without them the 80px Name keeps is 80 minus the checkbox strip.
+  for(const th of s.hr.cells)
+    if(th.classList.contains('selcol')) others+=th.getBoundingClientRect().width;
   return Math.max(36, Math.min(px, s.tb.clientWidth-80-others));
 }
 // Which column a resize handle actually drives: its own for a fixed
@@ -12258,12 +13108,37 @@ function colResizeTarget(id, th){
   const nx=th.nextElementSibling;
   return nx?{ci:+nx.dataset.ci, inv:-1}:null;
 }
+// Naming a heading: its own text, and for the headings that carry only
+// per-row buttons (queue, history, browse all end in one) the word for
+// what they hold. This used to fall back to Name, so those blank
+// headings announced themselves as a second "Name" column.
+function colHeadLabel(th){
+  const lbl=t('cols.move.title','Drag this heading to move the column. Arrow keys move it too; Shift with an arrow resizes it.');
+  // A heading with a tooltip of its own keeps it; ours is re-stamped on
+  // a locale switch, so it is marked rather than sniffed.
+  if(!th.title||th.dataset.colTip){ th.title=lbl; th.dataset.colTip='1'; }
+  th.setAttribute('aria-label',(th.textContent.trim()||t('col.actions','Actions'))+': '+lbl);
+  const h=th.querySelector(':scope>.colrs');
+  if(h) h.title=t('cols.resize.title','Drag to resize this column. Double-click puts the widths back.');
+}
+// Every heading in one table, named. Called again after the locale
+// catalogue lands (initCols runs before that fetch resolves, so the
+// first stamp is always English).
+function colLabelAll(id){
+  const s=colTable(id); if(!s) return;
+  for(const th of s.cells) colHeadLabel(th);
+  // The fixed lead cell is not in the model, but its heading still needs
+  // a name of its own: the <th> around the select-all box holds no text,
+  // so it announced as a second "Name" column.
+  for(const th of s.hr.cells)
+    if(th.classList.contains('selcol')) th.setAttribute('aria-label', t('col.select','Select'));
+}
+// Nothing to restamp where the subsystem never ran (initCols is behind
+// LAYOUT_EDIT), or the headings would advertise a drag they do not have.
+function colRelabel(){ if(LAYOUT_EDIT) COL_TABLES.forEach(colLabelAll); }
 function colHeadCtl(id, th){
   th.classList.add('colgrab');
-  const lbl=t('cols.move.title','Drag this heading to move the column. Arrow keys move it too; Shift with an arrow resizes it.');
-  if(!th.title) th.title=lbl;
   th.tabIndex=0;
-  th.setAttribute('aria-label',(th.textContent.trim()||t('col.name','Name'))+': '+lbl);
   const rtl=()=>document.documentElement.dir==='rtl';
   // Move: pointer capture so the drag survives leaving the header, and
   // a 6px threshold so a plain click still just focuses.
@@ -12274,7 +13149,7 @@ function colHeadCtl(id, th){
   // both ends of the row, where the pointer is over no cell at all.
   const insAt=x=>{
     let ins=0;
-    for(const c of th.parentElement.cells){
+    for(const c of colReal(th.parentElement)){
       const r=c.getBoundingClientRect();
       if(rtl() ? x<(r.left+r.right)/2 : x>(r.left+r.right)/2) ins++;
     }
@@ -12289,7 +13164,7 @@ function colHeadCtl(id, th){
     if(pid===null) return;
     if(!moved){ if(Math.abs(e.clientX-x0)<6) return; moved=true; th.classList.add('coldrag'); }
     clearMarks();
-    const cells=[...th.parentElement.cells], ins=insAt(e.clientX);
+    const cells=colReal(th.parentElement), ins=insAt(e.clientX);
     if(ins>=cells.length) cells[cells.length-1].classList.add('coldropend');
     else cells[ins].classList.add('coldrop');
   });
@@ -12299,7 +13174,7 @@ function colHeadCtl(id, th){
     pid=null;
     if(!moved) return;
     th.classList.remove('coldrag');
-    const cells=[...th.parentElement.cells];
+    const cells=colReal(th.parentElement);
     let ins=-1;
     cells.forEach((c,vi)=>{
       if(c.classList.contains('coldrop')) ins=vi;
@@ -12326,9 +13201,10 @@ function colHeadCtl(id, th){
       saveColPrefs(id, cp); applyCols(id);
       return;
     }
-    const vi=[...th.parentElement.cells].indexOf(th);
+    const cells=colReal(th.parentElement);
+    const vi=cells.indexOf(th);
     const ins=dir>0?vi+2:vi-1;
-    if(ins<0||ins>th.parentElement.cells.length) return;
+    if(ins<0||ins>cells.length) return;
     colReorder(id, vi, ins);
     th.focus();
   });
@@ -12369,7 +13245,8 @@ function colHeadCtl(id, th){
 function initCols(){
   for(const id of COL_TABLES){
     const s=colTable(id); if(!s) continue;
-    [...s.hr.cells].forEach((th,i)=>{ th.dataset.ci=i; colHeadCtl(id, th); });
+    s.cells.forEach((th,i)=>{ th.dataset.ci=i; colHeadCtl(id, th); });
+    colLabelAll(id);
     // Every render rewrites the tbody in natural order; re-permute what
     // just appeared. Moving tds does not touch the tbody's OWN child
     // list, so the observer cannot feed itself.
@@ -12518,7 +13395,9 @@ injectHelp();
 // behind it. Runs before the catalogue fetch below, and again after, so
 // a non-English page relabels too.
 function idxNavPill(){
-  const a=document.getElementById('navWall'); if(!a||IDX_ON||!IDX_COUNT) return;
+  // With spots on there is a real wall behind the pill, so it keeps
+  // its name.
+  const a=document.getElementById('navWall'); if(!a||IDX_ON||SPOT_ON||!IDX_COUNT) return;
   a.href='/wall#search';
   const lbl=document.getElementById('navWallLbl');
   if(lbl){ lbl.textContent=t('hdr.search','search'); lbl.removeAttribute('data-i18n'); }
@@ -12539,6 +13418,7 @@ if(LOCALE!=='en'){
     // arrived - rebuild the translated bits.
     document.querySelectorAll('.draghandle').forEach(g=>g.title=t('layout.drag.title','drag to move this card'));
     document.querySelectorAll('.cardhide').forEach(x=>x.title=t('layout.hide.title','hide this card: bring it back from the Hidden bar at the bottom, or Settings → Interface → Reset layout'));
+    colRelabel();   // table headings were named before the catalogue landed
     renderHiddenBar();
     renderSndEvents(); fillVoices(); checkWelcome(); idxNavPill();
     // (The 📖 pill + ? links are already locale-aware via injectHelp/manualUrl.)
