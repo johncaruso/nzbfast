@@ -92,7 +92,9 @@ impl Daemon {
     /// once per eviction pass.
     #[cfg(feature = "indexer")]
     pub fn protected_set(&self) -> nzbkit::index::Protected {
-        let items = self.watchlist.lock_ok().clone();
+        // §151: a synced title is watched, so the size cap must not
+        // evict what it is waiting for either.
+        let items = self.watch_items();
         let mut watchlisted: Vec<String> = Vec::new();
         for item in &items {
             // Disabled items still count: switching a show off is not
@@ -358,7 +360,7 @@ impl Daemon {
                 }
             }
         }
-        for w in self.watchlist.lock_ok().iter() {
+        for w in self.watch_items().iter() {
             let norm = nzbkit::release::norm_title(&w.title);
             if norm.is_empty() {
                 continue;
@@ -673,10 +675,18 @@ impl Daemon {
     /// the last known figures. A few-seconds-stale count is fine for a
     /// status pill - four HTTP workers queued behind a 62s lock hold
     /// is how one dashboard tab wedged the whole daemon.
+    ///
+    /// None means "no figures yet", not "empty index": every read path
+    /// was busy and nothing has seeded the cache since this daemon came
+    /// up. The API forwards that as a cold flag so the dashboard can say
+    /// it is still reading instead of claiming a populated index holds
+    /// zero releases. Zeros stay reserved for what is actually zero: an
+    /// indexer that is off, a database that will not open, or a genuinely
+    /// empty index.
     #[cfg(feature = "indexer")]
-    pub(in crate::serve) fn index_stats_snapshot(&self) -> (u64, u64, u64, u64) {
+    pub(in crate::serve) fn index_stats_snapshot(&self) -> Option<(u64, u64, u64, u64)> {
         if !self.index_db_wanted() {
-            return (0, 0, 0, 0);
+            return Some((0, 0, 0, 0));
         }
         if let Ok(mut guard) = self.index.try_lock() {
             if guard.is_none() {
@@ -694,20 +704,21 @@ impl Daemon {
                     ix.live_bytes().unwrap_or(0),
                 );
                 *self.index_stats_cache.lock_ok() = Some(snap);
-                return snap;
+                return Some(snap);
             }
-            return (0, 0, 0, 0);
+            return Some((0, 0, 0, 0));
         }
         if let Some(snap) = *self.index_stats_cache.lock_ok() {
-            return snap;
+            return Some(snap);
         }
         // The cache is only empty before the first successful read - the
         // restart window. A scan batch that reclaims the write connection
         // straight away used to make a 19 GB index report zero releases
         // to every dashboard load until the batch finished; the pooled
         // read-only connections run concurrently with that writer, so
-        // ask one of them instead. Busy/Unavailable still answer zeros:
-        // the pool's bounded wait is the whole point of it.
+        // ask one of them instead. Busy/Unavailable answer None: the
+        // pool's bounded wait is the whole point of it, and "could not
+        // read" must not be dressed up as a count.
         if let Reader::Got(ix) = self.index_read_acquire() {
             let (total, complete) = ix.stats().unwrap_or((0, 0));
             let snap = (
@@ -717,9 +728,9 @@ impl Daemon {
                 ix.live_bytes().unwrap_or(0),
             );
             *self.index_stats_cache.lock_ok() = Some(snap);
-            return snap;
+            return Some(snap);
         }
-        (0, 0, 0, 0)
+        None
     }
 
     /// Mutable variant for the odd transaction-shaped call (IMDb

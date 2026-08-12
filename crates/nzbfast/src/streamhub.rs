@@ -88,6 +88,14 @@ pub(crate) struct StreamHub {
     /// connections, so the active job keeps its budget. Exclusion stays
     /// all-or-nothing (`excluded_hosts`); this is the bounded middle.
     pub host_conn_caps: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// §96.5: remaining prepaid bytes per host for the NEXT download's
+    /// pool build - the configured block minus what the ledger says is
+    /// already spent, only for hosts with bytes left (a spent block
+    /// goes in `excluded_hosts` instead). The fleet build seeds each
+    /// server's mid-run budget from this, so a block that runs out
+    /// DURING a job releases the server there and then. Recomputed by
+    /// the runner at every job start, like `excluded_hosts`.
+    pub host_byte_budgets: std::sync::Mutex<std::collections::HashMap<String, u64>>,
     /// TODO 112 (dark, NZBFAST_LIVE_TUNE=1): per-host live connection
     /// targets, shared between each job's pool build and the epoch
     /// controller in tasks.rs. On the hub rather than per job because
@@ -167,6 +175,12 @@ pub(crate) struct StreamHub {
     /// re-read it per invocation (the operator may add the password
     /// WHILE the download runs). None on CLI runs and sidecar hubs.
     pub unpack_password_file: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// §99 try-order hint: the host the active job's NZB was fetched
+    /// from (the failure-link origin), owner-tagged like
+    /// `late_password`, so the in-stream probe can put the password
+    /// last associated with that site at the head of the file's
+    /// candidates. None on CLI runs and for uploaded NZBs.
+    pub pw_assoc_site: std::sync::Mutex<Option<(String, String)>>,
     /// The password the in-stream probe VERIFIED for this owner (from
     /// the passwords file or a harvested sidecar). The set decrypts
     /// one-pass, so finalize never meets an encrypted volume - this
@@ -252,6 +266,14 @@ impl StreamHub {
         let g = self.late_password.lock_ok();
         let (tag, pw) = g.as_ref()?;
         (tag == owner).then(|| pw.clone())
+    }
+
+    /// §99: the NZB source host for `owner`, same ownership rule - a
+    /// stale hint must never order another job's candidates.
+    pub fn pw_assoc_site_for(&self, owner: &str) -> Option<String> {
+        let g = self.pw_assoc_site.lock_ok();
+        let (tag, host) = g.as_ref()?;
+        (tag == owner).then(|| host.clone())
     }
 
     /// The warm connection pool, created on first use (it spawns a

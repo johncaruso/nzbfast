@@ -41,6 +41,11 @@ struct TrackBuf {
     bit_depth: Option<u8>,
     profile: Option<String>,
     level: Option<String>,
+    /// RFC 6381 codec string, built in the sample entry's own
+    /// configuration record where the bytes are (video only - an audio
+    /// track's canonical name is not settled until `esds` has been read,
+    /// so its string is built at the push site).
+    codec_str: Option<String>,
     bitrate: Option<u64>,
     matrix: Option<String>,
     transfer: Option<String>,
@@ -455,6 +460,7 @@ fn children<R: Read + Seek>(
         let b = rd.read_leaf_at(c.body, len, MAX_CHILD)?;
         match &c.kind {
             b"avcC" if b.len() >= 4 => {
+                st.track.codec_str = rfc6381_of(st, &b);
                 st.track.profile = Some(
                     match b[1] {
                         66 => "Baseline",
@@ -477,6 +483,7 @@ fn children<R: Read + Seek>(
                 });
             }
             b"hvcC" if b.len() >= 13 => {
+                st.track.codec_str = rfc6381_of(st, &b);
                 let prof = b[1] & 0x1F;
                 st.track.profile = match prof {
                     1 => Some("Main".into()),
@@ -488,12 +495,14 @@ fn children<R: Read + Seek>(
                 st.track.bit_depth = Some(if prof == 2 { 10 } else { 8 });
             }
             b"av1C" if b.len() >= 3 => {
+                st.track.codec_str = rfc6381_of(st, &b);
                 let idx = b[1] & 0x1F;
                 st.track.profile = Some(format!("Profile {}", (b[1] >> 5) & 0x07));
                 st.track.level = Some(format!("{}.{}", 2 + idx / 4, idx % 4));
                 st.track.bit_depth = Some(if (b[2] >> 6) & 1 == 1 { 10 } else { 8 });
             }
             b"vpcC" if b.len() >= 7 => {
+                st.track.codec_str = rfc6381_of(st, &b);
                 st.track.profile = Some(format!("Profile {}", b[4]));
                 st.track.level = Some(format!("{}.{}", b[5] / 10, b[5] % 10));
                 st.track.bit_depth = Some(b[6] >> 4);
@@ -617,6 +626,13 @@ fn esds(b: &[u8]) -> Option<(u8, Option<u64>)> {
     None
 }
 
+/// The codec string for whatever sample entry is being walked. The
+/// entry's fourcc has already settled `canon` by the time its children
+/// are read, so the configuration record is all that was missing.
+fn rfc6381_of(st: &State, cfg: &[u8]) -> Option<String> {
+    codec::rfc6381_video(st.track.canon.as_deref()?, Some(cfg))
+}
+
 fn flush_track(info: &mut MediaInfo, st: &mut State) {
     let t = std::mem::take(&mut st.track);
     if info.video.len() + info.audio.len() + info.subtitles.len() >= MAX_TRACKS {
@@ -668,6 +684,7 @@ fn flush_track(info: &mut MediaInfo, st: &mut State) {
                 profile: t.profile,
                 level: t.level,
                 bitrate: t.bitrate,
+                codec_rfc6381: t.codec_str,
                 enabled: t.enabled,
                 // MP4 has no default-track flag; the first track of a
                 // kind is what a player picks.
@@ -676,6 +693,7 @@ fn flush_track(info: &mut MediaInfo, st: &mut State) {
         }
         Some(b"soun") => {
             let first = info.audio.is_empty();
+            let codec_rfc6381 = codec::rfc6381_audio(&canon);
             info.audio.push(AudioTrack {
                 codec: canon,
                 codec_id: raw,
@@ -687,6 +705,7 @@ fn flush_track(info: &mut MediaInfo, st: &mut State) {
                 default: first,
                 forced: false,
                 bitrate: t.bitrate,
+                codec_rfc6381,
                 enabled: t.enabled,
             });
         }

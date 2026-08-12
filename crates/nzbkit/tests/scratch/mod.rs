@@ -1,14 +1,24 @@
-//! Scratch-directory guard for the integration suites.
+//! Scratch-directory guard for the integration suites - a copy of
+//! `crates/nzbfast/tests/scratch/mod.rs`, kept in step with it (§149
+//! taught both copies to keep a panicking test's tree).
 //!
 //! Every test that puts a `nzbfast-*` directory in the OS temp dir holds
 //! one of these for the test's lifetime: the directory is recreated fresh
-//! on attach and removed again on drop. Drops run during panic unwind, so
-//! a failing test cleans up the same as a passing one - the historical
-//! leak was ~90k dirs (~360 GB) of scratch in $TMPDIR over five days.
+//! on attach and removed again on drop - the historical leak was ~90k
+//! dirs (~360 GB) of scratch in $TMPDIR over five days. The removal is a
+//! plain `remove_dir_all`, never the Trash: routing temp paths through
+//! the Trash raced in-flight calls into Finder "-43" dialogs once
+//! already.
+//!
+//! A PANICKING test keeps its tree: the failure someone is about to
+//! debug lives in there, and deleting it during unwind destroys the
+//! evidence. The kept path is printed to stderr, so it lands in the
+//! failing test's captured output.
 //!
 //! Attaching also sweeps stale `nzbfast-*` directories older than a day
 //! (once per test process), so scratch from crashed or SIGKILLed runs -
-//! which no Drop can cover - still gets reclaimed by the next run.
+//! and the trees kept by failing tests above - still gets reclaimed by
+//! the next run.
 
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -54,6 +64,10 @@ impl AsRef<Path> for ScratchDir {
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("scratch kept for inspection: {}", self.path.display());
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }

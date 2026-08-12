@@ -505,6 +505,458 @@ pub fn avi() -> Vec<u8> {
     chunk(b"RIFF", &body)
 }
 
+// ---------------------------------------------------------------------------
+// Remux fixtures: containers with actual payload in them
+// ---------------------------------------------------------------------------
+//
+// Everything above describes a file; the remuxer needs one that also
+// CONTAINS something. These two build a couple of seconds of synthetic
+// elementary stream and wrap it in the shapes the sample walk has to
+// survive: mixed SimpleBlock and BlockGroup, all three lacing modes,
+// Cues reachable only through the SeekHead, and on the MP4 side a moov
+// at the end with composition offsets and a sparse sync-sample table.
+//
+// The payloads are not real video - the remuxer never looks inside a
+// sample, so a deterministic byte pattern proves exactly as much and
+// can be regenerated rather than committed.
+
+/// Deterministic sample payload: distinguishable per frame, so a
+/// byte-identity assertion cannot pass by accident.
+fn frame(tag: u8, n: usize) -> Vec<u8> {
+    (0..n).map(|i| tag ^ (i as u8).wrapping_mul(31)).collect()
+}
+
+/// An unsigned EBML variable-size integer, shortest form.
+fn vint(v: u64) -> Vec<u8> {
+    for len in 1..=8u32 {
+        let max = (1u64 << (7 * len)) - 1;
+        if v < max {
+            let mut out = Vec::with_capacity(len as usize);
+            let marker = 1u64 << (7 * len);
+            let x = v | marker;
+            for i in (0..len).rev() {
+                out.push((x >> (8 * i)) as u8);
+            }
+            return out;
+        }
+    }
+    panic!("value too large for a vint");
+}
+
+/// A SIGNED EBML lace delta: biased by the midpoint of its width.
+fn svint(v: i64) -> Vec<u8> {
+    for len in 1..=8u32 {
+        let bias = (1i64 << (7 * len - 1)) - 1;
+        let max = (1i64 << (7 * len)) - 1;
+        let biased = v + bias;
+        if biased >= 0 && biased < max {
+            return vint(biased as u64);
+        }
+    }
+    panic!("delta too large for a signed vint");
+}
+
+/// A signed integer leaf, two's complement in the shortest form that
+/// keeps the sign.
+fn sint(id: &[u8], v: i64) -> Vec<u8> {
+    let mut n = 1;
+    while n < 8 && !(-(1i64 << (8 * n - 1))..1i64 << (8 * n - 1)).contains(&v) {
+        n += 1;
+    }
+    el(id, &v.to_be_bytes()[8 - n..])
+}
+
+/// A SimpleBlock with an optional lacing mode.
+///
+/// `lacing`: 0 none, 1 Xiph, 2 fixed, 3 EBML - the wire encoding is
+/// those two bits shifted into the flags byte.
+fn simple_block(track: u64, rel: i16, key: bool, lacing: u8, frames: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = vint(track);
+    b.extend(rel.to_be_bytes());
+    let flags = if key { 0x80 } else { 0 } | (lacing << 1);
+    b.push(flags);
+    b.extend(lace_body(lacing, frames));
+    el(&[0xA3], &b)
+}
+
+/// The lacing header plus the concatenated frames.
+fn lace_body(lacing: u8, frames: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = Vec::new();
+    if lacing == 0 {
+        assert_eq!(frames.len(), 1, "an unlaced block holds one frame");
+        b.extend_from_slice(&frames[0]);
+        return b;
+    }
+    b.push((frames.len() - 1) as u8);
+    match lacing {
+        // Xiph: 255-terminated runs for all but the last frame.
+        1 => {
+            for f in &frames[..frames.len() - 1] {
+                let mut n = f.len();
+                while n >= 255 {
+                    b.push(255);
+                    n -= 255;
+                }
+                b.push(n as u8);
+            }
+        }
+        // Fixed: nothing written, the sizes must divide evenly.
+        2 => {
+            let first = frames[0].len();
+            assert!(
+                frames.iter().all(|f| f.len() == first),
+                "fixed lacing needs equal frames"
+            );
+        }
+        // EBML: an absolute first size then signed deltas.
+        _ => {
+            b.extend(vint(frames[0].len() as u64));
+            for w in frames.windows(2).take(frames.len().saturating_sub(2)) {
+                b.extend(svint(w[1].len() as i64 - w[0].len() as i64));
+            }
+        }
+    }
+    for f in frames {
+        b.extend_from_slice(f);
+    }
+    b
+}
+
+/// A BlockGroup: the older framing, whose keyframe-ness is stated by the
+/// ABSENCE of a ReferenceBlock.
+fn block_group(track: u64, rel: i16, payload: &[u8], duration: Option<u64>, refs: bool) -> Vec<u8> {
+    let mut blk = vint(track);
+    blk.extend(rel.to_be_bytes());
+    blk.push(0); // Block carries no keyframe bit at all
+    blk.extend_from_slice(payload);
+    let mut g = el(&[0xA1], &blk);
+    if let Some(d) = duration {
+        g.extend(uint(&[0x9B], d));
+    }
+    if refs {
+        g.extend(sint(&[0xFB], -40));
+    }
+    el(&[0xA0], &g)
+}
+
+const CUES_ID: &[u8] = &[0x1C, 0x53, 0xBB, 0x6B];
+const CLUSTER_ID: &[u8] = &[0x1F, 0x43, 0xB6, 0x75];
+
+fn remux_video_track() -> Vec<u8> {
+    let mut e = uint(&[0x83], 1); // TrackType video
+    e.extend(uint(&[0xD7], 1)); // TrackNumber
+    e.extend(uint(&[0x73, 0xC5], 0x1111));
+    e.extend(str_el(&[0x86], "V_MPEG4/ISO/AVC"));
+    e.extend(el(&[0x63, 0xA2], AVCC));
+    e.extend(uint(&[0x23, 0xE3, 0x83], 40_000_000)); // 40 ms
+    let mut v = uint(&[0xB0], 1280);
+    v.extend(uint(&[0xBA], 720));
+    e.extend(el(&[0xE0], &v));
+    el(&[0xAE], &e)
+}
+
+/// AAC-LC, 48 kHz, stereo: the two-byte AudioSpecificConfig.
+const ASC_AAC_LC_48_2: &[u8] = &[0x11, 0x90];
+
+fn remux_audio_track() -> Vec<u8> {
+    let mut e = uint(&[0x83], 2);
+    e.extend(uint(&[0xD7], 2));
+    e.extend(uint(&[0x73, 0xC5], 0x2222));
+    e.extend(str_el(&[0x86], "A_AAC"));
+    e.extend(str_el(&[0x22, 0xB5, 0x9C], "eng"));
+    e.extend(el(&[0x63, 0xA2], ASC_AAC_LC_48_2));
+    e.extend(uint(&[0x23, 0xE3, 0x83], 20_000_000)); // 20 ms
+    let mut a = uint(&[0x9F], 2);
+    a.extend(f64el(&[0xB5], 48_000.0));
+    e.extend(el(&[0xE1], &a));
+    el(&[0xAE], &e)
+}
+
+/// Frames per cluster and the timing they run at, stated once so the
+/// fixture and its expected-output twin cannot drift apart.
+///
+/// Twenty-four clusters is eleven and a half seconds, which is the
+/// smallest fixture that is honestly exercising: it spans several
+/// two-second fragments (so the boundary rule runs more than once), and
+/// a thirty-percent prefix of it still contains whole fragments, which
+/// is what the arrival-pattern test needs in order to mean anything.
+const CLUSTERS: usize = 24;
+const V_PER_CLUSTER: usize = 12;
+const V_STEP_MS: i64 = 40;
+const A_PER_CLUSTER: usize = 24;
+const A_STEP_MS: i64 = 20;
+
+/// The video and audio payloads this fixture contains, in decode order.
+/// The byte-identity test compares the remuxed `mdat` against these.
+pub fn mkv_remux_streams() -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let mut video = Vec::new();
+    let mut audio = Vec::new();
+    for k in 0..CLUSTERS {
+        for j in 0..V_PER_CLUSTER {
+            let n = k * V_PER_CLUSTER + j;
+            // Sizes vary but do not grow without bound: a fixture that
+            // is mostly one enormous frame stops testing the walk.
+            video.push(frame(0xA0 ^ n as u8, 300 + (n % 40) * 7));
+        }
+        for j in 0..A_PER_CLUSTER {
+            let n = k * A_PER_CLUSTER + j;
+            // Every fourth cluster laces at a fixed size, which needs
+            // equal frames.
+            let size = if k % 4 == 2 { 160 } else { 140 + (n % 11) * 3 };
+            audio.push(frame(0x50 ^ n as u8, size));
+        }
+    }
+    (video, audio)
+}
+
+/// A Matroska file with two seconds of payload, Cues behind the
+/// clusters, and every block framing the walk has to handle.
+pub fn mkv_remux_fixture() -> Vec<u8> {
+    let (video, audio) = mkv_remux_streams();
+    let info_el = info(1_920.0, None);
+    let tracks_el = tracks(&[remux_video_track(), remux_audio_track()]);
+
+    let mut clusters: Vec<(u64, Vec<u8>)> = Vec::new();
+    for k in 0..CLUSTERS {
+        let cluster_ms = (k * V_PER_CLUSTER) as i64 * V_STEP_MS;
+        let mut body = uint(&[0xE7], cluster_ms as u64);
+        for j in 0..V_PER_CLUSTER {
+            let n = k * V_PER_CLUSTER + j;
+            let rel = (j as i64 * V_STEP_MS) as i16;
+            let key = j == 0;
+            if j == 5 {
+                // One frame per cluster through the older framing, with
+                // an explicit duration and a reference that makes it a
+                // delta frame.
+                body.extend(block_group(1, rel, &video[n], Some(40), true));
+            } else {
+                body.extend(simple_block(1, rel, key, 0, &video[n..n + 1]));
+            }
+        }
+        // A different lacing mode every four clusters, so all three
+        // encodings and the unlaced case are all walked repeatedly.
+        let lacing = match k % 4 {
+            0 => 3u8, // EBML
+            1 => 1,   // Xiph
+            2 => 2,   // fixed
+            _ => 0,
+        };
+        let group = if lacing == 0 { 1 } else { 6 };
+        let mut j = 0;
+        while j < A_PER_CLUSTER {
+            let n = k * A_PER_CLUSTER + j;
+            let rel = (j as i64 * A_STEP_MS) as i16;
+            let frames = &audio[n..n + group];
+            body.extend(simple_block(2, rel, true, lacing, frames));
+            j += group;
+        }
+        clusters.push((cluster_ms as u64, el(CLUSTER_ID, &body)));
+    }
+
+    // SeekPosition is written as a fixed 8-byte integer so the index's
+    // own size does not move when the offset it carries does.
+    let seek_entry = |id: &[u8], pos: u64| {
+        let mut s = el(&[0x53, 0xAB], id);
+        s.extend(el(&[0x53, 0xAC], &pos.to_be_bytes()));
+        el(&[0x4D, 0xBB], &s)
+    };
+    let head_len = el(&[0x11, 0x4D, 0x9B, 0x74], &seek_entry(CUES_ID, 0)).len();
+
+    let mut off = (head_len + info_el.len() + tracks_el.len()) as u64;
+    let mut cue_body = Vec::new();
+    for (ts, c) in &clusters {
+        let mut pt = uint(&[0xB3], *ts);
+        let mut pos = uint(&[0xF7], 1); // CueTrack
+        pos.extend(uint(&[0xF1], off)); // CueClusterPosition
+        pt.extend(el(&[0xB7], &pos));
+        cue_body.extend(el(&[0xBB], &pt));
+        off += c.len() as u64;
+    }
+    let cues_at = off;
+    let seek_head = el(&[0x11, 0x4D, 0x9B, 0x74], &seek_entry(CUES_ID, cues_at));
+    assert_eq!(seek_head.len(), head_len, "seek head size must be stable");
+
+    let mut seg = seek_head;
+    seg.extend(info_el);
+    seg.extend(tracks_el);
+    for (_, c) in &clusters {
+        seg.extend_from_slice(c);
+    }
+    seg.extend(el(CUES_ID, &cue_body));
+
+    let mut out = ebml_head("matroska");
+    out.extend(el(SEGMENT, &seg));
+    out
+}
+
+// --- MP4 ---
+
+const MP4_V_SAMPLES: usize = 30;
+const MP4_A_SAMPLES: usize = 60;
+/// Samples per chunk, so the fixture exercises the stsc walk rather
+/// than one chunk holding everything.
+const MP4_V_PER_CHUNK: usize = 10;
+const MP4_A_PER_CHUNK: usize = 20;
+const MP4_V_TIMESCALE: u32 = 90_000;
+const MP4_A_TIMESCALE: u32 = 48_000;
+/// 30 fps in a 90 kHz timescale, and 1024 AAC samples at 48 kHz.
+const MP4_V_DELTA: u32 = 3_000;
+const MP4_A_DELTA: u32 = 1_024;
+
+pub fn mp4_remux_streams() -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let video = (0..MP4_V_SAMPLES)
+        .map(|i| frame(0xC0 ^ i as u8, 200 + i * 3))
+        .collect();
+    let audio = (0..MP4_A_SAMPLES)
+        .map(|i| frame(0x30 ^ i as u8, 100 + (i % 7)))
+        .collect();
+    (video, audio)
+}
+
+/// The composition offsets the fixture writes: every third frame is
+/// displayed later than it decodes, which is what a B-frame stream looks
+/// like and what `trun` version 1 exists to carry.
+fn mp4_ctts_runs() -> Vec<(u32, i32)> {
+    (0..MP4_V_SAMPLES / 3)
+        .flat_map(|_| [(1u32, 6_000i32), (2, 0)])
+        .collect()
+}
+
+fn table_u32(fourcc: &[u8; 4], values: &[u32]) -> Vec<u8> {
+    let mut b = (values.len() as u32).to_be_bytes().to_vec();
+    for v in values {
+        b.extend(v.to_be_bytes());
+    }
+    mp4box(fourcc, &full(0, &b))
+}
+
+fn table_pairs(fourcc: &[u8; 4], pairs: &[(u32, u32)]) -> Vec<u8> {
+    let mut b = (pairs.len() as u32).to_be_bytes().to_vec();
+    for (a, c) in pairs {
+        b.extend(a.to_be_bytes());
+        b.extend(c.to_be_bytes());
+    }
+    mp4box(fourcc, &full(0, &b))
+}
+
+fn table_stsc(runs: &[(u32, u32)]) -> Vec<u8> {
+    let mut b = (runs.len() as u32).to_be_bytes().to_vec();
+    for (first, spc) in runs {
+        b.extend(first.to_be_bytes());
+        b.extend(spc.to_be_bytes());
+        b.extend(1u32.to_be_bytes()); // sample_description_index
+    }
+    mp4box(b"stsc", &full(0, &b))
+}
+
+fn table_stsz(sizes: &[u32]) -> Vec<u8> {
+    let mut b = 0u32.to_be_bytes().to_vec(); // per-sample sizes follow
+    b.extend((sizes.len() as u32).to_be_bytes());
+    for s in sizes {
+        b.extend(s.to_be_bytes());
+    }
+    mp4box(b"stsz", &full(0, &b))
+}
+
+/// The interleave the fixture writes, as `(is_video, sample_range)` in
+/// mdat order. Chunks alternate, which is what a real muxer does and
+/// what makes the stsc/stco walk load-bearing.
+fn mp4_chunk_plan() -> Vec<(bool, std::ops::Range<usize>)> {
+    let mut plan = Vec::new();
+    let chunks = MP4_V_SAMPLES / MP4_V_PER_CHUNK;
+    for c in 0..chunks {
+        plan.push((true, c * MP4_V_PER_CHUNK..(c + 1) * MP4_V_PER_CHUNK));
+        plan.push((false, c * MP4_A_PER_CHUNK..(c + 1) * MP4_A_PER_CHUNK));
+    }
+    plan
+}
+
+/// An MP4 whose index is at the END, with composition offsets and a
+/// sparse sync-sample table: the shape a download hands us, and the one
+/// a seek has to work on.
+pub fn mp4_remux_fixture() -> Vec<u8> {
+    let (video, audio) = mp4_remux_streams();
+    let plan = mp4_chunk_plan();
+
+    // mdat first, so the chunk offsets can be computed against the real
+    // file layout rather than guessed.
+    let mut mdat_body = Vec::new();
+    let mut chunk_at: Vec<(bool, usize)> = Vec::new();
+    for (is_video, range) in &plan {
+        chunk_at.push((*is_video, mdat_body.len()));
+        for i in range.clone() {
+            mdat_body.extend_from_slice(if *is_video { &video[i] } else { &audio[i] });
+        }
+    }
+    let ftyp_el = ftyp();
+    let mdat_payload_at = (ftyp_el.len() + 8) as u32;
+    let v_chunks: Vec<u32> = chunk_at
+        .iter()
+        .filter(|(v, _)| *v)
+        .map(|(_, o)| mdat_payload_at + *o as u32)
+        .collect();
+    let a_chunks: Vec<u32> = chunk_at
+        .iter()
+        .filter(|(v, _)| !*v)
+        .map(|(_, o)| mdat_payload_at + *o as u32)
+        .collect();
+
+    let avcc = mp4box(b"avcC", &[1, 100, 0, 40, 0xFF, 0xE1, 0, 0]);
+    let mut vstbl = {
+        let mut b = 1u32.to_be_bytes().to_vec();
+        b.extend(visual_entry(b"avc1", 1280, 720, &avcc));
+        mp4box(b"stsd", &full(0, &b))
+    };
+    vstbl.extend(table_pairs(b"stts", &[(MP4_V_SAMPLES as u32, MP4_V_DELTA)]));
+    vstbl.extend(table_pairs(
+        b"ctts",
+        &mp4_ctts_runs()
+            .iter()
+            .map(|(c, v)| (*c, *v as u32))
+            .collect::<Vec<_>>(),
+    ));
+    vstbl.extend(table_stsz(
+        &video.iter().map(|f| f.len() as u32).collect::<Vec<_>>(),
+    ));
+    vstbl.extend(table_stsc(&[(1, MP4_V_PER_CHUNK as u32)]));
+    vstbl.extend(table_u32(b"stco", &v_chunks));
+    // A sync sample every ten frames: three keyframes in the file.
+    vstbl.extend(table_u32(b"stss", &[1, 11, 21]));
+
+    let mut vmdia = mdhd(MP4_V_TIMESCALE, MP4_V_SAMPLES as u32 * MP4_V_DELTA, 0x55C4);
+    vmdia.extend(hdlr(b"vide"));
+    vmdia.extend(mp4box(b"minf", &mp4box(b"stbl", &vstbl)));
+    let mut vtrak = tkhd(1, 1280, 720);
+    vtrak.extend(mp4box(b"mdia", &vmdia));
+
+    let mut astbl = {
+        let mut b = 1u32.to_be_bytes().to_vec();
+        b.extend(audio_entry(b"mp4a", 2, 48_000, &esds_aac()));
+        mp4box(b"stsd", &full(0, &b))
+    };
+    astbl.extend(table_pairs(b"stts", &[(MP4_A_SAMPLES as u32, MP4_A_DELTA)]));
+    astbl.extend(table_stsz(
+        &audio.iter().map(|f| f.len() as u32).collect::<Vec<_>>(),
+    ));
+    astbl.extend(table_stsc(&[(1, MP4_A_PER_CHUNK as u32)]));
+    astbl.extend(table_u32(b"stco", &a_chunks));
+
+    let mut amdia = mdhd(MP4_A_TIMESCALE, MP4_A_SAMPLES as u32 * MP4_A_DELTA, 0x15C7);
+    amdia.extend(hdlr(b"soun"));
+    amdia.extend(mp4box(b"minf", &mp4box(b"stbl", &astbl)));
+    let mut atrak = tkhd(2, 0, 0);
+    atrak.extend(mp4box(b"mdia", &amdia));
+
+    let mut moov_body = mvhd(1_000, 1_000);
+    moov_body.extend(mp4box(b"trak", &vtrak));
+    moov_body.extend(mp4box(b"trak", &atrak));
+
+    let mut out = ftyp_el;
+    out.extend(mp4box(b"mdat", &mdat_body));
+    out.extend(mp4box(b"moov", &moov_body));
+    out
+}
+
 /// Every fixture, named - the fuzz seed corpus and the truncation
 /// matrix both walk this list rather than repeating it.
 pub fn all() -> Vec<(&'static str, Vec<u8>)> {
@@ -519,5 +971,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>)> {
         ("mp4_faststart", mp4_faststart()),
         ("mp4_moov_at_end", mp4_moov_at_end()),
         ("avi", avi()),
+        ("mkv_remux", mkv_remux_fixture()),
+        ("mp4_remux", mp4_remux_fixture()),
     ]
 }

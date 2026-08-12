@@ -74,7 +74,7 @@ pub struct Parsed {
     /// ("Formula1.2026.Round11.Hungary.Post-Qualifying.Show.…" → Round11,
     /// Hungary, Post-Qualifying, Show). A non-empty `extra` means
     /// "title + year" is NOT a faithful reduction of this release.
-    pub extra: Vec<String>,
+    pub(crate) extra: Vec<String>,
     /// The episode DATE of a daily-dated post, normalized to
     /// "yyyymmdd" - the identity of a match, a race, a show of that day.
     /// Set for both conventions the parser knows ("At.Midnight.150615"

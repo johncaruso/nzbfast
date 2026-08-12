@@ -71,12 +71,12 @@ const SEVENZ_ID_PPMD: [u8; 3] = [0x03, 0x04, 0x01];
 /// occupies `[32 + header_off, 32 + header_off + header_size)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SevenzStart {
-    pub header_off: u64,
+    pub(crate) header_off: u64,
     pub header_size: u64,
     /// CRC32 of the end-header bytes - the field that lets a probe
     /// verify it fetched the right tail window without knowing the
     /// archive's total size.
-    pub header_crc: u32,
+    pub(crate) header_crc: u32,
 }
 
 /// Parse the 32-byte start header, CRC-checked. Sibling of
@@ -151,9 +151,9 @@ impl std::fmt::Display for ProbeError {
 /// One entry read out of the end header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SevenzEntryInfo {
-    pub name: String,
-    pub size: u64,
-    pub has_stream: bool,
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    pub(crate) has_stream: bool,
 }
 
 /// Verify that `tail` (the last bytes of the logical archive; for a
@@ -543,24 +543,24 @@ pub struct RarHead {
     /// 4 or 5. Recorded because the plaintext yield is
     /// version-determined (RAR4 79%, RAR5 8%) and the ratio drifts as
     /// posters migrate - a shift shows up here first.
-    pub v5: bool,
+    pub(crate) v5: bool,
     /// RAR5 main-header volume number (0-based), when the volume is a
     /// numbered member. The obfuscation-proof ordering: absent in RAR4
     /// and on a first volume.
-    pub volume_number: Option<u64>,
-    pub entries: Vec<RarEntryInfo>,
+    pub(crate) volume_number: Option<u64>,
+    pub(crate) entries: Vec<RarEntryInfo>,
 }
 
 /// One file piece a volume header described.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RarEntryInfo {
-    pub name: String,
+    pub(crate) name: String,
     /// Total unpacked size of the inner file - repeated in EVERY volume,
     /// which is what makes it a usable content key from a mid-set head.
-    pub unpacked_size: u64,
+    pub(crate) unpacked_size: u64,
     /// Stored whole-file CRC32, when this piece carries one.
-    pub file_crc: Option<u32>,
-    pub is_dir: bool,
+    pub(crate) file_crc: Option<u32>,
+    pub(crate) is_dir: bool,
 }
 
 /// Read a RAR volume's own leading bytes for the inner filename.
@@ -659,6 +659,31 @@ pub fn pick_rar_media_name(head: &RarHead) -> Option<(String, Option<String>)> {
         (size, None) => Some(format!("{size}")),
     };
     Some((clean, key))
+}
+
+/// Does this on-disk 7-Zip container need a password to open?
+///
+/// The disk-side twin of the `-mhe` verdict [`sevenz_tail_names`] returns
+/// as [`ProbeError::EncryptedHeader`]: same question, asked of a finished
+/// file rather than a head/tail pair. `rar::needs_password` has answered
+/// it for RAR volumes since the password affordance shipped; without this,
+/// the daemon's post-processing looked for encrypted RARs only, so a
+/// header-encrypted 7z ended the job as a generic "an archive could not be
+/// unpacked" LOCAL failure - no password prompt, no Retry-with-password -
+/// even though the unpacker had already said `PasswordRequired` in the log
+/// (soak round 3, 11 Aug, advQ).
+///
+/// False for anything that is not a readable 7z: a caller asking "does
+/// this need a password" about a missing or malformed file wants "no",
+/// and the malformed case is somebody else's error to report.
+pub fn sevenz_needs_password(path: &std::path::Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    matches!(
+        sevenz_rust2::Archive::read(&mut f, &sevenz_rust2::Password::default()),
+        Err(sevenz_rust2::Error::PasswordRequired) | Err(sevenz_rust2::Error::MaybeBadPassword(_))
+    )
 }
 
 #[cfg(test)]
@@ -932,6 +957,29 @@ mod tests {
         assert_eq!(declared.ppmd_mem, 0, "writer headers are LZMA, not PPMd");
         let entries = sevenz_tail_names(&head, &tail).unwrap();
         assert_eq!(pick_media_name(&entries).as_deref(), Some(NAME));
+    }
+
+    /// A `-mhe` container must answer the on-disk password question the
+    /// same way the in-stream probe answers it, and a plain one must not
+    /// claim to need a password. Without the disk-side answer, the
+    /// daemon's post-processing (which only ever looked for encrypted
+    /// RARs) ended an encrypted-7z job as a generic local unpack failure
+    /// with no password prompt - soak round 3, 11 Aug, advQ.
+    #[test]
+    fn a_header_encrypted_sevenz_is_known_to_need_a_password_on_disk() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sevenz");
+        assert!(
+            sevenz_needs_password(std::path::Path::new(&format!("{dir}/header-encrypted.7z"))),
+            "-mhe container must ask for a password"
+        );
+        assert!(
+            !sevenz_needs_password(std::path::Path::new(&format!("{dir}/store-single.7z"))),
+            "a plain store container needs no password"
+        );
+        assert!(
+            !sevenz_needs_password(std::path::Path::new(&format!("{dir}/does-not-exist.7z"))),
+            "a missing file is not a password question"
+        );
     }
 
     #[test]

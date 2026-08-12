@@ -200,35 +200,35 @@ pub fn section_class(section: &str) -> GroupKind {
 pub struct CorrFeatures {
     /// `release.first_posted - pre.pt`, seconds. Positive = the post
     /// trails the pre, the normal direction.
-    pub delta: i64,
+    pub(crate) delta: i64,
     /// The pre's announced size in bytes (0 = the feed did not say).
-    pub sz: u64,
+    pub(crate) sz: u64,
     /// The release's estimated CONTENT bytes: wire bytes minus
     /// identified par2, divided by [`YENC_FACTOR`].
-    pub est_content: u64,
+    pub(crate) est_content: u64,
     /// Whether any par2 was identified and subtracted. When false, the
     /// disguised-par2 pattern means a true match reads 5-18% heavy,
     /// never light - the reason the [1.00, 1.18] band exists.
-    pub par2_identified: bool,
+    pub(crate) par2_identified: bool,
     /// The pre's content class (section string first, classified title
     /// as fallback).
-    pub kind_pre: GroupKind,
+    pub(crate) kind_pre: GroupKind,
     /// The release's newsgroup class from [`group_kind`].
-    pub grp_kind: GroupKind,
+    pub(crate) grp_kind: GroupKind,
     /// The pre's announced file count (0 = absent).
-    pub fl: u32,
+    pub(crate) fl: u32,
     /// The release's non-par2 file count.
-    pub rel_files: u32,
+    pub(crate) rel_files: u32,
     /// Movie/TV/Music kind parsed from the pre TITLE (not the section),
     /// with its resolution - feeds the sizeless plausibility prior.
-    pub kind_title: Kind,
-    pub res_pre: Option<String>,
+    pub(crate) kind_title: Kind,
+    pub(crate) res_pre: Option<String>,
 }
 
 /// The score, split so the auto gate can require its size component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CorrScore {
-    pub total: i32,
+    pub(crate) total: i32,
     pub size_pts: i32,
     /// est_content / sz (0.0 when sizeless) - stored for the audit
     /// trail.

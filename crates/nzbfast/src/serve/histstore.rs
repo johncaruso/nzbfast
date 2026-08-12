@@ -588,6 +588,101 @@ mod store_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A queue -> history move is two independent durable writes: park
+    /// appends and fsyncs the terminal history row, then `save_queue`
+    /// rewrites queue.json without it. A kill in between leaves the same
+    /// nzo_id in BOTH files - and until this fix nothing deduplicated
+    /// them, so the job came back as Queued (job_wire restores a
+    /// nonterminal `Finishing` row that way) AND as Failed, and the
+    /// queued copy downloaded the whole release again (Codex sweep 12 Aug
+    /// F1).
+    ///
+    /// This writes the exact split-brain state a kill produces, restores
+    /// from it, and asserts exactly one copy - in history.
+    #[test]
+    fn a_half_written_park_restores_as_one_history_row() {
+        let dir = tmp("splitbrain");
+        let d = test_daemon(&dir);
+        let row = |id: &str, state: &str| {
+            format!(
+                r#"{{"nzo_id":"{id}","name":"Some.Release","out_dir":"/tmp/o",
+                    "nzb_path":"/tmp/n.nzb","state":"{state}"}}"#
+            )
+            .replace('\n', "")
+        };
+        // The durable write that DID land: the terminal history row.
+        std::fs::write(
+            d.history_store_path(),
+            format!("{}\n", row("nzo_7", "Failed")),
+        )
+        .unwrap();
+        // ...and the stale queue.json the rewrite never got to replace.
+        // `Finishing` is nonterminal, so job_wire brings it back as Queued.
+        std::fs::write(
+            d.spool.join("queue.json"),
+            format!(r#"{{"next_id":9,"queue":[{}]}}"#, row("nzo_7", "Finishing")),
+        )
+        .unwrap();
+
+        d.load_queue();
+
+        let queued: Vec<String> = d
+            .queue
+            .lock_ok()
+            .iter()
+            .map(|j| j.lock_ok().nzo_id.clone())
+            .collect();
+        let hist: Vec<(String, JobState)> = d
+            .history
+            .lock_ok()
+            .iter()
+            .map(|j| {
+                let g = j.lock_ok();
+                (g.nzo_id.clone(), g.state)
+            })
+            .collect();
+        assert!(
+            queued.is_empty(),
+            "the stale queue copy must not come back runnable: {queued:?}"
+        );
+        assert_eq!(
+            hist,
+            vec![("nzo_7".to_string(), JobState::Failed)],
+            "exactly one copy, holding the terminal verdict"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The other half of the contract: an ORDINARY queued job, with an
+    /// unrelated history, is restored untouched. Without this the fix
+    /// above would be indistinguishable from "drop the queue".
+    #[test]
+    fn an_ordinary_queue_survives_reconciliation() {
+        let dir = tmp("nosplit");
+        let d = test_daemon(&dir);
+        let row = |id: &str, state: &str| {
+            format!(
+                r#"{{"nzo_id":"{id}","name":"Some.Release","out_dir":"/tmp/o","nzb_path":"/tmp/n.nzb","state":"{state}"}}"#
+            )
+        };
+        std::fs::write(
+            d.history_store_path(),
+            format!("{}\n", row("nzo_old", "Completed")),
+        )
+        .unwrap();
+        std::fs::write(
+            d.spool.join("queue.json"),
+            format!(r#"{{"next_id":9,"queue":[{}]}}"#, row("nzo_new", "Queued")),
+        )
+        .unwrap();
+
+        d.load_queue();
+
+        assert_eq!(d.queue.lock_ok().len(), 1, "the queued job must survive");
+        assert_eq!(d.history.lock_ok().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The append-only store is created private. It carries the job's
     /// archive password, its local paths and its identity metadata, and
     /// plain `OpenOptions` under the usual 022 umask left it 0644 -

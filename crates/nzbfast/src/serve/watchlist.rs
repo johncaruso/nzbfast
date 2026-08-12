@@ -14,7 +14,9 @@ use super::*;
 /// the watcher's blocking thread, so the network calls are fine here.
 #[cfg(feature = "indexer")]
 pub(super) fn watch_calendar_refresh(d: &Arc<Daemon>) {
-    let items = d.watchlist.lock_ok().clone();
+    // §151: a synced show needs its airdates cached like any other,
+    // or "coming up" would be blank for everything Plex added.
+    let items = d.watch_items();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|t| t.as_secs() as i64)
@@ -438,7 +440,10 @@ fn reconcile_slots(d: &Arc<Daemon>, state: &mut crate::watchlist::WatchState) ->
 /// every enabled watch item against the index and grab / upgrade.
 pub(super) fn watchlist_pass(d: &Arc<Daemon>) {
     use crate::watchlist as wl;
-    let items = d.watchlist.lock_ok().clone();
+    // §151: the user's own list PLUS what the external sources synced.
+    // This is the one path that grabs anything, so it is the one that
+    // makes a synced entry an ordinary watched item.
+    let items = d.watch_items();
     // §74: the arrivals that woke this pass, if it was woken by one.
     // Taken, not read: a name only earns the "grabbed as it arrived"
     // record once, and a later periodic pass grabbing the same release
@@ -1052,7 +1057,23 @@ pub(super) fn watchlist_grab(
                     .iter()
                     .find(|i| &i.name == indexer)
                     .cloned();
-                if cfg.is_some_and(|c| !rt.usage.grab_allowed(&c)) {
+                // The search that produced this candidate snapshotted the
+                // ENABLED indexers, then awaited the network. By the time we
+                // get here the user may have disabled or deleted that
+                // account - and the old check was `cfg.is_some_and(...)`, so
+                // a MISSING config passed it: the stale response still
+                // fetched its enclosure with the (removed) credentials, spent
+                // the account's daily grab and enqueued the download (Codex
+                // sweep 12 Aug F6c). A revoked indexer is not a budget
+                // question, so say which it is.
+                let Some(cfg) = cfg.filter(|c| c.enabled) else {
+                    warn!(
+                        target: "watch",
+                        "{indexer} is no longer configured or is disabled - {stem} not grabbed"
+                    );
+                    return None;
+                };
+                if !rt.usage.grab_allowed(&cfg) {
                     warn!(target: "watch", "{indexer}: daily grab budget reached - {stem} not grabbed");
                     return None;
                 }

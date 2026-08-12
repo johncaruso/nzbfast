@@ -121,7 +121,7 @@ pub async fn stat_presence(
 /// GB/s of a compute stage, single-core and all-core.
 #[derive(Clone, Copy, serde::Serialize)]
 pub struct StageRate {
-    pub one_core: f64,
+    pub(crate) one_core: f64,
     pub all_core: f64,
 }
 
@@ -129,8 +129,8 @@ pub struct StageRate {
 pub struct ComputeReport {
     pub cores: usize,
     pub decode_simd: StageRate,
-    pub crc32: StageRate,
-    pub md5: StageRate,
+    pub(crate) crc32: StageRate,
+    pub(crate) md5: StageRate,
     /// The binding stage of the pipeline (decode once + verify once).
     pub verify: StageRate,
     /// All-core verify Gbps - the compute ceiling.
@@ -1175,7 +1175,7 @@ pub fn verdict(network_gbps: f64, compute: &ComputeReport, disk_gbps: f64) -> Sy
 #[derive(Clone, serde::Serialize)]
 pub struct ServerProbe {
     pub host: String,
-    pub connect_ok: bool,
+    pub(crate) connect_ok: bool,
     pub rtt_ms: f64,
     /// Fraction of the shared sample this server HAD (0..1).
     pub availability: f64,
@@ -1202,6 +1202,38 @@ pub struct DiversityReport {
     pub servers: Vec<ServerProbe>,
     pub pairs: Vec<OverlapPair>,
     pub recommendation: String,
+}
+
+/// Jaccard similarity of two servers' MISSING sets, over the first
+/// `common` positions only. `None` when there is nothing both answered.
+///
+/// `common` is the crux. A sweep that resets, times out or fails to flush
+/// leaves the rest of its vector `false`, and `false` there means UNKNOWN,
+/// not missing. Comparing the whole sample let two unrelated providers
+/// that each answered five of 100 requests and then reset look like they
+/// shared the same 95 gaps - a near-1.0 overlap, a "SAME infra" verdict
+/// and a "keep only one, add another backbone" recommendation drawn from
+/// nothing at all (Codex sweep 12 Aug F15).
+fn missing_jaccard(a: &[bool], b: &[bool], common: usize) -> Option<f64> {
+    let common = common.min(a.len()).min(b.len());
+    if common == 0 {
+        return None;
+    }
+    let (mut inter, mut union) = (0usize, 0usize);
+    for k in 0..common {
+        let (mi, mj) = (!a[k], !b[k]);
+        if mi || mj {
+            union += 1;
+        }
+        if mi && mj {
+            inter += 1;
+        }
+    }
+    Some(if union == 0 {
+        0.0
+    } else {
+        inter as f64 / union as f64
+    })
 }
 
 /// STAT a shared article sample on every server; per-server availability
@@ -1238,6 +1270,11 @@ pub async fn diversity(
                     let mut connect_ok = false;
                     let mut rtt = 0.0;
                     let mut had = 0usize;
+                    // How many of the sample the server ANSWERED. A sweep
+                    // that resets, times out or fails to flush leaves the
+                    // rest of `vec` false, and false has to mean "unknown"
+                    // there rather than "missing" (Codex sweep 12 Aug F15).
+                    let mut answered = 0usize;
                     if let Ok(Ok((mut conn, _))) =
                         tokio::time::timeout(Duration::from_secs(12), Connection::connect(&s)).await
                     {
@@ -1271,11 +1308,12 @@ pub async fn diversity(
                             }
                         }
                         conn.quit().await;
+                        answered = recv;
                     }
-                    (connect_ok, rtt, had, vec)
+                    (connect_ok, rtt, had, vec, answered)
                 })
                 .await;
-                swept.unwrap_or((false, 0.0, 0, vec![false; n]))
+                swept.unwrap_or((false, 0.0, 0, vec![false; n], 0))
             })
         })
         .collect();
@@ -1283,7 +1321,7 @@ pub async fn diversity(
     for h in sweeps {
         sweep_results.push(
             h.await
-                .unwrap_or((false, 0.0, 0, vec![false; sample_ids.len()])),
+                .unwrap_or((false, 0.0, 0, vec![false; sample_ids.len()], 0)),
         );
     }
     println!(
@@ -1300,7 +1338,9 @@ pub async fn diversity(
     let t_probes = Instant::now();
     let mut probes = Vec::new();
     let mut present: Vec<Vec<bool>> = Vec::new(); // [server][article] = had it
-    for (s, (connect_ok, rtt, had, vec)) in servers.iter().zip(sweep_results) {
+    // How far into `present[i]` that server's answers actually reach.
+    let mut answered: Vec<usize> = Vec::new();
+    for (s, (connect_ok, rtt, had, vec, got)) in servers.iter().zip(sweep_results) {
         let (speed, probe_bytes) = if connect_ok {
             let have: Vec<String> = sample_ids
                 .iter()
@@ -1320,11 +1360,16 @@ pub async fn diversity(
             host: s.host.clone(),
             connect_ok,
             rtt_ms: rtt,
-            availability: had as f64 / sample_ids.len().max(1) as f64,
+            // Over what was ANSWERED, not over the sample. Dividing by the
+            // full sample turned an interrupted sweep into a low
+            // availability figure for a provider that had everything it was
+            // asked about.
+            availability: had as f64 / got.max(1) as f64,
             speed_gbps: speed,
             bytes: probe_bytes,
         });
         present.push(vec);
+        answered.push(got);
     }
     println!(
         "[diversity] speed probes done in {:.1}s",
@@ -1339,21 +1384,9 @@ pub async fn diversity(
             if !probes[i].connect_ok || !probes[j].connect_ok {
                 continue;
             }
-            let (mut inter, mut union) = (0usize, 0usize);
-            for k in 0..sample_ids.len() {
-                let mi = !present[i][k];
-                let mj = !present[j][k];
-                if mi || mj {
-                    union += 1;
-                }
-                if mi && mj {
-                    inter += 1;
-                }
-            }
-            let jac = if union == 0 {
-                0.0
-            } else {
-                inter as f64 / union as f64
+            let Some(jac) = missing_jaccard(&present[i], &present[j], answered[i].min(answered[j]))
+            else {
+                continue;
             };
             let verdict = if jac >= 0.8 {
                 "SAME infra - redundant for recovery (share takedowns/gaps)"
@@ -1561,27 +1594,52 @@ mod tests {
 
     #[test]
     fn diversity_math_on_synthetic_vectors() {
-        // Not a network test - verify the Jaccard/verdict logic directly.
-        // 3 "servers": A,B identical gaps; C independent.
+        // Not a network test - the real Jaccard function, directly.
+        // 3 "servers": A,B identical gaps; C independent. All answered
+        // the whole sample.
         let present = [
             vec![true, false, true, false, true, false], // A: missing idx 1,3,5
             vec![true, false, true, false, true, false], // B: same
             vec![false, true, true, true, false, true],  // C: missing 0,4
         ];
-        let jac = |x: &[bool], y: &[bool]| {
-            let (mut i, mut u) = (0, 0);
-            for k in 0..x.len() {
-                let (mx, my) = (!x[k], !y[k]);
-                if mx || my {
-                    u += 1;
-                }
-                if mx && my {
-                    i += 1;
-                }
-            }
-            i as f64 / u as f64
-        };
+        let n = present[0].len();
+        let jac = |x: &[bool], y: &[bool]| missing_jaccard(x, y, n).unwrap();
         assert!((jac(&present[0], &present[1]) - 1.0).abs() < 1e-9); // identical
         assert!(jac(&present[0], &present[2]) < 0.4); // diverse
+    }
+
+    /// An interrupted sweep must not fabricate shared gaps. Two unrelated
+    /// providers each answer the first two of six requests - HAVING both -
+    /// and then reset. Over what they actually answered there is no gap to
+    /// share; counting the four unanswered entries as confirmed-missing
+    /// made them look perfectly correlated, which is what produces a
+    /// "SAME infra - keep only one" recommendation out of nothing (Codex
+    /// sweep 12 Aug F15).
+    #[test]
+    fn an_interrupted_sweep_does_not_invent_shared_gaps() {
+        // Both answered positions 0-1 (present), then the sweep died and
+        // the rest of the vector is still its `false` default.
+        let a = vec![true, true, false, false, false, false];
+        let b = vec![true, true, false, false, false, false];
+
+        // Over the WHOLE sample, the old maths: four identical "gaps".
+        let whole = missing_jaccard(&a, &b, 6).unwrap();
+        assert!(
+            whole >= 0.8,
+            "this fixture must reproduce the pre-fix SAME-infra reading, got {whole}"
+        );
+
+        // Over what both answered, the truth: no gap on either side.
+        let common = missing_jaccard(&a, &b, 2).unwrap();
+        assert!(
+            common < 0.4,
+            "two positions, both present on both servers: {common}"
+        );
+
+        // A sweep that answered nothing is not comparable at all, rather
+        // than perfectly correlated with every other failure.
+        assert_eq!(missing_jaccard(&a, &b, 0), None);
+        // And a `common` past either vector cannot index out of bounds.
+        assert!(missing_jaccard(&a, &b, 999).is_some());
     }
 }

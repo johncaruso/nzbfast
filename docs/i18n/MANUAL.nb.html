@@ -193,6 +193,16 @@ legitimasjon: Innstillinger → Usenet-servere → <b>Importer fra SABnzbd / NZB
 den eksisterende installasjonen din og kopierer over serverne. Det finnes også
 <code>nzbfast import-sab</code> på kommandolinjen.</div>
 
+<p>Velkomstkortet spør også <b>hvordan du har tenkt å bruke nzbfast</b>, med fire
+svar: en app som Sonarr eller Radarr styrer den, bytter fra SABnzbd,
+bytter fra NZBGet, eller bare deg, fra dette dashbordet. Å velge ett endrer
+ingenting i seg selv. Det viser en kort gjennomgangsliste - hver anbefaling med
+innstillingens eget navn, dens nåværende verdi, den anbefalte verdien og én
+linje om hvorfor - og <b>Bruk</b> setter bare radene du huker av. Hver rad er en
+vanlig innstilling du kan endre tilbake for seg etterpå, og den samme listen er
+fortsatt tilgjengelig senere under Innstillinger → <b>Anbefalte innstillinger
+for hvordan du bruker den</b>.</p>
+
 <h3 id="firstrun-key">API-nøkkelen din</h3>
 <p>På en virkelig ny installasjon lager nzbfast seg en API-nøkkel første gang daemonen
 starter, og skriver den ut én gang i et banner rett under dashbord-adressen. Fra da av
@@ -353,6 +363,15 @@ indekserer nødvendig. Statuslinjen viser skannefremdrift; <b>Skann nå</b> tvin
 <p>Legg til titler etter navn - også de som ikke er postet ennå. Når en matchende utgivelse
 dukker opp i indeksen, hentes den automatisk, med kvalitetspreferanser og oppgraderingsregler
 (en bedre kopi erstatter en dårligere).</p>
+<p>Kortet kan også følge en liste du har i Plex. Legg til en <b>listekilde</b>: koble
+enten til Plex-kontoen din (du godkjenner en kort kode på Plex sin egen side, så ingen
+passord når noensinne nzbfast), eller lim inn adressen til Plex-watchlisten din.
+Behandle den adressen som et passord - alle som har den, kan lese listen din - og
+derfor maskeres den når den er lagret. Synkroniserte titler vises som skrivebeskyttede
+rader ved siden av dine egne. En tilkoblet konto ser hele listen din, så fjerner du en
+tittel der, slutter den også å bli fulgt her (ferdige nedlastinger røres aldri); en
+adresse viser bare de nyeste oppføringene, så en tittel som mangler kan rett og slett
+ha rullet ut, og ingenting fjernes. Begge deler kan endres per kilde.</p>
 <h3 id="dash-history">Historikk</h3>
 <p>Nylige nedlastinger, én rad hver. Mislykkede jobber tilbyr <b>Prøv igjen</b> (fortsetter fra journalen). Krypterte arkiver viser en 🔑 opplåsingskontroll -
 skriv inn passordet, så blir jobben ferdig på stedet. Verifiseringshelse-stripen tegner defekte
@@ -464,6 +483,31 @@ rødt at delene stadig mangler. Hele grupper som ryddes får et
 Åpne den mens den laster ned, sjekk at innhold, språk og kvalitet er som forventet,
 og avbryt tidlig hvis de ikke er det - i stedet for å oppdage det etter hele
 nedlastingen.</p>
+<p>Den første halvparten av det står allerede på siden. Åpne raden til en
+nedlasting i køen (eller i historikken), så viser skuffen hva som er inne i
+videofilen, lest ut av de bytene som har kommet så langt: oppløsning, video- og
+lydkodeker, lydspråk, undertekster, kapitler. En utgivelse som er feil versjon,
+feil språk eller en oppskalering røper seg i det panelet lenge før nedlastingen
+er ferdig.</p>
+<p>Siden finner også ut om <em>denne</em> nettleseren kan spille filen, og sier det
+i stedet for å gjette: nettlesere er forskjellige (Safari dekoder HEVC der
+Chrome ikke gjør det, og nesten ingen dekoder AC-3- eller DTS-lyd), så
+spørsmålet stilles til den nettleseren du faktisk sitter i. Når svaret er ja,
+åpner <b>▶ Spill av</b> en spiller rett på siden, som viser filen mens den
+lastes ned. De fleste utgivelsene er MKV, som mange nettlesere nekter å åpne
+selv om de kan dekode alt inni, så nzbfast pakker dem om mens de spilles.
+Ingenting kodes om: bilde og lyd er de opprinnelige bytene i en annen
+innpakning, og å hoppe til et annet sted virker fortsatt. Er lydsporet et som
+denne nettleseren ikke kan dekode, og utgivelsen bærer et annet den kan, er det
+det andre sporet som spilles, så bildet ikke kommer stumt. Først når nettleseren
+mangler dekoderen for selve videoen, gir knappen filen videre til din egen
+mediespiller, som beskrevet nedenfor.</p>
+<p>Én innstilling styrer alt sammen: Innstillinger → Grensesnitt → <b>Sjekk en
+fil mens den lastes ned</b>. <b>Bare detaljer</b>, standarden, viser panelet og
+tilbyr ingen spiller på siden; <b>Detaljer og en spiller</b> legger til
+spilleren; <b>Av</b> stopper all lesing av filen - med den av åpner ingenting en
+halvlastet fil for noen.</p>
+<p>For å sjekke i din egen mediespiller i stedet:</p>
 <ul>
 <li><b>▶ Spill av</b> på veggen (eller <code>/m3u/&lt;id&gt;</code>) gir mediespilleren din
 en URL; daemonen starter eller gjenbruker nedlastingen bak den.</li>
@@ -496,8 +540,19 @@ hvilken som helst server inn i eller ut av poolen. Hver server har:</p>
 <tr><td>Tilkoblinger</td><td>Samtidige tilkoblinger per server. Bruk <b>Tilkoblingsjustering</b> (<a href="#performance">§13</a>) for å finne hver leverandørs optimale punkt i stedet for å gjette høyt.</td></tr>
 <tr><td>Nivå (trinn)</td><td>0 = primær; høyere nivåer er fyllservere, som bare spørres om artikler hvert lavere nivå bommet på. Sett kontoer uten grense på 0, blokk-kontoer på 1+.</td></tr>
 <tr><td>Blokkstørrelse (GB)</td><td>For blokk-kontoer (betal-per-GB): nzbfast sporer forbruk over levetiden mot dette og slutter å bruke serveren når den er brukt opp (advarsel ved 85 %).</td></tr>
+<tr><td>Hver byte faktureres</td><td>Slå på for en konto med målt forbruk. Nedlastingene dine bruker serveren akkurat som før; det som stopper, er at nzbfast sender den egen trafikk - den automatiske tilkoblingsjusteringen, systemtestens nettverksdel og header-skanninger for det innebygde indekset hopper alle over den. Uavhengig av nivået og av blokkstørrelsen, fordi en målt konto kan være din eneste leverandør og en ubegrenset kan stå på nivå 2. Av som standard. Den manuelle <b>Test</b> i <b>Tilkoblingsjustering</b> (<a href="#performance">§13</a>) virker fortsatt på en flagget server og spør først, siden det der er du som velger å bruke penger.</td></tr>
 </table></div>
 <p><b>La det være litt luft under kontoens tilkoblingsgrense.</b> Å sette tilkoblingene litt under grensen koster ingenting: gjennomstrømningen flater ut lenge før de siste én eller to tilkoblingene, og <b>Tilkoblingsjustering</b> (<a href="#performance">§13</a>) havner uansett under. Det er de ledige plassene som lar en annen enhet, et annet program eller et nytt forsøk etter en brutt socket slippe inn likevel, i stedet for å bli avvist mens denne opptar hver eneste plass.</p>
+<p><b>Du trenger ikke holde styr på maskinens grense for åpne filer.</b> Systemet teller hver
+tilkobling som en åpen fil, og macOS starter et program med en grense på 256 av dem, som et
+fullt sett tilkoblinger fordelt på flere servere kan passere. På macOS og Linux hever
+nzbfast selv den grensen ved oppstart: den ber om 65536 åpne filer og går ned gjennom
+16384, 4096 og 1024 til systemet sier ja, aldri over den harde grensen systemet setter, og
+den kjører videre med grensen den hadde hvis hvert trinn blir avvist. Windows har ingen slik
+grense per prosess. Andre programmer tar den grensen skallet ga dem, og et program som går
+tomt for åpne filer midt i en jobb kan stoppe uten å si hvorfor i loggen. Sett derfor
+tilkoblingene per server etter hva abonnementet ditt tillater, minus luften over, og ikke
+etter hva du tror maskinen tåler.</p>
 <h3 id="passwords">Slik lagres leverandørpassordene dine</h3>
 <p>Leverandørpassord i <code>config.local.json</code> er <b>tilslørt, ikke
 kryptert</b>. De lagres som <code>obf1:</code> etterfulgt av en kodet form, slik at
@@ -624,6 +679,7 @@ nøyaktig slik de ble postet i stedet for å gjettes.</p>
 <tr><td>Ta med utgivelsesgruppe</td><td>Merket <code>-GROUP</code> til slutt.</td></tr>
 <tr><td>Fjern søppelfiler</td><td><b>På som standard.</b> Sletter gjenliggende <code>.par2</code>, <code>.nzb</code>, <code>.sfv</code>, <code>.nfo</code> og sample-klipp fra ferdige film- og seriemapper. Aldri videoen eller undertekstene.</td></tr>
 <tr><td>Behold bare mediefilen</td><td><b>Av som standard, og destruktiv:</b> sletter permanent alt i mappen bortsett fra videoen (eller videoene) og undertekstene. Hver episode i en sesongpakke beholdes. Går foran <b>Fjern søppelfiler</b> når begge er på.</td></tr>
+<tr><td>Navngi nedlastinger etter .nzb-filen</td><td><b>Av som standard.</b> Den ferdige mappen og hovedfilen dens tar navnet fra <code>.nzb</code>-filen, i stedet for det opprydde navnet regnet ut fra utgivelsen. Bare den største filen får nytt navn: resten av en episodepakke, samplen, undertekstene og <code>.nfo</code>-filen beholder navnene de kom med. Hver kategori kan tillate eller nekte det for seg under <b>Dine kategorier</b>, og slik får du det for én type nedlasting og ikke en annen.</td></tr>
 <tr><td>Keep the other words in the name</td><td><b>På som standard.</b> Sport, løp og andre arrangementer er ofte én og samme tittel gjentatt hele sesongen, og bare ett eller to ord fra hverandre - "Round11 Hungary Race" mot "Round11 Hungary Qualifying". Å beholde de ordene er det som hindrer en hel sesong i å falle sammen til samme navn. Gjelder bare der navnet ikke kunne ryddes opp på annen måte, så vanlige filmer og episoder blir urørt.</td></tr>
 </table></div>
 <p class="dim">Hele gruppen kjører etter reparasjon og utpakking og før <b>Flytt
@@ -727,6 +783,14 @@ alle andre lagres de i <code>settings.json</code>.</p>
 kvalitetspreferanser, ferdig. Nye utgivelser hentes etter hvert som de dukker opp i de
 indekserte gruppene dine; kopier av bedre kvalitet oppgraderer tidligere hentinger; en
 kalendervisning viser hva som kommer.</p>
+<p>En <b>listekilde</b> mater watchlisten fra en liste du har i Plex, på én av to måter:
+koble til Plex-kontoen din ved å godkjenne en kort kode på Plex sin side, eller lim inn
+adressen til en Plex-watchlist. Adressen er en tilgangsnøkkel - den gir alle som har
+den, rett til å lese listen - så den maskeres etter lagring. Synkronisering av
+fjerninger er med vilje forskjellig per modus: en tilkoblet konto ser hele listen, så
+en tittel som fjernes der, blir ikke lenger fulgt her (allerede ferdige nedlastinger
+blir stående); en adressefeed inneholder bare de nyeste oppføringene, så fravær beviser
+ingenting, og titler blir bare lagt til. Begge standardvalgene kan endres per kilde.</p>
 <h3 id="auto-rss">RSS-feeder</h3>
 <p>Innstillinger → RSS: enhver newznab-/indekserer-RSS-URL med intervall per feed, kategori og
 filterregler (tittelmønstre, størrelsesgrenser). Matchende elementer lastes ned automatisk.</p>
@@ -740,7 +804,62 @@ plex/Jellyfin-klart uten et eksternt verktøy.</p>
 døgnet.</p>
 <h3>Skript</h3>
 <p>Et etterbehandlingsskript mottar SABnzbds posisjonelle argumenter og
-<code>SAB_*</code>-miljøvariabler - det store økosystemet av SAB-skript kjører som det er.</p>
+<code>SAB_*</code>-miljøvariabler: det store økosystemet av SAB-skript kjører
+som det er. NZBGets dialekt leveres ved siden av - <code>NZBPP_*</code>-variabler
+(<code>DIRECTORY</code>, <code>NZBNAME</code>, <code>CATEGORY</code>,
+<code>TOTALSTATUS</code>, <code>PARSTATUS</code>, <code>UNPACKSTATUS</code>,
+<code>FINALDIR</code>) og exit-kodene 93/94/95 - så kjernelogikken i et
+NZBGet-utvidelsesskript kjører også. Koblingen er ærlig snarere enn en emulering:
+reparasjon og utpakking skjer inne i one-pass-nedlastingen, så en ren fullføring
+rapporterer <code>PARSTATUS=0</code> og en reparert <code>PARSTATUS=2</code>.
+Skriptegne alternativformer (<code>NZBPO_*</code>) leveres ikke.
+Et skript kan la en hjelper kjøre videre i bakgrunnen når det avslutter, og
+nzbfast dreper den ikke, men nzbfast slutter å lese skriptets utdata
+i det øyeblikket skriptet selv er ferdig: gi en bakgrunnshjelper sin egen
+omdirigering av utdata, ellers stoppes den første gang den prøver å skrive.</p>
+<h3>Forkø-skript</h3>
+<p>En annen krok kjører <em>før</em> en nedlasting havner i køen
+(Innstillinger → Mapper → Forkø-skript), med SABnzbds forkø-kontrakt:
+argumentene <code>name, pp, category, script, priority, size, group</code> pluss
+<code>SAB_*</code>-miljøet. Den første utdatalinjen godtar (<code>1</code>)
+eller avviser (<code>0</code>) nedlastingen; linje 2-7 kan gi den nytt navn, sette
+<code>pp</code>, bytte kategori, velge et skript eller endre prioriteten
+(tomme linjer beholder standarden). En avvist nedlasting går til historikken som
+Mislykket med årsaken, og Prøv igjen fra historikken henter den tilbake uten å
+spørre skriptet på nytt. Kroken kan aldri miste en nedlasting: hvis skriptet
+mangler, krasjer, bruker opp tidsbudsjettet sitt eller skriver noe som ikke er en
+dom, fortsetter tillegget urørt, og loggen sier hvorfor.</p>
+<h3>Livssyklushendelser og signerte webhooker</h3>
+<p>Hver jobbmilepæl er en versjonert hendelse: <code>job.added</code>,
+<code>job.started</code>, <code>job.finishing</code>, <code>job.repaired</code>,
+<code>job.completed</code>, <code>job.failed</code>, pluss
+<code>queue.idle</code>, <code>giveup.tripped</code>, <code>disk.low</code>,
+<code>storage.slow</code> og <code>quota.reached</code>. Hver bærer
+<code>schema_version</code> (for øyeblikket 1; nye nøkler kan dukke opp uten et hopp -
+ignorer det du ikke kjenner), en monoton <code>seq</code> og et
+<code>at</code>-tidsstempel i millisekunder.</p>
+<p>For å motta dem legger du til et <b>webhook</b>-varslingsmål
+(Innstillinger → Automatisering) og lister i målets <i>events</i>-felt hvilke
+hendelsestyper det skal få - nøyaktige typer, eller et prefiks som <code>job.*</code>.
+Målet mottar deretter én POST per hendelse: hendelsens JSON som kropp pluss en
+<code>delivery</code>-id (<code>&lt;boot&gt;-&lt;seq&gt;</code>, håndtaket å
+deduplisere på), headerne <code>X-NzbFast-Event</code> og
+<code>X-NzbFast-Delivery</code>, og - når målet har en signeringshemmelighet -
+<code>X-NzbFast-Signature: sha256=&lt;hex&gt;</code>, en HMAC-SHA256
+av nøyaktig kroppens byte under hemmeligheten din (samme form som GitHubs
+webhooker bruker). Verifiser i Python:</p>
+<pre><code>expected = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
+ok = hmac.compare_digest(expected, request.headers["X-NzbFast-Signature"])</code></pre>
+<p>Levering er minst-én-gang: et mål som ikke kan nås, prøves igjen etter
+10&nbsp;s, 60&nbsp;s og 5&nbsp;min, og droppes så med feilen vist på målets
+innstillingsrad. Et HTTP-feilsvar (404, 401...) prøves ikke igjen - fiks
+mottakeren og bruk Test. Hvert mål har sin egen leveringsbane, så ett som er
+tregt eller unåelig, aldri holder et annet tilbake; innenfor en bane beholder
+leveringene rekkefølgen hendelsene skjedde i, og droppes én, viser
+sekvensnumrene hullet. De klassiske hendelsesordene
+(<code>completed</code>, <code>failed</code>, <code>repaired</code>,
+<code>disk</code>, <code>quota</code>) beholder betydningen sin for menneskelige
+varsler på samme mål.</p>
 
 <h2 id="arr">11 · Sonarr, Radarr og venner</h2>
 <p>nzbfast snakker SABnzbd-API-et nativt, så hver *arr fungerer rett ut av boksen - og den kan
@@ -752,6 +871,11 @@ fungere som <em>indekserer</em> for dem også.</p>
 (hvor du finner den: <a href="#firstrun-key">§2</a>).</li>
 <li>Kategori etter ønske (f.eks. <code>tv</code> / <code>movies</code>). Test → grønt merke → Lagre.</li>
 </ol>
+<p>Dashbordet rekker deg adressen: på en installasjon som ennå ikke har lastet
+ned noe, viser velkomstkortets rute "La Sonarr, Radarr eller en app legge til
+nedlastinger" den nøyaktige adressen med en <b>Copy</b>-knapp ved siden av.
+API-nøkkelen står med vilje ikke på den linjen; den ligger bak sin egen visning
+i Innstillinger → Sikkerhet (<a href="#firstrun-key">§2</a>).</p>
 <p>Kø, historikk, status per jobb, «fjern og slett», nytt forsøk og kategoriruting oppfører
 seg alt slik *arr-ene forventer.</p>
 <h3>Som indekserer (newznab)</h3>
@@ -799,7 +923,17 @@ URL-ene og en QR-kode å skanne.</p>
 <h3 id="remote-proxy">Nå nzbfast utenfra</h3>
 <p>Det finnes ingen innloggingsside, og det er med vilje. En innlogging med øktinformasjonskapsel er en sikkerhetsflate som må vedlikeholdes for alltid, og den ville uansett være den svakeste låsen på noe som vender mot det åpne internett. nzbfast autentiserer i stedet med API-nøkkelen din, og tar imot nøkkelen både i et forespørselshode og i URL-en (<code>X-Api-Key</code> eller <code>Authorization: Bearer</code>) - og det er nettopp det som lar noe foran håndtere innloggingen skikkelig.</p>
 <p><b>Det enkleste er ikke å publisere den i det hele tatt.</b> Installer <b>Tailscale</b> på denne maskinen og på telefonen, så havner begge på det samme private nettet: ingenting er eksponert, verken ruter eller sertifikat må røres, og Innstillinger → Fjerntilgang viser en adresse som fungerer overalt så snart Tailscale kjører. Velg dette med mindre du faktisk trenger et offentlig domene.</p>
-<p><b>Trenger du det</b>, sett en omvendt proxy foran, gi den sertifikatet, og la den ta autentiseringen. Start nzbfast med <code>--bind 127.0.0.1</code> slik at proxyen er eneste vei inn, og pek proxyen mot <code>http://127.0.0.1:6789</code>:</p>
+<p><b>nzbfast kan også servere HTTPS selv.</b> Pek Innstillinger → Sikkerhet →
+HTTPS-sertifikat / HTTPS-privatnøkkel mot et PEM-sertifikat og nøkkelen dets (eller
+start med <code>--tls-cert cert.pem --tls-key key.pem</code>), start på nytt, så
+svarer dashbordet og API-et på <code>https://</code> i stedet for ren HTTP - én
+lytter, ett skjema. Bruk sertifikatet domenet ditt allerede har (for eksempel
+fra Let's Encrypt via certbot), eller et selvsignert for LAN-et, som nettlesere
+godtar etter en engangsadvarsel. Et ødelagt eller utløpt sertifikat nekter
+oppstart med filen navngitt, så feilen er synlig der du gjorde den; forny ved å
+bytte ut filene og starte på nytt. Innebygd HTTPS krypterer trafikken, men
+legger ikke til noen innlogging, så behold API-nøkkelen satt.</p>
+<p><b>Trenger du et offentlig domene</b>, sett en omvendt proxy foran, gi den sertifikatet, og la den ta autentiseringen. Start nzbfast med <code>--bind 127.0.0.1</code> slik at proxyen er eneste vei inn, og pek proxyen mot <code>http://127.0.0.1:6789</code>:</p>
 <pre><code># Caddy
 example.com {
     reverse_proxy 127.0.0.1:6789
@@ -813,7 +947,11 @@ location / {
     proxy_set_header X-Forwarded-Proto $scheme;
 }</code></pre>
 <p>Legg på det proxyen din tilbyr: basic auth, en forward-auth-tjeneste som Authelia eller Authentik, eller klientsertifikater. Én ting overrasker alle - Sonarr, Radarr og telefonappene kan ikke fullføre en nettleserinnlogging, så la dem slippe forbi. De fleste proxyer kan slippe gjennom en forespørsel med et gyldig <code>X-Api-Key</code>-hode og kreve autentisering for alt annet.</p>
-<div class="warn-box"><b>Ikke bare videresend port 6789 på ruteren.</b> Panelet snakker ren HTTP, så API-nøkkelen din og alt du gjør med den ville krysse internett lesbart for alle underveis, og en installasjon helt uten nøkkel står åpen for den som finner den. Videresender du en port likevel, sett en API-nøkkel først.</div>
+<div class="warn-box"><b>Ikke bare videresend port 6789 på ruteren.</b>
+Uten et konfigurert sertifikat snakker panelet ren HTTP, så API-nøkkelen din og
+alt du gjør med den ville krysse internett lesbart for alle underveis, og en
+installasjon helt uten nøkkel står åpen for den som finner den. Videresender du
+en port likevel, sett en API-nøkkel først og slå på HTTPS.</div>
 
 <h2 id="performance">13 · Ytelsesverktøy</h2>
 <h3 id="perf-benchmark">Systembenchmark</h3>

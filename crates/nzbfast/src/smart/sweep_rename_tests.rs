@@ -84,6 +84,45 @@ fn sweep_junk_keeps_media_and_feature() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A sweep that would delete EVERY file in the release does nothing.
+///
+/// Found 12 Aug on the torture corpus: advO's SFX members unpacked
+/// correctly and the daemon then deleted the payload, because that
+/// payload is `test.txt.txt` and `.txt` is on JUNK_EXTS. The job
+/// finished Completed holding two `.exe` files and nothing else, which
+/// read as an unpack failure and was not one. Same premise as
+/// `keep_media_only`'s no-video guard: with every file classified as
+/// furniture there is nothing here to tell payload FROM, and an empty
+/// output directory is the one answer that cannot be right.
+#[test]
+fn a_sweep_that_would_empty_the_release_is_skipped_whole() {
+    let _steady = trash_globals_steady();
+    let dir = std::env::temp_dir().join(format!("nzbfast-alljunk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // The advO shape: the entire payload is a text file.
+    std::fs::write(dir.join("test.txt.txt"), b"123").unwrap();
+    std::fs::write(dir.join("release.nfo"), b"scene info").unwrap();
+    assert_eq!(sweep_junk(&dir), 0, "nothing may be swept");
+    assert!(dir.join("test.txt.txt").exists(), "the payload survives");
+    assert!(
+        dir.join("release.nfo").exists(),
+        "all-or-nothing, not a pick"
+    );
+
+    // One real payload file beside them and the sweep behaves as before:
+    // the guard is about emptying the release, not about .txt.
+    std::fs::write(dir.join("payload.bin"), vec![0u8; 8192]).unwrap();
+    assert_eq!(
+        sweep_junk(&dir),
+        2,
+        "furniture goes once something survives"
+    );
+    assert!(dir.join("payload.bin").exists());
+    assert!(!dir.join("test.txt.txt").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Obfuscated posts write hash-named, extensionless recovery volumes
 /// (the yEnc header name wins over the NZB subject), which the
 /// extension list alone can't see. Reported in the wild: a whole

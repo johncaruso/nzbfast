@@ -683,6 +683,7 @@ async fn early_fanout_arms_at_the_tail_latch_not_the_pending_floor() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     };
 
     // Plain fan-out, tail latched, pending far above the floor: the
@@ -750,6 +751,7 @@ async fn early_fanout_arms_at_the_tail_latch_not_the_pending_floor() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     };
     steered.register_inflight(&refetch, 1); // recovery leg on server b
     steered
@@ -889,6 +891,7 @@ async fn hedge_races_a_straggler_at_the_adaptive_bound() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     };
     shared.register_inflight(&w0, 0);
     shared
@@ -920,6 +923,7 @@ async fn hedge_races_a_straggler_at_the_adaptive_bound() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     };
     shared.register_inflight(&w1, 0);
     shared
@@ -949,6 +953,7 @@ async fn hedge_races_a_straggler_at_the_adaptive_bound() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     };
     shared.register_inflight(&w2, 0);
     shared
@@ -1038,6 +1043,7 @@ async fn suspect_dup_races_a_pre_byte_stall_at_once() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     };
     let servers = vec![mk("a", true), mk("b", true)];
     let reqs: Vec<ArticleReq> = (0..(ENDGAME_MAX + 10))
@@ -1187,6 +1193,90 @@ async fn a_live_target_change_parks_and_wakes_workers() {
         .expect("run hung across live target changes")
         .unwrap();
     assert_eq!(collect.await.unwrap(), segs.len());
+}
+
+/// §96.5: a prepaid block that runs out MID-RUN releases its server -
+/// workers stop topping up, drain what is in flight, and bow out for
+/// good - and the shared queue hands everything left to the flatrate
+/// server, so every article still gets its outcome. The paid overshoot
+/// is bounded to what was in flight at the trip, and exactly one
+/// "block spent" event lands on the ring for the graph.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spent_block_releases_the_server_mid_run_and_the_other_finishes() {
+    let data: Vec<u8> = (0..2_000_000u32).map(|i| i as u8).collect();
+    let mut articles = std::collections::HashMap::new();
+    let segs = crate::mock::make_file_articles("t.bin", &data, 20_000, "bb", &mut articles);
+    let ids: Vec<ArticleReq> = segs
+        .iter()
+        .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
+        .collect();
+    // Throttled so the block server cannot swallow the whole corpus in
+    // its first pipeline fills - the trip must happen mid-run.
+    let chaos = crate::mock::Chaos {
+        throttle: crate::mock::Throttle {
+            per_conn_bps: 300_000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let srv_a = crate::mock::MockServer::start(articles.clone(), chaos.clone()).await;
+    let srv_b = crate::mock::MockServer::start(articles, chaos).await;
+    const BUDGET: u64 = 400_000;
+    let (sa, mut ca) = payout_server(&srv_a, 3, PoolConfig::default());
+    ca.budget_bytes = Some(BUDGET);
+    let (sb, cb) = payout_server(&srv_b, 3, PoolConfig::default());
+    let servers = vec![(sa, ca), (sb, cb)];
+    let live = LiveStats::for_servers(&servers);
+    let servers: Vec<(ServerConfig, PoolConfig)> = servers
+        .into_iter()
+        .map(|(s, mut c)| {
+            c.live = Some(live.clone());
+            (s, c)
+        })
+        .collect();
+    let (tx, mut rx) = mpsc::channel(64);
+    let fetch = tokio::spawn(async move { fetch_all_multi(&servers, ids, tx).await });
+    let collect = tokio::spawn(async move {
+        let mut done = 0usize;
+        while let Some(o) = rx.recv().await {
+            if matches!(o, FetchOutcome::Done { .. }) {
+                done += 1;
+            }
+        }
+        done
+    });
+    tokio::time::timeout(Duration::from_secs(60), fetch)
+        .await
+        .expect("run hung after the block tripped")
+        .unwrap();
+    assert_eq!(
+        collect.await.unwrap(),
+        segs.len(),
+        "articles lost when the block server bowed out"
+    );
+    let spent = live.servers[0].bytes.load(Ordering::Relaxed);
+    assert!(
+        spent >= BUDGET,
+        "budget never tripped (spent {spent}) - the rig proved nothing"
+    );
+    // Bounded overshoot: what was in flight at the trip - window (3) x
+    // connections (3) encoded articles of ~27 KB, with slack for a
+    // response mid-read on each socket. The bug this guards against is
+    // a whole-corpus overshoot (2 MB).
+    assert!(
+        spent < BUDGET + 700_000,
+        "block server kept spending after its budget: {spent}"
+    );
+    assert!(
+        live.servers[1].bytes.load(Ordering::Relaxed) > 0,
+        "the flatrate server never took over"
+    );
+    let block_events = live
+        .recent_events(200)
+        .into_iter()
+        .filter(|e| e.kind == "block")
+        .count();
+    assert_eq!(block_events, 1, "expected exactly one block-spent event");
 }
 
 /// PAYOUT (TODO 121.1): a cold-storage article - dead air before the

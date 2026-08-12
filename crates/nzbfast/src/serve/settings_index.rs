@@ -188,6 +188,42 @@ pub(super) fn set_scoreboard_source(
     })
 }
 
+pub(super) fn set_scoreboard_cats(
+    d: &Arc<Daemon>,
+    _name: &str,
+    v: &str,
+) -> std::result::Result<(bool, Value), String> {
+    Ok({
+        // The requests-per-day dial. It can only ever REDUCE the day's
+        // cost, never raise it: the value is a subset of the built-in
+        // SCOREBOARD_CATEGORIES, empty means all four (the ceiling),
+        // and scoreboard_categories() filters rather than reads, so
+        // nothing stored here can invent a fifth request.
+        let cats = parse_scoreboard_cats(v).map_err(|e| format!("scoreboard_cats: {e}"))?;
+        // One category is the floor. An all-unticked list would read as
+        // "measure nothing" but store as the empty default, which is
+        // "measure everything" - the opposite of what was asked - so it
+        // is refused here rather than silently inverted.
+        if !v.trim().is_empty() && cats.is_empty() {
+            return Err(
+                "scoreboard_cats: name at least one category, or turn the scoreboard off".into(),
+            );
+        }
+        let n = if cats.is_empty() {
+            SCOREBOARD_CATEGORIES.len()
+        } else {
+            cats.len()
+        };
+        *d.scoreboard_cats.lock_ok() = cats.clone();
+        info!(
+            target: "scoreboard",
+            "sampling {n} categor{} a day - {n} request(s)",
+            if n == 1 { "y" } else { "ies" }
+        );
+        (true, json!(cats))
+    })
+}
+
 pub(super) fn set_predb_server(
     d: &Arc<Daemon>,
     _name: &str,

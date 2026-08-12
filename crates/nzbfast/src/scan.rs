@@ -1226,6 +1226,67 @@ async fn stat_one(conn: &mut Connection, msgid: &str) -> Result<bool> {
     Ok(present)
 }
 
+/// TODO 131 D3: the search-miss readout, without a daemon.
+///
+/// Same numbers `mode=search_misses` serves, for the index-ops case
+/// where you have the database file and want to know what the people
+/// using it could not find. Read-only - it opens the index read-write
+/// only because `Index::open` is the call that guarantees the schema,
+/// and a fresh checkout's index may predate the table.
+pub(crate) fn search_misses(
+    db: &Path,
+    days: i64,
+    thin: u32,
+    surface: Option<&str>,
+    limit: u32,
+) -> Result<()> {
+    let ix = nzbkit::index::Index::open(db)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|t| t.as_secs() as i64)
+        .unwrap_or(0);
+    let since = now - days.clamp(1, 365) * 86_400;
+    let surface = surface.filter(|s| matches!(*s, "wall" | "newznab"));
+    let summary = ix.search_log_summary(since, thin)?;
+    let rows = ix.search_misses(since, thin, surface, limit.clamp(1, 500))?;
+    println!(
+        "{} searches over {days} days, {} distinct; {} came back empty ({:.1}%)",
+        summary.searches,
+        summary.distinct,
+        summary.zero_searches,
+        if summary.searches > 0 {
+            summary.zero_searches as f64 * 100.0 / summary.searches as f64
+        } else {
+            0.0
+        },
+    );
+    println!(
+        "{} queries still unanswered, {} the scanner has since caught up with",
+        summary.missing, summary.resolved,
+    );
+    if rows.is_empty() {
+        println!("nothing missed in this window");
+        return Ok(());
+    }
+    println!();
+    println!(
+        "{:<50} {:>8} {:>6} {:>6}  {:<8} kind",
+        "query", "asked", "empty", "hits", "surface"
+    );
+    for m in &rows {
+        println!(
+            "{:<50} {:>8} {:>6} {:>6}  {:<8} {}",
+            trunc(&m.q, 50),
+            m.n,
+            m.zero_n,
+            m.last_hits,
+            m.surface,
+            m.kind,
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn spot_search(query: &str, db: &Path) -> Result<()> {
     let ix = nzbkit::index::Index::open(db)?;
     let hits = ix.spot_search(query, 30)?;

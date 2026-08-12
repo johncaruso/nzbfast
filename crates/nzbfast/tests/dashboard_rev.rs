@@ -136,6 +136,61 @@ fn scratch(name: &str) -> scratch::ScratchDir {
     dir
 }
 
+/// Same scratch, but pointed at a mock NNTP server that holds NO
+/// articles, so a job added here is picked, asks for its one segment,
+/// is told 430, and fails - the fast add-to-park arc.
+///
+/// For the two lifecycle tests only. They need a job that walks that
+/// whole arc, and until TODO §154 they got it from the plain
+/// `servers: []` scratch above: a job on a serverless daemon was picked
+/// and failed inside ~500 ms. §154 is exactly the decision that this
+/// must no longer happen - with no server configured the runner HOLDS
+/// the queue instead of failing the job, because a Failed row on the SAB
+/// facade is a blocklist-and-research signal to an *arr. So the arc
+/// these tests are about now needs a daemon with somewhere to dial.
+/// Nothing about their subject changed, only how the failure is
+/// provoked. (An unreachable address is NOT the way: the pool treats a
+/// refused connect as a server having a bad minute and retries it
+/// indefinitely, so the job never fails at all.)
+fn scratch_with_empty_server(name: &str) -> scratch::ScratchDir {
+    let dir = scratch(name);
+    let addr = empty_mock_server();
+    std::fs::write(
+        dir.join("config.json"),
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            addr.ip(),
+            addr.port()
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+/// Start a mock NNTP server holding nothing, on a thread of its own, and
+/// return its address. Deliberately never shut down: this file's tests
+/// are synchronous, the server has to outlive the daemon that dials it,
+/// and a test binary exiting takes its threads with it.
+fn empty_mock_server() -> std::net::SocketAddr {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let srv = nzbkit::mock::MockServer::start(
+                    std::collections::HashMap::new(),
+                    nzbkit::mock::Chaos::default(),
+                )
+                .await;
+                tx.send(srv.addr).unwrap();
+                std::future::pending::<()>().await;
+            });
+    });
+    rx.recv().expect("the mock server never bound")
+}
+
 /// One synthetic finished-job record in the persisted `job_json` shape.
 /// Only the fields `job_from_json` requires plus what the assertions
 /// read; everything else exercises the absent-key legacy paths.
@@ -581,7 +636,7 @@ fn http_post_nzb(port: u16, name: &str, nzb: &str) -> Value {
 /// me everything after 0", never a second prime.
 #[test]
 fn lifecycle_events_reach_a_watching_client() {
-    let dir = scratch("events");
+    let dir = scratch_with_empty_server("events");
     let d = serve(&dir);
     let port = d.port;
 
@@ -590,7 +645,8 @@ fn lifecycle_events_reach_a_watching_client() {
     let seq0 = first["events_seq"].as_u64().expect("events_seq");
     assert_eq!(first["events"].as_array().map(Vec::len), Some(0), "{first}");
 
-    // A job on a daemon with no servers fails fast and parks.
+    // A job whose one server holds none of its articles fails and
+    // parks (see scratch_with_empty_server).
     let nzb = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
         <nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\
         <file poster=\"t@t\" date=\"1722000000\" subject=\"&quot;Event.Test&quot; yEnc (1/1)\">\
@@ -683,12 +739,13 @@ fn retention_knobs_off_by_default_and_enforced_when_set() {
 }
 
 /// §129 4a: the lifecycle schema is versioned and the add-to-park arc
-/// emits its stages in order. One job on a serverless daemon walks
+/// emits its stages in order. One job on a daemon whose only server
+/// holds nothing walks
 /// job.added -> job.started -> job.failed -> queue.idle, every event
 /// stamped schema_version 1, and the added payload names its origin.
 #[test]
 fn the_lifecycle_arc_is_versioned_and_ordered() {
-    let dir = scratch("lifearc");
+    let dir = scratch_with_empty_server("lifearc");
     let d = serve(&dir);
     let port = d.port;
 
@@ -830,4 +887,60 @@ fn a_settings_change_bumps_the_queue_revision_on_an_idle_daemon() {
         assert_eq!(after["queue"][field], want, "{setting}={value}: {after}");
         rev = after["queue_revision"].as_u64().expect("queue_revision");
     }
+}
+
+/// §154's hold rides the same revisioned payload, and setting it moved
+/// nothing - so on a queue that has just STOPPED (every job Queued, so
+/// `any_active` is false too) an open dashboard kept the snapshot it had
+/// last applied and never drew the banner the hold exists to draw. The
+/// clear edge is the same defect from the other side: the banner would
+/// have stayed on screen after a server was added.
+///
+/// Both edges, and the idle poll between them stays empty - a hold
+/// re-published every tick would put the whole queue back on the wire
+/// once a second.
+#[test]
+fn the_no_servers_hold_bumps_the_queue_revision_on_both_edges() {
+    let dir = scratch_with_empty_server("noservrev");
+    let cfg = dir.join("config.json");
+    let server_cfg = std::fs::read_to_string(&cfg).unwrap();
+    let d = serve(&dir);
+    let port = d.port;
+
+    let first = api(port, "mode=dashboard");
+    let mut rev = first["queue_revision"].as_u64().expect("queue_revision");
+    assert!(first["queue"]["hold"].is_null(), "{first}");
+    let idle = api(port, &format!("mode=dashboard&queue_rev={rev}"));
+    assert!(idle["queue"].is_null(), "idle poll must stay empty: {idle}");
+
+    // The last server goes away. The runner re-reads the config every
+    // tick, so the hold lands within about a second.
+    std::fs::write(&cfg, "{\"servers\":[]}").unwrap();
+    let held = poll_until(port, rev, |q| q["hold"]["reason"] == "noservers");
+    rev = held["queue_revision"].as_u64().expect("queue_revision");
+    assert!(
+        api(port, &format!("mode=dashboard&queue_rev={rev}"))["queue"].is_null(),
+        "the hold must not re-publish the queue every tick"
+    );
+
+    // And a server comes back.
+    std::fs::write(&cfg, &server_cfg).unwrap();
+    let cleared = poll_until(port, rev, |q| q["hold"].is_null());
+    assert!(cleared["queue"]["hold"].is_null(), "{cleared}");
+}
+
+/// Poll the revisioned dashboard endpoint from `rev` until the queue
+/// payload arrives AND satisfies `want`. Returns the whole answer.
+fn poll_until(port: u16, rev: u64, want: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+    for _ in 0..60 {
+        let a = api(port, &format!("mode=dashboard&queue_rev={rev}"));
+        if !a["queue"].is_null() && want(&a["queue"]) {
+            return a;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!(
+        "the queue payload never moved: {}",
+        api(port, &format!("mode=dashboard&queue_rev={rev}"))
+    );
 }

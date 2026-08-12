@@ -8,12 +8,9 @@ fn mode(p: &Path) -> u32 {
     std::fs::metadata(p).unwrap().permissions().mode() & 0o777
 }
 
-fn scratch(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("nzbfast-umask-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
-}
+// TODO 149: the guard cleans up on drop; the local copy of scratch()
+// this replaces leaked every run's tree.
+use super::testkit::scratch;
 
 /// The whole job tree, at both depths, files and directories.
 #[test]
@@ -39,7 +36,6 @@ fn the_job_tree_gets_the_configured_modes() {
     assert_eq!(mode(&job.join("Subs")), 0o775, "nested dir");
     assert_eq!(mode(&job.join("ep.mkv")), 0o664, "file");
     assert_eq!(mode(&job.join("Subs").join("en.srt")), 0o664, "nested file");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The reason the parent walk exists: an *arr imports by renaming the
@@ -67,7 +63,6 @@ fn the_parents_up_to_the_download_root_are_opened_too() {
         0o700,
         "the walk climbed PAST the download root"
     );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A sibling under the same parents must be left exactly as it was:
@@ -92,7 +87,6 @@ fn a_neighbouring_job_is_not_touched() {
 
     assert_eq!(mode(&theirs), 0o700, "a sibling job was re-moded");
     assert_eq!(mode(&theirs.join("keep.mkv")), 0o600, "a sibling's file");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// 022 is what a container already gives, so choosing it must produce
@@ -109,5 +103,4 @@ fn the_container_default_reproduces_todays_modes() {
 
     assert_eq!(mode(&job), 0o755);
     assert_eq!(mode(&job.join("a.mkv")), 0o644);
-    let _ = std::fs::remove_dir_all(&root);
 }

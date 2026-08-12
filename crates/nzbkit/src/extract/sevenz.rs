@@ -171,6 +171,10 @@ impl Extractor {
         let buf = Arc::new(FrontierBuffer::new_gated(
             size,
             inner.verify_gate.clone().map(|g| (g, slot)),
+            // No scratch: the 7z reader peeks at arbitrary offsets, so
+            // "beyond the gap" is not provably cold - the stalled-chase
+            // spill stays a RAR-only bargain.
+            None,
         ));
         if !ctl.set.register(
             idx,

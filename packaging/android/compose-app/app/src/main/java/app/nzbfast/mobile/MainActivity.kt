@@ -46,12 +46,44 @@ sealed class Screen {
     data class Player(val nzoId: String, val url: String, val title: String) : Screen()
 }
 
+/**
+ * Something an OUTSIDE app asked us to download, staged until the user
+ * says yes.
+ *
+ * MainActivity is exported for ACTION_SEND and ACTION_VIEW, and intent
+ * filters constrain implicit launches only: any app on the device can
+ * start an exported component explicitly. Submitting on arrival therefore
+ * let a malicious foreground app make the victim's daemon - possibly a
+ * remote one, holding provider credentials - enqueue downloads of the
+ * attacker's choosing, without knowing the API key and without the share
+ * chooser ever appearing. We are the deputy; the confirmation is what
+ * stops us being a confused one (Codex sweep 12 Aug F10).
+ *
+ * The in-app paths (file picker, pasted link) are NOT staged: those are
+ * already an explicit action by the person holding the phone.
+ */
+sealed class PendingImport {
+    abstract val label: String
+
+    data class File(val uri: Uri, val name: String) : PendingImport() {
+        override val label get() = name
+    }
+
+    data class Link(val link: String) : PendingImport() {
+        override val label get() = link
+    }
+}
+
 class MainActivity : ComponentActivity() {
 
     private var screen by mutableStateOf<Screen>(Screen.Connect)
     private var connection by mutableStateOf<Connection?>(null)
     private var busy by mutableStateOf(false)
     private var note by mutableStateOf<String?>(null)
+
+    /** An external share/link waiting for the user to confirm it. See
+     *  [PendingImport]: nothing is uploaded or enqueued until they do. */
+    private var pendingImport by mutableStateOf<PendingImport?>(null)
 
     /** The one poll: mode=playback carries queue, history, per-file
      *  readiness and the byte-serving telemetry in a single response. */
@@ -73,13 +105,38 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        connection = Store.load(this)
-        if (connection != null) {
-            if (connection!!.mode == Mode.DEVICE) {
+        val saved = Store.load(this)
+        if (saved != null) {
+            if (saved.mode == Mode.DEVICE) {
+                // A saved ON-DEVICE connection must clear the same identity
+                // bar a fresh one does. Setting `connection` here and polling
+                // immediately is what sent the stored full key to whatever
+                // owned the port on every app start, not just the first (see
+                // EngineIdentity). The engine is asked to start, the screen
+                // goes to Home, and the credential waits for the proof.
                 startForegroundService(Intent(this, EngineService::class.java))
+                screen = Screen.Home
+                busy = true
+                lifecycleScope.launch {
+                    val proven = withContext(Dispatchers.IO) {
+                        EngineIdentity.awaitVerified(this@MainActivity)
+                    }
+                    busy = false
+                    if (proven == null) {
+                        note = "The engine did not start, or something else is using " +
+                            "its port. Check daemon.log in app storage."
+                        screen = Screen.Connect
+                        return@launch
+                    }
+                    note = null
+                    connection = saved
+                    startPolling()
+                }
+            } else {
+                connection = saved
+                screen = Screen.Home
+                startPolling()
             }
-            screen = Screen.Home
-            startPolling()
         }
         handleIntent(intent)
 
@@ -124,6 +181,47 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    /**
+     * "Another app wants nzbfast to download this" - shown before any
+     * upload or enqueue, naming what it is and which daemon would get it.
+     *
+     * Cancel is the destructive-free default and dismissing counts as
+     * cancel, so a launch the user did not intend costs nothing.
+     */
+    @Composable
+    private fun ImportConfirmation() {
+        val p = pendingImport ?: return
+        val target = connection?.let {
+            if (it.mode == Mode.DEVICE) "this phone" else it.baseUrl
+        }
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { pendingImport = null },
+            title = { Text("Add this to nzbfast?") },
+            text = {
+                Text(
+                    buildString {
+                        append("Another app asked nzbfast to download:\n\n")
+                        append(p.label)
+                        append("\n\n")
+                        when (target) {
+                            null -> append("You are not connected yet, so nothing can be added.")
+                            else -> append("It would be sent to $target.")
+                        }
+                    }
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = ::confirmImport,
+                    enabled = target != null,
+                ) { Text("Add") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingImport = null }) { Text("Cancel") }
+            },
+        )
+    }
+
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
     private fun AppScaffold() {
@@ -131,6 +229,7 @@ class MainActivity : ComponentActivity() {
         BackHandler(enabled = s is Screen.Add || s is Screen.Player) {
             screen = Screen.Home
         }
+        ImportConfirmation()
         when (s) {
             is Screen.Player -> PlayerScreen(
                 streamUrl = s.url,
@@ -218,25 +317,17 @@ class MainActivity : ComponentActivity() {
         note = null
         startForegroundService(Intent(this, EngineService::class.java))
         lifecycleScope.launch {
-            val local = NzbfastClient(
-                "http://127.0.0.1:${EngineService.PORT}",
-                EngineService.apiKey(this@MainActivity),
-            )
-            val up = withContext(Dispatchers.IO) {
-                var ok = false
-                var tries = 0
-                while (!ok && tries < 60) {
-                    ok = runCatching { local.version() }.getOrDefault("").isNotEmpty()
-                    if (!ok) {
-                        delay(500)
-                        tries++
-                    }
-                }
-                ok
+            // Identity BEFORE the credential. `local.version()` used to be
+            // the readiness probe, and it carried the persistent full API
+            // key to whatever held the port - see EngineIdentity. Nothing
+            // keyed happens until the listener has proven it is our engine.
+            val proven = withContext(Dispatchers.IO) {
+                EngineIdentity.awaitVerified(this@MainActivity)
             }
             busy = false
-            if (!up) {
-                note = "The engine did not start. Check daemon.log in app storage."
+            if (proven == null) {
+                note = "The engine did not start, or something else is using its port. " +
+                    "Check daemon.log in app storage."
                 return@launch
             }
             Store.saveDevice(this@MainActivity)
@@ -324,15 +415,32 @@ class MainActivity : ComponentActivity() {
                     intent.getParcelableExtra(Intent.EXTRA_STREAM)
                 }
                 val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+                // STAGED, not submitted - see PendingImport.
                 when {
-                    uri != null -> addFromUri(uri)
-                    text != null && text.contains("nzblnk:") -> addLink(text.trim())
+                    uri != null -> pendingImport = PendingImport.File(
+                        uri,
+                        queryDisplayName(uri) ?: "shared.nzb",
+                    )
+                    text != null && text.contains("nzblnk:") ->
+                        pendingImport = PendingImport.Link(text.trim())
                 }
             }
             Intent.ACTION_VIEW -> {
                 val data = intent.data ?: return
-                if (data.scheme == "nzblnk") addLink(data.toString())
+                if (data.scheme == "nzblnk") {
+                    pendingImport = PendingImport.Link(data.toString())
+                }
             }
+        }
+    }
+
+    /** The user said yes to a staged external import. */
+    private fun confirmImport() {
+        val p = pendingImport ?: return
+        pendingImport = null
+        when (p) {
+            is PendingImport.File -> addFromUri(p.uri)
+            is PendingImport.Link -> addLink(p.link)
         }
     }
 
@@ -346,9 +454,15 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
-                    val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                        ?: error("could not read the file")
                     val name = queryDisplayName(uri) ?: "shared.nzb"
+                    // readSharedNzb, not readBytes: the stream behind a
+                    // content URI is served by whichever app shared it,
+                    // which is free to make it arbitrarily long and to
+                    // lie about its length. The daemon's own 256 MiB
+                    // addfile cap is far too late to protect the phone.
+                    val stream = contentResolver.openInputStream(uri)
+                        ?: error("could not read the file")
+                    val bytes = client!!.readSharedNzb(stream, name)
                     client!!.addFile(name, bytes)
                 }
             }

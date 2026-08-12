@@ -86,6 +86,12 @@ fn throttled(bps: u64) -> Chaos {
 
 /// The daemon's race_stragglers-ON posture, which is what any A/B here
 /// must hold still while steering knobs move.
+///
+/// The four knobs are `PoolConfig::shipped()`'s racing half, spelled
+/// out rather than taken from it: `shipped()` also arms
+/// `adaptive_timeout`, and every leg here runs against a deliberately
+/// crawling mock, where the read budget would become a second moving
+/// part. It is off in BOTH arms, so the steering comparison holds.
 fn racing_cfg() -> PoolConfig {
     PoolConfig {
         connections: CONNS,

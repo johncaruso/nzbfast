@@ -49,3 +49,29 @@ updates:
         patterns:
           - "*"
     open-pull-requests-limit: 3
+  # The base images in Dockerfile and packaging/docker/Dockerfile.release
+  # are pinned by digest, which is what makes the build reproducible - and
+  # is also what makes it go stale. This ecosystem is the other half of
+  # that pin: without it a digest-pinned image never picks up a base-image
+  # CVE fix. Two directories because Dependabot scans one Dockerfile tree
+  # per entry. Two entries rather than one `directories:` list on purpose:
+  # a config Dependabot rejects disables EVERY ecosystem in this file, so
+  # the older, unambiguous `directory:` key is the safe one to spend here.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      docker-root:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3
+  - package-ecosystem: docker
+    directory: "/packaging/docker"
+    schedule:
+      interval: weekly
+    groups:
+      docker-release:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3

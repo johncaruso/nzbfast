@@ -14,9 +14,59 @@ import java.net.URLEncoder
  */
 internal object Http {
 
-    class HttpError(val code: Int, message: String) : Exception("HTTP $code: $message")
+    /**
+     * `body` is the response body, not just the excerpt in the message:
+     * the daemon's keyless 403 refusal carries the launcher handshake proof
+     * in its JSON, and [app.nzbfast.mobile.EngineIdentity] has to read it
+     * off a non-2xx reply.
+     */
+    class HttpError(val code: Int, val body: String) :
+        Exception("HTTP $code: ${body.take(200)}")
+
+    class TooLargeError(val name: String) :
+        Exception("$name is too big to be an NZB")
+
+    /**
+     * Ceiling on an NZB this app will read into memory.
+     *
+     * The biggest real NZB is a few tens of megabytes - roughly a
+     * kilobyte per segment, so a 100 GB post lands near 30 MB. This sits
+     * comfortably past that and far below what a phone can be made to
+     * swallow.
+     *
+     * The bound has to be HERE. The daemon caps `addfile` at 256 MiB,
+     * which protects the daemon and arrives long after the phone has
+     * already allocated the whole stream plus a payload-sized multipart
+     * copy of it - and a content URI handed over by a share intent is
+     * served by whatever app sent it, which is free to return an
+     * arbitrarily long stream and to lie about its length (Codex sweep
+     * 12 Aug F14).
+     */
+    const val NZB_SIZE_LIMIT: Int = 64 shl 20
 
     fun encode(v: String): String = URLEncoder.encode(v, "UTF-8")
+
+    /**
+     * Read at most [NZB_SIZE_LIMIT] bytes, throwing [TooLargeError] the
+     * moment the stream proves longer. Counted as it is read: declared
+     * content-provider metadata is never the bound, because a hostile
+     * provider controls it.
+     */
+    fun readBounded(s: InputStream, name: String): ByteArray {
+        val buf = ByteArrayOutputStream()
+        val chunk = ByteArray(64 * 1024)
+        var total = 0L
+        s.use {
+            while (true) {
+                val n = it.read(chunk)
+                if (n <= 0) break
+                total += n
+                if (total > NZB_SIZE_LIMIT) throw TooLargeError(name)
+                buf.write(chunk, 0, n)
+            }
+        }
+        return buf.toByteArray()
+    }
 
     fun get(url: String, apiKey: String? = null, timeoutMs: Int = 10_000): String {
         val c = URL(url).openConnection() as HttpURLConnection
@@ -26,7 +76,7 @@ internal object Http {
         try {
             val code = c.responseCode
             val body = readAll(if (code in 200..299) c.inputStream else c.errorStream)
-            if (code !in 200..299) throw HttpError(code, body.take(200))
+            if (code !in 200..299) throw HttpError(code, body)
             return body
         } finally {
             c.disconnect()
@@ -71,7 +121,7 @@ internal object Http {
             }
             val code = c.responseCode
             val body = readAll(if (code in 200..299) c.inputStream else c.errorStream)
-            if (code !in 200..299) throw HttpError(code, body.take(200))
+            if (code !in 200..299) throw HttpError(code, body)
             return body
         } finally {
             c.disconnect()
@@ -91,7 +141,7 @@ internal object Http {
             c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
             val code = c.responseCode
             val text = readAll(if (code in 200..299) c.inputStream else c.errorStream)
-            if (code !in 200..299) throw HttpError(code, text.take(200))
+            if (code !in 200..299) throw HttpError(code, text)
             return text
         } finally {
             c.disconnect()

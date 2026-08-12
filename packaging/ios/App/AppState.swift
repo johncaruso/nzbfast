@@ -175,7 +175,9 @@ final class AppState: ObservableObject {
                 defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                 do {
                     guard let client else { throw ApiError.daemon("Not connected.") }
-                    let data = try Data(contentsOf: url)
+                    // Bounded: see readBoundedNzb. The sharing app
+                    // chooses this file, not us.
+                    let data = try readBoundedNzb(at: url)
                     let resp = try await client.addFile(data: data, filename: url.lastPathComponent)
                     guard resp.status else {
                         throw ApiError.daemon(resp.error ?? "The server refused that NZB.")

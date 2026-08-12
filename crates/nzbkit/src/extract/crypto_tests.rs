@@ -218,6 +218,108 @@ fn checkless_encrypted_store_set_wrong_password_demotes_not_publishes() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// `rar a -htb` writes a BLAKE2sp digest INSTEAD of a CRC32, and nzbkit
+/// has no BLAKE2sp of its own - so nothing in the one-pass path can
+/// adjudicate such an output. `instream_decrypt_allowed` diverts the
+/// shape away from write-time decryption explicitly so the disk path
+/// (where rars checks the keyed digest) takes it, but nothing demoted
+/// it: the finish pass built a job with `expect_crc = None`, the RAR5
+/// password check set `verified = true`, and the demotion filter let it
+/// through. Result: plaintext published with no integrity verdict at
+/// all, on an archive whose ciphertext may have been damaged before the
+/// yEnc/PAR2 pass ever saw it (Codex sweep 12 Aug F2).
+///
+/// A CORRECT password, deliberately: the point is that a verified key is
+/// not a verified payload.
+///
+/// Both split shapes, and in both feed orders. The SPLIT case is the one
+/// that mattered most and the one the report missed: only the tail
+/// fragment carries the whole-file checks, so the write-time veto reads
+/// `hash: None, file_crc: None` off the head, answers "allowed", and
+/// latches the plaintext-once route for the whole file - which made
+/// whether anything was checked depend on which volume arrived first.
+#[test]
+fn a_hash_only_encrypted_set_demotes_rather_than_publishing_unchecked() {
+    let plain = payload(300_007, 53);
+    let mut f = fixtures::encrypt_file("hunter2", &plain, 37);
+    // The shape: a digest, and NO CRC32.
+    f.with_hash = true;
+    f.with_crc = false;
+    let n = f.cipher.len();
+    let unsplit = vec![fixtures::rar5_volume_enc(
+        &[("movie.mkv", &f, 0..n, false, false)],
+        None,
+    )];
+    let split = vec![
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..150_016, false, true)], Some(0)),
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, 150_016..n, true, false)], Some(1)),
+    ];
+    for (label, vols, tail_first) in [
+        ("unsplit", unsplit, false),
+        ("split-head-first", split.clone(), false),
+        ("split-tail-first", split, true),
+    ] {
+        let dir = tmpdir(&format!("enc-hash-only-{label}"));
+        let ex = Extractor::new(&dir, vols.len(), true);
+        ex.set_password("hunter2");
+        let order: Vec<usize> = if tail_first {
+            (0..vols.len()).rev().collect()
+        } else {
+            (0..vols.len()).collect()
+        };
+        for i in order {
+            feed(&ex, i, &format!("v{i}.rar"), &vols[i], 7000, 51 + i as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(
+            !rep.fallbacks.is_empty(),
+            "{label}: a set nothing here can check must demote to the verifying disk path"
+        );
+        assert!(
+            rep.decrypted.is_empty(),
+            "{label}: nothing may be reported as decrypted: {:?}",
+            rep.decrypted
+        );
+        assert!(
+            !dir.join("movie.mkv").exists(),
+            "{label}: no unverified plaintext may be published"
+        );
+        // And the volumes are byte-exact, so the disk path gets the
+        // posted bytes to verify the digest against.
+        for (i, v) in vols.iter().enumerate() {
+            let got = std::fs::read(dir.join(format!("v{i}.rar")))
+                .unwrap_or_else(|e| panic!("{label}: volume {i} must materialize: {e}"));
+            assert!(got == *v, "{label}: volume {i} must materialize byte-exact");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// The twin: a digest AND a CRC32 is fully adjudicable here, so it must
+/// still take the one-pass route. Without this the fix above would be
+/// indistinguishable from "demote anything with a hash record".
+#[test]
+fn a_hash_plus_crc_encrypted_set_still_maps_one_pass() {
+    let plain = payload(300_007, 54);
+    let mut f = fixtures::encrypt_file("hunter2", &plain, 39);
+    f.with_hash = true;
+    f.with_crc = true;
+    let vol =
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..f.cipher.len(), false, false)], None);
+    let dir = tmpdir("enc-hash-and-crc");
+    let ex = Extractor::new(&dir, 1, true);
+    ex.set_password("hunter2");
+    feed(&ex, 0, "v.rar", &vol, 7000, 61);
+    let rep = ex.finish().unwrap();
+    assert!(
+        rep.fallbacks.is_empty(),
+        "must not demote: {:?}",
+        rep.fallbacks
+    );
+    assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), plain);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The decrypt pass shards a file across threads, seeding each shard's
 /// CBC chain from the ciphertext block before it and folding the shard
 /// CRCs back with `crc32_combine`. Every shard count must therefore
@@ -1389,5 +1491,110 @@ fn finish_temp_renames_while_a_reader_streams() {
     // A NEW open now sees plaintext → raw reads (Plain).
     assert!(matches!(ex.open_stream("movie.mkv"), StreamOpen::Plain));
     drop(crypt);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A header-encrypted set whose password never turns up (the bench
+/// release1 shape) must NOT park its payload in RAM up to the holds
+/// cap: parked spans page to scratch beyond the pw-await window, so
+/// peak held bytes stay at the window while the finish demote still
+/// materializes byte-exact volumes with the password reason. Before
+/// the pager, a 1.6 GB set sat fully resident on a big-RAM box - the
+/// highest peak RSS of all five clients in the 2026-08-10 re-cut.
+#[test]
+fn pw_await_parked_spans_page_to_scratch() {
+    let dir = tmpdir("pw-await-page");
+    let plain = payload(24_000_000, 51);
+    let f = fixtures::encrypt_file("no-candidate-knows-this", &plain, 9);
+    let vol = fixtures::rar5_volume_enc_headers(
+        &[("obf.bin", &f, 0..f.cipher.len(), false, false)],
+        None,
+        "no-candidate-knows-this",
+        13,
+    );
+    let ex = Extractor::new(&dir, 1, true);
+    // Window = (cap/4).clamp(4 MB, 64 MB) = 8 MB; the 24 MB payload
+    // must overflow it to scratch, staying far under the 32 MB cap so
+    // nothing demotes on "held-bytes cap".
+    ex.set_holds_cap(32 << 20);
+    ex.set_password_probe(std::sync::Arc::new(|_probe| None));
+    // Offset 0 first so the slot classifies Rar (and parks on the
+    // password blocker) before the data piles - a shuffle that lands
+    // it late would route the early spans through the unclassified
+    // path instead, which is not this test's subject.
+    ex.write(0, "v.rar", vol.len() as u64, 0, &vol[..7000])
+        .unwrap();
+    feed(&ex, 0, "v.rar", &vol, 7000, 11);
+    assert!(
+        ex.holds_peak() < 12 << 20,
+        "parked spans stayed resident: peak {} for a {} B payload",
+        ex.holds_peak(),
+        vol.len()
+    );
+    assert!(
+        ex.holds_paged_total() > 10 << 20,
+        "paging never engaged: {}",
+        ex.holds_paged_total()
+    );
+    let rep = ex.finish().unwrap();
+    assert!(
+        rep.fallbacks
+            .iter()
+            .any(|(_, w)| w.contains("password") && !w.contains("held-bytes cap")),
+        "{:?}",
+        rep.fallbacks
+    );
+    assert_eq!(
+        std::fs::read(dir.join("v.rar")).unwrap(),
+        vol,
+        "materialized volume must be byte-exact"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The rescue survives paging: a probe that produces the password only
+/// at the finish force-probe must still re-key and extract one-pass,
+/// re-feeding the parked spans from scratch (`reclaim_span` preads).
+#[test]
+fn pw_await_probe_hit_refeeds_paged_spans() {
+    let dir = tmpdir("pw-await-page-hit");
+    let plain = payload(24_000_000, 52);
+    let f = fixtures::encrypt_file("late-sidecar-pw", &plain, 10);
+    let vol = fixtures::rar5_volume_enc_headers(
+        &[("obf.bin", &f, 0..f.cipher.len(), false, false)],
+        None,
+        "late-sidecar-pw",
+        14,
+    );
+    let ex = Extractor::new(&dir, 1, true);
+    ex.set_holds_cap(32 << 20);
+    let landed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let l = landed.clone();
+    ex.set_password_probe(std::sync::Arc::new(move |probe| {
+        // Every mid-feed probe misses (the sidecar has not "landed"
+        // yet); the finish force-probe hits, when the parked spans are
+        // on scratch.
+        if !l.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        (probe.verify("late-sidecar-pw") == crate::rar::PwVerdict::Verified)
+            .then(|| "late-sidecar-pw".to_string())
+    }));
+    // Offset 0 first for the same deterministic classification as the
+    // paging test above.
+    ex.write(0, "v.rar", vol.len() as u64, 0, &vol[..7000])
+        .unwrap();
+    feed(&ex, 0, "v.rar", &vol, 7000, 12);
+    landed.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        ex.holds_paged_total() > 10 << 20,
+        "paging never engaged: {}",
+        ex.holds_paged_total()
+    );
+    let rep = ex.finish().unwrap();
+    assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+    assert_eq!(rep.decrypted, vec!["obf.bin".to_string()]);
+    assert_eq!(std::fs::read(dir.join("obf.bin")).unwrap(), plain);
+    assert!(!dir.join("v.rar").exists(), "one-pass: no volume on disk");
     std::fs::remove_dir_all(&dir).unwrap();
 }

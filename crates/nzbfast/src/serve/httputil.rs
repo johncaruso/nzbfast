@@ -121,6 +121,40 @@ pub(super) fn header_apikey(req: &tiny_http::Request) -> Option<String> {
     })
 }
 
+/// The credentials part of an `Authorization` header whose scheme is
+/// `scheme`, compared the way RFC 7235 requires: the scheme token is
+/// case-INSENSITIVE.
+///
+/// Split out because /jsonrpc did this twice with a literal
+/// `strip_prefix("Basic ")`, so a client sending `basic` or `BASIC` - both
+/// compliant, and what some proxies and HTTP libraries emit - got a 401
+/// with correct credentials. The Bearer parser above already got this
+/// right (Codex sweep 12 Aug F18).
+pub(super) fn auth_credentials(req: &tiny_http::Request, scheme: &str) -> Option<String> {
+    let v = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Authorization"))?
+        .value
+        .as_str();
+    auth_scheme_value(v, scheme)
+}
+
+/// [`auth_credentials`] over the header VALUE, so the rule is testable
+/// without standing up a socket.
+pub(super) fn auth_scheme_value(header: &str, scheme: &str) -> Option<String> {
+    // split_whitespace, not split_once(' '): a header is allowed more than
+    // one space between the token and the credentials, and it handles a
+    // leading one too.
+    let mut parts = header.split_whitespace();
+    let got = parts.next()?;
+    if !got.eq_ignore_ascii_case(scheme) {
+        return None;
+    }
+    let cred = parts.next()?;
+    (!cred.is_empty()).then(|| cred.to_string())
+}
+
 /// The `Origin` a browser stamped on this request, if any.
 ///
 /// Absent on curl, on the *arrs, and on every server-side caller - which
@@ -518,4 +552,42 @@ pub(super) fn json_resp(v: Value) -> tiny_http::Response<std::io::Cursor<Vec<u8>
 #[cfg(feature = "indexer")]
 pub(super) fn may_publish_index(era: u64, pass_era: u64, enabled: bool) -> bool {
     era == pass_era && enabled
+}
+
+#[cfg(test)]
+mod auth_scheme_tests {
+    use super::auth_scheme_value;
+
+    /// RFC 7235 says the scheme token is case-insensitive, and the two
+    /// /jsonrpc credential checks compared it with a literal
+    /// `strip_prefix("Basic ")` - so a client sending `basic` or `BASIC`,
+    /// both compliant and both emitted in the wild by proxies and HTTP
+    /// libraries that normalize headers, got a 401 with correct
+    /// credentials (Codex sweep 12 Aug F18).
+    #[test]
+    fn the_scheme_token_is_case_insensitive() {
+        for spelling in ["Basic", "basic", "BASIC", "bAsIc"] {
+            assert_eq!(
+                auth_scheme_value(&format!("{spelling} dXNlcjpwYXNz"), "basic").as_deref(),
+                Some("dXNlcjpwYXNz"),
+                "{spelling} must be accepted"
+            );
+        }
+    }
+
+    /// ...and the credentials themselves are NOT: only the token is.
+    /// A different scheme, a missing credential or a bare token is no
+    /// match at all rather than an empty one.
+    #[test]
+    fn anything_that_is_not_this_scheme_is_no_match() {
+        assert_eq!(auth_scheme_value("Bearer abc", "basic"), None);
+        assert_eq!(auth_scheme_value("Basic", "basic"), None);
+        assert_eq!(auth_scheme_value("", "basic"), None);
+        assert_eq!(auth_scheme_value("   ", "basic"), None);
+        // Extra whitespace between the token and the credentials is legal.
+        assert_eq!(
+            auth_scheme_value("  Basic   dXNlcjpwYXNz  ", "basic").as_deref(),
+            Some("dXNlcjpwYXNz")
+        );
+    }
 }

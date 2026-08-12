@@ -192,6 +192,15 @@ nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
 inloggegevens: Instellingen → Usenet-servers → <b>Importeren uit SABnzbd / NZBGet…</b>
 vindt je bestaande installatie en neemt de servers over. Op de commandoregel is er
 ook <code>nzbfast import-sab</code>.</div>
+<p>De welkomstkaart vraagt ook <b>hoe je nzbfast wilt gebruiken</b>, met vier
+antwoorden: een app zoals Sonarr of Radarr stuurt hem aan, overstappen van SABnzbd,
+overstappen van NZBGet, of gewoon jij, vanaf dit dashboard. Een antwoord kiezen
+verandert op zichzelf niets. Het toont een korte lijst om na te lopen - elke
+aanbeveling met de eigen naam van de instelling, de huidige waarde, de aanbevolen
+waarde en één regel waarom - en <b>Toepassen</b> zet alleen de regels die je
+aanvinkt. Elke regel is een gewone instelling die je daarna los weer terug kunt
+zetten, en dezelfde lijst blijft later beschikbaar onder Instellingen →
+<b>Aanbevolen instellingen voor hoe je hem gebruikt</b>.</p>
 
 <h3 id="firstrun-key">Je API-sleutel</h3>
 <p>Bij een echt nieuwe installatie maakt nzbfast zelf een API-sleutel aan zodra de
@@ -366,6 +375,15 @@ forceert een ronde.</p>
 <p>Voeg titels op naam toe - ook titels die nog niet gepost zijn. Zodra een passende
 release in de index verschijnt wordt hij automatisch opgehaald, met
 kwaliteitsvoorkeuren en upgraderegels (een betere versie vervangt een slechtere).</p>
+<p>De kaart kan ook een lijst volgen die je in Plex bijhoudt. Voeg een <b>lijstbron</b> toe:
+koppel je Plex-account (je keurt een korte code goed op de eigen pagina van Plex, dus er
+bereikt nooit een wachtwoord nzbfast) of plak het adres van je Plex-watchlist. Behandel dat
+adres als een wachtwoord - iedereen die het heeft kan je lijst lezen - en daarom wordt het na
+het opslaan gemaskeerd. Gesynchroniseerde titels verschijnen als alleen-lezen regels naast je
+eigen titels. Een gekoppeld account ziet je hele lijst, dus een titel die je daar verwijdert
+wordt hier ook niet langer gevolgd (voltooide downloads blijven altijd staan); een adres toont
+alleen de nieuwste items, dus een ontbrekende titel kan er simpelweg afgeschoven zijn en er
+wordt niets verwijderd. Beide gedragingen zijn per bron om te zetten.</p>
 <h3 id="dash-history">Geschiedenis</h3>
 <p>Recente downloads, één regel per stuk. Mislukte taken bieden <b>Opnieuw
 proberen</b> (gaat verder vanuit het journal). Versleutelde archieven tonen een
@@ -483,6 +501,32 @@ krijgen een <b>opgeruimd</b>-badge.</li>
 bestand is. Open het terwijl het downloadt, controleer of inhoud, taal en kwaliteit
 zijn wat je verwachtte, en breek vroeg af als dat niet zo is - in plaats van het pas
 na de volledige download te ontdekken.</p>
+<p>De eerste helft daarvan staat al op de pagina. Open de regel van een download in
+de wachtrij (of in de geschiedenis) en de lade toont wat er in het videobestand
+zit, gelezen uit de bytes die tot nu toe zijn binnengekomen: resolutie, video- en
+audiocodecs, audiotalen, ondertitels, hoofdstukken. Een release die de verkeerde
+versie, de verkeerde taal of een upscale is, verraadt zichzelf in dat paneel lang
+voordat de download klaar is.</p>
+<p>De pagina zoekt ook uit of <em>deze</em> browser het bestand kan afspelen, en
+zegt dat in plaats van te gokken: browsers verschillen (Safari decodeert HEVC
+waar Chrome dat niet doet, en vrijwel geen enkele decodeert AC-3- of DTS-audio),
+dus de vraag wordt gesteld aan de browser waar je daadwerkelijk in zit. Is het
+antwoord ja, dan opent <b>▶ Afspelen</b> een speler direct op de pagina, die het
+bestand toont terwijl het downloadt. De meeste releases zijn MKV, dat veel
+browsers weigeren te openen terwijl ze alles erin wel kunnen decoderen, dus
+verpakt nzbfast die opnieuw tijdens het afspelen. Er wordt niets opnieuw
+gecodeerd: beeld en geluid zijn de oorspronkelijke bytes in een andere
+verpakking, en verspringen in het bestand werkt gewoon. Is het geluidsspoor er
+een die deze browser niet kan decoderen en draagt de release een tweede die hij
+wel aankan, dan speelt dat tweede spoor, zodat het beeld niet stil binnenkomt.
+Pas als de browser de decoder voor de video zelf mist, geeft de knop het bestand
+aan je eigen mediaspeler, zoals hieronder beschreven.</p>
+<p>Eén instelling regelt dit allemaal: Instellingen → Interface → <b>Een bestand
+controleren terwijl het downloadt</b>. <b>Alleen details</b>, de standaard, toont
+het paneel en biedt geen speler op de pagina; <b>Details en een speler</b> voegt de
+speler toe; <b>Uit</b> zorgt dat het bestand helemaal niet wordt gelezen - staat
+dit uit, dan opent niets voor wie dan ook een half gedownload bestand.</p>
+<p>Om in plaats daarvan in je eigen mediaspeler te controleren:</p>
 <ul>
 <li><b>▶ Afspelen</b> op de wall (of <code>/m3u/&lt;id&gt;</code>) geeft je mediaspeler
 een URL; de daemon start of hergebruikt de download erachter.</li>
@@ -518,8 +562,20 @@ server in of uit de pool halen. Elke server heeft:</p>
 <tr><td>Verbindingen</td><td>Gelijktijdige verbindingen per server. Gebruik <b>Verbindingstuning</b> (<a href="#performance">§13</a>) om de sweet spot van elke provider te vinden in plaats van hoog te gokken.</td></tr>
 <tr><td>Niveau (tier)</td><td>0 = primair; hogere niveaus zijn fill-servers, die alleen artikelen gevraagd worden die elk lager niveau miste. Zet onbeperkte accounts op 0, blokaccounts op 1+.</td></tr>
 <tr><td>Blokgrootte (GB)</td><td>Voor blokaccounts (betalen per GB): nzbfast houdt hiertegen het totale verbruik bij en stopt met de server zodra het blok op is (waarschuwing bij 85%).</td></tr>
+<tr><td>Elke byte wordt betaald</td><td>Zet dit aan voor een account met betaling per volume. Je downloads gebruiken de server precies zoals eerst; wat stopt is verkeer dat nzbfast uit zichzelf zou sturen - de automatische verbindingstuner, de netwerkstap van de systeembenchmark en de header-scans voor de ingebouwde index slaan hem allemaal over. Onafhankelijk van het niveau en van de blokgrootte, want een account met betaling per volume kan je enige provider zijn en een onbeperkt account kan op niveau 2 staan. Standaard uit. De handmatige <b>Test</b> in <b>Verbindingstuning</b> (<a href="#performance">§13</a>) werkt nog steeds op een zo gemarkeerde server en vraagt eerst, want daar kies jij ervoor om te besteden.</td></tr>
 </table></div>
 <p><b>Laat wat ruimte onder de verbindingslimiet van je account.</b> De verbindingen net onder de limiet zetten kost niets: de doorvoer vlakt al ruim voor de laatste een of twee verbindingen af, en <b>Verbindingstuning</b> (<a href="#performance">§13</a>) komt er toch al onder uit. Die vrije plekken zijn wat een tweede apparaat, een ander programma of een nieuwe poging na een verbroken socket er nog door laat, in plaats van geweigerd te worden terwijl deze elke plek bezet houdt.</p>
+<p><b>Je hoeft de limiet op open bestanden van je machine niet te beheren.</b> Het systeem
+telt elke verbinding als een open bestand, en macOS start een programma met een limiet van
+256 daarvan, wat een volledige set verbindingen over meerdere servers kan overschrijden. Op
+macOS en Linux tilt nzbfast die limiet bij het starten zelf op: het vraagt om 65536 open
+bestanden en zakt via 16384, 4096 en 1024 tot het systeem akkoord gaat, nooit boven de
+harde limiet die het systeem stelt, en het gaat verder met de limiet die het had als elke
+stap wordt geweigerd. Windows kent geen limiet van dit soort per proces. Andere programma's
+houden het bij de limiet die de shell ze meegaf, en een programma dat halverwege een taak
+zonder open bestanden komt te zitten kan stoppen zonder in zijn log te zeggen waarom. Stel
+de verbindingen per server dus in op wat je abonnement toestaat, minus de ruimte hierboven,
+en niet op wat je denkt dat de machine aankan.</p>
 <h3 id="passwords">Hoe je providerwachtwoorden worden bewaard</h3>
 <p>Providerwachtwoorden in <code>config.local.json</code> zijn <b>versluierd, niet
 versleuteld</b>. Ze worden opgeslagen als <code>obf1:</code> gevolgd door een
@@ -653,6 +709,7 @@ worden.</p>
 <tr><td>Releasegroep opnemen</td><td>Het label <code>-GROUP</code> aan het eind.</td></tr>
 <tr><td>Junkbestanden verwijderen</td><td><b>Standaard aan.</b> Verwijdert achtergebleven <code>.par2</code>, <code>.nzb</code>, <code>.sfv</code>, <code>.nfo</code> en samplefragmenten uit voltooide film- en seriemappen. Nooit de video of de ondertitels.</td></tr>
 <tr><td>Alleen het mediabestand bewaren</td><td><b>Standaard uit, en destructief:</b> verwijdert permanent alles in de map behalve de video('s) en de ondertitels. Elke aflevering van een seizoenspakket blijft staan. Gaat vóór <b>Junkbestanden verwijderen</b> als beide aan staan.</td></tr>
+<tr><td>Downloads vernoemen naar het .nzb-bestand</td><td><b>Standaard uit.</b> De voltooide map en het hoofdbestand krijgen de naam van het <code>.nzb</code>-bestand, in plaats van de opgeruimde naam die uit de release is afgeleid. Alleen het grootste bestand wordt hernoemd: de rest van een afleveringenpakket, de sample, de ondertitels en de <code>.nfo</code> houden de namen waarmee ze binnenkwamen. Elke categorie kan het voor zichzelf toestaan of verbieden onder <b>Je categorieën</b>, en zo krijg je het voor het ene soort download wel en het andere niet.</td></tr>
 <tr><td>Keep the other words in the name</td><td><b>Standaard aan.</b> Sport, races en andere evenementen zijn vaak één titel die het hele seizoen wordt herhaald, met maar een woord of twee verschil - "Round11 Hungary Race" tegenover "Round11 Hungary Qualifying". Die woorden bewaren is wat voorkomt dat een heel seizoen tot dezelfde naam samenvalt. Geldt alleen waar de naam niet op een andere manier opgeruimd kon worden, dus gewone films en afleveringen blijven ongemoeid.</td></tr>
 </table></div>
 <p class="dim">De hele groep draait na reparatie en uitpakken en vóór <b>Voltooide
@@ -759,6 +816,14 @@ alle andere worden ze bewaard in <code>settings.json</code>.</p>
 kwaliteitsvoorkeuren in, klaar. Nieuwe releases worden opgehaald zodra ze in je
 geïndexeerde groepen verschijnen; versies van betere kwaliteit upgraden eerdere grabs;
 een kalender laat zien wat eraan komt.</p>
+<p>Een <b>lijstbron</b> voedt de watchlist vanuit een lijst die je in Plex bijhoudt, op een van
+twee manieren: koppel je Plex-account door een korte code goed te keuren op de pagina van
+Plex, of plak een Plex-watchlistadres. Het adres is een toegangssleutel - wie het heeft mag de
+lijst lezen - en daarom wordt het na het opslaan gemaskeerd. Het synchroniseren van
+verwijderingen verschilt bewust per modus: een gekoppeld account ziet de hele lijst, dus een
+daar verwijderde titel wordt hier niet langer gevolgd (al voltooide downloads blijven staan);
+een adresfeed bevat alleen de meest recente items, dus afwezigheid bewijst niets en titels
+worden alleen toegevoegd. Beide standaardinstellingen zijn per bron aan te passen.</p>
 <h3 id="auto-rss">RSS-feeds</h3>
 <p>Instellingen → RSS: elke newznab/indexer-RSS-URL met per feed een interval, een
 categorie en filterregels (titelpatronen, grootte-grenzen). Passende items worden
@@ -775,7 +840,64 @@ op tijdstip.</p>
 <h3>Scripts</h3>
 <p>Een nabewerkingsscript krijgt SABnzbd's positionele argumenten en
 <code>SAB_*</code>-omgevingsvariabelen - het grote ecosysteem aan SAB-scripts draait
-ongewijzigd.</p>
+ongewijzigd. NZBGet's dialect wordt ernaast geleverd - <code>NZBPP_*</code>-variabelen
+(<code>DIRECTORY</code>, <code>NZBNAME</code>, <code>CATEGORY</code>,
+<code>TOTALSTATUS</code>, <code>PARSTATUS</code>, <code>UNPACKSTATUS</code>,
+<code>FINALDIR</code>) en de exitcodes 93/94/95 - zodat ook de kernlogica van een
+NZBGet-extensiescript draait. De koppeling is eerlijk in plaats van een emulatie:
+repareren en uitpakken gebeuren binnen de one-pass-download, dus een schone
+voltooiing meldt <code>PARSTATUS=0</code> en een gerepareerde <code>PARSTATUS=2</code>.
+Optievormen per script (<code>NZBPO_*</code>) worden niet geleverd.
+Een script mag bij het afsluiten een helper op de achtergrond laten doorlopen en
+nzbfast zal die niet stoppen, maar nzbfast stopt wel met het lezen van de uitvoer
+van het script op het moment dat het script zelf klaar is: geef een helper op de
+achtergrond zijn eigen uitvoeromleiding, anders wordt hij gestopt zodra hij voor
+het eerst iets probeert te printen.</p>
+<h3>Pre-queue-script</h3>
+<p>Een tweede haak draait <em>voordat</em> een download de wachtrij ingaat
+(Instellingen → Mappen → Pre-queue-script), met SABnzbd's pre-queue-contract:
+argumenten <code>name, pp, category, script, priority, size, group</code> plus de
+<code>SAB_*</code>-omgeving. De eerste regel van zijn uitvoer accepteert
+(<code>1</code>) of weigert (<code>0</code>) de download; regels 2 tot 7 kunnen hem
+hernoemen, <code>pp</code> instellen, de categorie wijzigen, een script kiezen of
+de prioriteit wijzigen (lege regels houden de standaard). Een geweigerde download
+gaat als Mislukt met de reden naar de geschiedenis, en Opnieuw proberen vanuit de
+geschiedenis haalt hem terug zonder het script opnieuw te vragen. De haak kan
+nooit een download kwijtraken: als het script ontbreekt, crasht, zijn tijdsbudget
+overschrijdt of iets print dat geen oordeel is, gaat het toevoegen onaangeroerd
+door en zegt het log waarom.</p>
+<h3>Levenscyclus-events en ondertekende webhooks</h3>
+<p>Elke mijlpaal van een taak is een geversioneerd event: <code>job.added</code>,
+<code>job.started</code>, <code>job.finishing</code>, <code>job.repaired</code>,
+<code>job.completed</code>, <code>job.failed</code>, plus
+<code>queue.idle</code>, <code>giveup.tripped</code>, <code>disk.low</code>,
+<code>storage.slow</code> en <code>quota.reached</code>. Elk draagt
+<code>schema_version</code> (nu 1; nieuwe sleutels kunnen verschijnen zonder
+ophoging - negeer wat je niet kent), een monotone <code>seq</code> en een
+<code>at</code>-tijdstempel in milliseconden.</p>
+<p>Om ze te ontvangen voeg je een <b>webhook</b>-notificatiedoel toe
+(Instellingen → Automatisering) en zet je in het <i>events</i>-veld de
+event-soorten die het moet krijgen - exacte soorten, of een prefix als
+<code>job.*</code>. Het doel krijgt dan één POST per event: de event-JSON als body
+plus een <code>delivery</code>-id (<code>&lt;boot&gt;-&lt;seq&gt;</code>, het
+handvat om op te ontdubbelen), de headers <code>X-NzbFast-Event</code> en
+<code>X-NzbFast-Delivery</code>, en - wanneer het doel een ondertekengeheim
+heeft - <code>X-NzbFast-Signature: sha256=&lt;hex&gt;</code>, een HMAC-SHA256 van
+de exacte body-bytes onder jouw geheim (dezelfde vorm die GitHub-webhooks
+gebruiken). Verifiëren in Python:</p>
+<pre><code>expected = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
+ok = hmac.compare_digest(expected, request.headers["X-NzbFast-Signature"])</code></pre>
+<p>Bezorging is minstens-één-keer: een doel dat niet bereikbaar is wordt opnieuw
+geprobeerd na 10&nbsp;s, 60&nbsp;s en 5&nbsp;min, en daarna losgelaten, met de
+mislukking zichtbaar op de instellingenregel van het doel. Een HTTP-foutantwoord
+(404, 401...) wordt niet opnieuw geprobeerd - repareer de ontvanger en gebruik
+Test. Elk doel heeft zijn eigen bezorgbaan, dus een doel dat traag of onbereikbaar
+is houdt nooit een ander op; binnen een baan houden bezorgingen de volgorde waarin
+de events gebeurden, en wordt er een losgelaten, dan tonen de volgnummers het gat.
+De klassieke event-woorden
+(<code>completed</code>, <code>failed</code>, <code>repaired</code>,
+<code>disk</code>, <code>quota</code>) houden op hetzelfde doel hun betekenis voor
+menselijke notificaties.</p>
 
 <h2 id="arr">11 · Sonarr, Radarr &amp; co</h2>
 <p>nzbfast spreekt de SABnzbd-API native, dus elke *arr werkt out of the box - en hij
@@ -787,6 +909,11 @@ kan ook als hun <em>indexer</em> optreden.</p>
 (waar je hem vindt: <a href="#firstrun-key">§2</a>).</li>
 <li>Categorie naar wens (bijv. <code>tv</code> / <code>movies</code>). Test → groen vinkje → Save.</li>
 </ol>
+<p>Het dashboard reikt je het adres aan: op een installatie die nog niets heeft
+gedownload toont de route "Laat Sonarr, Radarr of een app downloads toevoegen" van
+de welkomstkaart het exacte adres met een <b>Kopiëren</b>-knop ernaast. De
+API-sleutel staat bewust niet op die regel; die blijft achter zijn eigen
+onthulknop in Instellingen → Beveiliging (<a href="#firstrun-key">§2</a>).</p>
 <p>Wachtrij, geschiedenis, status per taak, "verwijderen &amp; wissen", opnieuw
 proberen en categorierouting gedragen zich allemaal zoals de *arrs verwachten.</p>
 <h3>Als indexer (newznab)</h3>
@@ -835,7 +962,18 @@ toegang toont de exacte URL's en een QR-code om te scannen.</p>
 <h3 id="remote-proxy">nzbfast van buitenaf bereiken</h3>
 <p>Er is geen inlogpagina, en dat is een bewuste keuze. Inloggen met een sessiecookie is een beveiligingsoppervlak dat je voor altijd moet onderhouden, en het zou nog steeds het zwakste slot zijn op alles wat aan het open internet hangt. nzbfast authenticeert in plaats daarvan met je API-sleutel, en accepteert die sleutel zowel in een request-header als in de URL (<code>X-Api-Key</code>, of <code>Authorization: Bearer</code>) - en juist dat laat iets ervoor de aanmelding netjes afhandelen.</p>
 <p><b>Het eenvoudigst is om helemaal niets te publiceren.</b> Installeer <b>Tailscale</b> op deze machine en op je telefoon: beide zitten dan in één privénetwerk, er staat niets open, je hoeft niets aan router of certificaat te doen, en Instellingen → Toegang op afstand toont een adres dat overal werkt zodra het Tailscale ziet draaien. Kies dit, tenzij je echt een publiek domein nodig hebt.</p>
-<p><b>Heb je dat wel nodig</b>, zet er dan een reverse proxy voor, geef die het certificaat en laat die de authenticatie doen. Start nzbfast met <code>--bind 127.0.0.1</code> zodat de proxy de enige ingang is, en wijs de proxy naar <code>http://127.0.0.1:6789</code>:</p>
+<p><b>nzbfast kan ook zelf HTTPS serveren.</b> Wijs Instellingen → Beveiliging →
+HTTPS-certificaat / HTTPS-privésleutel naar een PEM-certificaat en zijn sleutel (of
+start met <code>--tls-cert cert.pem --tls-key key.pem</code>), herstart, en het
+dashboard en de API antwoorden op <code>https://</code> in plaats van gewoon
+HTTP - één listener, één schema. Gebruik het certificaat dat je domein al heeft
+(bijvoorbeeld van Let's Encrypt via certbot), of een zelfondertekend exemplaar voor
+het LAN, dat browsers na een eenmalige waarschuwing accepteren. Een kapot of
+verlopen certificaat weigert de start met het bestand erbij genoemd, zodat de fout
+zichtbaar is waar je hem maakte; vernieuwen doe je door de bestanden te vervangen
+en te herstarten. Native HTTPS versleutelt het verkeer maar voegt geen aanmelding
+toe, dus houd de API-sleutel ingesteld.</p>
+<p><b>Heb je een publiek domein nodig</b>, zet er dan een reverse proxy voor, geef die het certificaat en laat die de authenticatie doen. Start nzbfast met <code>--bind 127.0.0.1</code> zodat de proxy de enige ingang is, en wijs de proxy naar <code>http://127.0.0.1:6789</code>:</p>
 <pre><code># Caddy
 example.com {
     reverse_proxy 127.0.0.1:6789
@@ -849,7 +987,11 @@ location / {
     proxy_set_header X-Forwarded-Proto $scheme;
 }</code></pre>
 <p>Leg erbovenop wat je proxy biedt: basic auth, een forward-auth-dienst als Authelia of Authentik, of clientcertificaten. Eén ding verrast iedereen - Sonarr, Radarr en de telefoon-apps kunnen geen browser-login doorlopen, laat ze er dus langs. De meeste proxy's kunnen een verzoek met een geldige <code>X-Api-Key</code>-header doorlaten en de rest om authenticatie vragen.</p>
-<div class="warn-box"><b>Zet poort 6789 niet zomaar open op je router.</b> Het dashboard spreekt gewoon HTTP: je API-sleutel en alles wat je ermee doet zouden leesbaar voor iedereen onderweg over het internet gaan, en een installatie zonder sleutel staat open voor wie hem vindt. Zet je toch een poort open, stel dan eerst een API-sleutel in.</div>
+<div class="warn-box"><b>Zet poort 6789 niet zomaar open op je router.</b>
+Zonder geconfigureerd certificaat spreekt het dashboard gewoon HTTP, dus je
+API-sleutel en alles wat je ermee doet zouden leesbaar voor iedereen onderweg over
+het internet gaan, en een installatie zonder sleutel staat open voor wie hem vindt.
+Zet je toch een poort open, stel dan eerst een API-sleutel in en zet HTTPS aan.</div>
 
 <h2 id="performance">13 · Prestatietools</h2>
 <h3 id="perf-benchmark">Systeembenchmark</h3>

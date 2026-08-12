@@ -37,6 +37,7 @@ mod probe;
 mod query;
 mod schema;
 mod scoreboard;
+mod searchlog;
 mod spots;
 #[cfg(test)]
 mod testutil;
@@ -53,6 +54,7 @@ pub use nzbimport::*;
 pub use pesto::*;
 pub use probe::*;
 pub use scoreboard::*;
+pub use searchlog::*;
 pub use spots::*;
 pub use titles::*;
 

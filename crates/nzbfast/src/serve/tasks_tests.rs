@@ -669,3 +669,133 @@ fn sampler_cap_cooldown_needs_a_slots_full_refusal_or_a_declared_tight_cap() {
     assert!(super::sampler_cap_cooldown(&NntpError::Timeout, &declared).is_none());
     assert!(super::sampler_cap_cooldown(&NntpError::Closed, &declared).is_none());
 }
+
+// ---------------------------------------------------------------------
+// 12. no_enabled_servers (TODO §154)
+// ---------------------------------------------------------------------
+
+/// The runner's "nothing to dial" gate. Its whole job is to be narrower
+/// than "the config did not load": a job held because there is no server
+/// waits and starts itself the moment one is added, while a job whose
+/// config is unreadable must still reach the download and report the
+/// real error rather than sit behind a hold that blames the server list.
+#[test]
+fn no_enabled_servers_is_zero_enabled_and_not_every_config_error() {
+    let dir = tdir("noservers");
+    let write = |name: &str, body: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    };
+
+    // The shape §154 was raised on. `Config::load` reports an EMPTY
+    // list as the NoServers error, not as Ok with an empty vec, so a
+    // guard written as `is_ok_and(|c| c.servers.is_empty())` would read
+    // false here and never fire on the one case that matters.
+    assert!(super::no_enabled_servers(&write(
+        "empty.json",
+        r#"{"servers":[]}"#
+    )));
+
+    // The second shape: servers exist, every one is switched off.
+    assert!(super::no_enabled_servers(&write(
+        "off.json",
+        r#"{"servers":[{"host":"a.example","port":119,"enabled":false},
+                       {"host":"b.example","port":119,"enabled":false}]}"#
+    )));
+
+    // One enabled server is enough - including when others are off.
+    assert!(!super::no_enabled_servers(&write(
+        "one.json",
+        r#"{"servers":[{"host":"a.example","port":119,"enabled":false},
+                       {"host":"b.example","port":119}]}"#
+    )));
+
+    // `enabled` defaults to true, which is what an untouched
+    // hand-written config looks like.
+    assert!(!super::no_enabled_servers(&write(
+        "default.json",
+        r#"{"servers":[{"host":"a.example","port":119}]}"#
+    )));
+
+    // Not our condition: a config that is missing, or that will not
+    // parse. Both stand the guard down so the download runs and says
+    // what is actually wrong.
+    assert!(!super::no_enabled_servers(&dir.join("nothing-here.json")));
+    assert!(!super::no_enabled_servers(&write(
+        "torn.json",
+        r#"{"servers":[{"#
+    )));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The idle trim's log gate (spawn_memory_trim) is a >=64 MB drop of
+/// `nzbkit::mem::dashboard_rss()` across `mi_collect(true)`. On macOS
+/// that meter must be phys_footprint, NOT ps-style RSS: mimalloc
+/// releases pages with MADV_FREE_REUSABLE, which leaves resident_size
+/// pinned but drops the footprint immediately. Pin the whole chain
+/// here - allocate pipeline-sized buffers under mimalloc (the bin's
+/// global allocator, so this lives in the bin test target), free them,
+/// force a collection, and require the meter to see the release at the
+/// production threshold. If someone swaps the meter back to a naive
+/// RSS reading, this fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn trim_meter_sees_madv_free_reusable_release() {
+    // 512 MB of anonymous pages, charged by touching, then offered back
+    // with the same madvise mimalloc's purge uses. The kernel drops
+    // phys_footprint immediately while ps-style resident_size stays
+    // pinned until the pages are repurposed - so this passes with a
+    // footprint meter and fails with an RSS one. Driving the kernel
+    // mechanism directly keeps mimalloc's purge heuristics (which defer
+    // under load) out of the assertion; the mi_collect half of the
+    // chain is exercised by the daemon's idle trim itself.
+    const LEN: usize = 512 << 20;
+    let baseline = nzbkit::mem::dashboard_rss().expect("meter");
+    // SAFETY: anonymous private mapping; on success the kernel hands us
+    // LEN bytes we alone reference, written through valid offsets below,
+    // madvised and unmapped with the same pointer and length.
+    unsafe {
+        let p = libc::mmap(
+            std::ptr::null_mut(),
+            LEN,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+            0,
+        );
+        assert!(p != libc::MAP_FAILED, "mmap failed");
+        let bytes = p.cast::<u8>();
+        for off in (0..LEN).step_by(4096) {
+            bytes.add(off).write(1);
+        }
+        let while_charged = nzbkit::mem::dashboard_rss().expect("meter");
+        let rc = libc::madvise(p, LEN, libc::MADV_FREE_REUSABLE);
+        assert_eq!(rc, 0, "madvise(MADV_FREE_REUSABLE) failed");
+        let after = nzbkit::mem::dashboard_rss().expect("meter");
+        libc::munmap(p, LEN);
+
+        eprintln!(
+            "trim meter: baseline={} MB charged={} MB after={} MB",
+            baseline >> 20,
+            while_charged >> 20,
+            after >> 20
+        );
+        // The meter saw the pages while they were charged...
+        assert!(
+            while_charged.saturating_sub(baseline) >= 400 << 20,
+            "meter never saw the pages: baseline={} MB charged={} MB",
+            baseline >> 20,
+            while_charged >> 20
+        );
+        // ...and saw the release at the trim log's 64 MB gate (it drops
+        // by the whole 512 MB; the gate is what production tests).
+        assert!(
+            while_charged.saturating_sub(after) >= 64 << 20,
+            "trim log gate would not fire: charged={} MB after={} MB",
+            while_charged >> 20,
+            after >> 20
+        );
+    }
+}

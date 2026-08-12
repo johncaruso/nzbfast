@@ -15,6 +15,27 @@
 //! is indistinguishable from an attacker cutting the connection, and the
 //! partial article behind it must never be accepted as complete.
 //!
+//! Intermittently red on `windows-unit` until 11 Aug 2026, and the
+//! diagnosis is worth keeping because the symptom pointed the wrong way.
+//! Two legs parked on a suspiciously round ~30 s and this one overran
+//! `LEG_BUDGET` as a bare WEDGE, which reads like a retry ladder firing
+//! only on Windows. It was not: 30 s is the flat `read_timeout` (see
+//! `pool_cfg` - `adaptive_timeout` is off, so there is no pre-byte
+//! ladder), every 30 s leg carried `stall >= 1` in its `ends` while the
+//! sub-second ones carried `stall: 0`, and the stalled sessions were
+//! ones with NO fault injected - their `peer` counts already matched the
+//! faults the front had delivered. Nothing in the client's pacing can
+//! even reach 30 s here: CONNECT_TIMEOUT is 20 s and the session-backoff
+//! ladder tops out at 25.6 s off this `connect_backoff` before
+//! MAX_SESSION_ATTEMPTS retires the worker.
+//!
+//! The cause was in the rig, in `mock_tls::pump`: `write_all` on a TLS
+//! stream reports plaintext ACCEPTED, not delivered, so a would-block
+//! socket write left the tail of an article queued inside rustls while
+//! the front went back to waiting on the mock. The comment at that flush
+//! carries the detail. A stalled session is now a named failure
+//! (`check_peer_classified`) rather than 30 s of anonymous wall.
+//!
 //! One test in this binary on purpose, like `tests/tls.rs`: the trust
 //! anchors are read from `NZBFAST_EXTRA_CA` exactly once per process,
 //! when the first `ClientConfig` is built, so the process that sets it
@@ -166,6 +187,12 @@ fn pool_cfg(connections: usize) -> PoolConfig {
         // without paying 75 real dials on a platform where a refused
         // connect is slow.
         cap_probe_bounces: 3,
+        // DELIBERATELY `default()` rather than `PoolConfig::shipped()`:
+        // the flat 30 s `read_timeout` is a thing under test here (the
+        // header above spends a paragraph on it), and `shipped()` would
+        // replace it with the adaptive two-phase budget. The other four
+        // shipped knobs are speculation on top of a fleet that is one
+        // faulty server, so they have nothing to add either.
         ..Default::default()
     }
 }
@@ -196,7 +223,7 @@ async fn run_leg(servers: Vec<(ServerConfig, PoolConfig)>, ids: &[String]) -> Re
     let reqs: Vec<ArticleReq> = ids.iter().cloned().map(ArticleReq::fresh).collect();
     let (tx, mut rx) = mpsc::channel(64);
     let t0 = Instant::now();
-    let fetch = tokio::spawn(async move { fetch_all_multi(&servers, reqs, tx).await });
+    let mut fetch = tokio::spawn(async move { fetch_all_multi(&servers, reqs, tx).await });
     let collect = tokio::spawn(async move {
         let (mut done, mut missing, mut failed) = (Vec::new(), Vec::new(), Vec::new());
         while let Some(o) = rx.recv().await {
@@ -208,17 +235,33 @@ async fn run_leg(servers: Vec<(ServerConfig, PoolConfig)>, ids: &[String]) -> Re
         }
         (done, missing, failed)
     });
-    let stats = tokio::time::timeout(LEG_BUDGET, fetch)
-        .await
-        .map_err(|_| format!("WEDGE: no terminal state in {LEG_BUDGET:?}"))?
-        .map_err(|e| format!("fetch task died: {e}"))?;
+    let say_notes = |live: &LiveStats| -> Vec<String> {
+        live.recent_events(64)
+            .into_iter()
+            .map(|e| format!("{} {} {}", e.host, e.kind, e.detail))
+            .collect()
+    };
+    let stats = match tokio::time::timeout(LEG_BUDGET, &mut fetch).await {
+        // A wedge used to report the bound and NOTHING else, so a red CI
+        // run left nobody anything to post-mortem - and the pool's own
+        // event log is the discriminator. `stall` in a leg's `ends` is
+        // one whole flat `read_timeout` (30 s, since `adaptive_timeout`
+        // is off here): a session that went SILENT, not one the peer
+        // closed. Two of those overrun this budget, which is what a
+        // wedge here has actually been. Abort before returning too - a
+        // detached pool would go on dialling through the next shape.
+        Err(_) => {
+            fetch.abort();
+            return Err(format!(
+                "WEDGE: no terminal state in {LEG_BUDGET:?}. The pool said:\n      {}",
+                say_notes(&live).join("\n      ")
+            ));
+        }
+        Ok(r) => r.map_err(|e| format!("fetch task died: {e}"))?,
+    };
     let elapsed = t0.elapsed();
     let (done, missing, failed) = collect.await.map_err(|e| format!("collector died: {e}"))?;
-    let notes = live
-        .recent_events(64)
-        .into_iter()
-        .map(|e| format!("{} {} {}", e.host, e.kind, e.detail))
-        .collect();
+    let notes = say_notes(&live);
     Ok(Leg {
         elapsed,
         done,
@@ -305,6 +348,24 @@ fn check_peer_classified(stats: &PoolStats, what: &str) -> Result<(), String> {
             "{what}: {} session(s) ended as `protocol` - a TLS transport fault \
              must not read as a protocol desync (ends={:?})",
             stats.ends.protocol, stats.ends
+        ));
+    }
+    // `stall` is OUR deadline, not the peer's hangup: one whole flat
+    // `read_timeout` (30 s - `adaptive_timeout` is off in `pool_cfg`)
+    // spent on a session that simply went quiet. Every fault here is
+    // meant to be seen at once, and these legs finish in tenths of a
+    // second when they are, so a stall never means "the fault took a
+    // while to land" - it means bytes were stranded upstream of the
+    // client and nothing but the budget noticed. Pinning it here is
+    // what turns that into a named failure instead of a leg that
+    // silently eats 30 s and eventually overruns LEG_BUDGET as an
+    // anonymous WEDGE, which is how it presented on windows-unit.
+    if stats.ends.stall > 0 {
+        return Err(format!(
+            "{what}: {} session(s) ended as `stall` - a session went silent and \
+             only the read_timeout ended it, so the fault was never delivered \
+             (ends={:?})",
+            stats.ends.stall, stats.ends
         ));
     }
     Ok(())

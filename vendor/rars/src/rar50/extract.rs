@@ -434,13 +434,14 @@ impl FileHeader {
     /// digests come back instead of being checked here.
     ///
     /// A split member's EXPECTED digests live in its LAST fragment's header
-    /// (WinRAR writes a different, running value in every earlier one, and
-    /// the rars writer leaves the earlier ones out entirely - both measured
-    /// on real sets), and the incremental split path does not have that
-    /// header until the decode has already run. So it drives the stream
-    /// from the FIRST fragment's shape - name, dictionary and unpacked size
-    /// all repeat across fragments - passes its own `hash` seed, and
-    /// verifies against the last fragment afterwards.
+    /// (every earlier fragment carries the digest of its own PACKED bytes
+    /// instead - see [`FileHeader::split_fragment_packed_digests`] - and
+    /// the rars writer leaves the earlier ones out entirely), and the
+    /// incremental split path does not have that header until the decode
+    /// has already run. So it drives the stream from the FIRST fragment's
+    /// shape - name, dictionary and unpacked size all repeat across
+    /// fragments - passes its own `hash` seed, and verifies against the
+    /// last fragment afterwards.
     fn stream_packed_digests<R: Read + Send>(
         &self,
         packed: &mut R,
@@ -1355,8 +1356,15 @@ impl<'a> DecoderSession<'a> {
         split: &PendingSplitRefs,
         final_file: &FileHeader,
         decryptor: Option<&SplitDecryptor>,
+        fragment_error: &SharedFragmentError,
     ) -> Result<Vec<u8>> {
-        final_file.decode_split_with_decoder(volumes, split, &mut self.decoder, decryptor)
+        final_file.decode_split_with_decoder(
+            volumes,
+            split,
+            &mut self.decoder,
+            decryptor,
+            fragment_error,
+        )
     }
 }
 
@@ -1915,9 +1923,10 @@ where
     let flat_limit = session.member_flat_limit(&first);
     // Always hash. The expected value is the LAST fragment's, and the
     // fragments do not agree on whether a hash record even EXISTS: the
-    // rars writer puts one only on the finish fragment, WinRAR puts a
-    // different running value on every one. Seeding off the first
-    // fragment would leave a set with nothing to check against. A
+    // rars writer puts one only on the finish fragment, WinRAR stamps
+    // every earlier one with the digest of that fragment's own PACKED
+    // bytes (checked per fragment by the chain below). Seeding off the
+    // first fragment would leave a set with nothing to check against. A
     // malformed record on the first fragment still errors here, exactly
     // as the whole-set walk errors on it.
     let seed = match streaming_hash_verifier(&first)? {
@@ -2029,9 +2038,17 @@ where
                 .files()
                 .nth(finish.1)
                 .ok_or(Error::InvalidHeader("RAR 5 split entry is missing"))?;
+            let fragment_error: SharedFragmentError = Default::default();
             let data = session
-                .decode_split(volumes, &pending, final_file, decryptor.as_ref())
-                .map_err(|error| final_file.entry_error("decoding", error))?;
+                .decode_split(
+                    volumes,
+                    &pending,
+                    final_file,
+                    decryptor.as_ref(),
+                    &fragment_error,
+                )
+                .map_err(|error| final_file.entry_error("decoding", error))
+                .map_err(|error| fragment_error.lock().unwrap().take().unwrap_or(error))?;
             final_file
                 .verify_integrity_with_keys(
                     &data,
@@ -2077,6 +2094,11 @@ struct GrowingChainedReader<'a, P, C> {
     /// the decoder has read.
     frag_start: u64,
     frag_pos: u64,
+    /// Running digests over the fragment the cursor is on, when its own
+    /// header says what its packed bytes must hash to. The decryptor
+    /// wraps OUTSIDE this chain, so these run over the stored bytes -
+    /// exactly what the per-fragment records cover.
+    frag_digest: Option<FragmentDigest>,
     /// The finish fragment (no SPLIT_AFTER) has been appended.
     last_seen: bool,
     /// Fragments already reported wholly consumed.
@@ -2114,6 +2136,7 @@ where
             cursor: None,
             frag_start: 0,
             frag_pos: 0,
+            frag_digest: None,
             last_seen: !first.is_split_after(),
             reported: 0,
             published: false,
@@ -2248,6 +2271,9 @@ where
         let range = file.block.data_range.clone();
         self.frag_start = range.start as u64;
         self.frag_pos = 0;
+        self.frag_digest = file
+            .split_fragment_packed_digests()
+            .map(|expected| FragmentDigest::new(expected, volume_index));
         self.cursor = Some(archive.owned_range_reader(range)?);
         Ok(())
     }
@@ -2276,11 +2302,22 @@ where
                 let read = cursor.read(out)?;
                 if read != 0 {
                     self.frag_pos += read as u64;
+                    if let Some(digest) = self.frag_digest.as_mut() {
+                        digest.update(&out[..read]);
+                    }
                     self.report();
                     return Ok(read);
                 }
                 // Drop the finished fragment BEFORE opening the next one.
                 self.cursor = None;
+                // The fragment is read out; its own header says what its
+                // packed bytes must hash to. Checked BEFORE the volume is
+                // reported consumed - the caller may act on that report.
+                if let Some(digest) = self.frag_digest.take() {
+                    if let Err(error) = digest.verify() {
+                        return Err(self.fail(error));
+                    }
+                }
                 if self.last_seen && self.at + 1 == self.pending.fragments.len() {
                     self.report();
                     return Ok(0);
@@ -3339,13 +3376,28 @@ impl PendingSplitRefs {
             is_directory: false,
         };
         let mut writer = open(&meta)?;
+        // A fragment digest mismatch reaches the decode paths below as the
+        // io error the chain stopped on; the typed error it wraps names
+        // the bad volume and is the one to report - bare, exactly as the
+        // incremental path reports it through `take_error`.
+        let fragment_error: SharedFragmentError = Default::default();
+        let recover_fragment_error =
+            |error: Error| fragment_error.lock().unwrap().take().unwrap_or(error);
         if final_file.is_stored() {
             // A stored split streams its fragments forward exactly once
             // (no retry path exists), so the consumption watermark is
             // safe unconditionally.
             return self
-                .write_stored_to(volumes, final_file, decryptor.as_ref(), &mut writer, spent)
-                .map_err(|error| final_file.entry_error("extracting", error));
+                .write_stored_to(
+                    volumes,
+                    final_file,
+                    decryptor.as_ref(),
+                    &mut writer,
+                    spent,
+                    &fragment_error,
+                )
+                .map_err(|error| final_file.entry_error("extracting", error))
+                .map_err(recover_fragment_error);
         }
 
         // Stream large split members through the same pipelined decoder as
@@ -3371,7 +3423,7 @@ impl PendingSplitRefs {
                 None
             };
             let mut reader = self
-                .fragment_reader(volumes, decryptor.as_ref(), watermark)
+                .fragment_reader(volumes, decryptor.as_ref(), watermark, &fragment_error)
                 .map_err(|error| final_file.entry_error("reading", error))?;
             let mut counting = CountingWriter {
                 inner: &mut *writer,
@@ -3417,13 +3469,24 @@ impl PendingSplitRefs {
                         session.decoder = session.fresh_decoder();
                     }
                 }
-                Err(error) => return Err(final_file.entry_error("decoding", error)),
+                Err(error) => {
+                    return Err(recover_fragment_error(
+                        final_file.entry_error("decoding", error),
+                    ))
+                }
             }
         }
 
         let data = session
-            .decode_split(volumes, &self, final_file, decryptor.as_ref())
-            .map_err(|error| final_file.entry_error("decoding", error))?;
+            .decode_split(
+                volumes,
+                &self,
+                final_file,
+                decryptor.as_ref(),
+                &fragment_error,
+            )
+            .map_err(|error| final_file.entry_error("decoding", error))
+            .map_err(recover_fragment_error)?;
         final_file
             .verify_integrity_with_keys(&data, decryptor.as_ref().map(|decryptor| &decryptor.keys))
             .map_err(|error| final_file.entry_error("verifying", error))?;
@@ -3441,11 +3504,12 @@ impl PendingSplitRefs {
         decryptor: Option<&SplitDecryptor>,
         writer: &mut dyn Write,
         spent: Option<&mut (dyn FnMut(usize) + Send)>,
+        fragment_error: &SharedFragmentError,
     ) -> Result<()> {
         let spent = spent.map(|f| {
             Box::new(move |volume: usize| f(volume)) as Box<dyn FnMut(usize) + Send + '_>
         });
-        let mut reader = self.fragment_reader(volumes, decryptor, spent)?;
+        let mut reader = self.fragment_reader(volumes, decryptor, spent, fragment_error)?;
         let crc = Crc32::new();
         let hash = streaming_hash_verifier(final_file)?;
         let mut written = 0u64;
@@ -3539,6 +3603,7 @@ impl PendingSplitRefs {
         volumes: &'r [Archive],
         decryptor: Option<&SplitDecryptor>,
         spent: Option<Box<dyn FnMut(usize) + Send + 'r>>,
+        fragment_error: &SharedFragmentError,
     ) -> Result<Box<dyn Read + Send + 'r>> {
         // Fragment METADATA validates eagerly (a missing volume or entry
         // still surfaces before any output is written), but at most ONE
@@ -3546,7 +3611,9 @@ impl PendingSplitRefs {
         // descriptor, and opening every fragment up front exhausted the
         // default 256-descriptor limit on real p99 sets (500-1,200
         // volumes). The single decrypting reader stays OUTSIDE the lazy
-        // sequence so CBC state runs unbroken across fragment seams.
+        // sequence so CBC state runs unbroken across fragment seams -
+        // which also means the chain digests each fragment's STORED
+        // bytes, exactly what the per-fragment records cover.
         let mut fragments = Vec::with_capacity(self.fragments.len());
         for &(volume_index, file_index) in &self.fragments {
             let archive = volumes
@@ -3556,13 +3623,20 @@ impl PendingSplitRefs {
                 .files()
                 .nth(file_index)
                 .ok_or(Error::InvalidHeader("RAR 5 split entry is missing"))?;
-            fragments.push((volume_index, file.block.data_range.clone()));
+            fragments.push((
+                volume_index,
+                file.block.data_range.clone(),
+                file.split_fragment_packed_digests(),
+            ));
         }
         let chained = LazyChainedReader {
             volumes,
             fragments,
             next: 0,
             current: None,
+            digest: None,
+            fragment_error: std::sync::Arc::clone(fragment_error),
+            failed: false,
             spent,
         };
         if let Some(decryptor) = decryptor {
@@ -3577,6 +3651,114 @@ impl PendingSplitRefs {
     }
 }
 
+/// The digests a non-final split fragment's PACKED bytes must produce,
+/// when its own header carries them - see
+/// [`FileHeader::split_fragment_packed_digests`].
+#[derive(Clone, Copy)]
+struct SplitFragmentDigests {
+    crc32: Option<u32>,
+    blake2: Option<[u8; 32]>,
+}
+
+impl FileHeader {
+    /// The digests this fragment's PACKED bytes must produce, when the
+    /// header carries them. WinRAR stamps every NON-final fragment of a
+    /// split member with the digest of that fragment's stored bytes -
+    /// CRC32 and/or BLAKE2sp, whichever the set uses; the raw CIPHERTEXT
+    /// for encrypted members, and never MAC-keyed (the encryption
+    /// record's 0x0002 flag is per fragment and WinRAR sets it only on
+    /// the final one) - while the FINAL fragment carries the whole
+    /// member's unpacked digests. unrar checks it at every volume
+    /// boundary (UIERROR_CHECKSUMPACKED), which is what localizes damage
+    /// to one volume instead of failing the member at its end; both
+    /// split walks do the same. Measured on the WinRAR 7.21 rar50
+    /// multivolume fixtures (plain, solid, encrypted, .rev) and rar
+    /// 7.23-written sets in both digest flavors, plain, -p and -hp. The
+    /// rars writer stamps no records on non-final fragments, so its sets
+    /// simply have nothing to check before the finish.
+    ///
+    /// A ciphertext digest is checkable without the password, and a
+    /// mismatch proves on-disk damage - never a wrong-password symptom.
+    fn split_fragment_packed_digests(&self) -> Option<SplitFragmentDigests> {
+        if !self.is_split_after() || self.uses_hash_mac() {
+            return None;
+        }
+        let blake2 = self.hash.as_ref().and_then(|hash| {
+            (hash.hash_type == 0 && hash.data.len() == 32).then(|| {
+                let mut expected = [0u8; 32];
+                expected.copy_from_slice(&hash.data);
+                expected
+            })
+        });
+        if self.data_crc32.is_none() && blake2.is_none() {
+            return None;
+        }
+        Some(SplitFragmentDigests {
+            crc32: self.data_crc32,
+            blake2,
+        })
+    }
+}
+
+/// Running digests over one fragment's packed bytes, verified when the
+/// fragment reads out. This is what fails a damaged set at the first bad
+/// volume, naming it, instead of decoding the whole member and failing
+/// on the final unpacked digest.
+struct FragmentDigest {
+    expected: SplitFragmentDigests,
+    crc: Crc32,
+    hasher: Option<blake2sp::Hasher>,
+    volume: usize,
+}
+
+impl FragmentDigest {
+    fn new(expected: SplitFragmentDigests, volume: usize) -> Self {
+        Self {
+            expected,
+            crc: Crc32::new(),
+            hasher: expected.blake2.is_some().then(blake2sp::Hasher::new),
+            volume,
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        if self.expected.crc32.is_some() {
+            self.crc.update(data);
+        }
+        if let Some(hasher) = self.hasher.as_mut() {
+            hasher.update(data);
+        }
+    }
+
+    fn verify(self) -> Result<()> {
+        if let Some(expected) = self.expected.crc32 {
+            let actual = self.crc.finish();
+            if actual != expected {
+                return Err(Error::SplitFragmentCrc32Mismatch {
+                    volume: self.volume,
+                    expected,
+                    actual,
+                });
+            }
+        }
+        if let (Some(expected), Some(hasher)) = (self.expected.blake2, self.hasher) {
+            if !constant_time_eq(&expected, &hasher.finalize()) {
+                return Err(Error::SplitFragmentHashMismatch {
+                    volume: self.volume,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The typed error behind the io error [`LazyChainedReader`] hands the
+/// decoder on a fragment digest mismatch - `Read::read` has no other
+/// channel, and the whole-set walk recovers it after the decode stops
+/// (the incremental path has [`GrowingChainedReader::take_error`] for
+/// the same job).
+type SharedFragmentError = std::sync::Arc<std::sync::Mutex<Option<Error>>>;
+
 /// Sequential reader over a split entry's fragments that opens each
 /// fragment only when the previous one is exhausted, and drops it before
 /// opening the next - one descriptor in flight regardless of volume
@@ -3584,10 +3766,21 @@ impl PendingSplitRefs {
 /// ordinary read error.
 struct LazyChainedReader<'a> {
     volumes: &'a [Archive],
-    /// (volume index, data range), validated at construction.
-    fragments: Vec<(usize, std::ops::Range<usize>)>,
+    /// (volume index, data range, expected packed digests), validated at
+    /// construction.
+    fragments: Vec<(usize, std::ops::Range<usize>, Option<SplitFragmentDigests>)>,
     next: usize,
     current: Option<Box<dyn Read + Send + 'a>>,
+    /// Running digests over the fragment `current` reads, when its own
+    /// header says what its packed bytes must hash to. The chain sits
+    /// INSIDE any decryptor, so these run over the stored bytes.
+    digest: Option<FragmentDigest>,
+    /// Typed-error channel to the walk holding the other end.
+    fragment_error: SharedFragmentError,
+    /// Keep failing on any read after a mismatch: a caller that
+    /// swallowed the first error must not see a clean EOF, advance the
+    /// chain and finish the member as if the fragment were sound.
+    failed: bool,
     /// Fires with the volume index of each fragment read to its end -
     /// except the LAST fragment, whose volume carries the members after
     /// the split one and stays live. A middle fragment is the only file
@@ -3602,6 +3795,11 @@ struct LazyChainedReader<'a> {
 
 impl Read for LazyChainedReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.failed {
+            return Err(std::io::Error::other(
+                "RAR 5 split fragment packed data digest mismatch",
+            ));
+        }
         // An empty read must not look like fragment EOF: it would advance
         // the chain past unread bytes - and, with the watermark armed,
         // report a volume spent that is still needed.
@@ -3612,9 +3810,23 @@ impl Read for LazyChainedReader<'_> {
             if let Some(reader) = self.current.as_mut() {
                 let read = reader.read(out)?;
                 if read != 0 {
+                    if let Some(digest) = self.digest.as_mut() {
+                        digest.update(&out[..read]);
+                    }
                     return Ok(read);
                 }
                 self.current = None;
+                // The fragment is read out; its own header says what its
+                // packed bytes must hash to. Checked BEFORE the volume is
+                // reported spent - the caller may act on that report.
+                if let Some(digest) = self.digest.take() {
+                    if let Err(error) = digest.verify() {
+                        self.failed = true;
+                        let message = error.to_string();
+                        *self.fragment_error.lock().unwrap() = Some(error);
+                        return Err(std::io::Error::other(message));
+                    }
+                }
                 // The fragment just exhausted is `next - 1`; report its
                 // volume unless it is the chain's last.
                 if self.next < self.fragments.len() {
@@ -3623,10 +3835,11 @@ impl Read for LazyChainedReader<'_> {
                     }
                 }
             }
-            let Some((volume_index, range)) = self.fragments.get(self.next) else {
+            let Some((volume_index, range, expected)) = self.fragments.get(self.next) else {
                 return Ok(0);
             };
             self.next += 1;
+            self.digest = (*expected).map(|expected| FragmentDigest::new(expected, *volume_index));
             let reader = self.volumes[*volume_index]
                 .range_reader(range.clone())
                 .map_err(std::io::Error::other)?;
@@ -3680,10 +3893,11 @@ impl FileHeader {
         split: &PendingSplitRefs,
         decoder: &mut Unpack50Decoder,
         decryptor: Option<&SplitDecryptor>,
+        fragment_error: &SharedFragmentError,
     ) -> Result<Vec<u8>> {
         if self.is_stored() {
             let mut data = Vec::new();
-            let mut reader = split.fragment_reader(volumes, decryptor, None)?;
+            let mut reader = split.fragment_reader(volumes, decryptor, None, fragment_error)?;
             reader.read_to_end(&mut data)?;
             if data.len() as u64 != self.unpacked_size {
                 return Err(Error::InvalidHeader(
@@ -3697,7 +3911,7 @@ impl FileHeader {
         let dictionary_size = usize::try_from(info.dictionary_size).map_err(|_| {
             Error::InvalidHeader("RAR 5 dictionary size overflows host address size")
         })?;
-        let mut reader = split.fragment_reader(volumes, decryptor, None)?;
+        let mut reader = split.fragment_reader(volumes, decryptor, None, fragment_error)?;
         let output_size = checked_unpacked_size(self.unpacked_size)?;
         decoder
             .decode_member_from_reader_with_dictionary(
@@ -3843,6 +4057,57 @@ mod tests {
             encryption: None,
             crypto: None,
         }
+    }
+
+    /// The per-fragment packed digest gate: NON-final fragments only,
+    /// never when the record is MAC-keyed, and only records that are
+    /// actually present and well formed.
+    #[test]
+    fn split_fragment_packed_digests_apply_to_nonfinal_unkeyed_fragments_only() {
+        let hash = FileHash {
+            hash_type: 0,
+            data: vec![0xab; 32],
+        };
+        let mut middle = plain_file(b"a.bin", b"data", Some(hash));
+        middle.block.flags = HFL_SPLIT_BEFORE | HFL_SPLIT_AFTER;
+        middle.data_crc32 = Some(0x1234_5678);
+        let digests = middle
+            .split_fragment_packed_digests()
+            .expect("middle fragment carries digests");
+        assert_eq!(digests.crc32, Some(0x1234_5678));
+        assert_eq!(digests.blake2, Some([0xab; 32]));
+
+        let mut last = middle.clone();
+        last.block.flags = HFL_SPLIT_BEFORE;
+        assert!(last.split_fragment_packed_digests().is_none());
+
+        // The 0x0002 encryption flag keys the digests; WinRAR sets it only
+        // on final fragments, and a keyed record is not checkable here.
+        let mut keyed = middle.clone();
+        keyed.encryption = Some(FileEncryption {
+            version: 0,
+            flags: 0x0002,
+            kdf_count: 15,
+            salt: [0; 16],
+            iv: [0; 16],
+            check_value: None,
+        });
+        assert!(keyed.split_fragment_packed_digests().is_none());
+
+        let mut unstamped = middle.clone();
+        unstamped.data_crc32 = None;
+        unstamped.hash = None;
+        assert!(unstamped.split_fragment_packed_digests().is_none());
+
+        // A malformed hash record length never becomes a check; the
+        // final-fragment verify paths are the ones that error on it.
+        let mut short_hash = middle.clone();
+        short_hash.data_crc32 = None;
+        short_hash.hash = Some(FileHash {
+            hash_type: 0,
+            data: vec![0xab; 16],
+        });
+        assert!(short_hash.split_fragment_packed_digests().is_none());
     }
 
     #[test]
@@ -4039,7 +4304,7 @@ mod tests {
             let (pending, final_file, volumes) =
                 two_fragment_split(&payload, false, payload.len() as u64, None);
             let outcome = pending
-                .write_stored_to(&volumes, &final_file, None, &mut FailingWriter, None)
+                .write_stored_to(&volumes, &final_file, None, &mut FailingWriter, None, &Default::default())
                 .map_err(|error| error.to_string());
             let _ = done_tx.send(outcome);
         });
@@ -4102,7 +4367,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         pending
-            .write_stored_to(&volumes, &final_file, None, &mut out, None)
+            .write_stored_to(&volumes, &final_file, None, &mut out, None, &Default::default())
             .expect("non-zero AES padding must extract");
         assert_eq!(out, expected);
     }
@@ -4118,7 +4383,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let err = pending
-            .write_stored_to(&volumes, &final_file, None, &mut out, None)
+            .write_stored_to(&volumes, &final_file, None, &mut out, None, &Default::default())
             .unwrap_err();
         assert!(
             matches!(err, Error::InvalidHeader(msg) if msg.contains("one block of padding")),
@@ -4141,7 +4406,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         pending
-            .write_stored_to(&volumes, &final_file, None, &mut out, None)
+            .write_stored_to(&volumes, &final_file, None, &mut out, None, &Default::default())
             .unwrap();
         assert_eq!(out, &padded[..logical]);
     }
@@ -4564,6 +4829,16 @@ mod tests {
     }
 
     fn stored_split_archive(data: &[u8], full: &[u8], crc: u32, flags: u64) -> Archive {
+        // Real archivers stamp NON-final fragments with the digests of
+        // that fragment's own packed bytes (see
+        // split_fragment_packed_digests); only the final fragment carries
+        // the whole member's unpacked digests, and the chain now rejects
+        // a fragment whose packed bytes miss its own record.
+        let (crc, hash) = if flags & HFL_SPLIT_AFTER != 0 {
+            (crc32(data), blake2sp::hash(data))
+        } else {
+            (crc, blake2sp::hash(full))
+        };
         let source: Arc<[u8]> = Arc::from(data.to_vec().into_boxed_slice());
         Archive {
             sfx_offset: 0,
@@ -4585,7 +4860,7 @@ mod tests {
                 name: b"split.txt".to_vec(),
                 hash: Some(FileHash {
                     hash_type: 0,
-                    data: blake2sp::hash(full).to_vec(),
+                    data: hash.to_vec(),
                 }),
                 redirection: None,
                 service_data: None,
@@ -4980,7 +5255,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let err = pending
-            .write_stored_to(&volumes, &final_file, None, &mut out, None)
+            .write_stored_to(&volumes, &final_file, None, &mut out, None, &Default::default())
             .unwrap_err();
         assert!(
             matches!(err, Error::InvalidHeader(msg) if msg.contains("mismatched packed and unpacked")),
@@ -4991,7 +5266,11 @@ mod tests {
     #[test]
     fn pending_split_refs_write_stored_to_rejects_crc_mismatch_on_unencrypted() {
         let payload: &[u8] = b"crc-mismatch payload";
-        let mut first = split_fragment_file(b"a.txt", HFL_SPLIT_AFTER);
+        // The FINAL fragment: its records are the whole member's unpacked
+        // digests, which is the check this test exercises. A SPLIT_AFTER
+        // fragment's records would be per-fragment packed digests and hit
+        // the volume-boundary check instead.
+        let mut first = split_fragment_file(b"a.txt", HFL_SPLIT_BEFORE);
         first.block.data_range = 0..payload.len();
         first.block.data_size = Some(payload.len() as u64);
         first.unpacked_size = payload.len() as u64;
@@ -5005,7 +5284,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let err = pending
-            .write_stored_to(&volumes, &final_file, None, &mut out, None)
+            .write_stored_to(&volumes, &final_file, None, &mut out, None, &Default::default())
             .unwrap_err();
         assert!(
             matches!(err, Error::Crc32Mismatch { .. }),
@@ -5019,7 +5298,8 @@ mod tests {
         let mut wrong_hash = blake2sp::hash(payload);
         wrong_hash[0] ^= 0xff;
 
-        let mut first = split_fragment_file(b"a.txt", HFL_SPLIT_AFTER);
+        // The FINAL fragment, for the same reason as the CRC twin above.
+        let mut first = split_fragment_file(b"a.txt", HFL_SPLIT_BEFORE);
         first.block.data_range = 0..payload.len();
         first.block.data_size = Some(payload.len() as u64);
         first.unpacked_size = payload.len() as u64;
@@ -5037,7 +5317,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let err = pending
-            .write_stored_to(&volumes, &final_file, None, &mut out, None)
+            .write_stored_to(&volumes, &final_file, None, &mut out, None, &Default::default())
             .unwrap_err();
         assert!(
             matches!(err, Error::HashMismatch { hash_type: 0 }),

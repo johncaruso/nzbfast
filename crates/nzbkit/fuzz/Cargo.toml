@@ -90,6 +90,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "remux"
+path = "fuzz_targets/remux.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "zip_parse"
 path = "fuzz_targets/zip_parse.rs"
 test = false

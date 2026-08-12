@@ -113,6 +113,7 @@ pub(super) fn apply_setting_tail(
         "scoreboard_enabled" => set_scoreboard_enabled(d, name, v)?,
         "scoreboard_url" => set_scoreboard_url(d, name, v)?,
         "scoreboard_source" => set_scoreboard_source(d, name, v)?,
+        "scoreboard_cats" => set_scoreboard_cats(d, name, v)?,
         "scoreboard_calibrate" => {
             let on = v == "1" || v.eq_ignore_ascii_case("true");
             d.scoreboard_calibrate.store(on, Ordering::Relaxed);
@@ -221,6 +222,7 @@ pub(super) fn apply_setting_tail(
         }
         "feeds" => set_feeds(d, name, v)?,
         "indexers" => set_indexers(d, name, v)?,
+        "list_sources" => set_list_sources(d, name, v)?,
         "watchlist_external" => set_watchlist_external(d, name, v)?,
         "watchlist_instant" => set_watchlist_instant(d, name, v)?,
         "watchlist_instant_max" => set_watchlist_instant_max(d, name, v)?,
@@ -235,6 +237,7 @@ pub(super) fn apply_setting_tail(
         "password_file" => set_password_file(d, name, v)?,
         "password_prompt" => set_password_prompt(d, name, v)?,
         "unpack_eat_volumes" => set_unpack_eat_volumes(d, name, v)?,
+        "preview" => set_preview(d, name, v)?,
         "par_cleanup" => {
             let on = flag();
             d.par_cleanup.store(on, Ordering::Relaxed);

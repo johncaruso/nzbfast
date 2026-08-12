@@ -46,11 +46,15 @@ use std::time::{Duration, Instant};
 const SEG: usize = 20_000;
 
 fn corpus(total_bytes: usize) -> (HashMap<String, Vec<u8>>, Vec<ArticleReq>) {
+    corpus_seg(total_bytes, SEG)
+}
+
+fn corpus_seg(total_bytes: usize, seg: usize) -> (HashMap<String, Vec<u8>>, Vec<ArticleReq>) {
     let data: Vec<u8> = (0..total_bytes as u32)
         .map(|i| (i * 17 % 253) as u8)
         .collect();
     let mut articles = HashMap::new();
-    let segs = make_file_articles("live.bin", &data, SEG, "lt", &mut articles);
+    let segs = make_file_articles("live.bin", &data, seg, "lt", &mut articles);
     let ids = segs
         .iter()
         .map(|(id, _, _)| ArticleReq::fresh(format!("<{id}>")))
@@ -93,11 +97,26 @@ async fn leg(
     let mut sc: ServerConfig = srv.server_config();
     sc.connections = spawn as u32;
     let target = ConnTarget::new(start);
+    // `shipped()`, not `default()`: the tuner never runs alone in the
+    // product - it reads a rate that the racing knobs are also spending,
+    // and a dup racing a straggler is bytes the controller then sees as
+    // capacity. A/B'd on rigs 1a and 3 before the switch (11 Aug 2026):
+    // both cleared their bands either way, and the shipped arm landed
+    // marginally closer to the knee of 12 (target 11 in 58.6 s against
+    // 10 in 63.1 s) - inside the noise of a contended box, so read it as
+    // "the controller is not fooled by dup spend", not as a payout.
+    // Rigs 2 and 4-6 were re-run under the shipped posture and hold.
+    //
+    // Run these ONE AT A TIME. Four of them at once on a 20-core box
+    // failed rig 2 outright (target stuck at 7, needs 10) - four mock
+    // lines competing for real CPU means the re-provisioned capacity is
+    // not there to be found, and the controller is right not to chase
+    // it. That is a rig artefact and it looks exactly like a regression.
     let cfg = PoolConfig {
         connections: spawn,
         ramp_delay: Duration::ZERO,
         live_target: Some(target.clone()),
-        ..Default::default()
+        ..PoolConfig::shipped()
     };
     let servers = vec![(sc, cfg)];
     let live = LiveStats::for_servers(&servers);
@@ -159,13 +178,22 @@ async fn leg(
         // left to keep the fleet busy for a whole epoch.
         let busy = total - n > target.get() * 8;
         let scan_active = scan.as_ref().is_some_and(|s| s.load(Ordering::Relaxed));
-        let fleet_met = connected >= target.get().min(tuner.desired());
+        // Band, like the daemon glue: an epoch whose fleet ended above
+        // its rung is still draining a down-step - its bytes belong to
+        // a bigger fleet and must not judge the rung (rig 7's lesson).
+        let fm_tgt = target.get();
+        let fleet_met = connected >= fm_tgt && connected <= fm_tgt + (fm_tgt / 32).max(2);
         let obs = EpochObs {
             rate_bps: rate,
             busy,
             rate_limited: scan_active,
             capacity_pressure: false,
             fleet_met,
+            // Single-server rigs: no share race to synchronize against
+            // and no shared-link anchor - gate every epoch, never
+            // saturated, which is exactly the pre-metronome cadence.
+            cycle_gate: true,
+            line_saturated: false,
         };
         samples.push((rate, connected, busy && !scan_active && fleet_met));
         if tuned {
@@ -337,6 +365,68 @@ async fn rig3_a_flat_healthy_line_holds_steady() {
             tuned.targets_seen
         );
     }
+}
+
+/// Rig 7: the surplus-trim rig, the 10 Aug five-client re-cut in
+/// miniature (BENCHMARKS 2026-08-10: 360 sockets vs 40 ran the same
+/// wall on apollo13, at a ~50% cpu_s premium). Knee 20 (line 600 KB/s
+/// / 30 KB/s per conn), fleet PINNED at 100 for the baseline and
+/// started at 100 for the tuned leg. The claims:
+///
+/// - the controller sheds the ~80 surplus sockets within the run
+///   (geometric walk - a +/-1 walk could not cross 80 sockets in any
+///   corpus this suite could afford),
+/// - the wall pays nothing for the trim (the sockets were surplus:
+///   equal wall IS the evidence they bought nothing),
+/// - the trim never dips below the knee band (the giganews guard: a
+///   fleet whose sockets all carry rate must keep them).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-clock live-tuner rig (~5 min) - run with --ignored"]
+async fn rig7_a_surplus_fleet_is_trimmed_at_no_wall_cost() {
+    // Small articles: a parked slot only frees after finishing its
+    // article, and in the SURPLUS regime each of 100 sockets carries
+    // line/100 = 6 KB/s, so a 20 KB article pins the park wave for
+    // ~3 s. Production articles drain in ~0.2 s at real line rates; a
+    // 4 KB article keeps the same ratio to a 2.5 s epoch here. At 20 KB
+    // no down-step of any size could settle inside the epoch and the
+    // fleet_met band (correctly) aborted every trim cycle.
+    let (articles, ids) = corpus_seg(140_000_000, 4_000);
+    let srv = MockServer::start(articles, throttled(30_000, 600_000)).await;
+    let epoch = Duration::from_millis(2500);
+    let base = leg(&srv, ids.clone(), 100, 100, false, epoch, vec![], None).await;
+    let tuned = leg(&srv, ids, 100, 100, true, epoch, vec![], None).await;
+    eprintln!(
+        "RIG7 base {:?} tuned {:?} final target {} path {:?}",
+        base.wall, tuned.wall, tuned.final_target, tuned.targets_seen
+    );
+    assert!(
+        tuned.final_target <= 32,
+        "kept {} sockets against a knee of 20 - the surplus was not trimmed (path {:?})",
+        tuned.final_target,
+        tuned.targets_seen
+    );
+    assert!(
+        tuned.final_target >= 17,
+        "trimmed past the knee of 20: {} (path {:?})",
+        tuned.final_target,
+        tuned.targets_seen
+    );
+    // Never below the knee band at ANY sampled epoch: a trim verdict
+    // that costs rate must fail, so the walk may touch the knee but
+    // must not cut into it.
+    for (i, t) in tuned.targets_seen.iter().enumerate() {
+        assert!(
+            *t >= 16,
+            "epoch {i}: the kept target cut below the knee to {t} (path {:?})",
+            tuned.targets_seen
+        );
+    }
+    assert!(
+        tuned.wall.as_secs_f64() < base.wall.as_secs_f64() * 1.15,
+        "the trim cost wall time: tuned {:?} vs base {:?}",
+        tuned.wall,
+        base.wall
+    );
 }
 
 /// Feed one leg's measured epochs to the decay detector as a single

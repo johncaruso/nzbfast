@@ -659,10 +659,13 @@ impl Extractor {
             .collect()
     }
 
-    /// Path of the slot's on-disk file (plain/materialized), if any.
+    /// Path of the slot's on-disk file (plain/materialized), if any -
+    /// the file's CURRENT location, tracking any verified-name publish
+    /// (see [`note_slot_renamed`](Self::note_slot_renamed)), since every
+    /// caller uses this to find the file on disk.
     pub fn slot_path(&self, slot: usize) -> Option<PathBuf> {
         let inner = self.inner.lock_ok();
-        inner.slots[slot].writer.as_ref().map(|w| w.path.clone())
+        inner.slots[slot].writer.as_ref().map(|w| w.current_path())
     }
 
     /// Bytes of the slot's declared file range that were never written.
@@ -900,6 +903,18 @@ impl Extractor {
             // fallen back to materialize+unrar by the time PAR2 renames it),
             // but the cache is only safe if every mutator invalidates.
             inner.slots[slot].sort_key = None;
+        }
+    }
+
+    /// The on-disk file behind `slot` was renamed (verified-name publish);
+    /// keep its writer's by-path reopen in step - see
+    /// [`FileWriter::note_renamed`](crate::disk::FileWriter::note_renamed).
+    /// No-op for writerless slots: those go through [`rename`](Self::rename),
+    /// which retargets the name BEFORE any writer is created.
+    pub fn note_slot_renamed(&self, slot: usize, new_path: std::path::PathBuf) {
+        let w = self.inner.lock_ok().slots[slot].writer.clone();
+        if let Some(w) = w {
+            w.note_renamed(new_path);
         }
     }
 

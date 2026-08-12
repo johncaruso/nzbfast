@@ -1385,8 +1385,8 @@ pub fn pick_set(inputs: &[&[u8]]) -> Result<Par2Set, Par2Error> {
 /// Files/blocks needed for repair planning, computed from slot reports.
 #[derive(Debug, Default)]
 pub struct DamageSummary {
-    pub bad_blocks: usize,
-    pub damaged_files: Vec<String>,
+    pub(crate) bad_blocks: usize,
+    pub(crate) damaged_files: Vec<String>,
 }
 
 pub fn summarize_damage<'a>(reports: impl Iterator<Item = &'a SlotReport>) -> DamageSummary {

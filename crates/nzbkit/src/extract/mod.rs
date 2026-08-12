@@ -395,8 +395,8 @@ pub struct ExtractReport {
 /// plain files, translated for direct-extracted inner files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frag {
-    pub file: String,
-    pub file_off: u64,
+    pub(crate) file: String,
+    pub(crate) file_off: u64,
     pub vol_off: u64,
     pub len: u64,
 }
@@ -1003,6 +1003,13 @@ struct Inner {
     /// extractor. Chain-wide totals come from
     /// [`Extractor::chase_trimmed_bytes`].
     chase_trimmed: u64,
+    /// True once the caller reported an article with a TERMINAL verdict
+    /// (430 everywhere, out of retention, transport dead) - the job can
+    /// no longer complete from the wire alone. Sticky, and SHARED down
+    /// the child chain like the budget: a chase wedged on such a gap
+    /// holds bytes nothing will decode, and this flag is what arms
+    /// their proactive spill ([`Extractor::page_stalled_chase`]).
+    lost_articles: Arc<AtomicBool>,
     /// Live split-7z sets, keyed by `sevenz_part_name` base, so a
     /// `.7z.002` classifying later can find the container `.7z.001`
     /// opened and join it. Cleared as each set settles. Zip splits
@@ -1268,6 +1275,7 @@ impl Extractor {
                 sevenz_trim_on: !sevenz_trim_env_off(),
                 rar_trim_on: !rar_trim_env_off(),
                 chase_trimmed: 0,
+                lost_articles: Arc::new(AtomicBool::new(false)),
                 sevenz_sets: HashMap::new(),
                 zip_split_decl: HashMap::new(),
                 nested_max_depth: nested_max_depth.max(1),
@@ -1454,6 +1462,11 @@ impl Extractor {
                 // E/K/T records drain through the root exactly like its
                 // placements fold into the root's frags.
                 ci.crypto_events = inner.crypto_events.clone();
+                // One terminal-verdict flag per chain: a nested chase
+                // (the common shape - the chase lives in the child) arms
+                // its stalled-frontier spill off the same report the
+                // root received.
+                ci.lost_articles = inner.lost_articles.clone();
             }
             inner.child = Some(child);
         }

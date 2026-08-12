@@ -2698,6 +2698,106 @@ mod tests {
         }
     }
 
+    /// Rewrites a volume's split fragment header so its packed-data CRC
+    /// field lies, restamping the header CRC so the volume still parses -
+    /// the shape of one damaged volume in an otherwise sound set. The
+    /// packed bytes themselves stay intact, so nothing but the
+    /// per-fragment check can notice.
+    fn corrupt_rar15_40_fragment_crc(volume: &mut [u8]) {
+        let (offset, head_size) = {
+            let archive = rar15_40::Archive::parse(volume).unwrap();
+            let file = archive
+                .files()
+                .next()
+                .expect("the volume carries the split fragment");
+            assert!(file.is_split_before() && file.is_split_after(), "middle fragment");
+            (file.block.offset, file.block.head_size as usize)
+        };
+        // file_crc sits at +16..+20 of the file block (after head_crc,
+        // type, flags, head_size, pack_size, unp_size, host_os).
+        for byte in &mut volume[offset + 16..offset + 20] {
+            *byte ^= 0x5a;
+        }
+        let head_crc = (crc32::crc32(&volume[offset + 2..offset + head_size]) & 0xffff) as u16;
+        volume[offset..offset + 2].copy_from_slice(&head_crc.to_le_bytes());
+    }
+
+    /// unrar parity: a damaged middle volume fails the set at THAT
+    /// fragment, naming it, instead of decoding the whole member and
+    /// failing on the final unpacked CRC. Exercised on the whole-set walk
+    /// for both the compressed and the stored split shape.
+    #[test]
+    fn rar15_40_whole_set_walk_fails_a_damaged_middle_fragment_naming_its_volume() {
+        let shapes: [&[&str]; 2] = [
+            &[
+                "rar300/compressed_multivol_prng_rar300.rar",
+                "rar300/compressed_multivol_prng_rar300.r00",
+                "rar300/compressed_multivol_prng_rar300.r01",
+                "rar300/compressed_multivol_prng_rar300.r02",
+                "rar300/compressed_multivol_prng_rar300.r03",
+            ],
+            &[
+                "rar300/stored_multivol_rar300.rar",
+                "rar300/stored_multivol_rar300.r00",
+                "rar300/stored_multivol_rar300.r01",
+                "rar300/stored_multivol_rar300.r02",
+            ],
+        ];
+        for names in shapes {
+            let mut parts: Vec<Vec<u8>> = names
+                .iter()
+                .map(|name| std::fs::read(rar15_40_fixture(name)).unwrap())
+                .collect();
+            corrupt_rar15_40_fragment_crc(&mut parts[2]);
+            let archives: Vec<_> = parts
+                .iter()
+                .map(|part| rar15_40::Archive::parse(part).unwrap())
+                .collect();
+
+            let error = collect_rar15_40_volumes(&archives, None).unwrap_err();
+            assert!(
+                matches!(error, Error::SplitFragmentCrc32Mismatch { volume: 2, .. }),
+                "{names:?}: {error:?}"
+            );
+        }
+    }
+
+    /// [`rar15_40_whole_set_walk_fails_a_damaged_middle_fragment_naming_its_volume`]
+    /// for the volume sequence walk: the compressed shape takes the
+    /// incremental chase, the stored shape takes the Finish-fragment
+    /// reassembly, and both must land the same volume-naming error.
+    #[test]
+    fn rar15_40_volume_sequence_fails_a_damaged_middle_fragment_naming_its_volume() {
+        let shapes: [&[&str]; 2] = [
+            &[
+                "rar300/compressed_multivol_prng_rar300.rar",
+                "rar300/compressed_multivol_prng_rar300.r00",
+                "rar300/compressed_multivol_prng_rar300.r01",
+                "rar300/compressed_multivol_prng_rar300.r02",
+                "rar300/compressed_multivol_prng_rar300.r03",
+            ],
+            &[
+                "rar300/stored_multivol_rar300.rar",
+                "rar300/stored_multivol_rar300.r00",
+                "rar300/stored_multivol_rar300.r01",
+                "rar300/stored_multivol_rar300.r02",
+            ],
+        ];
+        for names in shapes {
+            let mut parts: Vec<Vec<u8>> = names
+                .iter()
+                .map(|name| std::fs::read(rar15_40_fixture(name)).unwrap())
+                .collect();
+            corrupt_rar15_40_fragment_crc(&mut parts[2]);
+
+            let error = rar15_40_sequence_collect(&parts, None).unwrap_err();
+            assert!(
+                matches!(error, Error::SplitFragmentCrc32Mismatch { volume: 2, .. }),
+                "{names:?}: {error:?}"
+            );
+        }
+    }
+
     /// The RAR4 twin of the two structural pins: the split sink opens at
     /// the START fragment, and the chain publishes mid-volume progress
     /// while it is still reading.
@@ -2888,9 +2988,21 @@ mod tests {
     /// of these compressed members takes the incremental path.
     #[test]
     fn rar50_volume_sequence_incremental_split_matches_the_whole_set_walk() {
-        let shapes: [(&[&str], Option<&[u8]>); 4] = [
+        let shapes: [(&[&str], Option<&[u8]>); 5] = [
             (
                 &["multivol.part1.rar", "multivol.part2.rar", "multivol.part3.rar"],
+                None,
+            ),
+            (
+                // rar 7.23 with the default CRC32 records - the only set
+                // whose fragments carry data_crc32 instead of BLAKE2sp.
+                &[
+                    "crc32_multivol.part01.rar",
+                    "crc32_multivol.part02.rar",
+                    "crc32_multivol.part03.rar",
+                    "crc32_multivol.part04.rar",
+                    "crc32_multivol.part05.rar",
+                ],
                 None,
             ),
             (
@@ -2937,6 +3049,131 @@ mod tests {
             for (got, want) in streamed.iter().zip(&reference) {
                 assert_eq!(got.0, want.name, "{names:?}");
                 assert_eq!(got.1, want.data, "{names:?}");
+            }
+        }
+    }
+
+    /// Rewrites a middle volume's split fragment header so its packed-data
+    /// digest record lies, restamping the block header CRC so the volume
+    /// still parses - the shape of one damaged volume in an otherwise
+    /// sound set. The packed bytes themselves stay intact, so nothing but
+    /// the per-fragment check can notice.
+    fn corrupt_rar50_fragment_digest(volume: &mut [u8]) {
+        let (header_start, header_end, record) = {
+            let archive = rar50::Archive::parse(volume).unwrap();
+            let file = archive
+                .files()
+                .next()
+                .expect("the volume carries the split fragment");
+            assert!(file.is_split_before() && file.is_split_after(), "middle fragment");
+            let record = match &file.hash {
+                Some(hash) => hash.data.clone(),
+                None => file
+                    .data_crc32
+                    .expect("fragment carries a digest record")
+                    .to_le_bytes()
+                    .to_vec(),
+            };
+            // The block header spans its leading CRC32 through the last
+            // extra-area byte; the payload starts right after it.
+            (file.block.offset, file.block.data_range.start, record)
+        };
+        let position = volume[header_start + 4..header_end]
+            .windows(record.len())
+            .position(|window| window == record)
+            .expect("digest record bytes are in the header");
+        volume[header_start + 4 + position] ^= 0x5a;
+        let header_crc = crc32::crc32(&volume[header_start + 4..header_end]);
+        volume[header_start..header_start + 4].copy_from_slice(&header_crc.to_le_bytes());
+    }
+
+    /// The three RAR 5 split shapes with per-fragment packed digests:
+    /// compressed and stored BLAKE2sp (WinRAR 7.21 fixtures), and
+    /// compressed CRC32 (rar 7.23). `true` marks the CRC32 flavor.
+    fn rar50_split_digest_shapes() -> [(&'static [&'static str], bool); 3] {
+        [
+            (
+                &["multivol.part1.rar", "multivol.part2.rar", "multivol.part3.rar"],
+                false,
+            ),
+            (
+                &[
+                    "stored_multivol.part1.rar",
+                    "stored_multivol.part2.rar",
+                    "stored_multivol.part3.rar",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "crc32_multivol.part01.rar",
+                    "crc32_multivol.part02.rar",
+                    "crc32_multivol.part03.rar",
+                    "crc32_multivol.part04.rar",
+                    "crc32_multivol.part05.rar",
+                ],
+                true,
+            ),
+        ]
+    }
+
+    /// unrar parity (UIERROR_CHECKSUMPACKED): a damaged middle volume
+    /// fails the RAR 5 set at THAT fragment, naming it, instead of
+    /// decoding the whole member and failing on the final unpacked
+    /// digest. Exercised on the whole-set walk for both digest flavors
+    /// and both the compressed and the stored split shape.
+    #[test]
+    fn rar50_whole_set_walk_fails_a_damaged_middle_fragment_naming_its_volume() {
+        for (names, crc32_flavor) in rar50_split_digest_shapes() {
+            let mut parts: Vec<Vec<u8>> = names
+                .iter()
+                .map(|name| std::fs::read(rar50_fixture(name)).unwrap())
+                .collect();
+            corrupt_rar50_fragment_digest(&mut parts[1]);
+            let archives: Vec<_> = parts
+                .iter()
+                .map(|part| rar50::Archive::parse(part).unwrap())
+                .collect();
+
+            let error = collect_rar50_volumes(&archives, None).unwrap_err();
+            if crc32_flavor {
+                assert!(
+                    matches!(error, Error::SplitFragmentCrc32Mismatch { volume: 1, .. }),
+                    "{names:?}: {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, Error::SplitFragmentHashMismatch { volume: 1 }),
+                    "{names:?}: {error:?}"
+                );
+            }
+        }
+    }
+
+    /// [`rar50_whole_set_walk_fails_a_damaged_middle_fragment_naming_its_volume`]
+    /// for the volume sequence walk: the compressed shapes take the
+    /// incremental chase, the stored shape takes the Finish-fragment
+    /// reassembly, and all must land the same volume-naming error.
+    #[test]
+    fn rar50_volume_sequence_fails_a_damaged_middle_fragment_naming_its_volume() {
+        for (names, crc32_flavor) in rar50_split_digest_shapes() {
+            let mut parts: Vec<Vec<u8>> = names
+                .iter()
+                .map(|name| std::fs::read(rar50_fixture(name)).unwrap())
+                .collect();
+            corrupt_rar50_fragment_digest(&mut parts[1]);
+
+            let error = rar50_sequence_collect(&parts, None).unwrap_err();
+            if crc32_flavor {
+                assert!(
+                    matches!(error, Error::SplitFragmentCrc32Mismatch { volume: 1, .. }),
+                    "{names:?}: {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, Error::SplitFragmentHashMismatch { volume: 1 }),
+                    "{names:?}: {error:?}"
+                );
             }
         }
     }
@@ -4259,6 +4496,27 @@ mod tests {
                 feature: "recovery repair for RAR 1.3/1.4 archives"
             }
         );
+    }
+
+    /// Fixture with an oversubscribed RAR 2.9 main Huffman table: a
+    /// complete table plus one junk length-15 entry on the unused tail
+    /// symbol 298, the shape old WinRAR 2.x encoders emitted for unused
+    /// alphabet slots (seen in the wild on the 11 Aug 2026 soak set).
+    /// unrar never validates subscription and extracts it (verified with
+    /// UNRAR 7.21); rars used to refuse with "RAR 2.9 oversubscribed
+    /// Huffman table". The tolerant fallback must decode it CRC-clean.
+    #[test]
+    fn rar29_oversubscribed_huffman_table_extracts_like_unrar() {
+        let archive =
+            ArchiveReader::read_path(rar15_40_fixture("rars_generated/oversubscribed_main_tail.rar"))
+                .unwrap();
+        let entries = collect_extract(&archive, None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, b"big.dat");
+        assert_eq!(entries[0].data.len(), 171_847);
+        // The stored member CRC gates the extraction above; pin the
+        // payload here too so a silent decode change cannot hide.
+        assert_eq!(crc32::crc32(&entries[0].data), 0x4974_dc39);
     }
 
     #[test]

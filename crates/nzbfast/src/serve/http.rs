@@ -146,6 +146,17 @@ fn route_preview_probe(req: tiny_http::Request, d: &Arc<Daemon>, id: &str, query
         });
         return;
     }
+    // §73 phase 2: the setting gates the ENDPOINT, not just the panel.
+    // "off" means no half-downloaded file is opened and parsed for
+    // anyone - a user who turns the feature off has turned it off, not
+    // hidden it. Checked after auth so an unauthenticated caller learns
+    // nothing about this install's settings.
+    if preview_mode(d) == "off" {
+        let _ = req.respond(
+            json_resp(serde_json::json!({"error": "preview is off"})).with_status_code(403),
+        );
+        return;
+    }
     static PROBE_THREADS: AtomicUsize = AtomicUsize::new(0);
     const MAX_PROBE_THREADS: usize = 8;
     if PROBE_THREADS.fetch_add(1, Ordering::AcqRel) >= MAX_PROBE_THREADS {
@@ -169,6 +180,130 @@ fn route_preview_probe(req: tiny_http::Request, d: &Arc<Daemon>, id: &str, query
         }
         let _g = Guard;
         preview_probe_request(d, req, id);
+    });
+}
+
+/// `GET /preview/media/{nzo_id}` - §73 phase 3: the same file, rewrapped
+/// into fragmented MP4 so a browser that will not open the container can
+/// still play what is inside it.
+///
+/// Same auth as the probe, and then one gate more. The `preview` setting
+/// stops this at `metadata-only` as well as at `off`: the panel's job is
+/// to say what a file IS, and a user who chose that and not "full" has
+/// chosen not to have a player - the setting means what it says at both
+/// values, not just the one that turns everything off.
+///
+/// Its own thread and its own cap. Unlike the probe, one of these holds
+/// a socket for as long as somebody is watching, so it is sized like the
+/// `/stream` family rather than like an API poll - but lower, because a
+/// remux session also holds an open fragment in memory.
+fn route_preview_media(req: tiny_http::Request, d: &Arc<Daemon>, id: &str, query: &str) {
+    let id = id.trim_matches('/').to_string();
+    if id.is_empty() {
+        let _ =
+            req.respond(tiny_http::Response::from_string("nzo_id required").with_status_code(404));
+        return;
+    }
+    let mut sp = parse_query(query);
+    if let Some(k) = header_apikey(&req) {
+        sp.entry("apikey".to_string()).or_insert(k);
+    }
+    let given = sp.get("apikey").map(String::as_str);
+    let key_ok = {
+        let a = d.apikey.lock_ok().clone();
+        let n = d.nzbkey.lock_ok().clone();
+        full_key_ok(given, &a, &n)
+    };
+    let token_ok = sp.get("t").is_some_and(|t| ct_eq(t, &d.stream_token(&id)));
+    if !(key_ok || token_ok) {
+        let blocked = d.note_auth_failure(peer_ip(&req), "preview media");
+        let _ = req.respond(if blocked {
+            tiny_http::Response::from_string("too many bad keys").with_status_code(429)
+        } else {
+            tiny_http::Response::from_string(
+                "previewing a download needs an apikey or stream token (?t=)",
+            )
+            .with_status_code(401)
+        });
+        return;
+    }
+    // Checked after auth, so an unauthenticated caller learns nothing
+    // about this install's settings.
+    let mode = preview_mode(d);
+    if mode != "full" {
+        let _ = req.respond(
+            json_resp(serde_json::json!({
+                "error": "preview player is off",
+                "preview": mode,
+            }))
+            .with_status_code(403),
+        );
+        return;
+    }
+    // A range this response cannot honour is refused HERE - before a
+    // thread is spawned and before a byte of remuxing - because
+    // ignoring it is ruinous, not merely untidy.
+    //
+    // Safari's media loader (AppleCoreMedia) opens every file with
+    // `Range: bytes=0-1`, a two-byte probe whose `206` + `Content-Range`
+    // is how it learns the resource length. A produced stream has no
+    // length and no ranges, and `Accept-Ranges: none` says so - but
+    // IGNORING the header (which RFC 9110 permits, and which this
+    // endpoint used to do) means answering a two-byte probe with the
+    // entire file. Measured on 11 Aug 2026 against a 2.5 GB episode:
+    // Safari never learned a length, discarded everything, and retried
+    // every ~4 seconds - 99 probes and 123.7 GB transferred in six
+    // minutes, remuxing from scratch each time, for a black screen.
+    //
+    // `bytes=0-` is the whole resource and a 200 does satisfy it. That
+    // is what Chromium sends before playing this happily, so its path
+    // is deliberately untouched.
+    if let Some(r) = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Range"))
+        .map(|h| h.value.as_str().trim().to_string())
+        && r.strip_prefix("bytes=").map(str::trim) != Some("0-")
+    {
+        let _ = req.respond(
+            json_resp(serde_json::json!({
+                "error": "range_unavailable",
+                "hint": "this response is produced as it is read, so it has no byte ranges; \
+                         request it without a Range header, or seek with start_ms",
+                "range": r,
+            }))
+            .with_status_code(416)
+            .with_header(
+                tiny_http::Header::from_bytes(&b"Accept-Ranges"[..], &b"none"[..]).unwrap(),
+            ),
+        );
+        return;
+    }
+    static REMUX_THREADS: AtomicUsize = AtomicUsize::new(0);
+    const MAX_REMUX_THREADS: usize = 16;
+    if REMUX_THREADS.fetch_add(1, Ordering::AcqRel) >= MAX_REMUX_THREADS {
+        REMUX_THREADS.fetch_sub(1, Ordering::AcqRel);
+        let _ = req.respond(
+            tiny_http::Response::from_string("too many concurrent previews")
+                .with_status_code(503)
+                .with_header(
+                    tiny_http::Header::from_bytes(&b"Retry-After"[..], &b"2"[..]).unwrap(),
+                ),
+        );
+        return;
+    }
+    let d = d.clone();
+    let query = query.to_string();
+    std::thread::spawn(move || {
+        // Decrement on exit, including a panic in the handler.
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                REMUX_THREADS.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _g = Guard;
+        preview_media_request(d, req, id, query);
     });
 }
 
@@ -940,6 +1075,10 @@ pub(super) fn spawn_http_workers(
                 }
                 if let Some(id) = path.strip_prefix("/preview/probe/") {
                     route_preview_probe(req, &d, id, query);
+                    continue;
+                }
+                if let Some(id) = path.strip_prefix("/preview/media/") {
+                    route_preview_media(req, &d, id, query);
                     continue;
                 }
                 if path == "/manual" || path == "/manual/" || path.starts_with("/manual/") {

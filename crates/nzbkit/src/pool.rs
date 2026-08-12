@@ -291,6 +291,36 @@ pub struct PoolConfig {
     /// Production never notices: at the default 8 s backoff the ladder
     /// is backoff-dominated and a slow refusal is noise.
     pub cap_probe_bounces: u32,
+    /// Total time a server may spend granting NO sessions during one run
+    /// before it is retired for the rest of that run; `None` = never
+    /// give up on it.
+    ///
+    /// The ceiling `cap_probe_bounces` cannot be. That ladder counts
+    /// CONSECUTIVE bounces and any granted session resets it, so a
+    /// provider at its account cap that frees one slot every few minutes
+    /// renews the ~10 minute horizon indefinitely and the run never
+    /// reaches a terminal - the job simply sits at zero bytes. This
+    /// budget accumulates across episodes and cannot be rewound, so the
+    /// pathological case is bounded while an ordinary reconnect costs
+    /// its own seconds and nothing more.
+    ///
+    /// Retiring is not a verdict about the POST: the articles that only
+    /// that server carried end up transport-failed, which the daemon
+    /// classifies `FailKind::Transport` - auto-retried from the journal,
+    /// and never reported to an indexer as a dead post.
+    ///
+    /// `None` is a real configuration, not a disabled feature: a user
+    /// who would rather a job wait all night than come back as failed
+    /// sets it, and the queue row now says which provider it is waiting
+    /// on for the whole wait.
+    ///
+    /// It stands `cap_probe_bounces` down as well, because otherwise it
+    /// would not deliver what it promises: a wholly unreachable server
+    /// would still be retired on that ladder at ~10 minutes and the job
+    /// would still come back failed. With it `None` the pool waits, and
+    /// the run does not end on its own - by request. The auto-defer
+    /// watchdog is what keeps the rest of the queue moving.
+    pub outage_budget: Option<Duration>,
     /// Shared body-buffer pool; None = allocate per article.
     pub buf_pool: Option<Arc<BufPool>>,
     /// Live per-server gauges for dashboards (M14h); None = don't track.
@@ -341,6 +371,17 @@ pub struct PoolConfig {
     /// stay eligible (last-resort/only-source). Per-server, never
     /// OR-folded; wired from the server's block_account setting.
     pub block_account: bool,
+    /// §96.5 mid-run block cap: bytes this server may still spend on
+    /// THIS run (its prepaid block minus the lifetime already billed),
+    /// seeded by the daemon at fleet build. When the run's own
+    /// per-server byte counter crosses it, the server's workers drain
+    /// what is in flight and bow out for good - nothing is shed, and
+    /// the shared queue hands its remaining articles to the other
+    /// servers. None or Some(0) = unlimited, matching the config
+    /// convention that a zero block means "no block configured" (an
+    /// ALREADY-spent block never reaches here - the daemon's job-start
+    /// exclusion rules the host out of the fleet entirely).
+    pub budget_bytes: Option<u64>,
     /// Hedged-request experiment (off by default, env NZBFAST_HEDGE=1):
     /// replace the flat 8 s staleness bound in the dup race with an
     /// adaptive one - 3x the trained dispatch-to-done article-time EWMA,
@@ -474,6 +515,21 @@ pub struct PoolConfig {
     /// pipeline's decode consumers); an ack-less consumer would leak
     /// the set and pin every span "live" forever.
     pub arrival_ack: bool,
+    /// TODO 96.4: issue the endgame ladder's FAN-OUT dispatches as STAT
+    /// rather than BODY. A fan-out dup exists to buy a verdict, and on
+    /// an article that is merely absent from one backbone every racer
+    /// that HAS it delivers a whole body for a claim only one of them
+    /// can win. STAT answers the same question - the refusal codes are
+    /// identical, so `handle_missing`'s unanimity is unchanged - and
+    /// the hit costs one line instead of an article.
+    ///
+    /// It buys that with a round trip: a 223 is not bytes, so an
+    /// article the fan-out would have DELIVERED now has to be fetched
+    /// after the probe. Off by default because the phase this runs in
+    /// is the one §146 measured to be round-trip-bound with the wire
+    /// idle - see the §96 item 4 write-up for the A/B that says so.
+    /// `NZBFAST_STAT_PROBE=1` turns it on.
+    pub stat_probe: bool,
 }
 
 /// Live per-server gauges, updated by workers with relaxed atomics and
@@ -500,7 +556,7 @@ pub struct LiveStats {
     pub events: std::sync::Mutex<std::collections::VecDeque<PoolEvent>>,
     /// Run-level racing gauges (M7b.2): dup spend and the hygiene-cap
     /// state, for `report_diagnostics`' consumers and the "Why is this
-    /// slow?" panel. See [`steer::RaceLive`].
+    /// slow?" panel. See `steer::RaceLive`.
     pub race: steer::RaceLive,
 }
 
@@ -513,7 +569,7 @@ pub struct PoolEvent {
     pub at_ms: u64,
     pub host: String,
     /// `reconnect` | `rotate` | `cap` | `blocked` | `retired` |
-    /// `missing` | `racing` | `timeout` | `tail` | `drained` - see
+    /// `block` | `missing` | `racing` | `timeout` | `tail` | `drained` - see
     /// [`LiveStats::note`]. The dashboard groups these into severity
     /// classes (fault / tuning / recovery / phase), so a new kind must
     /// be added to its map or it draws in the fallback colour.
@@ -625,23 +681,23 @@ pub struct ServerLive {
     /// whole ring with its own events and erase the reconnects sitting
     /// beside them - the instrumentation would destroy the comparison it
     /// exists to make.
-    pub last_blocked_note: AtomicU64,
+    pub(crate) last_blocked_note: AtomicU64,
     /// Missing-article burst window: when the current window opened
     /// (unix ms, 0 = not yet opened) and what `articles_missing` read at
     /// that moment. See [`LiveStats::note_missing_burst`].
-    pub missing_note_at: AtomicU64,
-    pub missing_at_note: AtomicU64,
+    pub(crate) missing_note_at: AtomicU64,
+    pub(crate) missing_at_note: AtomicU64,
     /// Unix ms of the last adaptive-timeout marker, same once-a-second
     /// discipline as `last_blocked_note` - a provider gone slow expires
     /// budgets on every worker at once.
-    pub last_timeout_note: AtomicU64,
+    pub(crate) last_timeout_note: AtomicU64,
     /// Session-end causes; see [`SessionEnds`]. Same counters the CLI
     /// census prints, kept live for the dashboard.
-    pub ends_peer: AtomicU64,
-    pub ends_protocol: AtomicU64,
-    pub ends_prebyte: AtomicU64,
-    pub ends_stall: AtomicU64,
-    pub ends_ours: AtomicU64,
+    pub(crate) ends_peer: AtomicU64,
+    pub(crate) ends_protocol: AtomicU64,
+    pub(crate) ends_prebyte: AtomicU64,
+    pub(crate) ends_stall: AtomicU64,
+    pub(crate) ends_ours: AtomicU64,
     /// M7b.2 PUBLISHED CONTRACT for the live connection tuner (steering
     /// design §4.3; full semantics in the pool `steer` module doc):
     /// windowed delivered rate in B/s as of the last fold (~10 s
@@ -651,10 +707,71 @@ pub struct ServerLive {
     /// frontier-passed: a rate drop with it set is our own steering,
     /// not a provider knee). Demand-inclusive, fed only from real
     /// delivered bodies - do not rename or filter.
-    pub srv_rate: AtomicU64,
-    pub srv_rate_at: AtomicU64,
-    pub srv_art_ms: AtomicU64,
+    pub(crate) srv_rate: AtomicU64,
+    pub(crate) srv_rate_at: AtomicU64,
+    pub(crate) srv_art_ms: AtomicU64,
     pub steered: AtomicBool,
+    /// Unix ms when this server LAST stopped granting sessions, 0 while
+    /// it holds one. Set by the first dial that fails or is refused,
+    /// cleared by the first that succeeds, so it reads as "down since".
+    ///
+    /// `connected == 0` already says a server has nothing open right
+    /// now, and it says it about a worker mid-redial too - a level with
+    /// no duration and no cause. This is the pair that makes an outage
+    /// REPORTABLE while the job is still running: the moment it began,
+    /// and (with `down_reason`) whose fault it is. Without it the only
+    /// place that ever named a wholly-dead provider was the diagnostics
+    /// block of a job that FINISHED, which is exactly the block a job
+    /// wedged on that provider never reaches (soak, 12 Aug 2026).
+    pub down_since: AtomicU64,
+    /// Why, in the provider's or the OS's own words. See [`DownReason`].
+    pub down_reason: std::sync::Mutex<Option<DownReason>>,
+}
+
+/// Why a server is granting no sessions right now.
+#[derive(Debug, Clone)]
+pub struct DownReason {
+    /// `unreachable` (the dial itself failed - DNS, refused, TLS,
+    /// timeout), `refused` (it rejected the account for good) or
+    /// `capacity` (it is at a connection or IP cap and may clear).
+    /// A stable token, not prose: the dashboard maps it to a phrase in
+    /// the user's language and the detail below carries the words.
+    pub kind: &'static str,
+    /// The failing server's own sentence, verbatim.
+    pub detail: String,
+}
+
+impl ServerLive {
+    /// First failed dial of an outage wins the clock; later ones only
+    /// refresh the reason. Idempotent per episode, so the whole fleet
+    /// bouncing off one cap still reports one start time.
+    pub fn note_down(&self, kind: &'static str, detail: impl Into<String>) {
+        let _ = self
+            .down_since
+            .compare_exchange(0, now_ms(), Ordering::Relaxed, Ordering::Relaxed);
+        if let Ok(mut r) = self.down_reason.lock() {
+            *r = Some(DownReason {
+                kind,
+                detail: detail.into(),
+            });
+        }
+    }
+
+    /// A session was granted: the episode is over.
+    pub fn note_up(&self) {
+        self.down_since.store(0, Ordering::Relaxed);
+        if let Ok(mut r) = self.down_reason.lock() {
+            *r = None;
+        }
+    }
+
+    /// How long this server has been granting nothing, in seconds, or
+    /// `None` while it is up. Reading the level and the stamp together
+    /// here keeps every consumer's rule the same.
+    pub fn down_secs(&self) -> Option<u64> {
+        let at = self.down_since.load(Ordering::Relaxed);
+        (at > 0).then(|| now_ms().saturating_sub(at) / 1000)
+    }
 }
 
 /// A server's refusal to authenticate, as shown to the user.
@@ -702,6 +819,8 @@ impl LiveStats {
                     srv_rate_at: AtomicU64::new(0),
                     srv_art_ms: AtomicU64::new(0),
                     steered: AtomicBool::new(false),
+                    down_since: AtomicU64::new(0),
+                    down_reason: std::sync::Mutex::new(None),
                 })
                 .collect(),
             events: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -871,6 +990,7 @@ impl Default for PoolConfig {
             connect_backoff: Duration::from_secs(2),
             max_connect_attempts: 5,
             cap_probe_bounces: CAP_PROBE_BOUNCES,
+            outage_budget: Some(OUTAGE_BUDGET),
             buf_pool: None,
             live: None,
             live_target: None,
@@ -882,6 +1002,7 @@ impl Default for PoolConfig {
             steer_depth: false,
             race_envelope: false,
             block_account: false,
+            budget_bytes: None,
             hedge: false,
             ttfb_hedge: false,
             recycle_slow: false,
@@ -904,6 +1025,68 @@ impl Default for PoolConfig {
             desync_fence: std::env::var("NZBFAST_DESYNC_FENCE")
                 .ok()
                 .is_none_or(|v| v == "1"),
+            // TODO 96.4. Default OFF; same "every pool honors the knob"
+            // placement as the two above.
+            stat_probe: std::env::var("NZBFAST_STAT_PROBE")
+                .ok()
+                .is_some_and(|v| v == "1"),
+        }
+    }
+}
+
+impl PoolConfig {
+    /// The pool AS THE DAEMON SHIPS IT - the posture a measurement rig
+    /// wants unless it is deliberately measuring something else.
+    ///
+    /// [`PoolConfig::default()`] is the library's neutral posture, with
+    /// every speculation knob off. It is not what runs: `nzbfast`'s
+    /// `get/fleet.rs` resolves two dashboard settings, both ON by
+    /// default, into five of these fields.
+    ///
+    /// * "Race slow articles" (`race_stragglers`) -> [`Self::tail_fanout`],
+    ///   [`Self::tail_fanout_early`], [`Self::hedge`],
+    ///   [`Self::recycle_slope`].
+    /// * "Adaptive connection timeouts" (`adaptive_timeouts`) ->
+    ///   [`Self::adaptive_timeout`], in place of the flat
+    ///   [`Self::read_timeout`].
+    ///
+    /// A fleet built from `default()` therefore has the whole endgame
+    /// speculation layer and the adaptive read budget switched off, and
+    /// a rig that tunes against it is tuning a fleet nobody runs. Build
+    /// from this instead wherever those knobs are load-bearing:
+    ///
+    /// ```ignore
+    /// PoolConfig { connections, ramp_delay: Duration::ZERO, ..PoolConfig::shipped() }
+    /// ```
+    ///
+    /// Opting out is fine when it is the POINT - `tls_chaos` pins the
+    /// flat 30 s read timeout it exists to test, and the demote rig's
+    /// non-hostage legs stay pessimistic on purpose - but say so at the
+    /// call site. The knobs that are still dark (`steer_depth`,
+    /// `race_envelope`, `ttfb_hedge`, `recycle_slow`, `hot_spare`) are
+    /// env-only in the daemon too, so they stay off here.
+    ///
+    /// Two fields the daemon also sets are deliberately NOT here,
+    /// because neither is a property of the fleet alone.
+    /// [`Self::crc_steer`] depends on fleet SHAPE (a same-level peer on
+    /// another host must exist for a refetch-elsewhere to mean
+    /// anything), and [`Self::arrival_ack`] is a contract with a
+    /// consumer that calls `note_settled` - switching it on under a
+    /// collector that never acks would leave every delivered article
+    /// looking live. Rigs that want either one ask for it by name.
+    ///
+    /// Kept honest by `nzbfast`'s
+    /// `get::fleet::tests::shipped_matches_the_daemons_own_defaults`,
+    /// which reads the same two defaults out of `build_fleet`'s
+    /// resolution path.
+    pub fn shipped() -> Self {
+        PoolConfig {
+            adaptive_timeout: true,
+            tail_fanout: true,
+            tail_fanout_early: true,
+            hedge: true,
+            recycle_slope: true,
+            ..PoolConfig::default()
         }
     }
 }
@@ -1060,627 +1243,11 @@ pub struct SessionEnds {
     pub ours: u64,
 }
 
-/// M11 seek re-prioritization: a live handle to a running fetch's pending
-/// queue. The streaming layer promotes the articles under a player's seek
-/// point to the queue front; workers pick them up on their next pop.
-/// Holds the pool by Weak - the handle can outlive the run harmlessly
-/// (promote becomes a no-op once the pool is gone). Anything the caller
-/// still needs to read AFTER the run returns has to be latched on the
-/// handle itself; see `drained`.
-#[derive(Default)]
-pub struct QueueControl {
-    shared: std::sync::Mutex<Option<std::sync::Weak<Shared>>>,
-    /// Latched copy of `Shared::draining`. The pool's last strong `Arc` dies
-    /// with the fetch call, so by the time the engine asks whether the run
-    /// wound down gracefully the Weak above no longer upgrades - the answer
-    /// has to live on the handle the caller still holds.
-    drained: AtomicBool,
-}
-
-impl QueueControl {
-    fn attach(&self, sh: &Arc<Shared>) {
-        *self.shared.lock_ok() = Some(Arc::downgrade(sh));
-        // A handle reused for a second run starts that run undrained; the
-        // latch below describes the pool currently attached, not a past one.
-        self.drained.store(false, Ordering::Release);
-    }
-
-    /// Move every PENDING article whose message-id is in `ids` to the
-    /// front of the queue, in the ORDER GIVEN - the streaming layer passes
-    /// the requested byte range's articles seek-point-first, and that is
-    /// the order the player will read them in. (Queue relative order is
-    /// deliberately NOT preserved: a tail burst leaves file-end articles
-    /// ahead of mid-file ones, and a promoted span crossing that boundary
-    /// would otherwise download tail-first while the player starves at
-    /// the seek point.) Articles already fetched or in flight are
-    /// unaffected. Returns how many were moved.
-    pub fn promote(&self, ids: &[String]) -> usize {
-        self.promote_opts(ids, true)
-    }
-
-    /// [`Self::promote`] with the stream-mode side effect explicit.
-    /// `engage_stream: false` reorders the queue WITHOUT flipping the
-    /// pool into shallow pipelines: the extractor's offset-0 probe wants
-    /// its article sooner, but nothing blocks on it, and a scrambled
-    /// many-volume set probes once per slot - each 60 s stream-mode
-    /// linger would chain into the whole download running shallow.
-    pub fn promote_opts(&self, ids: &[String], engage_stream: bool) -> usize {
-        let Some(sh) = self
-            .shared
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-        else {
-            return 0;
-        };
-        // Streaming-layer promotes (and the 7z chase, whose worker
-        // blocks on the footer) engage stream mode (shallow pipelines)
-        // even when nothing moves.
-        if engage_stream {
-            sh.note_stream();
-        }
-        if ids.is_empty() {
-            return 0;
-        }
-        // The queue is a tokio Mutex popped briefly by workers; we're on a
-        // plain OS thread (the /stream handler). Bounded try_lock keeps
-        // this best-effort - a missed promotion just retries on the next
-        // blocked-read window.
-        let mut tries = 0;
-        let mut q = loop {
-            match sh.queue.try_lock() {
-                Ok(g) => break g,
-                Err(_) if tries < 20 => {
-                    tries += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(_) => return 0,
-            }
-        };
-        if q.is_empty() {
-            return 0;
-        }
-        // Rank = position in the caller's range order (first occurrence
-        // wins for duplicate ids).
-        let mut rank: HashMap<&str, usize> = HashMap::with_capacity(ids.len());
-        for (r, id) in ids.iter().enumerate() {
-            rank.entry(id.as_str()).or_insert(r);
-        }
-        let mut front: Vec<(usize, Work)> = Vec::new();
-        let mut rest: VecDeque<Work> = VecDeque::with_capacity(q.len());
-        for mut w in q.drain(..) {
-            if let Some(&r) = rank.get(w.id.as_str()) {
-                w.promoted = true;
-                front.push((r, w));
-            } else {
-                rest.push_back(w);
-            }
-        }
-        let n = front.len();
-        front.sort_by_key(|(r, _)| *r);
-        q.extend(front.into_iter().map(|(_, w)| w));
-        q.append(&mut rest);
-        if n > 0 {
-            // Count EVERY promoted item still queued (front run + shed
-            // re-inserts + prior promotes), record the promote's id set
-            // for the shed immunity check, then wake blocked readers so
-            // non-promoted in-flight transfers yield the line.
-            let total = q.iter().filter(|w| w.promoted).count();
-            sh.promoted_pending.store(total, Ordering::Release);
-            *sh.promoted_ids.lock_ok() = ids.iter().cloned().collect();
-            sh.promote_gen.send_modify(|g| *g += 1);
-        }
-        n
-    }
-
-    /// Responses so far that advanced an article without resolving it
-    /// (see [`Shared::deferred`]). A caller's stall watchdog must count
-    /// a change here as liveness: a refusal-only run can spend a whole
-    /// pass in the `soft_430` confirming repeat, moving neither decoded
-    /// bytes nor the outstanding count while working perfectly. `None`
-    /// once the run's pool is gone - there is nothing left to stall.
-    pub fn deferred(&self) -> Option<u64> {
-        // lock_ok, like every other accessor of this mutex: this runs
-        // inside the stall watchdog, and a poisoned lock panicking here
-        // would silently kill the exact protection it feeds.
-        Some(
-            self.shared
-                .lock_ok()
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)?
-                .deferred
-                .load(Ordering::Relaxed),
-        )
-    }
-
-    /// M11 stream mode: a live /stream reader touched the hub. Workers
-    /// cap their pipelines to `stream_window()` while this stays fresh
-    /// (see `Shared::stream_until`), so seek promotions preempt instead
-    /// of queueing behind hundreds of MB of pipelined responses. Called
-    /// on every reader read - cheap (one mutex + one atomic store).
-    pub fn note_stream_active(&self) {
-        if let Some(sh) = self
-            .shared
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-        {
-            sh.note_stream();
-        }
-    }
-
-    /// Can the ATTACHED fetch run still deliver any of `ids` - is one of
-    /// them pending in the queue or on the wire right now? `None` means
-    /// no pool is attached at all (between runs, or the run drained -
-    /// where settle-side repair may still cover the bytes and the caller
-    /// must decide how long repair deserves). The /stream reader uses a
-    /// `Some(false)` here to conclude a blocked span is terminally
-    /// undeliverable, so every unsure path with a live pool - an empty
-    /// id list, a queue lock that could not be taken - answers
-    /// `Some(true)`, never `Some(false)`.
-    ///
-    /// Racy by construction and deliberately so: an article can sit
-    /// between the queue pop and the in-flight registration for the
-    /// length of a `send_body` await, invisible to both checks. Callers
-    /// must therefore require consecutive negative verdicts spaced
-    /// longer than that window (the stream reader votes 1 s apart)
-    /// before acting.
-    pub fn any_live(&self, ids: &[String]) -> Option<bool> {
-        let sh = self
-            .shared
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)?;
-        if ids.is_empty() {
-            return Some(true);
-        }
-        {
-            let inf = sh.inflight.lock_ok();
-            if ids.iter().any(|id| inf.contains_key(id.as_str())) {
-                return Some(true);
-            }
-        }
-        // A body that already ARRIVED and is parked on a full outcome
-        // channel is the opposite of dead - it is seconds from being
-        // real bytes. Without this, disk backpressure long enough to
-        // block the handoff send made a successfully fetched article
-        // look terminal and the stream served zeros for bytes it
-        // already had.
-        {
-            let ok = sh.done_ok.lock_ok();
-            if ids.iter().any(|id| ok.contains(id.as_str())) {
-                return Some(true);
-            }
-        }
-        // A bad-body steer parked in the inbox is a refetch WAITING for
-        // a worker's next top-up, not a dead article. That top-up is
-        // usually ms away, but with every worker blocked in long
-        // pipelined body reads it can be tens of seconds out - long
-        // enough for the dead-span verdict to zero-fill the very span
-        // the steer is about to rewrite.
-        {
-            let inbox = sh.steer_inbox.lock_ok();
-            if !inbox.is_empty()
-                && ids
-                    .iter()
-                    .any(|id| inbox.iter().any(|w| w.id.as_str() == id.as_str()))
-            {
-                return Some(true);
-            }
-        }
-        // Same bounded try_lock discipline as `promote`: the caller is a
-        // plain OS thread, the queue a tokio Mutex popped by workers.
-        let mut tries = 0;
-        let q = loop {
-            match sh.queue.try_lock() {
-                Ok(g) => break g,
-                Err(_) if tries < 20 => {
-                    tries += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(_) => return Some(true),
-            }
-        };
-        let set: HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
-        Some(q.iter().any(|w| set.contains(w.id.as_str())))
-    }
-
-    /// In-stream PAR2 deferral (issue #14): permanently remove every
-    /// PENDING article whose message-id is in `ids` from the queue, and
-    /// mark each one terminal WITHOUT emitting a `FetchOutcome` - the
-    /// caller owns the accounting for exactly the ids returned. Articles
-    /// already in flight (or already resolved) are untouched and resolve
-    /// through their normal outcome; a duplicate call for an id already
-    /// cancelled is a no-op. Best-effort like `promote`: a missed lock
-    /// returns an empty list and the caller may retry.
-    pub fn cancel(&self, ids: &HashSet<String>) -> Vec<String> {
-        let Some(sh) = self
-            .shared
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-        else {
-            return Vec::new();
-        };
-        if ids.is_empty() {
-            return Vec::new();
-        }
-        // Same bounded try_lock discipline as `promote`: callers are the
-        // decode OS threads, and the queue is a tokio Mutex popped by
-        // workers.
-        let mut tries = 0;
-        let mut q = loop {
-            match sh.queue.try_lock() {
-                Ok(g) => break g,
-                Err(_) if tries < 20 => {
-                    tries += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(_) => return Vec::new(),
-            }
-        };
-        let mut removed: Vec<Work> = Vec::new();
-        let mut kept: VecDeque<Work> = VecDeque::with_capacity(q.len());
-        for w in q.drain(..) {
-            if ids.contains(w.id.as_str()) {
-                removed.push(w);
-            } else {
-                kept.push_back(w);
-            }
-        }
-        *q = kept;
-        // A cancelled item may have been seek-promoted; keep the promoted
-        // count honest so the shed immunity check stays accurate.
-        if removed.iter().any(|w| w.promoted) {
-            let total = q.iter().filter(|w| w.promoted).count();
-            sh.promoted_pending.store(total, Ordering::Release);
-        }
-        drop(q);
-        // Terminal bookkeeping OUTSIDE the queue lock (claim_done takes
-        // the done mutex; complete_one may fire the finished watch when
-        // the cancelled articles were the last pending work). The Work
-        // items are stashed whole so `requeue` can resurrect them.
-        let mut out = Vec::with_capacity(removed.len());
-        for w in removed {
-            if sh.claim_done(&w.id) {
-                sh.complete_one();
-                out.push(w.id.clone());
-                sh.cancelled.lock_ok().insert(w.id.clone(), w);
-            }
-        }
-        out
-    }
-
-    /// Undo a [`cancel`](Self::cancel): put previously-cancelled articles
-    /// back into the queue, un-terminal. All-or-nothing per call for the
-    /// ids it finds in the stash: on any obstacle (run already finished,
-    /// draining, queue lock unobtainable) everything is rolled back and 0
-    /// is returned - the caller keeps its deferred accounting. Only ids
-    /// a prior `cancel` returned can ever be requeued; unknown ids are
-    /// ignored (and do not count toward the return value).
-    pub fn requeue(&self, ids: &[String]) -> usize {
-        let Some(sh) = self
-            .shared
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-        else {
-            return 0;
-        };
-        if sh.aborted.load(Ordering::Acquire) || sh.draining.load(Ordering::Acquire) {
-            return 0;
-        }
-        let works: Vec<Work> = {
-            let mut stash = sh.cancelled.lock_ok();
-            ids.iter().filter_map(|id| stash.remove(id)).collect()
-        };
-        if works.is_empty() {
-            return 0;
-        }
-        let put_back = |ws: Vec<Work>| {
-            let mut stash = sh.cancelled.lock_ok();
-            for w in ws {
-                stash.insert(w.id.clone(), w);
-            }
-        };
-        // Pending BEFORE the finished check: with the count raised, a
-        // concurrent complete_one cannot reach zero and fire finished
-        // under us. If finished already fired, the fleet is winding down
-        // and nothing would ever fetch these - roll back.
-        // A rollback's fetch_sub can be the one that lands pending on
-        // zero (a real completion slipped in between our add and sub, and
-        // saw an inflated count) - it must then fire `finished` exactly
-        // like complete_one, or the fleet waits forever.
-        let sub_pending = |n: usize| {
-            if sh.pending.fetch_sub(n, Ordering::AcqRel) == n {
-                sh.mark_drained();
-                let _ = sh.finished.send(true);
-            }
-        };
-        sh.pending.fetch_add(works.len(), Ordering::AcqRel);
-        if *sh.finished.borrow() {
-            sub_pending(works.len());
-            put_back(works);
-            return 0;
-        }
-        {
-            let mut done = sh.done.lock_ok();
-            for w in &works {
-                done.remove(&w.id);
-            }
-        }
-        let mut tries = 0;
-        let mut q = loop {
-            match sh.queue.try_lock() {
-                Ok(g) => break g,
-                Err(_) if tries < 20 => {
-                    tries += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(_) => {
-                    // Roll back in reverse: re-terminal, drop pending
-                    // (firing finished if ours is the zeroing sub),
-                    // re-stash.
-                    let mut done = sh.done.lock_ok();
-                    for w in &works {
-                        done.insert(w.id.clone());
-                    }
-                    drop(done);
-                    sub_pending(works.len());
-                    put_back(works);
-                    return 0;
-                }
-            }
-        };
-        let n = works.len();
-        q.extend(works);
-        n
-    }
-
-    /// TODO 114 consumer steer: the decode consumer's per-article
-    /// verdict for a `FetchOutcome::Done` body, called once per Done
-    /// from the decode OS thread. With `PoolConfig::crc_steer` off (or
-    /// no pool attached, or the id unknown) this is a no-op answering
-    /// [`DecodeAck::Owned`].
-    ///
-    /// In steer mode every Done deferred its `complete_one` into
-    /// `Shared::handed`; this call settles it. A clean verdict (and a
-    /// declared part that matches the requested segment's) finalizes:
-    /// the consumer owns the outcome. A bad body - failed pcrc32, or a
-    /// valid body for the WRONG article (split-brain; its own CRC
-    /// passes, identity is the only tell) - is requeued to a DIFFERENT
-    /// server once (requeue-after-claim): the id is un-claimed from
-    /// `done` and the stashed Work re-enters the queue with the
-    /// deliverer's whole group folded into `tried_fail`, so the
-    /// refetch (or a still-racing dup) re-claims through the normal
-    /// one-outcome-per-id arbitration. Eligibility is the delivery
-    /// rule the shipped gate hardened: `other_can_take` (levels +
-    /// aliveness + group + the fill-server 430 pickup gate), checked
-    /// AFTER the fold, and one steer per id ever
-    /// (`Shared::crc_retried`). Every obstacle - no elsewhere, second
-    /// bad copy, aborted/draining/finished run - finalizes as
-    /// `Owned`: the consumer processes the body exactly as if this
-    /// seam did not exist. The requeue itself goes through
-    /// `Shared::steer_inbox`, never the tokio queue lock.
-    pub fn note_decoded(&self, id: &str, report: DecodeReport) -> DecodeAck {
-        let Some(sh) = self
-            .shared
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-        else {
-            return DecodeAck::Owned;
-        };
-        let Some(h) = sh.handed.lock_ok().remove(id) else {
-            return DecodeAck::Owned;
-        };
-        // The consumer owns the outcome from here unless a steer
-        // completes below; own = the deferred terminal bookkeeping
-        // runs now (mirrors the legacy post-send lines).
-        let finalize = |sh: &Shared| {
-            // Under arrival_ack the consumer's `note_settled` (after
-            // decode AND write) owns the done_ok removal: a clean
-            // verdict here precedes the disk write, and dropping the
-            // liveness entry now would let a slow pwrite outlast the
-            // /stream dead-span verdict and zero-fill bytes that are
-            // about to land (TODO 121.4's promise, re-opened by the
-            // steer seam). Non-ack pools have no later settle call, so
-            // they still clear it here.
-            if !sh.arrival_ack {
-                sh.done_ok.lock_ok().remove(id);
-            }
-            sh.complete_one();
-            DecodeAck::Owned
-        };
-        let why = match report {
-            DecodeReport::Bad { why } => why,
-            DecodeReport::Clean { part } => match (sh.parts.get(id), part) {
-                (Some(&want), Some(got)) if got != want => {
-                    "valid body for the wrong article (part mismatch)"
-                }
-                _ => return finalize(&sh),
-            },
-        };
-        let dbg = std::env::var_os("NZBFAST_POOL_DEBUG").is_some();
-        if sh.aborted.load(Ordering::Acquire)
-            || sh.draining.load(Ordering::Acquire)
-            || *sh.finished.borrow()
-        {
-            if dbg {
-                eprintln!("[crc-steer] {id}: own (run over/draining)");
-            }
-            return finalize(&sh);
-        }
-        let mut w = h.work;
-        // Group siblings fold FIRST so other_can_take skips the whole
-        // backbone serving the same bad copy - and a fill server's
-        // pickup gate (the primary's 430 bit) is enforced inside, so a
-        // primary+fill pair never buys a wasted refetch.
-        w.tried_fail |= h.group_bits;
-        // A dup's bad copy skips the eligibility gate and the once-
-        // per-id budget (see the `dup_copy` doc): it requeues even
-        // with nowhere better to go, because owning it would write
-        // damage a non-dup copy may already have resolved cleanly.
-        // Bounded structurally: each server group dup-races an id at
-        // most once (`dup_servers`), and the fold above stops the
-        // pickers re-racing from this group.
-        let charged = !h.dup_copy;
-        if charged
-            && (!sh.other_can_take(&w, h.server) || !sh.crc_retried.lock_ok().insert(w.id.clone()))
-        {
-            if dbg {
-                eprintln!(
-                    "[crc-steer] {id}: own (elsewhere={} already={})",
-                    sh.other_can_take(&w, h.server),
-                    sh.crc_retried.lock_ok().contains(id)
-                );
-            }
-            return finalize(&sh);
-        }
-        // NO tokio queue lock here (see the `steer_inbox` field doc):
-        // the Work goes into the inbox, which workers drain into the
-        // queue under their own `next_work` lock hold. Inbox FIRST,
-        // un-claim after: from the moment the id leaves `done` a
-        // future claimant is already guaranteed - the drained refetch,
-        // or a dup still racing - and `claim_done` arbitrates exactly
-        // one, as ever.
-        if let Some(l) = &sh.live {
-            l.note(
-                h.server,
-                "crc-retry",
-                format!("{id}: {why} - refetching from another server"),
-            );
-        }
-        if dbg {
-            eprintln!("[crc-steer] {id}: steered (from server {})", h.server);
-        }
-        sh.steer_inbox.lock_ok().push(w);
-        sh.done.lock_ok().remove(id);
-        // The body the consumer holds is dead weight now; the article
-        // stays in any_live's sight through the inbox entry pushed
-        // above until a worker drains it into the queue.
-        sh.done_ok.lock_ok().remove(id);
-        DecodeAck::Steered
-    }
-
-    /// TODO 121.4: the consumer's "this body is decoded and written"
-    /// ack for `arrival_ack` pools. Removes the `done_ok` liveness
-    /// entry that has covered the article since its claim - through
-    /// the outcome channel's buffer and the consumer's in-hand batch -
-    /// so the /stream dead-span verdict can never condemn a span whose
-    /// bytes are anywhere in the pipe. A no-op for ids already settled
-    /// (steer verdicts, non-ack pools) and after the run ends.
-    pub fn note_settled(&self, id: &str) {
-        if let Some(sh) = self
-            .shared
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-        {
-            sh.done_ok.lock_ok().remove(id);
-        }
-    }
-
-    /// Force a pool-state dump (the stall watchdog, on a suspected
-    /// deadlock). Same output as NZBFAST_POOL_DEBUG's idle-branch dump,
-    /// but on demand - so a hang in the field self-captures the queue /
-    /// inflight state that pins the root cause.
-    pub fn dump_state(&self) {
-        if let Some(sh) = self
-            .shared
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-        {
-            sh.debug_dump_idle();
-        }
-    }
-
-    /// Hard-stop the run (user cancelled the download). Lock-free by
-    /// design: an `aborted` flag every worker loop checks, plus the
-    /// finished watch to snap workers out of blocked reads. The old
-    /// implementation cleared the queue under a try_lock (starved out
-    /// forever on busy pools - 50+ workers contend for that mutex) and
-    /// zeroed `pending` (in-flight completions then fetch_sub-wrapped it
-    /// to usize::MAX and the pool never returned). The fetch returns
-    /// within seconds; the journal keeps what landed.
-    pub fn abort(&self) -> bool {
-        let Some(sh) = self
-            .shared
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-        else {
-            return false;
-        };
-        sh.aborted.store(true, Ordering::Release);
-        let _ = sh.finished.send(true);
-        true
-    }
-
-    /// Graceful stop (the friendly Pause): stop admitting new articles but
-    /// let everything already in flight finish and journal, then return -
-    /// so a resume re-fetches only the unstarted queue, wasting nothing.
-    /// Contrast [`abort`](Self::abort), which drops in-flight reads (they
-    /// re-download on resume) to free the line immediately.
-    pub fn drain(&self) -> bool {
-        let Some(sh) = self
-            .shared
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-        else {
-            return false;
-        };
-        sh.draining.store(true, Ordering::Release);
-        // Same state, latched on the handle: the workers read the flag on
-        // `Shared`, but `Shared` is gone by the time the engine asks.
-        self.drained.store(true, Ordering::Release);
-        // Not a hard finish signal: blocked reads must run to completion,
-        // so no finished.send here - the read loop drains naturally.
-        true
-    }
-
-    /// Was a graceful drain requested? The engine checks this AFTER the
-    /// network phase returns - to tell a paused wind-down (park + resume)
-    /// from a real completion (settle/repair) - and the pool has dropped its
-    /// `Shared` by then, so the answer comes from the latch `drain()` left
-    /// here. The live-pool read is kept for callers that ask mid-run.
-    pub fn is_draining(&self) -> bool {
-        self.drained.load(Ordering::Acquire)
-            || self
-                .shared
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-                .is_some_and(|sh| sh.draining.load(Ordering::Acquire))
-    }
-
-    /// Network-tail visibility (tail-prefetch experiment): Some(pending
-    /// article count) once a primary worker has found the queue dry
-    /// with articles still in flight - the pool's own tail latch - and
-    /// None before that moment or once the run is gone. `Some(0)` means
-    /// the tail completed; a live tail is `Some(n)` with `n > 0`.
-    pub fn tail_pending(&self) -> Option<usize> {
-        let sh = {
-            let g = self.shared.lock_ok();
-            g.as_ref()?.upgrade()?
-        };
-        let latched = sh.tail_started.lock_ok().is_some();
-        latched.then(|| sh.pending.load(Ordering::Acquire))
-    }
-}
+// M11 seek re-prioritization: QueueControl and its impl live in
+// pool/queue.rs (TODO 106 size-gate split); the re-export keeps
+// every `pool::QueueControl` spelling unchanged.
+mod queue;
+pub use queue::QueueControl;
 
 /// §129 3g: bare refusals one session remembers having handed out, so a
 /// later proof that the session was desynced can void the passes they
@@ -1778,6 +1345,15 @@ struct Work {
     /// per round trip - the measured zero-throughput stall before
     /// repair on a damaged post.
     ladder: bool,
+    /// TODO 96.4: dispatch this as a STAT, not a BODY. Set only on
+    /// ladder fan-out dups beyond the FIRST one for an article, and
+    /// only under [`PoolConfig::stat_probe`]: the first racer may still
+    /// deliver the article in one round trip, and every racer after it
+    /// could only ever deliver a copy of what that one brings. A STAT
+    /// answers the verdict question those racers exist to ask -
+    /// identical refusal codes, so `handle_missing` cannot tell the
+    /// difference - without buying an article to throw away.
+    probe: bool,
 }
 
 /// What a worker currently has on the wire, split by kind. The two
@@ -1856,6 +1432,12 @@ struct Inflight {
     /// group bits) - the endgame fan-out races each backbone at most
     /// once.
     dup_servers: u32,
+    /// TODO 96.4: server groups whose STAT probe answered 223. Only a
+    /// `stat_probe` fan-out ever writes here, and one bit is enough to
+    /// end the ladder: an article some backbone HOLDS can never reach a
+    /// unanimous Missing, so every further probe is a question whose
+    /// answer is already known.
+    found: u32,
     /// Servers whose transport - or, TODO 114, whose delivered BODY -
     /// already failed this article, seeded from the Work item at
     /// dispatch. Dup pickers skip these: racing an article back to a
@@ -1930,6 +1512,25 @@ struct AuthState {
     episode: tokio::sync::watch::Sender<(CapEpisode, u64)>,
     /// The server's own words, kept for the log and the dashboard.
     reason: std::sync::Mutex<Option<String>>,
+    /// Unix ms the CURRENT outage began, 0 while the server is granting
+    /// sessions. Paired with `down_ms_total` below.
+    down_since: AtomicU64,
+    /// Wall-clock ms this server has spent granting NO session during
+    /// this run, summed ACROSS episodes.
+    ///
+    /// `connect_failures` and `cap_bounces` are consecutive counters and
+    /// a single granted session zeroes both ([`session::dial_session`]'s
+    /// success arm), which is right for a blip and wrong for a cap: an
+    /// account whose provider frees one slot every few minutes renews
+    /// the ~10 minute `CAP_PROBE_BOUNCES` horizon forever, so the run
+    /// never reaches a terminal and the job sits at zero bytes for as
+    /// long as the user lets it (soak, 11->12 Aug 2026: 25 minutes on a
+    /// capped Giganews account, and only a rig watchdog ended it).
+    ///
+    /// This accumulator is the one clock a reopen does not rewind. It
+    /// only ever bites the flapping case: against a server that is
+    /// simply DOWN the consecutive horizon still expires first.
+    down_ms_total: AtomicU64,
 }
 
 impl Default for AuthState {
@@ -1941,6 +1542,8 @@ impl Default for AuthState {
             cap_prober: Default::default(),
             episode: tokio::sync::watch::channel((CapEpisode::Idle, 0)).0,
             reason: Default::default(),
+            down_since: Default::default(),
+            down_ms_total: Default::default(),
         }
     }
 }
@@ -1958,6 +1561,46 @@ impl AuthState {
             *self.reason.lock_ok() = Some(line.to_string());
         }
         first
+    }
+
+    /// This server just failed to grant a session. The FIRST failure of
+    /// an episode starts its clock; later ones are already counted.
+    ///
+    /// `held` is the number of sessions the server is serving RIGHT NOW
+    /// ([`Shared::sessions`]), and a non-zero one means this refusal was
+    /// not an outage at all. That distinction is the whole safety of the
+    /// budget: asking a provider for more connections than the plan
+    /// grants is the NORMAL case (we ask 30, the account allows 20), so
+    /// the surplus workers bounce off a capacity refusal for the entire
+    /// job. Counting those as downtime would accumulate fifteen minutes
+    /// of "outage" on a server that never stopped serving, and retire a
+    /// perfectly healthy provider mid-job.
+    fn mark_down(&self, held: usize) {
+        if held > 0 {
+            return;
+        }
+        let _ = self
+            .down_since
+            .compare_exchange(0, now_ms(), Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// A session was granted: bank the episode and stop the clock.
+    fn mark_up(&self) {
+        let at = self.down_since.swap(0, Ordering::Relaxed);
+        if at > 0 {
+            self.down_ms_total
+                .fetch_add(now_ms().saturating_sub(at), Ordering::Relaxed);
+        }
+    }
+
+    /// Total ms with no usable session this run, banked episodes plus
+    /// the open one.
+    fn down_ms(&self) -> u64 {
+        let open = match self.down_since.load(Ordering::Relaxed) {
+            0 => 0,
+            at => now_ms().saturating_sub(at),
+        };
+        self.down_ms_total.load(Ordering::Relaxed) + open
     }
 
     /// Try to give up this worker's slot to a capacity refusal. True when
@@ -2353,6 +1996,18 @@ struct Shared {
     /// §5.7 block-account mask: servers whose bytes are never spent
     /// speculatively, whatever their level.
     block_bits: u32,
+    /// TODO 96.4 STAT verdict probes armed (OR-fold, like `tail_fanout`).
+    stat_probe: bool,
+    /// §96.5 per-server remaining-block budgets in bytes (0 = no
+    /// budget). When a server's own `bytes` counter crosses its entry,
+    /// its workers drain their pipelines and bow out for good - the
+    /// mid-run half of the prepaid-block cap, whose job-boundary half
+    /// is the daemon's exhausted-host exclusion.
+    budget_bytes: Vec<u64>,
+    /// One-shot latch per server: the "block spent" event has been
+    /// emitted, and `note_server_dark` must not relabel the exit as a
+    /// connection failure.
+    budget_noted: Vec<AtomicBool>,
     /// Fleet-wide bytes of LOSING dup copies - the hygiene cap's
     /// counter (design 5.2; fleet-wide deliberately, the 3d/3c trap:
     /// per-server counters read zero for cross-server quantities).
@@ -2385,16 +2040,29 @@ const PROMOTE_SHED_MIN_AGE: Duration = Duration::from_millis(400);
 // every way a session ends - came out whole to pool/session.rs. Imported
 // rather than re-exported: these are pool internals, and the glob is what
 // keeps `super::handle_body`-style paths working for the test children.
+// TODO 106: the run's end game - the worker task, the spare filler, and
+// every way a run is sealed or a work item requeued - came out whole to
+// pool/runlife.rs. Free functions, so the glob puts them back in scope
+// for pool and its descendants exactly as the private ones were.
+mod runlife;
+use runlife::*;
+
 mod session;
 use session::*;
 
 mod pacing;
 use pacing::*;
 
+// TODO 106: the tail dup race and the B3 in-flight wire budget came out
+// whole to pool/hedge.rs. Inherent `impl Shared` methods, so no glob is
+// needed - the child's `pub(super)` puts them back in scope for pool and
+// every one of its descendants exactly as the private ones were.
+mod hedge;
+
 // Windowed per-server speed signals for steering and racing (M7b.2) -
 // see the module doc. Inherent `impl Shared` methods, so no glob needed;
 // pub for `RaceLive`, the run-level racing gauges LiveStats carries.
-pub mod steer;
+pub(crate) mod steer;
 
 /// Tail fan-out (opt-in, `PoolConfig::tail_fanout`): an idle primary only
 /// races a HEALTHY in-flight article once it has been on the wire this
@@ -2479,6 +2147,26 @@ const MAX_SESSION_ATTEMPTS: u32 = 12;
 /// against an account that is genuinely full for good.
 const CAP_PROBE_BOUNCES: u32 = 75;
 
+/// Shipped default for [`PoolConfig::outage_budget`]: 15 minutes of
+/// accumulated no-session time per server per run.
+///
+/// Set ABOVE the ~10 minute consecutive horizon on purpose, so the two
+/// never race. A server that is simply down still dies on the bounce
+/// ladder exactly as before, at the same moment, with the same
+/// diagnostics; this budget only reaches a server that keeps coming back
+/// just long enough to rewind that ladder. Below the horizon it would
+/// instead shorten every ordinary total outage, which is a behaviour
+/// change nobody asked for.
+const OUTAGE_BUDGET: Duration = Duration::from_secs(15 * 60);
+
+/// [`OUTAGE_BUDGET`] in whole minutes, which is the unit the daemon
+/// setting and the dashboard use. Exported so the shipped default lives
+/// in exactly one place - a constant here and a literal in the settings
+/// seed would drift the first time either moved.
+pub fn default_outage_mins() -> u64 {
+    OUTAGE_BUDGET.as_secs() / 60
+}
+
 /// M2c.4: at or below this many non-terminal articles the pool is in
 /// its ENDGAME - remaining 430-laddering articles are raced across all
 /// untried backbones at once instead of hop-by-hop (see `pick_dup`).
@@ -2550,6 +2238,10 @@ fn note_server_dark(shared: &Shared, idx: usize, prev: usize) {
         || shared.pending.load(Ordering::Acquire) == 0
         || shared.aborted.load(Ordering::Acquire)
         || shared.draining.load(Ordering::Acquire)
+        // §96.5: a budget bow-out already told its own story ("block
+        // spent") - the connections-kept-failing copy below would be a
+        // lie about a server that was serving fine.
+        || shared.budget_noted[idx].load(Ordering::Relaxed)
     {
         return;
     }
@@ -2571,6 +2263,32 @@ fn note_server_dark(shared: &Shared, idx: usize, prev: usize) {
 }
 
 impl Shared {
+    /// §96.5: has this server spent its remaining prepaid block on this
+    /// run? One relaxed load and a compare - the fast path the top-up
+    /// loop and the pre-dial gate check per pass. `bytes` only grows,
+    /// so a true answer is permanent for the run.
+    pub(super) fn over_budget(&self, idx: usize) -> bool {
+        let b = self.budget_bytes[idx];
+        b > 0 && self.bytes[idx].load(Ordering::Relaxed) >= b
+    }
+
+    /// §96.5: first worker past the budget emits the one "block spent"
+    /// event; the latch also keeps `note_server_dark` from relabelling
+    /// the exit as a connection failure.
+    pub(super) fn note_budget_spent(&self, idx: usize) {
+        if self.budget_noted[idx].swap(true, Ordering::Relaxed) {
+            return;
+        }
+        if let Some(live) = &self.live {
+            live.note(
+                idx,
+                "block",
+                "prepaid block spent - stopped fetching mid-download; \
+                 any remaining articles go to the other servers",
+            );
+        }
+    }
+
     /// Adaptive pre-byte budget for a server (TODO 96.1): 4x its
     /// time-to-status EWMA, clamped to [2 s, 10 s]. Unmeasured servers
     /// budget at the ceiling - generosity until the first sample, never
@@ -2717,6 +2435,7 @@ impl Shared {
                     fenced: false,
                     rearms: 0,
                     ladder: false,
+                    probe: false,
                 });
             }
         }
@@ -2805,7 +2524,13 @@ impl Shared {
             steer_clamped: (0..n_servers).map(|_| AtomicBool::new(false)).collect(),
             race_envelope: servers.iter().any(|(_, c)| c.race_envelope),
             block_bits: steer::block_bits(servers),
+            budget_bytes: servers
+                .iter()
+                .map(|(_, c)| c.budget_bytes.unwrap_or(0))
+                .collect(),
+            budget_noted: (0..n_servers).map(|_| AtomicBool::new(false)).collect(),
             dup_bytes_lost: AtomicU64::new(0),
+            stat_probe: servers.iter().any(|(_, c)| c.stat_probe),
         });
         (shared, unservable)
     }
@@ -3236,6 +2961,7 @@ impl Shared {
                     fenced: false,
                     rearms: w.rearms,
                     ladder: false,
+                    probe: false,
                 },
                 server: ctx.idx,
                 group_bits: ctx.group_bits,
@@ -3285,8 +3011,20 @@ impl Shared {
                 dup_servers: 0,
                 tried_fail: w.tried_fail,
                 suspect: false,
+                found: 0,
             },
         );
+    }
+
+    /// TODO 96.4: a STAT probe came back 223 - this backbone holds the
+    /// article. Recorded on the in-flight entry the probe was racing,
+    /// which is what stops the rest of the fan-out (see `Inflight::found`).
+    /// The entry can already be gone (the original landed while the probe
+    /// was reading); that is a no-op.
+    fn note_found(&self, id: &str, group_bits: u32) {
+        if let Some(inf) = self.inflight.lock_ok().get_mut(id) {
+            inf.found |= group_bits;
+        }
     }
 
     fn deregister_inflight(&self, w: &Work) {
@@ -3313,400 +3051,6 @@ impl Shared {
             // time still describes how long the owner held the article.
             self.note_srv_art(inf.server, ms);
         }
-    }
-
-    /// Hedge experiment: the staleness bound for the dup race. 3x the
-    /// trained article-time EWMA, clamped between the fan-out age floor
-    /// and the old flat 8 s - hedging can only be MORE responsive than
-    /// the flat rule, never less, and an untrained EWMA keeps the flat
-    /// bound.
-    fn hedge_stale_bound(&self) -> Duration {
-        if !self.hedge {
-            return HEDGE_STALE_MAX;
-        }
-        match self.art_ms.load(Ordering::Relaxed) {
-            0 => HEDGE_STALE_MAX,
-            ewma => Duration::from_millis((ewma * 3).clamp(
-                TAIL_FANOUT_MIN_AGE.as_millis() as u64,
-                HEDGE_STALE_MAX.as_millis() as u64,
-            )),
-        }
-    }
-
-    /// B3 wire-cap: charge one dispatched BODY's estimated bytes.
-    fn charge_wire(&self) {
-        self.inflight_body_bytes
-            .fetch_add(EST_BODY_BYTES, Ordering::AcqRel);
-    }
-
-    /// B3 wire-cap: release `n` pipeline items' charges - every exit
-    /// from a worker's in-flight deque (outcome, requeue, shed, abort)
-    /// releases exactly what dispatch charged.
-    ///
-    /// Saturating, not wrapping. The charge/release pairing is symmetric
-    /// by construction (one charge per item in a worker's deque), but one
-    /// asymmetry is enough to wrap this counter to ~u64::MAX, after which
-    /// `wire_over_cap` answers true forever and every worker in the pool
-    /// is pinned at pipeline depth one for the rest of the run. A
-    /// saturating floor degrades into "throttles slightly early" instead.
-    fn release_wire(&self, n: usize) {
-        let owed = EST_BODY_BYTES.saturating_mul(n as u64);
-        let _ = self
-            .inflight_body_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                // A worker only ever releases charges it holds, and the
-                // global is the sum of all live charges, so this holds for
-                // every value we can observe - concurrency included. It
-                // fires only when some path has put an UNCHARGED item into
-                // a worker's pipeline, which is the whole bug class.
-                debug_assert!(
-                    v >= owed,
-                    "wire-cap over-release: {v} charged, releasing {owed}"
-                );
-                Some(v.saturating_sub(owed))
-            });
-    }
-
-    /// B3 wire-cap: true when topping up past the one-in-flight floor
-    /// must pause. `cap` 0 = uncapped (default outside budgeted runs).
-    fn wire_over_cap(&self, cap: u64) -> bool {
-        cap > 0 && self.inflight_body_bytes.load(Ordering::Acquire) >= cap
-    }
-
-    /// The wire cap just refused a top-up: mark the graph, at most once
-    /// per 30 s for the whole run. The check runs on every pipeline
-    /// top-up, and an engaged cap answers true on all of them - the gate
-    /// is what keeps a slow-disk run from writing nothing but this.
-    fn note_wire_cap(&self) {
-        let Some(live) = &self.live else {
-            return;
-        };
-        let now = now_ms();
-        let prev = self.wire_note_at.load(Ordering::Relaxed);
-        if now.saturating_sub(prev) >= 30_000
-            && self
-                .wire_note_at
-                .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            live.note_run(
-                "wire",
-                "in-flight data reached its memory ceiling - fetching waits \
-                 for decode and the disk to catch up",
-            );
-        }
-    }
-
-    /// Tail duplicate-dispatch: pick an article in flight on another
-    /// server that is either much slower than `me` or has been sitting on
-    /// this article suspiciously long.
-    ///
-    /// M2c.4 endgame fan-out: when the job's non-terminal remainder is
-    /// small and an in-flight article has already 430'd somewhere, the
-    /// rate/staleness conditions no longer apply - every backbone that
-    /// hasn't tried it races it at once (each at most once, via
-    /// `dup_servers`), so the last few poisoned articles reach their
-    /// unanimous-430 Missing verdict in one round-trip instead of
-    /// walking the server ladder hop by hop (measured ~7 s of 0.0 MB/s
-    /// tail on the damaged leg). `required` keeps fill-server economics:
-    /// a level-N server only joins once every live lower level 430'd.
-    ///
-    /// Opt-in tail fan-out (`PoolConfig::tail_fanout`): in the endgame,
-    /// an IDLE primary also races HEALTHY in-flight articles - the last
-    /// few articles sitting on whichever connection happened to grab
-    /// them, while everyone else has gone idle. Gates: endgame only,
-    /// level 0 only (block-account bytes are never spent on speed),
-    /// empty pipeline only (a busy worker is not the idle capacity this
-    /// spends), article on the wire ≥ [`TAIL_FANOUT_MIN_AGE`], and each
-    /// server races an article at most once (`dup_servers`) - which also
-    /// spreads idle workers across stragglers instead of piling them
-    /// all on one. Unlike the two rules above this one may race an
-    /// article on ANOTHER CONNECTION OF ITS OWN SERVER: at the tail the
-    /// enemy is usually one degraded TCP session, not a slow provider,
-    /// and a fresh session to the same host routinely beats it. The
-    /// owner connection can never dup itself - the article rides its
-    /// pipeline, so its `window_used` is never 0.
-    fn pick_dup(
-        &self,
-        me: usize,
-        my_bit: u32,
-        group_bits: u32,
-        required: u32,
-        pipe: Pipeline,
-        level: u32,
-    ) -> Option<Work> {
-        // Early fan-out experiment: the tail latch flips at the exact
-        // moment idle capacity first exists (a primary found the queue
-        // dry with work still in flight), which with a big fleet is
-        // long before pending reaches ENDGAME_MAX - 48 connections at
-        // window 4 dry the queue with ~190 articles still on the wire.
-        // The idle-only and once-per-server gates below keep the spend
-        // self-limiting at any pending count.
-        let endgame = self.pending.load(Ordering::Acquire) <= ENDGAME_MAX
-            || (self.tail_fanout_early && self.tail_started.lock_ok().is_some());
-        // PER-WORKER, like `faster_can_take` above. `rate()` is a server's
-        // whole-run byte total over wall time, so it measures its share of
-        // the job, and that share is set mostly by how many connections it
-        // was given. Comparing shares made a big server judge a smaller one
-        // "half my speed" when every connection was equally fast, so its
-        // idle workers duplicated the smaller server's in-flight articles
-        // as a matter of course - fetching those bytes twice. Dividing by
-        // live workers asks the question the heuristic means to ask: is
-        // this article's owner actually slower. WINDOWED since M7b.2
-        // (steer module): the whole-run average judged "slow owner" with
-        // evidence as stale as the run is long.
-        let my_rate = self.steer_rate_per_worker(me);
-        // Hedge experiment: adaptive staleness bound, and a cap on how
-        // many dups staleness ALONE may issue - one per 20 completions
-        // plus a small burst allowance. The rate rule and the endgame
-        // are never capped; the cap exists so EWMA jitter on a link
-        // with occasional slow articles cannot become a dup storm.
-        let stale_bound = self.hedge_stale_bound();
-        // M7b.2 hygiene cap (design 5.2): at the cap every SPECULATIVE
-        // picker stops arming; ladder dups stay exempt (verdicts, not speed).
-        let capped = self.dup_spend_capped();
-        let done = self.done.lock_ok();
-        let hedges_ok =
-            !self.hedge || self.hedges_issued.load(Ordering::Relaxed) < 4 + done.len() as u64 / 20;
-        let mut inflight = self.inflight.lock_ok();
-        // (id, owner_rate, ladder-progress, stale-only) - endgame prefers
-        // the article CLOSEST to its verdict, normal phase the slowest
-        // owner; stale-only marks a hedge for the issue-rate cap.
-        let mut best: Option<(&String, f64, u32, bool)> = None;
-        // Tail fan-out candidates: fewest racers first, then longest on
-        // the wire - so the second idle worker picks the second
-        // straggler, not the same one.
-        let mut fan: Option<(&String, u8, Instant)> = None;
-        for (id, inf) in inflight.iter() {
-            if inf.tried_430 & my_bit != 0
-                || inf.dup_servers & my_bit != 0
-                || inf.tried_fail & my_bit != 0
-                || done.contains(id)
-            {
-                continue;
-            }
-            if endgame && inf.tried_430 != 0 {
-                if inf.server == me {
-                    continue;
-                }
-                if pipe.payload > 0 {
-                    continue; // ladder probes never ride behind a BODY
-                }
-                if inf.tried_430 & required != required {
-                    continue; // fill gate: lower levels first
-                }
-                let progress = inf.tried_430.count_ones();
-                if best.is_none_or(|(_, _, p, _)| progress > p) {
-                    best = Some((id, 0.0, progress, false));
-                }
-                continue;
-            }
-            // Tail fan-out (opt-in): endgame, healthy article, idle
-            // primary. Same-server racing allowed - see the doc above.
-            // An article younger than the age floor falls through to the
-            // normal rules instead, so switching this on never REMOVES a
-            // dup the rate rule would have issued.
-            //
-            // Refetch legs are exempt (`tried_fail != 0`): a CRC-steer
-            // (or plain failure) requeue is already a recovery fetch on
-            // a deliberately chosen server, and the same-server
-            // allowance made the recovering twin race ITS OWN steered
-            // refetches - on a damage leg that dup-storms up to one
-            // lost race per steered article (measured 33-43 dups, 0
-            // won, +15-18% raw transfer on the corrupt/splitbrain/
-            // corruptstorm matrix legs). Such an article still falls
-            // through to the slow-owner/stale rules, which a third
-            // server may legitimately win with.
-            if self.tail_fanout
-                && endgame
-                && !capped
-                && !self.speculative_blocked(my_bit, level)
-                && pipe.used == 0
-                && inf.tried_fail == 0
-                && inf.dispatched.elapsed() >= TAIL_FANOUT_MIN_AGE
-            {
-                if fan.is_none_or(|(_, d, t)| (inf.dups, inf.dispatched) < (d, t)) {
-                    fan = Some((id, inf.dups, inf.dispatched));
-                }
-                continue;
-            }
-            if inf.server == me {
-                continue;
-            }
-            if inf.dups >= 1 {
-                continue;
-            }
-            // Block-account economy: a FILL server never races on speed.
-            // It only ever joins the endgame 430-ladder above, which is
-            // gated on every live lower level having already missed. Its
-            // bytes are paid for per gigabyte, so spending them to
-            // re-fetch an article a primary is already delivering is a
-            // straight loss - and it became reachable the moment the
-            // comparison went per-worker, because a fill server has FEW
-            // connections and so looks fast by that measure exactly when
-            // it is least worth using. §5.7 widens the gate to any
-            // server flagged block_account, whatever its level.
-            if self.speculative_blocked(my_bit, level) {
-                continue;
-            }
-            let owner_rate = self.steer_rate_per_worker(inf.server);
-            // With race_envelope armed, the whole-run 2x slow-owner rule
-            // retires in favor of the envelope race + per-owner hedge
-            // bound - see `steer::speculative_arm` for the full gates.
-            let arm =
-                self.speculative_arm(inf, pipe.used, my_rate, owner_rate, stale_bound, capped);
-            if let Some(stale_only) = arm
-                && (!stale_only || hedges_ok)
-                && best.is_none_or(|(_, r, _, _)| owner_rate < r)
-            {
-                best = Some((id, owner_rate, 0, stale_only));
-            }
-        }
-        // Ladder probes and slow-owner races keep priority - they carry
-        // verdict or recovery value; the fan-out is pure speculation.
-        if let Some((_, _, _, true)) = best {
-            self.hedges_issued.fetch_add(1, Ordering::Relaxed);
-        }
-        // A ladder pick is the only one whose bytes buy a VERDICT rather
-        // than a copy of a body someone else may still deliver - which is
-        // why it alone rides a pipeline that already holds probes, and why
-        // the item it hands back is marked as one.
-        let is_ladder = matches!(best, Some((_, _, p, false)) if p > 0);
-        let rule = match best {
-            _ if is_ladder => "ladder",
-            Some((_, _, _, true)) => "stale",
-            Some(_) if self.race_envelope => "envelope",
-            Some(_) => "slow-owner",
-            None => "fanout",
-        };
-        let id = best
-            .map(|(id, _, _, _)| id.clone())
-            .or_else(|| fan.map(|(id, _, _)| id.clone()))?;
-        let inf = inflight.get_mut(&id).unwrap();
-        if std::env::var_os("NZBFAST_POOL_DEBUG").is_some() {
-            eprintln!(
-                "[pick-dup] {id}: rule={rule} me={me} owner={} owner_fail={:#b} age={:?}",
-                inf.server,
-                inf.tried_fail,
-                inf.dispatched.elapsed()
-            );
-        }
-        inf.dups += 1;
-        inf.dup_servers |= group_bits;
-        self.dups_issued.fetch_add(1, Ordering::Relaxed);
-        self.mirror_dup_issued();
-        self.note_race_burst();
-        Some(Work {
-            id,
-            attempts: 0,
-            promoted: false,
-            tried_430: 0,
-            tried_fail: 0,
-            dup: true,
-            prebyte_expiries: 0,
-            soft_430: 0,
-            fenced: false,
-            rearms: 0,
-            ladder: is_ladder,
-        })
-    }
-
-    /// TTFB-suspicion (TODO 115): the owner's read reported pre-byte
-    /// silence past the suspicion bound. Flag the article for
-    /// [`Self::pick_suspect_dup`]. The entry may already be gone (the
-    /// timer races the read's own completion) - that's a no-op.
-    fn mark_suspect(&self, id: &str) {
-        if let Some(inf) = self.inflight.lock_ok().get_mut(id) {
-            inf.suspect = true;
-            self.suspect_pending.store(true, Ordering::Release);
-            if std::env::var_os("NZBFAST_POOL_DEBUG").is_some() {
-                eprintln!("[ttfb-hedge] suspect {id} at {:?}", self.start.elapsed());
-            }
-        }
-    }
-
-    /// TTFB-suspicion dup (TODO 115, gated on [`PoolConfig::ttfb_hedge`]):
-    /// race a suspect in-flight article NOW, ahead of queued work,
-    /// instead of letting its owner wait out the full adaptive pre-byte
-    /// budget and a requeue round-trip. Same machinery as every other
-    /// dup - first answer wins, `done` arbitrates, the owner's read is
-    /// never killed - and the same economics as the stale rule: primaries
-    /// only (fill bytes are never spent on speculation), one dup per
-    /// article, each server at most once, and every pick counts against
-    /// the hedge issue-rate cap so a jittery link cannot dup-storm.
-    /// Unlike the stale rule this MAY race same-server: the owner is a
-    /// stalled TCP session, and a sibling session to the same host
-    /// routinely answers in one round-trip (the tail fan-out precedent).
-    /// And like the tail fan-out, IDLE pickers only (empty pipeline):
-    /// a busy worker's dup displaces queued work, which prices real
-    /// capacity - measured +6-15% wall on the jitter safety rig when
-    /// busy pickers joined, because a dup fetch can eat the same
-    /// pre-byte delay that raised the suspicion. Mid-run the pool is
-    /// capacity-bound and the hedge cannot win wall time there anyway;
-    /// its whole measured payout is at the supply-limited tail, where
-    /// idle pickers exist by definition.
-    fn pick_suspect_dup(
-        &self,
-        my_bit: u32,
-        group_bits: u32,
-        level: u32,
-        window_used: usize,
-    ) -> Option<Work> {
-        if !self.ttfb_hedge
-            || self.speculative_blocked(my_bit, level)
-            || window_used > 0
-            || !self.suspect_pending.load(Ordering::Acquire)
-            || self.dup_spend_capped()
-        {
-            return None;
-        }
-        let done = self.done.lock_ok();
-        if self.hedges_issued.load(Ordering::Relaxed) >= 4 + done.len() as u64 / 20 {
-            return None; // capped; the budget path still rescues
-        }
-        let mut inflight = self.inflight.lock_ok();
-        // Oldest suspicion first: it has the least budget left.
-        let picked: Option<String> = inflight
-            .iter()
-            .filter(|(id, inf)| {
-                inf.suspect
-                    && inf.dups == 0
-                    && inf.tried_430 & my_bit == 0
-                    && inf.dup_servers & my_bit == 0
-                    && inf.tried_fail & my_bit == 0
-                    && !done.contains(*id)
-            })
-            .min_by_key(|(_, inf)| inf.dispatched)
-            .map(|(id, _)| id.clone());
-        let Some(id) = picked else {
-            // Nothing suspect is still unraced - stop paying the scan
-            // until a new suspicion fires.
-            self.suspect_pending.store(false, Ordering::Release);
-            return None;
-        };
-        let inf = inflight.get_mut(&id).unwrap();
-        inf.dups += 1;
-        inf.dup_servers |= group_bits;
-        self.hedges_issued.fetch_add(1, Ordering::Relaxed);
-        self.dups_issued.fetch_add(1, Ordering::Relaxed);
-        self.mirror_dup_issued();
-        self.note_race_burst();
-        if std::env::var_os("NZBFAST_POOL_DEBUG").is_some() {
-            eprintln!("[ttfb-hedge] dup-race {id} at {:?}", self.start.elapsed());
-        }
-        Some(Work {
-            id,
-            attempts: 0,
-            promoted: false,
-            tried_430: 0,
-            tried_fail: 0,
-            dup: true,
-            prebyte_expiries: 0,
-            soft_430: 0,
-            fenced: false,
-            rearms: 0,
-            ladder: false,
-        })
     }
 }
 
@@ -4312,456 +3656,6 @@ pub fn fetch_all_sharded(
                 .map_or(0, |c| c.load(Ordering::Relaxed)),
         })
         .collect()
-}
-
-fn seal_run_blocking(
-    shared: &Arc<Shared>,
-    out: &mpsc::Sender<FetchOutcome>,
-    reason: &str,
-) -> usize {
-    if shared.workers_live.load(Ordering::Acquire) > 0
-        || shared.pending.load(Ordering::Acquire) == 0
-        || shared.aborted.load(Ordering::Acquire)
-        || shared.draining.load(Ordering::Acquire)
-    {
-        return 0;
-    }
-    let mut orphans: Vec<String> = {
-        let mut q = shared
-            .queue
-            .try_lock()
-            .expect("joined shards cannot hold queue");
-        q.drain(..).map(|w| w.id).collect()
-    };
-    orphans.extend(shared.inflight.lock_ok().drain().map(|(id, _)| id));
-    orphans.extend(shared.steer_inbox.lock_ok().drain(..).map(|w| w.id));
-    let mut sealed = 0;
-    for id in orphans {
-        if !shared.claim_done(&id) {
-            continue;
-        }
-        let _ = out.blocking_send(FetchOutcome::Failed {
-            id,
-            error: reason.to_string(),
-        });
-        shared.complete_one();
-        sealed += 1;
-    }
-    sealed
-}
-
-/// Hand a DRAINED connection to the warm pool, or close it when there is
-/// no warm pool (one-shot CLI runs). Callers must have an empty in-flight
-/// deque: a connection with unread pipelined responses on it is not
-/// reusable and must go through `quit()` instead.
-async fn park_or_quit(cfg: &PoolConfig, server: &ServerConfig, conn: Connection) {
-    match &cfg.warm {
-        Some(w) => w.give(server, conn).await,
-        None => conn.quit().await,
-    }
-}
-
-/// One spawned worker: the connect ramp, the session loop, and the run's
-/// terminal-state exit protocol. Every worker leaves through here, so the
-/// last one out is the one that seals the run (see [`seal_run`]).
-#[allow(clippy::too_many_arguments)]
-/// Hot-spare filler: keeps ONE authenticated connection parked for its
-/// server until the run ends, re-dialling whenever a worker claims it.
-/// Ends with the run (`finished`), on user abort, or on graceful drain -
-/// `drain()` deliberately sends no `finished`, so the filler must watch
-/// the flag itself or a paused job leaves it looping forever with an
-/// authenticated provider session (Codex 5 Aug M4). The 500 ms tick
-/// below bounds how late it notices. Quits whatever it still holds on
-/// every exit path. Connect failures back off 5 s - a provider at its
-/// connection cap refuses the spare and that refusal must not become a
-/// dial storm against the very cap the workers depend on.
-async fn spare_filler(shared: Arc<Shared>, server: ServerConfig, idx: usize) {
-    let mut finished = shared.finished.subscribe();
-    loop {
-        if *finished.borrow()
-            || shared.aborted.load(Ordering::Acquire)
-            || shared.draining.load(Ordering::Acquire)
-        {
-            break;
-        }
-        let empty = shared.spares[idx].lock_ok().is_none();
-        if empty {
-            match Connection::connect(&server).await {
-                Ok((c, _)) => {
-                    *shared.spares[idx].lock_ok() = Some(c);
-                }
-                Err(_) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
-                        _ = finished.wait_for(|f| *f) => break,
-                    }
-                }
-            }
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-            _ = finished.wait_for(|f| *f) => break,
-        }
-    }
-    // Guard dropped before the await - the lock must never be held
-    // across a suspension point.
-    let leftover = shared.spares[idx].lock_ok().take();
-    if let Some(c) = leftover {
-        c.quit().await;
-    }
-}
-
-async fn worker(
-    server: &ServerConfig,
-    cfg: &PoolConfig,
-    ctx: ServerCtx,
-    shared: Arc<Shared>,
-    out: mpsc::Sender<FetchOutcome>,
-    connects: Arc<AtomicU64>,
-    reconnects: Arc<AtomicU64>,
-    life: WorkerLife,
-    ramp: Duration,
-    slot: u32,
-) {
-    // The ramp paces CONNECT bursts, which is what providers punish (a
-    // provider given more sockets than it wants is 3-4x SLOWER, see
-    // conntune). A worker that reuses a parked connection performs no
-    // connect, so pacing it is pure added latency on exactly the path
-    // this mechanism exists to speed up.
-    //
-    // CLAIM one rather than asking whether one exists. A `has()` probe
-    // would let every worker in the fleet see the same single parked
-    // connection, all conclude they need no ramp, and all dial at once -
-    // reintroducing the burst in the one case the pool is nearly empty.
-    // `take` is atomic, so exactly as many workers skip the ramp as
-    // there are connections to skip it with.
-    //
-    // The claim must yield to the run finishing, for the same reason the
-    // dial in `session_loop` does (§35): `take` validates its candidate
-    // with a DATE round-trip bounded by VALIDATE_TIMEOUT, and that bound
-    // is 8 s against EXIT_GRACE's 5 s. A worker validating a peer that
-    // has gone mute therefore CANNOT return before `join_fleet` gives up
-    // on it, so the run pays the whole grace window - the exact tail §35
-    // was about, re-entered through the warm path. Losing the candidate
-    // on cancellation is already this code's contract: a validation that
-    // runs out of time leaves its DATE unanswered on the socket, so the
-    // connection is dropped rather than returned or re-parked.
-    let mut fin = shared.finished.subscribe();
-    // TODO 112: the live-target park comes BEFORE the warm claim - a
-    // slot spawned above the target must hold nothing, and a warm
-    // connection it claimed would idle out in its hands rather than
-    // serve an admitted worker. `admitted: false` means the run ended
-    // while parked; fall through so `life.retire()` still seals.
-    let admitted = match &cfg.live_target {
-        Some(t) => wait_for_slot(t, slot, &mut fin, &shared).await,
-        None => true,
-    };
-    let warm_conn = match &cfg.warm {
-        Some(w) if admitted => tokio::select! {
-            c = w.take(server) => c,
-            // Nothing left to claim it for. Fall through as if the pool
-            // were empty rather than returning: `life.retire()` below is
-            // what seals the run, and no path may skip it.
-            _ = run_over(&mut fin, &shared) => None,
-        },
-        _ => None,
-    };
-    // The ramp sleep must yield to abort/finish: at 100 connections ×
-    // 150 ms a still-ramping worker would otherwise outlive an aborted
-    // run by up to 15 s.
-    let ramped = admitted
-        && (warm_conn.is_some() || {
-            tokio::select! {
-                _ = tokio::time::sleep(ramp) => true,
-                _ = fin.wait_for(|f| *f) => false,
-            }
-        });
-    if ramped {
-        session_loop(
-            server,
-            cfg,
-            ctx,
-            shared.clone(),
-            out.clone(),
-            connects,
-            reconnects,
-            slot,
-            warm_conn,
-        )
-        .await;
-    }
-    if life.retire() {
-        seal_run(
-            &shared,
-            &out,
-            "no connection worker left to fetch this article",
-        )
-        .await;
-    }
-}
-
-/// The read-stall bookkeeping split by WHY the read ended (TODO
-/// 121.1/.2). A pre-byte adaptive expiry escalates the charged front
-/// article's OWN next-attempt budget (per-server widening alone
-/// re-floors between that article's retries) and is NOT a flap death:
-/// giving up pre-byte was our budget choice, and a heavy-tailed but
-/// healthy provider (cold storage at trained-floor budgets) produces
-/// FLAP_DEATHS of them a minute without a session actually dying -
-/// clamping it to keepers punished the wrong party. A mid-flow stall
-/// on an established session stays a death: bytes were moving and
-/// stopped, which is the wedge the flap breaker exists for.
-fn note_read_stall(
-    shared: &Shared,
-    idx: usize,
-    session_bytes: u64,
-    prebyte_expired: bool,
-    front: Option<&mut Work>,
-) {
-    if prebyte_expired {
-        if let Some(w) = front {
-            w.prebyte_expiries = w.prebyte_expiries.saturating_add(1);
-        }
-    } else if session_bytes > 0 {
-        // Count it where it happens, not at some later redial this
-        // worker may never win (a capped provider bounces most
-        // re-entries, which hid the churn entirely).
-        shared.note_flap(idx);
-    }
-}
-
-/// Enforce the pool's terminal-state invariant: every article the caller
-/// asked for gets exactly one outcome before the outcome channel closes.
-///
-/// Nothing else guarantees it. A worker bows out for good after
-/// `max_connect_attempts` consecutive connect failures, so if every
-/// provider is unreachable at startup - or every worker exhausts its
-/// reconnects mid-job - the last one returns with articles still queued,
-/// or still owned by the `inflight` map of a worker that died holding
-/// them. The fleet joins, the senders drop, and the channel closes having
-/// said NOTHING about those ids. The engine does eventually notice the
-/// unresolved slots, but by then the pool's diagnostics have lied and
-/// repair has run against a network ledger that never recorded the
-/// failures it is repairing around.
-///
-/// So whoever turns the lights out - the last worker to retire, or
-/// [`join_fleet`] afterwards for workers that panicked or were abandoned
-/// mid-flight - drains everything still non-terminal into one `Failed`
-/// per id. `claim_done` keeps that "exactly one" even against a straggler
-/// emitting its own outcome concurrently.
-///
-/// Aborted and draining runs are exempt: both are deliberate early stops
-/// whose unfinished work belongs to the caller (a resume re-fetches it),
-/// and failing it here would journal a user's pause as a download error.
-///
-/// Returns the number of articles sealed.
-async fn seal_run(shared: &Arc<Shared>, out: &mpsc::Sender<FetchOutcome>, reason: &str) -> usize {
-    // Not the last one out: on the sharded path another shard's runtime
-    // still has workers that can finish this work.
-    if shared.workers_live.load(Ordering::Acquire) > 0
-        || shared.pending.load(Ordering::Acquire) == 0
-        || shared.aborted.load(Ordering::Acquire)
-        || shared.draining.load(Ordering::Acquire)
-    {
-        return 0;
-    }
-    // Collected under the locks, emitted after: `out` is bounded, and a
-    // send that parks on a slow consumer while the queue is held would
-    // stall anything still touching the pool. Queue then inflight is the
-    // lock order every other path here uses.
-    let mut orphans: Vec<String> = Vec::new();
-    {
-        let mut q = shared.queue.lock().await;
-        orphans.extend(q.drain(..).map(|w| w.id));
-        let mut inf = shared.inflight.lock_ok();
-        orphans.extend(inf.drain().map(|(id, _)| id));
-        orphans.extend(shared.steer_inbox.lock_ok().drain(..).map(|w| w.id));
-    }
-    let mut sealed = 0usize;
-    for id in orphans {
-        if !shared.claim_done(&id) {
-            continue; // a duplicate dispatch already owns this outcome
-        }
-        let _ = out
-            .send(FetchOutcome::Failed {
-                id,
-                error: reason.to_string(),
-            })
-            .await;
-        shared.complete_one();
-        sealed += 1;
-    }
-    if sealed > 0 {
-        error!(
-            target: "pool",
-            "fleet exhausted with {sealed} article(s) unresolved - reported \
-             Failed ({reason}) so the run's terminal ledger is truthful"
-        );
-    }
-    sealed
-}
-
-/// M11 stream-mode shed: requeue a deliberately abandoned pipeline.
-/// Nothing failed, so nothing is charged an attempt. Items are inserted
-/// directly BEHIND the promoted run at the queue front, preserving their
-/// relative order: ahead of the promoted run they would re-create the
-/// very backlog the shed exists to clear; at the queue back, the head-of-
-/// file bytes a sequential player needs next would land after gigabytes
-/// of tail. Tail duplicates are dropped (the original owns the outcome).
-async fn shed_pipeline(shared: &Shared, inflight: &mut VecDeque<Work>) {
-    // B3 wire-cap: the whole pipeline leaves flight in one go.
-    shared.release_wire(inflight.len());
-    let mut q = shared.queue.lock().await;
-    let mut at = q.iter().take_while(|w| w.promoted).count();
-    while let Some(w) = inflight.pop_front() {
-        if w.dup {
-            continue;
-        }
-        shared.deregister_inflight(&w);
-        if shared.done.lock_ok().contains(&w.id) {
-            continue; // a dup already emitted this article's outcome
-        }
-        if w.promoted {
-            shared.promoted_pending.fetch_add(1, Ordering::AcqRel);
-        }
-        let idx = at.min(q.len());
-        q.insert(idx, w);
-        at += 1;
-    }
-}
-
-/// On connection death: the front in-flight article (the one that actually
-/// errored) is charged an attempt; the rest were casualties of the same
-/// connection and requeue free. Articles over budget report Failed. Tail
-/// duplicates are dropped silently - the original dispatch owns the
-/// outcome (and if the dup had already won, `done` protects the original).
-/// Resolves once this worker is no longer needed: every article terminal
-/// (`finished`), or a graceful drain under way.
-///
-/// Used to race blocking work that has no business outliving the run.
-/// `drain()` deliberately does not send `finished`, so draining has to be
-/// polled rather than awaited - same 250 ms slice as [`backoff_or_finish`],
-/// which is the resolution a human notices and far below any dial timeout.
-async fn run_over(finished: &mut tokio::sync::watch::Receiver<bool>, shared: &Shared) {
-    loop {
-        if shared.draining.load(Ordering::Acquire) {
-            return;
-        }
-        tokio::select! {
-            _ = finished.wait_for(|f| *f) => return,
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
-        }
-    }
-}
-
-/// Wait out a connect backoff, but give up the moment the RUN is done.
-///
-/// Returns false if the work finished while we slept, meaning this worker
-/// should retire rather than reconnect.
-///
-/// A bare sleep here held whole jobs open. Measured on the bench farm with
-/// one dead server in a six-server config: a job whose bytes had all
-/// arrived by 0.79 s did not RETURN until 3.17 s, so about 75% of it was
-/// spent after the last byte with nothing outstanding but a server that
-/// was never going to answer. Per-job cost of one dead provider was 4.1 s
-/// against 2.0 s without it - a dead server doubled every download.
-async fn backoff_or_finish(
-    backoff: Duration,
-    finished: &mut tokio::sync::watch::Receiver<bool>,
-    shared: &Shared,
-) -> bool {
-    if *finished.borrow() || shared.draining.load(Ordering::Acquire) {
-        return false;
-    }
-    // Race the wait against a DRAIN as well as a finish. `drain()`
-    // deliberately does not send `finished`, and nothing on the connect
-    // side checks `draining`, so a worker on an unreachable server slept
-    // out its whole ladder before retiring: with the defaults that is
-    // 2+4+8+16 s of backoff plus four dial timeouts, and the user's
-    // pause - which completes only when the fetch returns - visibly hung
-    // for the best part of a minute. The session-backoff path already
-    // slices for exactly this reason; the connect path never did.
-    let deadline = tokio::time::Instant::now() + backoff;
-    loop {
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if left.is_zero() {
-            return true;
-        }
-        let step = left.min(Duration::from_millis(250));
-        tokio::select! {
-            _ = tokio::time::sleep(step) => {}
-            _ = async { let _ = finished.wait_for(|f| *f).await; } => return false,
-        }
-        if shared.draining.load(Ordering::Acquire) {
-            return false;
-        }
-    }
-}
-
-/// `charge_front`: whether the front-of-pipeline casualty pays for the
-/// death (attempts bump + this server's `tried_fail` bit). Pass true
-/// when the front article is implicated - its own read stalled past
-/// budget, or the session never did any useful work (the RST-after-AUTH
-/// livelock the charge exists to break). Pass false for a clean
-/// connection death AFTER at least one completed body: that is the flap
-/// shape, the next-queued article is innocent, and branding it walked a
-/// whole twin-only backlog into the queue - the flapping server then
-/// sat idle for the entire drain of a bandwidth-saturated sibling
-/// (measured 7.5 s of wasted capacity per 300 MB on the chaos flap
-/// leg) because every queued article carried its bit and
-/// `other_can_take` barred a retake. A session with a completed body
-/// is progress by definition, so the uncharged requeue cannot livelock:
-/// the moment such an article is the FIRST casualty of a zero-work
-/// session, that session charges it.
-async fn requeue_or_fail(
-    shared: &Shared,
-    out: &mpsc::Sender<FetchOutcome>,
-    cfg: &PoolConfig,
-    ctx: ServerCtx,
-    inflight: &mut VecDeque<Work>,
-    error: &str,
-    charge_front: bool,
-) {
-    // Failed outcomes are emitted AFTER the queue lock drops: `out` is a
-    // bounded channel, and a send that parks on a slow consumer while the
-    // queue is locked would stall every worker that needs the queue.
-    let mut failed: Vec<String> = Vec::new();
-    // B3 wire-cap: the dead connection's whole pipeline leaves flight.
-    shared.release_wire(inflight.len());
-    {
-        let mut q = shared.queue.lock().await;
-        let mut first = true;
-        while let Some(mut w) = inflight.pop_front() {
-            let charged = first && charge_front;
-            first = false;
-            if w.dup {
-                continue;
-            }
-            shared.deregister_inflight(&w);
-            if shared.done.lock_ok().contains(&w.id) {
-                continue; // a dup already emitted this article's outcome
-            }
-            if charged {
-                w.attempts += 1;
-                w.tried_fail |= ctx.bit;
-                if w.attempts > cfg.article_retries {
-                    if shared.claim_done(&w.id) {
-                        failed.push(w.id);
-                    }
-                    continue;
-                }
-            }
-            q.push_front(w);
-        }
-    }
-    for id in failed {
-        let _ = out
-            .send(FetchOutcome::Failed {
-                id,
-                error: error.to_string(),
-            })
-            .await;
-        shared.complete_one();
-    }
 }
 
 #[cfg(test)]

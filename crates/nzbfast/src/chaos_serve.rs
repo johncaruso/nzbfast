@@ -83,6 +83,20 @@ pub struct Cli {
     /// splitbrain) or every-N (corruptstorm, desync).
     #[arg(long)]
     pub fault_count: Option<usize>,
+    /// Override how long the faulty server sits on a "no such article"
+    /// refusal, in ms. MEASURED per backbone, §146.3 item 4, 11 Aug:
+    /// 79 / 454 / 871 / 1227 / 2239 ms. That is a 28x spread, so there
+    /// is no single honest value and a fixture giving every mock
+    /// backbone the same one models a fleet that does not exist - vary
+    /// it per server. The cheapest backbone answers a 430 in one round
+    /// trip (79 ms against a 77 ms DATE); the dearest charges 211x its
+    /// own round trip, and pipelining recovers only 13-20% of that, so
+    /// it is serial work at the server rather than client latency.
+    /// A refusal ladder priced at wire speed reads exactly like a
+    /// client that has already solved it - so a fixture racing give-up
+    /// or fan-out policy against the ladder must set this.
+    #[arg(long)]
+    pub miss_delay_ms: Option<u64>,
     /// Article-ize real files from disk into the corpus (repeatable).
     /// A playable video here turns the chaos rig into a playback
     /// end-to-end fixture; --files 0 serves only these.
@@ -126,6 +140,7 @@ pub struct Opts {
     line_bps: u64,
     par2_redundancy: Option<u32>,
     fault_count: Option<usize>,
+    miss_delay_ms: Option<u64>,
     media: Vec<PathBuf>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -158,6 +173,7 @@ impl Cli {
             seed: cli.seed,
             par2_redundancy: cli.par2_redundancy,
             fault_count: cli.fault_count,
+            miss_delay_ms: cli.miss_delay_ms,
             media: cli.media,
             tls_cert: cli.tls_cert,
             tls_key: cli.tls_key,
@@ -1340,6 +1356,16 @@ pub async fn run(opts: Opts) -> Result<()> {
             alt_cert: alt_tls,
         },
     )?;
+    // --miss-delay-ms overrides AFTER the plan is drawn, so the flag
+    // works uniformly across profiles without widening `plan`'s
+    // signature (pinned by the 3c contract suite).
+    let mut plan = plan;
+    if let Some(ms) = opts.miss_delay_ms {
+        plan.chaos.missing_delay_ms = ms;
+        if let Some(t) = &mut plan.twin {
+            t.missing_delay_ms = ms;
+        }
+    }
     let twin_articles = plan.twin.is_some().then(|| articles.clone());
     // Under TLS the mocks move to their own loopback ports and the
     // fronts own the public ones; the plain path binds as it always did.

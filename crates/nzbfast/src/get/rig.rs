@@ -27,8 +27,10 @@ pub(super) fn install_password_probe(
     hub: &Option<Arc<StreamHub>>,
     out_dir: &Path,
     stream_owner: &str,
+    poster: &str,
 ) {
     let dir = out_dir.to_path_buf();
+    let poster = poster.to_string();
     let tried: std::sync::Mutex<std::collections::HashSet<([u8; 16], String)>> = Default::default();
     let hub_pw = hub.clone();
     let owner = stream_owner.to_string();
@@ -62,9 +64,22 @@ pub(super) fn install_password_probe(
             .as_ref()
             .and_then(|h| h.unpack_password_file.lock_ok().clone())
         {
-            for (i, pw) in crate::smart::read_password_file(&path)
-                .into_iter()
-                .enumerate()
+            // §99 try-order: the password last known to unlock this
+            // NZB's source site first, then this poster's, then the
+            // file top to bottom - so the wall-clock budget below is
+            // spent on the likeliest lines first.
+            let site = hub_pw
+                .as_ref()
+                .and_then(|h| h.pw_assoc_site_for(&owner))
+                .unwrap_or_default();
+            for (i, pw) in crate::smart::order_passwords(
+                crate::smart::read_password_file(&path),
+                &path,
+                &site,
+                &poster,
+            )
+            .into_iter()
+            .enumerate()
             {
                 cands.insert(
                     i,

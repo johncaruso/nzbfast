@@ -53,9 +53,17 @@ use std::io::{Read, Seek, SeekFrom};
 mod codec;
 mod ebml;
 pub mod facts;
+pub mod fmp4;
 mod isobmff;
 mod riff;
+pub mod samples;
+pub mod session;
+pub mod source;
 pub mod testmux;
+
+pub use samples::{RemuxError, Sample, SelectedTrack, TrackConfig, TrackKind};
+pub use session::{Emit, FragRef, RemuxSession};
+pub use source::Source;
 
 pub use codec::{CodecSupport, channel_layout, lookup};
 pub use facts::MediaFacts;
@@ -70,7 +78,7 @@ pub use facts::MediaFacts;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MediaInfo {
     pub container: Container,
-    pub duration_ms: Option<u64>,
+    pub(crate) duration_ms: Option<u64>,
     pub playback: PlaybackPath,
     pub video: Vec<VideoTrack>,
     pub audio: Vec<AudioTrack>,
@@ -81,7 +89,7 @@ pub struct MediaInfo {
     /// contract and added deliberately: this feature exists to answer
     /// "is this the right file", and a muxer's own name for the content
     /// survives every layer of subject-line obfuscation around it.
-    pub title: Option<String>,
+    pub(crate) title: Option<String>,
     /// True when every metadata region the container needed was read to
     /// its end without hitting a gap or a truncation. NOT "the file is
     /// fully downloaded".
@@ -156,51 +164,62 @@ pub struct VideoTrack {
     pub codec: String,
     /// Raw container identifier: MKV CodecID, MP4 sample-entry fourcc,
     /// AVI biCompression fourcc.
-    pub codec_id: String,
+    pub(crate) codec_id: String,
     pub width: u32,
     pub height: u32,
     /// Display aspect as "W:H" reduced by gcd, when the container says
     /// the pixels are not square. `None` means "as coded".
-    pub display_ar: Option<String>,
-    pub fps: Option<f64>,
-    pub bit_depth: Option<u8>,
-    pub hdr: Option<Hdr>,
-    pub profile: Option<String>,
-    pub level: Option<String>,
-    pub bitrate: Option<u64>,
+    pub(crate) display_ar: Option<String>,
+    pub(crate) fps: Option<f64>,
+    pub(crate) bit_depth: Option<u8>,
+    pub(crate) hdr: Option<Hdr>,
+    pub(crate) profile: Option<String>,
+    pub(crate) level: Option<String>,
+    pub(crate) bitrate: Option<u64>,
+    /// The RFC 6381 codec parameter ("avc1.640029"), built from the
+    /// container's own configuration record - what a browser is asked
+    /// about with `canPlayType` / `MediaSource.isTypeSupported`. `null`
+    /// when the container carried no configuration record to build it
+    /// from; the client then falls back to a coarse family test.
+    pub(crate) codec_rfc6381: Option<String>,
     /// False when the container marked the track disabled. Disabled
     /// tracks are still listed (the panel shows everything) but do not
     /// vote on [`PlaybackPath`].
-    pub enabled: bool,
-    pub default: bool,
+    pub(crate) enabled: bool,
+    pub(crate) default: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AudioTrack {
     pub codec: String,
-    pub codec_id: String,
+    pub(crate) codec_id: String,
     /// Normalised BCP 47; "und" when the muxer said nothing.
-    pub lang: String,
-    pub channels: u32,
+    pub(crate) lang: String,
+    pub(crate) channels: u32,
     /// "mono", "stereo", "5.1", "7.1", or "N ch".
-    pub channel_layout: String,
-    pub sample_rate: Option<u32>,
-    pub title: Option<String>,
-    pub default: bool,
-    pub forced: bool,
-    pub bitrate: Option<u64>,
-    pub enabled: bool,
+    pub(crate) channel_layout: String,
+    pub(crate) sample_rate: Option<u32>,
+    pub(crate) title: Option<String>,
+    pub(crate) default: bool,
+    pub(crate) forced: bool,
+    pub(crate) bitrate: Option<u64>,
+    /// The RFC 6381 codec parameter ("mp4a.40.2", "ec-3"). Same purpose
+    /// as [`VideoTrack::codec_rfc6381`]: it is how the panel finds out
+    /// whether this browser has the decoder, which is what stands
+    /// between "plays" and "plays, silently".
+    pub(crate) codec_rfc6381: Option<String>,
+    pub(crate) enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SubTrack {
-    pub codec: String,
-    pub codec_id: String,
-    pub lang: String,
-    pub title: Option<String>,
-    pub default: bool,
-    pub forced: bool,
-    pub kind: SubKind,
+    pub(crate) codec: String,
+    pub(crate) codec_id: String,
+    pub(crate) lang: String,
+    pub(crate) title: Option<String>,
+    pub(crate) default: bool,
+    pub(crate) forced: bool,
+    pub(crate) kind: SubKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -215,20 +234,20 @@ pub enum SubKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Chapter {
-    pub start_ms: u64,
+    pub(crate) start_ms: u64,
     /// "" when the container gave a chapter no name.
-    pub title: String,
+    pub(crate) title: String,
 }
 
 /// Colour signalling, resolved from the H.273 code points both
 /// containers write.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Hdr {
-    pub matrix: Option<String>,
-    pub transfer: Option<String>,
-    pub primaries: Option<String>,
-    pub max_cll: Option<u32>,
-    pub max_fall: Option<u32>,
+    pub(crate) matrix: Option<String>,
+    pub(crate) transfer: Option<String>,
+    pub(crate) primaries: Option<String>,
+    pub(crate) max_cll: Option<u32>,
+    pub(crate) max_fall: Option<u32>,
     /// The panel's badge: "HDR10", "HLG", "HDR" (wide primaries but an
     /// unknown transfer), or "SDR".
     pub format: String,
@@ -695,6 +714,7 @@ mod tests {
             profile: None,
             level: None,
             bitrate: None,
+            codec_rfc6381: None,
             enabled: true,
             default: true,
         }
@@ -712,6 +732,7 @@ mod tests {
             default: true,
             forced: false,
             bitrate: None,
+            codec_rfc6381: None,
             enabled: true,
         }
     }

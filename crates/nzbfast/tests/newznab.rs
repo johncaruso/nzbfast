@@ -1111,3 +1111,137 @@ async fn an_install_that_was_already_indexing_stays_on() {
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// TODO 131 workstream D item D3: what people searched for and could
+/// not find reaches the readout, from every surface that asks the
+/// index a question.
+///
+/// This is the test that pins the CALL SITES. The buffer, the table
+/// and the retention caps have their own unit tests; what only an e2e
+/// can say is that the newznab facade an *arr talks to and the wall's
+/// own search box both actually record, and that the readout hands
+/// back a list a human can act on.
+///
+/// The daemon's flush timer is shortened through the documented debug
+/// env seam rather than waited out - a minute is a minute.
+#[tokio::test(flavor = "multi_thread")]
+async fn searches_that_miss_reach_the_d3_readout() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-nnmiss-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let db = dir.join("index.db");
+    {
+        let mut ix = nzbkit::index::Index::open(&db).unwrap();
+        ix.ingest(
+            "alt.binaries.teevee",
+            &[
+                over(
+                    1,
+                    "\"Cat.Show.S02E01.1080p.rar\" yEnc (1/1)",
+                    "<a1@x>",
+                    1000,
+                ),
+                over(
+                    2,
+                    "\"Cat.Show.S02E01.1080p.par2\" yEnc (1/1)",
+                    "<a2@x>",
+                    200,
+                ),
+            ],
+            1_700_000_000,
+        )
+        .unwrap();
+    }
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
+    index_enabled(&cfg);
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .env("NZBFAST_SEARCH_LOG_FLUSH_SECS", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--index-db")
+            .arg(&db);
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        // An *arr asking for something we have, and for something we
+        // do not. Both are recorded; only the second is a miss.
+        let (_, body) = http_get(port, "/api?t=tvsearch&q=cat+show&apikey=sekrit");
+        assert!(body.contains("Cat.Show.S02E01"), "{body}");
+        for _ in 0..3 {
+            let (_, body) = http_get(port, "/api?t=tvsearch&q=dog+show&apikey=sekrit");
+            assert!(!body.contains("<item>"), "{body}");
+        }
+        // And the dashboard's own search card, over a different miss.
+        let (_, body) = http_get(
+            port,
+            "/api?mode=index_search&q=Dune.Part.Three&apikey=sekrit&output=json",
+        );
+        assert!(body.contains("\"results\":[]"), "{body}");
+
+        // Wait for a flush - the query path only ever touched memory.
+        let mut readout = String::new();
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let (code, body) = http_get(
+                port,
+                "/api?mode=search_misses&apikey=sekrit&output=json&limit=20",
+            );
+            assert_eq!(code, 200, "{body}");
+            if body.contains("dog show") {
+                readout = body;
+                break;
+            }
+        }
+        assert!(
+            readout.contains("\"q\":\"dog show\""),
+            "the *arr's miss never reached the readout: {readout}"
+        );
+        // Normalized, from the surface that asked, counted three times.
+        assert!(readout.contains("\"surface\":\"newznab\""), "{readout}");
+        assert!(readout.contains("\"n\":3"), "{readout}");
+        // The dashboard's miss too, under the wall surface and its
+        // normalized spelling.
+        assert!(readout.contains("\"q\":\"dune part three\""), "{readout}");
+        assert!(readout.contains("\"surface\":\"wall\""), "{readout}");
+        // What we DID answer is recorded but is not a miss.
+        assert!(!readout.contains("\"q\":\"cat show\""), "{readout}");
+        assert!(readout.contains("\"searches\":5"), "{readout}");
+        assert!(readout.contains("\"distinct\":3"), "{readout}");
+        assert!(readout.contains("\"zero_searches\":4"), "{readout}");
+        assert!(readout.contains("\"missing\":2"), "{readout}");
+
+        // The privacy clear leaves nothing behind.
+        let (_, body) = http_get(port, "/api?mode=search_log_clear&apikey=sekrit&output=json");
+        assert!(body.contains("\"status\":true"), "{body}");
+        let (_, body) = http_get(
+            port,
+            "/api?mode=search_misses&apikey=sekrit&output=json&days=365",
+        );
+        assert!(body.contains("\"misses\":[]"), "{body}");
+        assert!(body.contains("\"searches\":0"), "{body}");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

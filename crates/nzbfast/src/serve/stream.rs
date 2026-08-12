@@ -225,10 +225,23 @@ pub(super) fn stream_request(
                 let nzo = job.lock_ok().nzo_id.clone();
                 d.history.lock_ok().retain(|x| !Arc::ptr_eq(x, &job));
                 d.queue.lock_ok().push_front(job);
-                // Back into the queue: the history store must forget it
-                // or a restart would show it in both places.
-                d.history_tombstone(&[nzo]);
-                d.save_queue();
+                // Queue first, tombstone second - the same ordering as
+                // `Daemon::retry`, for the same reason. Tombstoning first
+                // and rewriting queue.json afterwards meant a kill or a
+                // failed write in between deleted the record from history
+                // while the queue snapshot had never heard of it: it
+                // survived in NEITHER store (Codex sweep 12 Aug F1).
+                if d.save_queue() {
+                    // Back into the queue: the history store must forget it
+                    // or a restart would show it in both places.
+                    d.history_tombstone(&[nzo]);
+                } else {
+                    error!(
+                        target: "library",
+                        "{nzo}: fetching now, but the queue could not be written - its \
+                         library record was left in place rather than deleted"
+                    );
+                }
                 info!(target: "library", "/stream/{id} → fetching now");
             } else {
                 // A download that already FINISHED: its bytes are on
@@ -353,6 +366,34 @@ pub(super) fn stream_request(
 // §73 phase 1: the preview-and-verify probe
 // ---------------------------------------------------------------------------
 
+/// The three states of the `preview` setting, in the order the settings
+/// dropdown offers them.
+///
+/// `off` refuses `/preview/probe` outright: no half-downloaded file is
+/// read for anyone, and the dashboard drops the panel. `metadata-only`
+/// reads the container and says what the file is, with the handoff to
+/// the user's own player that has always been there. `full` adds a
+/// player in the page for the files this browser can actually open -
+/// which is a question only the browser can answer, so the daemon says
+/// what the file IS and the page decides what it can do with it.
+pub(super) const PREVIEW_MODES: [&str; 3] = ["off", "metadata-only", "full"];
+
+/// Default: what the file is, without a player. The verification value
+/// is the part everyone wants; a video element in the page is a taste.
+pub(super) const PREVIEW_DEFAULT: &str = "metadata-only";
+
+/// The current mode, normalised - anything unrecognised reads as the
+/// default rather than as "off", so a hand-edited settings.json cannot
+/// silently disable a feature the user never turned off.
+pub(super) fn preview_mode(d: &Daemon) -> String {
+    let m = d.preview.lock_ok().clone();
+    if PREVIEW_MODES.contains(&m.as_str()) {
+        m
+    } else {
+        PREVIEW_DEFAULT.to_string()
+    }
+}
+
 /// The still-downloading main video of `id`, as something the probe can
 /// read: its output name, its writer, and a reader that answers
 /// `WouldBlock` for bytes that have not landed.
@@ -375,6 +416,32 @@ pub(super) fn open_live_probe(
     Arc<nzbkit::disk::FileWriter>,
     nzbkit::mediaprobe::LiveProbeReader,
 )> {
+    let (name, w, f, crypt) = open_live_media(d, id)?;
+    let r = nzbkit::mediaprobe::LiveProbeReader {
+        w: w.clone(),
+        f,
+        crypt,
+        pos: 0,
+    };
+    Some((name, w, r))
+}
+
+/// The same resolution, one step earlier: the open file and its
+/// decryptor, before either reader wraps them.
+///
+/// [`open_live_probe`] hands back the non-blocking reader a poll wants;
+/// the remux path needs the same file under a reader that WAITS, so the
+/// step both share lives here rather than being written twice with one
+/// of the two copies eventually forgetting the encrypted-store case.
+pub(super) fn open_live_media(
+    d: &Daemon,
+    id: &str,
+) -> Option<(
+    String,
+    Arc<nzbkit::disk::FileWriter>,
+    std::fs::File,
+    Option<nzbkit::extract::StreamCrypt>,
+)> {
     let live = d.active_stream.lock_ok().as_deref() == Some(id);
     if !live {
         return None;
@@ -388,13 +455,7 @@ pub(super) fn open_live_probe(
         Some(nzbkit::extract::StreamOpen::Encrypted(f, c)) => (f, Some(c)),
         _ => (std::fs::File::open(&w.path).ok()?, None),
     };
-    let r = nzbkit::mediaprobe::LiveProbeReader {
-        w: w.clone(),
-        f,
-        crypt,
-        pos: 0,
-    };
-    Some((name, w, r))
+    Some((name, w, f, crypt))
 }
 
 /// The finished main video of `job` on disk. A private `out_dir` is all

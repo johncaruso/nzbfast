@@ -122,13 +122,24 @@ fn restore_job_settings(
             warn!(target: "unlock", "could not create {}: {e}", path.display());
         }
         // Mirror for the in-stream probe (it holds a hub, not the
-        // daemon).
-        *daemon.hub.unpack_password_file.lock_ok() = Some(path);
+        // daemon), and for the on-disk extraction ladder (which holds
+        // neither - see `smart::set_operator_password_file`).
+        *daemon.hub.unpack_password_file.lock_ok() = Some(path.clone());
+        crate::smart::set_operator_password_file(Some(path));
     }
     if let Some(m) = saved.get("password_prompt").and_then(Value::as_str)
         && matches!(m, "now" | "done" | "never")
     {
         *daemon.password_prompt.lock_ok() = m.to_string();
+    }
+    // §73 phase 2. An unrecognised value is ignored rather than
+    // rejected: the field is read through `preview_mode`, which falls
+    // back to the default, and a settings.json a human edited badly
+    // should not turn a feature off silently.
+    if let Some(m) = saved.get("preview").and_then(Value::as_str)
+        && PREVIEW_MODES.contains(&m)
+    {
+        *daemon.preview.lock_ok() = m.to_string();
     }
     // TODO 101: the mode is read by the unpack ladder through
     // `eatvol`, so mirror it whether it was saved or defaulted -
@@ -534,6 +545,12 @@ fn restore_ui_and_index_settings(daemon: &Arc<Daemon>, saved: &serde_json::Map<S
             .index_nzbimport_budget
             .store(v.min(2000), Ordering::Relaxed);
     }
+    // §131 D3. A privacy switch that silently comes back ON after a
+    // restart is worse than not having one, so this restore is the
+    // load-bearing third of the three lists.
+    if let Some(v) = saved.get("index_search_log").and_then(Value::as_bool) {
+        daemon.index_search_log.store(v, Ordering::Relaxed);
+    }
     #[cfg(feature = "indexer")]
     if let Some(v) = saved.get("predb_max_rows").and_then(Value::as_u64) {
         daemon.predb_max_rows.store(
@@ -694,6 +711,32 @@ pub(super) fn seed_scoreboard_source(settings_path: &Path) -> Mutex<String> {
             .unwrap_or("")
             .trim()
             .to_string(),
+    )
+}
+
+/// Which categories the daily sample asks for. Empty (the default, and
+/// what an unreadable or nonsense value falls back to) = all four: a
+/// setting that can only ever REDUCE the day's requests has to fail
+/// towards the full sample, never towards a silently narrowed one.
+pub(super) fn seed_scoreboard_cats(settings_path: &Path) -> Mutex<Vec<String>> {
+    Mutex::new(
+        load_settings(settings_path)
+            .get("scoreboard_cats")
+            .and_then(|v| match v {
+                // save_setting persists the parsed Vec<String>; the
+                // comma string is accepted too so a hand-written
+                // settings.json works.
+                Value::Array(a) => Some(
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .and_then(|s| parse_scoreboard_cats(&s).ok())
+            .unwrap_or_default(),
     )
 }
 
@@ -866,6 +909,18 @@ pub(super) fn seed_auto_retry_secs(_settings_path: &Path, auto_retry_mins: u64) 
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(auto_retry_mins * 60),
+    )
+}
+
+/// Minutes of accumulated no-connection time before a server is retired
+/// for the rest of a job (0 = never). Defaults to the pool's own shipped
+/// budget, so the two cannot drift apart by editing only one of them.
+pub(super) fn seed_server_outage_mins(settings_path: &Path) -> AtomicU64 {
+    AtomicU64::new(
+        load_settings(settings_path)
+            .get("server_outage_mins")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(nzbkit::pool::default_outage_mins()),
     )
 }
 
@@ -1337,11 +1392,15 @@ pub(super) fn spawn_core_tasks(
     tasks::spawn_watch_folder(daemon);
 
     tasks::spawn_memory_trim(daemon);
+    tasks::spawn_usage_flush(daemon);
 
     tasks::spawn_auto_speed(daemon, config);
 
     #[cfg(feature = "indexer")]
     tasks::spawn_group_catalog(daemon, config);
+
+    #[cfg(feature = "indexer")]
+    tasks::spawn_search_log_writer(daemon);
 
     // Full scans, the tip watcher and VACUUM all write the same SQLite
     // file. A shared pass gate makes the exclusion two-way: checking an
@@ -1395,6 +1454,11 @@ pub(super) fn spawn_core_tasks(
     tasks::spawn_rss_poller(daemon, settings_path, feeds)?;
 
     tasks::spawn_watchlist_watcher(daemon, settings_path);
+
+    // §151: the external list sources that FILL that watchlist. After
+    // it, so the watcher has already restored the user's own rows by the
+    // time the first sync wakes it.
+    spawn_list_sync(daemon, settings_path);
 
     tasks::spawn_download_worker(daemon, config, &index_pass_gate, mem_budget);
 
@@ -1761,6 +1825,8 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         index_probe7z_budget: AtomicU64::new(150),
         index_pesto: std::sync::atomic::AtomicBool::new(true),
         index_pesto_budget: AtomicU64::new(120),
+        index_search_log: std::sync::atomic::AtomicBool::new(true),
+        search_log_buf: Mutex::new(std::collections::HashMap::new()),
         index_nzbimport: std::sync::atomic::AtomicBool::new(true),
         index_nzbimport_budget: AtomicU64::new(300),
         bench_interval: AtomicU64::new(0),
@@ -1815,6 +1881,7 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         cleanup_exts: Mutex::new(Vec::new()),
         password_file: Mutex::new(config.with_file_name("passwords.txt")),
         password_prompt: Mutex::new("done".to_string()),
+        preview: Mutex::new(PREVIEW_DEFAULT.to_string()),
         unpack_eat_volumes: Mutex::new("off".to_string()),
         // Loaded from settings.json below (next to smart_folders); the
         // reclassify flag starts set so startup reconciles the stored
@@ -1895,6 +1962,7 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         scoreboard_enabled: seed_scoreboard_enabled(&settings_path),
         scoreboard_url: seed_scoreboard_url(&settings_path),
         scoreboard_source: seed_scoreboard_source(&settings_path),
+        scoreboard_cats: seed_scoreboard_cats(&settings_path),
         scoreboard_key: seed_scoreboard_key(&settings_path),
         scoreboard_calibrate: seed_scoreboard_calibrate(&settings_path),
         scoreboard_running: std::sync::atomic::AtomicBool::new(false),
@@ -1947,6 +2015,7 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
                 .and_then(|v| v.as_object().cloned())
                 .unwrap_or_default(),
         ),
+        run_usage_flushed: Mutex::new(Default::default()),
         pause_until: Mutex::new(None),
         pause_gen: AtomicU64::new(0),
         connections: std::sync::atomic::AtomicUsize::new(connections.max(1)),
@@ -1959,6 +2028,7 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         pause_source: std::sync::Mutex::new("user"),
         limit_source: std::sync::Mutex::new("user"),
         auto_retry_secs: seed_auto_retry_secs(&settings_path, auto_retry_mins),
+        server_outage_mins: seed_server_outage_mins(&settings_path),
         quota: AtomicU64::new(quota.unwrap_or(0)),
         quota_spent: AtomicU64::new(0),
         quota_reset: AtomicBool::new(false),
@@ -2038,6 +2108,7 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         watchlist: Mutex::new(Vec::new()),
         watch_state: Mutex::new(Default::default()),
         watch_now: tokio::sync::Notify::new(),
+        lists: Default::default(),
         arr_giveup_threshold: AtomicU64::new(0),
         arr_instances: Mutex::new(Vec::new()),
         giveup: Arc::new(Mutex::new(Default::default())),

@@ -240,7 +240,15 @@ pub(super) fn build_rig(
         extractor.set_password(pw);
     }
     // One-pass encrypted plan, increment A: see install_password_probe.
-    install_password_probe(&extractor, hub, out_dir, stream_owner);
+    // The dominant poster is the §99 try-order key the probe can read
+    // off the NZB itself; the source-site key rides the hub.
+    install_password_probe(
+        &extractor,
+        hub,
+        out_dir,
+        stream_owner,
+        &crate::smart::dominant_poster(nzb),
+    );
     // That AES pass replaces the ciphertext this journal's placement
     // records point INTO. Once a file holds plaintext it is no longer the
     // bytes the journal describes, so a resume that still trusted it would

@@ -190,6 +190,15 @@ nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
 <div class="tip"><b>Vinkki</b>Ajoitko jo SABnzbdiä tai NZBGetiä? Ohita tunnusten kirjoittaminen:
 Asetukset → Usenet-palvelimet → <b>Tuo SABnzbdistä / NZBGetistä…</b> löytää olemassa olevan
 asennuksesi ja kopioi sen palvelimet. Komentorivillä on myös <code>nzbfast import-sab</code>.</div>
+<p>Tervetulokortti kysyy myös, <b>miten aiot käyttää nzbfastia</b>, neljällä
+vaihtoehdolla: sovellus kuten Sonarr tai Radarr ohjaa sitä, siirryt SABnzbdistä,
+siirryt NZBGetistä, tai vain sinä, tästä koontinäytöstä. Valinta ei itsessään
+muuta mitään. Se näyttää lyhyen tarkistuslistan - jokainen suositus asetuksen
+omalla nimellä, sen nykyinen arvo, suositeltu arvo ja yksi rivi perusteluja -
+ja <b>Käytä</b> asettaa vain ne rivit, jotka ruksaat. Jokainen rivi on
+tavallinen asetus, jonka voit muuttaa takaisin itsekseen jälkeenpäin, ja sama
+lista pysyy myöhemminkin saatavilla kohdassa Asetukset → <b>Suositellut
+asetukset käyttötapasi mukaan</b>.</p>
 
 <h3 id="firstrun-key">API-avaimesi</h3>
 <p>Aidosti uudessa asennuksessa nzbfast tekee itselleen API-avaimen, kun daemon
@@ -353,6 +362,14 @@ indeksoijaa tarvita. Tilarivi näyttää skannausedistymisen; <b>Skannaa nyt</b>
 <p>Lisää nimikkeitä nimellä - myös sellaisia, joita ei ole vielä julkaistu. Kun vastaava julkaisu
 ilmestyy indeksiin, se napataan automaattisesti laatuvalintojen ja
 päivityssääntöjen mukaan (parempi kopio korvaa huonomman).</p>
+<p>Kortti voi myös seurata listaa, jota pidät Plexissä. Lisää <b>listalähde</b>: joko yhdistä
+Plex-tilisi (hyväksyt lyhyen koodin Plexin omalla sivulla, joten salasanasi ei koskaan päädy
+nzbfastille) tai liitä Plex-seurantalistasi osoite. Käsittele osoitetta kuin salasanaa - kuka
+tahansa, jolla se on, voi lukea listasi - ja siksi se peitetään tallennuksen jälkeen.
+Synkronoidut nimikkeet näkyvät vain luku -riveinä omiesi rinnalla. Yhdistetty tili näkee koko
+listasi, joten nimikkeen poistaminen sieltä lopettaa sen seurannan myös täällä (valmiisiin
+latauksiin ei kosketa); osoite näyttää vain uusimmat kohteet, joten puuttuva nimike on voinut
+vain vieriä pois listalta eikä mitään poisteta. Kummankin toiminnan voi vaihtaa lähdekohtaisesti.</p>
 <h3 id="dash-history">Historia</h3>
 <p>Viimeaikaiset lataukset, kukin omalla rivillään. Epäonnistuneet työt tarjoavat <b>Yritä uudelleen</b>
 (jatkaa journaalista). Salatut arkistot näyttävät 🔑-lukituksen avauksen - syötä
@@ -468,6 +485,31 @@ joita parhaillaan tyhjennetään, saavat <b>siivottu</b>-merkin.</li>
 tiedosto. Avaa se latauksen aikana, tarkista että sisältö, kieli ja laatu ovat mitä
 odotit, ja keskeytä ajoissa jos eivät ole - sen sijaan että huomaisit sen vasta koko
 latauksen jälkeen.</p>
+<p>Ensimmäinen puoli tästä on jo sivulla. Avaa latauksen rivi jonossa (tai
+historiassa), niin laatikko näyttää mitä videotiedoston sisällä on, luettuna
+tähän mennessä saapuneista tavuista: resoluutio, video- ja äänikoodekit,
+äänen kielet, tekstitykset, luvut. Julkaisu, joka on väärä leikkaus, väärä
+kieli tai skaalattu ylöspäin, paljastaa itsensä tuossa paneelissa kauan ennen
+latauksen valmistumista.</p>
+<p>Sivu selvittää myös, pystyykö <em>tämä</em> selain toistamaan tiedoston, ja
+sanoo sen arvailun sijaan: selaimet eroavat (Safari purkaa HEVC:n siinä missä
+Chrome ei, eikä juuri mikään pura AC-3- tai DTS-ääntä), joten kysymys esitetään
+juuri sille selaimelle, jossa olet. Kun vastaus on kyllä, <b>▶ Toista</b> avaa
+soittimen suoraan sivulle, joka näyttää tiedoston sen latautuessa. Useimmat
+julkaisut ovat MKV-tiedostoja, joita monet selaimet kieltäytyvät avaamasta,
+vaikka osaavat purkaa kaiken niiden sisällä, joten nzbfast pakkaa ne uudelleen
+toiston aikana. Mitään ei koodata uudelleen: kuva ja ääni ovat alkuperäiset
+tavut toisessa kuoressa, ja toiseen kohtaan hyppääminen toimii yhä. Jos
+ääniraita on sellainen, jota tämä selain ei osaa purkaa, ja julkaisussa on
+toinen, jonka se osaa, soitetaan tuo toinen raita, jottei kuva tule mykkänä.
+Vasta kun selaimelta puuttuu purkaja itse videolle, painike luovuttaa tiedoston
+omalle mediasoittimellesi, kuten alla kuvataan.</p>
+<p>Yksi asetus hallitsee kaikkea tätä: Asetukset → Käyttöliittymä → <b>Tarkista
+tiedosto latauksen aikana</b>. <b>Vain tiedot</b>, oletus, näyttää paneelin
+eikä tarjoa sivun sisäistä soitinta; <b>Tiedot ja soitin</b> lisää soittimen;
+<b>Pois</b> estää tiedoston lukemisen kokonaan - sen ollessa pois mikään ei
+avaa puoliksi ladattua tiedostoa kenellekään.</p>
+<p>Tarkistaaksesi sen sijaan omassa mediasoittimessasi:</p>
 <ul>
 <li><b>▶ Toista</b> seinällä (tai <code>/m3u/&lt;id&gt;</code>) antaa mediasoittimellesi
 URL:n; daemon käynnistää tai käyttää uudelleen sen takana olevaa latausta.</li>
@@ -500,8 +542,20 @@ tahansa palvelin mukaan pooliin tai pois siitä. Jokaisella palvelimella on:</p>
 <tr><td>Yhteydet</td><td>Palvelinkohtaiset samanaikaiset yhteydet. Käytä <b>Yhteyksien viritystä</b> (<a href="#performance">§13</a>) löytääksesi kunkin palveluntarjoajan makeimman kohdan sen sijaan, että arvaisit korkealta.</td></tr>
 <tr><td>Taso / porras</td><td>0 = ensisijainen; korkeammat tasot ovat täyttöpalvelimia, joilta kysytään vain artikkeleita, jotka jokainen alempi taso jätti väliin. Aseta rajoittamattomat tilit tasolle 0, lohkotilit tasolle 1+.</td></tr>
 <tr><td>Lohkon koko (GB)</td><td>Lohko- (maksa-per-GB) tileille: nzbfast seuraa elinaikaista käyttöä tätä vasten ja lakkaa käyttämästä palvelinta, kun se on käytetty loppuun (varoitus 85%:ssa).</td></tr>
+<tr><td>Jokainen tavu laskutetaan</td><td>Kytke päälle mitatulle tilille. Latauksesi käyttävät palvelinta täsmälleen kuten ennenkin; se mikä loppuu on nzbfastin oman liikenteen lähettäminen sille - automaattinen yhteysviritin, järjestelmän suorituskykytestin verkko-osuus ja sisäänrakennetun indeksin otsakeskannaukset ohittavat sen kaikki. Riippumaton tasosta ja lohkon koosta, koska mitattu tili voi olla ainoa palveluntarjoajasi ja rajoittamaton voi istua tasolla 2. Oletuksena pois. Manuaalinen <b>Test</b> kohdassa <b>Yhteyksien viritys</b> (<a href="#performance">§13</a>) toimii yhä merkityllä palvelimella ja kysyy ensin, koska siinä sinä itse valitset kuluttamisen.</td></tr>
 </table></div>
 <p><b>Jätä hieman pelivaraa tilisi yhteysrajan alle.</b> Yhteysmäärän asettaminen hieman rajan alle ei maksa mitään: siirtonopeus tasaantuu jo hyvissä ajoin ennen viimeistä paria yhteyttä, ja <b>Yhteyksien viritys</b> (<a href="#performance">§13</a>) päätyy joka tapauksessa sen alle. Juuri nuo vapaat paikat päästävät toisen laitteen, toisen ohjelman tai katkenneen yhteyden uusintayrityksen silti sisään sen sijaan, että ne torjuttaisiin tämän varatessa jokaisen paikan.</p>
+<p><b>Sinun ei tarvitse huolehtia koneesi avointen tiedostojen rajasta.</b> Järjestelmä
+laskee jokaisen yhteyden avoimeksi tiedostoksi, ja macOS käynnistää ohjelman 256 tiedoston
+rajalla, jonka täysi yhteysmäärä usealla palvelimella voi ylittää. macOS:ssä ja Linuxissa
+nzbfast nostaa rajaa itse käynnistyessään: se pyytää 65536 avointa tiedostoa ja laskee
+siitä lukuihin 16384, 4096 ja 1024, kunnes järjestelmä suostuu, eikä koskaan yli
+järjestelmän asettaman kovan rajan, ja se jatkaa saamallaan rajalla, jos jokainen askel
+torjutaan. Windowsissa ei ole tällaista prosessikohtaista rajaa. Muut ohjelmat tyytyvät
+siihen rajaan, jonka komentotulkki niille antoi, ja ohjelma, jolta avoimet tiedostot
+loppuvat kesken työn, voi pysähtyä kertomatta lokissaan syytä. Aseta siis kunkin
+palvelimen yhteydet sen mukaan, mitä tilauksesi sallii, yllä mainittu pelivara
+vähennettynä, etkä sen mukaan, mitä arvelet koneen kestävän.</p>
 <h3 id="passwords">Miten palveluntarjoajien salasanat tallennetaan</h3>
 <p>Palvelinsalasanat tiedostossa <code>config.local.json</code> ovat <b>hämärrettyjä,
 eivät salattuja</b>. Ne tallennetaan muodossa <code>obf1:</code> ja sen perässä
@@ -634,6 +688,7 @@ julkaistiin sen sijaan että niitä arvattaisiin.</p>
 <tr><td>Sisällytä julkaisuryhmä</td><td>Lopussa oleva <code>-GROUP</code>-merkintä.</td></tr>
 <tr><td>Poista roskatiedostot</td><td><b>Oletuksena päällä.</b> Poistaa yli jääneet <code>.par2</code>-, <code>.nzb</code>-, <code>.sfv</code>- ja <code>.nfo</code>-tiedostot sekä näytepätkät valmiista elokuva- ja sarjakansioista. Ei koskaan videota eikä sen tekstityksiä.</td></tr>
 <tr><td>Säilytä vain mediatiedosto</td><td><b>Oletuksena pois, ja tuhoava:</b> poistaa pysyvästi kaiken kansiosta paitsi videon (tai videot) ja tekstitykset. Kausipaketin jokainen jakso säilytetään. Ohittaa asetuksen <b>Poista roskatiedostot</b>, kun molemmat ovat päällä.</td></tr>
+<tr><td>Nimeä lataukset .nzb-tiedoston mukaan</td><td><b>Oletuksena pois.</b> Valmis kansio ja sen päätiedosto saavat <code>.nzb</code>-tiedoston nimen sen siistityn nimen sijaan, joka julkaisusta pääteltiin. Vain suurin tiedosto nimetään uudelleen: jaksopaketin loput, näyte, tekstitykset ja <code>.nfo</code> pitävät nimet, joilla ne saapuivat. Mikä tahansa kategoria voi sallia tai kieltää sen itsekseen kohdassa <b>Omat kategoriat</b>, ja juuri niin saat sen yhdelle lataustyypille etkä toiselle.</td></tr>
 <tr><td>Keep the other words in the name</td><td><b>Päällä oletuksena.</b> Urheilu, kilpailut ja muut tapahtumat ovat usein yksi ja sama nimi toistettuna koko kauden ajan, vain sanan tai kahden päässä toisistaan - "Round11 Hungary Race" vastaan "Round11 Hungary Qualifying". Noiden sanojen säilyttäminen on juuri se, mikä estää koko kautta luhistumasta samaksi nimeksi. Pätee vain siellä, missä nimeä ei voitu siistiä muulla tavoin, joten tavallisiin elokuviin ja jaksoihin ei kosketa.</td></tr>
 </table></div>
 <p class="dim">Koko ryhmä ajetaan korjauksen ja purun jälkeen ja ennen kohtaa <b>Siirrä
@@ -737,6 +792,14 @@ kaikki muutkin, ne tallentuvat tiedostoon <code>settings.json</code>.</p>
 <p>Yksinkertaisin automaatio: lisää nimike koontinäytölle, aseta laatuvalinnat,
 valmis. Uudet julkaisut napataan niiden ilmestyessä indeksoituihin ryhmiisi;
 parempilaatuiset kopiot päivittävät aiemmat nappaukset; kalenterinäkymä näyttää, mitä on tulossa.</p>
+<p><b>Listalähde</b> syöttää seurantalistaa Plexissä pitämästäsi listasta kahdella tavalla:
+yhdistä Plex-tilisi hyväksymällä lyhyt koodi Plexin sivulla, tai liitä Plex-seurantalistan
+osoite. Osoite on tunnistautumistieto - se antaa haltijalleen oikeuden lukea listan - joten se
+peitetään tallennuksen jälkeen. Poistojen synkronointi eroaa tiloittain tarkoituksella:
+yhdistetty tili näkee koko listan, joten sieltä poistetun nimikkeen seuranta loppuu myös täällä
+(jo valmistuneet lataukset säilyvät); osoitesyöte sisältää vain uusimmat kohteet, joten
+puuttuminen ei todista mitään ja nimikkeitä vain lisätään. Molemmat oletukset voi muuttaa
+lähdekohtaisesti.</p>
 <h3 id="auto-rss">RSS-syötteet</h3>
 <p>Asetukset → RSS: mikä tahansa newznab/indeksoija-RSS-URL syötekohtaisella välillä, kategorialla ja
 suodatussäännöillä (nimikemallit, kokorajat). Vastaavat kohteet ladataan
@@ -751,8 +814,63 @@ plex/Jellyfin-valmiina ilman ulkoista työkalua.</p>
 vuorokaudenajan mukaan.</p>
 <h3>Komentosarjat</h3>
 <p>Jälkikäsittelykomentosarja saa SABnzbdin positionaaliset argumentit ja
-<code>SAB_*</code>-ympäristömuuttujat - laaja SAB-komentosarjojen ekosysteemi toimii
-sellaisenaan.</p>
+<code>SAB_*</code>-ympäristömuuttujat: laaja SAB-komentosarjojen ekosysteemi toimii
+sellaisenaan. NZBGetin murre tarjotaan sen rinnalla - <code>NZBPP_*</code>-muuttujat
+(<code>DIRECTORY</code>, <code>NZBNAME</code>, <code>CATEGORY</code>,
+<code>TOTALSTATUS</code>, <code>PARSTATUS</code>, <code>UNPACKSTATUS</code>,
+<code>FINALDIR</code>) ja poistumiskoodit 93/94/95 - joten myös NZBGet-laajennus-
+komentosarjan ydinlogiikka toimii. Kartoitus on rehellinen eikä emulointi:
+korjaus ja purku tapahtuvat yksivaiheisen latauksen sisällä, joten puhdas
+valmistuminen raportoi <code>PARSTATUS=0</code> ja korjattu <code>PARSTATUS=2</code>.
+Komentosarjakohtaisia valintamuotoja (<code>NZBPO_*</code>) ei tarjota.
+Komentosarja voi jättää apuohjelman pyörimään taustalle poistuessaan, eikä
+nzbfast tapa sitä, mutta nzbfast lakkaa lukemasta komentosarjan tulostetta
+heti kun itse komentosarja päättyy: anna taustalle jätetylle apuohjelmalle
+oma tulosteenohjaus, tai se pysäytetään heti ensimmäisellä kerralla, kun se
+yrittää tulostaa.</p>
+<h3>Jonoa edeltävä komentosarja</h3>
+<p>Toinen koukku ajetaan <em>ennen</em> kuin lataus tulee jonoon
+(Asetukset → Kansiot → Jonoa edeltävä komentosarja), SABnzbdin pre-queue-sopimuksella:
+argumentit <code>name, pp, category, script, priority, size, group</code> sekä
+<code>SAB_*</code>-ympäristö. Sen tulosteen ensimmäinen rivi hyväksyy (<code>1</code>)
+tai hylkää (<code>0</code>) latauksen; rivit 2-7 voivat nimetä sen uudelleen, asettaa
+<code>pp</code>:n, vaihtaa kategorian, valita komentosarjan tai vaihtaa prioriteetin
+(tyhjät rivit pitävät oletuksen). Hylätty lataus menee historiaan Epäonnistuneena
+syyn kera, ja Uudelleenyritys historiasta tuo sen takaisin kysymättä komentosarjalta
+uudestaan. Koukku ei voi koskaan hukata latausta: jos komentosarja puuttuu,
+kaatuu, ylittää aikabudjettinsa tai tulostaa jotain, mikä ei ole tuomio,
+lisäys etenee koskemattomana ja loki kertoo miksi.</p>
+<h3>Elinkaaritapahtumat ja allekirjoitetut webhookit</h3>
+<p>Jokainen työn merkkipaalu on versioitu tapahtuma: <code>job.added</code>,
+<code>job.started</code>, <code>job.finishing</code>, <code>job.repaired</code>,
+<code>job.completed</code>, <code>job.failed</code>, sekä
+<code>queue.idle</code>, <code>giveup.tripped</code>, <code>disk.low</code>,
+<code>storage.slow</code> ja <code>quota.reached</code>. Jokainen kantaa
+<code>schema_version</code>-kentän (nyt 1; uusia avaimia voi ilmestyä ilman
+versiokorotusta - ohita se, mitä et tunne), monotonisen <code>seq</code>-arvon ja
+<code>at</code>-aikaleiman millisekunteina.</p>
+<p>Vastaanottaaksesi ne lisää <b>webhook</b>-ilmoituskohde
+(Asetukset → Automaatio) ja listaa sen <i>events</i>-kenttään tapahtumalajit,
+jotka sen pitää saada - tarkat lajit tai etuliite kuten <code>job.*</code>. Kohde
+saa sitten yhden POSTin per tapahtuma: tapahtuman JSONin runkona sekä
+<code>delivery</code>-tunnisteen (<code>&lt;boot&gt;-&lt;seq&gt;</code>, kahvan jolla
+kaksoiskappaleet karsitaan), <code>X-NzbFast-Event</code>- ja
+<code>X-NzbFast-Delivery</code>-otsakkeet, ja - kun kohteella on allekirjoitus-
+salaisuus - <code>X-NzbFast-Signature: sha256=&lt;hex&gt;</code>, HMAC-SHA256:n
+täsmälleen rungon tavuista salaisuudellasi (sama muoto, jota GitHubin webhookit
+käyttävät). Varmenna Pythonilla:</p>
+<pre><code>expected = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
+ok = hmac.compare_digest(expected, request.headers["X-NzbFast-Signature"])</code></pre>
+<p>Toimitus on vähintään-kerran: kohdetta, jota ei tavoiteta, yritetään uudelleen
+10&nbsp;s, 60&nbsp;s ja 5&nbsp;min kuluttua, minkä jälkeen se pudotetaan ja
+epäonnistuminen näkyy kohteen asetusrivillä. HTTP-virhevastausta (404, 401...) ei
+yritetä uudelleen - korjaa vastaanottaja ja käytä Testiä. Jokaisella kohteella on
+oma toimituskaistansa, joten hidas tai tavoittamaton ei koskaan pidättele toista;
+kaistan sisällä toimitukset pitävät tapahtumien tapahtumisjärjestyksen, ja jos yksi
+pudotetaan, järjestysnumerot näyttävät aukon. Klassiset tapahtumasanat
+(<code>completed</code>, <code>failed</code>, <code>repaired</code>,
+<code>disk</code>, <code>quota</code>) säilyttävät ihmisilmoitusmerkityksensä
+samalla kohteella.</p>
 
 <h2 id="arr">11 · Sonarr, Radarr &amp; kumppanit</h2>
 <p>nzbfast puhuu SABnzbd-API:a natiivisti, joten jokainen *arr toimii heti laatikosta -
@@ -764,6 +882,11 @@ ja se voi toimia myös niiden <em>indeksoijana</em>.</p>
 (mistä löydät sen: <a href="#firstrun-key">§2</a>).</li>
 <li>Kategoria halutusti (esim. <code>tv</code> / <code>movies</code>). Test → vihreä ruksi → Save.</li>
 </ol>
+<p>Koontinäyttö ojentaa osoitteen sinulle: asennuksessa, joka ei ole vielä ladannut
+mitään, tervetulokortin reitti ”Anna Sonarrin, Radarrin tai sovelluksen lisätä
+lataukset” näyttää tarkan osoitteen ja <b>Copy</b>-painikkeen sen vieressä. API-avain
+ei tarkoituksella ole sillä rivillä; se pysyy oman paljastuksensa takana kohdassa
+Asetukset → Suojaus (<a href="#firstrun-key">§2</a>).</p>
 <p>Jono, historia, työkohtainen tila, ”remove &amp; delete”, uudelleenyritys ja kategoriaohjaus
 käyttäytyvät kaikki niin kuin *arrit odottavat.</p>
 <h3>Indeksoijana (newznab)</h3>
@@ -811,7 +934,17 @@ tarkat URL:t ja skannattavan QR-koodin.</p>
 <h3 id="remote-proxy">nzbfastin tavoittaminen kodin ulkopuolelta</h3>
 <p>Kirjautumissivua ei ole, ja se on tarkoituksellista. Istuntoevästeeseen perustuva kirjautuminen on tietoturvapinta, jota pitäisi ylläpitää ikuisesti, ja se olisi silti heikoin lukko missä tahansa avoimeen internetiin näkyvässä. nzbfast todentaa sen sijaan API-avaimellasi, ja ottaa avaimen vastaan sekä pyynnön otsakkeessa että osoitteessa (<code>X-Api-Key</code> tai <code>Authorization: Bearer</code>) - juuri se antaa edessä olevan palvelun hoitaa kirjautumisen kunnolla.</p>
 <p><b>Yksinkertaisinta on olla julkaisematta sitä lainkaan.</b> Asenna <b>Tailscale</b> tähän koneeseen ja puhelimeesi, niin molemmat liittyvät samaan yksityisverkkoon: mitään ei altisteta, reitittimeen tai varmenteisiin ei tarvitse koskea, ja Asetukset → Etäkäyttö näyttää kaikkialta toimivan osoitteen heti kun Tailscale on käynnissä. Valitse tämä, ellet nimenomaan tarvitse julkista verkkotunnusta.</p>
-<p><b>Jos tarvitset</b>, laita eteen käänteisproxy, anna sille varmenne ja anna sen hoitaa todennus. Käynnistä nzbfast valitsimella <code>--bind 127.0.0.1</code>, jotta proxy on ainoa reitti sisään, ja osoita proxy osoitteeseen <code>http://127.0.0.1:6789</code>:</p>
+<p><b>nzbfast osaa myös tarjota HTTPS:n itse.</b> Osoita Asetukset → Suojaus →
+HTTPS-varmenne / HTTPS-yksityisavain PEM-varmenteeseen ja sen avaimeen (tai
+käynnistä valitsimilla <code>--tls-cert cert.pem --tls-key key.pem</code>), käynnistä
+uudelleen, ja koontinäyttö ja API vastaavat osoitteessa <code>https://</code> pelkän
+HTTP:n sijaan - yksi kuuntelija, yksi skeema. Käytä varmennetta, joka verkkotunnuksellasi
+jo on (esimerkiksi Let's Encryptistä certbotilla), tai itse allekirjoitettua
+lähiverkkoon; selaimet hyväksyvät sen kertaluonteisen varoituksen jälkeen. Viallinen
+tai vanhentunut varmenne estää käynnistyksen ja nimeää tiedoston, joten virhe näkyy
+siellä missä sen teit; uusi korvaamalla tiedostot ja käynnistämällä uudelleen. Natiivi
+HTTPS salaa liikenteen mutta ei lisää kirjautumista, joten pidä API-avain asetettuna.</p>
+<p><b>Jos tarvitset julkisen verkkotunnuksen</b>, laita eteen käänteisproxy, anna sille varmenne ja anna sen hoitaa todennus. Käynnistä nzbfast valitsimella <code>--bind 127.0.0.1</code>, jotta proxy on ainoa reitti sisään, ja osoita proxy osoitteeseen <code>http://127.0.0.1:6789</code>:</p>
 <pre><code># Caddy
 example.com {
     reverse_proxy 127.0.0.1:6789
@@ -825,7 +958,12 @@ location / {
     proxy_set_header X-Forwarded-Proto $scheme;
 }</code></pre>
 <p>Lisää päälle se, mitä proxysi tarjoaa: basic auth, forward-auth-palvelu kuten Authelia tai Authentik, tai asiakasvarmenteet. Yksi asia yllättää kaikki - Sonarr, Radarr ja puhelinsovellukset eivät pysty suorittamaan selainkirjautumista, joten jätä niille reitti ohi. Useimmat proxyt osaavat päästää läpi pyynnön, jossa on kelvollinen <code>X-Api-Key</code>-otsake, ja vaatia todennuksen kaikelta muulta.</p>
-<div class="warn-box"><b>Älä vain ohjaa porttia 6789 reitittimessäsi.</b> Hallintapaneeli puhuu salaamatonta HTTP:tä, joten API-avaimesi ja kaikki mitä sillä teet kulkisivat internetin yli kenen tahansa reitillä olevan luettavissa, ja asennus ilman avainta on avoin kenelle tahansa sen löytävälle. Jos ohjaat portin silti, aseta ensin API-avain.</div>
+<div class="warn-box"><b>Älä vain ohjaa porttia 6789 reitittimessäsi.</b>
+Ilman määritettyä varmennetta koontinäyttö puhuu salaamatonta HTTP:tä, joten
+API-avaimesi ja kaikki mitä sillä teet kulkisivat internetin yli kenen tahansa
+reitillä olevan luettavissa, ja asennus, jossa avainta ei ole asetettu lainkaan,
+on avoin kenelle tahansa sen löytävälle. Jos ohjaat portin silti, aseta ensin
+API-avain ja kytke HTTPS päälle.</div>
 
 <h2 id="performance">13 · Suorituskykytyökalut</h2>
 <h3 id="perf-benchmark">Järjestelmän mittaus</h3>

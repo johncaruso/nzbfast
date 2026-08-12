@@ -7,6 +7,40 @@ use tracing::{error, info, warn};
 #[path = "daemon_index.rs"]
 mod daemon_index;
 
+// The whole `enqueue` add path, moved out bodily (TODO 106). Same
+// child-module shape as daemon_index for the same reason.
+#[path = "daemon_enqueue.rs"]
+mod daemon_enqueue;
+
+// Every way a job is sent round again - the M32 auto-retry cooldown, the
+// manual retry, and the move-retry ladder under both (TODO 106). Same
+// child-module shape.
+#[path = "daemon_retry.rs"]
+mod daemon_retry;
+
+// The queue on disk: save_queue out, load_queue back (TODO 106). Same
+// child-module shape.
+#[path = "daemon_persist.rs"]
+mod daemon_persist;
+
+// §131 D3 search-miss logging - the in-memory buffer that keeps
+// recording a search off the query path. Same child-module shape as
+// daemon_index for the same reason.
+// The provider ledger: bytes billed per server per day, the reliability
+// tally, and the block-account arithmetic on top of both (TODO 106).
+// Same child-module shape.
+#[path = "daemon_usage.rs"]
+mod daemon_usage;
+
+// The warm pool, the idle-release policy, and the offline switch over
+// the top (TODO 106). Same child-module shape.
+#[path = "daemon_idle.rs"]
+mod daemon_idle;
+
+#[path = "searchlog.rs"]
+mod searchlog;
+pub use searchlog::*;
+
 /// How many index reads may be in flight at once.
 ///
 /// The point is the gap between this and the HTTP worker count (8): a
@@ -590,6 +624,25 @@ pub struct Daemon {
     /// head for the mandatory hash gate); the default 120 clears the
     /// census's ~70 sets/day inflow many times over.
     pub index_pesto_budget: AtomicU64,
+    /// §131 workstream D item D3 search-miss logging (live setting
+    /// index_search_log, ON by default): record what this index was
+    /// asked for and how much of it we answered, so the queries we
+    /// answer with nothing can say what to deepen or backfill next.
+    ///
+    /// Purely local behaviour data - see the privacy paragraph on the
+    /// `search_log` table. Switching this off also CLEARS the table:
+    /// a privacy switch that leaves the history behind is not one.
+    pub index_search_log: std::sync::atomic::AtomicBool,
+    /// Searches waiting to be written, merged in memory.
+    ///
+    /// The load-bearing property: every interactive search runs on a
+    /// pooled READ-ONLY index connection (`query_only=ON`), which
+    /// exists precisely so an HTTP worker never queues behind the
+    /// writer. Recording a search therefore may not touch SQLite at
+    /// all on the query path - reaching for the read-write handle
+    /// there is the http_wedge class of bug. [`Daemon::note_search`]
+    /// only takes this mutex; the 60 s flush task does the writing.
+    pub search_log_buf: Mutex<std::collections::HashMap<SearchLogKey, SearchLogPending>>,
     /// §131 #6 posted-NZB ingestion (live setting index_nzbimport, ON
     /// by default): one-file `*.nzb` posts are fetched, parsed and
     /// joined against the identity substrate by message-id. The kill
@@ -833,6 +886,14 @@ pub struct Daemon {
     /// reported through unpack_blocked_by). Consumed client-side except
     /// for the "never" completion shape, which finalize applies.
     pub password_prompt: Mutex<String>,
+    /// §73 phase 2: how far the preview-and-verify feature goes.
+    /// "off" (nothing: `/preview/probe` refuses and the panel is gone),
+    /// "metadata-only" (the default - the panel reads the container and
+    /// says what the file is, and hands off to the user's own player),
+    /// or "full" (the panel plus a player in the page for the files this
+    /// browser can open). It gates the endpoint, not just the UI: "off"
+    /// means the daemon stops reading half-downloaded files for anyone.
+    pub preview: Mutex<String>,
     /// TODO 101: "off" (the default - volumes are only ever swept AFTER
     /// a successful extraction), "low_disk" (eat them during extraction,
     /// but only on a job whose forecast says it cannot otherwise fit and
@@ -1083,6 +1144,15 @@ pub struct Daemon {
     /// resolved at run time, so a key rotated in the indexer editor
     /// carries over. Empty = use `scoreboard_url`/`scoreboard_key`.
     pub(super) scoreboard_source: Mutex<String>,
+    /// Which of [`SCOREBOARD_CATEGORIES`] the daily sample asks for -
+    /// one request each, so this is the requests-per-day dial. Indexers
+    /// meter every call, so the user gets to spend fewer than the full
+    /// four; empty (the default) = all of them.
+    ///
+    /// A RESTRICTION, never an extension: `scoreboard_categories()`
+    /// filters the built-in list with this, so the only thing this can
+    /// do is take categories away.
+    pub(super) scoreboard_cats: Mutex<Vec<String>>,
     /// Spend up to 5 of the user's daily NZB downloads on band-precision
     /// calibration (subject-stem exact matching). Off by default: it is
     /// the user's metered grab quota.
@@ -1218,6 +1288,11 @@ pub struct Daemon {
     /// persisted to .spool/usage.json (metered/block accounts need to see
     /// where the gigabytes went).
     pub(super) usage: Mutex<serde_json::Map<String, Value>>,
+    /// §96.5: per-host bytes of the RUNNING download already billed to
+    /// the usage ledger by `flush_run_usage` - the high-water map that
+    /// makes mid-job billing idempotent against the end-of-job call.
+    /// Cleared by the runner at every job start, beside `pool_live`.
+    pub(super) run_usage_flushed: Mutex<std::collections::HashMap<String, u64>>,
     /// Timed pause ("pause for N minutes"): auto-resume deadline. Any
     /// manual pause/resume bumps pause_gen, cancelling the pending timer.
     pub(super) pause_until: Mutex<Option<Instant>>,
@@ -1266,6 +1341,20 @@ pub struct Daemon {
     /// with missing articles (0 = off). Configured in minutes
     /// (auto_retry_mins); NZBFAST_AUTO_RETRY_SECS overrides for tests.
     pub(super) auto_retry_secs: AtomicU64,
+    /// Minutes a server may spend granting NO connection during one job
+    /// before the pool retires it for the rest of that job; 0 = never
+    /// give up on it. See [`nzbkit::pool::PoolConfig::outage_budget`].
+    ///
+    /// A setting rather than a constant because the two answers are both
+    /// defensible and the right one is the user's. The default (15) ends
+    /// a wedged job with a transport verdict, which auto-retries from
+    /// the journal and never reports the post dead to an indexer - the
+    /// queue keeps moving. Zero waits instead, for as long as it takes,
+    /// which is what someone who knows their provider comes back (or is
+    /// downloading something they will not find again) actually wants.
+    /// Both are now legible: the queue row names the provider and the
+    /// duration either way.
+    pub(super) server_outage_mins: AtomicU64,
     /// Byte budget per quota period (0 = off).
     pub(super) quota: AtomicU64,
     /// b'd' (daily), b'w' (weekly, Monday) or b'm' (monthly).
@@ -1534,6 +1623,9 @@ pub struct Daemon {
     pub watch_state: Mutex<crate::watchlist::WatchState>,
     /// mode=watchlist_check_now: wakes the watcher out of its sleep.
     pub(super) watch_now: tokio::sync::Notify,
+    /// §151 external list sources. Declared in `serve/listsrc.rs`, which
+    /// owns it; `Daemon::watch_items` is how it is read.
+    pub(super) lists: super::listsrc::ListState,
     /// §96.3 give-up breaker: distinct final failures per target
     /// (episode/movie) before the target is given up. 0 = off, the
     /// default - the breaker unmonitors things in the user's *arr, which
@@ -1605,6 +1697,100 @@ pub struct DaemonEvent {
 /// bounded window the UI can always afford to serve.
 const DAEMON_EVENT_RING: usize = 256;
 
+/// How long a server must have been granting NO sessions before the
+/// queue row says so, in seconds. Long enough that an ordinary redial,
+/// a capacity bounce or a router blip passes unremarked; short enough
+/// that a user watching a row at 0 B/s is told why well inside the
+/// pool's ~10 minute outage horizon.
+///
+/// Env-tunable for tests only - nothing in the UI offers it.
+pub fn server_down_secs() -> u64 {
+    std::env::var("NZBFAST_SERVER_DOWN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60)
+}
+
+/// A configured server that is granting no sessions right now, as the
+/// API and the queue row report it. Sampled from the live pool, which
+/// is why it only exists while something is downloading.
+#[derive(Debug, Clone)]
+pub struct ServerOutage {
+    pub host: String,
+    /// Unix ms the episode began. Stable for its whole life (the gauge
+    /// is set once and cleared on recovery), so it is what identifies
+    /// an episode - `secs` drifts by a tick and cannot.
+    pub since_ms: u64,
+    /// Seconds since the first dial of this episode failed.
+    pub secs: u64,
+    /// `unreachable` | `refused` | `capacity` - see
+    /// [`nzbkit::pool::DownReason`].
+    pub kind: &'static str,
+    /// The server's own words, verbatim.
+    pub detail: String,
+}
+
+/// Which outage the QUEUE ROW reports, if any, and as which token.
+///
+/// Two rules, both deliberate. The row speaks only while the job is in
+/// an open stall episode: a dead backup on a job downloading at full
+/// speed belongs on the Providers card, not as an alarm on a working
+/// row. And the outage must have outlived [`server_down_secs`], so an
+/// ordinary redial or a capacity bounce that clears in seconds never
+/// reaches the user at all.
+///
+/// `outages` arrives longest-first, so the first match is the worst.
+pub fn row_outage(
+    stalled: bool,
+    outages: &[ServerOutage],
+) -> Option<(&'static str, &ServerOutage)> {
+    if !stalled {
+        return None;
+    }
+    let win = server_down_secs();
+    let o = outages.iter().find(|o| o.secs >= win)?;
+    let tok = match o.kind {
+        "refused" => "server_refused",
+        "capacity" => "server_capacity",
+        _ => "server_unreachable",
+    };
+    Some((tok, o))
+}
+
+/// Every server currently in an outage, worst (longest) first.
+///
+/// Reported whatever the rest of the pool is doing: a dead BACKUP on an
+/// otherwise healthy job is a real fact about a paid-for provider, and
+/// the Providers card is the right place for it. The queue row applies
+/// its own extra gate (see the `server_down` activity token) so a job
+/// that is downloading fine never shouts about it.
+pub fn server_outages(d: &Daemon) -> Vec<ServerOutage> {
+    let mut v: Vec<ServerOutage> = d
+        .hub
+        .pool_live
+        .lock_ok()
+        .as_ref()
+        .map(|l| {
+            l.servers
+                .iter()
+                .filter_map(|s| {
+                    let secs = s.down_secs()?;
+                    let r = s.down_reason.lock_ok().clone()?;
+                    Some(ServerOutage {
+                        host: s.host.clone(),
+                        since_ms: s.down_since.load(Ordering::Relaxed),
+                        secs,
+                        kind: r.kind,
+                        detail: r.detail,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort_by_key(|o| std::cmp::Reverse(o.secs));
+    v
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerRefusal {
     /// True when retrying cannot help (a bad credential); false when the
@@ -1642,6 +1828,22 @@ pub const EVICT_ORDERS: [&str; 5] = ["ladder", "oldest", "newest", "largest", "s
 /// silently make the whole restriction match nothing.
 #[cfg(feature = "indexer")]
 pub const EVICT_KINDS: [&str; 4] = ["movie", "tv", "software", "other"];
+
+/// The parity scoreboard's sampling menu: newznab's standard top-level
+/// thousands, paired with the label the samples are stored and reported
+/// under. The daily run makes ONE request per category in this list, so
+/// its length is the scoreboard's whole cost, and `scoreboard_cats` can
+/// only ever pick a subset of it - four requests a day is the ceiling
+/// and one is the floor.
+///
+/// Not indexer-gated: the sampler that walks it is, but the setting
+/// that trims it, its validator and the API readout are not.
+pub const SCOREBOARD_CATEGORIES: [(u32, &str); 4] = [
+    (2000, "movies"),
+    (5000, "tv"),
+    (3000, "audio"),
+    (7000, "books"),
+];
 
 /// How long a deliberate touch (detail sheet, /getnzb, queue add) keeps a
 /// release safe from the size cap. The user asked for "recently opened"
@@ -1788,6 +1990,42 @@ pub fn parse_evict_kinds(s: &str) -> std::result::Result<Vec<String>, String> {
         }
         if !out.contains(&k) {
             out.push(k);
+        }
+    }
+    Ok(out)
+}
+
+/// The `scoreboard_cats` comma list → validated category labels.
+///
+/// The list may only ever REDUCE what the scoreboard asks for: every
+/// name has to be one of [`SCOREBOARD_CATEGORIES`], so there is no
+/// spelling of this setting that adds a request to the day. Empty is
+/// the default and means every category - the ceiling, not a hole - so
+/// the only way to spend less is to name the subset you want.
+///
+/// An unknown name is an error rather than a silent drop: the whole
+/// point of the control is that the user knows what they are paying
+/// for, and a typo that quietly halved the sample would be the exact
+/// opposite of that.
+pub fn parse_scoreboard_cats(s: &str) -> std::result::Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in s.split(',') {
+        let c = raw.trim().to_ascii_lowercase();
+        if c.is_empty() {
+            continue;
+        }
+        if !SCOREBOARD_CATEGORIES.iter().any(|(_, l)| *l == c) {
+            return Err(format!(
+                "unknown category {c:?} (expected {})",
+                SCOREBOARD_CATEGORIES
+                    .iter()
+                    .map(|(_, l)| *l)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !out.contains(&c) {
+            out.push(c);
         }
     }
     Ok(out)
@@ -2075,6 +2313,22 @@ impl Daemon {
         crate::smart::read_password_file(&self.password_file.lock_ok())
     }
 
+    /// The same candidates in §99 try-order: the password last known to
+    /// unlock a download from `site` first, then the last one for
+    /// `poster`, then the rest in file order.
+    pub fn read_unpack_passwords_for(&self, site: &str, poster: &str) -> Vec<String> {
+        let path = self.password_file.lock_ok().clone();
+        crate::smart::order_passwords(crate::smart::read_password_file(&path), &path, site, poster)
+    }
+
+    /// §99: remember that `pw` unlocked a download from `site` /
+    /// `poster`, so the next passworded job tries it first. The value
+    /// never reaches get_config or a log line.
+    pub fn record_unlock_password(&self, site: &str, poster: &str, pw: &str) {
+        let path = self.password_file.lock_ok().clone();
+        crate::smart::record_password_assoc(&path, site, poster, pw);
+    }
+
     /// Why indexing is standing down, or None if it should run. A reason
     /// rather than a bool so the UI can say WHICH it is - an index that
     /// has quietly stopped growing is otherwise a mystery, and the two
@@ -2149,6 +2403,27 @@ impl Daemon {
         None
     }
 
+    /// The reason words above, in the words a log reader needs.
+    ///
+    /// The background legs used to print one fixed sentence, "paused for
+    /// foreground job", whichever reason had actually fired. On 11 Aug
+    /// 2026 that sentence was the entire record of a scan loop that had
+    /// been standing down for fourteen hours because the daemon was
+    /// OFFLINE: the log said a download had the line, the queue was
+    /// empty, and the two could not be reconciled without reading the
+    /// source. A stand-down that names the wrong cause is worse than one
+    /// that names none.
+    #[cfg(feature = "indexer")]
+    pub(super) fn pause_phrase(reason: &str) -> &'static str {
+        match reason {
+            "offline" => "the daemon is offline",
+            "off" => "the switch is off",
+            "paused" => "indexing is paused",
+            "downloading" => "a download is running",
+            _ => "standing down",
+        }
+    }
+
     /// True when some queue entry is ready for the runner (Queued and
     /// not paused; deferred counts - the runner picks deferred work
     /// when nothing else is runnable, so it still wants the threads).
@@ -2217,6 +2492,24 @@ impl Daemon {
         Ok((url, key))
     }
 
+    /// The categories today's sample will actually ask for, in
+    /// [`SCOREBOARD_CATEGORIES`] order. One request each, so the length
+    /// of this IS the scoreboard's requests-per-day figure.
+    ///
+    /// The stored list can only ever SHRINK this: it is filtered
+    /// against the built-in set rather than read as one, so no stored
+    /// value - not a hand-edited settings.json, not a stale entry from
+    /// a future version - can add a category, and the empty default
+    /// means "all of them", the most this ever asks for.
+    pub(super) fn scoreboard_categories(&self) -> Vec<(u32, &'static str)> {
+        let picked = self.scoreboard_cats.lock_ok().clone();
+        SCOREBOARD_CATEGORIES
+            .iter()
+            .copied()
+            .filter(|(_, label)| picked.is_empty() || picked.iter().any(|p| p == label))
+            .collect()
+    }
+
     /// May the watchlist spend the user's indexer accounts? See
     /// `watchlist_external_set` for why this is a tri-state rather than
     /// the plain bool it reads like.
@@ -2237,7 +2530,8 @@ impl Daemon {
         if !self.watchlist_instant.load(Ordering::Relaxed) {
             return None;
         }
-        let m = crate::watchlist::InstantMatcher::compile(&self.watchlist.lock_ok());
+        // watch_items: a synced entry gets the instant grab too (§151).
+        let m = crate::watchlist::InstantMatcher::compile(&self.watch_items());
         (!m.is_empty()).then_some(m)
     }
 
@@ -3216,460 +3510,8 @@ impl Daemon {
         })
     }
 
-    /// `pp` is the post-processing mode the CALLER requested (0-3, None
-    /// = none named). The pre-queue hook receives it - SAB's contract
-    /// hands the script the requested pp - but it is RECORDED on the
-    /// job afterwards by `record_add_params`, which fills only what the
-    /// hook did not already answer.
-    pub(super) fn enqueue(
-        &self,
-        nzb_bytes: &[u8],
-        name: &str,
-        category: &str,
-        priority: i32,
-        pp: Option<i64>,
-        password: Option<&str>,
-        origin: &str,
-        allow_dupe: bool,
-    ) -> Result<String> {
-        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let nzo_id = format!("SABnzbd_nzo_nzbfast{n}");
-        let nzb = nzbkit::nzb::Nzb::parse(nzb_bytes)?;
-        let mut stem = name.trim_end_matches(".nzb").to_string();
-        // Archive password: an explicit param (SAB API) wins; the
-        // `Name{{password}}` convention comes OFF the display name either
-        // way (and the output folder - never leak a password into the
-        // filesystem); the NZB's own <meta type="password"> is the
-        // fallback (the engine would find it again at download time -
-        // capturing it here surfaces has_password to the UI).
-        let mut password: Option<String> = password.filter(|p| !p.is_empty()).map(str::to_string);
-        // All three name conventions - {{pw}}, password=pw, {pw} - are
-        // recognized and stripped (crate::smart::name_password).
-        if let Some((pw, clean)) = crate::smart::name_password(&stem) {
-            password.get_or_insert(pw);
-            stem = clean;
-        }
-        if password.is_none() {
-            password = nzb.password().map(str::to_string);
-        }
-        // Zip-packed post, spotted from the NZB's own file list before a
-        // single byte is fetched. We cannot unpack one, so saying it here
-        // costs the user a click instead of a download. Name-shaped
-        // evidence only - an obfuscated container has no name to read, and
-        // guessing from a subject line would cry wolf on ordinary posts.
-        let zip_packed = nzb
-            .files
-            .iter()
-            .filter_map(|f| f.filename_hint())
-            .any(nzbkit::zip::name_is_zip_shaped);
-        if zip_packed {
-            info!(
-                target: "queue",
-                "{nzo_id} looks zip-packed - store and deflate zips unpack \
-                 natively, an encrypted one too when the job has a password; an \
-                 exotic codec will arrive packed"
-            );
-        }
-        let total_bytes = nzb.eager_bytes();
-        // M23 Smart Folders: the first matching rule can retarget the
-        // category (= out_root subfolder) and request TV filing.
-        let mut category = category.to_string();
-        let mut tv_sort = false;
-        let mut smart_rule = String::new();
-        if let Some(r) =
-            crate::smart::first_match(&self.smart_folders.lock_ok(), &stem, total_bytes)
-        {
-            if !r.category.is_empty() {
-                category = r.category.clone();
-            }
-            tv_sort = r.tv_sort;
-            // Kept on the job: "why is this in Films?" is answerable only
-            // by the rule that decided it, and the rule list is editable.
-            smart_rule = r.name.clone();
-            info!(
-                target: "smart",
-                "rule {:?} matched {stem:?} → category {:?}{}",
-                r.name,
-                category,
-                if tv_sort { " + TV filing" } else { "" }
-            );
-        }
-        // `category` (the `cat=` request param) and `stem` (from the NZB
-        // name / `nzbname`) are untrusted and must never escape out_root:
-        // an absolute component replaces the base, and `..` is resolved by
-        // the OS at create/remove time - a crafted name plus a delete call
-        // could otherwise write to, or recursively delete, an arbitrary
-        // directory (bug sweep). Force each to a single contained path
-        // component before it ever touches the filesystem.
-        if !category.is_empty() {
-            category = nzbkit::disk::sanitize_filename(&category);
-        }
-        // §129 4a: consult the pre-queue hook - rename, recategorize,
-        // reprioritize, pick pp/script, or reject - before anything is
-        // published. Before the spool write (a rename names the spool
-        // file), before the add lock (a slow script must never
-        // serialize concurrent adds), and demoted via blocking_db
-        // (enqueue is reachable from tokio tasks). Fail-open by
-        // contract - see serve/prequeue.rs.
-        let mut priority = priority;
-        let mut hook_pp = None;
-        let mut hook_script = String::new();
-        let mut hook_reject = None;
-        if self.pre_queue_script.lock_ok().is_some() {
-            let mut groups: Vec<String> = Vec::new();
-            for f in &nzb.files {
-                for g in &f.groups {
-                    if !groups.contains(g) {
-                        groups.push(g.clone());
-                    }
-                }
-            }
-            let verdict = crate::persist::blocking_db(|| {
-                self.run_pre_queue(
-                    &nzo_id,
-                    origin,
-                    &stem,
-                    pp,
-                    &category,
-                    priority,
-                    total_bytes,
-                    &groups,
-                )
-            });
-            if let Some(v) = verdict {
-                if !v.accept {
-                    hook_reject = Some("rejected by the pre-queue script".to_string());
-                }
-                if let Some(n) = v.name {
-                    stem = n;
-                }
-                if let Some(c) = v.category {
-                    category = nzbkit::disk::sanitize_filename(&c);
-                }
-                if let Some(p) = v.priority {
-                    // The hook's priority is an EXPLICIT one: it also
-                    // suppresses the category default fill below.
-                    priority = p;
-                }
-                hook_pp = v.pp;
-                hook_script = v.script.unwrap_or_default();
-            }
-        }
-        // Named after the release as well as the job id. A folder of
-        // SABnzbd_nzo_nzbfast<n>.nzb files could not be matched to
-        // anything a user had ever seen; the id stays first so the name
-        // is still unique and sortable, and old jobs are unaffected
-        // because nzb_path is persisted per job.
-        let spool_path = self
-            .spool
-            .join(format!("{nzo_id}-{}.nzb", safe_spool_stem(&stem)));
-        // Atomic: a resume re-parses this file; it must never be torn.
-        crate::persist::write_atomic(&spool_path, nzb_bytes)?;
-        // §129 2b: the category's default priority fills an add that
-        // did not name one (-100, SAB's "default"). An explicit
-        // priority - including -2 add-paused - always wins.
-        if priority == SAB_DEFAULT_PRIORITY
-            && let Some(p) = self
-                .cat_meta
-                .lock_ok()
-                .get(&category)
-                .and_then(|m| m.priority)
-        {
-            priority = p;
-        }
-        let dir_stem = nzbkit::disk::sanitize_filename(&stem);
-        let base_out_dir = self.base_out_dir(&category, &dir_stem);
-        // Two DIFFERENT NZBs whose names sanitize to the same stem and carry
-        // no dupe_key (no SxxEyy/year marker - e.g. software or music posts)
-        // are not caught by the M14f duplicate hold below, so they would
-        // share one out_dir. Their pipelines deliberately overlap (A's tail
-        // repairs/extracts while B's net leg runs), so B's journal + volume
-        // writers truncate the files A is still reading → both corrupt. Give
-        // a colliding job its own directory.
-        //
-        // A COMPLETED job's payload claims its directory too. Treating it as
-        // inert meant a re-add reused the folder and the very first decoded
-        // span truncated the previous, good result - which was then gone for
-        // nothing if the replacement failed on missing articles, a password
-        // or ENOSPC. The re-add downloads under its own name and takes over
-        // the canonical directory only once it has verified (`replaces`,
-        // published by `publish_over_previous`). A FAILED job's leftovers are
-        // junk and are still reused in place, so retrying a flaky post does
-        // not climb .2, .3, .4.
-        // From here to the queue push is one transaction. Choosing a
-        // directory and deciding "not a duplicate" are both reads of
-        // state this job is about to change, and neither is published
-        // until the push, so without the lock two concurrent adds of one
-        // release agree on everything and then collide.
-        let publish = self.add_lock.lock_ok();
-        // dir_claim stats the output volume (`p.exists()`), which can be
-        // a network share, and enqueue is reachable from tokio tasks
-        // (watchlist watcher, RSS poller) - demote the worker around it.
-        let (out_dir, replaces) = crate::persist::blocking_db(|| {
-            choose_out_dir(&base_out_dir, &dir_stem, &|p| self.dir_claim(p))
-        });
-        self.register_cat(&category);
-        // M14f duplicate check: same identity already queued, running, or
-        // successfully completed → hold this one as an ALTERNATIVE
-        // (paused, Duplicate priority). It auto-promotes if the original
-        // fails; PROPERs always download.
-        //
-        // `allow_dupe` is the user having been ASKED and said yes (the
-        // wall's confirmation). It suppresses the hold, not the key: the
-        // job still carries its identity, so everything downstream that
-        // reasons about duplicates keeps working.
-        let key = dupe_key(&stem);
-        let collision = if allow_dupe {
-            None
-        } else {
-            self.dupe_collision(&stem)
-        };
-        let duplicate = collision.is_some();
-        // §129 2d: what a duplicate add becomes is the user's call now.
-        // "pause" is the M14f hold; "discard" refuses the add outright;
-        // "fail" files it straight to history as Failed (the *arr
-        // contract: a failed grab triggers their own search for a
-        // different release, where a silently held one just sits).
-        let dupe_action = self.dupe_action.lock_ok().clone();
-        if let Some(c) = &collision
-            && dupe_action == "discard"
-            // A hook REJECT outranks the duplicates setting: the job is
-            // about to file to history with the hook's reason.
-            && hook_reject.is_none()
-        {
-            drop(publish);
-            // The spool copy was written above; a refused add must not
-            // leave it behind.
-            let _ = std::fs::remove_file(&spool_path);
-            info!(
-                target: "queue",
-                "refused {stem:?} - duplicate of {} ({}, {}), and duplicates \
-                 are set to be discarded",
-                c.name, c.nzo_id, c.where_
-            );
-            anyhow::bail!(
-                "duplicate of {:?} ({}) - discarded; the duplicates setting \
-                 decides this",
-                c.name,
-                c.where_
-            );
-        }
-        // Late-pick groundwork: was the runner free to take this job the
-        // moment it lands? Only then does a slow pick mean the runner was
-        // starved (the fixed inline-SQLite bug held picks back 38 s)
-        // rather than the job simply waiting its turn.
-        let runner_idle = self.started_at.lock_ok().is_none()
-            && !self.paused.load(std::sync::atomic::Ordering::Relaxed)
-            && !self.queue.lock_ok().iter().any(|j| {
-                let g = j.lock_ok();
-                g.state == JobState::Queued && !g.paused
-            });
-        // C4-4: the accepted NZB is a (name, payload message-id set)
-        // pairing for the identity substrate - recorded after the job
-        // publishes, below.
-        let pairing_name = stem.clone();
-        let job = Arc::new(Mutex::new(Job {
-            origin: origin.to_string(),
-            nzo_id: nzo_id.clone(),
-            name: stem,
-            nzb_sha: nzb_sha(nzb_bytes),
-            finalizing: false,
-            nzb_path: spool_path,
-            category: category.clone(),
-            state: JobState::Queued,
-            total_bytes,
-            out_dir,
-            fail_message: String::new(),
-            fail_detail: String::new(),
-            finished_at: None,
-            finished_unix: None,
-            // SAB priority -2 means "add paused", -100 means "the default".
-            priority: enqueue_priority(priority, duplicate),
-            paused: duplicate || priority == -2,
-            queued_at: Some(Instant::now()),
-            queued_unix: Some(unix_now()),
-            idle_at_add: runner_idle,
-            // Stamped by `enqueue_fetched` when the NZB came from a URL
-            // and the indexer sent an X-DNZB-Failure header.
-            failure_link: String::new(),
-            failure_host: String::new(),
-            failure_https: false,
-            failure_depth: 0,
-            identify: String::new(),
-            media: None,
-            media_rejudge: false,
-            retries: 0,
-            dupe_key: key,
-            library: self.library_cats.lock_ok().contains(&category),
-            fetched: false,
-            tombstone: false,
-            del_on_drop: false,
-            suspended: false,
-            downloaded_bytes: 0,
-            elapsed_secs: 0.0,
-            deferred: false,
-            defer_reason: String::new(),
-            defer_count: 0,
-            demote: false,
-            bad_blocks: None,
-            verify_blocks: 0,
-            tv_sort,
-            smart_rule,
-            filed: false,
-            filed_suffix: None,
-            filed_title: None,
-            filed_base: None,
-            password,
-            password_required: false,
-            eat_volumes_ok: false,
-            zip_packed,
-            unpack_blocked_by: String::new(),
-            move_split: String::new(),
-            move_failed: String::new(),
-            move_attempts: 0,
-            move_pending: false,
-            archive_shape: String::new(),
-            inner_crc: 0,
-            identity_name: String::new(),
-            identity_imdb: String::new(),
-            identity_src: String::new(),
-            auto_retry_at: None,
-            auto_retry_why: None,
-            pp_params: Vec::new(),
-            sab_pp: hook_pp,
-            script_override: hook_script,
-            replaces,
-            // §77: filled in by the health prober on its next idle tick.
-            // Deliberately not probed inline here - enqueue is called
-            // from the HTTP handler, the watch folder and the RSS
-            // poller, and none of them may block on a network round trip
-            // to every configured server.
-            health: None,
-            // Counted at completion by the post-processing sweeps.
-            cleaned_files: 0,
-            cleaned_par2: 0,
-            cleaned_trash: false,
-        }));
-        // §129 4a: a pre-queue REJECT files to history as Failed with
-        // the reason - the dupe_action="fail" shape verbatim, so the
-        // *arr contract (a failed grab means "search for another
-        // release") and retry-from-history both hold. The spool .nzb
-        // stays; a retry does not re-run the hook (SAB semantics).
-        if let Some(why) = hook_reject {
-            {
-                let mut g = job.lock_ok();
-                g.state = JobState::Failed;
-                g.paused = false;
-                g.priority = 0;
-                g.fail_message = why;
-                g.finished_at = Some(Instant::now());
-                g.finished_unix = Some(unix_now());
-            }
-            self.history.lock_ok().push(job.clone());
-            drop(publish);
-            info!(
-                target: "prequeue",
-                "{nzo_id} filed to history as FAILED - rejected by the pre-queue \
-                 script"
-            );
-            self.save_queue();
-            let _ = self.history_upsert(std::slice::from_ref(&job));
-            self.life_emit_parked(&job);
-            self.history_enforce_retention();
-            return Ok(nzo_id);
-        }
-        // §129 2d, dupe_action = "fail": the job never queues - it files
-        // straight to history as Failed, through the same seam every
-        // history mutation uses (history_upsert beside save_queue), and
-        // emits the job.failed lifecycle event a real failure would.
-        // Retry from history remains the escape hatch: the spool .nzb
-        // is in place and retry asks the duplicates question afresh.
-        if let Some(c) = &collision
-            && dupe_action == "fail"
-        {
-            {
-                let mut g = job.lock_ok();
-                g.state = JobState::Failed;
-                g.paused = false;
-                g.priority = 0;
-                g.fail_message = format!(
-                    "duplicate of {:?} ({}) - failed; the duplicates setting decides this",
-                    c.name, c.where_
-                );
-                g.finished_at = Some(Instant::now());
-                g.finished_unix = Some(unix_now());
-            }
-            self.history.lock_ok().push(job.clone());
-            drop(publish);
-            info!(
-                target: "queue",
-                "{nzo_id} filed to history as FAILED - duplicate of {} ({}), and \
-                 duplicates are set to fail",
-                c.name, c.nzo_id
-            );
-            self.save_queue();
-            let _ = self.history_upsert(std::slice::from_ref(&job));
-            self.life_emit_parked(&job);
-            self.history_enforce_retention();
-            return Ok(nzo_id);
-        }
-        // §129 4a: the add joins the event ring and the queue in one
-        // step, announced BEFORE the job is visible to anything that
-        // could start it. Every add path funnels through here, so this
-        // one emit covers all fourteen of them.
-        //
-        // The queue lock is what makes the ordering a guarantee rather
-        // than a race: `pick_job` scans under this same lock, so a
-        // runner that sees this job necessarily acquired the lock after
-        // we released it, and its job.started is therefore behind our
-        // job.added on the ring. Emitting AFTER the push instead let a
-        // fast pick outrun a slow `save_queue` - a 16-way-loaded box put
-        // job.started on the ring at seq 1, 54 ms ahead of the job.added
-        // for the same nzo_id, which is a webhook consumer watching a
-        // job start before it exists. The idle latch re-arms inside the
-        // same window for the same reason: an idle sweep between the
-        // push and a later store could emit a queue.idle that this add
-        // has already invalidated.
-        //
-        // Deadlock-safe by lock order: the ring, the webhook channel and
-        // the target list are leaves taken under the queue lock, and no
-        // path takes them the other way round. The cost is that the
-        // event now precedes `save_queue` rather than following it, so a
-        // crash in that window loses a job a consumer was told about -
-        // the same window every other reader of the add already had,
-        // since the queue was live to the API at exactly this point.
-        self.queue_idle_latch.store(false, Ordering::Relaxed);
-        {
-            let mut q = self.queue.lock_ok();
-            self.life_emit(
-                "job.added",
-                json!({
-                    "nzo_id": nzo_id,
-                    "name": pairing_name,
-                    "category": category,
-                    "priority": enqueue_priority(priority, duplicate),
-                    "origin": origin,
-                    "total_bytes": total_bytes,
-                    "duplicate": duplicate,
-                    "paused": duplicate || priority == -2,
-                }),
-            );
-            q.push_back(job);
-        }
-        // Published: the directory and the identity are now visible to
-        // every other adder.
-        drop(publish);
-        if duplicate {
-            info!(target: "queue", "added {nzo_id} as ALTERNATIVE (duplicate held)");
-        } else {
-            info!(target: "queue", "added {nzo_id}");
-        }
-        self.save_queue();
-        // After the add is published and saved, never on its critical
-        // path: a contended index costs this pairing, not the add.
-        self.record_nzb_pairing(&pairing_name, origin, &nzb);
-        Ok(nzo_id)
-    }
+    // `enqueue` lives in daemon_enqueue.rs (TODO 106 size-gate split),
+    // a child module declared at the top of this file.
 
     /// Truth-audit I: did this job park as a held ALTERNATIVE instead of
     /// joining the queue to run? Read back rather than returned out of
@@ -3688,313 +3530,6 @@ impl Daemon {
             let g = j.lock_ok();
             g.nzo_id == nzo_id && g.paused && g.priority == DUPE_PRIORITY
         })
-    }
-
-    /// M18b: bill per-server bytes of a finished download to today's
-    /// usage history (UTC days, like the quota) and persist. Best-effort.
-    pub(super) fn add_usage(&self, per_server: &[(String, u64)]) {
-        let days = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| (d.as_secs() / 86_400) as i64)
-            .unwrap_or(0);
-        let (y, m, d) = civil_from_days(days);
-        let key = format!("{y:04}-{m:02}-{d:02}");
-        let mut u = self.usage.lock_ok();
-        for bucket in [key.as_str(), "lifetime"] {
-            let day = u.entry(bucket.to_string()).or_insert_with(|| json!({}));
-            if let Some(map) = day.as_object_mut() {
-                for (host, bytes) in per_server {
-                    if *bytes == 0 {
-                        continue;
-                    }
-                    let cur = map.get(host).and_then(Value::as_u64).unwrap_or(0);
-                    map.insert(host.clone(), json!(cur + bytes));
-                }
-            }
-        }
-        // Keep ~60 date buckets ("YYYY-…" sorts before "lifetime", which
-        // is never pruned - block accounts span years; "reliability"
-        // survives the prune the same way).
-        while u.keys().filter(|k| k.starts_with('2')).count() > 60 {
-            let oldest = u.keys().find(|k| k.starts_with('2')).cloned();
-            if let Some(k) = oldest {
-                u.remove(&k);
-            }
-        }
-        self.save_usage(&u);
-    }
-
-    pub(super) fn save_usage(&self, u: &serde_json::Map<String, Value>) {
-        let path = self.spool.join("usage.json");
-        if let Ok(text) = serde_json::to_string_pretty(&Value::Object(u.clone())) {
-            let _ = crate::persist::write_atomic(&path, text.as_bytes());
-        }
-    }
-
-    /// Reliability ledger: accumulate a finished job's per-server article
-    /// tries/430s under the never-pruned "reliability" usage bucket -
-    /// completion% over lifetime is the keep-subscribing signal.
-    pub(super) fn add_reliability(&self, per_server: &[(String, u64, u64)]) {
-        if per_server.iter().all(|(_, t, _)| *t == 0) {
-            return;
-        }
-        let mut u = self.usage.lock_ok();
-        let rel = u
-            .entry("reliability".to_string())
-            .or_insert_with(|| json!({}));
-        if let Some(map) = rel.as_object_mut() {
-            for (host, tried, missing) in per_server {
-                if *tried == 0 {
-                    continue;
-                }
-                let (ct, cm) = map
-                    .get(host)
-                    .map(|v| {
-                        let g = |k| v.get(k).and_then(Value::as_u64).unwrap_or(0);
-                        (g("tried"), g("missing"))
-                    })
-                    .unwrap_or((0, 0));
-                map.insert(
-                    host.clone(),
-                    json!({"tried": ct + tried, "missing": cm + missing}),
-                );
-            }
-        }
-        self.save_usage(&u);
-    }
-
-    /// Lifetime (tried, missing) article counts for `host`, from the
-    /// reliability ledger. None until the first finished job recorded any.
-    pub(super) fn reliability(&self, host: &str) -> Option<(u64, u64)> {
-        let u = self.usage.lock_ok();
-        let v = u.get("reliability")?.get(host)?;
-        let g = |k| v.get(k).and_then(Value::as_u64).unwrap_or(0);
-        let (t, m) = (g("tried"), g("missing"));
-        (t > 0).then_some((t, m))
-    }
-
-    /// Go offline or come back, and do it NOW rather than on a timer.
-    ///
-    /// Offline is the instant sibling of the idle-release policy: same
-    /// goal (stop occupying the account so the operator can use it from
-    /// somewhere else), no waiting. It:
-    ///
-    /// - pauses the queue, so the outage is not spent starting jobs that
-    ///   cannot connect. Without this every job would fail its way
-    ///   through the queue against articles that were never missing, and
-    ///   the operator would come back to a screen of red that says
-    ///   nothing about what happened. The active job winds down through
-    ///   the ordinary pause path and parks with its journal intact - a
-    ///   one-pass extraction survives, because the journal records where
-    ///   each article's bytes physically landed;
-    /// - hangs up every parked connection in the warm pool, and shuts
-    ///   the pool to new ones until this comes back online - the job
-    ///   winding down above parks its fleet as it finishes, so a drain
-    ///   on its own is undone seconds later;
-    /// - stands the background legs down through
-    ///   [`Self::indexing_pause_reason`], which the scan loop, the tip
-    ///   watcher and the spot leg all consult, and which makes the tip
-    ///   watcher QUIT the sessions it holds.
-    ///
-    /// Coming back online only unpauses a queue that going offline
-    /// paused - see `paused_by_offline`.
-    pub fn set_offline(self: &Arc<Self>, want_offline: bool) {
-        let was = self.offline.swap(want_offline, Ordering::SeqCst);
-        if was == want_offline {
-            return;
-        }
-        let (paused, by_offline) = offline_pause_transition(
-            want_offline,
-            self.paused.load(Ordering::Relaxed),
-            self.paused_by_offline.load(Ordering::Relaxed),
-        );
-        self.paused.store(paused, Ordering::Relaxed);
-        self.paused_by_offline.store(by_offline, Ordering::Relaxed);
-        if want_offline {
-            *self.pause_until.lock_ok() = None;
-        }
-        // Bumped either way: an in-flight job has to wind down whether or
-        // not this transition was the thing that paused the queue,
-        // because staying connected is exactly what offline forbids.
-        self.pause_gen.fetch_add(1, Ordering::Relaxed);
-        match want_offline {
-            true => {
-                // The pause flag above is a START-time gate (`pick_job`);
-                // nothing samples it inside a running fetch. Without the
-                // wind-down below, going offline turned the dot red,
-                // answered `{"offline":true}` and printed the line under
-                // this comment while the active job's whole fleet stayed
-                // connected and transferring - on a big job, hours of
-                // exactly the occupancy the operator pressed the control
-                // to end. Graceful, like every other pause path: in-flight
-                // articles land and journal, so the job re-queues instead
-                // of failing and a one-pass extraction survives.
-                self.suspend_active(true);
-                // The prefetch sidecar is its own hub and its own fleet,
-                // so the signal above does not reach it. Sync context
-                // here (a blocking API handler thread), so this is the
-                // sync poke rather than the async `stop_sidecar`.
-                self.poke_sidecar(|_| true);
-                self.close_warm_pools();
-                // ...and again once the fleet has parked. A graceful
-                // wind-down ends with each worker HANDING its connection
-                // to the warm pool (`park_or_quit`), so the clear fired
-                // above drains a map those sessions have not reached yet
-                // and they then sit parked for the whole idle timeout -
-                // the occupancy offline exists to end.
-                self.clear_warm_pool_once_the_fleet_parks();
-                info!(target: "offline", "going offline: queue paused, provider connections closing");
-            }
-            false => {
-                // The load-bearing half of `close_warm_pools`. Offline
-                // stops the pool taking connections at all, and only
-                // this path reopens it - leave it shut and every later
-                // job silently pays the cold start again.
-                if let Some(pool) = self.hub.warm.get() {
-                    pool.set_accepting(true);
-                }
-                info!(target: "offline", "back online");
-            }
-        }
-        persist_pause(self);
-    }
-
-    /// Hang up every parked connection now, and stop it filling back up.
-    ///
-    /// Both halves are needed, because the queue pause that goes with
-    /// offline is a GRACEFUL wind-down: the workers finish their
-    /// in-flight windows and park from the pool's drained exits, which
-    /// happens over the following seconds - i.e. after the drain below.
-    /// A drain alone would empty the pool and then watch the tail of the
-    /// job refill it, up to 64 sessions per server, kept alive by the
-    /// keepalive tick while the UI reports offline. So the flag goes
-    /// down FIRST, synchronously, and is already down when the spawned
-    /// clear lands. (`clear` itself must not latch it: config reloads
-    /// call that, and pooling has to survive a saved password.)
-    ///
-    /// `clear` is async (the goodbyes run concurrently under one bound),
-    /// while the callers here are sync API handlers, so this hands it to
-    /// the runtime rather than blocking a handler thread on a provider
-    /// that may be mute. Nothing waits on the result: the sessions are
-    /// already unreachable from the pool the moment `clear` takes its
-    /// lock, which is what "offline" actually promises.
-    pub(super) fn close_warm_pools(&self) {
-        if let Some(pool) = self.hub.warm.get() {
-            pool.set_accepting(false);
-            let pool = pool.clone();
-            tokio::spawn(async move { pool.clear().await });
-        }
-    }
-
-    /// Hang up again once the wound-down fleet has finished parking.
-    ///
-    /// The second half of going offline while a job is running. A
-    /// graceful wind-down does not close the fleet's sockets: each worker
-    /// says goodbye to the queue and then HANDS its live connection to
-    /// the warm pool (`park_or_quit`). So the `close_warm_pools()` fired
-    /// at the moment of the offline call drains a map those sessions have
-    /// not entered yet, and ~one fleet's worth of them park into it a
-    /// second later and stay for the whole idle timeout - which is the
-    /// occupancy the operator pressed the control to end.
-    ///
-    /// Waits on the live-connection gauge rather than on the job, for the
-    /// reason `wind_down` records: a job leaves `Downloading` well before
-    /// its fleet has said goodbye. Bounded, because a provider that never
-    /// answers must not leave this polling forever.
-    ///
-    /// Re-checks `offline` every pass, and that check is load-bearing:
-    /// coming back online and starting a job must not meet a clear that
-    /// was armed for the previous state and QUITs the new job's freshly
-    /// warmed sessions.
-    pub(super) fn clear_warm_pool_once_the_fleet_parks(self: &Arc<Self>) {
-        let d = self.clone();
-        tokio::spawn(async move {
-            let connected = || -> usize {
-                d.hub
-                    .pool_live
-                    .lock_ok()
-                    .as_ref()
-                    .map(|l| {
-                        l.servers
-                            .iter()
-                            .map(|s| s.connected.load(Ordering::Relaxed))
-                            .sum()
-                    })
-                    .unwrap_or(0)
-            };
-            let deadline = Instant::now() + OFFLINE_PARK_BUDGET;
-            loop {
-                if !d.offline.load(Ordering::Relaxed) {
-                    return;
-                }
-                if connected() == 0 || Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            if !d.offline.load(Ordering::Relaxed) {
-                return;
-            }
-            // `.get()`, never the constructing accessor - see
-            // `close_warm_pools` and the wind-down's note at the same
-            // call: asking for the pool in order to empty it CREATES it,
-            // and creation spawns a keepalive tick.
-            if let Some(pool) = d.hub.warm.get() {
-                pool.clear().await;
-            }
-        });
-    }
-
-    /// Push each server's idle-release policy into the warm pool.
-    ///
-    /// The pool is created lazily by the download path, which has the
-    /// hub but not the daemon, so this is called from both: at job start
-    /// against the config that job is about to use, and again whenever a
-    /// server is saved - an operator turning this on while idle, which
-    /// is exactly when they would, must not have to wait for the next
-    /// download to see it take effect.
-    pub fn push_idle_release_policies(&self, servers: &[nzbkit::config::ServerConfig]) {
-        if let Some(pool) = self.hub.warm.get() {
-            pool.set_release_policies(servers);
-        }
-    }
-
-    /// How long since a download last ran, or `None` while one is
-    /// running. The clock the background samplers check before deciding
-    /// whether to hold a session open across their sleep.
-    #[cfg(feature = "indexer")]
-    pub fn download_idle_for(&self) -> Option<std::time::Duration> {
-        if self.started_at.lock_ok().is_some() {
-            return None;
-        }
-        Some(self.last_download_end.lock_ok().elapsed())
-    }
-
-    /// Should a background sampler keep its connection to THIS server
-    /// open across ticks, or close it and reconnect on the next one?
-    ///
-    /// The samplers - the M29 availability oracle and the tip watcher -
-    /// each hold one session per server for as long as the indexer is
-    /// on, whether or not that server opted into warm pooling. That is a
-    /// permanently occupied slot for work that uses the socket for a
-    /// fraction of a second per tick, and against a provider limiting
-    /// source addresses it is the whole account. Once the daemon has
-    /// been download-idle past that server's release timeout they borrow
-    /// a slot per tick instead of owning one: the traffic is unchanged,
-    /// the occupancy drops to the length of the probe.
-    ///
-    /// Per server, like everything else here: a strict provider's
-    /// timeout must not make the samplers churn reconnects against a lax
-    /// one that never had a problem.
-    ///
-    /// Holding is still right while a download runs, when the account is
-    /// in use by this host anyway and the reconnects would be pure cost.
-    #[cfg(feature = "indexer")]
-    pub fn sampler_may_hold(&self, server: &nzbkit::config::ServerConfig) -> bool {
-        let Some(after) = server.idle_release_policy().after else {
-            return true;
-        };
-        self.download_idle_for().is_none_or(|idle| idle < after)
     }
 
     /// All-core CPU% (0-100) from the process cpu-time delta since the
@@ -4061,16 +3596,6 @@ impl Daemon {
             }
             _ => 0.0,
         }
-    }
-
-    /// Lifetime bytes billed to `host` (block-account accounting).
-    pub(super) fn usage_lifetime(&self, host: &str) -> u64 {
-        self.usage
-            .lock_ok()
-            .get("lifetime")
-            .and_then(|v| v.get(host))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
     }
 
     /// §129 4c: has this install EVER had a download? The dashboard's
@@ -5096,580 +4621,6 @@ impl Daemon {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
             });
-        }
-    }
-
-    /// M32: re-queue any Failed history job whose auto-retry cooldown has
-    /// elapsed. Called from the scheduler loop; one lock + linear scan.
-    pub(super) fn run_due_auto_retries(self: &Arc<Self>) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let due: Vec<(String, String)> = self
-            .history
-            .lock_ok()
-            .iter()
-            .filter_map(|j| {
-                let g = j.lock_ok();
-                (g.state == JobState::Failed && g.auto_retry_at.is_some_and(|t| t <= now))
-                    .then(|| (g.nzo_id.clone(), g.name.clone()))
-            })
-            .collect();
-        for (id, name) in due {
-            if self.retry(&id) {
-                info!(
-                    target: "retry",
-                    "{id}: automatic retry (cooldown elapsed - refetching only what's missing)"
-                );
-                // The row the user was shown as FAILED has just left
-                // History and joined the queue. Announce the move: without
-                // it the record appears to have been lost and a download
-                // nobody asked for appears to have started.
-                let mut ring = self.auto_retried.lock_ok();
-                ring.push_back((id, name, now as i64));
-                while ring.len() > 8 {
-                    ring.pop_front();
-                }
-            }
-        }
-        // The other half of the cooldown: a COMPLETED job whose move to
-        // the completed folder failed retries the MOVE, never the
-        // download. Separate arm on purpose - `retry` above would pull
-        // the record out of history and re-fetch a payload that is
-        // already whole on disk.
-        let due_moves: Vec<String> = self
-            .history
-            .lock_ok()
-            .iter()
-            .filter_map(|j| {
-                let g = j.lock_ok();
-                (g.state == JobState::Completed
-                    && !g.move_failed.is_empty()
-                    && g.auto_retry_at.is_some_and(|t| t <= now))
-                .then(|| g.nzo_id.clone())
-            })
-            .collect();
-        for id in due_moves {
-            self.redrive_move(&id);
-        }
-    }
-
-    /// Record what one move attempt did to the job and arm - or refuse
-    /// to arm - the next automatic try. Call with the job lock held,
-    /// once `move_failed` carries the attempt's outcome.
-    ///
-    /// The one place the ladder lives. Both movers (the finalize-side
-    /// worker and the scheduler's redrive) used to carry their own copy
-    /// of "re-arm the flat cooldown", which is how the retry stayed
-    /// unbounded in two places at once: nothing counted the attempts,
-    /// so nothing could grow the delay or ever stop. An unreachable
-    /// destination is not a transient the way a missing article is -
-    /// an unmounted destination volume logged 45 identical EACCES
-    /// failures over 15 hours on 8 Aug 2026, and the 45th was as
-    /// uninformative as the first.
-    ///
-    /// Giving up is not giving up on the payload: every byte is whole
-    /// at `out_dir`, the row stays amber, the drawer still names the
-    /// destination and the error, and `Try the move now` restarts the
-    /// ladder the moment the user has fixed what was wrong.
-    pub(super) fn settle_move_attempt(&self, j: &mut Job) {
-        if j.move_failed.is_empty() {
-            j.move_attempts = 0;
-            // Only ever disarm OUR reason: a stamp left by anything
-            // else is not this function's to clear.
-            if j.auto_retry_why.as_deref() == Some("move") {
-                j.auto_retry_at = None;
-                j.auto_retry_why = None;
-            }
-            return;
-        }
-        j.move_attempts = j.move_attempts.saturating_add(1);
-        let base = self.auto_retry_secs.load(Ordering::Relaxed);
-        // Zero is the user turning automatic retries off outright, and
-        // it is not a give-up worth logging - they asked for this.
-        if base == 0 {
-            return;
-        }
-        if j.move_attempts >= MOVE_RETRY_GIVE_UP {
-            // Disarm rather than merely declining to re-arm. The
-            // redrive clears the stamp before it tries, so this is
-            // usually already None - but the finalize-side mover does
-            // not, and a stamp left behind here is the scheduler's cue
-            // to run the whole ladder again, which is the unbounded
-            // loop this function exists to end.
-            j.auto_retry_at = None;
-            j.auto_retry_why = None;
-            warn!(
-                target: "move",
-                "{}: giving up on the move after {} failed attempts - {}. \
-                 The download is safe at {}; \"Try the move now\" in its \
-                 history drawer starts a fresh ladder.",
-                j.nzo_id,
-                j.move_attempts,
-                j.move_failed,
-                j.out_dir.display()
-            );
-            return;
-        }
-        let secs = move_retry_delay(base, j.move_attempts);
-        j.auto_retry_at = Some(unix_now() as u64 + secs);
-        j.auto_retry_why = Some("move".to_string());
-    }
-
-    /// Re-attempt the move-completed relocation for a parked Completed
-    /// job whose first attempt failed (Job::move_failed). Files only -
-    /// the download is done and stays done. Returns false when the job
-    /// is missing, unfenced state forbids it, or no failure is recorded.
-    ///
-    /// The observed failure mode this exists for is transient: macOS
-    /// denied a network volume to the daemon for a moment and allowed
-    /// it minutes later (7 Aug 2026), so "try again on the M32
-    /// cooldown" converts hours of silently-stranded payloads into one
-    /// delayed move. On another failure the cooldown re-arms - each
-    /// attempt is one create_dir plus one copy that stops at the first
-    /// error, so a persistently absent NAS costs a probe per cycle, not
-    /// a re-download.
-    pub(super) fn redrive_move(self: &Arc<Self>, nzo_id: &str) -> bool {
-        let Some(job) = self.history_job(nzo_id) else {
-            return false;
-        };
-        // Same fence pair the recategorize path takes, for the same
-        // reasons: `moving` keeps deletes/retries off the payload while
-        // files are in flight, and `finalizing` means the tail already
-        // owns the directory. The fence is dropped by the guard inside
-        // the blocking task, so it holds exactly as long as files can
-        // be moving; the early-out paths below release it by hand.
-        if !self.moving.lock_ok().insert(nzo_id.to_string()) {
-            return false;
-        }
-        struct MoveClaim(Arc<Daemon>, String);
-        impl Drop for MoveClaim {
-            fn drop(&mut self) {
-                self.0.moving.lock_ok().remove(&self.1);
-            }
-        }
-        let claim = MoveClaim(self.clone(), nzo_id.to_string());
-        let (out_dir, cat) = {
-            let mut g = job.lock_ok();
-            if g.state != JobState::Completed || g.finalizing || g.move_failed.is_empty() {
-                return false; // claim drops here, releasing the fence
-            }
-            // Disarm before the attempt so a success does not leave a
-            // stale cooldown ticking; a failure re-arms below.
-            g.auto_retry_at = None;
-            g.auto_retry_why = None;
-            (g.out_dir.clone(), g.category.clone())
-        };
-        let d = self.clone();
-        let job2 = job.clone();
-        let id2 = nzo_id.to_string();
-        // The copy is bulk I/O - blocking pool, with the fence riding
-        // along in `claim` so it cannot be released before the move
-        // settles.
-        tokio::task::spawn_blocking(move || {
-            let _claim = claim;
-            info!(target: "move", "{id2}: retrying the move to the completed folder");
-            let (moved, split, failed) = d.relocate_completed(&out_dir, &cat, None);
-            let mut j = job2.lock_ok();
-            j.move_failed = failed.unwrap_or_default();
-            j.move_split = match &split {
-                Some(src) => src.to_string_lossy().to_string(),
-                None => String::new(),
-            };
-            if let Some(dest) = moved {
-                j.filed = j.tv_sort && is_season_dir(&dest);
-                j.out_dir = dest;
-            }
-            // Arms the NEXT rung, or stops the ladder. The disarm above
-            // ran before the attempt, so this is the only thing that
-            // can leave a stamp behind.
-            d.settle_move_attempt(&mut j);
-            drop(j);
-            d.history_upsert_if_present(&job2);
-            d.save_queue();
-        });
-        true
-    }
-
-    /// The drawer button's redrive: forget the failed-attempt count
-    /// first, then try.
-    ///
-    /// A user pressing "Try the move now" has almost always just fixed
-    /// the thing that was wrong - mounted the volume, granted the
-    /// share, freed the disk - so the ladder starts again from its
-    /// first rung, and a job the daemon had given up on becomes
-    /// automatic again. Without the reset, one manual press on a job at
-    /// the give-up count would try exactly once and go quiet forever.
-    pub(super) fn retry_move_now(self: &Arc<Self>, nzo_id: &str) -> bool {
-        if let Some(job) = self.history_job(nzo_id) {
-            job.lock_ok().move_attempts = 0;
-        }
-        self.redrive_move(nzo_id)
-    }
-
-    pub(super) fn retry(&self, nzo_id: &str) -> bool {
-        // Same transaction as `enqueue`: this picks an output directory
-        // by the same claim rule and republishes the job into the queue,
-        // so it must not interleave with an add (or another retry)
-        // making the same decision about the same folder.
-        let publish = self.add_lock.lock_ok();
-        let mut h = self.history.lock_ok();
-        // A recategorize is moving this job's payload right now. Taking
-        // it out of history and re-queueing it would start writers at
-        // the path the move is emptying, and the move would then point
-        // the record at the destination while the download continued at
-        // the source. The auto-retry timer fires from the scheduler, so
-        // this is not a race the user has to lose deliberately.
-        //
-        // UNDER the history lock, which is the half that makes it work
-        // (Codex H7). `history_change_cat` raises its `moving` marker and
-        // THEN re-verifies the record is still in history; a check taken
-        // outside this lock could pass just before the marker went up
-        // while the move still proceeded. Both REST and JSON-RPC history
-        // delete already sample it here; retry read it one lock too
-        // early, so a recategorize could re-verify the record present,
-        // block on `add_lock`, and then move the payload of a job this
-        // call had already pulled out of history and re-queued - leaving
-        // a full payload at the destination named by no record, while
-        // the re-queued job downloaded the release again into the
-        // directory the move was emptying.
-        if self.moving.lock_ok().contains(nzo_id) {
-            info!(target: "retry", "{nzo_id}: refused - its files are being moved right now");
-            return false;
-        }
-        let Some(pos) = h.iter().position(|j| j.lock_ok().nzo_id == nzo_id) else {
-            return false;
-        };
-        // A password unlock is finalizing this record right now - it is
-        // extracting/renaming/moving under `out_dir` and will write the
-        // committed state back when it settles. Removing and re-queueing
-        // the record here would reassign that directory under the
-        // running task (Codex sweep 3 Aug H1). Checked under the history
-        // lock: set_password raises the flag and then re-verifies the
-        // record is still present under this same lock, so whichever
-        // committed second sees the other.
-        if h[pos].lock_ok().finalizing {
-            info!(target: "retry", "{nzo_id}: refused - an unlock is finalizing it right now");
-            return false;
-        }
-        let job = h.remove(pos);
-        drop(h);
-        // A TV-filed job's out_dir is the SHARED `Show/Season NN` library
-        // folder. Re-queueing it as-is would point the whole re-download
-        // (journal, volume writers, and every later "delete this job's
-        // files") at a directory that belongs to the season, not the job.
-        // Give it a fresh private directory instead.
-        //
-        // So does a job whose old folder someone else has taken since it
-        // failed: a Failed record reads as Free, so a re-add of the same
-        // name is handed exactly that directory, and re-queueing this one
-        // as-is would put two live jobs in it - or, once the re-add has
-        // finished, aim this download straight at its verified payload,
-        // which is the collision `DirClaim::Payload` exists to prevent.
-        // Checked AFTER the history removal above, so an ordinary failed
-        // retry still finds its own folder unclaimed and reuses it in
-        // place: re-adds must not climb .2/.3/.4.
-        let (filed, category, name, cur) = {
-            let j = job.lock_ok();
-            (
-                j.filed,
-                j.category.clone(),
-                j.name.clone(),
-                j.out_dir.clone(),
-            )
-        };
-        // With NO job lock held: dir_claim locks every job in the queue
-        // and history.
-        let taken = matches!(self.dir_claim(&cur), DirClaim::Active | DirClaim::Payload);
-        // A job's out_dir is the absolute path baked in from the
-        // download-folder setting IN FORCE WHEN IT WAS ADDED. If that
-        // setting has since changed - the user picked a new download folder,
-        // or a settings.json was carried between two machines where the old
-        // path (a since-unplugged drive, a differently mounted volume) does
-        // not even exist - the captured path no longer sits under the
-        // current root. Re-running the job as-is would keep writing to, or
-        // fail EACCES/ENOENT against, a folder the user has deliberately
-        // moved away from (field repro 9 Aug: out_dir was changed to a
-        // mounted path, yet retry still targeted the old /Volumes/... one).
-        // Re-derive it from the CURRENT root + this job's category, exactly
-        // as a fresh add resolves it. A path still under the current root is
-        // left untouched, so an ordinary failed retry keeps its own folder,
-        // its journal and its progress. (refile_out_dir honours the category
-        // as a subfolder; a cat_meta `dir` rename is not re-applied here, the
-        // same as the filed/taken paths above - a pre-existing gap, not this
-        // fix's concern.)
-        let stale = !cur.starts_with(self.out_dir());
-        if filed || taken || stale {
-            let (dir, replaces) =
-                refile_out_dir(&self.out_dir(), &category, &name, &|p| self.dir_claim(p));
-            let mut j = job.lock_ok();
-            info!(
-                target: "retry",
-                "{}: {} {} - re-downloading into {} instead",
-                j.nzo_id,
-                if filed {
-                    "was filed into"
-                } else if taken {
-                    "another job now owns"
-                } else {
-                    "targeted a download folder that is no longer configured:"
-                },
-                j.out_dir.display(),
-                dir.display()
-            );
-            j.out_dir = dir;
-            j.replaces = replaces;
-            j.filed = false;
-            // The journal that backed those bytes is in the OLD folder,
-            // so nothing is on disk at the new one: this retry really
-            // does start from zero, and the queue row must say so rather
-            // than inherit a percentage from a directory it has just
-            // been moved out of. (An ordinary failed retry keeps its
-            // folder, its journal and its figure.)
-            j.downloaded_bytes = 0;
-            // The two travel together: the job is no longer in the season
-            // folder, so the suffix its old files carried there is not an
-            // answer about anything this record now owns.
-            j.filed_suffix = None;
-        }
-        {
-            let mut j = job.lock_ok();
-            j.state = JobState::Queued;
-            // A retry is an instruction to RUN the job, so it cannot
-            // arrive back in the queue holding a pause `pick_job` will
-            // skip it for (Codex sweep 2, 3 Aug M4). The flag reaches
-            // here from a pause taken while the job was in its
-            // post-network tail, which the tail correctly ignored and
-            // then left set; the shared transition now refuses to set
-            // it there at all, and this is the belt to that brace - a
-            // failed record's pause flag describes nothing either way.
-            j.paused = false;
-            j.fail_message.clear();
-            j.fail_detail.clear();
-            j.finished_at = None;
-            j.finished_unix = None;
-            j.retries += 1;
-            // A due-or-pending auto-retry is consumed by ANY retry (manual
-            // included) - never leave a stale past-due stamp that would
-            // re-trigger endlessly from history.
-            j.auto_retry_at = None;
-            // Travels with the stamp: a cleared retry has no reason left
-            // to explain, and a stale token would caption the NEXT
-            // failure's row with the last one's cause.
-            j.auto_retry_why = None;
-            // TODO §77: the pre-flight verdict is about a moment that has
-            // passed. A retry exists BECAUSE the answer may have changed -
-            // the automatic one runs on exactly the theory that propagation
-            // has filled the gaps since - so the row must not go on showing
-            // what the servers said before the last attempt. Cleared rather
-            // than aged out: the prober re-samples a job with no verdict on
-            // its next idle tick, which is the answer worth having here.
-            j.health = None;
-        }
-        self.queue.lock_ok().push_back(job);
-        drop(publish);
-        // The record has LEFT history: stop it replaying there. Its new
-        // life as a queue record is save_queue's to persist.
-        self.history_tombstone(&[nzo_id.to_string()]);
-        self.save_queue();
-        true
-    }
-
-    /// Persist queue + history to `.spool/queue.json` so a daemon restart
-    /// doesn't forget the job list. Only the record is at stake: the NZB
-    /// itself already lives in the spool, and each out_dir's article
-    /// journal makes a resumed download fetch only what's still missing.
-    /// Called after every mutation, once the queue/history locks are
-    /// released. Best-effort like save_setting: a failed write must never
-    /// take down a live daemon.
-    ///
-    /// Returns whether the record actually landed. Almost every caller is
-    /// right to ignore that - the job is live in memory either way. The watch
-    /// poller is not: it deletes the user's original .nzb once the job is
-    /// accepted, so it needs to know the acceptance survived a restart.
-    pub(super) fn save_queue(&self) -> bool {
-        // API requests run on a worker pool - serialize the writes so two
-        // mutations can't interleave bytes in the file. Take the IO lock
-        // BEFORE snapshotting: if the snapshot were built first, a slow
-        // encoder (T1) could grab the lock after a later mutation (T2)
-        // already wrote its fresher snapshot, then overwrite it with stale
-        // state and lose T2's change across restart. Snapshotting under the
-        // lock makes the last writer also the one holding the newest state.
-        static IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = IO.lock_ok();
-        let jobs: Vec<Value> = self
-            .queue
-            .lock_ok()
-            .iter()
-            .map(|j| job_json(&j.lock_ok()))
-            .collect();
-        // §129 1a: history is NOT here any more. It lives in its own
-        // append-only store (`histstore.rs`), written by the sites that
-        // actually change it - park, delete, retry, recategorize, the
-        // unlock/mover bookkeeping - so an unlimited history stops
-        // costing every queue mutation an O(all-time) rewrite.
-        let v = json!({
-            "next_id": self.next_id.load(Ordering::Relaxed),
-            "queue": jobs,
-        });
-        // The dashboard's change handle, bumped WITH the write: a queue
-        // change that should survive restart comes through here, so the
-        // revision sees it by construction.
-        self.queue_rev.fetch_add(1, Ordering::Relaxed);
-        let path = self.spool.join("queue.json");
-        match serde_json::to_string_pretty(&v) {
-            Ok(text) => match crate::persist::write_atomic(&path, text.as_bytes()) {
-                Ok(()) => true,
-                Err(e) => {
-                    error!(target: "queue", "persist {}: {e}", path.display());
-                    false
-                }
-            },
-            Err(e) => {
-                error!(target: "queue", "serialize: {e}");
-                false
-            }
-        }
-    }
-
-    /// Reload `.spool/queue.json` at startup, re-creating the Job records.
-    /// Wall-clock floor (seconds since the Unix epoch) for the RESTORED
-    /// id allocator. The snapshot's `next_id` can be stale when the run
-    /// that allocated past it could not persist (disk full at enqueue),
-    /// and those already-issued ids carry permanent stream tokens - so
-    /// a restore must never let allocation fall back behind real time.
-    /// Only applied on restore: a fresh daemon with no state keeps its
-    /// small ids (and has no earlier run to collide with unless
-    /// persistence never worked at all, which startup now warns about).
-    fn id_floor() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    }
-
-    /// A job that was Downloading when the daemon stopped comes back
-    /// Queued, so the scheduler restarts it and its journal resumes the
-    /// transfer.
-    pub(super) fn load_queue(&self) {
-        // Before anything reads a job's out_dir: put back a download that
-        // an interrupted replace left in limbo.
-        recover_interrupted_publishes(&self.out_dir());
-        let path = self.spool.join("queue.json");
-        // A torn/corrupt file falls back to the .bak of the last good
-        // parse - never "start empty" and let the next save_queue make
-        // the loss permanent.
-        // §129 1a: history has its own store now. Replay it FIRST so the
-        // legacy-migration merge below can prefer the newer layout when
-        // both name an id (a crash between the split's two writes).
-        let (stored_hist, wants_compaction) = self.history_replay();
-        let (v, mut legacy_hist) = match crate::persist::load_json_with_backup(&path) {
-            Some(v) => {
-                let legacy = v
-                    .get("history")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                (Some(v), legacy)
-            }
-            None => (None, Vec::new()),
-        };
-        // Records already living in history.jsonl win over their legacy
-        // queue.json copies - the split happened, then something wrote
-        // history.jsonl, then the queue.json rewrite was lost.
-        legacy_hist.retain(|r| {
-            r.get("nzo_id")
-                .and_then(Value::as_str)
-                .is_none_or(|id| !stored_hist.iter().any(|j| j.nzo_id == id))
-        });
-        let migrating = !legacy_hist.is_empty();
-        let queue_arr = v
-            .as_ref()
-            .and_then(|v| v.get("queue"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let (queued, from_file) = restore_records(&queue_arr, &legacy_hist);
-        // `from_file` is the legacy history records plus any terminal
-        // records restore_records routed OUT of the queue array
-        // (interrupted post-processing). Order for the final Vec, oldest
-        // first: legacy array, then the store's records, then the routed
-        // ones (they finished last, mid-shutdown). A routed record whose
-        // park already reached history.jsonl before the crash keeps the
-        // store's copy.
-        let legacy_ids: std::collections::HashSet<String> = legacy_hist
-            .iter()
-            .filter_map(|r| r.get("nzo_id").and_then(Value::as_str))
-            .map(str::to_string)
-            .collect();
-        let (legacy_part, routed): (Vec<Job>, Vec<Job>) = from_file
-            .into_iter()
-            .partition(|j| legacy_ids.contains(&j.nzo_id));
-        let routed: Vec<Job> = routed
-            .into_iter()
-            .filter(|j| !stored_hist.iter().any(|s| s.nzo_id == j.nzo_id))
-            .collect();
-        let routed_any = !routed.is_empty();
-        let mut history = legacy_part;
-        history.extend(stored_hist);
-        history.extend(routed);
-        let (nq, nh) = (queued.len(), history.len());
-        for job in queued {
-            self.register_cat(&job.category);
-            self.queue.lock_ok().push_back(Arc::new(Mutex::new(job)));
-        }
-        for job in history {
-            self.register_cat(&job.category);
-            self.history.lock_ok().push(Arc::new(Mutex::new(job)));
-        }
-        let v = match v {
-            Some(v) => v,
-            None => {
-                // No queue.json at all, but maybe a history store.
-                if wants_compaction {
-                    self.history_compact();
-                }
-                self.history_enforce_retention();
-                if nh > 0 {
-                    info!(target: "queue", "restored {nh} history jobs");
-                }
-                return;
-            }
-        };
-        if let Some(n) = v.get("next_id").and_then(Value::as_u64) {
-            // Never reuse an id - SABnzbd clients key on nzo_id uniqueness,
-            // and stream tokens are H(secret, nzo_id): a reused id would
-            // hand a previous job's permanent capability URL to a NEW job.
-            // The persisted allocator alone cannot guarantee that (the
-            // snapshot write is best-effort and an enqueue whose snapshot
-            // failed already returned its id and token), so the wall-clock
-            // floor below keeps allocations ahead of any earlier run's
-            // even when its snapshots never landed.
-            let cur = self.next_id.load(Ordering::Relaxed);
-            self.next_id
-                .store(n.max(cur).max(Self::id_floor()), Ordering::Relaxed);
-        }
-        // The one-time split, and the store's own housekeeping. Compact
-        // FIRST (it writes every live record, so migrated and routed
-        // rows land in history.jsonl), then rewrite queue.json without
-        // its history array - in that order, so a crash between the two
-        // duplicates records into both files (deduped above on the next
-        // boot) rather than losing them from both.
-        if migrating || routed_any || wants_compaction {
-            self.history_compact();
-        }
-        if migrating {
-            self.save_queue();
-            info!(
-                target: "queue",
-                "history moved out of queue.json into its own store ({} records)",
-                nh
-            );
-        }
-        self.history_enforce_retention();
-        if nq + nh > 0 {
-            info!(target: "queue", "restored {nq} queued + {nh} history jobs");
         }
     }
 }

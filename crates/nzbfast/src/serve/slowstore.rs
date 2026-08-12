@@ -113,6 +113,14 @@ pub(crate) struct Tune {
     pub probe_slow_ms: u64,
     /// Probe cadence while the pause holds.
     pub probe_secs: u64,
+    /// Probe cadence while merely ANSWERING THE DIAGNOSTIC (§108 option
+    /// 2): the queue is running and nothing has tripped, so this is
+    /// deliberately slower than `probe_secs` - four times slower at the
+    /// defaults. It only runs at all while the whyslow core is stuck at
+    /// its disk-vs-client fork, which needs an established shortfall
+    /// AND heavy write-side parking, so a healthy daemon never reaches
+    /// it. See `DIAG_SLOW_RUNS`.
+    pub diag_secs: u64,
     /// N: consecutive healthy probes before the queue resumes. The
     /// hysteresis - one good answer from a flapping enclosure is not
     /// recovery.
@@ -131,10 +139,22 @@ impl Default for Tune {
             probe_bytes: 4 << 20,
             probe_slow_ms: 1_500,
             probe_secs: 15,
+            diag_secs: 60,
             probe_healthy: 3,
         }
     }
 }
+
+/// Consecutive SLOW diagnostic probes before the whyslow verdict is
+/// allowed to name the disk.
+///
+/// One is not enough, for the same reason one clean probe is not a
+/// recovery: this verdict is shown to a user as a fact about their
+/// hardware, and the cheapest way to be wrong about it is to believe a
+/// single sample. Two at the default cadence means about two minutes of
+/// a genuinely struggling volume - still days earlier than the breaker,
+/// which needs three quarters of a three-minute window.
+const DIAG_SLOW_RUNS: u32 = 2;
 
 impl Tune {
     /// Read the `slow_storage` object out of settings.json. Every field
@@ -170,6 +190,12 @@ impl Tune {
         }
         if let Some(n) = num("probe_secs") {
             t.probe_secs = (n as u64).clamp(1, 3600);
+        }
+        if let Some(n) = num("diag_secs") {
+            // Never faster than the paused cadence: the diagnostic runs
+            // while the queue is still working, so it must be the
+            // lighter of the two, not the heavier.
+            t.diag_secs = (n as u64).clamp(t.probe_secs, 24 * 3600);
         }
         if let Some(n) = num("probe_healthy") {
             t.probe_healthy = (n as u32).clamp(1, 100);
@@ -480,8 +506,17 @@ pub(crate) struct Held {
     /// The volume the evidence is about (the job's output directory, or
     /// the daemon's output root when no job was running).
     pub path: PathBuf,
-    /// [`Evidence::sentence`] - what the drawer shows and the log said.
+    /// [`Evidence::sentence`] - what the log said, and the tooltip of
+    /// last resort. The dashboard composes its OWN sentence from the
+    /// two numbers below, because this one is built here in English
+    /// and a formatted sentence cannot be translated at the display
+    /// edge the way a bare status word can.
     pub evidence: String,
+    /// The same measurement as numbers, for the localised sentence:
+    /// seconds of the window that were stalled, out of the seconds the
+    /// window covers.
+    pub stalled_secs: f64,
+    pub window_secs: f64,
     /// The job that was downloading when the pause fired, so the queue
     /// row that gets the sub-line is the one this happened to.
     pub nzo_id: Option<String>,
@@ -510,6 +545,31 @@ pub(crate) struct Governor {
     /// and only while `pause_source` is "storage" - a user pause landing
     /// on top takes ownership and this clears.
     held: std::sync::Mutex<Option<Held>>,
+    /// §108 option 2: the whyslow core is at its disk-vs-client fork
+    /// and wants the volume tested. Set by the whyslow tick, read by
+    /// the watcher - an atomic because they are different threads at
+    /// different cadences and neither should wait on the other.
+    want_diag: std::sync::atomic::AtomicBool,
+    /// What the diagnostic probes have said so far.
+    diag: std::sync::Mutex<Diag>,
+}
+
+/// The diagnostic latch: what the pre-pause probes have found, and when.
+///
+/// Kept apart from `held` on purpose. `held` is an ACTION in force;
+/// this is only an opinion offered to the "why is this slow?" panel,
+/// and it must never be mistaken for one - nothing here pauses
+/// anything, and the breaker's own evidence is untouched by it.
+#[derive(Debug, Default, Clone)]
+struct Diag {
+    /// Consecutive slow probes, against [`DIAG_SLOW_RUNS`].
+    slow_runs: u32,
+    /// Milliseconds the last diagnostic probe took.
+    last_ms: u64,
+    /// When that probe answered. A verdict about hardware goes stale:
+    /// once the fork stops being reached the probes stop, and an
+    /// opinion nobody is refreshing must not keep condemning a volume.
+    at_ms: u64,
 }
 
 impl Default for Governor {
@@ -518,6 +578,8 @@ impl Default for Governor {
             on: std::sync::atomic::AtomicBool::new(super::SLOW_STORAGE_PAUSE_DEFAULT),
             tune: std::sync::Mutex::new(Tune::default()),
             held: std::sync::Mutex::new(None),
+            want_diag: std::sync::atomic::AtomicBool::new(false),
+            diag: std::sync::Mutex::new(Diag::default()),
         }
     }
 }
@@ -542,6 +604,82 @@ impl Governor {
     pub(crate) fn paused(&self) -> bool {
         self.held.lock_ok().is_some()
     }
+
+    /// The whyslow core, telling us whether it is stuck at the fork.
+    pub(crate) fn set_want_diag(&self, want: bool) {
+        // Asking the question again after it lapsed must not inherit an
+        // old answer: the probes stopped because the fork stopped being
+        // reached, and whatever the volume was doing then is not
+        // evidence about now.
+        if want && !self.want_diag.swap(true, Ordering::Relaxed) {
+            *self.diag.lock_ok() = Diag::default();
+        } else if !want {
+            self.want_diag.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn wants_diag(&self) -> bool {
+        self.want_diag.load(Ordering::Relaxed)
+    }
+
+    /// Does the diagnostic currently condemn the volume?
+    ///
+    /// Three conditions, all of them narrowing: enough consecutive slow
+    /// probes, an answer recent enough to still be about now, and the
+    /// question still being asked. The freshness bound is three
+    /// cadences, so one missed probe does not drop a standing verdict.
+    pub(crate) fn suspect(&self, now_ms: u64) -> bool {
+        if !self.wants_diag() {
+            return false;
+        }
+        let fresh_ms = self.tune().diag_secs.saturating_mul(3_000);
+        let d = self.diag.lock_ok();
+        d.slow_runs >= DIAG_SLOW_RUNS && now_ms.saturating_sub(d.at_ms) <= fresh_ms
+    }
+
+    /// The last diagnostic probe's duration, for the panel's numbers.
+    pub(crate) fn diag_ms(&self) -> u64 {
+        self.diag.lock_ok().last_ms
+    }
+}
+
+/// Fold one diagnostic probe into the latch. Returns whether the
+/// volume is now condemned.
+///
+/// Only SLOW accumulates. A fast probe clears the run outright, and so
+/// does an errored one: an error is not evidence of slowness - a write
+/// that fails outright is the ACUTE path's business, and it has its own
+/// verdict.
+fn note_diag(d: &Daemon, probe: &Probe, now_ms: u64) -> bool {
+    let mut g = d.slow_storage.diag.lock_ok();
+    g.last_ms = probe.ms();
+    g.at_ms = now_ms;
+    g.slow_runs = match probe {
+        Probe::Slow(_) => g.slow_runs.saturating_add(1),
+        _ => 0,
+    };
+    g.slow_runs >= DIAG_SLOW_RUNS
+}
+
+/// Tell the dashboard its queue payload moved.
+///
+/// Everything this module changes - `paused`, `pause_source` and the
+/// `storage_pause` block below - rides the §129 1b revisioned queue
+/// payload, and the poll answers `"queue": null` for a client whose
+/// revision matches unless something is actively transferring. A
+/// storage pause is precisely the case where nothing is: the wind-down
+/// takes the one running job off the wire, so from the moment the pause
+/// lands until it lifts, `any_active` is false and the revision is the
+/// ONLY thing that can move the payload.
+///
+/// Without this the header pill, the row sub-line and the drawer all
+/// freeze at whatever they last applied - the recovery tally sits at
+/// "0 so far" for the whole pause, and a release with an empty queue
+/// behind it leaves "paused - output storage is not keeping up" on
+/// screen indefinitely. This is the same staleness `persist_pause`
+/// documents, from a path that deliberately does not persist.
+fn bump(d: &Daemon) {
+    d.queue_rev.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The queue payload's `storage_pause` block: null unless a storage
@@ -556,6 +694,8 @@ pub(super) fn payload(d: &Daemon) -> Value {
         Some(h) => json!({
             "path": h.path.to_string_lossy(),
             "evidence": h.evidence,
+            "stalled_secs": h.stalled_secs.round(),
+            "window_secs": h.window_secs.round(),
             "nzo_id": h.nzo_id,
             "since_unix": h.since_unix,
             "probe_ms": h.probe_ms,
@@ -604,6 +744,8 @@ pub(super) fn engage(d: &Arc<Daemon>, ev: &Evidence, path: &Path, probe: &Probe)
     *d.slow_storage.held.lock_ok() = Some(Held {
         path: path.to_path_buf(),
         evidence: sentence.clone(),
+        stalled_secs: ev.stalled_secs,
+        window_secs: ev.window_secs,
         nzo_id,
         since_unix: super::job::unix_now(),
         probe_ms: *ms,
@@ -611,6 +753,7 @@ pub(super) fn engage(d: &Arc<Daemon>, ev: &Evidence, path: &Path, probe: &Probe)
     });
     d.paused.store(true, Ordering::Relaxed);
     *d.pause_source.lock_ok() = "storage";
+    bump(d);
     // A storage pause cancels any pending timed auto-resume: coming back
     // is the probe's call now, not a clock's.
     d.pause_gen.fetch_add(1, Ordering::Relaxed);
@@ -667,6 +810,9 @@ pub(super) fn release(d: &Arc<Daemon>, why: &str) {
         // wind-down) cannot inherit "storage" and be mistaken for ours.
         *d.pause_source.lock_ok() = "user";
     }
+    // Unconditional: the handover case does not lift anything, but it
+    // still drops the `storage_pause` block off the payload.
+    bump(d);
     info!(target: "storage", "{why}");
     d.note_event("clear", why.to_string());
 }
@@ -689,6 +835,11 @@ pub(super) fn heal(d: &Arc<Daemon>, probe: &Probe) -> bool {
         };
         (h.healthy, h.path.clone())
     };
+    // Every probe moves the payload, whether or not it resumes: the
+    // tally and the last-probe duration are what the drawer's recovery
+    // line is made of, and a probe that resets the count to zero after a
+    // flap is exactly the moment the user should see change.
+    bump(d);
     if healthy < need {
         return false;
     }
@@ -796,6 +947,7 @@ async fn watch(d: Arc<Daemon>) {
     // (pool identity, blocked_ms total, bytes total) at the last tick.
     let mut prev: Option<(Arc<nzbkit::pool::LiveStats>, u64, u64, u64)> = None;
     let mut last_probe_ms = 0u64;
+    let mut last_diag_ms = 0u64;
     loop {
         tokio::time::sleep(TICK).await;
         let todo = step(&d);
@@ -863,6 +1015,33 @@ async fn watch(d: Arc<Daemon>) {
             bytes: bytes.saturating_sub(pbytes),
         };
         let Some(ev) = judge.observe(sample) else {
+            // No nomination. This is where the vast majority of ticks
+            // land, and it is also the only place the §108 option 2
+            // diagnostic can run: the breaker has NOT tripped, so if
+            // the whyslow core is stuck at its disk-vs-client fork,
+            // the volume is the open question and nothing else is
+            // going to answer it. Same instrument, slower cadence.
+            if d.slow_storage.wants_diag()
+                && now.saturating_sub(last_diag_ms) >= diag_secs_now(&d) * 1000
+            {
+                last_diag_ms = now;
+                let (bytes, slow) = {
+                    let t = d.slow_storage.tune();
+                    (t.probe_bytes, t.probe_slow_ms)
+                };
+                let probe = run_probe(affected_path(&d), bytes, slow).await;
+                if note_diag(&d, &probe, nzbkit::pool::now_ms()) {
+                    // Opinion only - the queue keeps running. The panel
+                    // reads this; nothing else does.
+                    info!(
+                        target: "storage",
+                        "the output volume is answering slowly ({} ms for a {:.0} MB write) \
+                         while downloads run short of the line - naming it in the slowdown panel",
+                        probe.ms(),
+                        bytes as f64 / 1e6
+                    );
+                }
+            }
             continue;
         };
         let path = affected_path(&d);
@@ -899,6 +1078,10 @@ fn totals(live: &nzbkit::pool::LiveStats) -> (u64, u64, u64) {
 /// timeout reports as slow-by-observation rather than hanging the
 /// watcher - the write is still outstanding on its own thread, and the
 /// next tick's probe simply starts a new one.
+fn diag_secs_now(d: &Daemon) -> u64 {
+    d.slow_storage.tune().diag_secs
+}
+
 async fn run_probe(path: PathBuf, bytes: u64, slow_ms: u64) -> Probe {
     let budget = Duration::from_millis(slow_ms.saturating_mul(4).max(5_000));
     let job = tokio::task::spawn_blocking(move || probe_write(&path, bytes, slow_ms));

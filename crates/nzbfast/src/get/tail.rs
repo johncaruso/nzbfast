@@ -209,6 +209,51 @@ pub(super) fn unpack_tail(
     // The downloaded volume set is done with. Everything below works on
     // what extraction PRODUCED, which this mode has no business eating.
     drop(eat_arm);
+    // The post IS an SFX: every member is an .exe/.bin/.sfx with a RAR or
+    // 7z signature sitting past a launcher stub. Nothing above sees one -
+    // the in-stream mapper sniffs offset 0, so a stub reads as a plain
+    // data file, the job "completes" with two executables as the payload,
+    // and the nested pass below never runs (an .exe is not an extractable
+    // archive to it, deliberately). This is the entry gate for that
+    // shape, and it belongs HERE rather than in the nested pass because
+    // only this frame can tell a downloaded file from a produced one.
+    //
+    // That distinction is the whole safety argument. A payload's
+    // `setup.exe` is very often a legitimate WinRAR SFX installer and must
+    // never be auto-exploded, which is why `extract_one_level`'s step 3
+    // is depth-0 only - but by the time we get here, extraction output
+    // and downloaded files share one directory, so "top level" no longer
+    // means "downloaded". `slot_path` does: it is the live on-disk path of
+    // a slot the DOWNLOAD wrote (rename-aware, so a deobfuscated name
+    // still matches). Only those paths are eligible; anything extraction
+    // produced is invisible to this arm however executable it looks.
+    //
+    // Runs before the nested pass, not instead of it: an SFX wrapping a
+    // RAR that wraps another archive still denests, because the pass
+    // below sees what this produced.
+    if all_good && !no_extract && !locked_no_password {
+        let downloaded: std::collections::HashSet<std::path::PathBuf> = (0..slots.len())
+            .filter_map(|i| extractor.slot_path(i))
+            .collect();
+        let sfx: Vec<std::path::PathBuf> = collect_sfx_archives(out_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| downloaded.contains(p))
+            .collect();
+        if !sfx.is_empty() {
+            // Same permit as every other arm: carving a stub off and
+            // unpacking what is behind it is heavy CPU and heavy disk.
+            let _cpu = crate::lanegate::heavy_cpu_blocking();
+            if !extract_sfx(out_dir, &sfx, password) {
+                all_good = false;
+                reextract_failed = Some(
+                    "the downloaded self-extracting archive could not be unpacked \
+                     (damaged, encrypted, or an unsupported compression method)"
+                        .into(),
+                );
+            }
+        }
+    }
     // Post-extraction pass: nested archives (a RAR whose payload is one
     // more RAR), 7z sets, and SFX payloads unpack here - the inner layer
     // only exists once the outer extraction produced it, so this is
@@ -351,8 +396,9 @@ pub(super) fn report_extraction(
     for (sidx, pname) in deferred_renames {
         if let Some(path) = extractor.slot_path(*sidx)
             && path.exists()
+            && let Some(new) = publish_verified_name(&path, pname, out_dir)
         {
-            publish_verified_name(&path, pname, out_dir);
+            extractor.note_slot_renamed(*sidx, new);
         }
     }
     // Named-RAR volume files of the DOWNLOADED set sitting in the output
@@ -520,6 +566,7 @@ pub(super) fn finish_job(
     backbones: &[String],
     post_age_days: u32,
     repair_shortfall: Option<(usize, usize)>,
+    extracted: &[String],
 ) -> Result<()> {
     // Download complete and verified (or repaired): the journal's job is
     // done. Anything less is a FAILED job - the daemon parks it in history
@@ -561,7 +608,14 @@ pub(super) fn finish_job(
         anyhow::bail!(with_build(format!(
             "{why} - the verified files are still in the output directory"
         )))
-    } else if incomplete > 0 || derrs > 0 {
+    }
+    // Nothing below this point certified the payload, and a one-pass job
+    // has already written it: take it out of circulation before the
+    // failure returns. See quarantine_partials for why this is a rename
+    // and not a delete. Deliberately AFTER the reextract_failed arm,
+    // whose files really were verified and whose message says so.
+    quarantine_failed_payload(out_dir, extracted);
+    if incomplete > 0 || derrs > 0 {
         let causes = LossCauses {
             missing_430: missing_430.load(Ordering::Relaxed),
             retention_excluded: retention_skipped,
@@ -590,6 +644,44 @@ pub(super) fn finish_job(
         anyhow::bail!(with_build(
             "verification failed and PAR2 repair could not complete".into()
         ))
+    }
+}
+
+/// Rename a failed job's direct-extracted payload aside, and SAY so.
+///
+/// The mechanism and the reasoning live in
+/// `nzbkit::journal::quarantine_partials`; this is the reporting half.
+/// A failed job's one line about it matters more than the success
+/// path's: the user is about to look in the output directory for the
+/// file the verdict just told them they do not have, and without this
+/// they find a plausible-looking one wearing a suffix nobody explained.
+///
+/// A rename that FAILED is a warning rather than a second failure - the
+/// job is already failing and has its own cause to report, and burying
+/// that cause under a filesystem complaint helps nobody. It still has
+/// to be said: the file it names is the false artifact the rename
+/// exists to prevent, and it is still sitting there.
+fn quarantine_failed_payload(out_dir: &Path, extracted: &[String]) {
+    if extracted.is_empty() {
+        return;
+    }
+    let (done, failed) = nzbkit::journal::quarantine_partials(out_dir, extracted);
+    if !done.is_empty() {
+        println!(
+            "  {} unverified file(s) renamed to *{} so nothing imports them: {} \
+             (the bytes are kept - a retry resumes from them)",
+            done.len(),
+            nzbkit::journal::PARTIAL_SUFFIX,
+            done.join(", ")
+        );
+        info!(target: "quarantine", "renamed {} unverified payload file(s) aside", done.len());
+    }
+    for name in &failed {
+        println!(
+            "  ⚠ could not rename the unverified {name} aside - it is INCOMPLETE despite \
+             its name and size, do not import it"
+        );
+        warn!(target: "quarantine", "{name}: could not be renamed aside");
     }
 }
 
@@ -715,6 +807,29 @@ mod tests {
         derrs: u64,
         repair_shortfall: Option<(usize, usize)>,
     ) -> Result<()> {
+        run_finish_ex(
+            dir,
+            all_good,
+            reextract_failed,
+            incomplete,
+            derrs,
+            repair_shortfall,
+            &[],
+        )
+    }
+
+    /// The same, with the direct-extracted payload list the quarantine
+    /// pass reads.
+    #[allow(clippy::too_many_arguments)]
+    fn run_finish_ex(
+        dir: &Path,
+        all_good: bool,
+        reextract_failed: Option<String>,
+        incomplete: usize,
+        derrs: u64,
+        repair_shortfall: Option<(usize, usize)>,
+        extracted: &[String],
+    ) -> Result<()> {
         let (j, _) = nzbkit::journal::Journal::open(dir, b"<nzb/>").unwrap();
         finish_job(
             all_good,
@@ -740,6 +855,7 @@ mod tests {
             &[],
             0,
             repair_shortfall,
+            extracted,
         )
     }
 
@@ -789,6 +905,90 @@ mod tests {
             m.contains("verification failed and PAR2 repair could not complete"),
             "{m}"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The advG lesson (torture round, 12 Aug): a post carrying an
+    /// article nobody has fails correctly and USED TO leave `g.bin` -
+    /// exactly the payload's name, exactly its size, a zero-filled hole
+    /// in the middle - sitting in the output directory, where an *arr
+    /// importing on name and size takes it. SABnzbd and NZBGet leave
+    /// nothing. Every failing arm has to move it aside; the bytes stay
+    /// (they are the retry's resume state) but the NAME must not.
+    #[test]
+    fn every_failing_arm_takes_the_unverified_payload_out_of_circulation() {
+        let suffix = nzbkit::journal::PARTIAL_SUFFIX;
+        // One case per failure arm of finish_job, each with its own
+        // directory so the arms cannot cover for each other.
+        for (label, incomplete, derrs, shortfall) in [
+            ("missing-articles", 1usize, 0u64, None),
+            ("decode-errors", 0, 2, None),
+            ("repair-shortfall", 0, 0, Some((9usize, 1usize))),
+            ("bare-verify", 0, 0, None),
+        ] {
+            let d = tdir(&format!("quarantine-{label}"));
+            std::fs::write(d.join("payload.mkv"), b"holed").unwrap();
+            assert!(
+                run_finish_ex(
+                    &d,
+                    false,
+                    None,
+                    incomplete,
+                    derrs,
+                    shortfall,
+                    &["payload.mkv".to_string()]
+                )
+                .is_err(),
+                "{label} must still fail"
+            );
+            assert!(
+                !d.join("payload.mkv").exists(),
+                "{label}: the payload name must not survive a failed job"
+            );
+            assert!(
+                d.join(format!("payload.mkv{suffix}")).exists(),
+                "{label}: the bytes must be kept for the retry, not deleted"
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// The one failing arm that must NOT touch anything: its files were
+    /// verified, and its own message tells the user they are still in
+    /// the output directory. Renaming them aside would make that
+    /// sentence a lie and take a good payload away from the user over a
+    /// re-extract that failed for a different reason.
+    #[test]
+    fn a_failed_reextract_keeps_its_verified_files_where_the_message_says() {
+        let d = tdir("quarantine-reextract");
+        std::fs::write(d.join("payload.mkv"), b"verified").unwrap();
+        let m = run_finish_ex(
+            &d,
+            false,
+            Some("boom".into()),
+            3,
+            2,
+            None,
+            &["payload.mkv".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(m.contains("still in the output directory"), "{m}");
+        assert!(
+            d.join("payload.mkv").exists(),
+            "verified files must stay under their own name"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A job that SUCCEEDS is untouched - the whole point is that the
+    /// user gets the file. Belt to the `all_good` early return.
+    #[test]
+    fn a_good_job_keeps_its_payload_under_its_own_name() {
+        let d = tdir("quarantine-good");
+        std::fs::write(d.join("payload.mkv"), b"whole").unwrap();
+        assert!(run_finish_ex(&d, true, None, 0, 0, None, &["payload.mkv".to_string()]).is_ok());
+        assert!(d.join("payload.mkv").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

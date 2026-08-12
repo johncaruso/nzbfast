@@ -2364,19 +2364,23 @@ pub(in crate::serve) async fn spot_pass(
             }
         };
         let scan = crate::spot_scan_pass(config, &mut scratch, g, backfill, deepen);
+        // The reason rides out with the preemption - see
+        // `Daemon::pause_phrase`. The deepening leg lives on this arm,
+        // so a wrongly-named stand-down here is why 4.3 M articles of
+        // free.pt history sat unread with nothing to point at.
         let pause = async {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if daemon2.spot_pause_reason().is_some() {
-                    break;
+                if let Some(reason) = daemon2.spot_pause_reason() {
+                    break reason;
                 }
             }
         };
         match tokio::select! {
-            result = scan => Some(result),
-            _ = pause => None,
+            result = scan => Ok(result),
+            reason = pause => Err(reason),
         } {
-            Some(Ok(sum)) if sum.new > 0 => info!(
+            Ok(Ok(sum)) if sum.new > 0 => info!(
                 target: "spots",
                 "{g}: {} new spots ({} scanned, {} verified){}",
                 sum.new, sum.scanned, sum.valid,
@@ -2392,9 +2396,13 @@ pub(in crate::serve) async fn spot_pass(
                     String::new()
                 },
             ),
-            Some(Ok(_)) => {}
-            Some(Err(e)) => warn!(target: "spots", "{g}: {e}"),
-            None => info!(target: "spots", "{g} paused for foreground job"),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!(target: "spots", "{g}: {e}"),
+            Err(reason) => info!(
+                target: "spots",
+                "{g} stood down: {}",
+                Daemon::pause_phrase(reason)
+            ),
         }
         drop(scratch);
         // Republish so queries see this pass's writes.
@@ -2421,14 +2429,14 @@ pub(in crate::serve) async fn spot_pass(
                 let pause = async {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        if daemon2.spot_pause_reason().is_some() {
-                            break;
+                        if let Some(reason) = daemon2.spot_pause_reason() {
+                            break reason;
                         }
                     }
                 };
                 let outcome = tokio::select! {
-                    result = resolve => Some(result),
-                    _ = pause => None,
+                    result = resolve => Ok(result),
+                    reason = pause => Err(reason),
                 };
                 drop(scratch);
                 if let Ok(fresh) = nzbkit::index::Index::open(db) {
@@ -2436,7 +2444,7 @@ pub(in crate::serve) async fn spot_pass(
                 }
                 daemon2.drop_index_read();
                 match outcome {
-                    Some(Ok(sum)) => {
+                    Ok(Ok(sum)) => {
                         if sum.fetched + sum.failed > 0 {
                             info!(
                                 target: "spots",
@@ -2460,9 +2468,13 @@ pub(in crate::serve) async fn spot_pass(
                             let _ = daemon2.with_index(|ix| ix.seed_missing_titles(14, 500).ok());
                         }
                     }
-                    Some(Err(e)) => warn!(target: "spots", "spot resolve: {e}"),
-                    None => {
-                        info!(target: "spots", "spot resolve paused for foreground job")
+                    Ok(Err(e)) => warn!(target: "spots", "spot resolve: {e}"),
+                    Err(reason) => {
+                        info!(
+                            target: "spots",
+                            "spot resolve stood down: {}",
+                            Daemon::pause_phrase(reason)
+                        )
                     }
                 }
             }
@@ -2558,6 +2570,16 @@ pub(in crate::serve) async fn retention_and_statistics(
                     0
                 };
                 let stale = ix.prune_stale_partials(7 * 86_400, now).unwrap_or(0);
+                // §131 D3 search-miss log, both caps. Not counted in
+                // the pruned totals below: these are derived rows
+                // about queries, not catalogue content, and folding
+                // them into "retention pruned N old rows" would make
+                // that line lie about what left the index.
+                let _ = ix.search_log_prune(
+                    crate::serve::SEARCH_LOG_DAYS * 86_400,
+                    crate::serve::SEARCH_LOG_ROWS,
+                    now,
+                );
                 let _ = ix.kv_set("retention_at", &now.to_string());
                 Some((aged, stale))
             })

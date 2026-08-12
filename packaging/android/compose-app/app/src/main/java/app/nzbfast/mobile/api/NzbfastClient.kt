@@ -46,6 +46,16 @@ class NzbfastClient(private val baseUrl: String, private val apiKey: String) {
         return Parse.addResult(body)
     }
 
+    /**
+     * Read a shared NZB with a client-side size bound - see
+     * [Http.NZB_SIZE_LIMIT]. Throws [Http.TooLargeError] past it.
+     *
+     * Here rather than at the call site so every intake path gets the
+     * bound, and so the UI has one exception class to report.
+     */
+    fun readSharedNzb(stream: java.io.InputStream, name: String): ByteArray =
+        Http.readBounded(stream, name)
+
     fun addNzbLnk(link: String): AddResult =
         Parse.addResult(api("mode=addnzblnk&link=${Http.encode(link)}"))
 

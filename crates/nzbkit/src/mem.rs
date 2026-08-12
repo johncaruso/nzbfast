@@ -128,6 +128,9 @@ fn process_memory_counters() -> Option<(u64, u64)> {
 /// containers (path `/`) and nested host paths (systemd slices, docker
 /// with host cgroupns) resolve. "max" / v1's page-rounded i64::MAX
 /// sentinel read as no limit.
+// `pub`, matching the `cfg(not(linux))` twin below: examples/memprobe.rs
+// consumes it from OUTSIDE the crate, so a `pub(crate)` here is E0603 on
+// Linux and invisible everywhere else (see the §103.6 note below).
 #[cfg(target_os = "linux")]
 pub fn cgroup_mem_limit() -> Option<u64> {
     use std::path::Path;
@@ -346,8 +349,8 @@ pub fn process_budget() -> MemBudget {
 /// honoured in full the moment they run on bigger hardware.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConcurrencyCaps {
-    pub connections: usize,
-    pub window: usize,
+    pub(crate) connections: usize,
+    pub(crate) window: usize,
     pub decoders: usize,
 }
 
@@ -675,6 +678,13 @@ pub fn cpu_time_secs() -> Option<f64> {
 /// while leaving priority CLASS alone, so we schedule normally instead
 /// of being parked, without starving anyone the way a raised priority
 /// would. No-op off Windows and on Windows versions without the API.
+// `pub`, matching the `cfg(not(windows))` twin below - and NOT optional:
+// nzbfast's lib and main both call this at startup from outside the
+// crate, so demoting it makes the function unreachable, then dead code,
+// then a `-D warnings` error in the windows-gated clippy job. A
+// visibility change under a `#[cfg]` can only be validated on the gated
+// platform: a macOS `--all-targets` run compiles the OTHER arm and reads
+// clean either way (§103.6, 12 Aug).
 #[cfg(windows)]
 pub fn opt_out_of_power_throttling() {
     #[repr(C)]

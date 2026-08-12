@@ -170,6 +170,7 @@ pub fn decode_into_integrity(
     let mut name = String::new();
     let mut file_size: u64 = 0;
     let mut part: Option<u32> = None;
+    let mut yend_part: Option<u32> = None;
     let mut begin: u64 = 1;
     let mut end: u64 = 0;
     let mut expected_crc: Option<u32> = None;
@@ -238,6 +239,7 @@ pub fn decode_into_integrity(
                 let h = line.get(6..).unwrap_or(&[]);
                 expected_len = field_u64(h, b"size");
                 expected_crc = field_hex(h, b"pcrc32").or_else(|| field_hex(h, b"crc32"));
+                yend_part = field_u64(h, b"part").map(|n| n as u32);
                 pos = next;
             } else if seen_begin {
                 // First payload line: switch to SIMD block mode from the raw
@@ -300,6 +302,7 @@ pub fn decode_into_integrity(
                         let h = rest.get(4..).unwrap_or(&[]);
                         expected_len = field_u64(h, b"size");
                         expected_crc = field_hex(h, b"pcrc32").or_else(|| field_hex(h, b"crc32"));
+                        yend_part = field_u64(h, b"part").map(|n| n as u32);
                     } else if rest.starts_with(b"begin ") {
                         seen_begin = true;
                         let h = &rest[6..];
@@ -415,6 +418,15 @@ pub fn decode_into_integrity(
     // or the differential fuzz oracle is meaningless.
     if !seen_yend {
         return Err(YencError::Truncated);
+    }
+    // Same trailer-consistency check as the scalar oracle, in the same
+    // position: both decoders must agree or the differential fuzz oracle is
+    // meaningless. Placement never uses either part number, so this only ever
+    // turns a silently-inconsistent article into a named error.
+    if let (Some(b), Some(e)) = (part, yend_part)
+        && b != e
+    {
+        return Err(YencError::PartNumberMismatch { begin: b, end: e });
     }
     if let Some(len) = expected_len
         && len != data.len() as u64

@@ -13,6 +13,7 @@ enum ApiError: LocalizedError {
     case http(Int)
     case daemon(String)
     case decode(String)
+    case tooLarge(String)
 
     var errorDescription: String? {
         switch self {
@@ -20,8 +21,38 @@ enum ApiError: LocalizedError {
         case .http(let code): return "Server answered HTTP \(code)."
         case .daemon(let msg): return msg
         case .decode(let what): return "Unexpected reply while reading \(what)."
+        case .tooLarge(let name): return "\(name) is too big to be an NZB."
         }
     }
+}
+
+/// Ceiling on an NZB this app will read into memory.
+///
+/// The biggest real NZB is a few tens of megabytes - roughly a kilobyte
+/// per segment, so a 100 GB post lands near 30 MB. This is comfortably
+/// past that and far below what a phone can be made to swallow.
+///
+/// The bound has to be HERE. The daemon caps `addfile` at 256 MiB, which
+/// protects the daemon and arrives long after the phone has already
+/// allocated the file plus a payload-sized multipart copy of it - and a
+/// file URL handed over by the share sheet is chosen by whatever app
+/// shared it (Codex sweep 12 Aug F14).
+let nzbSizeLimit = 64 << 20
+
+/// Read a shared or picked file, refusing anything past `nzbSizeLimit`.
+///
+/// The length is measured from the filesystem rather than trusted from
+/// metadata, and the read is bounded whatever it said.
+func readBoundedNzb(at url: URL) throws -> Data {
+    let name = url.lastPathComponent
+    let handle = try FileHandle(forReadingFrom: url)
+    defer { try? handle.close() }
+    // One byte past the limit is enough to know it is over, and reading a
+    // bounded amount means a lying (or unknown) declared length cannot
+    // make this allocate more than the cap either way.
+    let data = try handle.read(upToCount: nzbSizeLimit + 1) ?? Data()
+    if data.count > nzbSizeLimit { throw ApiError.tooLarge(name) }
+    return data
 }
 
 final class ApiClient {
@@ -185,16 +216,18 @@ final class ApiClient {
     /// Resolve a tokenized play URL for a job via /m3u. The token
     /// scopes access to this one job so the full API key never rides
     /// in a media URL (the grab-apikey-leak lesson).
+    ///
+    /// The MINT request carries the key in `X-Api-Key`, never in the URL.
+    /// It used to pass `?apikey=` with a bare `URLRequest`, so the long-
+    /// lived full credential rode a query string past every reverse proxy
+    /// and URL diagnostic between here and the daemon - the same leak the
+    /// returned per-job token exists to avoid, reintroduced one layer up
+    /// (Codex sweep 12 Aug F17). `/m3u` has always accepted the header.
     func playURL(for id: String) async throws -> URL {
-        guard var comps = URLComponents(url: config.baseURL
+        let url = config.baseURL
             .appendingPathComponent("m3u")
-            .appendingPathComponent(id), resolvingAgainstBaseURL: false) else {
-            throw ApiError.badURL
-        }
-        comps.queryItems = [URLQueryItem(name: "apikey", value: config.apiKey)]
-        guard let url = comps.url else { throw ApiError.badURL }
-        let req = URLRequest(url: url)
-        let (data, resp) = try await session.data(for: req)
+            .appendingPathComponent(id)
+        let (data, resp) = try await session.data(for: request(url))
         guard let http = resp as? HTTPURLResponse,
               (200..<300).contains(http.statusCode) else {
             throw ApiError.http((resp as? HTTPURLResponse)?.statusCode ?? 0)

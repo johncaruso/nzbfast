@@ -920,3 +920,602 @@ async fn gzip_corrupt_overview_fails_the_read_cleanly_end_to_end() {
         again.map(|v| v.len())
     );
 }
+
+// ---------------------------------------------------------------------
+// Untrusted-input parsers (coverage §122). Every field below arrives on
+// an OVER row or a LIST body - poster- or provider-controlled text - and
+// each guard here exists because something in that text once reached
+// arithmetic or an index that could not take it.
+// ---------------------------------------------------------------------
+
+/// The Date header of every overview row. The alpha-zone table, the
+/// two-digit year rule and the four range guards are all reachable from
+/// a post nobody vetted, and the guards are what keep the civil-days
+/// arithmetic (`era * 146097`, `days * 86400`) inside i64 - a wrapped
+/// timestamp is stored as `first_posted` and then drives retention
+/// masking and the oracle's age bucket.
+#[test]
+fn nntp_dates_take_alpha_zones_short_years_and_refuse_the_rest() {
+    let utc = parse_nntp_date("Thu, 02 May 2024 12:34:56 +0000").expect("the ordinary shape");
+    // A named zone is an offset like any other: same instant, spelled
+    // differently. EST is -5 h, so the local clock reads five hours
+    // earlier for the same moment.
+    assert_eq!(
+        parse_nntp_date("Thu, 02 May 2024 07:34:56 EST"),
+        Some(utc),
+        "EST must resolve to -5 h, not to UTC"
+    );
+    assert_eq!(parse_nntp_date("2 May 2024 08:34:56 EDT"), Some(utc));
+    assert_eq!(parse_nntp_date("2 May 2024 06:34:56 CST"), Some(utc));
+    assert_eq!(parse_nntp_date("2 May 2024 07:34:56 CDT"), Some(utc));
+    assert_eq!(parse_nntp_date("2 May 2024 05:34:56 MST"), Some(utc));
+    assert_eq!(parse_nntp_date("2 May 2024 06:34:56 MDT"), Some(utc));
+    assert_eq!(parse_nntp_date("2 May 2024 04:34:56 PST"), Some(utc));
+    assert_eq!(parse_nntp_date("2 May 2024 05:34:56 PDT"), Some(utc));
+    // Unknown or absent zones are UTC, and a trailing comment is cut
+    // before tokenising ever sees it.
+    assert_eq!(parse_nntp_date("2 May 2024 12:34:56 UT (GMT)"), Some(utc));
+    assert_eq!(parse_nntp_date("2 May 2024 12:34:56"), Some(utc));
+    // Two-digit years: 70-99 are last century, everything else this one.
+    let y1999 = parse_nntp_date("1 Jan 1999 00:00:00 +0000").expect("1999");
+    assert_eq!(parse_nntp_date("1 Jan 99 00:00:00 +0000"), Some(y1999));
+    let y2024 = parse_nntp_date("1 Jan 2024 00:00:00 +0000").expect("2024");
+    assert_eq!(parse_nntp_date("1 Jan 24 00:00:00 +0000"), Some(y2024));
+    // Seconds are optional; a leap second is in range.
+    assert_eq!(
+        parse_nntp_date("2 May 2024 12:34 +0000"),
+        Some(utc - 56),
+        "a missing seconds field is zero, not a rejection"
+    );
+    assert!(parse_nntp_date("31 Dec 2016 23:59:60 +0000").is_some());
+    // And the refusals - each of these is an arithmetic hazard, not a
+    // cosmetic complaint.
+    for hostile in [
+        "2 May 300000000000 12:34:56 +0000", // year overflows the maths
+        "2 May 1969 12:34:56 +0000",         // before the epoch floor
+        "32 May 2024 12:34:56 +0000",        // no such day
+        "0 May 2024 12:34:56 +0000",
+        "2 May 2024 99:34:56 +0000", // no such hour
+        "2 May 2024 12:99:56 +0000",
+        "2 May 2024 12:34:99 +0000",
+        "May 2024 12:34:56 +0000", // no day before the month
+        "2 Foo 2024 12:34:56 +0000",
+        "not a date at all",
+        "",
+    ] {
+        assert_eq!(
+            parse_nntp_date(hostile),
+            None,
+            "accepted a hostile date: {hostile:?}"
+        );
+    }
+    // A non-ascii zone used to panic the OVER consumer on a byte slice.
+    assert!(parse_nntp_date("2 May 2024 12:34:56 +€x").is_some());
+}
+
+/// `LIST ACTIVE` and `LIST NEWSGROUPS` bodies. Same ingress rules as
+/// GROUP: a name must be ascii, the numbers must parse, and a high-water
+/// mark near 2^62 is a poisoned line (the scan cursor is a wrapping
+/// `fetch_add`, so a poisoned high would walk the whole u64 space in
+/// OVER requests).
+#[test]
+fn the_list_parsers_drop_poisoned_rows_and_empty_descriptions() {
+    let raw = b"alt.bin.good 42 7 y\n\
+                alt.bin.moderated 9 1 m\n\
+                alt.bin.nostatus 5 1\n\
+                \n\
+                alt.bin.short 5\n\
+                alt.bin.\xc3\xa9 9 1 y\n\
+                alt.bin.nan high low y\n\
+                alt.bin.poisoned 4611686018427387904 1 y\n";
+    let groups = parse_list_active(raw);
+    let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["alt.bin.good", "alt.bin.moderated", "alt.bin.nostatus"],
+        "only well-formed ascii rows survive"
+    );
+    assert_eq!((groups[0].high, groups[0].low), (42, 7));
+    assert_eq!(groups[1].status, 'm');
+    assert_eq!(
+        groups[2].status, 'y',
+        "a row without a status field posts as usual"
+    );
+
+    let raw = b"alt.bin.a\tthe first group\n\
+                alt.bin.b   spaced description\n\
+                alt.bin.c\t?\n\
+                alt.bin.d\t\n\
+                \tno name at all\n";
+    assert_eq!(
+        parse_list_newsgroups(raw),
+        vec![
+            ("alt.bin.a".to_string(), "the first group".to_string()),
+            ("alt.bin.b".to_string(), "spaced description".to_string()),
+        ],
+        "placeholder and empty descriptions carry nothing"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Scripted servers. The mock implements the download ladder; these cover
+// the command ladders it does not (LIST, CAPABILITIES, COMPRESS) and the
+// SOCKS5 tunnel, neither of which any lib test could reach before.
+// ---------------------------------------------------------------------
+
+/// Greet, then answer each command line with the first canned response
+/// whose (upper-cased) prefix matches, or "500" if none does. One
+/// connection at a time, which is all these ladders need.
+fn scripted(greeting: &'static str, script: &'static [(&'static str, &'static str)]) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        while let Ok((s, _)) = listener.accept() {
+            let mut w = s.try_clone().expect("clone");
+            if w.write_all(greeting.as_bytes()).is_err() {
+                continue;
+            }
+            let mut r = BufReader::new(s);
+            let mut line = String::new();
+            while r.read_line(&mut line).unwrap_or(0) > 0 {
+                let cmd = line.trim_end().to_ascii_uppercase();
+                line.clear();
+                let resp = script
+                    .iter()
+                    .find(|(p, _)| cmd.starts_with(p))
+                    .map_or("500 unknown command\r\n", |(_, r)| *r);
+                if w.write_all(resp.as_bytes()).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    port
+}
+
+fn at(port: u16) -> crate::config::ServerConfig {
+    crate::config::ServerConfig {
+        host: "127.0.0.1".into(),
+        port,
+        tls: false,
+        username: None,
+        password: None,
+        connections: 1,
+        pin_connections: false,
+        rcvbuf: None,
+        level: 0,
+        group: None,
+        retention_days: 0,
+        block_bytes: None,
+        block_account: false,
+        bind_ip: None,
+        socks5: None,
+        enabled: true,
+        warm_pool: false,
+        idle_release_secs: None,
+        idle_keep: None,
+        max_source_ips: None,
+    }
+}
+
+/// The three list-shaped commands the indexer's discovery path leans on.
+/// Each is "check the code, then read the multiline body", and each has
+/// a rejection arm callers rely on: LIST NEWSGROUPS is optional on most
+/// binary providers, and treating its refusal as a fault would take the
+/// whole discovery run down over descriptions nobody needs.
+#[tokio::test]
+async fn the_list_and_capabilities_ladders_answer_hit_and_miss() {
+    const SCRIPT: &[(&str, &str)] = &[
+        (
+            "CAPABILITIES",
+            "101 capability list follows\r\nVERSION 2\r\nCOMPRESS DEFLATE\r\n.\r\n",
+        ),
+        (
+            "LIST ACTIVE",
+            "215 groups follow\r\nalt.bin.a 12 3 y\r\nalt.bin.b 4 1 n\r\n.\r\n",
+        ),
+        ("LIST NEWSGROUPS", "503 no descriptions here\r\n"),
+        ("XFEATURE COMPRESS GZIP", "290 ok\r\n"),
+    ];
+    let port = scripted("200 scripted ready\r\n", SCRIPT);
+    let (mut conn, greeting) = Connection::connect(&at(port)).await.expect("connect");
+    assert_eq!(greeting.code, 200);
+    let caps = conn.capabilities().await.expect("CAPABILITIES");
+    assert_eq!(caps, vec!["VERSION 2", "COMPRESS DEFLATE"]);
+    assert!(
+        caps_support_compress_deflate(&caps),
+        "the advert callers gate COMPRESS on must read out of this list"
+    );
+    let groups = conn.list_active().await.expect("LIST ACTIVE");
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].name, "alt.bin.a");
+    assert_eq!(groups[1].status, 'n');
+    // The optional one, refused: an error the caller can read as "no
+    // descriptions", never a parse of the refusal line.
+    match conn.list_newsgroups().await {
+        Err(NntpError::Unexpected { cmd, line }) => {
+            assert_eq!(cmd, "LIST NEWSGROUPS");
+            assert!(line.starts_with("503"), "{line}");
+        }
+        other => panic!("expected the refusal to surface, got {other:?}"),
+    }
+    // Header compression is a latch: the second call must not spend
+    // another round trip on a server that already said yes.
+    assert!(conn.enable_header_gzip().await, "290 enables");
+    assert!(conn.header_gzip());
+    assert!(conn.enable_header_gzip().await, "already on, no round trip");
+    conn.quit().await;
+
+    // And the same three commands on a server that refuses them all.
+    const REFUSER: &[(&str, &str)] = &[];
+    let port = scripted("200 refuser ready\r\n", REFUSER);
+    let (mut conn, _) = Connection::connect(&at(port)).await.expect("connect");
+    assert!(matches!(
+        conn.capabilities().await,
+        Err(NntpError::Unexpected { .. })
+    ));
+    assert!(matches!(
+        conn.list_active().await,
+        Err(NntpError::Unexpected { .. })
+    ));
+    assert!(
+        !conn.enable_header_gzip().await,
+        "a rejected XFEATURE leaves the connection in plain mode"
+    );
+    conn.quit().await;
+}
+
+/// A server that refuses at AUTHINFO USER rather than at PASS - the
+/// shape a capacity refusal usually takes, since the account is fine and
+/// the server simply will not open another session. The refusal must
+/// carry its CLASSIFICATION, not just its code: a capacity refusal and a
+/// wrong password share 481/502 and want opposite responses (§15e).
+#[tokio::test]
+async fn a_refusal_at_the_user_line_is_classified_not_just_reported() {
+    const CAPPED: &[(&str, &str)] = &[(
+        "AUTHINFO USER",
+        "502 max number of simultaneous IP addresses reached\r\n",
+    )];
+    let port = scripted("200 capped ready\r\n", CAPPED);
+    let mut sc = at(port);
+    sc.username = Some("u".into());
+    sc.password = Some("p".into());
+    match Connection::connect(&sc).await {
+        Err(NntpError::AuthFailed { kind, line }) => {
+            assert_eq!(kind, AuthRefusal::Capacity, "{line}");
+        }
+        other => panic!(
+            "expected a classified refusal, got {}",
+            other.err().map_or("a connection", |_| "another error")
+        ),
+    }
+
+    // The other side of the same door: a server that authenticates on
+    // the USER line alone (281 without ever asking for a password).
+    const ONE_STEP: &[(&str, &str)] =
+        &[("AUTHINFO USER", "281 welcome\r\n"), ("DATE", "111 0\r\n")];
+    let port = scripted("200 one-step ready\r\n", ONE_STEP);
+    let mut sc = at(port);
+    sc.username = Some("u".into());
+    sc.password = Some("p".into());
+    let (mut conn, _) = Connection::connect(&sc)
+        .await
+        .expect("281 at USER is a complete login");
+    assert_eq!(conn.date().await.expect("DATE").code, 111);
+    conn.quit().await;
+
+    // And a permanent one, so the taxonomy's other arm is pinned here
+    // too: same code, different words, opposite remedy.
+    const WRONG_PW: &[(&str, &str)] = &[
+        ("AUTHINFO USER", "381 password required\r\n"),
+        ("AUTHINFO PASS", "481 authentication failed\r\n"),
+    ];
+    let port = scripted("200 strict ready\r\n", WRONG_PW);
+    let mut sc = at(port);
+    sc.username = Some("u".into());
+    sc.password = Some("nope".into());
+    match Connection::connect(&sc).await {
+        Err(NntpError::AuthFailed { kind, .. }) => assert_eq!(kind, AuthRefusal::Permanent),
+        other => panic!(
+            "expected a permanent refusal, got {}",
+            other.err().map_or("a connection", |_| "another error")
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// SOCKS5 (RFC 1928 CONNECT + RFC 1929 user/pass). M32 routes ALL traffic
+// through it, DNS included - the hostname goes to the proxy verbatim as
+// ATYP=DOMAIN - so every arm below is on the path of a proxied download.
+// ---------------------------------------------------------------------
+
+/// A scripted proxy. It reads exactly what the client's framing says it
+/// will send, records it for the assertions, and answers with the given
+/// plan. `auth_reply` is only used when `method_reply` selects user/pass.
+fn socks5_proxy(
+    method_reply: &'static [u8],
+    auth_reply: &'static [u8],
+    connect_reply: &'static [u8],
+) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let Ok((mut s, _)) = listener.accept() else {
+            return;
+        };
+        let take = |s: &mut std::net::TcpStream, n: usize| -> Option<Vec<u8>> {
+            let mut b = vec![0u8; n];
+            s.read_exact(&mut b).ok()?;
+            recorder.lock().expect("recorder").extend_from_slice(&b);
+            Some(b)
+        };
+        let mut serve = || -> Option<()> {
+            // Greeting: VER, NMETHODS, then that many method bytes.
+            let head = take(&mut s, 2)?;
+            take(&mut s, head[1] as usize)?;
+            s.write_all(method_reply).ok()?;
+            if method_reply.len() >= 2 && method_reply[1] == 0x02 {
+                // RFC 1929: VER, ULEN, user, PLEN, pass.
+                let h = take(&mut s, 2)?;
+                take(&mut s, h[1] as usize)?;
+                let p = take(&mut s, 1)?;
+                take(&mut s, p[0] as usize)?;
+                s.write_all(auth_reply).ok()?;
+                if auth_reply.len() >= 2 && auth_reply[1] != 0x00 {
+                    return None;
+                }
+            }
+            // CONNECT: VER, CMD, RSV, ATYP, then a domain literal.
+            take(&mut s, 4)?;
+            let l = take(&mut s, 1)?;
+            take(&mut s, l[0] as usize + 2)?;
+            s.write_all(connect_reply).ok()?;
+            Some(())
+        };
+        let _ = serve();
+        // Hold the socket so the client's read never races a FIN.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    });
+    (port, seen)
+}
+
+#[tokio::test]
+async fn socks5_tunnels_the_hostname_and_survives_both_reply_shapes() {
+    // No credentials: offer method 0 only, and drain an IPv4 BND.ADDR.
+    let (port, seen) = socks5_proxy(
+        &[0x05, 0x00],
+        &[],
+        &[0x05, 0, 0, 0x01, 127, 0, 0, 1, 0, 119],
+    );
+    let sc = at(0);
+    socks5_connect(&format!("127.0.0.1:{port}"), "news.example.com", 119, &sc)
+        .await
+        .expect("a clean no-auth tunnel");
+    let sent = seen.lock().expect("recorder").clone();
+    assert_eq!(
+        &sent[..3],
+        &[0x05, 0x01, 0x00],
+        "with no credentials the client offers method 0 only"
+    );
+    let domain = [&[0x03u8, 16][..], b"news.example.com"].concat();
+    assert!(
+        sent.windows(domain.len()).any(|w| w == domain),
+        "the hostname must go out as a DOMAIN literal so the PROXY \
+         resolves it - resolving here would leak the lookup: {sent:?}"
+    );
+    assert_eq!(
+        &sent[sent.len() - 2..],
+        &119u16.to_be_bytes(),
+        "the port rides the request big-endian"
+    );
+
+    // Credentials, and a DOMAIN-shaped reply address to drain.
+    let mut reply = vec![0x05, 0, 0, 0x03, 5];
+    reply.extend_from_slice(b"proxy");
+    reply.extend_from_slice(&119u16.to_be_bytes());
+    let reply: &'static [u8] = Box::leak(reply.into_boxed_slice());
+    let (port, seen) = socks5_proxy(&[0x05, 0x02], &[0x01, 0x00], reply);
+    socks5_connect(
+        &format!("user:secret@127.0.0.1:{port}"),
+        "news.example.com",
+        563,
+        &sc,
+    )
+    .await
+    .expect("a clean user/pass tunnel");
+    let sent = seen.lock().expect("recorder").clone();
+    assert_eq!(
+        &sent[..4],
+        &[0x05, 0x02, 0x00, 0x02],
+        "with credentials the client offers user/pass beside no-auth"
+    );
+    assert!(
+        sent.windows(6).any(|w| w == b"secret"),
+        "the password reaches the proxy over the RFC 1929 sub-negotiation"
+    );
+}
+
+#[tokio::test]
+async fn every_socks5_refusal_is_reported_without_leaking_the_password() {
+    let sc = at(0);
+    // A port typo: the error reaches the log file, the logtee ring and
+    // bench_history.json, so it must name the PROXY part only.
+    let e = socks5_connect("user:hunter2@127.0.0.1", "news.example.com", 119, &sc)
+        .await
+        .expect_err("host:port is required");
+    let msg = e.to_string();
+    assert!(msg.contains("expected host:port"), "{msg}");
+    assert!(
+        !msg.contains("hunter2"),
+        "a malformed spec must not persist the credential: {msg}"
+    );
+
+    // The proxy wants auth we were never given.
+    let (port, _) = socks5_proxy(&[0x05, 0x02], &[], &[]);
+    let e = socks5_connect(&format!("127.0.0.1:{port}"), "news.example.com", 119, &sc)
+        .await
+        .expect_err("no credentials to answer with");
+    assert!(e.to_string().contains("wants auth"), "{e}");
+
+    // The proxy rejects the credentials it asked for.
+    let (port, _) = socks5_proxy(&[0x05, 0x02], &[0x01, 0x01], &[]);
+    let e = socks5_connect(
+        &format!("u:p@127.0.0.1:{port}"),
+        "news.example.com",
+        119,
+        &sc,
+    )
+    .await
+    .expect_err("rejected credentials");
+    assert!(e.to_string().contains("auth rejected"), "{e}");
+
+    // No method in common (0xFF).
+    let (port, _) = socks5_proxy(&[0x05, 0xFF], &[], &[]);
+    let e = socks5_connect(&format!("127.0.0.1:{port}"), "news.example.com", 119, &sc)
+        .await
+        .expect_err("no usable method");
+    assert!(e.to_string().contains("no usable auth method"), "{e}");
+
+    // The tunnel itself is refused - the code is what a user needs.
+    let (port, _) = socks5_proxy(&[0x05, 0x00], &[], &[0x05, 0x05, 0, 0x01, 0, 0, 0, 0, 0, 0]);
+    let e = socks5_connect(&format!("127.0.0.1:{port}"), "news.example.com", 119, &sc)
+        .await
+        .expect_err("refused CONNECT");
+    assert!(e.to_string().contains("refused (code 5)"), "{e}");
+
+    // A reply address type nothing can drain: fail, never guess a length.
+    let (port, _) = socks5_proxy(&[0x05, 0x00], &[], &[0x05, 0x00, 0, 0x09, 0, 0, 0, 0]);
+    let e = socks5_connect(&format!("127.0.0.1:{port}"), "news.example.com", 119, &sc)
+        .await
+        .expect_err("unknown ATYP");
+    assert!(e.to_string().contains("ATYP 9 unknown"), "{e}");
+
+    // A hostname no SOCKS5 request can carry (one length byte). The
+    // proxy is live and negotiated: the refusal is about the REQUEST,
+    // not about reaching the proxy.
+    let (port, _) = socks5_proxy(&[0x05, 0x00], &[], &[0x05, 0x00, 0, 0x01, 0, 0, 0, 0, 0, 0]);
+    let long = "a".repeat(256);
+    let e = socks5_connect(&format!("127.0.0.1:{port}"), &long, 119, &sc)
+        .await
+        .expect_err("over-long hostname");
+    assert!(e.to_string().contains("too long for socks5"), "{e}");
+}
+
+// ---------------------------------------------------------------------
+// RFC 8054 COMPRESS DEFLATE. The scan path's compressed transport: raw
+// deflate in both directions, each write ended with Z_SYNC_FLUSH so the
+// peer can decode a command without waiting for a block boundary.
+// ---------------------------------------------------------------------
+
+/// Raw-deflate a chunk the way a compliant peer does: sync-flushed, so
+/// everything written is decodable immediately.
+fn sync_flush(enc: &mut flate2::Compress, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 64);
+    enc.compress_vec(data, &mut out, flate2::FlushCompress::None)
+        .expect("compress");
+    loop {
+        let cap = out.capacity();
+        out.reserve(1024);
+        enc.compress_vec(&[], &mut out, flate2::FlushCompress::Sync)
+            .expect("sync flush");
+        if out.len() < cap.max(out.capacity()) {
+            break;
+        }
+    }
+    out
+}
+
+/// The transport against an INDEPENDENT deflate peer (flate2 directly,
+/// not another `DeflateTransport`), which is what makes this an interop
+/// test rather than a mirror. Covers the three things RFC 8054 asks of
+/// it: bytes the buffered reader slurped past the 206 are already
+/// stream bytes and must seed the decoder; a write is decodable by the
+/// peer as soon as it is flushed; and a response arriving in several
+/// wire chunks decodes as one.
+#[tokio::test]
+async fn the_deflate_transport_interoperates_with_a_plain_deflate_peer() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let (client, mut peer) = tokio::io::duplex(64 * 1024);
+    let mut enc = flate2::Compress::new(flate2::Compression::default(), false);
+    // The greeting the reader slurped with the 206 line: already
+    // compressed, and the transport has to start from it.
+    let leftover = sync_flush(&mut enc, b"215 rows follow\r\n");
+    let mut t = DeflateTransport::new(client, leftover);
+    let mut head = vec![0u8; 17];
+    t.read_exact(&mut head)
+        .await
+        .expect("leftover seeds the decoder");
+    assert_eq!(&head, b"215 rows follow\r\n");
+
+    // A command out: the peer must be able to decode it immediately,
+    // which is the whole point of the sync flush in `poll_flush`.
+    t.write_all(b"LIST ACTIVE\r\n").await.expect("write");
+    t.flush().await.expect("flush");
+    let mut wire = vec![0u8; 4096];
+    let n = peer.read(&mut wire).await.expect("peer read");
+    let mut dec = flate2::Decompress::new(false);
+    // `decompress_vec` only fills SPARE capacity - an unreserved Vec
+    // decodes to nothing at all.
+    let mut plain = Vec::with_capacity(4096);
+    dec.decompress_vec(&wire[..n], &mut plain, flate2::FlushDecompress::Sync)
+        .expect("the peer decodes a flushed command");
+    assert_eq!(plain, b"LIST ACTIVE\r\n");
+
+    // A response split across two wire writes decodes as one body.
+    let a = sync_flush(&mut enc, b"alt.bin.a 5 1 y\r\n");
+    let b = sync_flush(&mut enc, b".\r\n");
+    peer.write_all(&a).await.expect("peer write");
+    peer.flush().await.expect("peer flush");
+    peer.write_all(&b).await.expect("peer write");
+    peer.flush().await.expect("peer flush");
+    let mut body = vec![0u8; 20];
+    t.read_exact(&mut body).await.expect("read the split reply");
+    assert_eq!(&body, b"alt.bin.a 5 1 y\r\n.\r\n");
+    t.shutdown().await.expect("shutdown flushes and closes");
+}
+
+/// A corrupt compressed stream must fail the connection cleanly - the
+/// caller reconnects uncompressed - never surface garbage as overview
+/// rows, and never spin on an inflater that cannot progress.
+#[tokio::test]
+async fn a_corrupt_deflate_stream_fails_the_connection_instead_of_parsing() {
+    use tokio::io::AsyncReadExt as _;
+    let (client, mut peer) = tokio::io::duplex(4096);
+    let mut t = DeflateTransport::new(client, Vec::new());
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt as _;
+        let _ = peer.write_all(&[0xff; 64]).await;
+        let _ = peer.flush().await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    });
+    let mut out = [0u8; 64];
+    let e = tokio::time::timeout(std::time::Duration::from_secs(5), t.read(&mut out))
+        .await
+        .expect("a damaged stream must not hang the reader")
+        .expect_err("garbage must not decode");
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+}
+
+/// The negotiation around it: 206 wraps the connection for the rest of
+/// its life, and anything else leaves the caller a plain error to
+/// reconnect on (the half-negotiated stream is dropped, never reused).
+#[tokio::test]
+async fn compress_deflate_is_refused_cleanly_when_the_server_says_no() {
+    const NO_COMPRESS: &[(&str, &str)] = &[("COMPRESS DEFLATE", "403 not available\r\n")];
+    let port = scripted("200 plain ready\r\n", NO_COMPRESS);
+    let (conn, _) = Connection::connect(&at(port)).await.expect("connect");
+    match conn.enable_compression().await {
+        Err(NntpError::Unexpected { cmd, line }) => {
+            assert_eq!(cmd, "COMPRESS DEFLATE");
+            assert!(line.starts_with("403"), "{line}");
+        }
+        other => panic!(
+            "expected the refusal, got {}",
+            other.map(|_| "a wrapped conn").unwrap_or("an error")
+        ),
+    }
+}

@@ -119,7 +119,7 @@ pub const MAX_STATUS_BYTES: usize = 64 * 1024;
 /// A parsed status line, e.g. `222 0 <id> body follows`.
 #[derive(Debug, Clone)]
 pub struct Status {
-    pub code: u16,
+    pub(crate) code: u16,
     pub line: String,
 }
 
@@ -153,6 +153,30 @@ fn check_echoed_id(st: &Status, expected: Option<&str>) -> Result<(), NntpError>
         });
     }
     Ok(())
+}
+
+/// What a STAT status line means: `Ok(true)` the article exists (223),
+/// `Ok(false)` it does not (423/430, plus Giganews's nonstandard
+/// "451 0 <msgid>" for removed/DMCA'd articles - treating that as a
+/// protocol error threw away whole sample batches, so Giganews
+/// takedowns were never counted as misses).
+///
+/// One function, two readers: [`Connection::read_stat`] for the serial
+/// callers that own the whole conversation, and
+/// [`Connection::read_stat_noting`] for the pipelined one. They differ
+/// in what they do around the status line - timeouts, positional
+/// attribution, TTFB - and must never differ in what a refusal IS,
+/// because the pool now charges a STAT's refusal to the same unanimity
+/// that a BODY's answers to (TODO 96.4).
+fn stat_verdict(st: Status) -> Result<bool, NntpError> {
+    match st.code {
+        223 => Ok(true),
+        423 | 430 | 451 => Ok(false),
+        _ => Err(NntpError::Unexpected {
+            cmd: "STAT".into(),
+            line: st.line,
+        }),
+    }
 }
 
 pub struct GroupInfo {
@@ -2684,14 +2708,46 @@ impl Connection {
     /// takedowns were never counted as misses).
     pub async fn read_stat(&mut self) -> Result<bool, NntpError> {
         let st = self.read_status().await?;
-        match st.code {
-            223 => Ok(true),
-            423 | 430 | 451 => Ok(false),
-            _ => Err(NntpError::Unexpected {
-                cmd: "STAT".into(),
-                line: st.line,
-            }),
-        }
+        stat_verdict(st)
+    }
+
+    /// TODO 96.4: [`read_stat`] for the PIPELINED path - the same
+    /// command and the same verdict alphabet ([`stat_verdict`], shared
+    /// with the serial reader above), read with the attribution and
+    /// alignment discipline [`read_body_into`] applies to a BODY's.
+    ///
+    /// That discipline is the whole reason this exists rather than the
+    /// pool calling `read_stat`: on a pipelined socket a response is
+    /// attributed POSITIONALLY, so it has to pass `check_echoed_id` and
+    /// report whether the id was echoed, or a dropped response upstream
+    /// files this refusal against the article behind it - the §129 3g
+    /// class. `read_stat`'s serial callers (preflight, sysbench, scan,
+    /// the indexer) own the whole conversation and need none of it.
+    ///
+    /// `first_byte` bounds the wait for the status line, and
+    /// `status_seen` reports its arrival to a caller racing a
+    /// suspicion timer. There is no second phase: a STAT has no body to
+    /// stall in the middle of.
+    pub async fn read_stat_noting(
+        &mut self,
+        expected: Option<&str>,
+        first_byte: std::time::Duration,
+        status_seen: &std::sync::atomic::AtomicBool,
+        id_echoed: &std::sync::atomic::AtomicBool,
+    ) -> Result<(bool, std::time::Duration), NntpError> {
+        let t0 = std::time::Instant::now();
+        let st = match tokio::time::timeout(first_byte, self.read_status()).await {
+            Err(_) => return Err(NntpError::Timeout),
+            Ok(r) => r?,
+        };
+        status_seen.store(true, std::sync::atomic::Ordering::Release);
+        let ttfb = t0.elapsed();
+        check_echoed_id(&st, expected)?;
+        id_echoed.store(
+            expected.is_some() && echoed_message_id(&st.line).is_some(),
+            std::sync::atomic::Ordering::Release,
+        );
+        Ok((stat_verdict(st)?, ttfb))
     }
 
     /// Read one BODY response. `Ok(Some(raw))` on 222 (raw dot-stuffed body,

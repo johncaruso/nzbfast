@@ -218,9 +218,9 @@ impl AeCtr {
 /// Derived AE material for one entry: the CTR key, the HMAC key, and
 /// the 2-byte password verifier.
 pub struct AeKeys {
-    pub enc_key: Vec<u8>,
-    pub mac_key: Vec<u8>,
-    pub verify: [u8; AE_VERIFY_LEN],
+    pub(crate) enc_key: Vec<u8>,
+    pub(crate) mac_key: Vec<u8>,
+    pub(crate) verify: [u8; AE_VERIFY_LEN],
 }
 
 pub fn ae_derive(password: &[u8], salt: &[u8], key_len: usize) -> AeKeys {

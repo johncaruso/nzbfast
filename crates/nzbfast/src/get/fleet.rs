@@ -45,6 +45,12 @@ pub(super) async fn build_fleet(
     // bench suite A/Bs single knobs against a live setting ("1"/"2"
     // arms, anything else disarms).
     let saved = crate::persist::load_json_with_backup(&config.with_file_name("settings.json"));
+    // The unset-setting defaults for both switches come from
+    // `PoolConfig::shipped()`, so "what the daemon ships" has ONE
+    // definition that test fleets can build from as well - a rig that
+    // takes `PoolConfig::default()` measures a pool with the whole
+    // speculation layer dark.
+    let ship = PoolConfig::shipped();
     // "Adaptive connection timeouts" (setting adaptive_timeouts, ON by
     // default): two-phase adaptive read bounds in place of the flat
     // whole-response timeout. Fault rigs (research/SPECULATION-
@@ -53,7 +59,7 @@ pub(super) async fn build_fleet(
     let adaptive = saved
         .as_ref()
         .and_then(|v| v.get("adaptive_timeouts").and_then(|v| v.as_bool()))
-        .unwrap_or(true);
+        .unwrap_or(ship.adaptive_timeout);
     let adaptive_timeout = std::env::var("NZBFAST_ADAPTIVE_TIMEOUT")
         .ok()
         .map_or(adaptive, |v| v == "1");
@@ -65,7 +71,7 @@ pub(super) async fn build_fleet(
     let race = saved
         .as_ref()
         .and_then(|v| v.get("race_stragglers").and_then(|v| v.as_bool()))
-        .unwrap_or(true);
+        .unwrap_or(ship.tail_fanout);
     let tf = std::env::var("NZBFAST_TAIL_FANOUT").ok();
     let tail_fanout = tf.as_deref().map_or(race, |v| v == "1" || v == "2");
     let tail_fanout_early = tf.as_deref().map_or(race, |v| v == "2");
@@ -79,6 +85,21 @@ pub(super) async fn build_fleet(
     // adaptive_timeouts off. Graduates the race_stragglers way only
     // with the jitter safety leg and the greet-delay rigs green.
     let ttfb_hedge = std::env::var("NZBFAST_TTFB_HEDGE").is_ok_and(|v| v == "1");
+    // "Give up on a dead server after" (setting server_outage_mins,
+    // 0 = never). Read from the same settings.json as the knobs above so
+    // the CLI and the daemon agree; the env override is for tests, which
+    // cannot afford to wait out fifteen real minutes.
+    let outage_budget = std::env::var("NZBFAST_SERVER_OUTAGE_MINS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .or_else(|| {
+            saved
+                .as_ref()
+                .and_then(|v| v.get("server_outage_mins").and_then(|v| v.as_u64()))
+        })
+        .map_or(ship.outage_budget, |m| {
+            (m > 0).then(|| std::time::Duration::from_secs(m * 60))
+        });
     let recycle_slope = std::env::var("NZBFAST_RECYCLE_SLOPE")
         .ok()
         .map_or(race, |v| v == "1");
@@ -225,6 +246,15 @@ pub(super) async fn build_fleet(
         .as_ref()
         .map(|h| h.host_conn_caps.lock_ok().clone())
         .unwrap_or_default();
+    // §96.5: remaining prepaid bytes per host, computed by the daemon at
+    // job start. Threaded into each server's pool config so the pool can
+    // release a server whose block runs out MID-RUN - the job-boundary
+    // exclusion above this (excluded_hosts) only helps the next job.
+    // Empty on a CLI run, which has no usage ledger to budget from.
+    let host_budgets = hub
+        .as_ref()
+        .map(|h| h.host_byte_budgets.lock_ok().clone())
+        .unwrap_or_default();
     // TODO 112: with live tuning on (the `live_tune` setting, or
     // NZBFAST_LIVE_TUNE=1 as the dev override), the fleet is SPAWNED at
     // the ceiling and run at a live target the epoch controller moves.
@@ -299,12 +329,14 @@ pub(super) async fn build_fleet(
                 // the whole point of the flag is that one account's
                 // billing says nothing about another's.
                 block_account: s.block_account,
+                budget_bytes: host_budgets.get(&s.host).copied(),
                 hedge,
                 ttfb_hedge,
                 recycle_slow,
                 recycle_slope,
                 hot_spare,
                 flap_cap_keepers,
+                outage_budget,
                 crc_steer,
                 // TODO 121.4: the decode consumers ack every Done id
                 // (note_settled / note_decoded), so the pool holds
@@ -366,6 +398,93 @@ pub(super) async fn build_fleet(
         buf_pool,
         out_pool,
         servers,
+    }
+}
+
+#[cfg(test)]
+mod shipped_defaults {
+    use super::*;
+
+    /// `PoolConfig::shipped()` must BE what this builder resolves for a
+    /// user who has touched nothing.
+    ///
+    /// nzbkit's rigs build their fleets from a `PoolConfig`, and the
+    /// obvious constructor - `default()` - has the whole speculation
+    /// layer dark, because the library's neutral posture is not the
+    /// product's. `shipped()` exists so a rig can say "the pool as the
+    /// daemon ships it" in one token; this test is what stops that
+    /// claim from quietly becoming false. The two `unwrap_or`s above
+    /// read their default OUT of `shipped()`, so the values cannot
+    /// drift - what this catches is the other direction: a sixth knob
+    /// added to one side and not the other, or a switch that stops
+    /// fanning out to all four of its fields.
+    #[tokio::test]
+    async fn shipped_matches_the_daemons_own_defaults() {
+        // The bench suite A/Bs single knobs through the environment;
+        // under one of those shells the daemon is deliberately not
+        // shipped-shaped and this test has nothing to say.
+        for k in [
+            "NZBFAST_TAIL_FANOUT",
+            "NZBFAST_HEDGE",
+            "NZBFAST_RECYCLE_SLOPE",
+            "NZBFAST_ADAPTIVE_TIMEOUT",
+        ] {
+            if std::env::var_os(k).is_some() {
+                eprintln!("skipped: {k} overrides the shipped posture");
+                return;
+            }
+        }
+        let cfg: Config = serde_json::from_str(r#"{"servers":[{"host":"ship.example"}]}"#).unwrap();
+        let dir = std::env::temp_dir().join(format!("nzbfast-shipped-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // No settings.json in this directory - the fresh-install case.
+        let fleet = build_fleet(
+            &cfg,
+            &dir.join("config.local.json"),
+            4,
+            4,
+            &None,
+            None,
+            "",
+            &nzbkit::mem::MemBudget::with_total(1 << 30),
+        )
+        .await;
+        let got = &fleet.servers[0].1;
+        let want = PoolConfig::shipped();
+        let knobs = |c: &PoolConfig| {
+            [
+                ("adaptive_timeout", c.adaptive_timeout),
+                ("tail_fanout", c.tail_fanout),
+                ("tail_fanout_early", c.tail_fanout_early),
+                ("hedge", c.hedge),
+                ("recycle_slope", c.recycle_slope),
+            ]
+        };
+        assert_eq!(
+            knobs(got),
+            knobs(&want),
+            "PoolConfig::shipped() no longer describes what this builder \
+             ships - fix whichever side moved, and re-check the rigs that \
+             build their fleets from it"
+        );
+        // And the dark knobs stay dark on both sides: `shipped()` is the
+        // default posture, not "everything on".
+        let dark = |c: &PoolConfig| {
+            [
+                ("steer_depth", c.steer_depth),
+                ("race_envelope", c.race_envelope),
+                ("ttfb_hedge", c.ttfb_hedge),
+                ("recycle_slow", c.recycle_slow),
+                ("hot_spare", c.hot_spare),
+            ]
+        };
+        assert!(
+            dark(&want).iter().all(|(_, v)| !v),
+            "a dark knob was armed in PoolConfig::shipped(): {:?}",
+            dark(&want)
+        );
+        assert_eq!(dark(got), dark(&want), "dark-knob posture diverged");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

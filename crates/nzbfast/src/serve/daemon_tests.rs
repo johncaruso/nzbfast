@@ -194,6 +194,57 @@ fn spot_pause_reason_same_shape_reads_index_paused() {
     });
 }
 
+/// Every reason either ladder can produce has to have a phrase of its
+/// own. The scan legs print `pause_phrase(reason)` and nothing else, so
+/// a reason word added to the ladders without one falls through to the
+/// generic arm and the log goes back to saying nothing - which is the
+/// whole 11 Aug 2026 failure, arrived at from the other direction.
+#[cfg(feature = "indexer")]
+#[test]
+fn every_pause_reason_has_its_own_phrase() {
+    let mut seen: Vec<(&str, &str)> = Vec::new();
+    with_daemon("pausephrase", |d| {
+        d.index_pause_on_download.store(true, Ordering::Relaxed);
+        // Walk both ladders top to bottom, collecting what they say.
+        let ladder: [(&str, &dyn Fn(&Arc<Daemon>)); 4] = [
+            ("offline", &|d: &Arc<Daemon>| {
+                d.offline.store(true, Ordering::Relaxed)
+            }),
+            ("off", &|d: &Arc<Daemon>| {
+                d.offline.store(false, Ordering::Relaxed);
+                d.index_enabled.store(false, Ordering::Relaxed);
+                d.spot_enabled.store(false, Ordering::Relaxed);
+            }),
+            ("paused", &|d: &Arc<Daemon>| {
+                d.index_enabled.store(true, Ordering::Relaxed);
+                d.spot_enabled.store(true, Ordering::Relaxed);
+                d.index_paused.store(true, Ordering::Relaxed);
+            }),
+            ("downloading", &|d: &Arc<Daemon>| {
+                d.index_paused.store(false, Ordering::Relaxed);
+                d.index_jobs_active.store(1, Ordering::Release);
+            }),
+        ];
+        for (want, set) in ladder {
+            set(d);
+            assert_eq!(d.indexing_pause_reason(), Some(want));
+            assert_eq!(d.spot_pause_reason(), Some(want));
+            let phrase = Daemon::pause_phrase(want);
+            assert_ne!(
+                phrase, "standing down",
+                "{want} fell through to the generic arm"
+            );
+            seen.push((want, phrase));
+        }
+    });
+    for (i, (reason, phrase)) in seen.iter().enumerate() {
+        assert!(
+            !seen[..i].iter().any(|(_, p)| p == phrase),
+            "{reason} shares a phrase with an earlier reason: {phrase}"
+        );
+    }
+}
+
 #[cfg(feature = "indexer")]
 #[test]
 fn index_db_wanted_when_either_switch_is_on() {
@@ -1057,6 +1108,72 @@ fn usage_ledger_accumulates_and_skips_zero_entries() {
     });
 }
 
+/// §96.5: a refill restarts the block-used counter without rewinding
+/// the lifetime ledger - the ledger also answers the history totals
+/// and `jobs_ever`, so the two must be able to disagree.
+#[test]
+fn block_refill_restarts_the_counter_but_never_the_ledger() {
+    with_daemon("blockbase", |d| {
+        d.add_usage(&[("blk.example".into(), 700)]);
+        assert_eq!(d.block_spent("blk.example"), 700);
+        d.block_refilled("blk.example");
+        assert_eq!(
+            d.block_spent("blk.example"),
+            0,
+            "refill restarts the counter"
+        );
+        assert_eq!(
+            d.usage_lifetime("blk.example"),
+            700,
+            "the lifetime ledger is never rewound"
+        );
+        d.add_usage(&[("blk.example".into(), 300)]);
+        assert_eq!(d.block_spent("blk.example"), 300);
+        assert_eq!(d.usage_lifetime("blk.example"), 1000);
+        // Persisted: the base must survive a restart or the refill
+        // un-happens the next time the daemon loads usage.json.
+        let disk = crate::persist::load_json_with_backup(&d.spool.join("usage.json")).unwrap();
+        assert_eq!(
+            disk.get("block_base")
+                .and_then(|b| b.get("blk.example"))
+                .and_then(|v| v.as_u64()),
+            Some(700)
+        );
+    });
+}
+
+/// §96.5: the mid-job usage flush bills only the delta since the last
+/// call, at any cadence - so the periodic tick and the net-drain call
+/// can both run without double-billing a paid block.
+#[test]
+fn flush_run_usage_delta_bills_and_never_double_bills() {
+    with_daemon("usageflush", |d| {
+        let sc: nzbkit::config::ServerConfig =
+            serde_json::from_str(r#"{"host":"blk.example"}"#).unwrap();
+        let live =
+            nzbkit::pool::LiveStats::for_servers(&[(sc, nzbkit::pool::PoolConfig::default())]);
+        live.servers[0].bytes.store(500, Ordering::Relaxed);
+        *d.hub.pool_live.lock_ok() = Some(live.clone());
+        d.flush_run_usage();
+        assert_eq!(d.usage_lifetime("blk.example"), 500);
+        d.flush_run_usage();
+        assert_eq!(
+            d.usage_lifetime("blk.example"),
+            500,
+            "an unmoved counter must bill nothing"
+        );
+        live.servers[0].bytes.store(800, Ordering::Relaxed);
+        d.flush_run_usage(); // the net-drain call is this same helper
+        assert_eq!(d.usage_lifetime("blk.example"), 800);
+        // Job boundary: pool cleared first, then the high-water map -
+        // a flush tick in that gap sees no pool and bills nothing.
+        *d.hub.pool_live.lock_ok() = None;
+        d.run_usage_flushed.lock_ok().clear();
+        d.flush_run_usage();
+        assert_eq!(d.usage_lifetime("blk.example"), 800);
+    });
+}
+
 /// §129 4c: the second empty state must not come back once a job has
 /// run. Clearing history is the case that broke a naive "is the queue
 /// empty right now" check, so the sticky term is asserted on its own -
@@ -1588,7 +1705,9 @@ fn index_stats_answer_from_the_read_pool_while_the_writer_is_busy() {
         );
         // A scan batch owns the write connection for the whole window.
         let _writer = d.index.lock_ok();
-        let snap = d.index_stats_snapshot();
+        let snap = d
+            .index_stats_snapshot()
+            .expect("the read pool serves figures while the writer is busy");
         assert!(
             snap.2 > 0,
             "a busy write lock must not read as an empty index: {snap:?}"
@@ -1596,4 +1715,100 @@ fn index_stats_answer_from_the_read_pool_while_the_writer_is_busy() {
         // And the answer seeds the cache for the next busy poll.
         assert_eq!(*d.index_stats_cache.lock_ok(), Some(snap));
     });
+}
+
+/// The residue of the window above: write lock busy, cache cold, and
+/// the read pool cannot help either (here: the database file does not
+/// exist yet, so a read-only open fails). The one honest answer is "no
+/// figures yet" - None, which the API forwards as stats_cold - never
+/// zeros dressed up as a count.
+#[cfg(feature = "indexer")]
+#[test]
+fn index_stats_answer_cold_not_zero_when_no_read_path_is_available() {
+    with_daemon("statscold", |d| {
+        d.index_enabled.store(true, Ordering::Relaxed);
+        assert!(d.index_stats_cache.lock_ok().is_none());
+        let _writer = d.index.lock_ok();
+        assert_eq!(
+            d.index_stats_snapshot(),
+            None,
+            "an unreadable index must answer cold, not empty"
+        );
+        // Cold answers must not seed the cache: the next poll should
+        // try the real read paths again, not replay the placeholder.
+        assert!(d.index_stats_cache.lock_ok().is_none());
+    });
+}
+
+fn outage(host: &str, secs: u64, kind: &'static str) -> ServerOutage {
+    ServerOutage {
+        host: host.to_string(),
+        since_ms: 1_000,
+        secs,
+        kind,
+        detail: "the server's own words".into(),
+    }
+}
+
+/// The queue row names a dead provider only when the job is actually
+/// stuck behind it, and only once the outage has outlived the window.
+///
+/// Both gates earn their keep. Without the stall gate, a job pulling at
+/// full line speed from server A would put a red "no connection" line on
+/// its own row because a backup B nobody needed is out - an alarm on a
+/// row that is working. Without the window, every capacity bounce and
+/// every ordinary redial would flicker one.
+#[test]
+fn a_row_names_a_dead_server_only_when_it_is_stuck_behind_it() {
+    // Window default is 60 s; keep the test independent of the env knob.
+    let win = server_down_secs();
+    let long = outage("news.example", win + 5, "unreachable");
+    let brief = outage("news.example", win.saturating_sub(1), "unreachable");
+
+    assert!(
+        row_outage(false, std::slice::from_ref(&long)).is_none(),
+        "a healthy row must stay quiet about a dead backup"
+    );
+    assert!(
+        row_outage(true, std::slice::from_ref(&brief)).is_none(),
+        "an outage inside the window is a redial, not news"
+    );
+    let (tok, o) =
+        row_outage(true, std::slice::from_ref(&long)).expect("stuck and past the window");
+    assert_eq!(tok, "server_unreachable");
+    assert_eq!(o.host, "news.example");
+    assert!(row_outage(true, &[]).is_none());
+}
+
+/// The three causes are three tokens, because they are three different
+/// things for the user to do: wait, wait for a slot, or go fix a
+/// password. One "server down" phrase would have flattened them.
+#[test]
+fn each_outage_cause_gets_its_own_token() {
+    let win = server_down_secs() + 1;
+    for (kind, want) in [
+        ("unreachable", "server_unreachable"),
+        ("capacity", "server_capacity"),
+        ("refused", "server_refused"),
+    ] {
+        let o = [outage("h", win, kind)];
+        assert_eq!(row_outage(true, &o).expect("reported").0, want, "{kind}");
+    }
+}
+
+/// Worst first: with two providers out, the row reports the one that has
+/// been out longest, because that is the one least likely to come back
+/// on its own.
+#[test]
+fn the_longest_outage_is_the_one_the_row_reports() {
+    let win = server_down_secs();
+    // `server_outages` sorts longest-first; `row_outage` trusts that.
+    let os = [
+        outage("old.example", win + 600, "unreachable"),
+        outage("new.example", win + 1, "capacity"),
+    ];
+    assert_eq!(
+        row_outage(true, &os).expect("reported").1.host,
+        "old.example"
+    );
 }

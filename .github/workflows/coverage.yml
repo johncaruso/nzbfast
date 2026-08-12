@@ -40,6 +40,18 @@
 # and it sat in the metric at 0.00% (216 lines) purely because it
 # landed after the 6 Aug policy commit named its siblings.
 #
+# The nzbkit floor moved 84 -> 87 on 12 Aug (TODO 122), the first raise
+# since the ratchet was built. 84 was set when the measurement WAS 84.6
+# and a red was days away; the last three dispatches read 91.24 (7 Aug),
+# 90.57 (10 Aug) and the §122 session-lifecycle round on top of that, so
+# a floor of 84 had stopped being a ratchet - six and a half points of
+# slack will not fire on a regression that deletes a whole subsystem's
+# tests. 87 keeps ~3.5pp of margin under the weakest of those readings,
+# which covers the gf16 per-runner coin flip (~0.3pp, budgeted at its
+# LOW value - see the §122.5 trap) and months of drift at the ordinary
+# pace (~0.23pp/day, measured 7->10 Aug). Same rule as ever applies to
+# it: never lower a floor to make a run pass, the answer is tests.
+#
 # Nightly, not per-push: a full coverage build recompiles the workspace
 # instrumented, which is minutes, and ci-private is deliberately lean.
 name: coverage
@@ -84,6 +96,35 @@ jobs:
           tar -xzf cargo-llvm-cov.tar.gz
           sudo mv cargo-llvm-cov /usr/local/bin/
           rm cargo-llvm-cov.tar.gz
+      # THE §122.3 TRAP, ON CI (diagnosed 12 Aug, dispatch 31601073864).
+      # `cargo llvm-cov` globs EVERY binary in the llvm-cov target dir,
+      # and the cache above restores the PREVIOUS run's dir - which still
+      # holds that run's `nzbkit-<oldhash>` test binary, built from the
+      # sources as they were then. Cargo never garbage-collects it, so a
+      # file whose source has changed since is measured TWICE: once from
+      # today's binary (with today's profile) and once from the stale one
+      # (no profile at all, so every line of it reads as missed).
+      #
+      # The signature is unmistakable once you know it: files nobody
+      # touched read exactly right, and every file that CHANGED doubles
+      # its line count with ~98% of the new lines uncovered. On the
+      # dispatch above, on a tree measured locally at 91.08: nntp.rs
+      # (unchanged) read its true 1,958 lines / 271 missed, while pool.rs
+      # went 1,800 -> 3,488 lines and 104 -> 1,766 missed and
+      # pool/session.rs 1,029 -> 2,066 and 205 -> 1,166 - on code whose
+      # only edit was a one-line `mod` declaration. Crate total 85.48
+      # against a true 91-ish. Worth reading the 6 Aug "STILL RED after
+      # the batch" entry in TODO 122.5 with this in mind: it has the same
+      # shape (pool.rs and nntp.rs "grew with the chip landings"), and it
+      # was answered with more tests.
+      #
+      # `clean --workspace` drops the workspace's own instrumented
+      # artifacts and profiles; DEPENDENCY artifacts stay, so the cache
+      # still earns its keep (deps are most of the build and they do not
+      # change between runs). This is the same command §122.3 tells a
+      # human to run before a local measurement, for the same reason.
+      - name: drop stale instrumented binaries (§122.3)
+        run: cargo llvm-cov clean --workspace
       # Two floors, measured per crate, because one workspace-wide number
       # would let a regression in the weak crate hide behind the strong
       # one. NZBFAST_NO_ENRICH is CLAUDE.md invariant 5 - the bin suite
@@ -105,11 +146,11 @@ jobs:
           path: coverage-table
           key: coverage-table-${{ github.run_id }}
           restore-keys: coverage-table-
-      - name: nzbkit lib coverage (floor 84, product files only)
+      - name: nzbkit lib coverage (floor 87, product files only)
         env:
           NZBFAST_NO_ENRICH: "1"
         run: >
-          cargo llvm-cov --locked -p nzbkit --lib --fail-under-lines 84
+          cargo llvm-cov --locked -p nzbkit --lib --fail-under-lines 87
           --ignore-filename-regex 'nzbkit/src/(mock|mock_tls|sysbench|benchserve)\.rs$'
       # Must run HERE, before the bins step: `report` globs every
       # binary in the llvm-cov target dir, and after the -p nzbfast

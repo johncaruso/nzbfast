@@ -19,11 +19,40 @@
 
 use super::*;
 
+// Session-lifecycle unit tests (coverage §122) - a child of THIS module,
+// not a sibling in pool/, so the private helpers (`top_up_window`, the
+// two death paths) and `ReadStep`'s private fields stay reachable.
+#[cfg(test)]
+mod unit_tests;
+
 /// One dial attempt: the `None` arm of `session_loop`'s warm-claim
 /// match, moved verbatim (TODO 113). Owns the connect, the AUTHINFO
 /// refusal taxonomy (permanent vs capacity, §15e / TODO 115) and the
 /// connect backoff ladder; the counters live in `session_loop` and
 /// cross as `&mut` so the ladder state survives across sessions.
+/// Has this server used up [`PoolConfig::outage_budget`]?
+///
+/// One place, so the pre-dial gate and the park ladder cannot drift.
+/// `None` (never give up) is a supported configuration and answers false
+/// forever - the queue row says which provider the job is waiting on for
+/// as long as it waits.
+pub(super) fn outage_budget_blown(cfg: &PoolConfig, shared: &Arc<Shared>, idx: usize) -> bool {
+    let Some(budget) = cfg.outage_budget else {
+        return false;
+    };
+    shared.auth[idx].down_ms() >= budget.as_millis() as u64
+}
+
+/// Has the elected prober's CONSECUTIVE bounce ladder run out?
+///
+/// False forever when `outage_budget` is off: the two give-up paths
+/// answer to one control, or the setting lies (a user who chose "wait
+/// however long it takes" would still get a failed job at ~10 minutes
+/// from a ladder they cannot see).
+pub(super) fn ladder_exhausted(cfg: &PoolConfig, bounces: u32) -> bool {
+    cfg.outage_budget.is_some() && bounces >= cfg.cap_probe_bounces
+}
+
 pub(super) enum DialStep {
     /// A connected, validated session - proceed to the pipeline.
     Conn(Connection),
@@ -59,6 +88,17 @@ pub(super) async fn dial_session(
     // how a wrong password used to cost every worker its full
     // backoff ladder before anyone bowed out.
     if shared.auth[ctx.idx].is_rejected() {
+        return DialStep::Quit;
+    }
+    // Cumulative outage budget. Checked BEFORE the dial as well as on
+    // the park ladder, because the case it exists for never reaches the
+    // ladder: a server that grants a session every few minutes resets
+    // `connect_failures` each time, so its workers cycle through this
+    // arm forever and `park_or_probe` is never entered at all.
+    if outage_budget_blown(cfg, shared, ctx.idx) {
+        // Release anyone parked, so the run can seal rather than wait on
+        // workers watching a server nobody will dial again.
+        shared.auth[ctx.idx].publish_episode(CapEpisode::Dead);
         return DialStep::Quit;
     }
     if let Some(w) = &cfg.warm {
@@ -119,6 +159,18 @@ pub(super) async fn dial_session(
                     live.note(ctx.idx, kind, detail);
                 }
             }
+            // The outage (if any) is over the moment a session is
+            // GRANTED, whatever the reason it started - a dial error,
+            // a capacity bounce or a refusal that has since been fixed.
+            if let Some(live) = &cfg.live
+                && let Some(sl) = live.servers.get(ctx.idx)
+            {
+                sl.note_up();
+            }
+            // The budget's own clock, which unlike the gauge above is
+            // always present (a CLI run configures no `live`) and unlike
+            // the counters below is BANKED rather than zeroed.
+            shared.auth[ctx.idx].mark_up();
             *ever_connected = true;
             shared.connected[ctx.idx].store(true, Ordering::Relaxed);
             *connect_failures = 0;
@@ -143,6 +195,11 @@ pub(super) async fn dial_session(
         // so expensive.
         Err(crate::nntp::NntpError::AuthFailed { kind, line }) => {
             let first = shared.auth[ctx.idx].note(kind, &line);
+            // Read ONCE, and read it before either clock: both the public
+            // gauge and the budget clock have to answer the same question
+            // ("is this server serving anything right now?") from the same
+            // observation, or the two can disagree about one refusal.
+            let held = shared.sessions[ctx.idx].load(Ordering::Acquire);
             // Out to the dashboard, so the user is told which server
             // stopped pulling its weight and in whose words.
             if let Some(live) = &cfg.live
@@ -152,7 +209,37 @@ pub(super) async fn dial_session(
                     permanent: kind == crate::nntp::AuthRefusal::Permanent,
                     line: line.clone(),
                 });
+                // Same fact on the LIVE outage gauge, so the queue row
+                // can say a provider is granting nothing and for how
+                // long. The Providers card has carried the refusal
+                // since §35, but nothing carried it to the job whose
+                // articles were stuck behind it.
+                //
+                // Guarded by `held` exactly as `mark_down` below is, and
+                // for the same reason: asking a provider for more
+                // connections than the plan grants is the NORMAL case (we
+                // ask 30, the account allows 20), so the surplus workers
+                // bounce off a capacity refusal for the whole job. This
+                // gauge had no guard, so one surplus dial stamped
+                // `down_since` on a server that never stopped serving -
+                // and `server_outages` trusts that stamp, so the queue row
+                // said "no usable connection" and the total==0 watchdog
+                // branch could demote a job off a false outage. The
+                // refusal above is unguarded on purpose: the Providers
+                // card SHOULD show what the server said, whether or not
+                // the account is also serving (Codex sweep 12 Aug F11).
+                if held == 0 {
+                    sl.note_down(
+                        if kind == crate::nntp::AuthRefusal::Permanent {
+                            "refused"
+                        } else {
+                            "capacity"
+                        },
+                        line.clone(),
+                    );
+                }
             }
+            shared.auth[ctx.idx].mark_down(held);
             match kind {
                 crate::nntp::AuthRefusal::Permanent => {
                     // Retrying cannot fix a credential. Say it once,
@@ -287,6 +374,16 @@ pub(super) async fn dial_session(
         }
         Err(e) => {
             *connect_failures += 1;
+            // Live outage gauge (the dashboard's, not the ladder's):
+            // a dial that fails is the ONE flavour of dead server that
+            // used to leave nothing behind anywhere but a single `warn!`
+            // at t=0 - no refusal line, no event, no per-server state.
+            if let Some(live) = &cfg.live
+                && let Some(sl) = live.servers.get(ctx.idx)
+            {
+                sl.note_down("unreachable", e.to_string());
+            }
+            shared.auth[ctx.idx].mark_down(shared.sessions[ctx.idx].load(Ordering::Acquire));
             // Say WHY, once per worker per run. This was a bare
             // `Err(_)` and the silence was expensive: a server that
             // cannot authenticate, cannot resolve, or is refusing
@@ -410,6 +507,13 @@ pub(super) async fn park_or_probe(
     // counters. A server capped for good costs one
     // paced dial every ~32 s until the horizon.
     *bounces = bounces.saturating_add(1);
+    // The prober is the one worker still dialling, so the budget has to
+    // be able to end ITS ladder too - otherwise a server that reopens
+    // just often enough to keep resetting `bounces` is probed forever.
+    if outage_budget_blown(cfg, shared, ctx.idx) {
+        shared.auth[ctx.idx].publish_episode(CapEpisode::Dead);
+        return DialStep::Quit;
+    }
     // Each paced bounce is DELIBERATE progress along the recovery
     // ladder, and it must say so on the liveness counter the stall
     // watchdog reads: during a from-the-start outage nothing decodes
@@ -419,7 +523,18 @@ pub(super) async fn park_or_probe(
     // a local pool wedge). A prober genuinely frozen mid-dial stops
     // bouncing, stops ticking, and still trips the watchdog.
     shared.deferred.fetch_add(1, Ordering::Relaxed);
-    if *bounces >= cfg.cap_probe_bounces {
+    // `outage_budget: None` means the user asked to WAIT, however long
+    // it takes, rather than have a job come back failed - so it stands
+    // this horizon down too. Retiring here at ~10 minutes would give
+    // them a failed job on a provider that was going to come back,
+    // which is the exact outcome they turned the budget off to avoid.
+    //
+    // The run then genuinely does not end on its own, which is the
+    // point: the queue row names the provider and the duration for the
+    // whole wait, the auto-defer watchdog moves other jobs past this one
+    // (see the daemon's stall watchdog), and pause/cancel still land -
+    // every wait here selects on `finished`.
+    if ladder_exhausted(cfg, *bounces) {
         // The lease outlived any realistic horizon:
         // release the parked yielders to exit so the
         // run can reach a truthful terminal instead of
@@ -499,7 +614,13 @@ pub(super) async fn read_one(
     // read's own report that bytes arrived - after that, silence
     // is a body pacing question, not a dead connection, and the
     // timer must not fire.
-    let ttfb_hedge_armed = cfg.ttfb_hedge && cfg.adaptive_timeout;
+    // TODO 96.4: never arm it behind a verdict probe. The timer marks
+    // the FRONT ARTICLE suspect so other workers race its owner, and a
+    // probe's front article is owned by somebody else entirely - a slow
+    // 430 from this backbone would be read as pre-byte silence on a
+    // connection that is not even the one being waited on.
+    let ttfb_hedge_armed =
+        cfg.ttfb_hedge && cfg.adaptive_timeout && !inflight.front().is_some_and(|w| w.probe);
     let status_seen = AtomicBool::new(false);
     let id_echoed = AtomicBool::new(false);
     let suspect_front: Option<String> = if ttfb_hedge_armed {
@@ -526,6 +647,39 @@ pub(super) async fn read_one(
             // as an NntpError and takes the existing protocol-error
             // exit (drop the session, requeue the pipeline).
             let expected = inflight.front().map(|w| w.id.as_str());
+            // TODO 96.4: a verdict probe answers with one status line
+            // and nothing else, so there is no post-byte phase to bound
+            // - the pre-byte budget is the whole read. Attribution,
+            // the echoed-id check and the fence behind it are the BODY
+            // path's, unchanged.
+            if inflight.front().is_some_and(|w| w.probe) {
+                let budget = if cfg.adaptive_timeout {
+                    article_prebyte_budget(
+                        shared.ttfb_budget(ctx.idx),
+                        inflight.front().map_or(0, |w| w.prebyte_expiries),
+                    )
+                } else {
+                    cfg.read_timeout
+                };
+                return match conn
+                    .read_stat_noting(expected, budget, &status_seen, &id_echoed)
+                    .await
+                {
+                    Ok((hit, ttfb)) => {
+                        if cfg.adaptive_timeout {
+                            shared.note_ttfb(ctx.idx, ttfb);
+                        }
+                        Ok(Ok(hit))
+                    }
+                    Err(crate::nntp::NntpError::Timeout) => {
+                        if cfg.adaptive_timeout {
+                            shared.note_ttfb_timeout(ctx.idx);
+                        }
+                        Err(())
+                    }
+                    Err(e) => Ok(Err(e)),
+                };
+            }
             if cfg.adaptive_timeout {
                 // TODO 96.1: two-phase bound. Pre-byte budget
                 // adapts to this server's measured TTFB; once
@@ -910,6 +1064,31 @@ pub(super) async fn handle_body(
         }
     }
     BodyStep::Proceed
+}
+
+/// TODO 96.4: a verdict probe came back 223 - this backbone HOLDS the
+/// article. Nothing terminal happens here and no outcome is sent: a
+/// probe is always a dup, so the original still owns the article and is
+/// either delivering it right now or about to requeue it. What the
+/// answer buys is the end of the ladder - recorded on the in-flight
+/// entry, where `pick_dup` reads it and stops asking a question whose
+/// answer cannot be "missing everywhere" any more.
+pub(super) fn handle_probe_hit(
+    cfg: &PoolConfig,
+    ctx: ServerCtx,
+    shared: &Arc<Shared>,
+    inflight: &mut VecDeque<Work>,
+    buf: Vec<u8>,
+) {
+    let w = inflight.pop_front().expect("response without command");
+    shared.release_wire(1);
+    if let Some(p) = &cfg.buf_pool {
+        p.give(buf);
+    }
+    shared.note_found(&w.id, ctx.group_bits);
+    if std::env::var_os("NZBFAST_POOL_DEBUG").is_some() {
+        eprintln!("[stat-probe] {} present on server {}", w.id, ctx.idx);
+    }
 }
 
 /// An authoritative 430/423 "no such article": per-server evidence,
@@ -1508,7 +1687,17 @@ async fn top_up_window(
         w.fenced = cfg.desync_fence
             && shared.bare_refuser[ctx.idx].load(Ordering::Acquire)
             && !shared.fence_off[ctx.idx].load(Ordering::Acquire);
-        let sent = match conn.send_body(&w.id).await {
+        // TODO 96.4: a fan-out dup buys a verdict, not bytes, so under
+        // `stat_probe` it goes out as STAT. Everything else about the
+        // dispatch - the fence, the wire charge, the attribution - is
+        // identical, which is the point: a STAT's refusal codes are a
+        // BODY's, so nothing downstream of `handle_missing` can tell
+        // the two apart.
+        let sent = match if w.probe {
+            conn.send_stat(&w.id).await
+        } else {
+            conn.send_body(&w.id).await
+        } {
             Ok(()) if w.fenced => conn.send_fence().await,
             other => other,
         };
@@ -1596,6 +1785,22 @@ pub(super) async fn session_loop(
     let mut promote_gen = shared.promote_gen.subscribe();
 
     'session: loop {
+        // §96.5: the prepaid block is spent - this worker leaves for
+        // good, before it can dial (or keep) a session the account can
+        // no longer pay for. Checked at the loop top so the in-session
+        // drain below routes here: over budget the pipeline stops
+        // topping up, in-flight responses complete and are counted,
+        // the quit lands, and the redial becomes this bow-out. The
+        // worker's retire brings `alive` down, so the routing masks
+        // (level gates, the every-live-server-430'd terminal rule)
+        // self-correct exactly as they do for a dead server.
+        if shared.over_budget(ctx.idx) {
+            shared.note_budget_spent(ctx.idx);
+            if let Some(c) = preclaimed.take() {
+                c.quit().await;
+            }
+            return;
+        }
         if !pre_dial_gates(
             cfg,
             slot,
@@ -1748,7 +1953,13 @@ pub(super) async fn session_loop(
             let over_target = cfg
                 .live_target
                 .as_ref()
-                .is_some_and(|t| slot as usize >= t.get());
+                .is_some_and(|t| slot as usize >= t.get())
+                // §96.5: a block that ran out mid-session takes the
+                // same drain: stop admitting work, let what is in
+                // flight complete (those bytes are already owed), quit
+                // - and the budget gate at the top of 'session turns
+                // the redial into a permanent bow-out.
+                || shared.over_budget(ctx.idx);
             if over_target && inflight.is_empty() && !shared.draining.load(Ordering::Acquire) {
                 shared.note_session_end(ctx.idx, 4);
                 last_end = Some(4);
@@ -1856,6 +2067,10 @@ pub(super) async fn session_loop(
                 Some(p) => p.take(),
                 None => Vec::with_capacity(800 * 1024),
             };
+            // TODO 96.4: which command the answer below belongs to. A
+            // 223 and a 222 are both `Ok(Ok(true))`, and only this says
+            // which one arrived.
+            let probe_front = inflight.front().is_some_and(|w| w.probe);
             let step = read_one(
                 &mut conn,
                 &mut buf,
@@ -1908,6 +2123,9 @@ pub(super) async fn session_loop(
                 }
             }
             match read {
+                Ok(Ok(true)) if probe_front => {
+                    handle_probe_hit(cfg, ctx, &shared, &mut inflight, buf);
+                }
                 Ok(Ok(true)) => {
                     match handle_body(
                         cfg,

@@ -173,9 +173,9 @@ fn build_par2(files: u32, file_size: u64, article: usize) -> Vec<u8> {
 }
 
 pub struct BenchSet {
-    pub files: u32,
-    pub file_size: u64,
-    pub article: usize,
+    pub(crate) files: u32,
+    pub(crate) file_size: u64,
+    pub(crate) article: usize,
     parts_per_file: u32,
     tail_len: usize,
     full_block: Arc<Vec<u8>>,

@@ -76,7 +76,7 @@ pub struct FlatPlan {
     /// b[t] = 2^{255·g^t} - the fixed Rader kernel, raw values.
     kernel: [u16; 256],
     /// Rows the root produces: max selected exponent + 1.
-    pub needed: usize,
+    pub(crate) needed: usize,
 }
 
 /// Per-worker scratch arenas: one pool per tree depth, reused across

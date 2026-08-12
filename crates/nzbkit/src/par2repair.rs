@@ -181,9 +181,9 @@ enum NttFault {
 pub struct SyndromeReport {
     /// The NTT transform computed the syndromes (false on the fold path
     /// and on every mid-flight fallback).
-    pub ntt_used: bool,
+    pub(crate) ntt_used: bool,
     /// Present slices fed to the transform (0 when it did not run).
-    pub n_present: usize,
+    pub(crate) n_present: usize,
 }
 
 /// One thread's share of a multi-accumulate: `dsts[j] ^= Σ_i
@@ -748,15 +748,15 @@ pub struct NttDivergence {
     /// that failed verification.
     pub panicked: bool,
     /// Missing-block count (syndrome rows).
-    pub m: usize,
+    pub(crate) m: usize,
     /// Present source slices fed to the transform (0 when unknown, e.g.
     /// a panic before the transform ran).
-    pub n_present: usize,
-    pub block_size: usize,
+    pub(crate) n_present: usize,
+    pub(crate) block_size: usize,
     /// Largest recovery exponent used.
-    pub max_exp: u32,
+    pub(crate) max_exp: u32,
     /// What was being repaired (set directory or first file name).
-    pub context: String,
+    pub(crate) context: String,
 }
 
 /// Drain the recorded divergence events (the daemon appends them to the
@@ -849,14 +849,30 @@ fn run_with_ntt_fallback<T>(
     attempt(SyndromePath::Fold, &mut NttProbe::default())
 }
 
-/// Conservative static gates from the measured Stage 0/1 sweeps
-/// (research/NTT-STAGE0-crossover-2026-07-30.md): the hot-loop
-/// crossover sits near m~260-420 on the measured ARM boxes, and the
-/// small-n structural loss means the transform never pays on
-/// few-source sets. Thresholds sit comfortably above the crossover
-/// because Stage 2 integration overhead only pushes it up; revisit
-/// with end-to-end numbers, per the Stage 1 doc.
-const NTT_MIN_MISSING: usize = 512;
+/// Conservative static gates. The Stage 0/1 hot-loop sweeps
+/// (research/NTT-STAGE0-crossover-2026-07-30.md) put the crossover
+/// near m~260-420 on the measured ARM boxes and asked for an
+/// end-to-end revisit; that revisit ran twice, on both machine
+/// classes, and it did NOT push the crossover up the way the original
+/// margin assumed:
+///
+/// - 32-core Mac15,14 (research/NTT-CROSSOVER-E2E-2026-08-11.md):
+///   end-to-end `repair_dir`, crossover m~256-300.
+/// - 20-core Mac13,2 / M1 Ultra, the class the Stage 0 comment cites
+///   (research/NTT-CROSSOVER-E2E-20CORE-2026-08-11.md): 126 byte-gated
+///   legs, three reps, crossover m~288 in both CPU and wall, with the
+///   fold linear at 0.150 CPU-s per missing block against a nearly
+///   flat NTT.
+///
+/// So `NTT_MIN_MISSING` is 384, not the original 512: still ~1.3x
+/// above the measured crossover on both boxes (the margin the
+/// small-n structural loss and any host we have not measured are
+/// owed), while no longer folding the 384-511 band, which cost up to
+/// 1.4 s wall / 25 CPU-s per repair on the 20-core box. The other two
+/// gates are unchanged - at low present counts the transform's
+/// structural loss stands (forcing it at m=64 costs 2.6x the fold's
+/// CPU), and the budget is an OOM guard, not a speed one.
+const NTT_MIN_MISSING: usize = 384;
 const NTT_MIN_PRESENT: usize = 8192;
 const NTT_MAX_EXP_FACTOR: usize = 3;
 /// Flat ceiling on the default resident-corpus budget. The NTT is a
@@ -1031,554 +1047,9 @@ fn resolve_syndrome_path(
     }
 }
 
-impl Reconstructor {
-    pub fn new(
-        block_size: usize,
-        n_inputs: usize,
-        missing: &[usize],
-        recovery: &[(u32, Vec<u8>)],
-    ) -> Result<Reconstructor, RepairError> {
-        Self::new_with_path(block_size, n_inputs, missing, recovery, SyndromePath::Auto)
-    }
-
-    #[doc(hidden)]
-    pub fn new_with_path(
-        block_size: usize,
-        n_inputs: usize,
-        missing: &[usize],
-        recovery: &[(u32, Vec<u8>)],
-        path: SyndromePath,
-    ) -> Result<Reconstructor, RepairError> {
-        if block_size == 0 || !block_size.is_multiple_of(2) {
-            return Err(RepairError::Malformed(format!(
-                "block size {block_size} not a positive multiple of 2"
-            )));
-        }
-        if recovery.len() != missing.len() {
-            return Err(RepairError::Malformed(format!(
-                "{} recovery slices for {} missing blocks - caller must pass exactly one per",
-                recovery.len(),
-                missing.len()
-            )));
-        }
-        // See MAX_REPAIR_DIM's docs: a crafted set declaring tens of
-        // thousands of missing blocks is a repair-time DoS, not a repair.
-        if missing.len() > MAX_REPAIR_DIM {
-            return Err(RepairError::Malformed(format!(
-                "{} missing blocks exceeds the repair-matrix cap ({MAX_REPAIR_DIM})",
-                missing.len()
-            )));
-        }
-        let base_logs = input_base_logs(n_inputs)?;
-        if let Some(&j) = missing.iter().find(|&&j| j >= n_inputs) {
-            return Err(RepairError::Malformed(format!(
-                "missing index {j} out of range ({n_inputs} inputs)"
-            )));
-        }
-        let t_inv = std::time::Instant::now();
-        // Consecutive exponents (both repair paths pick the SMALLEST
-        // available, so this is the norm - gaps mean recovery packets
-        // were themselves lost) make A a Vandermonde in the bases times
-        // a diagonal, whose explicit inverse costs O(m²) instead of
-        // Gauss-Jordan's O(m³).
-        let consecutive = !recovery.is_empty() && recovery.windows(2).all(|w| w[1].0 == w[0].0 + 1);
-        let structured = if consecutive {
-            let ks: Vec<u32> = missing.iter().map(|&j| base_logs[j]).collect();
-            invert_vandermonde(&ks, recovery[0].0)
-        } else {
-            None
-        };
-        let (label, inverse) = match structured {
-            Some(inv) => ("vandermonde", inv),
-            None => {
-                // A[r][c] = g_{missing[c]}^{e_r} = 2^{k·e mod 65535}
-                let a: Vec<Vec<u16>> = recovery
-                    .iter()
-                    .map(|&(e, _)| {
-                        missing
-                            .iter()
-                            .map(|&j| gf16::pow2(base_logs[j] as u64 * e as u64))
-                            .collect()
-                    })
-                    .collect();
-                ("gauss-jordan", invert(a)?)
-            }
-        };
-        if std::env::var_os("NZBFAST_REPAIR_TIMING").is_some() {
-            info!(
-                target: "repair-timing",
-                "matrix invert ({}x{0}, {label}): {:.2?}",
-                missing.len(),
-                t_inv.elapsed()
-            );
-        }
-        let words = block_size / 2;
-        let mut exponents = Vec::with_capacity(recovery.len());
-        let mut syndromes = Vec::with_capacity(recovery.len());
-        for (e, data) in recovery {
-            if data.len() != block_size {
-                return Err(RepairError::Malformed(format!(
-                    "recovery slice (exponent {e}) is {} bytes, block size is {block_size}",
-                    data.len()
-                )));
-            }
-            let mut w = vec![0u16; words];
-            for (dw, s) in w.iter_mut().zip(data.chunks_exact(2)) {
-                *dw = u16::from_le_bytes([s[0], s[1]]);
-            }
-            exponents.push(*e);
-            syndromes.push(w);
-        }
-        // EXPERIMENTAL NTT dispatch (merged NTT plan Stage 2): when the
-        // repair shape clears the measured gates, the worker RETAINS the
-        // fed batches - the batch arenas ARE the resident source corpus -
-        // and finish() runs the output-pruned NTT instead of having
-        // folded along the way. Overflowing the retention budget folds
-        // everything retained and reverts to streaming: the fold remains
-        // the unconditional fallback, mid-flight.
-        let ntt_budget =
-            resolve_syndrome_path(path, block_size, n_inputs, missing.len(), &exponents);
-        let worker_exponents = exponents.clone();
-        // Capacity 4 (was 1): with M2c.2's parallel readers each sender
-        // carries a BATCH_BYTES/N-sized batch, so a slightly deeper
-        // queue keeps disks busy while a batch folds without growing
-        // worst-case in-flight memory beyond the old single-feeder cap.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<FeedBatch>(8);
-        let fold_trace = std::env::var_os("NZBFAST_FOLD_TRACE").is_some();
-        let worker = std::thread::spawn(move || {
-            let exponents = worker_exponents;
-            let mut syndromes = syndromes;
-            let mut retained: Vec<FeedBatch> = Vec::new();
-            let mut retained_bytes = 0usize;
-            let mut ntt_budget = ntt_budget;
-            let mut waited = std::time::Duration::ZERO;
-            let mut folded = std::time::Duration::ZERO;
-            let mut calls = 0usize;
-            let mut bytes = 0usize;
-            loop {
-                let t_w = std::time::Instant::now();
-                let Ok(first) = rx.recv() else { break };
-                waited += t_w.elapsed();
-                if let Some(budget) = ntt_budget {
-                    // Charge the pad the NTT will need for this batch as
-                    // well as the batch itself: every SHORT slice (a file
-                    // tail) is copied into a zero-padded whole block in
-                    // `ntt_syndromes`, so a set of many small files - all
-                    // tails - costs up to a second copy of the corpus
-                    // that the fed bytes alone never show.
-                    let pad = first
-                        .slices
-                        .iter()
-                        .filter(|&&(_, _, len)| len != 0 && len != block_size)
-                        .count()
-                        * block_size;
-                    retained_bytes += first.arena.len() + pad;
-                    retained.push(first);
-                    if retained_bytes > budget {
-                        // Budget blown: fold what we held and stream on.
-                        if std::env::var_os("NZBFAST_REPAIR_TIMING").is_some() {
-                            warn!(
-                                target: "repair-timing",
-                                "ntt retention over budget \
-                                 ({retained_bytes} > {budget} bytes) - fold fallback"
-                            );
-                        }
-                        fold_batches(&exponents, &mut syndromes, &retained);
-                        retained.clear();
-                        retained_bytes = 0;
-                        ntt_budget = None;
-                    }
-                    continue;
-                }
-                let mut merged = vec![first];
-                // Coalesce whatever the feeders have already queued: the
-                // tiled fold walks EVERY syndrome row once per call, so N
-                // small batches cost N row sweeps where one merged batch
-                // costs one. Parallel feeders split BATCH_BYTES across
-                // handles for memory control (M2c.2), which shrank fold
-                // units 8x - measured as a repair regression on
-                // small-L3 parts.
-                //
-                // The bound is channel capacity PLUS live senders, not
-                // capacity alone: each try_recv that frees a buffered slot
-                // immediately unblocks a sender, whose message lands in the
-                // buffer and is drained on the next iteration. With
-                // sync_channel(4) and up to 8 feeders that is up to 12
-                // batches merged, not 5. Harmless at typical block sizes
-                // (~48 MB vs the 32 MB BATCH_BYTES design cap), but a feeder
-                // batch is one whole block when block_size is large - a set
-                // with 16 MB blocks holds ~192 MB in the merged batch. The
-                // fold is XOR accumulation, so merging and reordering are
-                // exact; this is a memory bound, not a correctness one.
-                while let Ok(more) = rx.try_recv() {
-                    merged.push(more);
-                }
-                let t_f = std::time::Instant::now();
-                fold_batches(&exponents, &mut syndromes, &merged);
-                folded += t_f.elapsed();
-                calls += 1;
-                let mb: usize = merged.iter().map(|b| b.arena.len()).sum();
-                bytes += mb;
-                if fold_trace {
-                    warn!(
-                        target: "fold-trace",
-                        "call {calls}: {} srcs, {:.1} MB, {:.2?}",
-                        merged.iter().map(|b| b.slices.len()).sum::<usize>(),
-                        mb as f64 / 1e6,
-                        t_f.elapsed()
-                    );
-                }
-            }
-            if fold_trace {
-                info!(
-                    target: "fold-trace",
-                    "total: {calls} calls, {:.1} MB, fold {:.2?}, recv-wait {:.2?}",
-                    bytes as f64 / 1e6,
-                    folded,
-                    waited
-                );
-            }
-            (syndromes, retained)
-        });
-        Ok(Reconstructor {
-            block_size,
-            base_logs: std::sync::Arc::new(base_logs),
-            missing: missing.to_vec(),
-            exponents,
-            inverse,
-            tx: Some(tx),
-            worker: Some(worker),
-            batch: FeedBatch::with_capacity(BATCH_BYTES),
-            batch_capacity: BATCH_BYTES,
-            ntt_selected: ntt_budget.is_some(),
-            ntt_fault: match path {
-                SyndromePath::NttForceCorrupt(_) => NttFault::Corrupt,
-                SyndromePath::NttForcePanic(_) => NttFault::Panic,
-                _ => NttFault::None,
-            },
-        })
-    }
-
-    /// Whether the dispatcher selected the NTT path at construction.
-    /// Not part of the supported API surface.
-    #[doc(hidden)]
-    pub fn ntt_selected(&self) -> bool {
-        self.ntt_selected
-    }
-
-    /// Accumulate one present input slice (borrowed - it is packed into
-    /// the batch arena, so callers can reuse one read buffer instead of
-    /// allocating per slice). `data` may be shorter than the block size
-    /// (file tail) - the zero padding contributes nothing.
-    pub fn feed(&mut self, input_index: usize, data: &[u8]) {
-        debug_assert!(
-            !self.missing.contains(&input_index),
-            "fed a slice declared missing"
-        );
-        debug_assert!(data.len() <= self.block_size);
-        if self.batch.arena.len() + data.len() > self.batch_capacity {
-            self.flush();
-        }
-        self.batch.push(self.base_logs[input_index], data);
-        if self.batch.arena.len() >= self.batch_capacity {
-            self.flush();
-        }
-    }
-
-    /// Hand the pending batch to the fold worker. Blocks only when a
-    /// batch is already queued behind the one being folded.
-    fn flush(&mut self) {
-        if self.batch.slices.is_empty() {
-            return;
-        }
-        let batch = std::mem::replace(
-            &mut self.batch,
-            FeedBatch::with_capacity(self.batch_capacity),
-        );
-        // The worker outlives every sender; send can't fail.
-        let _ = self
-            .tx
-            .as_ref()
-            .expect("finish() not yet called")
-            .send(batch);
-    }
-
-    /// A shareable feed handle for parallel producers (M2c.2). Each
-    /// reader thread takes its own Feeder; batches from every handle
-    /// funnel into the same fold worker, so slices may arrive in any
-    /// interleaving (the syndrome fold is order-free XOR accumulation).
-    /// `max_batch` bounds the handle's assembly buffer - callers split
-    /// [`BATCH_BYTES`] across handles so total in-flight memory stays
-    /// what the single-feeder design used. Drop every Feeder (they
-    /// flush on drop) BEFORE calling [`finish`], or finish blocks on
-    /// the channel.
-    pub fn feeder(&self, max_batch: usize) -> Feeder {
-        let max_batch = max_batch.max(1 << 20);
-        Feeder {
-            tx: self.tx.as_ref().expect("finish() not yet called").clone(),
-            base_logs: self.base_logs.clone(),
-            batch: FeedBatch::with_capacity(max_batch),
-            max_batch,
-        }
-    }
-
-    /// Solve: returns the reconstructed slices (full `block_size` bytes
-    /// each, zero-padded past any file tail) in `missing` order.
-    pub fn finish(self) -> Vec<Vec<u8>> {
-        self.finish_reported().0
-    }
-
-    /// [`finish`](Self::finish), also reporting what the syndrome pass
-    /// did - the repair drivers' verify-failure fallback needs to know
-    /// whether the NTT actually computed the syndromes. Not part of the
-    /// supported API surface.
-    #[doc(hidden)]
-    pub fn finish_reported(mut self) -> (Vec<Vec<u8>>, SyndromeReport) {
-        self.flush();
-        drop(self.tx.take());
-        let (mut syndromes, retained) = self
-            .worker
-            .take()
-            .expect("finish() called once")
-            .join()
-            .expect("syndrome fold worker panicked");
-        let mut report = SyndromeReport {
-            ntt_used: false,
-            n_present: 0,
-        };
-        if !retained.is_empty() {
-            (report.ntt_used, report.n_present) = self.ntt_syndromes(&mut syndromes, &retained);
-        }
-        // The retained corpus is dead the moment the syndromes are
-        // computed, and it is the single biggest live allocation on the
-        // NTT path - it must not still be resident while the m x
-        // block_size output below is allocated and then copied out. The
-        // worker arenas are already gone (dropped when the scoped
-        // threads exited), so this window is the real NTT peak.
-        drop(retained);
-        let m = self.missing.len();
-        let words = self.block_size / 2;
-        let mut out: Vec<Vec<u16>> = vec![vec![0u16; words]; m];
-        if m > 0 {
-            // Same tiled multi-accumulate as the syndrome fold: the
-            // m x m back-substitution re-reads every syndrome row per
-            // output row, so untiled it costs m x the syndrome set in
-            // RAM sweeps (and used to run scalar on top). Shares the
-            // row x column scheduler too - with one missing block this
-            // solve is a single row, so rows alone would run it on one
-            // thread.
-            let syn_bytes: Vec<&[u8]> = syndromes.iter().map(|s| gf16::words_as_bytes(s)).collect();
-            let inverse = &self.inverse;
-            let t_bs = std::time::Instant::now();
-            fold_parallel(&mut out, &syn_bytes, &|j, i| inverse[j][i]);
-            if std::env::var_os("NZBFAST_REPAIR_TIMING").is_some() {
-                info!(target: "repair-timing", "back-substitution: {:.2?}", t_bs.elapsed());
-            }
-        }
-        // Same reason as the retained corpus above: the syndrome rows
-        // are consumed by the back-substitution and nothing past it
-        // reads them, so they must not stay live across the byte
-        // conversion, which briefly holds two copies of the output.
-        drop(syndromes);
-        // On little-endian a word slice already IS its PAR2 byte view,
-        // so this is a memcpy per block rather than a per-byte iterator
-        // chain over the whole repaired payload.
-        let out = out
-            .into_iter()
-            .map(|w| gf16::words_as_bytes(&w).to_vec())
-            .collect();
-        (out, report)
-    }
-
-    /// EXPERIMENTAL NTT syndrome pass over the retained source corpus
-    /// (merged NTT plan Stage 2). XORs each present slice's contribution
-    /// into the recovery-initialized syndrome rows via the output-pruned
-    /// transform; any shape the plan cannot represent (duplicate feeds,
-    /// out-of-range logs) falls back to folding the retained batches -
-    /// bit-identical semantics either way, since the fold is pure XOR
-    /// accumulation. Returns (ntt actually ran, present slices fed).
-    fn ntt_syndromes(&self, syndromes: &mut [Vec<u16>], retained: &[FeedBatch]) -> (bool, usize) {
-        let timing = std::env::var_os("NZBFAST_REPAIR_TIMING").is_some();
-        let t0 = std::time::Instant::now();
-        let words = self.block_size / 2;
-        // Slice table: full-length slices point into the batch arenas
-        // (the resident corpus); short tails are copied once into a
-        // zero-padded side arena so every stripe pointer is readable.
-        let mut table: Vec<*const u8> = Vec::new();
-        let mut present: Vec<(u32, crate::par2ntt::SrcId)> = Vec::new();
-        // Counted up front rather than grown block by block: a set of
-        // many small files is nearly all tails, so the doubling Vec
-        // would hold up to twice the final pad during a reallocation -
-        // and that transient is exactly what the retention backstop's
-        // pad charge is trying to bound.
-        let n_short = retained
-            .iter()
-            .flat_map(|b| b.slices.iter())
-            .filter(|&&(_, _, len)| len != 0 && len != self.block_size)
-            .count();
-        let mut pad_arena: Vec<u8> = Vec::new();
-        pad_arena.reserve_exact(n_short * self.block_size);
-        let mut pads: Vec<(usize, usize, usize)> = Vec::new(); // (table idx, pad off, len)
-        pads.reserve_exact(n_short);
-        for b in retained {
-            for &(log, off, len) in &b.slices {
-                if len == 0 {
-                    continue;
-                }
-                let id = table.len() as crate::par2ntt::SrcId;
-                if len == self.block_size {
-                    table.push(b.arena[off..off + len].as_ptr());
-                } else {
-                    let poff = pad_arena.len();
-                    pad_arena.resize(poff + self.block_size, 0);
-                    pads.push((table.len(), poff, len));
-                    table.push(std::ptr::null()); // patched below
-                }
-                present.push((log, id));
-            }
-        }
-        // Second pass for the tail copies: pad_arena has its final size
-        // now, so pointers taken from it below are stable.
-        {
-            let mut pi = 0usize;
-            let mut ti = 0usize;
-            for b in retained {
-                for &(_, off, len) in &b.slices {
-                    if len == 0 {
-                        continue;
-                    }
-                    if len != self.block_size {
-                        let (idx, poff, plen) = pads[pi];
-                        debug_assert_eq!(idx, ti);
-                        pad_arena[poff..poff + plen].copy_from_slice(&b.arena[off..off + len]);
-                        table[ti] = pad_arena[poff..poff + self.block_size].as_ptr();
-                        pi += 1;
-                    }
-                    ti += 1;
-                }
-            }
-            debug_assert_eq!(pi, pads.len());
-        }
-        let needed = self.exponents.iter().copied().max().unwrap_or(0) as usize + 1;
-        let plan = match crate::par2ntt::FlatPlan::build(&present, needed) {
-            Ok(p) => p,
-            Err(why) => {
-                if timing {
-                    info!(target: "repair-timing", "ntt plan unbuildable ({why}) - fold fallback");
-                }
-                fold_batches(&self.exponents, syndromes, retained);
-                return (false, 0);
-            }
-        };
-        // Stripe width and worker count: W=512 (1 KiB stripes) holds the
-        // measured wall inside the scratch budget (Stage 1 doc); workers
-        // pull stripes from a shared queue and XOR their rows into
-        // disjoint column ranges of the shared syndrome rows.
-        let w: usize = std::env::var("NZBFAST_NTT_W")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v: &usize| v >= 16)
-            .unwrap_or(512)
-            .min(words.max(16));
-        let stripes = words.div_ceil(w);
-        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        // Same physical-core rule as fold_parallel on hybrid x86.
-        #[cfg(all(target_arch = "x86_64", windows))]
-        let cores = physical_cores().map_or(cores, |p| p.min(cores));
-        let threads = std::env::var("NZBFAST_NTT_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(cores)
-            .clamp(1, stripes.max(1));
-        struct SynPtrs(Vec<*mut u16>, Vec<usize>);
-        // SAFETY: raw pointers into the syndrome rows; workers XOR
-        // into disjoint column ranges only (one stripe per atomic
-        // fetch_add claim, per the stripe/worker comment above), so
-        // sharing them across the scope's threads races nothing.
-        unsafe impl Send for SynPtrs {}
-        // SAFETY: as above, writes are confined to the claiming
-        // worker's stripe columns.
-        unsafe impl Sync for SynPtrs {}
-        let syn = SynPtrs(
-            syndromes.iter_mut().map(|s| s.as_mut_ptr()).collect(),
-            self.exponents.iter().map(|&e| e as usize).collect(),
-        );
-        struct SrcTable(Vec<*const u8>);
-        // SAFETY: read-only pointers into the retained batch arenas
-        // and the finalized pad arena (stable per the second-pass
-        // comment above); neither is mutated while the scope's
-        // workers read them.
-        unsafe impl Send for SrcTable {}
-        // SAFETY: as above, all access through these pointers is
-        // read-only.
-        unsafe impl Sync for SrcTable {}
-        let table = SrcTable(table);
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|s| {
-            let plan = &plan;
-            let syn = &syn;
-            let table = &table;
-            let next = &next;
-            for _ in 0..threads {
-                s.spawn(move || {
-                    let mut scratch = plan.new_scratch(w);
-                    let mut out = vec![0u16; plan.needed * w];
-                    loop {
-                        let c = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if c >= stripes {
-                            break;
-                        }
-                        let len = w.min(words - c * w);
-                        // SAFETY: every table entry is readable for
-                        // block_size bytes (full slices point into the
-                        // batch arenas, tails into the zero-padded
-                        // side arena, per the slice-table comment
-                        // above), and c*w*2 + 2*len <= block_size
-                        // because len = w.min(words - c*w), satisfying
-                        // transform's src_of contract.
-                        let src_of = |id: crate::par2ntt::SrcId| unsafe {
-                            table.0[id as usize].add(c * w * 2)
-                        };
-                        plan.transform(&src_of, len, &mut scratch, &mut out);
-                        for (j, &e) in syn.1.iter().enumerate() {
-                            // SAFETY: syndrome row j is words long and
-                            // c*w + len <= words, so the range is in
-                            // bounds; stripe c belongs to this worker
-                            // alone (claimed via the atomic queue), so
-                            // no other thread touches these columns.
-                            let row =
-                                unsafe { std::slice::from_raw_parts_mut(syn.0[j].add(c * w), len) };
-                            for (d, s) in row.iter_mut().zip(&out[e * len..(e + 1) * len]) {
-                                *d ^= *s;
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        if timing {
-            info!(
-                target: "repair-timing",
-                "ntt syndromes (m={}, needed={}, n={}, W={w}, threads={threads}): {:.2?}",
-                self.exponents.len(),
-                plan.needed,
-                present.len(),
-                t0.elapsed()
-            );
-        }
-        match self.ntt_fault {
-            NttFault::None => {}
-            // TEST ONLY (NttForceCorrupt): a single flipped word models
-            // an NTT correctness bug; whole-file verification must catch
-            // it and the fold retry must rescue the repair.
-            NttFault::Corrupt => syndromes[0][0] ^= 1,
-            // TEST ONLY (NttForcePanic): the retry must survive a panic
-            // on the NTT path.
-            NttFault::Panic => panic!("injected NTT panic (NttForcePanic test path)"),
-        }
-        (true, present.len())
-    }
-}
+// `impl Reconstructor` lives in par2repair/reconstruct.rs (TODO 106
+// size-gate split).
+mod reconstruct;
 
 /// One producer's handle into a [`Reconstructor`]'s fold worker (M2c.2
 /// parallel feed reads). Same batching as the built-in feed path, but
@@ -2731,6 +2202,9 @@ struct Target {
     /// length is exactly `length`.
     intact: bool,
     exists: bool,
+    /// Verify-pass MD5 state for the in-place self-prove to resume
+    /// from (see [`Md5Resume`]); None keeps the full reread.
+    resume: Option<Md5Resume>,
 }
 
 /// Ceiling on one packet file. Every consumer below reads a packet file
@@ -3165,6 +2639,7 @@ fn repair_dir_set_inner(
             present: Vec::new(),
             intact: false,
             exists: false,
+            resume: None,
         });
         next_slice = next_slice.saturating_add(n_slices);
     }
@@ -3563,8 +3038,10 @@ fn repair_dir_set_inner(
             let _ = std::fs::remove_file(tmp);
         }
     };
-    // (path to verify, target index) - temps verify before their rename.
-    let mut checks: Vec<(PathBuf, usize)> = Vec::new();
+    // (path to verify, target index, patched in place) - temps verify
+    // before their rename, and only in-place patches may resume the
+    // proof from the verify pass's MD5 snapshot (see [`Md5Resume`]).
+    let mut checks: Vec<(PathBuf, usize, bool)> = Vec::new();
     for &ti in &damaged {
         let t = &targets[ti];
         let identified = t.exists && (t.intact || t.present.iter().any(|&p| p));
@@ -3615,7 +3092,7 @@ fn repair_dir_set_inner(
                 cleanup(&renames, None);
                 return Err(e);
             }
-            checks.push((t.path.clone(), ti));
+            checks.push((t.path.clone(), ti, true));
         } else {
             // A temp this call provably created. The name used to be fully
             // predictable and opened with `File::create`, which truncates and
@@ -3661,7 +3138,7 @@ fn repair_dir_set_inner(
                 cleanup(&renames, Some(&tmp));
                 return Err(e);
             }
-            checks.push((tmp.clone(), ti));
+            checks.push((tmp.clone(), ti, false));
             renames.push((tmp, ti));
         }
     }
@@ -3678,13 +3155,17 @@ fn repair_dir_set_inner(
         std::thread::scope(|s| {
             for (cchunk, rchunk) in checks.chunks(chunk).zip(results.chunks_mut(chunk)) {
                 s.spawn(move || {
-                    for ((path, ti), r) in cchunk.iter().zip(rchunk) {
-                        *r = Some(md5_matches(path, &targets_ref[*ti].file));
+                    for ((path, ti, in_place), r) in cchunk.iter().zip(rchunk) {
+                        let t = &targets_ref[*ti];
+                        *r = Some(match &t.resume {
+                            Some(res) if *in_place => md5_matches_resumed(path, &t.file, res),
+                            _ => md5_matches(path, &t.file),
+                        });
                     }
                 });
             }
         });
-        for ((_, ti), r) in checks.iter().zip(results) {
+        for ((_, ti, _), r) in checks.iter().zip(results) {
             match r.expect("verify worker filled every slot") {
                 Ok(true) => {}
                 Ok(false) => {
@@ -3918,6 +3399,62 @@ pub struct Pass1Out {
     /// damaged file with IFSC data (None when clean, absent, or the
     /// set has no IFSC packets - those fall back to all-false).
     pub present: Option<Vec<bool>>,
+    /// Where the post-repair self-prove may pick the whole-file MD5
+    /// back up (TODO 133.1 cost work) - see [`Md5Resume`].
+    pub resume: Option<Md5Resume>,
+}
+
+/// The whole-file MD5 state this verify pass had reached at the byte
+/// boundary of the first block it could not prove present - the point
+/// up to which the file's bytes have been read (and hashed) once
+/// already, and before which an IN-PLACE patch writes nothing: every
+/// block the patch touches is a not-present block, and those all start
+/// at or after this boundary (so do `set_len`'s zero-extension bytes).
+/// Hashing `[offset..length]` of the patched file from `state` is
+/// therefore the same FileDesc-MD5 proof over the same final bytes as
+/// a full reread; the only thing it stops re-checking is that nothing
+/// OUTSIDE the repair rewrote the already-verified prefix in the
+/// window between verify and patch, which the full reread only caught
+/// by accident. Temp-file rebuilds do NOT get this: their prefix is a
+/// fresh copy whose bytes nobody has hashed, so they keep the full
+/// reread ([`md5_matches`]).
+///
+/// The self-prove itself stays a separate read-back-from-disk step
+/// after the patch - fusing it into the syndrome feed is the shape the
+/// mapped driver's safety contract forbids
+/// (`mapped_driver_rereads_files_it_did_not_rebuild`), and this
+/// mirrors that: prove what landed, never what was about to be fed.
+///
+/// `#[doc(hidden)] pub` for `par2_verify_diff`, which asserts the
+/// resumed verdict can never disagree with the full one.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct Md5Resume {
+    offset: u64,
+    state: Md5,
+}
+
+/// Blocks below this stop the resume snapshotting: one `Md5` clone per
+/// block start is noise against hashing 64 KiB, but a wire-supplied
+/// 4-byte block size would turn it into the dominant term of the scan.
+#[cfg(not(fuzzing))]
+const RESUME_MIN_BLOCK: usize = 64 << 10;
+/// Under cargo-fuzz the gate drops to 16 bytes for the same reason
+/// `HASH_PAR_MIN_BYTES` does: `par2_verify_diff` asserts the resumed
+/// self-prove verdict against the full one, and a gate the generated
+/// block sizes never cross would leave that assertion passing while
+/// proving nothing. The threshold is a performance choice; the snapshot
+/// it gates is either taken or not, never different.
+#[cfg(fuzzing)]
+const RESUME_MIN_BLOCK: usize = 16;
+
+/// The resume gate, readable from outside the crate so
+/// `par2_verify_diff` can assert it is small enough for the block sizes
+/// that target generates - the same silent-coverage guard as
+/// [`hash_par_min_bytes`].
+#[doc(hidden)]
+pub fn resume_min_block() -> usize {
+    RESUME_MIN_BLOCK
 }
 
 /// Target verification in ONE streaming pass: the whole-file MD5 and
@@ -3969,6 +3506,7 @@ pub fn verify_pass1(
                 intact: false,
                 clean: false,
                 present: None,
+                resume: None,
             });
         }
         Err(e) => return Err(e.into()),
@@ -3996,6 +3534,10 @@ pub fn verify_pass1(
             intact: false,
             clean: false,
             present: Some(crc_ok),
+            // The pool branch never computes the whole-file MD5, so
+            // there is no state to resume from - such targets keep the
+            // full-reread self-prove.
+            resume: None,
         });
     }
     let mut whole = Md5::new();
@@ -4003,6 +3545,14 @@ pub fn verify_pass1(
     let mut crc = crc32fast::Hasher::new();
     let mut bfill = 0usize;
     let mut bidx = 0usize;
+    // Resume snapshotting (TODO 133.1): `pending` is the whole-file
+    // MD5 state at the START of the block currently being scanned;
+    // when a block fails its CRC, that clone becomes the frozen
+    // `snap` the self-prove resumes from. Cloning stops the moment a
+    // failure is frozen - after that only the hash itself keeps going.
+    let snapping = track && bs >= RESUME_MIN_BLOCK;
+    let mut snap: Option<Md5Resume> = None;
+    let mut pending: Option<Md5Resume> = None;
     // The buffer is bounded regardless of the slice size - `bs` is
     // wire-supplied up to MAX_BLOCK_SIZE (256 MiB), and this allocates
     // once per parallel worker. The in-stream block CRC accumulates
@@ -4013,18 +3563,41 @@ pub fn verify_pass1(
     while pos < limit {
         let take = ((limit - pos) as usize).min(buf.len());
         read_full(&mut f, &mut buf[..take])?;
-        whole.update(&buf[..take]);
+        if !snapping {
+            whole.update(&buf[..take]);
+        }
         if let Some(ok) = blocks_ok.as_mut() {
             let mut p = 0usize;
             while p < take {
+                if snapping && bfill == 0 && snap.is_none() {
+                    pending = Some(Md5Resume {
+                        offset: pos + p as u64,
+                        state: whole.clone(),
+                    });
+                }
                 let seg = (bs - bfill).min(take - p);
+                if snapping {
+                    // Fed per block segment instead of per read so the
+                    // state at each block boundary exists to clone;
+                    // segments are >= RESUME_MIN_BLOCK except at
+                    // buffer straddles, so the per-call overhead stays
+                    // noise.
+                    whole.update(&buf[p..p + seg]);
+                }
                 crc.update(&buf[p..p + seg]);
                 bfill += seg;
                 p += seg;
                 if bfill == bs {
                     let done = std::mem::replace(&mut crc, crc32fast::Hasher::new());
-                    if let Some(check) = file.blocks.get(bidx) {
-                        ok[bidx] = done.finalize() == check.crc32;
+                    let matched = file
+                        .blocks
+                        .get(bidx)
+                        .is_some_and(|check| done.finalize() == check.crc32);
+                    if let Some(slot) = ok.get_mut(bidx) {
+                        *slot = matched;
+                    }
+                    if !matched && snap.is_none() {
+                        snap = pending.take();
                     }
                     bfill = 0;
                     bidx += 1;
@@ -4054,6 +3627,25 @@ pub fn verify_pass1(
                 ok[bidx] = padded == check.crc32;
             }
         }
+        if !ok.get(bidx).copied().unwrap_or(true) && snap.is_none() {
+            // Tail block unproven (bad padded CRC, cut short, or no
+            // IFSC entry): the resume boundary is its start.
+            snap = pending.take();
+        }
+    }
+    // No block failed IN the streamed bytes: any remaining damage
+    // (blocks wholly past a boundary-truncated EOF, or nothing but a
+    // length mismatch `set_len` fixes) starts at or after `limit`, so
+    // the state right here resumes it. A partial tail that FAILED set
+    // `snap` above, so reaching here with `bfill > 0` means the tail
+    // proved out - the only in-place mutation left is `set_len`, which
+    // never touches a byte below `limit`. Cloned before `finalize`
+    // consumes the hasher.
+    if snapping && snap.is_none() {
+        snap = Some(Md5Resume {
+            offset: limit,
+            state: whole.clone(),
+        });
     }
     let md5: [u8; 16] = whole.finalize().into();
     let md5_ok = disk_len >= file.length && md5 == file.md5;
@@ -4062,6 +3654,11 @@ pub fn verify_pass1(
         intact: md5_ok && disk_len == file.length,
         clean: md5_ok,
         present: if md5_ok { None } else { blocks_ok },
+        // Kept even when the MD5 matched: a clean-but-oversized target
+        // (`needs_resize`) is patched by a bare `set_len` truncation,
+        // and its resume boundary is `limit` - the whole proof is the
+        // already-computed state, no reread at all.
+        resume: snap,
     })
 }
 
@@ -4115,6 +3712,7 @@ fn verify_all_targets(targets: &mut [Target], bs: usize) -> Result<(), RepairErr
             Some(p) => p,
             None => vec![out.clean; t.n_slices],
         };
+        t.resume = out.resume;
     }
     Ok(())
 }
@@ -4150,6 +3748,40 @@ pub fn md5_matches(path: &Path, file: &Par2File) -> Result<bool, RepairError> {
         return Ok(false);
     }
     let mut hasher = Md5::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let md5: [u8; 16] = hasher.finalize().into();
+    Ok(md5 == file.md5)
+}
+
+/// [`md5_matches`] resumed from the verify pass's snapshot: the same
+/// FileDesc whole-file proof, minus a reread of the prefix the verify
+/// pass already hashed and an in-place patch cannot have touched (see
+/// [`Md5Resume`] for why that equivalence holds, and for why temp-file
+/// rebuilds never take this path).
+///
+/// `#[doc(hidden)] pub` for `par2_verify_diff`: the fourth verdict in
+/// the differential - on an unpatched file it must equal
+/// [`md5_matches`] exactly.
+#[doc(hidden)]
+pub fn md5_matches_resumed(
+    path: &Path,
+    file: &Par2File,
+    resume: &Md5Resume,
+) -> Result<bool, RepairError> {
+    use std::io::Seek;
+    let mut f = File::open(path)?;
+    if f.metadata()?.len() != file.length {
+        return Ok(false);
+    }
+    let mut hasher = resume.state.clone();
+    f.seek(std::io::SeekFrom::Start(resume.offset))?;
     let mut buf = vec![0u8; 1 << 20];
     loop {
         let n = f.read(&mut buf)?;

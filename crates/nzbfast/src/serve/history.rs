@@ -449,16 +449,53 @@ pub(super) fn history_page(d: &Daemon, q: &HistQuery, summary: bool) -> (Vec<Val
     (slots, matched, counts)
 }
 
+/// §96 (AltMount audit, item 2): a Completed row whose output directory
+/// the user has since deleted presents as Failed - "the files this row
+/// promises are not there". An *arr that reads Completed plus a storage
+/// path re-tries the import against the missing path forever; Failed is
+/// the one status its failed-download handling acts on (grab another
+/// release), which for a job whose payload was deleted before import is
+/// the right outcome.
+///
+/// The guard is the whole point (and why the naive flip was deferred off
+/// the v1.0.14 release day): the PARENT directory must still exist, so
+/// this fires only for "this job's folder was deleted", never for "the
+/// NAS is unmounted" - a mount that is down would otherwise flip a whole
+/// page of healthy history to Failed at once and have every *arr
+/// blocklist a healthy release per poll, the §154 harm class. Checked at
+/// render time for the rows on the requested page only, never persisted
+/// and never swept in the background; the store keeps the truthful
+/// Completed, so a restored folder restores the row.
+fn storage_deleted(j: &Job) -> bool {
+    j.state == JobState::Completed
+        // Mid-move the directory is legitimately absent at one end;
+        // the mover's own amber furniture reports that state.
+        && !j.move_pending
+        && j.out_dir.is_absolute()
+        && !j.out_dir.exists()
+        && j.out_dir.parent().is_some_and(|p| p.exists())
+}
+
+/// The English diagnostic a storage-deleted row carries in
+/// `fail_message`, same contract as the pipeline's own sentences: the
+/// opening clause is the verdict, the dashboard composes the localized
+/// guidance from the tokens beside it.
+const STORAGE_DELETED_MSG: &str = "the downloaded files are no longer on disk; \
+     the output folder was deleted after this download completed";
+
 /// §129 1b: the compact row `mode=dashboard` lists. What the LIST
 /// renders and nothing else - the drawer fetches the full row on demand
 /// via `mode=history&nzo_ids=`. Keys are a subset of the facade row's,
 /// under the same names, so the client renders both with one template.
 fn history_summary(d: &Daemon, j: &Job) -> Value {
+    let deleted = storage_deleted(j);
     json!({
         "nzo_id": j.nzo_id,
         "name": j.name,
         "category": if j.category.is_empty() { "*" } else { &j.category },
-        "status": match j.state { JobState::Completed => "Completed", JobState::Failed => "Failed", _ => "Queued" },
+        "status": if deleted { "Failed" } else {
+            match j.state { JobState::Completed => "Completed", JobState::Failed => "Failed", _ => "Queued" }
+        },
         "bytes": j.total_bytes,
         "size": format!("{}B", sab_units(j.total_bytes as f64)),
         "completed": j.finished_unix.unwrap_or(0),
@@ -467,13 +504,20 @@ fn history_summary(d: &Daemon, j: &Job) -> Value {
         // in both, so one template reads either.
         "retries": j.retries,
         "library": j.library,
-        "fail_message": j.fail_message,
-        "fail_kind": if j.state == JobState::Failed {
+        "fail_message": if deleted { STORAGE_DELETED_MSG } else { j.fail_message.as_str() },
+        // A deleted-storage row is a LOCAL fact (the post is fine) and
+        // the one thing worth offering is a fresh download - "show the
+        // folder", local's usual move, would open a path that is gone.
+        "fail_kind": if deleted {
+            "local"
+        } else if j.state == JobState::Failed {
             fail_kind_token(fail_kind(&j.fail_message))
         } else {
             ""
         },
-        "fail_action": if j.state == JobState::Failed {
+        "fail_action": if deleted {
+            "retry"
+        } else if j.state == JobState::Failed {
             fail_action(
                 fail_kind(&j.fail_message),
                 fail_hint(&j.fail_message),
@@ -630,6 +674,10 @@ fn history_row(d: &Daemon, j: &Job) -> Value {
         } else {
             j.out_dir.to_string_lossy().into_owned()
         };
+        // §96 item 2: see `storage_deleted`. The same flip in both row
+        // shapes, or the list and its drawer would disagree about one
+        // record.
+        let deleted = storage_deleted(j);
         json!({
             "nzo_id": j.nzo_id,
             "name": j.name,
@@ -637,8 +685,10 @@ fn history_row(d: &Daemon, j: &Job) -> Value {
             "origin": j.origin,
             "nzb_path": j.nzb_path.to_string_lossy(),
             "category": if j.category.is_empty() { "*" } else { &j.category },
-            "status": match j.state { JobState::Completed => "Completed", JobState::Failed => "Failed", _ => "Queued" },
-            "fail_message": j.fail_message,
+            "status": if deleted { "Failed" } else {
+                match j.state { JobState::Completed => "Completed", JobState::Failed => "Failed", _ => "Queued" }
+            },
+            "fail_message": if deleted { STORAGE_DELETED_MSG } else { j.fail_message.as_str() },
             "fail_detail": j.fail_detail,
             // This failure was a full disk, decided by the same
             // matcher the NZBGet SPACE verdict uses. Its own key so
@@ -661,7 +711,10 @@ fn history_row(d: &Daemon, j: &Job) -> Value {
             // say what to DO per kind - and suppress Retry for the
             // two kinds the daemon itself knows retrying cannot fix
             // (gone, preflight). Empty on anything not Failed.
-            "fail_kind": if j.state == JobState::Failed {
+            "fail_kind": if deleted {
+                // A local fact - the post is fine (see the summary row).
+                "local"
+            } else if j.state == JobState::Failed {
                 fail_kind_token(fail_kind(&j.fail_message))
             } else {
                 ""
@@ -679,7 +732,11 @@ fn history_row(d: &Daemon, j: &Job) -> Value {
             // button the drawer offers beside the reason. Two
             // failures can share a fail_kind and need opposite next
             // moves - see `fail_hint`. Empty on anything not Failed.
-            "fail_hint": if j.state == JobState::Failed {
+            "fail_hint": if deleted {
+                // Its own sub-cause token: `local`'s generic guidance
+                // points at the folder, and the folder is what is gone.
+                "deleted"
+            } else if j.state == JobState::Failed {
                 fail_hint(&j.fail_message)
             } else {
                 ""
@@ -687,7 +744,9 @@ fn history_row(d: &Daemon, j: &Job) -> Value {
             // ...and the single action that answers it. One key so
             // the page never has to re-derive the rule, and so the
             // rule itself is testable.
-            "fail_action": if j.state == JobState::Failed {
+            "fail_action": if deleted {
+                "retry"
+            } else if j.state == JobState::Failed {
                 fail_action(
                     fail_kind(&j.fail_message),
                     fail_hint(&j.fail_message),
@@ -703,13 +762,14 @@ fn history_row(d: &Daemon, j: &Job) -> Value {
             // number and never renders the list, which is the shape
             // #34 reported. The count keeps its meaning under
             // `retries`; the dashboard reads that.
-            "retry": j.state == JobState::Failed
-                && fail_action(
-                    fail_kind(&j.fail_message),
-                    fail_hint(&j.fail_message),
-                    &j.fail_message,
-                    j.password_required,
-                ) == "retry",
+            "retry": deleted
+                || (j.state == JobState::Failed
+                    && fail_action(
+                        fail_kind(&j.fail_message),
+                        fail_hint(&j.fail_message),
+                        &j.fail_message,
+                        j.password_required,
+                    ) == "retry"),
             "retries": j.retries,
             // This job came out of the local index rather than from
             // an NZB the user holds. It matters on a failure: a

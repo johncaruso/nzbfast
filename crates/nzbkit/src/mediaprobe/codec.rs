@@ -286,6 +286,107 @@ pub fn lookup_sub(container: Container, raw: &str) -> (String, SubKind) {
     (low, SubKind::Text)
 }
 
+// ---------------------------------------------------------------------------
+// RFC 6381 codec strings - the form a browser can be ASKED about
+// ---------------------------------------------------------------------------
+
+/// The RFC 6381 codec parameter for a video track, built from the very
+/// bytes the container carries it in (§73 phase 2).
+///
+/// This is what makes the panel's playback verdict worth trusting. A
+/// canonical name alone ("h264") cannot answer "will this play here":
+/// browsers refuse H.264 High 10, and Safari plays HEVC while Chrome
+/// does not. `canPlayType('video/mp4; codecs="avc1.6E0028"')` answers
+/// exactly, and only the codec-private bytes can spell that string.
+/// `None` when the container gave us no configuration record (AVI
+/// always, a truncated MKV sometimes) - the client then falls back to a
+/// coarse family test.
+///
+/// `cfg` is the raw configuration record: Matroska's CodecPrivate, or
+/// the MP4 sample entry's `avcC` / `hvcC` / `av1C` / `vpcC` child.
+pub fn rfc6381_video(canon: &str, cfg: Option<&[u8]>) -> Option<String> {
+    let cfg = cfg?;
+    match canon {
+        // avcC: [1] profile_idc, [2] constraint flags, [3] level_idc.
+        "h264" if cfg.len() >= 4 => {
+            Some(format!("avc1.{:02X}{:02X}{:02X}", cfg[1], cfg[2], cfg[3]))
+        }
+        // hvcC, ISO/IEC 14496-15 Annex E: profile space as a letter,
+        // profile idc, the compatibility flags with their BITS REVERSED
+        // (Main's 0x60000000 is written "6"), tier + level, then the six
+        // constraint bytes with trailing zero bytes dropped.
+        "hevc" if cfg.len() >= 13 => {
+            let space = match cfg[1] >> 6 {
+                1 => "A",
+                2 => "B",
+                3 => "C",
+                _ => "",
+            };
+            let idc = cfg[1] & 0x1F;
+            let compat = u32::from_be_bytes([cfg[2], cfg[3], cfg[4], cfg[5]]).reverse_bits();
+            let tier = if (cfg[1] >> 5) & 1 == 1 { 'H' } else { 'L' };
+            let mut cons = String::new();
+            let end = cfg[6..12]
+                .iter()
+                .rposition(|b| *b != 0)
+                .map_or(0, |i| i + 1);
+            for b in &cfg[6..6 + end] {
+                use std::fmt::Write as _;
+                let _ = write!(cons, ".{b:02X}");
+            }
+            Some(format!(
+                "hvc1.{space}{idc}.{compat:X}.{tier}{}{cons}",
+                cfg[12]
+            ))
+        }
+        // av1C: [1] seq_profile + seq_level_idx, [2] tier, bit-depth bits.
+        "av1" if cfg.len() >= 3 => {
+            let profile = cfg[1] >> 5;
+            let level = cfg[1] & 0x1F;
+            let tier = if cfg[2] >> 7 == 1 { 'H' } else { 'M' };
+            let depth = match ((cfg[2] >> 6) & 1, (cfg[2] >> 5) & 1) {
+                (1, 1) => 12,
+                (1, 0) => 10,
+                _ => 8,
+            };
+            Some(format!("av01.{profile}.{level:02}{tier}.{depth:02}"))
+        }
+        // vpcC is a FullBox: four bytes of version+flags first.
+        "vp9" if cfg.len() >= 7 => Some(format!(
+            "vp09.{:02}.{:02}.{:02}",
+            cfg[4],
+            cfg[5],
+            cfg[6] >> 4
+        )),
+        _ => None,
+    }
+}
+
+/// The RFC 6381 codec parameter for an audio track.
+///
+/// No configuration record is needed: every one of these is a constant
+/// per family, and the question the panel asks is "can this browser
+/// decode this at all", not "at which profile". AAC answers as LC
+/// (`mp4a.40.2`) because a browser that decodes LC decodes the HE
+/// variants of it too, and nothing here distinguishes them.
+pub fn rfc6381_audio(canon: &str) -> Option<String> {
+    Some(
+        match canon {
+            "aac" => "mp4a.40.2",
+            "mp3" => "mp4a.40.34",
+            "ac3" => "ac-3",
+            "eac3" => "ec-3",
+            "opus" => "opus",
+            "flac" => "flac",
+            "vorbis" => "vorbis",
+            "dts" => "dtsc",
+            "truehd" => "mlpa",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
 /// Channel count to the name a viewer recognises.
 pub fn channel_layout(n: u32) -> String {
     match n {
@@ -438,6 +539,57 @@ mod tests {
         assert_eq!(channel_layout(8), "7.1");
         assert_eq!(channel_layout(12), "12 ch");
         assert_eq!(channel_layout(0), "unknown");
+    }
+
+    /// The strings a browser is asked about. Each expectation is a real
+    /// one: `avc1.640029` is High@4.1, `hvc1.1.6.L93.B0` is the Main
+    /// profile HEVC every phone records, `av01.0.05M.08` is AV1 Main.
+    #[test]
+    fn rfc6381_strings_match_the_configuration_bytes() {
+        // avcC: version, profile_idc=100 (High), constraints, level=41.
+        assert_eq!(
+            rfc6381_video("h264", Some(&[1, 100, 0, 41])).as_deref(),
+            Some("avc1.640029")
+        );
+        // High 10 spells itself out, which is the whole point: browsers
+        // decode 8-bit H.264 and refuse this one.
+        assert_eq!(
+            rfc6381_video("h264", Some(&[1, 110, 0, 40])).as_deref(),
+            Some("avc1.6E0028")
+        );
+        // hvcC: profile_space 0, tier L, profile_idc 1, compatibility
+        // 0x60000000 (reversed -> 6), constraints B0, level 93.
+        let hvcc = [1u8, 0x01, 0x60, 0, 0, 0, 0xB0, 0, 0, 0, 0, 0, 93];
+        assert_eq!(
+            rfc6381_video("hevc", Some(&hvcc)).as_deref(),
+            Some("hvc1.1.6.L93.B0")
+        );
+        // Main 10, high tier.
+        let hvcc10 = [1u8, 0x22, 0x20, 0, 0, 0, 0xB0, 0, 0, 0, 0, 0, 120];
+        assert_eq!(
+            rfc6381_video("hevc", Some(&hvcc10)).as_deref(),
+            Some("hvc1.2.4.H120.B0")
+        );
+        // av1C: seq_profile 0, seq_level_idx 5, main tier, 8-bit.
+        assert_eq!(
+            rfc6381_video("av1", Some(&[0x81, 0x05, 0x00])).as_deref(),
+            Some("av01.0.05M.08")
+        );
+        // vpcC carries four bytes of version+flags before its payload.
+        assert_eq!(
+            rfc6381_video("vp9", Some(&[0, 0, 0, 0, 2, 41, 0xA0])).as_deref(),
+            Some("vp09.02.41.10")
+        );
+        // No configuration record, or a codec with no string worth
+        // asking about: the client falls back to a family test.
+        assert_eq!(rfc6381_video("h264", None), None);
+        assert_eq!(rfc6381_video("mpeg4", Some(&[1, 2, 3, 4])), None);
+        // A record too short to hold what it claims is not guessed at.
+        assert_eq!(rfc6381_video("hevc", Some(&[1, 0x01, 0x60])), None);
+
+        assert_eq!(rfc6381_audio("aac").as_deref(), Some("mp4a.40.2"));
+        assert_eq!(rfc6381_audio("eac3").as_deref(), Some("ec-3"));
+        assert_eq!(rfc6381_audio("pcm"), None);
     }
 
     #[test]

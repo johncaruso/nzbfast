@@ -41,8 +41,8 @@ pub enum Method {
 pub struct Rar5Crypt {
     /// PBKDF2 iteration count exponent (iterations = 2^lg2_count).
     pub lg2_count: u8,
-    pub salt: [u8; 16],
-    pub iv: [u8; 16],
+    pub(crate) salt: [u8; 16],
+    pub(crate) iv: [u8; 16],
     /// Stored password check (8-byte value + 4-byte SHA-256 csum), when
     /// the archiver wrote one (WinRAR does by default).
     pub check: Option<[u8; 12]>,
@@ -2603,12 +2603,12 @@ pub mod fixtures {
     /// zero-padded to 16 at the very end. Volumes carve arbitrary byte
     /// ranges out of `cipher` and repeat the same salt in every header.
     pub struct EncFile4 {
-        pub plain_len: u64,
+        pub(crate) plain_len: u64,
         pub cipher: Vec<u8>,
-        pub salt: [u8; 8],
+        pub(crate) salt: [u8; 8],
         /// CRC32 of the PLAINTEXT - what a RAR4 header stores, and the
         /// only thing that can adjudicate the password at finish.
-        pub crc: u32,
+        pub(crate) crc: u32,
     }
 
     /// Encrypt `plain` as one RAR4 file stream.
@@ -2741,22 +2741,29 @@ pub mod fixtures {
     /// Volumes carve arbitrary byte ranges out of `cipher` and repeat the
     /// same (salt, iv, check) in every piece's header.
     pub struct EncFile {
-        pub plain_len: u64,
+        pub(crate) plain_len: u64,
         pub cipher: Vec<u8>,
-        pub lg2_count: u8,
-        pub salt: [u8; 16],
-        pub iv: [u8; 16],
-        pub check: [u8; 12],
+        pub(crate) lg2_count: u8,
+        pub(crate) salt: [u8; 16],
+        pub(crate) iv: [u8; 16],
+        pub(crate) check: [u8; 12],
         /// Plaintext CRC32 written into the file header (flag 0x04) when
         /// `with_crc` is set - exercises the post-decrypt verify path.
-        pub crc: u32,
-        pub with_crc: bool,
+        pub(crate) crc: u32,
+        pub(crate) with_crc: bool,
         /// Set the crypt record's tweaked-checksum flag (0x02): the stored
         /// CRC is then treated as untrustworthy for a plain comparison.
-        pub tweaked: bool,
+        pub(crate) tweaked: bool,
         /// Omit the password-check value (crypt flag 0x01 cleared) - the
         /// rare WinRAR "don't store password check" case.
-        pub no_check: bool,
+        pub(crate) no_check: bool,
+        /// Write an FHEXTRA_HASH record (type 0x02) carrying a BLAKE2sp
+        /// digest - `rar a -htb`. Set WITHOUT `with_crc` this is the
+        /// hash-only shape: a plaintext check nzbkit cannot compute, so no
+        /// in-stream path may publish the output. The digest bytes are
+        /// arbitrary here: nothing in nzbkit hashes plaintext, so what the
+        /// tests exercise is the ROUTING, not a comparison.
+        pub(crate) with_hash: bool,
         /// The password these parameters were derived from - needed to
         /// re-derive `hash_key` when `tweaked` folds the stored CRC.
         pub password: String,
@@ -2796,12 +2803,23 @@ pub mod fixtures {
             with_crc: false,
             tweaked: false,
             no_check: false,
+            with_hash: false,
             password: password.to_string(),
         }
     }
 
-    /// The file-encryption extra record (type 0x01) for `f`.
-    fn crypt_extra(f: &EncFile) -> Vec<u8> {
+    /// The file-encryption extra record (type 0x01) for `f`, plus the
+    /// file-hash record (type 0x02) when `f.with_hash` and this is the
+    /// TAIL piece.
+    ///
+    /// Tail-only for the same reason the CRC32 is: a whole-file check
+    /// describes the whole file, and real RAR5 writes it on the unsplit
+    /// entry or the last fragment. A fixture that stamped it on every
+    /// piece would be testing a shape no archive has - and here it is
+    /// worse than cosmetic, because `instream_decrypt_allowed` reads the
+    /// check fields PER PIECE, so a head that disagrees with its tail
+    /// routes half of one output through a different path.
+    fn crypt_extra(f: &EncFile, tail: bool) -> Vec<u8> {
         let mut body = Vec::new();
         vint(0x01, &mut body); // record type: encryption
         vint(0, &mut body); // version
@@ -2816,6 +2834,14 @@ pub mod fixtures {
         let mut out = Vec::new();
         vint(body.len() as u64, &mut out);
         out.extend_from_slice(&body);
+        if f.with_hash && tail {
+            let mut h = Vec::new();
+            vint(0x02, &mut h); // record type: file hash
+            vint(0, &mut h); // hash type: BLAKE2sp
+            h.extend_from_slice(&[0xAB; 32]);
+            vint(h.len() as u64, &mut out);
+            out.extend_from_slice(&h);
+        }
         out
     }
 
@@ -2876,7 +2902,7 @@ pub mod fixtures {
             }
             let piece = &f.cipher[range.clone()];
             blocks.push((
-                hdr_v5(2, hflags, &body, &crypt_extra(f), piece.len() as u64),
+                hdr_v5(2, hflags, &body, &crypt_extra(f, tail), piece.len() as u64),
                 piece.to_vec(),
             ));
         }

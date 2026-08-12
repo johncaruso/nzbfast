@@ -191,6 +191,15 @@ nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
 Setări → Servere Usenet → <b>Importă din SABnzbd / NZBGet…</b> îți găsește instalarea
 existentă și îi copiază serverele. Există și <code>nzbfast import-sab</code>
 pe linia de comandă.</div>
+<p>Cardul de bun venit te întreabă și <b>cum ai de gând să folosești nzbfast</b>,
+cu patru răspunsuri: o aplicație precum Sonarr sau Radarr îl conduce, treci de la
+SABnzbd, treci de la NZBGet, sau doar tu, din acest panou. Alegerea uneia nu
+schimbă nimic de la sine. Afișează o listă scurtă de revizuit - fiecare
+recomandare cu numele propriu al setării, valoarea ei curentă, valoarea
+recomandată și un rând de motivație - iar <b>Aplică</b> setează doar rândurile pe
+care le bifezi. Fiecare rând este o setare obișnuită pe care o poți schimba
+înapoi de una singură după aceea, iar aceeași listă rămâne disponibilă și mai
+târziu sub Setări → <b>Setări recomandate după felul în care îl folosești</b>.</p>
 
 <h3 id="firstrun-key">Cheia ta API</h3>
 <p>La o instalare cu adevărat nouă, nzbfast își face singur o cheie API prima dată când
@@ -353,6 +362,15 @@ extern. Linia de stare arată progresul scanării; <b>Scanează acum</b> forțea
 <p>Adaugă titluri după nume - inclusiv unele nepostate încă. Când un release potrivit
 apare în index, este preluat automat, cu preferințe de calitate și reguli de
 upgrade (o copie mai bună o înlocuiește pe una mai slabă).</p>
+<p>Cardul poate urmări și o listă pe care o ții în Plex. Adaugă o <b>sursă de listă</b>: fie
+îți conectezi contul Plex (aprobi un cod scurt chiar pe pagina Plex, așa că nicio parolă nu
+ajunge vreodată la nzbfast), fie lipești adresa watchlist-ului tău Plex. Tratează adresa ca pe
+o parolă - oricine o are îți poate citi lista - motiv pentru care este mascată după salvare.
+Titlurile sincronizate apar ca rânduri doar-citire lângă ale tale. Un cont conectat vede
+întreaga listă, așa că un titlu șters acolo nu mai este urmărit nici aici (descărcările
+finalizate nu sunt atinse niciodată); o adresă arată doar cele mai noi intrări, deci un titlu
+lipsă poate pur și simplu să fi ieșit din listă și nimic nu este șters. Oricare dintre
+comportamente poate fi schimbat per sursă.</p>
 <h3 id="dash-history">Istoric</h3>
 <p>Descărcări recente, câte un rând fiecare. Joburile eșuate oferă <b>Reîncearcă</b>
 (reia din jurnal). Arhivele criptate arată un control de deblocare 🔑 - introdu
@@ -467,6 +485,31 @@ roșu că părțile lipsesc în mod repetat. Grupurile aflate în curățare poa
 potrivit. Deschide-l în timp ce se descarcă, verifică dacă conținutul, limba și
 calitatea sunt cele așteptate și anulează din timp dacă nu sunt - în loc să afli
 abia după descărcarea completă.</p>
+<p>Prima jumătate din asta este deja pe pagină. Deschide rândul unei descărcări
+în coadă (sau în istoric), iar sertarul arată ce se află în fișierul video, citit
+din baiții sosiți până acum: rezoluție, codecuri video și audio, limbi audio,
+subtitrări, capitole. O lansare care este montajul greșit, limba greșită sau un
+upscale se dă de gol în acel panou cu mult înainte ca descărcarea să se termine.</p>
+<p>Pagina își dă seama și dacă <em>acest</em> browser poate reda fișierul, și o
+spune în loc să ghicească: browserele diferă (Safari decodează HEVC acolo unde
+Chrome nu, și aproape niciunul nu decodează audio AC-3 sau DTS), așa că
+întrebarea este pusă browserului în care te afli de fapt. Când răspunsul e da,
+<b>▶ Redă</b> deschide un player chiar în pagină, care arată fișierul în timp ce
+se descarcă. Majoritatea lansărilor sunt MKV, pe care multe browsere refuză să
+îl deschidă deși pot decoda tot ce se află înăuntru, așa că nzbfast le
+reîmpachetează în timpul redării. Nimic nu este recodat: imaginea și sunetul
+sunt octeții originali într-un alt ambalaj, iar saltul la alt moment
+funcționează în continuare. Dacă pista audio este una pe care acest browser nu o
+poate decoda, iar lansarea poartă o a doua pe care o poate, acea a doua pistă
+este cea care se aude, ca imaginea să nu ajungă mută. Doar când browserului îi
+lipsește decodorul pentru video în sine butonul predă fișierul propriului tău
+player multimedia, așa cum se descrie mai jos.</p>
+<p>O singură setare le guvernează pe toate: Setări → Interfață → <b>Verifică un
+fișier în timp ce se descarcă</b>. <b>Doar detalii</b>, valoarea implicită,
+arată panoul și nu oferă player în pagină; <b>Detalii și un player</b> adaugă
+playerul; <b>Oprit</b> oprește cu totul citirea fișierului - cu ea oprită, nimic
+nu va deschide un fișier descărcat pe jumătate pentru nimeni.</p>
+<p>Pentru a verifica în schimb în propriul player media:</p>
 <ul>
 <li><b>▶ Redă</b> pe perete (sau <code>/m3u/&lt;id&gt;</code>) îi dă playerului tău media
 un URL; daemonul pornește sau reutilizează descărcarea din spate.</li>
@@ -499,8 +542,20 @@ sau excluderea oricărui server din pool. Fiecare server are:</p>
 <tr><td>Conexiuni</td><td>Conexiuni simultane per server. Folosește <b>Reglarea conexiunilor</b> (<a href="#performance">§13</a>) pentru a găsi punctul optim al fiecărui provider în loc să ghicești mare.</td></tr>
 <tr><td>Nivel (treaptă)</td><td>0 = primar; nivelurile mai mari sunt servere de umplere, întrebate doar pentru articolele pe care le-a ratat fiecare nivel inferior. Pune conturile nelimitate la 0, conturile cu bloc la 1+.</td></tr>
 <tr><td>Dimensiunea blocului (GB)</td><td>Pentru conturile cu bloc (plată-per-GB): nzbfast urmărește utilizarea pe toată durata față de aceasta și nu mai folosește serverul când e consumat (avertisment la 85%).</td></tr>
+<tr><td>Fiecare bait este facturat</td><td>Activeaz-o pentru un cont contorizat. Descărcările tale folosesc serverul exact ca înainte; ce încetează este traficul propriu pe care i-l trimite nzbfast - regulatorul automat de conexiuni, etapa de rețea a benchmark-ului de sistem și scanările de antete pentru indexul încorporat îl sar toate. Independentă de nivel și de dimensiunea blocului, pentru că un cont contorizat poate fi singurul tău provider, iar unul nelimitat poate sta la nivelul 2. Dezactivată implicit. <b>Testul</b> manual din <b>Reglarea conexiunilor</b> (<a href="#performance">§13</a>) funcționează în continuare pe un server marcat și întreabă mai întâi, fiindcă acolo tu ești cel care alege să cheltuiască.</td></tr>
 </table></div>
 <p><b>Lasă puțină marjă sub limita de conexiuni a contului tău.</b> Setarea conexiunilor puțin sub limită nu costă nimic: debitul se aplatizează cu mult înainte de ultimele una sau două conexiuni, iar <b>Reglarea conexiunilor</b> (<a href="#performance">§13</a>) rămâne oricum sub ea. Acele locuri libere sunt cele care lasă un al doilea dispozitiv, alt client sau o reîncercare după un socket căzut să intre totuşi, în loc să fie refuzate în timp ce acesta ocupă fiecare loc.</p>
+<p><b>Nu trebuie să te ocupi de limita de fișiere deschise a mașinii tale.</b> Sistemul
+socotește fiecare conexiune drept un fișier deschis, iar macOS pornește un program cu o
+limită de 256, pe care un set complet de conexiuni răspândite pe mai multe servere o poate
+depăși. Pe macOS și Linux, nzbfast ridică singur această limită la pornire: cere 65536 de
+fișiere deschise și coboară prin 16384, 4096 și 1024 până când sistemul acceptă, fără să
+treacă vreodată de limita dură fixată de sistem, și merge mai departe cu limita pe care o
+avea dacă fiecare pas este refuzat. Windows nu are o limită de acest fel per proces.
+Ceilalți clienți rămân cu limita pe care le-a dat-o shell-ul, iar unul care rămâne fără
+fișiere deschise în mijlocul unei sarcini se poate opri fără să scrie în jurnal de ce. Așa
+că setează conexiunile fiecărui server după cât permite abonamentul tău, minus marja de mai
+sus, nu după cât crezi că duce mașina.</p>
 <h3 id="passwords">Cum sunt păstrate parolele furnizorilor tăi</h3>
 <p>Parolele de furnizor din <code>config.local.json</code> sunt <b>ofuscate, nu
 criptate</b>. Sunt scrise ca <code>obf1:</code> urmat de o formă codificată, așa încât
@@ -632,6 +687,7 @@ fie ghicite.</p>
 <tr><td>Include grupul de release</td><td>Marcajul <code>-GROUP</code> de la final.</td></tr>
 <tr><td>Elimină fișierele inutile</td><td><b>Activată implicit.</b> Șterge fișierele <code>.par2</code>, <code>.nzb</code>, <code>.sfv</code>, <code>.nfo</code> rămase și clipurile-eșantion din folderele de film și serial finalizate. Niciodată videoclipul sau subtitrările lui.</td></tr>
 <tr><td>Păstrează doar fișierul media</td><td><b>Dezactivată implicit și distructivă:</b> șterge definitiv tot din folder în afară de videoclip(uri) și subtitrări. Fiecare episod dintr-un pachet de sezon este păstrat. Are întâietate față de <b>Elimină fișierele inutile</b> când ambele sunt active.</td></tr>
+<tr><td>Numește descărcările după fișierul .nzb</td><td><b>Dezactivată implicit.</b> Folderul finalizat și fișierul lui principal iau numele fișierului <code>.nzb</code>, în locul numelui pus la punct dedus din lansare. Doar cel mai mare fișier este redenumit: restul unui pachet de episoade, eșantionul, subtitrările și <code>.nfo</code> păstrează numele cu care au sosit. Orice categorie poate să o permită sau să o interzică pe cont propriu sub <b>Categoriile tale</b>, și așa o obții pentru un fel de descărcare și nu pentru altul.</td></tr>
 <tr><td>Keep the other words in the name</td><td><b>Activat implicit.</b> Sportul, cursele și alte evenimente sunt adesea un singur titlu repetat tot sezonul, la un cuvânt sau două distanță - "Round11 Hungary Race" față de "Round11 Hungary Qualifying". Păstrarea acelor cuvinte este ceea ce împiedică un sezon întreg să se reducă la același nume. Se aplică doar acolo unde numele nu a putut fi pus la punct altfel, așa că filmele și episoadele obișnuite rămân neatinse.</td></tr>
 </table></div>
 <p class="dim">Întregul grup rulează după reparare și dezarhivare și înainte de <b>Mută
@@ -736,6 +792,14 @@ celelalte, ajung în <code>settings.json</code>.</p>
 <p>Cea mai simplă automatizare: adaugă un titlu pe panou, setează preferințele de calitate,
 gata. Release-urile noi sunt preluate pe măsură ce apar în grupurile tale indexate;
 copiile de calitate mai bună fac upgrade preluărilor anterioare; o vizualizare de tip calendar arată ce urmează.</p>
+<p>O <b>sursă de listă</b> alimentează watchlist-ul dintr-o listă pe care o ții în Plex, în
+unul din două moduri: îți conectezi contul Plex aprobând un cod scurt pe pagina Plex, sau
+lipești o adresă de watchlist Plex. Adresa este o cheie de acces - îi dă oricui o deține
+dreptul de a citi lista - așa că este mascată după salvare. Sincronizarea ștergerilor diferă
+intenționat după mod: un cont conectat vede întreaga listă, deci un titlu șters acolo nu mai
+este urmărit aici (descărcările deja finalizate rămân); un feed pe bază de adresă aduce doar
+cele mai recente intrări, deci absența nu dovedește nimic și titlurile sunt doar adăugate.
+Ambele valori implicite pot fi schimbate per sursă.</p>
 <h3 id="auto-rss">Feeduri RSS</h3>
 <p>Setări → RSS: orice URL RSS newznab/indexer cu interval per feed, categorie și
 reguli de filtrare (tipare de titlu, limite de dimensiune). Elementele care se potrivesc sunt descărcate
@@ -750,8 +814,66 @@ gata pentru Plex/Jellyfin fără un instrument extern.</p>
 după ora zilei.</p>
 <h3>Scripturi</h3>
 <p>Un script de post-procesare primește argumentele poziționale ale SABnzbd și
-variabilele de mediu <code>SAB_*</code> - ecosistemul mare de scripturi SAB rulează
-ca atare.</p>
+variabilele de mediu <code>SAB_*</code>: ecosistemul mare de scripturi SAB rulează
+ca atare. Dialectul NZBGet este oferit alături - variabilele <code>NZBPP_*</code>
+(<code>DIRECTORY</code>, <code>NZBNAME</code>, <code>CATEGORY</code>,
+<code>TOTALSTATUS</code>, <code>PARSTATUS</code>, <code>UNPACKSTATUS</code>,
+<code>FINALDIR</code>) și codurile de ieșire 93/94/95 - astfel că rulează și
+logica de bază a unui script de extensie NZBGet. Maparea este onestă, nu o
+emulare: repararea și dezarhivarea se petrec în interiorul descărcării
+într-o singură trecere, așa că o finalizare curată raportează
+<code>PARSTATUS=0</code>, iar una reparată <code>PARSTATUS=2</code>.
+Formele de opțiuni per script (<code>NZBPO_*</code>) nu sunt oferite.
+Un script poate lăsa un ajutor rulând în fundal când iese, iar nzbfast nu îl va
+omorî, dar nzbfast chiar încetează să citească ieșirea scriptului în clipa în
+care scriptul însuși se termină: dă-i unui ajutor trecut în fundal propria
+redirecționare a ieșirii, altfel va fi oprit prima dată când încearcă să
+afișeze ceva.</p>
+<h3>Script pre-coadă</h3>
+<p>Un al doilea hook rulează <em>înainte</em> ca o descărcare să intre în coadă
+(Setări → Foldere → Script pre-coadă), cu contractul pre-coadă al SABnzbd:
+argumentele <code>name, pp, category, script, priority, size, group</code> plus
+mediul <code>SAB_*</code>. Primul rând al ieșirii sale acceptă (<code>1</code>)
+sau respinge (<code>0</code>) descărcarea; rândurile 2-7 o pot redenumi, pot
+seta <code>pp</code>, pot schimba categoria, pot alege un script sau pot schimba
+prioritatea (rândurile goale păstrează valoarea implicită). O descărcare
+respinsă merge în istoric ca Eșuată, cu motivul, iar Reîncearcă din istoric o
+aduce înapoi fără a mai întreba scriptul. Hook-ul nu poate pierde niciodată o
+descărcare: dacă scriptul lipsește, cade, își depășește bugetul de timp sau
+afișează ceva ce nu este un verdict, adăugarea continuă neatinsă, iar jurnalul
+spune de ce.</p>
+<h3>Evenimente de ciclu de viață și webhook-uri semnate</h3>
+<p>Fiecare etapă a unui job este un eveniment versionat: <code>job.added</code>,
+<code>job.started</code>, <code>job.finishing</code>, <code>job.repaired</code>,
+<code>job.completed</code>, <code>job.failed</code>, plus
+<code>queue.idle</code>, <code>giveup.tripped</code>, <code>disk.low</code>,
+<code>storage.slow</code> și <code>quota.reached</code>. Fiecare poartă
+<code>schema_version</code> (acum 1; chei noi pot apărea fără o incrementare -
+ignoră ce nu cunoști), un <code>seq</code> monoton și un marcaj de timp
+<code>at</code> în milisecunde.</p>
+<p>Pentru a le primi, adaugă o țintă de notificare <b>webhook</b>
+(Setări → Automatizare) și trece în câmpul ei <i>events</i> felurile de
+evenimente pe care trebuie să le primească - feluri exacte sau un prefix precum
+<code>job.*</code>. Ținta primește apoi un POST per eveniment: JSON-ul
+evenimentului drept corp plus un id <code>delivery</code>
+(<code>&lt;boot&gt;-&lt;seq&gt;</code>, mânerul după care deduplici), antetele
+<code>X-NzbFast-Event</code> și <code>X-NzbFast-Delivery</code>, și - când ținta
+are un secret de semnare - <code>X-NzbFast-Signature: sha256=&lt;hex&gt;</code>,
+un HMAC-SHA256 al baiților exacți ai corpului sub secretul tău (aceeași formă pe
+care o folosesc webhook-urile GitHub). Verifică în Python:</p>
+<pre><code>expected = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
+ok = hmac.compare_digest(expected, request.headers["X-NzbFast-Signature"])</code></pre>
+<p>Livrarea este cel-puțin-o-dată: o țintă care nu poate fi atinsă este
+reîncercată după 10&nbsp;s, 60&nbsp;s și 5&nbsp;min, apoi abandonată, cu eșecul
+afișat pe rândul de setări al țintei. Un răspuns de eroare HTTP (404, 401...) nu
+este reîncercat - repară receptorul și folosește Testul. Fiecare țintă are
+propria bandă de livrare, așa că una lentă sau de neatins nu o ține niciodată pe
+loc pe alta; în interiorul unei benzi, livrările păstrează ordinea în care s-au
+petrecut evenimentele, iar dacă una este abandonată, numerele de secvență arată
+golul. Cuvintele clasice de evenimente
+(<code>completed</code>, <code>failed</code>, <code>repaired</code>,
+<code>disk</code>, <code>quota</code>) își păstrează sensul de notificare umană
+pe aceeași țintă.</p>
 
 <h2 id="arr">11 · Sonarr, Radarr și prietenii</h2>
 <p>nzbfast vorbește nativ API-ul SABnzbd, așa că fiecare *arr funcționează imediat -
@@ -763,6 +885,11 @@ ca atare.</p>
 (unde o găsești: <a href="#firstrun-key">§2</a>).</li>
 <li>Categorie după preferință (ex. <code>tv</code> / <code>movies</code>). Test → bifă verde → Save.</li>
 </ol>
+<p>Panoul îți întinde adresa: pe o instalare care nu a descărcat încă nimic,
+ruta „Lasă Sonarr, Radarr sau o aplicație să adauge descărcări” din cardul de
+bun venit arată adresa exactă cu un buton <b>Copiază</b> alături. Cheia API nu
+este pe acel rând în mod deliberat; rămâne în spatele propriei dezvăluiri în
+Setări → Securitate (<a href="#firstrun-key">§2</a>).</p>
 <p>Coada, istoricul, starea per job, „remove &amp; delete”, reîncercarea și rutarea pe categorii
 se comportă toate cum se așteaptă *arr-urile.</p>
 <h3>Ca indexer (newznab)</h3>
@@ -810,7 +937,18 @@ URL-urile exacte și un cod QR de scanat.</p>
 <h3 id="remote-proxy">Accesul la nzbfast din afara casei</h3>
 <p>Nu există o pagină de autentificare, iar asta este intenționat. Un login cu cookie de sesiune este o suprafață de securitate de întreținut la nesfârșit și ar rămâne oricum cea mai slabă încuietoare a oricărui lucru expus pe internet. nzbfast se autentifică în schimb cu cheia ta API și acceptă cheia atât într-un antet al cererii, cât și în URL (<code>X-Api-Key</code> sau <code>Authorization: Bearer</code>) - exact ceea ce permite unui serviciu aflat în față să se ocupe cum trebuie de autentificare.</p>
 <p><b>Cel mai simplu este să nu îl publici deloc.</b> Instalează <b>Tailscale</b> pe această mașină și pe telefon, iar amândouă intră în aceeași rețea privată: nimic nu este expus, nu e nevoie de router sau certificate, iar Setări → Acces la distanță afișează o adresă care funcționează de oriunde de îndată ce vede Tailscale pornit. Alege această cale dacă nu ai nevoie explicit de un domeniu public.</p>
-<p><b>Dacă ai nevoie</b>, pune în față un proxy invers, dă-i certificatul și lasă-l pe el să facă autentificarea. Pornește nzbfast cu <code>--bind 127.0.0.1</code>, ca proxy-ul să fie singura cale de intrare, și îndreaptă proxy-ul spre <code>http://127.0.0.1:6789</code>:</p>
+<p><b>nzbfast poate servi și el însuși HTTPS.</b> Îndreaptă Setări → Securitate →
+Certificat HTTPS / Cheie privată HTTPS spre un certificat PEM și cheia lui (sau
+pornește cu <code>--tls-cert cert.pem --tls-key key.pem</code>), repornește, iar
+panoul și API-ul răspund pe <code>https://</code> în loc de HTTP simplu - un
+singur ascultător, o singură schemă. Folosește certificatul pe care domeniul tău
+îl are deja (de exemplu de la Let's Encrypt prin certbot) sau unul auto-semnat
+pentru LAN, pe care browserele îl acceptă după un avertisment o singură dată. Un
+certificat stricat sau expirat refuză pornirea cu fișierul numit, așa că
+greșeala este vizibilă acolo unde ai făcut-o; reînnoiește înlocuind fișierele și
+repornind. HTTPS-ul nativ criptează traficul, dar nu adaugă o autentificare, așa
+că păstrează cheia API setată.</p>
+<p><b>Dacă ai nevoie de un domeniu public</b>, pune în față un proxy invers, dă-i certificatul și lasă-l pe el să facă autentificarea. Pornește nzbfast cu <code>--bind 127.0.0.1</code>, ca proxy-ul să fie singura cale de intrare, și îndreaptă proxy-ul spre <code>http://127.0.0.1:6789</code>:</p>
 <pre><code># Caddy
 example.com {
     reverse_proxy 127.0.0.1:6789
@@ -824,7 +962,11 @@ location / {
     proxy_set_header X-Forwarded-Proto $scheme;
 }</code></pre>
 <p>Adaugă deasupra ce oferă proxy-ul tău: autentificare basic, un serviciu de forward-auth precum Authelia sau Authentik, ori certificate de client. Un lucru îi prinde pe toți - Sonarr, Radarr și aplicațiile de telefon nu pot parcurge o autentificare din browser, așa că lasă-le o cale pe lângă. Majoritatea proxy-urilor pot lăsa să treacă o cerere cu un antet <code>X-Api-Key</code> valid și pot cere autentificare pentru tot restul.</p>
-<div class="warn-box"><b>Nu redirecționa pur și simplu portul 6789 pe router.</b> Panoul vorbește HTTP simplu, deci cheia ta API și tot ce faci cu ea ar traversa internetul lizibile pentru oricine de pe traseu, iar o instalare fără nicio cheie este deschisă oricui o găsește. Dacă redirecționezi totuși un port, setează mai întâi o cheie API.</div>
+<div class="warn-box"><b>Nu redirecționa pur și simplu portul 6789 pe router.</b>
+Fără un certificat configurat, panoul vorbește HTTP simplu, deci cheia ta API și
+tot ce faci cu ea ar traversa internetul lizibile pentru oricine de pe traseu,
+iar o instalare fără nicio cheie setată este deschisă oricui o găsește. Dacă
+redirecționezi totuși un port, setează mai întâi o cheie API și activează HTTPS.</div>
 
 <h2 id="performance">13 · Instrumente de performanță</h2>
 <h3 id="perf-benchmark">Benchmark de sistem</h3>

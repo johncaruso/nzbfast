@@ -271,8 +271,10 @@ async fn settle_with_set(
                 if !mapped {
                     if extractor.is_chased(sidx) {
                         deferred_renames.push((sidx, pname.clone()));
-                    } else if let Some(path) = extractor.slot_path(sidx) {
-                        publish_verified_name(&path, pname, out_dir);
+                    } else if let Some(path) = extractor.slot_path(sidx)
+                        && let Some(new) = publish_verified_name(&path, pname, out_dir)
+                    {
+                        extractor.note_slot_renamed(sidx, new);
                     }
                 }
             }

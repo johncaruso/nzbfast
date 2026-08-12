@@ -161,6 +161,9 @@ fn file_stream(info: &mut MediaInfo, s: &Stream, b: &[u8]) {
                 profile: None,
                 level: None,
                 bitrate: None,
+                // AVI carries no configuration record for any of this,
+                // so there is nothing to spell a codec string out of.
+                codec_rfc6381: None,
                 enabled: true,
                 default: info.video.is_empty(),
             });
@@ -172,6 +175,7 @@ fn file_stream(info: &mut MediaInfo, s: &Stream, b: &[u8]) {
             let raw = format!("0x{tag:04x}");
             let (canon, _) = codec::lookup(Container::Avi, &raw, false);
             let channels = u32::from(u16_le(b, 2).unwrap_or(0));
+            let codec_rfc6381 = codec::rfc6381_audio(&canon);
             info.audio.push(AudioTrack {
                 codec: canon,
                 codec_id: raw,
@@ -184,6 +188,7 @@ fn file_stream(info: &mut MediaInfo, s: &Stream, b: &[u8]) {
                 default: info.audio.is_empty(),
                 forced: false,
                 bitrate: u32_le(b, 8).filter(|v| *v > 0).map(|v| u64::from(v) * 8),
+                codec_rfc6381,
                 enabled: true,
             });
         }

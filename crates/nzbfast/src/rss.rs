@@ -46,6 +46,45 @@ fn default_interval() -> u64 {
     900
 }
 
+impl FeedConfig {
+    /// Everything about this feed that decides what one poll's items MEAN:
+    /// the address polled, the rules judged against, and the category
+    /// stamped on what is enqueued.
+    ///
+    /// The RSS loop snapshots a feed, awaits a slow fetch, and then applies
+    /// the snapshot's rules - so deleting a feed or tightening its rules
+    /// while a poll was in flight did not revoke that poll's authority to
+    /// enqueue (Codex sweep 12 Aug F6b). `interval_secs` is excluded: it
+    /// only decides when the NEXT poll runs.
+    pub fn fetch_fingerprint(&self) -> String {
+        format!(
+            "{}\u{1}{}\u{1}{}",
+            self.url,
+            self.category,
+            self.rules.join("\u{2}")
+        )
+    }
+
+    /// A stable, non-secret identity for this feed, for keys that go to
+    /// disk.
+    ///
+    /// The url is the identity, but a feed url essentially always carries
+    /// the indexer's `apikey=`, so the url itself must never be written
+    /// into a spool file. This is a hash of it: stable across restarts,
+    /// distinct per feed, and it reveals nothing.
+    pub fn scope_key(&self) -> String {
+        // FxHash-style: this needs to be stable and cheap, not
+        // cryptographic - a collision costs one cross-feed suppression,
+        // which is exactly the pre-existing behaviour.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in self.url.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        format!("{h:016x}")
+    }
+}
+
 /// What the last poll of one feed actually did.
 ///
 /// The poller used to fold every fetch and parse failure into an empty
@@ -298,7 +337,7 @@ pub(crate) fn find_elem<'a>(xml: &'a str, local: &str) -> Option<(usize, &'a str
 
 /// Raw tag text (`<` up to but excluding `>`) of every element in `xml`
 /// whose local name is `local`, self-closing included.
-fn elem_tags<'a>(xml: &'a str, local: &str) -> Vec<&'a str> {
+pub(crate) fn elem_tags<'a>(xml: &'a str, local: &str) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut at = 0;
     while let Some((open, _)) = find_elem(&xml[at..], local) {
@@ -373,9 +412,6 @@ impl std::fmt::Display for FeedParseError {
 /// and the parser's tolerance for namespace prefixes, junk elements and
 /// half-formed items is load-bearing - feeds in the wild are messy.
 pub fn parse_feed_checked(xml: &str) -> Result<Vec<FeedItem>, FeedParseError> {
-    // Byte-limited scan: only the document's opening needs looking at,
-    // and a multi-megabyte body of HTML must not be lowercased whole.
-    let head: String = xml.chars().take(4096).collect::<String>().to_lowercase();
     // Compare the LOCAL name, cutting any `prefix:` between the `<` and
     // the element name. A namespace prefix is legal on the root as much
     // as anywhere else - `<atom:feed xmlns:atom="…">` is a perfectly
@@ -385,36 +421,64 @@ pub fn parse_feed_checked(xml: &str) -> Result<Vec<FeedItem>, FeedParseError> {
     // outcome this check exists to prevent, reached from the other
     // side, and the parser below is deliberately prefix-tolerant.
     const FEED_ROOTS: [&str; 4] = ["rss", "feed", "rdf", "channel"];
-    let looks_like_a_feed = head.match_indices('<').any(|(at, _)| {
+    match wrong_document(xml, &FEED_ROOTS, "an RSS or Atom feed") {
+        Some(what) => Err(FeedParseError(what)),
+        None => Ok(parse_feed(xml)),
+    }
+}
+
+/// Does this body look like the kind of document it was fetched as, and
+/// if not, what does it look like instead?
+///
+/// `roots` are the local element names whose presence near the top means
+/// yes; `want` names the document for the fallback sentence. `Some` is a
+/// user-facing line naming what arrived instead, because "not a feed"
+/// alone sends a user hunting in the wrong place and a login page is by
+/// far the commonest answer.
+///
+/// Shared with §151's Plex readers, which need this exact check against a
+/// different root (`MediaContainer`) for the same reason: an expired
+/// token is answered with an HTTP 200 that is not the document at all,
+/// and a tolerant parser would call that a healthy empty list.
+pub(crate) fn wrong_document(xml: &str, roots: &[&str], want: &str) -> Option<String> {
+    // Byte-limited scan: only the document's opening needs looking at,
+    // and a multi-megabyte body of HTML must not be lowercased whole.
+    let head: String = xml.chars().take(4096).collect::<String>().to_lowercase();
+    let looks_right = head.match_indices('<').any(|(at, _)| {
         let name = head[at + 1..]
             .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
             .next()
             .unwrap_or_default();
-        FEED_ROOTS.contains(&name.rsplit(':').next().unwrap_or(name))
+        // `head` is lowercased, so the roots are compared case-blind -
+        // XML element names are case-SENSITIVE and Plex's root is
+        // `MediaContainer`, which a literal `contains` would never see.
+        let local = name.rsplit(':').next().unwrap_or(name);
+        roots.iter().any(|r| r.eq_ignore_ascii_case(local))
     });
-    if !looks_like_a_feed {
-        // Name what it looks like instead - "not a feed" alone sends a
-        // user hunting in the wrong place, and a login page is by far
-        // the most common answer here.
-        let what = if head.contains("<html") || head.contains("<!doctype html") {
-            "the server answered with a web page, not a feed - \
-             the url is probably wrong, or the apikey has been revoked \
-             and this is a login page"
-        } else if head.contains("<error") {
-            // A newznab error document IS the answer to "why is this
-            // feed empty", and it usually says "Incorrect user
-            // credentials". Reporting the generic line instead threw
-            // away the one message that names the cause.
-            "the indexer answered with an error, not a feed - \
-             check the apikey and the feed url"
-        } else if head.trim().is_empty() {
-            "the server answered with an empty body"
-        } else {
-            "the server's answer is not an RSS or Atom feed"
-        };
-        return Err(FeedParseError(what.into()));
+    if looks_right {
+        return None;
     }
-    Ok(parse_feed(xml))
+    Some(
+        if head.contains("<html") || head.contains("<!doctype html") {
+            format!(
+                "the server answered with a web page, not {want} - \
+             the address is probably wrong, or the credential has been \
+             revoked and this is a login page"
+            )
+        } else if head.contains("<error") {
+            // A newznab error document IS the answer to "why is this feed
+            // empty", and it usually says "Incorrect user credentials".
+            // Reporting the generic line instead threw away the one message
+            // that names the cause.
+            "the server answered with an error, not a document - \
+         check the credential and the address"
+                .to_string()
+        } else if head.trim().is_empty() {
+            "the server answered with an empty body".to_string()
+        } else {
+            format!("the server's answer is not {want}")
+        },
+    )
 }
 
 /// Minimal RSS 2.0 + Atom parser: `<item>` (RSS) and `<entry>` (Atom)
@@ -580,6 +644,74 @@ mod tests {
     /// below without shipping a dead public function.
     fn rules_accept(rules: &[String], item: &FeedItem) -> bool {
         rules_judge(rules, item).accept
+    }
+
+    fn feed(url: &str, category: &str, rules: &[&str]) -> FeedConfig {
+        FeedConfig {
+            url: url.into(),
+            interval_secs: 900,
+            category: category.into(),
+            rules: rules.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// The scope key is what makes the durable seen-guid set per feed
+    /// rather than global. Two feeds must never share one, or an item
+    /// with `guid = 123` in feed A suppresses a DIFFERENT item with
+    /// `guid = 123` in feed B, across restarts (Codex sweep 12 Aug F12).
+    ///
+    /// And it must not be the url: a feed url essentially always carries
+    /// the indexer's apikey, and this value is written to `rss-seen.json`.
+    #[test]
+    fn a_feed_scope_key_is_stable_distinct_and_carries_no_credential() {
+        let a = feed("https://indexer/rss?apikey=SECRET1", "tv", &[]);
+        let b = feed("https://indexer/rss?apikey=SECRET2", "tv", &[]);
+        assert_eq!(a.scope_key(), a.clone().scope_key(), "must be stable");
+        assert_ne!(a.scope_key(), b.scope_key(), "two feeds, two scopes");
+        for k in [a.scope_key(), b.scope_key()] {
+            assert!(!k.contains("SECRET"), "the key leaked the url: {k}");
+            assert!(!k.contains("apikey"), "the key leaked the url: {k}");
+            assert!(k.chars().all(|c| c.is_ascii_hexdigit()), "{k}");
+        }
+        // Interval is not identity: changing the cadence must not orphan
+        // every guid this feed has already judged.
+        let mut slower = a.clone();
+        slower.interval_secs = 60;
+        assert_eq!(a.scope_key(), slower.scope_key());
+    }
+
+    /// The RSS loop snapshots a feed, awaits a fetch that can take most of
+    /// a minute, then applies the SNAPSHOT's rules and category. The
+    /// fingerprint is how a poll checks it still has authority to do that
+    /// (Codex sweep 12 Aug F6b): everything that changes what a poll MEANS
+    /// is in it, and the cadence - which only decides when the next one
+    /// runs - is not.
+    #[test]
+    fn a_fetch_fingerprint_covers_what_changes_the_meaning_of_a_poll() {
+        let base = feed("https://i/rss", "tv", &["accept:*1080p*"]);
+        let same = base.clone();
+        assert_eq!(base.fetch_fingerprint(), same.fetch_fingerprint());
+
+        let mut slower = base.clone();
+        slower.interval_secs = 60;
+        assert_eq!(
+            base.fetch_fingerprint(),
+            slower.fetch_fingerprint(),
+            "cadence is not authority"
+        );
+
+        for changed in [
+            feed("https://other/rss", "tv", &["accept:*1080p*"]),
+            feed("https://i/rss", "movies", &["accept:*1080p*"]),
+            feed("https://i/rss", "tv", &["accept:*2160p*"]),
+            feed("https://i/rss", "tv", &[]),
+        ] {
+            assert_ne!(
+                base.fetch_fingerprint(),
+                changed.fetch_fingerprint(),
+                "an edit that changes what the poll means must revoke it: {changed:?}"
+            );
+        }
     }
 
     #[test]

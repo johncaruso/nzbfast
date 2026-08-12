@@ -100,31 +100,31 @@ pub struct SpotHeader {
     /// before the `<` minus the single separating space, quotes and all.
     /// spotweb signs `substr($from, 0, strpos($from, '<') - 1)`, so this is
     /// deliberately not trimmed.
-    pub poster: String,
+    pub(crate) poster: String,
     /// Self-signed RSA public-key modulus from the From record, big-endian
     /// (exponent is always 65537). Empty on server-signed spots, which put
     /// a random number there and rely on a master key instead.
-    pub modulus: Vec<u8>,
+    pub(crate) modulus: Vec<u8>,
     /// PKCS#1 v1.5 signature over the header - the LAST dot-field of the
     /// part after `@` (spotweb's `headersign`).
-    pub signature: Vec<u8>,
-    /// Signature over `<message-id>` made with [`Self::modulus`]; the
+    pub(crate) signature: Vec<u8>,
+    /// Signature over `<message-id>` made with `Self::modulus`; the
     /// full-spot check uses it, the header check never does. Optional.
     pub user_signature: Vec<u8>,
     /// Category, 0-based as spotweb stores it (the wire digit minus one).
-    pub category: u8,
+    pub(crate) category: u8,
     /// Key regime: 1–6 select a distributed Spotnet key, 7 is self-signed.
-    pub key_id: u8,
+    pub(crate) key_id: u8,
     /// Subcategory runs, e.g. `["a09", "b04"]`.
-    pub subcats: Vec<String>,
-    pub size: u64,
+    pub(crate) subcats: Vec<String>,
+    pub(crate) size: u64,
     /// Unix timestamp from the record.
-    pub date: i64,
+    pub(crate) date: i64,
     pub custom_id: String,
     pub custom_value: String,
     /// The portion after `@` minus the trailing signature field - the exact
     /// bytes [`Self::signature`] covers.
-    pub signed_part: String,
+    pub(crate) signed_part: String,
 }
 
 /// Parse a spot From header. Returns `None` on anything malformed or
@@ -257,19 +257,19 @@ pub enum SpotKeySource {
 /// Result of [`verify_spot`]: signature strictly, hashcash as a warning.
 #[derive(Debug, Clone)]
 pub struct SpotVerify {
-    pub signature_ok: bool,
+    pub(crate) signature_ok: bool,
     /// `false` only for self-signed spots whose message-id fails the V2
     /// hashcash proof-of-work - a warning flag, never a rejection.
-    pub hashcash_ok: bool,
+    pub(crate) hashcash_ok: bool,
     /// Which key verified, `None` when nothing did.
-    pub key_source: Option<SpotKeySource>,
+    pub(crate) key_source: Option<SpotKeySource>,
     /// The title the signature actually covered, `None` when nothing
     /// verified. Two conventions are live and the verifier has to try
     /// both, so which one won is the only evidence of where the spotter
     /// meant the title to end - a trailing `| ClubNZB` is part of the
     /// title for one poster and a tag appended after it for another.
     /// Store this rather than the raw subject.
-    pub title: Option<String>,
+    pub(crate) title: Option<String>,
 }
 
 /// Verify a spot header: RSA PKCS#1 v1.5 / SHA-1 over

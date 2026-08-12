@@ -486,6 +486,11 @@ fn flush_track(info: &mut MediaInfo, st: &mut State) {
             };
             let (profile, level, cp_depth) =
                 codec_private_video(&canon, t.codec_private.as_deref());
+            // Matroska's CodecPrivate IS the configuration record the
+            // codec string is spelled from - avcC bytes for H.264,
+            // hvcC for HEVC - so the browser question is answerable
+            // for an MKV without an MP4 sample entry anywhere in sight.
+            let codec_rfc6381 = codec::rfc6381_video(&canon, t.codec_private.as_deref());
             let hdr = (t.matrix.is_some()
                 || t.transfer.is_some()
                 || t.primaries.is_some()
@@ -522,12 +527,14 @@ fn flush_track(info: &mut MediaInfo, st: &mut State) {
                 profile,
                 level,
                 bitrate: None,
+                codec_rfc6381,
                 enabled: t.enabled,
                 default: t.default,
             });
         }
         Some(TRACK_AUDIO) => {
             let (canon, _) = codec::lookup(info.container, &raw, false);
+            let codec_rfc6381 = codec::rfc6381_audio(&canon);
             let ch = t.channels.unwrap_or(0);
             st.filed.push((t.uid, t.number, false));
             info.audio.push(AudioTrack {
@@ -547,6 +554,7 @@ fn flush_track(info: &mut MediaInfo, st: &mut State) {
                 default: t.default,
                 forced: t.forced,
                 bitrate: None,
+                codec_rfc6381,
                 enabled: t.enabled,
             });
         }
@@ -917,8 +925,12 @@ mod tests {
         assert_eq!(v.fps, Some(23.976));
         assert_eq!(v.profile.as_deref(), Some("High"));
         assert_eq!(v.level.as_deref(), Some("4.1"));
+        // §73 phase 2: the string the panel asks the browser about,
+        // spelled out of the same CodecPrivate the profile came from.
+        assert_eq!(v.codec_rfc6381.as_deref(), Some("avc1.640029"));
         assert_eq!(i.audio.len(), 2);
         assert_eq!(i.audio[0].codec, "aac");
+        assert_eq!(i.audio[0].codec_rfc6381.as_deref(), Some("mp4a.40.2"));
         assert_eq!(i.audio[0].lang, "en");
         assert_eq!(i.audio[0].channels, 2);
         assert_eq!(i.audio[0].channel_layout, "stereo");
@@ -926,6 +938,8 @@ mod tests {
         // The /B spelling mkvmerge writes must land on the same code as
         // the /T one.
         assert_eq!(i.audio[1].codec, "ac3");
+        // The one that decides "plays" from "plays, silently".
+        assert_eq!(i.audio[1].codec_rfc6381.as_deref(), Some("ac-3"));
         assert_eq!(i.audio[1].lang, "de");
         assert_eq!(i.audio[1].channels, 6);
         assert_eq!(i.audio[1].channel_layout, "5.1");

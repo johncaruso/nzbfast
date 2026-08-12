@@ -46,13 +46,13 @@ pub struct PostedNzbCandidate {
 /// row - so the lookup returns rows, not a unique hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MsgidRow {
-    pub msgid: String,
-    pub release_id: i64,
-    pub stem: String,
+    pub(crate) msgid: String,
+    pub(crate) release_id: i64,
+    pub(crate) stem: String,
     /// Segments the whole RELEASE holds (`releases.have_parts`) - the
     /// quorum denominator. The release total, not the matched file's,
     /// so a claim must cover the release it would rename.
-    pub row_nsegs: u32,
+    pub(crate) row_nsegs: u32,
 }
 
 /// A per-NZB, per-release join summary (built by

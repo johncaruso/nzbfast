@@ -28,7 +28,7 @@ use crc32fast::Hasher as Crc32;
 use libfuzzer_sys::fuzz_target;
 use md5::{Digest, Md5};
 use nzbkit::par2::{BlockCheck, Par2File};
-use nzbkit::par2repair::{md5_matches, verify_pass1};
+use nzbkit::par2repair::{md5_matches, md5_matches_resumed, verify_pass1};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -160,6 +160,12 @@ fuzz_target!(|data: &[u8]| {
         nzbkit::par2repair::hash_par_min_bytes() < MAX_LEN as u64,
         "the pool gate is above every length this target generates"
     );
+    // Same guard for the resumed self-prove: its snapshot gate must sit
+    // below most of BLOCK_SIZES or assertion 4 below stops covering it.
+    assert!(
+        nzbkit::par2repair::resume_min_block() <= 16,
+        "the resume gate is above the block sizes this target generates"
+    );
     let mut src = Src { d: data, i: 0 };
     let bs = src.pick(&BLOCK_SIZES);
     let decl_len = src.u16() % (MAX_LEN + 1);
@@ -264,4 +270,14 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(serial.clean, want_clean, "clean vs the FileDesc MD5");
     assert_eq!(serial.intact, want_intact, "intact vs the FileDesc MD5");
     assert_eq!(serial.present, want_present, "presence vs the IFSC CRC32s");
+
+    // 4. The resumed self-prove (TODO 133.1) is the same proof as the
+    //    full one. On the unpatched file the snapshot's prefix state
+    //    covers exactly the bytes still on disk, so the resumed verdict
+    //    must equal the full-reread verdict bit for bit - any drift
+    //    here is the H7 class again, one verdict per code path.
+    if let Some(res) = &serial.resume {
+        let resumed = md5_matches_resumed(p, &file, res).expect("md5_matches_resumed");
+        assert_eq!(resumed, self_prove, "resumed vs full self-prove");
+    }
 });

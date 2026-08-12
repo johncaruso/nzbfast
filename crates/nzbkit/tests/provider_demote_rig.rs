@@ -375,11 +375,54 @@ async fn twin_leg_conns(
     twin_leg_sized(label, age_days, a_conns, N_ARTICLES, mk_chaos).await
 }
 
+/// The default posture for these legs is `PoolConfig::default()` and
+/// that is DELIBERATE, not an oversight: it is the pessimistic arm.
+///
+/// What the daemon ships is `PoolConfig::shipped()` - "Race slow
+/// articles" ON, which is four knobs whose entire job is to take work
+/// away from a provider that is holding it up. Measuring "does this
+/// faulty server pay its way" with the racer already armed would answer
+/// a question about the racer. These legs ask what the fault costs
+/// BEFORE anything mitigates it, so a demotion's case is made against
+/// the worst number rather than the flattered one.
+///
+/// The legs that need the shipped posture take it explicitly and say
+/// why: the two `adaptive_timeout: true` sites below (dead air is what
+/// they price, and a flat 30 s bound prices the rig instead), and
+/// `a_crawling_provider_holds_the_tail_hostage_until_the_racer_takes_it_back`,
+/// which runs BOTH arms because the gap between them is its finding.
 async fn twin_leg_sized(
     label: &str,
     age_days: u32,
     a_conns: usize,
     n: usize,
+    mk_chaos: impl Fn(&[String]) -> Chaos,
+) -> Cost {
+    twin_leg_cfg(
+        label,
+        age_days,
+        a_conns,
+        n,
+        PoolConfig {
+            crc_steer: true,
+            ..Default::default()
+        },
+        mk_chaos,
+    )
+    .await
+}
+
+/// `twin_leg_sized` with the pool config under test. The one knob that
+/// needs it is `desync_fence`: §146 charges a FENCED bare refusal on
+/// arrival, so with the fence armed the confirming repeat no longer
+/// scales with the article count - and the only way to still exercise
+/// the repeat is to take the fence away.
+async fn twin_leg_cfg(
+    label: &str,
+    age_days: u32,
+    a_conns: usize,
+    n: usize,
+    cfg: PoolConfig,
     mk_chaos: impl Fn(&[String]) -> Chaos,
 ) -> Cost {
     let (arts_a, reqs) = corpus_of(age_days, n);
@@ -394,10 +437,6 @@ async fn twin_leg_sized(
         },
     )
     .await;
-    let cfg = PoolConfig {
-        crc_steer: true,
-        ..Default::default()
-    };
     let servers = vec![server_conns(&a, a_conns, cfg.clone()), server(&b, cfg)];
     leg(label, servers, &[&a, &b], reqs).await
 }
@@ -643,16 +682,58 @@ async fn freshmiss_wasted_dispatches_are_bounded_by_the_refusal_shape() {
         "bare: {} dispatches for {N_ARTICLES} articles",
         bare.srv(0).tried
     );
-    // And the confirming repeat is the whole difference between the two
-    // families - the number that says a demotion aimed at the bare shape
-    // would be aiming at soft_430, not at the provider.
+    // The confirming repeat USED to be the whole difference between the
+    // two families, and this assertion used to read `bare > echo`. §146
+    // changed that on purpose: a bare refusal read off a FENCED socket
+    // has had its position proven one response later, which is exactly
+    // what the repeat was buying, so it is charged on arrival. The
+    // repeat now costs one dispatch for the whole RUN - the first bare
+    // refusal, the one that arms the fence - instead of one per absent
+    // article. So the two families now cost the same, and the honest
+    // pin is that the bare arm is no longer SYSTEMATICALLY dearer.
+    //
+    // (Stated as a band rather than equality: which server reaches an
+    // article first varies per run, so both counts drift by a few
+    // either way. What must not come back is the old ~2x.)
+    let (b_miss, e_miss) = (bare.srv(0).missing as i64, echo.srv(0).missing as i64);
     assert!(
-        bare.srv(0).missing > echo.srv(0).missing,
-        "the bare arm ({}) must cost more refusals than the echoed one \
-         ({}) - otherwise the confirming repeat is not firing and the \
-         rig is measuring nothing",
-        bare.srv(0).missing,
+        (b_miss - e_miss).abs() <= (missing as i64) / 10,
+        "the fenced bare arm ({b_miss}) should now cost about what the \
+         echoed one does ({e_miss}) for {missing} absent articles - a \
+         gap this size means the per-article confirming repeat is back"
+    );
+
+    // …and the repeat must still be there when the fence is NOT, which
+    // is the half that keeps §129 3g's armor honest: a provider that
+    // never answers a fence has it retired by `note_fence_dud`, and a
+    // deployment can turn it off outright. Both land here.
+    let unfenced = twin_leg_cfg(
+        "freshmiss (bare 430, no fence)",
+        0,
+        CONNS,
+        N_ARTICLES,
+        PoolConfig {
+            crc_steer: true,
+            desync_fence: false,
+            ..Default::default()
+        },
+        |ids| miss_chaos(ids, missing),
+    )
+    .await;
+    println!("{}", unfenced.line());
+    assert_eq!(unfenced.done, N_ARTICLES, "unfenced arm lost articles");
+    assert!(
+        unfenced.srv(0).missing > echo.srv(0).missing,
+        "with no fence to prove position, a bare 430 must still buy its \
+         confirming repeat: {} refusals against the echoed arm's {}",
+        unfenced.srv(0).missing,
         echo.srv(0).missing
+    );
+    assert!(
+        unfenced.srv(0).missing as usize <= 2 * missing,
+        "still at most ONE confirming repeat, saw {} for {missing} \
+         absent articles",
+        unfenced.srv(0).missing
     );
 }
 
@@ -1151,6 +1232,239 @@ async fn baseline_cost_of_a_badly_answering_provider() {
         );
     }
     for c in &table {
+        assert_eq!(c.done, N_ARTICLES, "{} lost articles", c.label);
+    }
+}
+
+/// §109's hunt: the shapes 3d's own reopener clause names. 3d closed on
+/// "every shape raced here is bounded by `tried_430` or by `crc_steer`'s
+/// once-per-id steer - if one turns up that is NOT remembered per
+/// (article, server) AND is net-negative, the rig is the place to add
+/// it". These are those candidates, and they are deliberately the ones
+/// the 430 family cannot cover, because a 430 is REMEMBERED and each of
+/// these is not:
+///
+/// - **corrupt 100% / 1-in-2**: 3d priced the storm at 1-in-3 only, and
+///   found it strongly net-POSITIVE. That is a rate, not a verdict: a
+///   cache node serving nothing but damage spends real bandwidth and
+///   real decode to deliver zero good bytes, and the steer's memory is
+///   per (article, server), so the SECOND article is asked of it just
+///   as innocently as the first. If the shape ever goes negative it
+///   goes negative here.
+/// - **bodyerror forever**: connects, authenticates, and answers every
+///   BODY with a non-body status. The session dies on the protocol
+///   error and the article is requeued with nothing charged to anyone -
+///   the purest "connected but useless" provider there is.
+/// - **cgnat mute**: every connection goes permanently silent after a
+///   few bodies. The client learns nothing until its read bound fires,
+///   so the cost is paid in dead air rather than in refusals - and dead
+///   air is the one currency the 430 legs could not measure.
+/// - **crawl**: a provider that is not wrong at all, just 25x slower
+///   than its twin for the whole run. Nothing here is a fault the pool
+///   can remember, because nothing it says is untrue.
+/// - **flap** (`drop_after`) is the control, not a candidate: it is the
+///   shape the existing breaker owns, and its row is here so the table
+///   shows containment beside the shapes that have none.
+///
+/// Run: `cargo test -p nzbkit --release --test provider_demote_rig --
+/// --ignored --nocapture --test-threads=1`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-clock measurement - run with --ignored"]
+async fn hunting_a_net_negative_provider() {
+    // The shipped shape of the knobs these legs run into: adaptive
+    // timeouts decide what dead air COSTS, and the whole cgnat leg is a
+    // dead-air measurement. Racing it against the flat 30 s default
+    // would price a timeout nobody ships.
+    let cfg = || PoolConfig {
+        crc_steer: true,
+        adaptive_timeout: true,
+        ..Default::default()
+    };
+    let hunt = |label: &'static str, mk: fn() -> Chaos| async move {
+        twin_leg_cfg(label, 0, CONNS, N_ARTICLES, cfg(), move |_| mk()).await
+    };
+
+    let mut table = vec![solo_leg("twin alone (control)", 0).await];
+    table.push(
+        hunt("corrupt 100%", || Chaos {
+            corrupt_every: 1,
+            throttle: healthy(),
+            ..Default::default()
+        })
+        .await,
+    );
+    table.push(
+        hunt("corrupt 1-in-2", || Chaos {
+            corrupt_every: 2,
+            throttle: healthy(),
+            ..Default::default()
+        })
+        .await,
+    );
+    table.push(
+        hunt("bodyerror forever", || Chaos {
+            body_error: Some(u64::MAX),
+            throttle: healthy(),
+            ..Default::default()
+        })
+        .await,
+    );
+    table.push(
+        hunt("cgnat mute every 3", || Chaos {
+            mute_after_bodies: 3,
+            throttle: healthy(),
+            ..Default::default()
+        })
+        .await,
+    );
+    table.push(
+        hunt("crawl (1/25 rate)", || Chaos {
+            throttle: Throttle {
+                per_conn_bps: PER_CONN_BPS / 25,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await,
+    );
+    table.push(
+        hunt("flap: drop every 2 (control)", || Chaos {
+            drop_after: 2,
+            throttle: healthy(),
+            ..Default::default()
+        })
+        .await,
+    );
+
+    println!(
+        "\n§109 hunt for a net-negative provider, {N_ARTICLES} articles \
+              x {ART} B, {CONNS} conns/server, twin at {PER_CONN_BPS} B/s:"
+    );
+    for c in &table {
+        println!("  {}", c.line());
+    }
+    let solo = table[0].wall.as_secs_f64();
+    println!(
+        "\n  vs the clean twin alone ({solo:.2}s) - over 1.00 means the \
+              faulty server made the job SLOWER than its own absence:"
+    );
+    for c in table.iter().skip(1) {
+        println!(
+            "    {:<28} {:.2}x   {} dispatches, {:.2} MB served, {} owned-bad",
+            c.label,
+            c.wall.as_secs_f64() / solo.max(0.001),
+            c.srv(0).tried,
+            c.srv(0).bytes as f64 / 1e6,
+            c.owned_bad
+        );
+    }
+    for c in &table {
+        assert_eq!(c.done, N_ARTICLES, "{} lost articles", c.label);
+    }
+}
+
+/// The one mechanism left by which a connected-but-degraded provider
+/// can be net-negative, and the reason the hunt table above cannot show
+/// it: HOSTAGE ARTICLES AT THE TAIL.
+///
+/// Mid-run a slow provider is self-limiting - one shared FIFO, workers
+/// self-clock, so it simply claims less (the crawl row takes 36
+/// dispatches where the twin takes 576, without anything deciding that
+/// it should). At the FINISH that reverses: the last articles are
+/// claimed, and one of them sitting behind a crawling session gates the
+/// whole job no matter how idle the rest of the fleet is. The hunt
+/// table's articles are 8 kB, so even a 25x crawl hands one back in
+/// 0.4 s and the effect hides inside the noise. Here the crawl is made
+/// catastrophic (1/200) so a hostage article costs seconds, which is
+/// what a 740 kB article behind a genuinely sick session costs on a real
+/// line.
+///
+/// The arms are the shipped setting, not a hypothesis: "Race slow
+/// articles" (`race_stragglers`, ON by default) resolves to
+/// `tail_fanout` + `tail_fanout_early` + `hedge` + `recycle_slope` in
+/// `get/fleet.rs` - which is what `PoolConfig::shipped()` returns, and
+/// what `PoolConfig::default()` has all four OFF of, so every other leg
+/// in this file is deliberately measuring the pessimistic pool (see
+/// `twin_leg_sized`). If the OFF arm is net-negative and the ON arm is
+/// not, then the hostage cost is real AND already paid for, and a
+/// demotion would be buying a second time what one setting already
+/// bought.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-clock measurement - run with --ignored"]
+async fn a_crawling_provider_holds_the_tail_hostage_until_the_racer_takes_it_back() {
+    /// Slow enough that one hostage article is seconds, not milliseconds.
+    const CRAWL_DIVISOR: u64 = 200;
+    let crawl = || Chaos {
+        throttle: Throttle {
+            per_conn_bps: PER_CONN_BPS / CRAWL_DIVISOR,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let arm = |label: &'static str, race: bool, n: usize| async move {
+        // The ON arm is the shipped posture in one token; the OFF arm is
+        // the same fleet with the setting unticked. `adaptive_timeout`
+        // is forced on in BOTH so the only moving part is the racer.
+        let base = if race {
+            PoolConfig::shipped()
+        } else {
+            PoolConfig::default()
+        };
+        twin_leg_cfg(
+            label,
+            0,
+            CONNS,
+            n,
+            PoolConfig {
+                crc_steer: true,
+                adaptive_timeout: true,
+                ..base
+            },
+            move |_| crawl(),
+        )
+        .await
+    };
+
+    let solo = solo_leg("twin alone (control)", 0).await;
+    let off = arm("crawl 1/200, racer OFF", false, N_ARTICLES).await;
+    let on = arm("crawl 1/200, racer ON (ships)", true, N_ARTICLES).await;
+
+    println!(
+        "\n§109 hostage tail: a provider {CRAWL_DIVISOR}x slower than its \
+         twin, {N_ARTICLES} articles x {ART} B:"
+    );
+    for c in [&solo, &off, &on] {
+        println!("  {}", c.line());
+    }
+    let base = solo.wall.as_secs_f64().max(0.001);
+    for c in [&off, &on] {
+        println!(
+            "    {:<30} {:.2}x the twin-alone control",
+            c.label,
+            c.wall.as_secs_f64() / base
+        );
+    }
+
+    // Is the hostage cost a CONSTANT or a RATE? The crawler above took
+    // 12 dispatches - exactly one pipeline fill (conns x window) - and
+    // delivered none of them, which predicts a fixed cost that a longer
+    // job amortizes away. A demotion is worth building for a rate and
+    // not for a constant, so the answer is the whole decision.
+    println!("\n  the same fault over a growing corpus (racer ON, as shipped):");
+    for n in [N_ARTICLES, N_ARTICLES * 3] {
+        let base = solo_leg_of("solo", 0, n).await;
+        let with = arm("crawl", true, n).await;
+        let (b, w) = (base.wall.as_secs_f64(), with.wall.as_secs_f64());
+        println!(
+            "    {n:>5} articles: solo {b:>6.2}s → with a crawling provider \
+             {w:>6.2}s  (+{:.2}s, {:.2}x, {} dispatches to the crawler)",
+            w - b,
+            w / b.max(0.001),
+            with.srv(0).tried
+        );
+    }
+
+    for c in [&solo, &off, &on] {
         assert_eq!(c.done, N_ARTICLES, "{} lost articles", c.label);
     }
 }

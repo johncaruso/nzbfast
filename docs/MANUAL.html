@@ -200,6 +200,15 @@ nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
 Settings → Usenet servers → <b>Import from SABnzbd / NZBGet…</b> finds your existing
 installation and copies its servers over. There is also <code>nzbfast import-sab</code>
 on the command line.</div>
+<p>The welcome card also asks <b>how you plan to use nzbfast</b>, with four
+answers: an app such as Sonarr or Radarr drives it, moving from SABnzbd,
+moving from NZBGet, or just you, from this dashboard. Picking one changes
+nothing by itself. It shows a short review list - each recommendation with
+the setting's own name, its current value, the recommended value and one line
+of why - and <b>Apply</b> sets only the rows you tick. Every row is an
+ordinary setting you can change back on its own afterwards, and the same list
+stays available later under Settings → <b>Recommended settings for how you
+use it</b>.</p>
 
 <h3 id="firstrun-key">Your API key</h3>
 <p>On a genuinely new install, nzbfast makes itself an API key the first time the
@@ -362,6 +371,15 @@ indexer needed. The status line shows scan progress; <b>Scan now</b> forces a pa
 <p>Add titles by name, including ones not posted yet. When a matching release
 appears in the index it is grabbed automatically, with quality preferences and
 upgrade rules (a better copy replaces a worse one).</p>
+<p>The card can also follow a list you keep in Plex. Add a <b>list source</b>:
+either link your Plex account (you approve a short code on Plex's own page, so
+no password ever reaches nzbfast) or paste your Plex watchlist address. Treat
+that address like a password - anyone who has it can read your list - which is
+why it is masked once saved. Synced titles appear as read-only rows beside your
+own. A linked account sees your whole list, so removing a title there stops it
+being watched here too (finished downloads are never touched); an address only
+shows the newest entries, so a missing title may simply have scrolled off and
+nothing is removed. Either behaviour can be flipped per source.</p>
 <h3 id="dash-history">History</h3>
 <p>Recent downloads, one row each. Failed jobs offer <b>Retry</b>
 (resumes from the journal). Encrypted archives show a 🔑 unlock control: enter the
@@ -501,6 +519,31 @@ is honoured if you already have one.</li>
 Open it while it downloads, check the content, language and quality are what you
 expected, and cancel early if they aren't, instead of finding out after the full
 download.</p>
+<p>The first half of that is on the page already. Open a download's row in the
+queue (or in history) and the drawer shows what is inside the video file, read
+out of the bytes that have arrived so far: resolution, video and audio codecs,
+audio languages, subtitles, chapters. A release that is the wrong cut, the
+wrong language or an upscale gives itself away in that panel long before the
+download finishes.</p>
+<p>The page also works out whether <em>this</em> browser can play the file, and
+says so instead of guessing: browsers differ (Safari decodes HEVC where Chrome
+does not, and almost none decode AC-3 or DTS audio), so the question is put to
+the browser you are actually in. When the answer is yes, <b>▶ Play</b> opens a
+player right in the page, showing the file while it downloads. Most releases are
+MKV, which many browsers refuse to open even though they can decode everything
+inside it, so nzbfast repacks those as they play. Nothing is re-encoded: the
+picture and the sound are the original bytes in a different wrapper, and jumping
+to another point still works. If the soundtrack is one this browser cannot
+decode and the release carries a second one it can, that second track is what
+plays, so the picture does not arrive silent. Only when the browser has no
+decoder for the video itself does the button hand the file to your own media
+player instead, as described below.</p>
+<p>One setting governs all of it: Settings → Interface → <b>Check a file
+while it downloads</b>. <b>Details only</b>, the default, shows the panel and
+offers no in-page player; <b>Details and a player</b> adds the player;
+<b>Off</b> stops the file being read at all - with it off, nothing will open
+a half-downloaded file for anyone.</p>
+<p>To check in your own media player instead:</p>
 <ul>
 <li><b>▶ Play</b> on the wall (or <code>/m3u/&lt;id&gt;</code>) hands your media player
 an URL; the daemon starts or reuses the download behind it.</li>
@@ -536,6 +579,17 @@ and switch any server in or out of the pool. Each server has:</p>
 <tr><td>Every byte is billed</td><td>Turn on for a metered account. Your downloads use the server exactly as before; what stops is nzbfast sending it traffic of its own - the automatic connection tuner, the system benchmark's network leg, and header scans for the built-in index all skip it. Independent of the level and of the block size, because a metered account can be your only provider and an unlimited one can sit at level 2. Off by default. The manual <b>Test</b> in <b>Connection tuning</b> (<a href="#performance">§13</a>) still works on a flagged server and asks first, since that one is you choosing to spend.</td></tr>
 </table></div>
 <p><b>Leave a little headroom under your account's connection cap.</b> Setting connections a shade below the cap costs nothing: throughput flattens out well before the last connection or two, and <b>Connection tuning</b> (<a href="#performance">§13</a>) usually settles below it anyway. Those spare slots are what let a second device, another client, or a retry after a dropped socket still get in, instead of being refused while this one holds every slot.</p>
+<p><b>You do not have to manage your machine's open-file limit.</b> The system counts
+every connection as an open file, and macOS starts a program with a limit of 256 of
+them, which a full set of connections across several servers can pass. On macOS and
+Linux nzbfast raises that limit for itself as it starts: it asks for 65536 open files
+and steps down through 16384, 4096 and 1024 until the system agrees, never above the
+hard limit the system sets, and it carries on with the limit it was given if every
+step is refused. Windows has no per-process limit of this kind. Other clients take
+whatever limit the shell handed them, and one that runs out of open files part-way
+through a job can stop with nothing in its log to say why. So set each server's
+connections from what your plan allows, less the headroom above, and not from what
+you think the machine will put up with.</p>
 <h3 id="passwords">How your provider passwords are stored</h3>
 <p>Provider passwords in <code>config.local.json</code> are <b>obfuscated, not
 encrypted</b>. They are stored as <code>obf1:</code> followed by an encoded
@@ -771,6 +825,14 @@ every other setting they persist to <code>settings.json</code>.</p>
 <p>The simplest automation: add a title on the dashboard, set quality preferences,
 done. New releases are grabbed as they appear in your indexed groups;
 better-quality copies upgrade earlier grabs; a calendar view shows what's coming.</p>
+<p>A <b>list source</b> feeds the watchlist from a list you keep in Plex, in one
+of two ways: link your Plex account by approving a short code on Plex's page, or
+paste a Plex watchlist address. The address is a credential - it grants whoever
+holds it the right to read the list - so it is masked after saving. Removal
+syncing differs by mode on purpose: a linked account sees the whole list, so a
+title removed there stops being watched here (already-finished downloads stay);
+an address feed carries only the most recent entries, so absence proves nothing
+and titles are only ever added. Both defaults can be changed per source.</p>
 <h3 id="auto-rss">RSS feeds</h3>
 <p>Settings → RSS: any newznab/indexer RSS URL with per-feed interval, category and
 filter rules (title patterns, size bounds). Matching items are downloaded
@@ -852,6 +914,11 @@ and it can act as their <em>indexer</em> too.</p>
 (where to find it: <a href="#firstrun-key">§2</a>).</li>
 <li>Category as desired (e.g. <code>tv</code> / <code>movies</code>). Test → green check → Save.</li>
 </ol>
+<p>The dashboard hands you the address: on an install that has not downloaded
+anything yet, the welcome card's "Let Sonarr, Radarr or an app add downloads"
+route shows the exact address with a <b>Copy</b> button beside it. The API key
+is deliberately not on that line; it stays behind its own reveal in
+Settings → Security (<a href="#firstrun-key">§2</a>).</p>
 <p>Queue, history, per-job status, "remove &amp; delete", retry and category routing
 all behave as the *arrs expect.</p>
 <h3>As an indexer (newznab)</h3>

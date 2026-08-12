@@ -80,7 +80,7 @@ struct AddView: View {
             guard let url = try result.get().first else { busy = false; return }
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            let data = try Data(contentsOf: url)
+            let data = try readBoundedNzb(at: url)
             let resp = try await requireApi().addFile(data: data, filename: url.lastPathComponent)
             finish(added: resp)
         } catch {

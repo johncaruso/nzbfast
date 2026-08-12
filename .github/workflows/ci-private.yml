@@ -133,8 +133,12 @@ jobs:
             /usr/share/swift \
             /usr/local/share/powershell
           df -h / | tail -1
+      # `id:` on both setup steps because the gate guards below name
+      # them - see the long note above `fmt`. Nothing else reads them.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
       - name: toolchain
+        id: toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
         with:
@@ -174,7 +178,51 @@ jobs:
         run: |
           du -sh target/*/incremental 2>/dev/null || true
           rm -rf target/*/incremental
+      # EVERY gate step from here down carries an `if:`, and that is the
+      # point: a red gate must not skip the gates after it. The form is
+      # nightly.yml's, which got it in e7df7bf3 (TODO 143) - `!cancelled()`
+      # plus a REAL precondition per step.
+      #
+      # Until this edit these twelve gate steps carried zero `if:` between
+      # them, so a red `fmt` skipped the lock gate, the size gate, the
+      # overflow gate, clippy, the whole unit suite AND cargo deny: one
+      # line of output standing in for six unknown verdicts, which reads
+      # exactly like "one small thing is broken". That shape has now cost
+      # three separate multi-day incidents - the 7-10 Aug outage here (an
+      # early size gate hid clippy, deny and the unit tests for four
+      # days), four nights of nightly red hiding http_wedge,
+      # index_size_cap and queue_soak (TODO 143), and TODO 116.2's four
+      # Windows failures surviving two commits. One shape, three scopes;
+      # this file was the last place it lived (TODO 116.4).
+      #
+      # `!cancelled()` rather than `always()`, for the reason nightly
+      # gives: a genuinely cancelled run - superseded by the concurrency
+      # group above - should stop, not grind through every gate.
+      #
+      # NOT a blanket guard, and that is the half that takes the thought.
+      # A step whose PRECONDITION failed must still skip, or a failed
+      # checkout reports six identical reds instead of one honest one -
+      # which is what nightly's `steps.build.outcome == 'success'` half is
+      # doing. Here the three python gates need only the tree
+      # (`checkout`), the cargo gates need a compiler (`toolchain`), and
+      # `unit tests` / `cargo deny` additionally need their own installer
+      # step. The dependency chains without being restated: `toolchain` is
+      # unguarded, so a failed checkout skips it, and everything gated on
+      # it skips in turn. fmt / lock / size / overflow / clippy / tests /
+      # deny are genuinely independent of EACH OTHER and all report.
+      #
+      # This does not soften the verdict. `if:` decides whether a step
+      # RUNS, never whether its failure counts, and nothing here carries
+      # continue-on-error - so any red gate still fails the job. A run
+      # that reported everything and exited green would be worse than the
+      # masking it replaced.
+      #
+      # The price is wall clock on a red push: the job now spends its full
+      # ~15-19 min before reporting a one-character fmt error instead of
+      # ~2. That is the trade the three incidents above already paid for
+      # in days.
       - name: fmt
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo fmt -p nzbkit -p nzbfast -p nzbtray --check
       # TODO 102b. Two manual sweeps failed to keep new code off
       # `.lock().unwrap()`, so this is a gate rather than a third sweep.
@@ -182,6 +230,7 @@ jobs:
       # sessions share one checkout, so running it as a pre-commit hook would
       # refuse your commit for another session's in-flight line.
       - name: lock gate
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         run: tools/lock-gate.py
       # TODO 106. serve() regrew 1,819 -> 2,234 within days of TODO 43
       # splitting it, so the splits get a ratchet before they get redone.
@@ -189,6 +238,7 @@ jobs:
       # is split, and the gate refuses stale entries so the list only
       # shrinks.
       - name: size gate
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         run: tools/size-gate.py
       # TODO 88. Horizontal overflow on the site bit three times in two days
       # (8058b393, 6b2274a6, 3195f9da) and every one was found by hand, days
@@ -198,8 +248,10 @@ jobs:
       # and asserts the gate still refuses them, so a refactor cannot quietly
       # turn the gate into a no-op that passes everything.
       - name: overflow gate
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         run: tools/overflow-gate.py --selftest && tools/overflow-gate.py
       - name: clippy
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         # No escapes: every warning blocks. The categories still allowed
         # are named in the workspace lints table in Cargo.toml, each with
         # its reason.
@@ -217,9 +269,18 @@ jobs:
       # than trusted, same pattern (and rationale) as the cargo-deny
       # step below.
       - name: install cargo-nextest
+        id: nextest
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
           ver="0.9.140"
-          curl -sSfL -o cargo-nextest.tar.gz \
+          # --retry-all-errors, not bare --retry: a mid-transfer drop is
+          # not one of the "transient" conditions plain --retry covers,
+          # and a truncated tarball is what actually happens (12 Aug 2026,
+          # three runs lost across both runners). The sha256 below is
+          # still the correctness gate - retrying only removes the
+          # single-packet-drop failure mode, it never accepts a bad file.
+          curl -sSfL --retry 5 --retry-delay 3 --retry-all-errors \
+            --connect-timeout 20 -o cargo-nextest.tar.gz \
             "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${ver}/cargo-nextest-${ver}-x86_64-unknown-linux-gnu.tar.gz"
           echo "4ee9aaa0d0171a985a5d0eb735b87355894c1c455972e9674fb9fdbd1387c9a3  cargo-nextest.tar.gz" | sha256sum -c -
           tar -xzf cargo-nextest.tar.gz
@@ -232,6 +293,9 @@ jobs:
       # as named FLAKY results instead of hiding them; the ci profile
       # also writes a JUnit report naming every test.
       - name: unit tests
+        # Two preconditions, both real: the compiler and the runner this
+        # step invokes. Everything above it is a peer gate, not an input.
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && steps.nextest.outcome == 'success' }}
         env:
           # CLAUDE.md invariant 5. The bin suite runs product code that
           # consults this at the network boundary (identity.rs
@@ -306,11 +370,12 @@ jobs:
         # this TODO item was born from.
         #
         # windows-unit gets the BUILD saving automatically from the same
-        # Cargo.toml gate with its step untouched. Its clippy loses the
-        # seven targets (it does not pass the feature); the whole tree
-        # holds one cfg(windows) site across those files and the Linux
-        # clippy above lints everything else in them, so that hole is a
-        # documented sliver, folded in whenever that job is next edited.
+        # Cargo.toml gate with its step untouched, and its clippy briefly
+        # lost the seven targets for not passing the feature - a
+        # documented sliver (one cfg(windows) site across those files;
+        # the Linux clippy above lints everything else in them), closed
+        # on 11 Aug as TODO 116 item f when that job was next edited, for
+        # the step guards. Its clippy now passes the same flag.
         #
         # Note what does NOT need saying here: `binary(daemon)` is pinned
         # to a max-threads-1 test group in .config/nextest.toml, so
@@ -329,15 +394,24 @@ jobs:
       # the same check on a schedule to catch advisories published
       # against an unchanged tree.
       - name: install cargo-deny
+        id: deny
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
           ver="0.20.2"
-          curl -sSfL -o cargo-deny.tar.gz \
+          # Same retry rationale as the cargo-nextest step above; this is
+          # the step that lost run 31619042403 to `curl: (56) Connection
+          # died`.
+          curl -sSfL --retry 5 --retry-delay 3 --retry-all-errors \
+            --connect-timeout 20 -o cargo-deny.tar.gz \
             "https://github.com/EmbarkStudios/cargo-deny/releases/download/${ver}/cargo-deny-${ver}-x86_64-unknown-linux-musl.tar.gz"
           echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  cargo-deny.tar.gz" | sha256sum -c -
           tar -xzf cargo-deny.tar.gz
           sudo mv "cargo-deny-${ver}-x86_64-unknown-linux-musl/cargo-deny" /usr/local/bin/
           rm -rf cargo-deny.tar.gz "cargo-deny-${ver}-x86_64-unknown-linux-musl"
       - name: cargo deny
+        # The gate this job lost for four days in the 7-10 Aug outage,
+        # for being last in the file.
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && steps.deny.outcome == 'success' }}
         run: cargo deny check
 
   # The same fast unit suites, on Windows, on every push. The workspace
@@ -388,7 +462,15 @@ jobs:
       # short of space, and `rm` on a 2x runner is not free.
       CARGO_INCREMENTAL: "0"
     steps:
+      # `id:` because the two gate steps below guard on it - the same
+      # treatment the `check` job's gates get, and the note above its
+      # `fmt` step carries the reasoning for both jobs. This leg is where
+      # the masking was observed most recently: on run 31501154210
+      # (11 Aug, main) `workspace suite` failed and `clippy
+      # (windows-gated code)` reads `skipped`, which is TODO 116.2's
+      # finding happening again while its fix was being written.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
       # No toolchain step: rust-toolchain.toml pins the version and
       # rustup installs it for the msvc host on the first cargo
       # invocation. Same as the Windows jobs in pr-check.yml and
@@ -430,15 +512,37 @@ jobs:
       # on a rerun-and-it-passes failure, and Windows is where a new
       # flake is most likely to appear first.
       - name: install cargo-nextest
+        id: nextest
         shell: pwsh
         run: |
           $ver = "0.9.140"
           $url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$ver/cargo-nextest-$ver-x86_64-pc-windows-msvc.zip"
-          Invoke-WebRequest -Uri $url -OutFile cargo-nextest.zip
           $want = "ec39698dfe5bcfffb7d5da037f226bc1670584ba247123f4e684a0f224fe828d"
-          $got = (Get-FileHash cargo-nextest.zip -Algorithm SHA256).Hash.ToLower()
-          Write-Host "cargo-nextest zip sha256 = $got"
-          if ($got -ne $want) { throw "cargo-nextest zip sha256 mismatch: got $got, expected $want" }
+          # An EXPLICIT loop, not -MaximumRetryCount: that parameter only
+          # retries HTTP 304/4xx/5xx, and what this step actually dies of
+          # is `The response ended prematurely. (ResponseEnded)` - a
+          # transport-level truncation it does not cover. Three Windows
+          # runs were lost to it on 12 Aug 2026, at 2x private-repo
+          # billing, with the workspace suite skipped every time; a
+          # skipped suite reads as "Windows is fine" and it is not.
+          #
+          # The hash is checked INSIDE the loop so a short read retries
+          # rather than failing the job, and it remains the only thing
+          # that decides correctness - five bad downloads still throw.
+          $ok = $false
+          foreach ($i in 1..5) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile cargo-nextest.zip
+              $got = (Get-FileHash cargo-nextest.zip -Algorithm SHA256).Hash.ToLower()
+              Write-Host "attempt ${i}: cargo-nextest zip sha256 = $got"
+              if ($got -eq $want) { $ok = $true; break }
+              Write-Host "attempt ${i}: sha256 mismatch (expected $want)"
+            } catch {
+              Write-Host "attempt ${i}: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds (5 * $i)
+          }
+          if (-not $ok) { throw "cargo-nextest download failed after 5 attempts (expected sha256 $want)" }
           New-Item -ItemType Directory -Force -Path C:\nextest | Out-Null
           Expand-Archive cargo-nextest.zip -DestinationPath C:\nextest -Force
           Remove-Item cargo-nextest.zip
@@ -468,6 +572,7 @@ jobs:
       # hidden by exactly this absence) - but the honest response is to
       # fix what it names, not to narrow the expression back.
       - name: workspace suite
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.nextest.outcome == 'success' }}
         env:
           NZBFAST_NO_ENRICH: "1"
         run: |
@@ -495,9 +600,24 @@ jobs:
       # on Cargo.lock.
       #
       # Runs AFTER the suites deliberately: the tests are the signal this
-      # job exists for, and a lint failure must not cost us them.
+      # job exists for, and a lint failure must not cost us them. Since
+      # the guard below, that ordering no longer costs us the LINT when
+      # the suites are the red half - which it did on every red run from
+      # 7 Aug to 11 Aug, so the only place cfg(windows) code is linted
+      # anywhere in CI had no verdict for as long as the suite was
+      # broken (TODO 116.2, and 116.4 which this is).
       # --keep-going because clippy stops at the first failing crate -
       # without it nzbtray's errors masked nzbkit's, which masked
       # nzbfast's, and each round surfaced only one crate's worth.
+      #
+      # TODO 116 item f, folded in here because this is that job's "next
+      # edit for its own reasons": the heavy-tests features enrol the
+      # seven build-gated targets (TODO 116b) so this step lints them
+      # again. Without it they stopped compiling here at all, leaving one
+      # cfg(windows) site across the seven files linted on no runner
+      # anywhere - the same hole in miniature that this whole step exists
+      # to close. Identical flag to the Linux clippy above; check-mode
+      # links nothing, so it costs none of the link time the gate saves.
       - name: clippy (windows-gated code)
-        run: cargo clippy -p nzbkit -p nzbfast -p nzbtray --all-targets --no-deps --keep-going -- -D warnings
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: cargo clippy -p nzbkit -p nzbfast -p nzbtray --all-targets --no-deps --keep-going --features nzbkit/heavy-tests,nzbfast/heavy-tests -- -D warnings

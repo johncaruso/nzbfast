@@ -300,7 +300,58 @@ fn create_base_schema(db: &Connection) -> rusqlite::Result<()> {
             at INTEGER NOT NULL,
             UNIQUE(source, ref_guid));
          CREATE INDEX IF NOT EXISTS idx_sb_at ON scoreboard_samples(at);
-         CREATE INDEX IF NOT EXISTS idx_sb_cat ON scoreboard_samples(category, at);",
+         CREATE INDEX IF NOT EXISTS idx_sb_cat ON scoreboard_samples(category, at);
+         -- Search-miss log (TODO 131 workstream D, item D3; design
+         -- research/DESIGN-D3-search-log-2026-08-11.md). What the user
+         -- and their *arr clients asked this index for, and how many
+         -- rows they got back - so the queries we answer with nothing
+         -- can tell the scanner what to deepen or backfill next.
+         --
+         -- PRIVACY: this is LOCAL-ONLY behaviour data about the person
+         -- running the daemon. It is never enriched (no network lookup
+         -- reads it), never exported (not in the SAB or newznab
+         -- facades, not in any diagnostic bundle or update payload),
+         -- never aggregated across installs, and its readout sits
+         -- behind the full API key. The live setting index_search_log
+         -- turns recording off AND clears the table. Nothing in this
+         -- table may ever leave the box.
+         --
+         -- One row per DISTINCT (surface, q, kind), not per search
+         -- event: an *arr re-asks the same RSS query every 15 minutes
+         -- and the wall's box searches as you type, so an event stream
+         -- would be tens of thousands of near-duplicate rows a day.
+         -- `q` is the normalized form the matcher actually sees
+         -- (lowercased, separators collapsed), never the raw keystroke.
+         CREATE TABLE IF NOT EXISTS search_log(
+            id INTEGER PRIMARY KEY,
+            -- wall | newznab. Where the query came from; a miss an
+            -- *arr reports is a different problem from one a human
+            -- typed, and the fixes differ.
+            surface TEXT NOT NULL,
+            q TEXT NOT NULL,
+            -- The kind filter in force ('' when none): a movie search
+            -- that misses is not the same hole as a global one.
+            kind TEXT NOT NULL DEFAULT '',
+            -- Times asked, and times answered with nothing (or with
+            -- fewer rows than the readout's `thin` bar).
+            n INTEGER NOT NULL DEFAULT 0,
+            zero_n INTEGER NOT NULL DEFAULT 0,
+            first_at INTEGER NOT NULL,
+            last_at INTEGER NOT NULL,
+            -- last_hits is the CURRENT truth; best_hits is whether we
+            -- ever answered it at all. A query that missed for a week
+            -- and now returns rows is a hole the scanner FILLED, and
+            -- must fall out of the top-misses list rather than sit at
+            -- the top of it forever on the strength of its history.
+            last_hits INTEGER NOT NULL DEFAULT 0,
+            best_hits INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(surface, q, kind));
+         -- One index, serving both the retention sweep and the
+         -- readout's rolling window. The ranking sort is left to
+         -- SQLite: the row cap keeps this table at thousands of rows,
+         -- where an index on the ordering key would cost more to
+         -- maintain than the sort costs to run.
+         CREATE INDEX IF NOT EXISTS idx_search_log_last ON search_log(last_at);",
     )?;
     Ok(())
 }

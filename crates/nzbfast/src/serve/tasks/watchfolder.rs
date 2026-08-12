@@ -193,6 +193,63 @@ fn quarantine_rejected(
     Ok(dest)
 }
 
+/// The queue owns this release now, so the user's source file goes.
+///
+/// To the Trash, not gone: this is the user's own .nzb, and "I dropped it
+/// in and now I cannot find it again" is a real complaint. If it cannot be
+/// removed at all (read-only bind mount, no unlink right on the share) it
+/// has to be remembered exactly like a failure is - otherwise every pass
+/// re-reads the same bytes and the release is queued, and fetched from the
+/// provider, all over again, once every 5 s, forever.
+///
+/// Returns whether the pass should forget `p`'s signature. A re-drop of the
+/// same .nzb at the same path would otherwise match the record just
+/// ingested (mtime-preserving copies reproduce it exactly) and count as
+/// settled on sight - the very thing the pass memory exists to stop.
+fn consume_source_file(d: &Arc<Daemon>, p: &std::path::Path, sig: (u64, u64), name: &str) -> bool {
+    // One more identity check first. The signature was last confirmed
+    // before the parse, the enqueue and a durable queue write, and what
+    // gets deleted here is a PATHNAME - so a producer that atomically
+    // renamed a DIFFERENT x.nzb over the path in that window had its
+    // replacement trashed, unread, while the old bytes went to the queue.
+    // The replacement is left exactly where it is and the next pass picks
+    // it up (Codex sweep 12 Aug F7).
+    if watch_sig(p) != Some(sig) {
+        info!(
+            target: "watch",
+            "{} was replaced after {name} was queued - leaving the new file for \
+             the next pass",
+            p.display()
+        );
+        d.watch_failed.lock_ok().remove(p);
+        return true;
+    }
+    match crate::smart::remove_user_file(p, crate::smart::delete_to_trash()) {
+        Ok(_) => {
+            d.watch_failed.lock_ok().remove(p);
+            true
+        }
+        Err(err) => {
+            warn!(
+                target: "watch",
+                "{name} queued, but {} could not be removed - {err}; delete it \
+                 yourself or it stays listed",
+                p.display()
+            );
+            d.watch_failed.lock_ok().insert(
+                p.to_path_buf(),
+                (
+                    sig.0,
+                    sig.1,
+                    format!("{}: {err}", watchfail::KEPT),
+                    String::new(),
+                ),
+            );
+            false
+        }
+    }
+}
+
 /// Watch-folder poller. Always running; the folder itself is a live
 /// setting (None = idle), so the dashboard can point it elsewhere or
 /// turn it off without a restart.
@@ -564,55 +621,8 @@ pub(in crate::serve) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                             d.watch_failed.lock_ok().remove(&p);
                                             continue;
                                         }
-                                        // The queue owns the release now, so
-                                        // the source goes. If it can't be
-                                        // removed (read-only bind mount, no
-                                        // unlink right on the share) it has
-                                        // to be remembered exactly like a
-                                        // failure is: otherwise every pass
-                                        // re-reads the same bytes and the
-                                        // release is queued - and fetched
-                                        // from the provider - all over again,
-                                        // once every 5 s, forever.
-                                        // To the Trash, not gone: this is
-                                        // the user's own .nzb, and "I dropped
-                                        // it in and now I cannot find it
-                                        // again" is a real complaint.
-                                        match crate::smart::remove_user_file(
-                                            &p,
-                                            crate::smart::delete_to_trash(),
-                                        ) {
-                                            Ok(_) => {
-                                                // Forget the signature with the
-                                                // file: a re-drop of the same
-                                                // .nzb at the same path would
-                                                // otherwise match the record we
-                                                // just ingested (mtime-
-                                                // preserving copies reproduce it
-                                                // exactly) and count as settled
-                                                // on sight - the very thing the
-                                                // pass memory exists to stop.
-                                                this_pass.remove(&p);
-                                                d.watch_failed.lock_ok().remove(&p);
-                                            }
-                                            Err(err) => {
-                                                warn!(
-                                                    target: "watch",
-                                                    "{name} queued, but {} could not be \
-                                                     removed - {err}; delete it yourself or it \
-                                                     stays listed",
-                                                    p.display()
-                                                );
-                                                d.watch_failed.lock_ok().insert(
-                                                    p,
-                                                    (
-                                                        sig.0,
-                                                        sig.1,
-                                                        format!("{}: {err}", watchfail::KEPT),
-                                                        String::new(),
-                                                    ),
-                                                );
-                                            }
+                                        if consume_source_file(&d, &p, sig, &name) {
+                                            this_pass.remove(&p);
                                         }
                                     }
                                     Ok(_) => {

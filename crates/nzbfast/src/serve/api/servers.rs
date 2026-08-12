@@ -305,6 +305,38 @@ fn m_server_delete(
     })
 }
 
+/// §96.5: restart a host's block-used counter after the user buys a
+/// new block, by stamping the current lifetime figure as the block's
+/// base - the lifetime ledger itself is never rewound (it also answers
+/// the history totals). Keyed by HOST, not index: the counter belongs
+/// to the account, and an index would re-point under a concurrent
+/// reorder.
+fn m_server_block_refilled(
+    d: &Arc<Daemon>,
+    _req: &mut tiny_http::Request,
+    params: &std::collections::HashMap<String, String>,
+    _ctx: &ApiCtx<'_>,
+    _api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    Some(
+        match params
+            .get("value")
+            .map(String::as_str)
+            .filter(|h| !h.is_empty())
+        {
+            Some(host) => {
+                d.block_refilled(host);
+                info!(
+                    target: "config",
+                    "block refilled for {host} - used counter restarted at zero"
+                );
+                json!({"status": true, "block_used": 0})
+            }
+            None => json!({"status": false, "error": "value must name the server host"}),
+        },
+    )
+}
+
 fn m_server_test(
     _d: &Arc<Daemon>,
     _req: &mut tiny_http::Request,
@@ -1121,6 +1153,11 @@ pub(in crate::serve) fn dispatch(
         "server_reorder" => return m_server_reorder(d, req, params, ctx, api_body),
         "server_delete" => return m_server_delete(d, req, params, ctx, api_body),
         "server_test" => return m_server_test(d, req, params, ctx, api_body),
+        // §96.5: the user bought a new prepaid block - restart the
+        // host's used-counter at zero (value=host).
+        "server_block_refilled" => {
+            return m_server_block_refilled(d, req, params, ctx, api_body);
+        }
         // §G: fetch and parse ONE feed right now and say what came
         // back. The poller runs on the feed's own interval - up to a
         // quarter of an hour - so without this the only way to find out

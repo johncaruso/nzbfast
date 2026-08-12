@@ -156,6 +156,13 @@ pub(super) struct Tick {
     pub cpu_pct: f64,
     /// A slowstore pause engaging/in force.
     pub storage: bool,
+    /// §108 option 2: no pause, but slowstore's diagnostic probes have
+    /// found the output volume answering slowly. Same instrument as the
+    /// pause's confirming probe, needing consecutive slow answers, and
+    /// it only runs while this core is asking (see `wants_disk_answer`)
+    /// - so this is never a background opinion, only the reply to a
+    /// question this tick's own evidence raised.
+    pub storage_suspect: bool,
     pub servers: Vec<ServerTick>,
 }
 
@@ -213,6 +220,9 @@ pub(super) struct Core {
     /// This tick's diagnostic numbers, kept for the payload.
     last_blocked_pct: f64,
     last_cpu_pct: f64,
+    /// §108 option 2: this tick reached the downstream fork with the
+    /// breaker not in force, so the volume is the open question.
+    disk_question: bool,
 }
 
 impl Core {
@@ -289,6 +299,13 @@ impl Core {
         }
 
         let vote = self.classify(&t, blocked_pct);
+        // Keep asking while the CONDITIONS hold, not while the answer is
+        // still "client". A Disk vote with no pause in force IS the
+        // diagnostic's answer, and closing the question on it would stop
+        // the probes, stale the latch, and drop the verdict straight
+        // back to Client - a flip-flop on a minute's cycle. A real pause
+        // closes it instead: the breaker owns the volume from there.
+        self.disk_question = !t.storage && matches!(vote.0, Layer::Client | Layer::Disk);
         self.votes.push_back(vote);
         if self.votes.len() > WINDOW {
             self.votes.pop_front();
@@ -342,7 +359,15 @@ impl Core {
         }
         // Established shortfall. Downstream or upstream of the sockets?
         if blocked_pct >= BLOCKED_BAR * 100.0 {
-            if t.storage {
+            // A pause in force is the strongest form of the same claim.
+            // `storage_suspect` is the weaker one that gets here first:
+            // the breaker needs three quarters of a three-minute window
+            // before it acts, and a volume that is merely BAD - parked
+            // and delivering a fifth of the line, for days - never
+            // reaches that bar at all. Without this the same evidence
+            // fell through to Client, which is honest about the three
+            // candidates but sends nobody to look at their drive.
+            if t.storage || t.storage_suspect {
                 return (Layer::Disk, String::new());
             }
             if t.cpu_pct >= CPU_BAR {
@@ -541,8 +566,14 @@ pub(super) fn feed(
         anchor_bps,
         cpu_pct: d.cpu_pct(),
         storage: d.slow_storage.paused(),
+        storage_suspect: d.slow_storage.suspect(nzbkit::pool::now_ms()),
         servers,
     });
+    // §108 option 2: publish the question the tick just raised, so the
+    // slowstore watcher knows whether to spend a probe. Set AFTER the
+    // tick, from the tick's own conclusion - the watcher runs on its own
+    // clock and simply reads the latest answer.
+    d.slow_storage.set_want_diag(d.whyslow.wants_disk_answer());
 }
 
 /// The daemon-facing wrapper: the core behind a lock, plus the payload
@@ -567,6 +598,13 @@ impl Default for WhySlow {
 impl WhySlow {
     pub(super) fn tick(&self, t: Tick) {
         self.core.lock_ok().tick(t);
+    }
+
+    /// Whether the core is at its disk-vs-client fork and wants the
+    /// volume tested. Read by the slowstore watcher, which is the only
+    /// thing that touches the volume.
+    pub(super) fn wants_disk_answer(&self) -> bool {
+        self.core.lock_ok().disk_question
     }
 
     /// The queue payload's `whyslow` block - null when no job owns the
@@ -662,6 +700,16 @@ impl WhySlow {
             "blocked_pct": (c.last_blocked_pct * 10.0).round() / 10.0,
             "cpu_pct": (c.last_cpu_pct * 10.0).round() / 10.0,
             "storage": d.slow_storage.paused(),
+            // §108 option 2: when the disk is named WITHOUT a pause in
+            // force, this is the number that named it - the module's
+            // rule is that every asserted verdict travels with the
+            // evidence that produced it, and "storage is not keeping
+            // up" is a claim about someone's hardware. 0 when the
+            // diagnostic is not what is talking.
+            "storage_probe_ms": match c.verdict().0 == Layer::Disk && !d.slow_storage.paused() {
+                true => d.slow_storage.diag_ms(),
+                false => 0,
+            },
             "envelope_bps": c.envelope_bps,
             "hardware_bps": hardware_bps,
             "hardware_src": hardware_src,
@@ -698,6 +746,11 @@ mod tests {
         bytes: HashMap<String, u64>,
         blocked: HashMap<String, u64>,
         recon: HashMap<String, u64>,
+        /// What slowstore's diagnostic probes are currently saying. A
+        /// field rather than another positional argument: `run` is
+        /// already at the clippy limit, and every existing case wants
+        /// the default (no diagnostic verdict).
+        suspect: bool,
     }
 
     impl Rig {
@@ -708,6 +761,7 @@ mod tests {
                 bytes: HashMap::new(),
                 blocked: HashMap::new(),
                 recon: HashMap::new(),
+                suspect: false,
             }
         }
 
@@ -749,6 +803,7 @@ mod tests {
                     anchor_bps: anchor,
                     cpu_pct: cpu,
                     storage,
+                    storage_suspect: self.suspect,
                     servers: sv,
                 });
             }
@@ -866,6 +921,125 @@ mod tests {
             &[("a", 8, 8, 50_000_000, 7000, 0, false)],
         );
         assert_eq!(r.core.verdict().0, Layer::Disk);
+    }
+
+    /// §108 option 2. The volume that is BAD but not bad enough to trip
+    /// the breaker: parked on the write side, delivering a twentieth of
+    /// the line, for as long as you care to watch. The breaker needs
+    /// three quarters of a three-minute window and never fires here, so
+    /// before the diagnostic this read as Client - honest about the
+    /// three candidates, but it sends nobody to look at their drive.
+    #[test]
+    fn a_slow_volume_is_named_before_the_breaker_trips() {
+        let mut r = Rig::new();
+        let regime = |r: &mut Rig| {
+            r.run(
+                WINDOW,
+                50e6,
+                0,
+                1_000_000_000,
+                30.0,
+                false,
+                &[("a", 8, 8, 50_000_000, 7000, 0, false)],
+            )
+        };
+        // No answer yet: the probes have not run, or have come back
+        // fast. We do not guess.
+        regime(&mut r);
+        assert_eq!(
+            r.core.verdict().0,
+            Layer::Client,
+            "with no disk answer the honest verdict is our own pipeline"
+        );
+        assert!(
+            r.core.disk_question,
+            "...and the fork must be ASKING, or no probe ever runs"
+        );
+
+        // slowstore's probes come back slow, twice: now it is the disk,
+        // with no pause anywhere in sight.
+        r.suspect = true;
+        regime(&mut r);
+        assert_eq!(r.core.verdict().0, Layer::Disk);
+        assert!(
+            r.core.disk_question,
+            "the question stays open on a Disk vote - closing it would \
+             stop the probes, stale the answer and flip back to Client"
+        );
+
+        // The volume recovers: a fast probe drops the suspicion and the
+        // verdict goes back to naming us, not the hardware.
+        r.suspect = false;
+        regime(&mut r);
+        assert_eq!(r.core.verdict().0, Layer::Client);
+    }
+
+    /// The question is only asked where an answer would change the
+    /// verdict. Everywhere else, probing a volume would be work for its
+    /// own sake - and this feature's whole licence is that it never
+    /// touches a healthy daemon's disk.
+    #[test]
+    fn the_disk_question_is_asked_only_at_the_fork() {
+        // Riding the line: nothing is slow.
+        let mut r = Rig::new();
+        r.run(
+            WINDOW,
+            950e6,
+            0,
+            1_000_000_000,
+            30.0,
+            false,
+            &[("a", 8, 8, 950_000_000, 900, 0, false)],
+        );
+        assert_eq!(r.core.verdict().0, Layer::Line);
+        assert!(!r.core.disk_question, "a healthy line asks nothing");
+
+        // Short of the line, but the sockets could not fill the pipe -
+        // upstream, so the volume is not the question.
+        let mut r = Rig::new();
+        r.run(
+            WINDOW,
+            50e6,
+            0,
+            1_000_000_000,
+            30.0,
+            false,
+            &[("a", 8, 8, 50_000_000, 0, 0, false)],
+        );
+        assert_eq!(r.core.verdict().0, Layer::Provider);
+        assert!(!r.core.disk_question, "a provider shortfall asks nothing");
+
+        // Downstream, but CPU owns it: a witness already condemned.
+        let mut r = Rig::new();
+        r.run(
+            WINDOW,
+            50e6,
+            0,
+            1_000_000_000,
+            97.0,
+            false,
+            &[("a", 8, 8, 50_000_000, 7000, 0, false)],
+        );
+        assert_eq!(r.core.verdict().0, Layer::Cpu);
+        assert!(!r.core.disk_question, "CPU is its own witness");
+
+        // The breaker is in force: it owns the volume from here, and
+        // its probes are already running on the paused cadence.
+        let mut r = Rig::new();
+        r.run(
+            WINDOW,
+            50e6,
+            0,
+            1_000_000_000,
+            30.0,
+            true,
+            &[("a", 8, 8, 50_000_000, 7000, 0, false)],
+        );
+        assert_eq!(r.core.verdict().0, Layer::Disk);
+        assert!(
+            !r.core.disk_question,
+            "a real pause closes the question - the breaker owns it"
+        );
     }
 
     #[test]
@@ -1077,6 +1251,7 @@ mod tests {
             anchor_bps: 1_000_000_000,
             cpu_pct: 30.0,
             storage: false,
+            storage_suspect: false,
             servers: vec![srv("a", 8, 8, 500_000_000, 0)],
         });
         assert_eq!(r.core.verdict().0, Layer::Unknown);
@@ -1224,6 +1399,7 @@ mod tests {
             anchor_bps: 1_000_000_000,
             cpu_pct: 30.0,
             storage: false,
+            storage_suspect: false,
             servers: vec![srv("a", 8, 8, 1000, 0)],
         });
         assert_eq!(

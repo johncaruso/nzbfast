@@ -635,7 +635,7 @@ body.nosearch #sortwrap,body.nosearch #more{display:none!important}
     <option value="posted" data-i18n="wall.lsort.posted">Newest</option>
     <option value="seen" data-i18n="wall.lsort.seen">Recently added</option>
     <option value="size" data-i18n="wall.sort.size">Largest</option>
-    <option value="name" data-i18n="wall.sort.title">Name A–Z</option>
+    <option value="name" data-i18n="wall.lsort.name">Name A–Z</option>
     <option value="files" data-i18n="wall.lsort.files">Most files</option>
     <option value="kind" data-i18n="wall.lcol.cat">Category</option>
     <option value="completeness" data-i18n="wall.lsort.comp">Most complete</option>
@@ -933,6 +933,13 @@ addEventListener('pointerdown', e=>{
   el.classList.add('clickflash');
 }, true);
 let key = localStorage.nzbfastKey || '';
+// Same contract as the dashboard's: every adoption bumps the epoch, and
+// api() only treats a refusal as news about the CURRENT key if the key
+// has not moved on since the request went out. The wall mints nothing,
+// but it is the page most likely to be holding a key the dashboard tab
+// next door has just rotated.
+let keyEpoch = 0;
+function adoptKey(v){ key = v; localStorage.nzbfastKey = v; keyEpoch++; }
 // M31b: the sort is persisted so "For you" (affinity) sticks across
 // reloads; it also keeps the select's value in sync with sortBy given
 // affinity now leads the option list.
@@ -1038,6 +1045,17 @@ function keyCancel(){
   keyNotice(true);   // reversible via the strip
   keyFinish(false);
 }
+// The dashboard tab (or another wall tab) paired or rotated - same
+// listener it carries. Without it this page keeps a key the browser
+// itself knows is stale, and asks for one that was typed in next door a
+// second ago. Fires only in OTHER tabs, so it never loops back.
+addEventListener('storage', e => {
+  if (e.key !== 'nzbfastKey' || !e.newValue || e.newValue === key) return;
+  adoptKey(e.newValue);
+  keyDeclined = false; sessionStorage.removeItem('nzbfastKeyDeclined');
+  keyNotice(false);
+  if (keyPrompt) keyFinish(true);
+});
 function keyToggleShow(){
   const inp = document.getElementById('keyin'), btn = document.getElementById('keyshow');
   const show = inp.type === 'password';
@@ -1070,7 +1088,7 @@ async function keySubmit(){
       return;
     }
     if (j.status === false){ err.textContent = tErr(j.error) || String(j.error); return; }
-    key = v; localStorage.nzbfastKey = v;
+    adoptKey(v);
     keyDeclined = false; sessionStorage.removeItem('nzbfastKeyDeclined');
     keyNotice(false);
     // Resolving the promise lets every call that failed into this modal
@@ -1096,6 +1114,7 @@ async function api(mode, extra, authKey){
   if (authKey == null && keyPrompt && !(await keyPrompt))
     return {status:false, error:'API Key Required'};
   const sent = authKey != null ? authKey : key;
+  const epoch = keyEpoch;
   // Issue #4: the key rides the X-Api-Key header, not the query string
   // (keeps it out of proxy logs / history / Referer). Navigation links
   // (/m3u, /getnzb) still use ?apikey= - links cannot carry headers.
@@ -1108,7 +1127,16 @@ async function api(mode, extra, authKey){
   let j;
   try { j = await r.json(); }
   catch(e){ return {status:false, error:'HTTP '+r.status}; }
-  if (authFail(j) && authKey == null && await ensureKey(sent)) return api(mode, extra);
+  if (authFail(j) && authKey == null){
+    // The key moved on while this was in flight, or the dashboard tab
+    // re-paired into the shared localStorage: retry under what the
+    // browser holds now before asking anyone for a key they have
+    // already given once.
+    if (keyEpoch !== epoch && key !== sent) return api(mode, extra);
+    const stored = localStorage.nzbfastKey || '';
+    if (stored && stored !== sent && stored !== key){ adoptKey(stored); return api(mode, extra); }
+    if (await ensureKey(sent)) return api(mode, extra);
+  }
   return j;
 }
 // Escapes <, >, & AND both quote characters. Release names/stems come
@@ -3020,6 +3048,7 @@ async function apiPost(mode, body){
   if (keyPrompt && !(await keyPrompt))
     return {status:false, error:'API Key Required'};
   const sent = key;
+  const epoch = keyEpoch;
   let r;
   try {
     r=await fetch(`/api?mode=${mode}`,
@@ -3028,7 +3057,13 @@ async function apiPost(mode, body){
   let j;
   try { j=await r.json(); }
   catch(e){ return {status:false, error:'HTTP '+r.status}; }
-  if(authFail(j) && await ensureKey(sent)) return apiPost(mode,body);
+  if(authFail(j)){
+    // Same stale-refusal rules as api().
+    if (keyEpoch !== epoch && key !== sent) return apiPost(mode, body);
+    const stored = localStorage.nzbfastKey || '';
+    if (stored && stored !== sent && stored !== key){ adoptKey(stored); return apiPost(mode, body); }
+    if (await ensureKey(sent)) return apiPost(mode, body);
+  }
   return j;
 }
 function fixToggle(){

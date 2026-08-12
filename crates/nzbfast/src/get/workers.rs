@@ -216,6 +216,11 @@ impl Par2Race<'_> {
         let Some(&(sidx, nbytes)) = id_to_slot.get(id) else {
             return;
         };
+        // A terminal verdict arms the extractor's stalled-chase spill: a
+        // compressed set wedged behind this article's gap pages its cold
+        // frontier bytes to scratch instead of sitting fully resident to
+        // the holds cap. Idempotent past the first call.
+        self.extractor.note_article_lost();
         let sidx = sidx as usize;
         done.fetch_add(nbytes, Ordering::Relaxed);
         self.slots[sidx].missing.fetch_add(1, Ordering::Relaxed);
@@ -842,6 +847,14 @@ pub(super) fn spawn_spec_prefetch(
     buf_pool: &Arc<nzbkit::pool::BufPool>,
     prefetched: &Arc<std::sync::Mutex<Vec<(usize, Vec<PathBuf>)>>>,
     prefetch_stop: &Arc<std::sync::atomic::AtomicBool>,
+    // §146: the tail give-up's standing order, in recovery SLICES - the
+    // 2x ceiling it needs on hand before it may abandon the walkers.
+    // Terminal missing is a TRAILING indicator paced by the very ladder
+    // the give-up exists to skip, so escalating on it alone always
+    // arrives too late; walkers at queue-dry are refused-somewhere
+    // articles on an idle wire, and covering them is the same certain-
+    // damage bet one rung earlier.
+    tail_demand: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     use nzbkit::pool::ArticleReq;
     use std::collections::HashMap;
@@ -889,12 +902,41 @@ pub(super) fn spawn_spec_prefetch(
                 .collect();
         ladder.sort_by_key(|(_, _, _, _, bytes)| *bytes);
         let side_servers = side_pool_servers(servers);
+        // §146: the fleet a DEMAND rung runs on. The 1-conn side pool
+        // exists so a prefetch never provokes a provider's connection
+        // cap while the main fleet holds this account's grants - but a
+        // demand rung only fires at queue-dry, when the main fleet is
+        // holding those grants IDLE over nothing but refusal walkers.
+        // Borrowing up to 8 connections per server (never above the
+        // user's own configured budget) fetches hundreds of MB of
+        // recovery data in the seconds the give-up needs, instead of
+        // trickling it through one connection per server while the
+        // ladder it exists to retire walks to completion first. An
+        // account genuinely at its cap refuses the extra dials and the
+        // capacity machinery parks them - degrading to the old pace,
+        // not failing.
+        let tail_servers: Vec<(ServerConfig, nzbkit::pool::PoolConfig)> = side_servers
+            .iter()
+            .map(|(sc, pc)| {
+                let mut sc = sc.clone();
+                let mut pc = pc.clone();
+                let width = servers
+                    .iter()
+                    .find(|(s, _)| s.host == sc.host && s.port == sc.port)
+                    .map(|(s, _)| s.connections.clamp(1, 8))
+                    .unwrap_or(1);
+                sc.connections = width;
+                pc.connections = width as usize;
+                (sc, pc)
+            })
+            .collect();
         let slots2 = slots.to_vec();
         let out2 = out_dir.to_path_buf();
         let bp = buf_pool.clone();
         let vol_cap = volume_prealloc_cap(nzb);
         let pre = prefetched.clone();
         let stop = prefetch_stop.clone();
+        let demand = tail_demand.clone();
         tokio::spawn(async move {
             // Codex 5 Aug M3: a rung used to run with no cancellation
             // handle, so a blackholed side provider held drain_network's
@@ -916,13 +958,16 @@ pub(super) fn spawn_spec_prefetch(
                 }
                 let miss: usize =
                     slots2.iter().map(|s| s.missing.load(Ordering::Relaxed)).sum();
-                if miss > covered {
+                // The give-up's standing order outranks the terminal
+                // count when it is larger - see the parameter doc.
+                let want = miss.max(demand.load(Ordering::Acquire));
+                if want > covered {
                     // Exact-fit rung: the smallest unfetched volume
                     // covering the whole deficit (else the biggest
                     // left) - the pure smallest-first ladder
                     // over-fetched ~2x once the damage count ran
                     // ahead of the rungs.
-                    let deficit = miss - covered;
+                    let deficit = want - covered;
                     if ladder.is_empty() {
                         return; // every volume already prefetched
                     }
@@ -931,13 +976,31 @@ pub(super) fn spawn_spec_prefetch(
                         .position(|(_, _, _, count, _)| *count >= deficit)
                         .unwrap_or(ladder.len() - 1);
                     let (fi, reqs, idm, count, bytes) = ladder.remove(at);
-                    info!(
-                        target: "repair",
-                        "{miss} article(s) terminally missing - prefetching recovery volume ({:.1} MB) alongside the download",
-                        bytes as f64 / 1e6
-                    );
+                    if want > miss {
+                        info!(
+                            target: "repair",
+                            "{miss} article(s) terminally missing and {want} recovery \
+                             block(s) wanted to retire the refusal ladder - prefetching \
+                             recovery volume ({:.1} MB)",
+                            bytes as f64 / 1e6
+                        );
+                    } else {
+                        info!(
+                            target: "repair",
+                            "{miss} article(s) terminally missing - prefetching recovery volume ({:.1} MB) alongside the download",
+                            bytes as f64 / 1e6
+                        );
+                    }
+                    // A demand rung rides the borrowed-width fleet; an
+                    // ordinary terminal-missing rung keeps the polite
+                    // 1-conn side pool.
+                    let fleet = if want > miss {
+                        &tail_servers
+                    } else {
+                        &side_servers
+                    };
                     let fetched = fetch_volume_articles(
-                        &side_servers,
+                        fleet,
                         reqs,
                         idm,
                         &out2,
@@ -1290,6 +1353,270 @@ pub(super) fn spawn_par_race(
         })
 }
 
+/// §146 tail give-up, the decision half - held still where a test can
+/// reach it. `true` when EVERY walker article belongs to a file the
+/// active recovery set covers AND the recovery blocks on hand cover the
+/// exact walker set - plus the damage already priced in - at 2x. One
+/// uncovered walker vetoes the whole trade: repair rebuilds nothing
+/// outside its own set, so abandoning that article would convert a
+/// fetchable file into permanent damage.
+pub(super) fn tail_giveup_covered(
+    walkers: &[String],
+    est: &RaceEstimate,
+    block: usize,
+    live_bad: usize,
+    missing_blocks: usize,
+    on_hand: usize,
+) -> bool {
+    let mut exact_blocks = 0usize;
+    for id in walkers {
+        let Some(&(_, b)) = est.bytes_of.get(id) else {
+            return false; // a walker repair cannot rebuild - keep walking
+        };
+        exact_blocks += (b as usize).div_ceil(block) + 1;
+    }
+    let ceiling = exact_blocks + live_bad + missing_blocks;
+    on_hand >= ceiling.saturating_mul(2)
+}
+
+/// §146 tail give-up: recovery slices already decoded into the job dir
+/// by the MAIN pool (volumes that were never deferred, so the side
+/// prefetch never saw them). Walks `.par2` files up to three levels
+/// deep, skips paths the caller already counted, and re-reads a file
+/// only when its length has moved since the cached count - a damaged
+/// volume's holes simply truncate the packet scan, which undercounts,
+/// and undercounting is the safe direction for a 2x margin.
+fn disk_recovery_blocks(
+    dir: &Path,
+    set_id: &[u8; 16],
+    block: usize,
+    skip: &std::collections::HashSet<PathBuf>,
+    cache: &mut std::collections::HashMap<PathBuf, (u64, usize)>,
+) -> usize {
+    fn walk(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if depth > 0 {
+                    walk(&p, depth - 1, out);
+                }
+            } else if p
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("par2"))
+            {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, 3, &mut files);
+    let mut total = 0usize;
+    for p in files {
+        if skip.contains(&p) {
+            continue;
+        }
+        let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        let n = match cache.get(&p) {
+            Some(&(l, n)) if l == len => n,
+            _ => {
+                let n = std::fs::read(&p)
+                    .map(|bytes| {
+                        nzbkit::par2repair::recovery_slice_locators(&bytes, set_id)
+                            .into_iter()
+                            .filter(|(_, _, l)| *l == block)
+                            .count()
+                    })
+                    .unwrap_or(0);
+                cache.insert(p.clone(), (len, n));
+                n
+            }
+        };
+        total += n;
+    }
+    total
+}
+
+// §146 tail give-up (default ON, kill switch NZBFAST_NO_TAIL_GIVEUP=1):
+// the zero-throughput tail in front of repair on a damaged post is 60
+// articles serially buying "no such article" verdicts from every
+// backbone - measured 13-15 s on a real five-provider fleet, FLAT
+// across a 10x connection sweep, while the recovery volumes sat
+// prefetched and repair itself cost 2.2 s. Those verdicts buy nothing:
+// when the recovery blocks on hand already cover every still-walking
+// article, repair rebuilds their bytes EXACTLY whether the ladder ends
+// in Missing or in a fifth backbone's surprise copy. So the moment the
+// pool reports that nothing but 430-walkers remain (verdict_walkers -
+// which is also what keeps this OFF the corrupt-body damage class:
+// those refetches carry tried_fail, never tried_430) and the coverage
+// maths holds at 2x, give the walkers up and let settle start repair
+// NOW. Same accounting contract as the par-race above: no outcome ever
+// arrives for a given-up article, so the bar is settled here, and the
+// repair self-proves by re-reading the whole set. Loops rather than
+// firing once - an article that slipped one census (mid-requeue
+// between two locks) is caught by the next tick.
+pub(super) fn spawn_tail_giveup(
+    slots: &[Arc<FileSlot>],
+    verifier: &Arc<nzbkit::live::LiveVerifier>,
+    queue_ctl: &Arc<nzbkit::pool::QueueControl>,
+    prefetch_stop: &Arc<std::sync::atomic::AtomicBool>,
+    prefetched: &Arc<std::sync::Mutex<Vec<(usize, Vec<PathBuf>)>>>,
+    fetch_done: &Arc<AtomicU64>,
+    slot_file: &[usize],
+    nzb: &Arc<Nzb>,
+    out_dir: &Path,
+    // The standing order to the spec prefetch (see its parameter doc):
+    // set to the 2x block ceiling whenever the census is open but the
+    // margin is short, so the prefetch fetches toward exactly the
+    // coverage that lets the give-up fire.
+    tail_demand: &Arc<std::sync::atomic::AtomicUsize>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if std::env::var_os("NZBFAST_NO_TAIL_GIVEUP").is_some() {
+        return None;
+    }
+    let slots2 = slots.to_vec();
+    let verifier2 = verifier.clone();
+    let queue_ctl2 = queue_ctl.clone();
+    let stop = prefetch_stop.clone();
+    let pre = prefetched.clone();
+    let fetch_done2 = fetch_done.clone();
+    let slot_file2 = slot_file.to_vec();
+    let nzb2 = nzb.clone();
+    let dir = out_dir.to_path_buf();
+    let demand = tail_demand.clone();
+    Some(tokio::spawn(async move {
+        use std::collections::{HashMap, HashSet};
+        // Recovery volumes reach disk by TWO roads and the on-hand
+        // census must count both: the M2c.5 side prefetch (the
+        // `prefetched` list), and the main pool fetching them INLINE -
+        // which is what happens whenever damage shows up early enough
+        // that the volumes are never deferred. `recovery_blocks_seen`
+        // is frozen at activation (usually the index alone: 0 slices),
+        // so without the disk walk the gate read "0 on hand" against a
+        // job whose volumes were all sitting decoded in the out dir.
+        // Cached by (path -> len, count): a volume is only re-read when
+        // its length moves, so steady-state ticks cost one readdir.
+        let mut disk_cache: HashMap<PathBuf, (u64, usize)> = HashMap::new();
+        // Why the ladder is still being walked, said ONCE per run: a
+        // veto here is deliberate (uncovered walker, thin margin), and
+        // an operator watching a zero-throughput tail deserves the
+        // numbers behind it rather than silence.
+        let mut veto_said = false;
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return; // network phase over - settle owns it now
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let Some(set) = verifier2.set() else { continue };
+            // The census gates everything: Some only when EVERY pending
+            // article is a refusal-walker, which is exactly the state
+            // the tail stall consists of. A single clean payload
+            // article anywhere keeps this closed.
+            let Some(walkers) = queue_ctl2.verdict_walkers() else {
+                continue;
+            };
+            let set_names: HashSet<String> = set
+                .files
+                .iter()
+                .map(|f| nzbkit::disk::sanitize_filename(&f.name).to_lowercase())
+                .collect();
+            let block = set.block_size.max(1) as usize;
+            let est = par_race_estimate(&set_names, block, &slots2, &slot_file2, &nzb2);
+            let (_, live_bad) = verifier2.live_counts();
+            let missing_blocks = par_race_missing_blocks(block, &slots2, &slot_file2, &nzb2);
+            // On hand: blocks the activation saw, plus prefetched
+            // volumes, plus inline-fetched volumes decoded into the job
+            // dir - deduped by path so a volume on both lists is never
+            // counted twice toward the margin.
+            let mut on_hand = set.recovery_blocks_seen;
+            let mut counted: HashSet<PathBuf> = HashSet::new();
+            for (_, paths) in pre.lock_ok().iter() {
+                for p in paths {
+                    if !counted.insert(p.clone()) {
+                        continue;
+                    }
+                    if let Ok(bytes) = std::fs::read(p) {
+                        on_hand += nzbkit::par2repair::recovery_slice_locators(
+                            &bytes,
+                            &set.recovery_set_id,
+                        )
+                        .into_iter()
+                        .filter(|(_, _, len)| *len == block)
+                        .count();
+                    }
+                }
+            }
+            on_hand +=
+                disk_recovery_blocks(&dir, &set.recovery_set_id, block, &counted, &mut disk_cache);
+            if !tail_giveup_covered(
+                &walkers,
+                &est,
+                block,
+                live_bad as usize,
+                missing_blocks,
+                on_hand,
+            ) {
+                let uncovered = walkers
+                    .iter()
+                    .filter(|id| !est.bytes_of.contains_key(*id))
+                    .count();
+                let exact: usize = walkers
+                    .iter()
+                    .filter_map(|id| est.bytes_of.get(id))
+                    .map(|&(_, b)| (b as usize).div_ceil(block) + 1)
+                    .sum();
+                // Coverage exists but the margin is short: hand the
+                // spec prefetch a standing order for the full 2x
+                // ceiling, so the next rungs fetch toward exactly the
+                // number that lets this fire. An UNCOVERED walker is a
+                // hard veto - no amount of prefetch changes it.
+                if uncovered == 0 {
+                    let ceiling = exact + live_bad as usize + missing_blocks;
+                    demand.store(ceiling.saturating_mul(2), Ordering::Release);
+                }
+                if !veto_said {
+                    veto_said = true;
+                    info!(
+                        target: "repair",
+                        "tail give-up held back: {} walker(s), {uncovered} outside the \
+                         recovery set, {exact}+{}+{missing_blocks} blocks against \
+                         {on_hand} on hand (needs 2x) - walking the ladder instead",
+                        walkers.len(),
+                        live_bad,
+                    );
+                }
+                continue; // not covered (or not covered ENOUGH) - the ladder must finish
+            }
+            let want: HashSet<String> = walkers.iter().cloned().collect();
+            let claimed = queue_ctl2.give_up_covered(&want);
+            if claimed.is_empty() {
+                continue;
+            }
+            let mut freed = 0u64;
+            for id in &claimed {
+                if let Some(&(sidx, b)) = est.bytes_of.get(id) {
+                    slots2[sidx].remaining.fetch_sub(1, Ordering::AcqRel);
+                    slots2[sidx].abandoned.fetch_add(1, Ordering::Relaxed);
+                    freed += b;
+                }
+            }
+            // No outcome will ever arrive for these - settle the bar
+            // here, exactly like a sniff deferral or the par-race.
+            fetch_done2.fetch_add(freed, Ordering::Relaxed);
+            info!(
+                target: "repair",
+                "tail give-up: parity already covers the last {} article(s) still \
+                 walking the refusal ladder ({on_hand} recovery blocks on hand, \
+                 {live_bad} bad + {missing_blocks} missing blocks priced in) - \
+                 stopped asking and moved to repair",
+                claimed.len(),
+            );
+        }
+    }))
+}
+
 /// Wind the network phase down: stop the side tasks, join the decode
 /// consumers off the reactor, flush the final D records, stop the
 /// ticker and watchdog, honor user abort and graceful pause (bailing
@@ -1302,6 +1629,7 @@ pub(super) async fn drain_network(
     prefetch_stop: &Arc<std::sync::atomic::AtomicBool>,
     spec_prefetch_task: Option<tokio::task::JoinHandle<()>>,
     par_race_task: Option<tokio::task::JoinHandle<()>>,
+    tail_giveup_task: Option<tokio::task::JoinHandle<()>>,
     consumers: Vec<std::thread::JoinHandle<()>>,
     pending_d: &Arc<std::sync::Mutex<Vec<PendingD>>>,
     pending_r: &Arc<std::sync::Mutex<PendingR>>,
@@ -1328,6 +1656,9 @@ pub(super) async fn drain_network(
         let _ = t.await;
     }
     if let Some(t) = par_race_task {
+        let _ = t.await;
+    }
+    if let Some(t) = tail_giveup_task {
         let _ = t.await;
     }
     // Decode threads exit when the channel closes (fetch dropped tx).
@@ -1761,6 +2092,97 @@ mod pending_r_tests {
     }
 }
 
+/// The tail-side watchers as one bundle: the spec-prefetch scratch state
+/// (`prefetched` / `prefetch_stop` / `tail_demand`) plus the three
+/// spawned tasks that share it. Built by [`spawn_tail_watchers`]; the
+/// destructure at the call site keeps every downstream read on the
+/// inline names, same as the other phase bundles.
+pub(super) struct TailWatchers {
+    pub(super) prefetched: Arc<std::sync::Mutex<Vec<(usize, Vec<PathBuf>)>>>,
+    pub(super) prefetch_stop: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) spec_prefetch_task: Option<tokio::task::JoinHandle<()>>,
+    pub(super) par_race_task: Option<tokio::task::JoinHandle<()>>,
+    pub(super) tail_giveup_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// M2c.5 speculative recovery prefetch, the dark PAR2-race experiment,
+/// and the §146 tail give-up - the three side tasks that watch the fetch
+/// from the recovery side - moved out of `get_with_progress` bodily
+/// under the size gate (TODO 106). Behaviour unchanged: each spawn's
+/// gate (hub flag / env var) is exactly the inline code's.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_tail_watchers(
+    hub: &Option<Arc<StreamHub>>,
+    has_main: bool,
+    nzb: &Arc<Nzb>,
+    servers: &[(ServerConfig, nzbkit::pool::PoolConfig)],
+    slots: &[Arc<FileSlot>],
+    out_dir: &Path,
+    buf_pool: &Arc<nzbkit::pool::BufPool>,
+    verifier: &Arc<nzbkit::live::LiveVerifier>,
+    queue_ctl: &Arc<nzbkit::pool::QueueControl>,
+    fetch_done: &Arc<AtomicU64>,
+    decoded_bytes: &Arc<AtomicU64>,
+    slot_file: &[usize],
+) -> TailWatchers {
+    let prefetched: Arc<std::sync::Mutex<Vec<(usize, Vec<PathBuf>)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let prefetch_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // §146: the tail give-up's standing order to the spec prefetch, in
+    // recovery slices - see the two spawns' parameter docs.
+    let tail_demand = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let spec_prefetch_task: Option<tokio::task::JoinHandle<()>> = {
+        let allowed = match hub {
+            Some(h) => h.spec_prefetch.load(Ordering::Relaxed),
+            None => std::env::var_os("NZBFAST_NO_SPEC_PREFETCH").is_none(),
+        };
+        spawn_spec_prefetch(
+            allowed,
+            has_main,
+            nzb,
+            servers,
+            slots,
+            out_dir,
+            buf_pool,
+            &prefetched,
+            &prefetch_stop,
+            &tail_demand,
+        )
+    };
+    // PAR2-race experiment (dark): see spawn_par_race.
+    let par_race_task = spawn_par_race(
+        slots,
+        verifier,
+        queue_ctl,
+        &prefetch_stop,
+        &prefetched,
+        fetch_done,
+        decoded_bytes,
+        slot_file,
+        nzb,
+    );
+    // §146 tail give-up (default on): see spawn_tail_giveup.
+    let tail_giveup_task = spawn_tail_giveup(
+        slots,
+        verifier,
+        queue_ctl,
+        &prefetch_stop,
+        &prefetched,
+        fetch_done,
+        slot_file,
+        nzb,
+        out_dir,
+        &tail_demand,
+    );
+    TailWatchers {
+        prefetched,
+        prefetch_stop,
+        spec_prefetch_task,
+        par_race_task,
+        tail_giveup_task,
+    }
+}
+
 #[cfg(test)]
 mod disk_full_halt_tests {
     use super::*;
@@ -1903,5 +2325,33 @@ mod par_race_tests {
             std::env::var("NZBFAST_PAR_RACE").is_err(),
             "NZBFAST_PAR_RACE leaked into the test environment"
         );
+    }
+
+    /// §146 tail give-up decision: one uncovered walker vetoes the whole
+    /// trade, and the 2x margin is a hard floor - at ceiling*2-1 the
+    /// ladder keeps walking.
+    #[test]
+    fn tail_giveup_needs_every_walker_covered_at_twice_the_ceiling() {
+        let n = nzb();
+        let block = 4096usize;
+        let slots = vec![slot("a.rar", 3, 0), slot("b.sample.mkv", 2, 0)];
+        let set_names: std::collections::HashSet<String> =
+            [nzbkit::disk::sanitize_filename("a.rar").to_lowercase()]
+                .into_iter()
+                .collect();
+        let est = par_race_estimate(&set_names, block, &slots, &[0, 1], &n);
+        // Walkers a1+a2: 2 blocks each (ceil(4000/4096)+1). No other
+        // damage priced in: ceiling 4, so 8 recovery blocks commit and
+        // 7 do not.
+        let walkers = vec!["<a1@t>".to_string(), "<a2@t>".to_string()];
+        assert!(tail_giveup_covered(&walkers, &est, block, 0, 0, 8));
+        assert!(!tail_giveup_covered(&walkers, &est, block, 0, 0, 7));
+        // Damage already priced in raises the ceiling with it.
+        assert!(!tail_giveup_covered(&walkers, &est, block, 3, 0, 8));
+        assert!(tail_giveup_covered(&walkers, &est, block, 3, 0, 14));
+        // An uncovered companion's article vetoes everything, however
+        // many blocks are on hand - repair cannot rebuild it.
+        let with_b = vec!["<a1@t>".to_string(), "<b1@t>".to_string()];
+        assert!(!tail_giveup_covered(&with_b, &est, block, 0, 0, 10_000));
     }
 }

@@ -13,6 +13,10 @@ mod enrich;
 mod indexer;
 #[cfg(feature = "indexer")]
 mod scoreboard;
+// The download runner's guard ladder, hub hand-over and tail accounting,
+// moved out of `spawn_download_worker` under the fn ceiling (TODO 106).
+mod runner;
+use runner::*;
 mod stall;
 mod tuner;
 mod watchfolder;
@@ -113,21 +117,86 @@ pub(super) fn spawn_scheduler(
 /// been idle for a full minute after a download, hand the retained
 /// pages back to the OS; the next download simply faults fresh ones
 /// in. One trim per idle period, none at startup.
+/// §131 D3: write out what people searched for.
+///
+/// The whole point of the buffer this drains is that a search handler
+/// never touches the index write connection (see serve/searchlog.rs),
+/// so somebody off the query path has to do the writing. It is this
+/// task rather than the index scan loop because that loop's interval
+/// is a user setting - 15 minutes by default - and an hour of merged
+/// counters would collapse genuinely separate searches into one
+/// as-you-type prefix run.
+///
+/// A minute is short enough that the prefix collapse only ever eats
+/// one person's typing, and cheap enough to be invisible: an idle
+/// daemon takes one uncontended mutex and returns.
+#[cfg(feature = "indexer")]
+pub(super) fn spawn_search_log_writer(daemon: &Arc<Daemon>) {
+    let d = daemon.clone();
+    // The e2e that pins the four call sites has to see a flush land, and
+    // a minute is a minute. Same shape as the other test seams: a debug
+    // env override, clamped, documented in docs/ENVIRONMENT.md.
+    let every = std::env::var("NZBFAST_SEARCH_LOG_FLUSH_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60)
+        .clamp(1, 3_600);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(every)).await;
+            let d2 = d.clone();
+            // The flush is synchronous SQLite (with_index_mut runs it
+            // on blocking_db), so hand the whole thing to a blocking
+            // thread rather than holding a tokio worker across it.
+            let _ = tokio::task::spawn_blocking(move || d2.flush_search_log()).await;
+        }
+    });
+}
+
+/// §96.5: bill the running download's per-server bytes into the usage
+/// ledger every 30 s, instead of only at net-drain. The whole point is
+/// crash safety for PAID bytes: block accounts span years, and the old
+/// end-of-job-only billing forgot an entire run's spend if the daemon
+/// died mid-job - the block then read fuller than it was. Delta-billed
+/// through `flush_run_usage`, so the net-drain call bills only what the
+/// last tick had not; a tick with no download (pool_live is None) costs
+/// two lock peeks and no disk write.
+pub(super) fn spawn_usage_flush(daemon: &Arc<Daemon>) {
+    let d = daemon.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            d.flush_run_usage();
+        }
+    });
+}
+
 pub(super) fn spawn_memory_trim(daemon: &Arc<Daemon>) {
     let d = daemon.clone();
     tokio::spawn(async move {
-        let mut idle_since: Option<Instant> = None;
-        let mut trimmed = true; // nothing worth trimming before the first job
+        // The download-end stamp the last trim covered. Arming on the
+        // stamp rather than on catching `started_at` mid-flight matters:
+        // the old 15 s sampler never SAW a job shorter than a tick, so a
+        // fast job's retained buffers were never trimmed. Boot's initial
+        // stamp counts as covered - nothing worth trimming before the
+        // first job.
+        let mut covered = *d.last_download_end.lock_ok();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            if d.started_at.lock_ok().is_some() {
-                idle_since = None;
-                trimmed = false;
+            // `download_idle`, not `started_at` alone: the stamp lands
+            // when the NETWORK drains, and repair/extract/move run on
+            // the post-processing lane after it (a short download with a
+            // long repair is the shape where the tail outlasts the
+            // download by minutes). The sidecar prefetch is the other
+            // half of the house idle test. Nothing is lost by waiting -
+            // `covered` only advances when the trim actually fires, so
+            // the next tick past the tail still collects.
+            if !download_idle(&d) || busy_tail(&d) {
                 continue;
             }
-            let since = *idle_since.get_or_insert_with(Instant::now);
-            if !trimmed && since.elapsed() >= std::time::Duration::from_secs(60) {
-                trimmed = true;
+            let end = *d.last_download_end.lock_ok();
+            if end != covered && end.elapsed() >= std::time::Duration::from_secs(60) {
+                covered = end;
                 let before = nzbkit::mem::dashboard_rss().unwrap_or(0);
                 // mimalloc (macOS + Linux): force a collection - the
                 // call that actually offers the pages back. On macOS the
@@ -141,6 +210,16 @@ pub(super) fn spawn_memory_trim(daemon: &Arc<Daemon>) {
                 nzbkit::mem::trim(); // glibc malloc_trim; no-op under mimalloc
                 let after = nzbkit::mem::dashboard_rss().unwrap_or(0);
                 let freed = before.saturating_sub(after);
+                // Always visible under NZBFAST_LOG=mem=debug: the trim
+                // that measured nothing is the interesting one when a
+                // big footprint fails to come down (live memory, not
+                // allocator retention - the collector cannot help).
+                tracing::debug!(
+                    target: "mem",
+                    "idle trim: footprint {} -> {} MB",
+                    before >> 20,
+                    after >> 20
+                );
                 if freed >= 64 << 20 {
                     info!(
                         target: "mem",
@@ -295,7 +374,16 @@ pub(super) fn spawn_group_catalog(daemon: &Arc<Daemon>, config: &std::path::Path
             // The orphan sweep below is NOT indexer work (it tidies
             // the download spool), so it keeps its hourly tick and
             // this stands down around it rather than instead of it.
-            let indexing = !d.indexer_off();
+            // ...and offline takes both for the same reason the master
+            // switch does, one step further out: a 111k-group LIST and a
+            // rolling OVER sample are provider traffic, and offline says
+            // there is none. Measured on the live daemon 11 Aug 2026:
+            // "[groups] catalogue fetched: 111332 groups" at 15:51,
+            // twelve hours into an offline the operator had set to hand
+            // the account to another machine. The explicit refresh in
+            // the settings UI is left alone - `kick_group_fetch`'s API
+            // callers are a click, not a clock.
+            let indexing = !d.indexer_off() && !d.offline.load(Ordering::Relaxed);
             let age = {
                 let cat = d.group_catalog.lock_ok();
                 cat.as_ref().map(|c| epoch_secs() as i64 - c.fetched_at)
@@ -347,6 +435,18 @@ pub(super) fn spawn_index_scan(
     let daemon2 = daemon.clone();
     let index_pass_gate = index_pass_gate.clone();
     tokio::spawn(async move {
+        // What this loop last said it was standing down for, and when.
+        // Deliberately local: it lives exactly as long as the task, and
+        // nothing outside may reset it.
+        //
+        // The 11 Aug 2026 case this exists for: the loop went quiet at
+        // 03:25 and was still quiet fourteen hours later, with nothing
+        // in the log after the per-group lines and nothing in it ever
+        // again. `[predb]` writes every minute, so the file looked
+        // alive; the only honest check was the index's own newest row.
+        // A stand-down that lasts hours has to keep saying so.
+        let mut standdown: Option<(&'static str, std::time::Instant)> = None;
+        const STANDDOWN_RESTATE_SECS: u64 = 3600;
         loop {
             // A pass takes min(connections/par, 5) NNTP connections
             // PER concurrent group - 15 of a 20-connection account at
@@ -358,10 +458,53 @@ pub(super) fn spawn_index_scan(
             // waits only while BOTH are stopped, and each leg below
             // re-asks for itself. A spots-only install runs this
             // loop with an empty group list.
-            let scan_groups = daemon2.indexing_pause_reason().is_none();
-            if !scan_groups && daemon2.spot_pause_reason().is_some() {
+            let idx_reason = daemon2.indexing_pause_reason();
+            let scan_groups = idx_reason.is_none();
+            // The index reason is the one named: the two differ only in
+            // their own master switch, and this loop is the index scan.
+            if let Some(reason) = idx_reason.filter(|_| daemon2.spot_pause_reason().is_some()) {
+                // Say it on the transition, then restate it hourly. One
+                // line an hour is nothing next to the alternative:
+                // fourteen hours in which the only truthful signal was a
+                // SQL query against `releases.first_seen` that nobody
+                // thinks to run, because the log looks fine.
+                let say = match standdown {
+                    Some((was, since)) => {
+                        was != reason || since.elapsed().as_secs() >= STANDDOWN_RESTATE_SECS
+                    }
+                    None => true,
+                };
+                if say {
+                    let held = standdown
+                        .filter(|(was, _)| *was == reason)
+                        .map(|(_, since)| {
+                            format!(", {} min so far", since.elapsed().as_secs() / 60)
+                        })
+                        .unwrap_or_default();
+                    info!(
+                        target: "index",
+                        "indexing and spots both standing down: {}{held}",
+                        Daemon::pause_phrase(reason)
+                    );
+                    // Keep the ORIGINAL instant across a restatement of
+                    // the same reason - the elapsed time is the whole
+                    // point of the restatement, and resetting it here
+                    // would print "60 min so far" forever.
+                    let since = standdown
+                        .filter(|(was, _)| *was == reason)
+                        .map_or_else(std::time::Instant::now, |(_, since)| since);
+                    standdown = Some((reason, since));
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
+            }
+            if let Some((was, since)) = standdown.take() {
+                info!(
+                    target: "index",
+                    "indexing resumed after {} min ({})",
+                    since.elapsed().as_secs() / 60,
+                    Daemon::pause_phrase(was)
+                );
             }
             let groups = if scan_groups {
                 daemon2.index_groups.lock_ok().clone()
@@ -480,24 +623,33 @@ pub(super) fn spawn_index_scan(
                         turbo,
                         coverage,
                     );
+                    // Carries the reason out, not just the fact: this
+                    // future fires for every stand-down cause, and the
+                    // fixed "paused for foreground job" it used to print
+                    // sent a 14-hour offline standstill (11 Aug 2026)
+                    // looking for a download that was never there.
                     let pause = async {
                         loop {
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            if daemon3.indexing_pause_reason().is_some() {
-                                break;
+                            if let Some(reason) = daemon3.indexing_pause_reason() {
+                                break reason;
                             }
                         }
                     };
                     match tokio::select! {
-                        result = scan => Some(result),
-                        _ = pause => None,
+                        result = scan => Ok(result),
+                        reason = pause => Err(reason),
                     } {
-                        Some(Err(e)) => warn!(target: "index", "scan {g}: {e}"),
-                        None => {
+                        Ok(Err(e)) => warn!(target: "index", "scan {g}: {e}"),
+                        Err(reason) => {
                             preempted2.store(true, Ordering::Relaxed);
-                            info!(target: "index", "scan {g} paused for foreground job");
+                            info!(
+                                target: "index",
+                                "scan {g} stood down: {}",
+                                Daemon::pause_phrase(reason)
+                            );
                         }
-                        Some(Ok(())) => {}
+                        Ok(Ok(())) => {}
                     }
                     daemon3
                         .scan_progress
@@ -592,25 +744,29 @@ pub(super) fn spawn_index_scan(
                         let pause = async {
                             loop {
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                if daemon2.indexing_pause_reason().is_some() {
-                                    break;
+                                if let Some(reason) = daemon2.indexing_pause_reason() {
+                                    break reason;
                                 }
                             }
                         };
                         match tokio::select! {
-                            r = gap => Some(r),
-                            _ = pause => None,
+                            r = gap => Ok(r),
+                            reason = pause => Err(reason),
                         } {
-                            Some(Ok((tried, done))) if tried > 0 => {
+                            Ok(Ok((tried, done))) if tried > 0 => {
                                 info!(
                                     target: "gapfill",
                                     "{tried} incomplete releases re-hunted, {done} completed"
                                 );
                             }
-                            Some(Ok(_)) => {}
-                            Some(Err(e)) => warn!(target: "gapfill", "{e}"),
-                            None => {
-                                info!(target: "gapfill", "paused for foreground job")
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => warn!(target: "gapfill", "{e}"),
+                            Err(reason) => {
+                                info!(
+                                    target: "gapfill",
+                                    "stood down: {}",
+                                    Daemon::pause_phrase(reason)
+                                )
                             }
                         }
                         drop(scratch);
@@ -844,6 +1000,18 @@ fn download_idle(d: &Arc<Daemon>) -> bool {
     d.started_at.lock_ok().is_none() && d.sidecar.lock_ok().is_none()
 }
 
+/// Is a post-processing tail still running? `download_idle` answers for
+/// the WIRE only - the download-end stamp lands when the network drains
+/// and the repair/extract/move tail is handed to the lane after it, so a
+/// job can be well past its last article and still be working the disk
+/// hard. Same predicate the §129 1b poll calls "active".
+fn busy_tail(d: &Arc<Daemon>) -> bool {
+    d.queue.lock_ok().iter().any(|j| {
+        let g = j.lock_ok();
+        g.state == JobState::Finishing || g.finalizing
+    })
+}
+
 /// The sampled message-ids for one job, and the age in days of the
 /// youngest article in the post.
 ///
@@ -1003,6 +1171,21 @@ pub(super) fn spawn_rss_poller(
         /// items back through the dedupe and re-grabs history, which
         /// is the one thing this file exists to prevent. The cap is
         /// far wider than any rolling feed window.
+        /// Keys are `<feed scope>\u{1}<guid>`, not the bare guid.
+        ///
+        /// An RSS `guid` and an Atom `id` are publisher-local arbitrary
+        /// strings, and one global set meant two feeds publishing
+        /// different items under guid `123` suppressed each other -
+        /// including across restarts, so a rule-rejected item in feed A
+        /// permanently hid an accepted item in feed B (Codex sweep 12 Aug
+        /// F12).
+        ///
+        /// Reads still fall back to the bare guid, because every entry
+        /// written before this change is unscoped and re-evaluating them
+        /// would re-grab whatever is still inside each feed's rolling
+        /// window. Legacy entries therefore keep suppressing (the old
+        /// behaviour, cross-feed collisions and all) and age out of the
+        /// LRU, while every new decision is per feed.
         struct SeenGuids {
             set: std::collections::HashSet<String>,
             order: std::collections::VecDeque<String>,
@@ -1010,10 +1193,14 @@ pub(super) fn spawn_rss_poller(
         }
         impl SeenGuids {
             const MAX: usize = 20_000;
-            fn contains(&self, guid: &str) -> bool {
-                self.set.contains(guid)
+            fn key(scope: &str, guid: &str) -> String {
+                format!("{scope}\u{1}{guid}")
             }
-            fn insert(&mut self, guid: &str) {
+            fn contains(&self, scope: &str, guid: &str) -> bool {
+                self.set.contains(&Self::key(scope, guid)) || self.set.contains(guid)
+            }
+            fn insert(&mut self, scope: &str, guid: &str) {
+                let guid = &Self::key(scope, guid);
                 if !self.set.insert(guid.to_string()) {
                     return;
                 }
@@ -1135,12 +1322,41 @@ pub(super) fn spawn_rss_poller(
                         Vec::new()
                     }
                 };
+                // Is this feed still the one we were told to poll?
+                //
+                // The snapshot above predates a network fetch that can take
+                // most of a minute, and everything below acts on that
+                // snapshot's authority: its rules decide, its category is
+                // stamped, its enclosure is fetched with the user's
+                // credentials and the result is enqueued. Deleting the feed
+                // or tightening its rules in that window used to change
+                // none of it (Codex sweep 12 Aug F6b).
+                //
+                // Re-read rather than trusted, and re-read AGAIN after the
+                // enclosure fetch below, because that is a second await.
+                let fp = feed.fetch_fingerprint();
+                let authorized = || {
+                    d.feeds
+                        .lock_ok()
+                        .iter()
+                        .any(|f| f.fetch_fingerprint() == fp)
+                };
+                if !items.is_empty() && !authorized() {
+                    info!(
+                        target: "rss",
+                        "a feed was removed or changed while it was being polled - \
+                         discarding that poll's {} item(s)",
+                        items.len()
+                    );
+                    continue;
+                }
+                let scope = feed.scope_key();
                 for it in items {
-                    if seen.lock_ok().contains(&it.guid) {
+                    if seen.lock_ok().contains(&scope, &it.guid) {
                         continue;
                     }
                     // In memory only; the pass flushes once at the end.
-                    let mark_seen = |guid: &str| seen.lock_ok().insert(guid);
+                    let mark_seen = |guid: &str| seen.lock_ok().insert(&scope, guid);
                     let judged = crate::rss::rules_judge(&feed.rules, &it);
                     if !judged.accept {
                         // A rules reject is final for this guid.
@@ -1173,6 +1389,19 @@ pub(super) fn spawn_rss_poller(
                     let origin = feed_origin.clone();
                     let nzb =
                         tokio::task::spawn_blocking(move || fetch_url_from(&link, &origin)).await;
+                    // The second await, so the second recheck: a feed
+                    // revoked while its enclosure was downloading must not
+                    // enqueue, and must not leave a seen marker either -
+                    // the item was never judged by the rules in force.
+                    if !authorized() {
+                        info!(
+                            target: "rss",
+                            "a feed was removed or changed while {} was being fetched - \
+                             not enqueuing it",
+                            it.title
+                        );
+                        break;
+                    }
                     // The guid is marked seen only AFTER the grab
                     // sticks: marking before the fetch meant one
                     // transient 503 permanently dropped the release
@@ -1371,6 +1600,28 @@ fn spawn_instant_recheck(daemon: &Arc<Daemon>) {
     });
 }
 
+/// TODO §154: has this box nothing at all to dial right now?
+///
+/// Strictly "zero ENABLED servers", which arrives in two shapes: a
+/// config that loads and has every server disabled, and `servers: []`,
+/// which the loader reports as the `NoServers` ERROR rather than an
+/// empty list - that is this condition under another name, and it is the
+/// exact error a download with no servers used to die on.
+///
+/// Every OTHER load failure is a different condition with different
+/// reporting - a missing file, a torn write, a path typo - and the
+/// runner already `continue`s past load errors elsewhere, so the two are
+/// deliberately not folded together: an unreadable config leaves this
+/// guard standing down and the download reports the real error instead
+/// of a hold that blames a server list nobody could read.
+fn no_enabled_servers(config: &std::path::Path) -> bool {
+    match nzbkit::config::Config::load(config) {
+        Ok(c) => !c.servers.iter().any(|s| s.enabled),
+        Err(nzbkit::config::ConfigError::NoServers) => true,
+        Err(_) => false,
+    }
+}
+
 /// Download worker: one download at a time at full pipeline speed,
 /// but job N's TAIL (settle/repair/extract) overlaps job N+1's
 /// download - the network never idles across queue boundaries.
@@ -1395,204 +1646,18 @@ pub(super) fn spawn_download_worker(
         // In-flight statfs probe for the min-free guard (≤1 outstanding).
         let mut disk_probe: Option<tokio::task::JoinHandle<Option<u64>>> = None;
         loop {
-            // §129 2g: a scheduled quota_reset zeroes the window here,
-            // where the ledger lives - checked before every guard so a
-            // disk hold or offline spell cannot defer it. Opened if
-            // need be so the reset also lands on disk for a quota that
-            // is currently off but has spend recorded (re-enabling
-            // must not resurrect it).
-            if d.quota_reset.swap(false, Ordering::Relaxed) {
-                let period = d.quota_period.load(Ordering::Relaxed) as char;
-                let mut led = ledger
-                    .take()
-                    .unwrap_or_else(|| QuotaLedger::open(&d.spool, period));
-                led.bytes = 0;
-                led.save();
-                info!(
-                    target: "guard",
-                    "quota ledger reset by schedule - the period's spend starts from zero"
-                );
-                ledger = Some(led);
-            }
-            // M14g guards. Low disk stops everything (a Force job
-            // can't write to a full disk either); a spent quota still
-            // lets Force jobs through (SAB semantics).
-            //
-            // statfs on an external or network volume can hang without
-            // bound (a NAS share that dropped, a sleeping USB disk), and
-            // this loop IS the runner - a hung probe here stops every
-            // pick. Probe on the blocking pool with a timeout; a timeout
-            // means "unknown", which must not block the pick (None
-            // already means the guard stands down, same as a missing
-            // directory). Keep the ONE stuck probe and re-await it next
-            // pass rather than stacking a new blocked thread per pass.
-            let min = d.min_free.load(Ordering::Relaxed);
-            let mut free_now: Option<u64> = None;
-            if min > 0 {
-                let mut probe = disk_probe.take().unwrap_or_else(|| {
-                    let out = d.out_dir();
-                    tokio::task::spawn_blocking(move || free_bytes(&out))
-                });
-                match tokio::time::timeout(std::time::Duration::from_secs(2), &mut probe).await {
-                    Ok(res) => free_now = res.ok().flatten(),
-                    Err(_) => disk_probe = Some(probe),
-                }
-            }
-            if min > 0
-                && let Some(free) = free_now
-                && free < min
-            {
-                if guard_reason.as_deref() != Some("disk") {
-                    info!(
-                        target: "guard",
-                        "pausing: {:.1} GB free < {:.1} GB min",
-                        free as f64 / 1e9,
-                        min as f64 / 1e9
-                    );
-                    guard_reason = Some("disk".into());
-                    // Marker on the transition only - this loop re-checks
-                    // every 5 s and the row strip carries the live figure.
-                    let msg = format!(
-                        "downloads paused - {:.1} GB free is under the {:.1} GB minimum",
-                        free as f64 / 1e9,
-                        min as f64 / 1e9
-                    );
-                    // §129 2e: targets routed onto "disk" hear about it
-                    // too - the same transition-only edge as the marker.
-                    d.notify_event("disk", &msg);
-                    // §129 4a: the schema's disk.low, same edge.
-                    d.life_emit(
-                        "disk.low",
-                        json!({
-                            "message": msg,
-                            "free_bytes": free,
-                            "min_bytes": min,
-                        }),
-                    );
-                    d.note_event("disk", msg);
-                }
-                // Refreshed every pass, not just on entry: the free
-                // figure moves while the user clears space, and the row
-                // strip shows it live.
-                *d.queue_hold.lock_ok() =
-                    Some(("disk".into(), free as f64 / 1e9, min as f64 / 1e9));
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let Some(only_force) = download_guards(
+                &d,
+                &config,
+                &lane,
+                &mut guard_reason,
+                &mut ledger,
+                &mut disk_probe,
+            )
+            .await
+            else {
                 continue;
-            }
-            // §129 backpressure: tails piling up faster than they
-            // drain must not fill the disk with undone unpacks - same
-            // "pause with a reason" doctrine as the §108 storage pause.
-            if lane.saturated() {
-                if guard_reason.as_deref() != Some("postproc") {
-                    let (n, cap) = (lane.backlog(), lane.cap());
-                    info!(target: "guard", "pausing picks: {n} finishing job(s) at the lane bound {cap}");
-                    guard_reason = Some("postproc".into());
-                    d.note_event(
-                        "postproc",
-                        "waiting for post-processing to catch up - the next \
-                         download starts when a finishing job completes",
-                    );
-                }
-                *d.queue_hold.lock_ok() =
-                    Some(("postproc".into(), lane.backlog() as f64, lane.cap() as f64));
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            }
-            if guard_reason.as_deref() == Some("postproc") {
-                guard_reason = None;
-                *d.queue_hold.lock_ok() = None;
-                d.note_event("clear", "post-processing caught up - downloads resume");
-            }
-            // Offline outranks everything below, INCLUDING Force.
-            //
-            // It has to be its own gate rather than a term in
-            // `only_force`, because Force is defined as the thing that
-            // walks past a paused queue - and offline only ever reached
-            // this loop as a pause it set on the way through. So a
-            // priority-2 job started while the header said Offline, the
-            // fleet reopened, and the operator's OTHER machine was
-            // refused at the account's connection cap with no reason to
-            // suspect this daemon (TODO 65). Force is not even reliably
-            // the user's own choice: the retry/start path hard-codes
-            // `priority = 2` on its behalf.
-            //
-            // Offline is not a scheduling state like pause; it is a
-            // promise about the network, made in absolute terms - the
-            // confirm dialog says every connection is closed "so you can
-            // use the account from another machine", and startup logs
-            // "touching no provider". Coming back online is the only act
-            // that releases it, which is one click and is what the
-            // button already says.
-            if d.offline.load(Ordering::Relaxed) {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            }
-            let mut only_force = d.paused.load(Ordering::Relaxed);
-            let quota = d.quota.load(Ordering::Relaxed);
-            let period = d.quota_period.load(Ordering::Relaxed) as char;
-            if quota > 0 || ledger.is_some() {
-                // (Re)open on first use or a live period change; keep
-                // billing an open ledger even if the cap is lifted so
-                // re-enabling sees the true window usage.
-                if ledger.as_ref().is_none_or(|l| l.period != period) {
-                    ledger = Some(QuotaLedger::open(&d.spool, period));
-                }
-            }
-            // Publish what the period has cost so far, whether or not a
-            // cap is set: the facade's `left_quota` needs the running
-            // total, not just the exhausted case (L5).
-            d.quota_spent.store(
-                ledger.as_mut().map(|l| l.spent()).unwrap_or(0),
-                Ordering::Relaxed,
-            );
-            if let (Some(led), true) = (ledger.as_mut(), quota > 0)
-                && led.spent() >= quota
-            {
-                if guard_reason.as_deref() != Some("quota") {
-                    info!(
-                        target: "guard",
-                        "quota spent ({:.1} of {:.1} GB) - only Force jobs until the period rolls over",
-                        led.bytes as f64 / 1e9,
-                        quota as f64 / 1e9
-                    );
-                    guard_reason = Some("quota".into());
-                    let msg = format!(
-                        "download quota spent ({:.1} of {:.1} GB) - only Force \
-                         jobs run until the period rolls over",
-                        led.bytes as f64 / 1e9,
-                        quota as f64 / 1e9
-                    );
-                    // §129 2e: same transition-only edge as the marker.
-                    d.notify_event("quota", &msg);
-                    // §129 4a: the schema's quota.reached, same edge.
-                    d.life_emit(
-                        "quota.reached",
-                        json!({
-                            "message": msg,
-                            "spent_bytes": led.bytes,
-                            "quota_bytes": quota,
-                        }),
-                    );
-                    d.note_event("quota", msg);
-                }
-                *d.queue_hold.lock_ok() =
-                    Some(("quota".into(), led.spent() as f64 / 1e9, quota as f64 / 1e9));
-                only_force = true;
-            }
-            if guard_reason.is_some() && !only_force {
-                info!(target: "guard", "cleared");
-                guard_reason = None;
-                d.note_event(
-                    "clear",
-                    "the space and quota guards cleared - downloads resume",
-                );
-            }
-            if guard_reason.is_none() {
-                let mut h = d.queue_hold.lock_ok();
-                if h.is_some() {
-                    *h = None;
-                }
-            }
+            };
             d.run_due_auto_retries();
             let Some(job) = d.pick_job(only_force) else {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1626,7 +1691,18 @@ pub(super) fn spawn_download_worker(
                     }
                 }
             }
-            let (nzb_path, out_dir, total, library, nzo_id, name, prio, job_password, eat_ok) = {
+            let (
+                nzb_path,
+                out_dir,
+                total,
+                library,
+                nzo_id,
+                name,
+                prio,
+                job_password,
+                eat_ok,
+                failure_host,
+            ) = {
                 let mut j = job.lock_ok();
                 j.state = JobState::Downloading;
                 // §129 4a: the pick is the "started" moment. A job that
@@ -1675,6 +1751,9 @@ pub(super) fn spawn_download_worker(
                     j.priority,
                     j.password.clone(),
                     j.eat_volumes_ok,
+                    // §99 try-order key for the in-stream password
+                    // probe: which site supplied the NZB.
+                    j.failure_host.clone(),
                 )
             };
             let index_job_guard = d.begin_index_job();
@@ -1862,96 +1941,7 @@ pub(super) fn spawn_download_worker(
                 }
             }
 
-            // Block accounts: rule exhausted hosts out of this job's
-            // pool (lifetime usage ≥ the configured block size).
-            {
-                let cfg_now = nzbkit::config::Config::load(&config).ok();
-                let excluded: Vec<String> = cfg_now
-                    .as_ref()
-                    .map(|c| {
-                        c.servers
-                            .iter()
-                            .filter(|s| {
-                                s.block_bytes
-                                    .is_some_and(|b| b > 0 && d.usage_lifetime(&s.host) >= b)
-                            })
-                            .map(|s| s.host.clone())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                *d.hub.excluded_hosts.lock_ok() = excluded;
-            }
-            // M2c.5: allow the engine's speculative recovery prefetch
-            // for the main job unless a period quota is configured -
-            // same reasoning as the sidecar guard: opportunistic
-            // fetches must not race a metered budget.
-            d.hub
-                .spec_prefetch
-                .store(d.quota.load(Ordering::Relaxed) == 0, Ordering::Relaxed);
-            *d.active_stream.lock_ok() = Some(nzo_id.clone());
-            // Queue-row sub-line: fetching, from here until the pipeline
-            // itself advances the token at its section transitions.
-            d.hub.activity.lock_ok().insert(nzo_id.clone(), "fetching");
-            // Clear the hub's per-job slots BEFORE the fetch spawns: if
-            // get_with_progress errors before repopulating them (bad
-            // NZB, config error), net_rx resolves by drop and the
-            // net-drain accounting below would otherwise re-read the
-            // PREVIOUS job's pool/verifier - double-billing its bytes
-            // and article counts and stamping its bad blocks here.
-            *d.hub.pool_live.lock_ok() = None;
-            *d.hub.verifier.lock_ok() = None;
-            // Same reason, for the resume credit: a leftover figure from
-            // the previous job would be subtracted from THIS job's
-            // network bytes, under-billing its quota and under-reporting
-            // its speed.
-            d.hub.resume_seeded.store(0, Ordering::Relaxed);
-            // M29 oracle: fresh per-job sink - the pool records each
-            // article's hit/430 into it; drained to the ledger below.
-            *d.hub.oracle.lock_ok() = Some(Arc::new(nzbkit::oracle::OracleSink::default()));
-            // M29 opt-in routing: install a ledger snapshot for this
-            // job only when `oracle_route` is on, so get_with_progress
-            // can skip providers confidently gone for the release's
-            // (family, age-bucket). Off → cleared, so a plain job never
-            // consults it. A wrong verdict costs only latency (the
-            // engine never removes the last usable provider).
-            #[cfg(feature = "indexer")]
-            {
-                *d.hub.route_gone.lock_ok() = if d.oracle_route.load(Ordering::Relaxed) {
-                    d.with_index(|ix| ix.oracle_snapshot().ok())
-                } else {
-                    None
-                };
-            }
-            // Slim build: no availability ledger, so no snapshot to route by.
-            #[cfg(not(feature = "indexer"))]
-            {
-                *d.hub.route_gone.lock_ok() = None;
-            }
-            // Also drop the previous job's extractor. It is otherwise
-            // left installed for post-completion streaming, but now that
-            // active_stream points at THIS job, a /stream/<this id>
-            // request passes the owner check while the fetch is still
-            // parsing the NZB / restoring the journal (or forever, if it
-            // errors first) - and pick_media would map the request onto
-            // the stale extractor and serve the PREVIOUS job's file. With
-            // it cleared, the stream blocks until this job installs its
-            // own extractor (main.rs), which is the correct wait.
-            *d.hub.extractor.lock_ok() = None;
-            // And the previous job's late-attached password (C1): the
-            // owner tag already keeps a stale entry from ever matching
-            // this job's reads, so this is hygiene, not correctness.
-            *d.hub.late_password.lock_ok() = None;
-            // Same owner-tag hygiene for the live wants-a-password
-            // signal and the probe's verified winner - a stale tag
-            // never matches this job's slot or record.
-            *d.hub.password_wanted.lock_ok() = None;
-            *d.hub.password_found.lock_ok() = None;
-            // And the seek handle with it: SeekCtl holds a STRONG
-            // extractor reference, so a stale one would pin the
-            // previous job's whole extractor graph until this job
-            // happens to overwrite it - or forever, if the fetch
-            // errors first or the daemon idles.
-            *d.hub.seek.lock_ok() = None;
+            reset_hub_for_job(&d, &config, &nzo_id, failure_host);
             let (net_tx, net_rx) = tokio::sync::oneshot::channel::<()>();
             let fetch = {
                 let config = config.clone();
@@ -2036,73 +2026,12 @@ pub(super) fn spawn_download_worker(
             // and two pipelines must never share an out_dir or a
             // server's connection budget. Its journal keeps the bytes.
             stop_sidecar(&d).await;
-            // Decoded-byte count is final at network-drain (consumers
-            // joined before the signal fires) - safe to bill the quota
-            // before the next job resets the counter.
-            if let Some(led) = ledger.as_mut() {
-                led.add(d.progress.load(Ordering::Relaxed));
-            }
-            // History stats: decoded bytes + network wall time, final
-            // at net-drain (the NEXT job resets the progress counter,
-            // so capture before looping).
-            let dl_bytes = d.progress.load(Ordering::Relaxed);
-            // ...and the same figure plus whatever a resume already had
-            // on disk, which is what a paused row needs to report. Read
-            // here for the same reason `dl_bytes` is: the tail task
-            // below runs concurrently with the next iteration, and that
-            // zeroes both.
-            let on_disk_bytes =
-                dl_bytes.saturating_add(d.hub.resume_seeded.load(Ordering::Relaxed));
-            // Bill this job's per-server bytes to the usage history
-            // (pool_live is still THIS job's - the next one hasn't
-            // started yet), and its article tries/430s to the
-            // reliability ledger.
-            let (per_server, per_server_rel): (Vec<(String, u64)>, Vec<(String, u64, u64)>) = d
-                .hub
-                .pool_live
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|l| {
-                    l.servers
-                        .iter()
-                        .map(|s| {
-                            (
-                                (s.host.clone(), s.bytes.load(Ordering::Relaxed)),
-                                (
-                                    s.host.clone(),
-                                    s.articles_tried.load(Ordering::Relaxed),
-                                    s.articles_missing.load(Ordering::Relaxed),
-                                ),
-                            )
-                        })
-                        .unzip()
-                })
-                .unwrap_or_default();
-            d.add_usage(&per_server);
-            d.add_reliability(&per_server_rel);
-            // M29 oracle: fold this job's per-article outcomes into
-            // the availability ledger (one batched transaction).
-            #[cfg(feature = "indexer")]
-            if let Some(sink) = d.hub.oracle.lock_ok().take() {
-                let samples = sink.drain();
-                if !samples.is_empty() {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|t| t.as_secs() as i64)
-                        .unwrap_or(0);
-                    d.with_index(|ix| ix.oracle_ingest(&samples, now).ok());
-                }
-            }
-            // The verifier is still THIS job's too - keep the Arc so
-            // the tail task reads the final in-stream bad-block count
-            // even after the next job swaps the hub's slot.
-            let verifier = d.hub.verifier.lock_ok().clone();
-            // Same reason for the extractor: the shape is only final
-            // once the tail has settled (a late demote in
-            // finish/verify flips a set to "partly on disk"), and by
-            // then the next job may own the hub slot.
-            let shaper = d.hub.extractor_for(Some(&nzo_id));
+            let JobTail {
+                dl_bytes,
+                on_disk_bytes,
+                verifier,
+                shaper,
+            } = settle_job_tail(&d, &nzo_id, &mut ledger);
             lane.submit(PostprocTicket {
                 job,
                 fetch,

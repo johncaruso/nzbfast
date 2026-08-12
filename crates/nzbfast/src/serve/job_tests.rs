@@ -145,6 +145,49 @@ fn mid_download_disk_full_verdict_classifies_end_to_end() {
     assert!(disk_full_failure(&appended));
 }
 
+/// Damaged copies on the server are not a fault of this machine, and the
+/// drawer must not answer them with "show the folder". Both clauses land
+/// in `Local` (they are neither missing articles nor a repair verdict),
+/// so the HINT is what carries the remedy. Wire-corruption leg, 11 Aug.
+#[test]
+fn corrupt_articles_offer_retry_and_a_short_post_offers_search() {
+    let corrupt = "the articles did not decode: 1 damaged article(s) and no missing \
+                   segments - every article arrived, but their contents failed the yEnc \
+                   checks, so the copies on the server are corrupt. Retrying re-fetches \
+                   them, and a second provider usually carries a clean copy \
+                   (first error: decode error: =yend size 700000 does not match \
+                   decoded length 700024)";
+    assert_eq!(fail_hint(corrupt), "corrupt");
+    assert_eq!(
+        fail_action(fail_kind(corrupt), fail_hint(corrupt), corrupt, false),
+        "retry",
+        "a re-fetch is the remedy for bytes the server damaged"
+    );
+
+    let short = "post size header disagrees with its parts: every article arrived and \
+                 decoded, but 2 file(s) declare more bytes than the post actually \
+                 carries, 0 decode/write errors. Re-downloading cannot change this - \
+                 the missing bytes were never posted";
+    assert_eq!(fail_hint(short), "shortpost");
+    assert_eq!(
+        fail_action(fail_kind(short), fail_hint(short), short, false),
+        "search",
+        "asking again returns the same short post - another release is the answer"
+    );
+
+    // A genuine write failure keeps the folder, and a locked archive
+    // still outranks every hint.
+    let wrote = "could not write the download: 3 decode/write error(s) and no missing \
+                 segments - every article arrived, so check free space, permissions and \
+                 the log above";
+    assert_eq!(fail_hint(wrote), "");
+    assert_eq!(fail_action(fail_kind(wrote), "", wrote, false), "path");
+    assert_eq!(
+        fail_action(fail_kind(corrupt), "corrupt", corrupt, true),
+        "password"
+    );
+}
+
 #[test]
 fn mid_download_verdict_keys_on_the_opening_only() {
     // An unpack-stage disk-full mentions space but did NOT halt the

@@ -56,8 +56,13 @@ BASELINE_FILES = {
     # ...and 11,146 after the #34 SAB-parity round. What a credential may
     # do - the full key, the add-only nzbkey, and the bootstrap hatch
     # between them - is one subject and six tests, and moved whole to
-    # tests/daemon_authkey/. 10,466.
-    "crates/nzbfast/tests/daemon.rs": 10466,
+    # tests/daemon_authkey/. 10,466. Regrown to 10,699 through the §99
+    # try-order and §100 retry merges; the four passworded-archive legs -
+    # set_password after the fact, the passwords file consulted at
+    # completion, the ENOSPC republish, and the prompt that must not
+    # leave the archive packed - are one subject and moved whole to
+    # tests/daemon_password/. 10,030.
+    "crates/nzbfast/tests/daemon.rs": 10030,
     # 7471 when first measured; two concurrent 5 Aug sessions landed
     # test growth (one-pass rigs + the round-6 crc-retry pricing leg).
     "crates/nzbfast/tests/e2e.rs": 7641,
@@ -85,8 +90,19 @@ BASELINE_FILES = {
     # session lifecycle - dial, pipeline, read, and the dozen ways a
     # session ends - is 1,791 contiguous lines and moved whole to
     # pool/session.rs. 4,698, which is margin measured in hundreds of
-    # lines rather than one.
-    "crates/nzbkit/src/pool.rs": 4698,
+    # lines rather than one. Regrown to 5,010 through the §146 tail
+    # give-up + shipped-PoolConfig merges; the M11 QueueControl handle
+    # (struct + whole impl) moved bodily to pool/queue.rs: 4,224. Regrown
+    # to 4,350; the tail dup race and the B3 in-flight wire budget - how
+    # the pool spends EXTRA wire on an article somebody else already
+    # holds, and the bound on how much wire may be in flight - are the
+    # tail of `impl Shared` and moved whole to pool/hedge.rs: 3,946.
+    # Regrown to 4,121. This time the whole tail of the file below
+    # `fetch_all_sharded` - the worker task, the spare filler, the
+    # read-stall note, and every way a run is sealed or a work item
+    # requeued/failed - is one subject (sealing) and moved whole to
+    # pool/runlife.rs: 3,677.
+    "crates/nzbkit/src/pool.rs": 3677,
     # rig_tests.rs was here at 2,988 (born in the TODO 113 split of the
     # pool's payout/safety rigs), then 3,125 when the §114 consumer-steer
     # rigs replaced the pool-gate ones, then 3,372 through the §129
@@ -126,12 +142,29 @@ BASELINE_FILES = {
     # mover (move_dest_root, mover_enqueue/process, identify_video,
     # relocate_completed) went to serve/mover.rs beside the lanes that
     # call it. 5,570 - margin measured in hundreds of lines, which is
-    # the lesson of the pool.rs round.
-    "crates/nzbfast/src/serve/daemon.rs": 5570,
+    # the lesson of the pool.rs round. Regrown to 5,714 through the D3
+    # search-log and §73 preview merges; the whole `enqueue` add path
+    # moved to daemon_enqueue.rs (a daemon child, the daemon_index
+    # shape): 5,266. Regrown to 5,473; two more children on that same
+    # shape took every way a job is sent round again (the M32 auto-retry
+    # cooldown, the manual retry, and the move-retry ladder under both)
+    # to daemon_retry.rs, and the queue on disk - save_queue out,
+    # load_queue back - to daemon_persist.rs: 4,910. Regrown to 5,018;
+    # two more children on the same shape took what each provider has
+    # COST us (bytes billed per server per UTC day, the reliability
+    # tally, and the §96.5 block-account arithmetic on top of both) to
+    # daemon_usage.rs, and what the daemon does with connections when
+    # nothing is downloading (the warm pool, the idle-release policy,
+    # and the offline switch over the top) to daemon_idle.rs: 4,630.
+    "crates/nzbfast/src/serve/daemon.rs": 4630,
     # 5,150, then 5,397 after the 8 Aug burst. The inline `mod tests`
     # (the repair math and the mapped driver) moved to
-    # par2repair/inline_tests.rs, beside unit_tests.rs: 4,206.
-    "crates/nzbkit/src/par2repair.rs": 4206,
+    # par2repair/inline_tests.rs, beside unit_tests.rs: 4,206. Regrown
+    # to 4,337 through the 133.1 self-prove and Codex-sweep merges;
+    # `impl Reconstructor` moved whole to par2repair/reconstruct.rs
+    # (a child of the defining module, so the private fields stay in
+    # scope): 3,791.
+    "crates/nzbkit/src/par2repair.rs": 3791,
     "crates/nzbkit/src/rar.rs": 4088,
     "crates/nzbfast/src/wall.rs": 3911,
     "crates/nzbkit/src/nntp.rs": 3688,
@@ -152,8 +185,16 @@ BASELINE_FILES = {
 
 BASELINE_FNS = {
     # "path::fn_name": lines measured
-    # 688 when first measured; pre-gate concurrent work landed 719, then 770.
-    "crates/nzbfast/src/serve/tasks.rs::spawn_download_worker": 770,
+    # spawn_download_worker was here at 688, then 719, then 770 from
+    # pre-gate concurrent work, and reached 831 as the §154 no-servers
+    # hold and the §96.5 block-account budgets landed inside it. Three
+    # self-contained stretches of the loop moved to serve/tasks/runner.rs:
+    # the M14g guard ladder (`download_guards`, which sleeps on the
+    # caller's behalf and answers `only_force` or "do not pick"), the
+    # per-job hub hand-over (`reset_hub_for_job`), and the figures read at
+    # network-drain before the next iteration zeroes them
+    # (`settle_job_tail`). 417 lines now - under the ceiling, so its entry
+    # is GONE.
     # queue_json was here at 652, then 670 after the 8 Aug burst. `resume_at`
     # and the watch_failed row builder came out whole (609), and the lane's
     # own comment trim (61537f5d) merged over it: 604. The #34 SAB-parity

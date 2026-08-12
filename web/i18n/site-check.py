@@ -43,8 +43,19 @@ def check(en_path, tr_path, lang, anon=False):
     if probs:
         fail += 1
 
-for base in ['index', 'features', 'download', 'benchmarks']:
+# `indexer` shipped 15 locales but was never listed here, and the whole
+# `explained` family landed English-first; an ungated family is one that
+# drifts silently, which is the failure this script exists to prevent.
+BASES = ['index', 'features', 'download', 'benchmarks', 'indexer',
+         'explained', 'explained-onepass', 'explained-damaged',
+         'explained-method', 'explained-numbers']
+# The anonymity grep belongs on every page that cites a measurement, not just
+# the benchmarks table: the Explained pages quote the same rounds in prose.
+ANON = {'benchmarks', 'explained', 'explained-onepass', 'explained-damaged',
+        'explained-method', 'explained-numbers'}
+
+for base in BASES:
     for l in ['fr', 'de', 'it', 'es', 'nl', 'pt', 'sv', 'da', 'nb', 'fi', 'tr', 'ro',
               'he', 'ar', 'fa']:
-        check(f'website/{base}.html', f'website/{base}.{l}.html', l, anon=(base == 'benchmarks'))
+        check(f'website/{base}.html', f'website/{base}.{l}.html', l, anon=(base in ANON))
 sys.exit(1 if fail else 0)

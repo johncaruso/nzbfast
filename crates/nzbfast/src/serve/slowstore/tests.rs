@@ -586,6 +586,189 @@ fn releasing_our_own_pause_lifts_it() {
     assert!(d.paused.load(Ordering::Relaxed));
 }
 
+/// Every edge that moves the payload must move the REVISION with it.
+///
+/// This is the §129 1b staleness trap, and a storage pause walks
+/// straight into it: the poll answers `"queue": null` to a client whose
+/// revision matches unless something is actively transferring, and the
+/// first thing this feature does is take the one running job off the
+/// wire. So from the pause landing to the pause lifting there is nothing
+/// active, and the revision is the only thing that can repaint the
+/// header pill, the row sub-line and the drawer's recovery tally.
+///
+/// The tally is the visible half: it changes on every probe - 15 s apart
+/// by default - and it is what tells a user watching a paused queue that
+/// their volume is coming back. Frozen at "0 of 3" it says the opposite.
+#[test]
+fn every_payload_change_moves_the_queue_revision() {
+    let dir = TmpDir::new("rev");
+    let d = crate::serve::testutil::test_daemon(dir.path());
+    let out = d.out_dir();
+    let ev = Evidence {
+        stalled_secs: 50.0,
+        window_secs: 60.0,
+        goodput_bps: 1e6,
+        norm_bps: 100e6,
+    };
+    let rev = || d.queue_rev.load(Ordering::Relaxed);
+
+    // A DECLINED nomination changes nothing on the payload, so it must
+    // not churn the revision either - a volume that probes fine every
+    // few minutes would otherwise hand every open dashboard a full
+    // queue payload for nothing.
+    let quiet = rev();
+    assert!(!engage(&d, &ev, &out, &Probe::Fast(4)));
+    assert_eq!(rev(), quiet, "a declined nomination is not a change");
+
+    let before = rev();
+    assert!(engage(&d, &ev, &out, &Probe::Slow(3_000)));
+    assert!(rev() > before, "the pause itself must move the revision");
+
+    // Each probe writes the tally and the last-probe duration.
+    for expect in [1_u32, 2, 0] {
+        let at = rev();
+        let probe = match expect {
+            0 => Probe::Slow(9_000),
+            _ => Probe::Fast(3),
+        };
+        assert!(!heal(&d, &probe));
+        assert_eq!(payload(&d)["healthy_probes"], expect);
+        assert!(rev() > at, "probe {expect} must move the revision");
+    }
+
+    // And the resume, which is the one that strands a user: it happens
+    // with a paused (therefore inactive) queue behind it, so nothing
+    // else is going to move the payload afterwards.
+    assert!(!heal(&d, &Probe::Fast(3)));
+    assert!(!heal(&d, &Probe::Fast(3)));
+    let at = rev();
+    assert!(heal(&d, &Probe::Fast(3)));
+    assert_eq!(payload(&d), Value::Null);
+    assert!(rev() > at, "the resume must move the revision");
+}
+
+/// The numbers behind the evidence ride the payload, not just the
+/// English sentence built here: the dashboard composes its own
+/// translated line from them, and a pre-formatted sentence cannot be
+/// translated at the display edge.
+#[test]
+fn the_payload_carries_the_evidence_as_numbers() {
+    let dir = TmpDir::new("evnum");
+    let d = crate::serve::testutil::test_daemon(dir.path());
+    let out = d.out_dir();
+    let ev = Evidence {
+        stalled_secs: 148.6,
+        window_secs: 180.0,
+        goodput_bps: 1e6,
+        norm_bps: 100e6,
+    };
+    assert!(engage(&d, &ev, &out, &Probe::Slow(3_000)));
+    let p = payload(&d);
+    assert_eq!(p["stalled_secs"], 149.0);
+    assert_eq!(p["window_secs"], 180.0);
+    // The English sentence stays too: it is what the log and the
+    // notification said, and the tooltip of last resort.
+    assert!(
+        p["evidence"]
+            .as_str()
+            .unwrap()
+            .starts_with("write stalls: "),
+        "{p}"
+    );
+}
+
+/// §108 option 2: the diagnostic latch. Nothing here pauses anything -
+/// this is the opinion the "why is this slow?" panel reads when the
+/// breaker has NOT tripped, so the bar is hysteresis and honesty rather
+/// than the pause path's full ceremony.
+#[test]
+fn the_diagnostic_needs_consecutive_slow_probes_and_goes_stale() {
+    let dir = TmpDir::new("diag");
+    let d = crate::serve::testutil::test_daemon(dir.path());
+    let now = 1_000_000u64;
+
+    // Nobody is asking: slowstore does not volunteer an opinion, and a
+    // probe result arriving without a question cannot condemn anything.
+    assert!(!d.slow_storage.suspect(now));
+    assert!(!note_diag(&d, &Probe::Slow(4_000), now));
+    assert!(!d.slow_storage.suspect(now), "no question, no verdict");
+
+    // The whyslow core asks. Asking CLEARS whatever was latched: the
+    // probes stopped because the fork stopped being reached, and the
+    // volume's behaviour back then is not evidence about now.
+    d.slow_storage.set_want_diag(true);
+    assert!(!d.slow_storage.suspect(now), "asking is not answering");
+
+    // One slow probe is not a verdict - the same reason one clean probe
+    // is not a recovery.
+    assert!(!note_diag(&d, &Probe::Slow(4_000), now));
+    assert!(!d.slow_storage.suspect(now));
+    assert!(note_diag(&d, &Probe::Slow(4_100), now + 60_000));
+    assert!(d.slow_storage.suspect(now + 60_000));
+    assert_eq!(d.slow_storage.diag_ms(), 4_100);
+
+    // A fast probe clears it outright: the volume answered, so whatever
+    // it was doing, it is not doing it now.
+    assert!(!note_diag(&d, &Probe::Fast(6), now + 120_000));
+    assert!(!d.slow_storage.suspect(now + 120_000));
+
+    // An ERRORED probe is not evidence of slowness either. A write that
+    // fails outright is the acute path's business and has its own
+    // verdict; treating it as "slow" would put the wrong words on it.
+    assert!(!note_diag(&d, &Probe::Slow(4_000), now + 180_000));
+    assert!(!note_diag(&d, &Probe::Failed("EIO".into()), now + 240_000));
+    assert!(!note_diag(&d, &Probe::Slow(4_000), now + 300_000));
+    assert!(
+        !d.slow_storage.suspect(now + 300_000),
+        "the error reset the run, so this is only the first slow probe again"
+    );
+    assert!(note_diag(&d, &Probe::Slow(4_000), now + 360_000));
+    assert!(d.slow_storage.suspect(now + 360_000));
+
+    // Staleness: an opinion nobody is refreshing stops condemning. The
+    // bound is three cadences, so ONE missed probe never drops a
+    // standing verdict.
+    let diag_secs = d.slow_storage.tune().diag_secs;
+    assert!(d.slow_storage.suspect(now + 360_000 + diag_secs * 2_000));
+    assert!(!d.slow_storage.suspect(now + 360_000 + diag_secs * 4_000));
+
+    // And the question closing drops it immediately: the panel must not
+    // keep naming a drive once the evidence that raised the question is
+    // gone.
+    d.slow_storage.set_want_diag(false);
+    assert!(!d.slow_storage.suspect(now + 360_000));
+}
+
+/// The diagnostic must never be mistaken for the breaker. It is an
+/// opinion; only `engage` is an action.
+#[test]
+fn the_diagnostic_never_pauses_anything() {
+    let dir = TmpDir::new("diag-noact");
+    let d = crate::serve::testutil::test_daemon(dir.path());
+    d.slow_storage.set_want_diag(true);
+    for i in 0..10 {
+        note_diag(&d, &Probe::Slow(9_000), 1_000_000 + i * 60_000);
+    }
+    assert!(d.slow_storage.suspect(1_000_000 + 9 * 60_000));
+    assert!(!d.paused.load(Ordering::Relaxed), "no pause");
+    assert!(!d.slow_storage.paused(), "no held state");
+    assert_eq!(payload(&d), Value::Null, "nothing on the queue payload");
+    assert_eq!(*d.pause_source.lock_ok(), "user", "source untouched");
+}
+
+/// `diag_secs` is the lighter of the two cadences by construction: the
+/// diagnostic runs while the queue is still working, so a hand edit must
+/// not be able to make it heavier than the paused one.
+#[test]
+fn the_diagnostic_cadence_can_never_undercut_the_paused_one() {
+    let t = Tune::from_settings(&json!({"probe_secs": 30, "diag_secs": 5}));
+    assert_eq!(t.probe_secs, 30);
+    assert_eq!(t.diag_secs, 30, "clamped up to the paused cadence");
+    let t = Tune::from_settings(&json!({"diag_secs": 600}));
+    assert_eq!(t.diag_secs, 600);
+    assert_eq!(Tune::default().diag_secs, 60);
+}
+
 /// The affected volume is the JOB's output directory - categories can
 /// send jobs to different disks, and naming the wrong one sends the user
 /// to check the wrong hardware.

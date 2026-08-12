@@ -245,8 +245,9 @@ pub fn import(ini_path: &Path, out_path: &Path, force: bool) -> Result<()> {
                 // Obfuscated on the way out. This map is built by hand rather
                 // than serialized from a ServerConfig, so it does not get the
                 // serde hook and has to call this itself. Obfuscation, not
-                // encryption - see nzbkit::config::obfuscate.
-                o["password"] = json!(nzbkit::config::obfuscate(p));
+                // encryption - and the RAW-INPUT encoder, because a
+                // sabnzbd.ini password is cleartext whatever it starts with.
+                o["password"] = json!(nzbkit::config::obfuscate_input(p));
             }
             // Tier + retention only when they say something. Omitting the
             // zero cases keeps a single-server import a minimal config, and

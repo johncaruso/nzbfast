@@ -27,6 +27,15 @@ pub enum YencError {
     Truncated,
     #[error("=ypart begin={begin} end={end} cannot hold {len} decoded bytes")]
     PartGeometry { begin: u64, end: u64, len: u64 },
+    /// `=ybegin part=` and `=yend part=` disagree about which part this is.
+    /// Found by the round-4 torture set advZA (TODO 159): the article decoded
+    /// and placed correctly, because placement comes from `=ypart` alone, so
+    /// nothing detected that the two part numbers contradicted each other. A
+    /// post where BOTH were wrong would then be indistinguishable from a
+    /// healthy one. Cheap to check, and an inconsistent trailer is evidence
+    /// the article is not what it claims to be.
+    #[error("=ybegin part={begin} but =yend part={end} - inconsistent trailer")]
+    PartNumberMismatch { begin: u32, end: u32 },
 }
 
 /// A decoded yEnc article (one part of a file, or a whole small file).
@@ -37,7 +46,7 @@ pub struct Decoded {
     /// Total file size from `=ybegin size=`.
     pub file_size: u64,
     /// Part number from `=ybegin part=` (None for single-part posts).
-    pub part: Option<u32>,
+    pub(crate) part: Option<u32>,
     /// 1-based inclusive byte range from `=ypart begin=`/`end=`.
     /// For single-part posts this covers the whole file.
     pub begin: u64,
@@ -64,7 +73,7 @@ pub struct Meta {
     pub name: String,
     pub file_size: u64,
     pub part: Option<u32>,
-    pub begin: u64,
+    pub(crate) begin: u64,
     pub end: u64,
     /// Length of the decoded payload now in the caller's buffer.
     pub len: usize,
@@ -94,6 +103,7 @@ pub fn decode_checked(body: &[u8]) -> Result<(Decoded, bool), YencError> {
     let mut part: Option<u32> = None;
     let mut begin: u64 = 1;
     let mut end: u64 = 0;
+    let mut yend_part: Option<u32> = None;
     let mut expected_crc: Option<u32> = None;
     let mut expected_len: Option<u64> = None;
     let mut seen_begin = false;
@@ -148,6 +158,9 @@ pub fn decode_checked(body: &[u8]) -> Result<(Decoded, bool), YencError> {
             // Multi-part posts carry pcrc32 (CRC of this part); single-part
             // posts carry crc32. Prefer the part CRC.
             expected_crc = hex(&kv, "pcrc32").or_else(|| hex(&kv, "crc32"));
+            // The trailer's part number, kept only to check it against
+            // =ybegin's below. Nothing places bytes with it.
+            yend_part = num(&kv, "part").map(|n| n as u32);
         } else if seen_begin {
             decode_line(line, &mut data);
         }
@@ -163,6 +176,15 @@ pub fn decode_checked(body: &[u8]) -> Result<(Decoded, bool), YencError> {
     // silently corrupt output.
     if !seen_yend {
         return Err(YencError::Truncated);
+    }
+    // Both part numbers present and disagreeing means the trailer does not
+    // belong to this header. Checked before the length and CRC because it is
+    // the cheapest and most specific of the three, and a mismatch here makes
+    // the other two meaningless.
+    if let (Some(b), Some(e)) = (part, yend_part)
+        && b != e
+    {
+        return Err(YencError::PartNumberMismatch { begin: b, end: e });
     }
     if let Some(len) = expected_len
         && len != data.len() as u64
@@ -734,5 +756,59 @@ mod tests {
         assert_eq!(field_name(b"size=1"), None);
         // Field at end with empty value.
         assert_eq!(field_value(b"size=10 crc32=", b"crc32"), Some(&b""[..]));
+    }
+
+    /// Round-4 torture set advZA: `=yend part=` contradicting `=ybegin part=`.
+    ///
+    /// The article decodes and places CORRECTLY - placement comes from
+    /// `=ypart` alone - so nothing used to notice the two part numbers
+    /// disagreed, and a post where BOTH were wrong would have been
+    /// indistinguishable from a healthy one. Both decoders must reject it, and
+    /// must reject it the SAME way, or the differential fuzz oracle is
+    /// meaningless.
+    #[test]
+    fn a_yend_part_that_contradicts_ybegin_is_rejected_by_both_decoders() {
+        let data = test_data(3_000);
+        let article = encode("z.bin", 9_000, Some((2, 3)), 3_001, &data);
+        // Sanity: untouched, it decodes.
+        assert!(
+            decode(&article).is_ok(),
+            "the unmutated article must decode"
+        );
+
+        // Rewrite ONLY the trailer's part number, exactly as pynntp_evil's
+        // `yend_partnum` fault does. Byte-level, not via String: a yEnc
+        // payload is arbitrary binary and is NOT valid UTF-8.
+        let tail = article
+            .windows(6)
+            .position(|w| w == b"=yend ")
+            .expect("encoded article must carry a =yend trailer");
+        let mut mutated = article.clone();
+        let at = mutated[tail..]
+            .windows(6)
+            .position(|w| w == b"part=2")
+            .map(|i| tail + i)
+            .expect("=yend must carry part=2");
+        mutated[at + 5] = b'9'; // same length, so nothing downstream shifts
+        assert_ne!(mutated, article, "the mutation must change the bytes");
+
+        let scalar = decode(&mutated);
+        assert!(
+            matches!(
+                scalar,
+                Err(YencError::PartNumberMismatch { begin: 2, end: 9 })
+            ),
+            "scalar decoder accepted a contradictory trailer: {scalar:?}"
+        );
+
+        let mut buf = vec![0u8; mutated.len()];
+        let simd = crate::yenc_simd::decode_into(&mutated, &mut buf);
+        assert!(
+            matches!(
+                simd,
+                Err(YencError::PartNumberMismatch { begin: 2, end: 9 })
+            ),
+            "SIMD decoder disagreed with the oracle: {simd:?}"
+        );
     }
 }

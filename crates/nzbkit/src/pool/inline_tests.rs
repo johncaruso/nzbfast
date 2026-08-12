@@ -361,6 +361,7 @@ async fn futile_scan_throttles_before_retrying() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     });
     assert!(
         next_work(&shared, ctx, &tx, Pipeline::payload(0))
@@ -430,6 +431,7 @@ async fn endgame_fans_out_dup_races_for_laddering_articles() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     };
     shared.register_inflight(&lad, 0);
 
@@ -493,6 +495,7 @@ async fn endgame_fans_out_dup_races_for_laddering_articles() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     };
     big.register_inflight(&lad2, 0);
     assert!(
@@ -560,6 +563,7 @@ async fn tail_fanout_races_healthy_articles_in_the_endgame() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     };
     shared.register_inflight(&w, 0);
 
@@ -623,6 +627,7 @@ async fn tail_fanout_races_healthy_articles_in_the_endgame() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     };
     shared.register_inflight(&w2, 0);
     shared
@@ -670,6 +675,7 @@ async fn tail_fanout_races_healthy_articles_in_the_endgame() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     };
     big.register_inflight(&w3, 0);
     big.inflight.lock_ok().get_mut("<n0>").unwrap().dispatched =
@@ -748,6 +754,7 @@ async fn a_server_with_more_connections_is_not_mistaken_for_a_faster_one() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     };
     shared.register_inflight(&w, 1); // owned by the SMALL server
 
@@ -830,6 +837,7 @@ async fn a_fill_server_never_duplicates_primary_work_on_speed() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     };
     shared.register_inflight(&w, 0); // owned by the PRIMARY
 
@@ -1457,6 +1465,7 @@ async fn shed_pipeline_requeues_behind_promoted_run_uncharged() {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     });
     // A seek promotes a7 and a3 to the front (in that range order).
     let ids: Vec<String> = ["<a7>", "<a3>"].iter().map(|s| s.to_string()).collect();

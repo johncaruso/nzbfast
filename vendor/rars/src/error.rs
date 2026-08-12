@@ -78,6 +78,20 @@ pub enum Error {
         expected: u32,
         actual: u32,
     },
+    /// A split member's non-final fragment failed the packed-data CRC its
+    /// own header carries, so the damage is located before the member
+    /// finishes decoding. `volume` is the zero-based index of the bad
+    /// volume within the set.
+    SplitFragmentCrc32Mismatch {
+        volume: usize,
+        expected: u32,
+        actual: u32,
+    },
+    /// [`Self::SplitFragmentCrc32Mismatch`] for a BLAKE2sp record (RAR 5
+    /// sets written with -htb carry a hash instead of a CRC32).
+    SplitFragmentHashMismatch {
+        volume: usize,
+    },
     HashMismatch {
         hash_type: u64,
     },
@@ -156,6 +170,19 @@ impl std::fmt::Display for Error {
                     f,
                     "checksum mismatch: expected {expected:#010x}, got {actual:#010x}"
                 )
+            }
+            Self::SplitFragmentCrc32Mismatch {
+                volume,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "packed data checksum mismatch in split volume {volume}: expected {expected:#010x}, got {actual:#010x}"
+                )
+            }
+            Self::SplitFragmentHashMismatch { volume } => {
+                write!(f, "packed data hash mismatch in split volume {volume}")
             }
             Self::HashMismatch { hash_type } => {
                 write!(f, "hash mismatch for hash type {hash_type}")
@@ -459,6 +486,19 @@ mod tests {
             }
             .to_string(),
             "checksum mismatch: expected 0xabcd, got 0x1234"
+        );
+        assert_eq!(
+            Error::SplitFragmentCrc32Mismatch {
+                volume: 3,
+                expected: 0xabcd_ef01,
+                actual: 0x1234_5678,
+            }
+            .to_string(),
+            "packed data checksum mismatch in split volume 3: expected 0xabcdef01, got 0x12345678"
+        );
+        assert_eq!(
+            Error::SplitFragmentHashMismatch { volume: 3 }.to_string(),
+            "packed data hash mismatch in split volume 3"
         );
         assert_eq!(
             Error::UnsupportedVersion(ArchiveVersion::Rar50).to_string(),

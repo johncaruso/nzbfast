@@ -199,8 +199,11 @@ fn add_server(existing: usize) -> Result<Value> {
     if !pass.is_empty() {
         // Obfuscated on the way out. Built by hand rather than serialized from
         // a ServerConfig, so the serde hook does not apply here. Obfuscation,
-        // not encryption - see nzbkit::config::obfuscate.
-        o["password"] = json!(nzbkit::config::obfuscate(&pass));
+        // not encryption - see nzbkit::config::obfuscate_input, which is the
+        // RAW-INPUT encoder: what the user just typed is never already
+        // encoded, so a password that happens to start `obf1:` must not be
+        // mistaken for one.
+        o["password"] = json!(nzbkit::config::obfuscate_input(&pass));
     }
     if level > 0 {
         o["level"] = json!(level);

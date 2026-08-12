@@ -370,6 +370,54 @@ fn file_name(p: &Path) -> String {
         .to_string()
 }
 
+/// Does this container hold at least one password-protected entry?
+///
+/// The sibling of `rar::needs_password` / `nameprobe::sevenz_needs_password`,
+/// and the reason it exists: an encrypted zip is the one locked shape the
+/// post-processing surface could not SEE, so a job carrying nothing but
+/// one reported "an archive was left packed" and offered the folder,
+/// while the whole remedy was a password we may already hold.
+///
+/// A container we cannot even open is not "locked" - say no and let the
+/// ordinary unpack path report why it could not be read.
+pub fn needs_password(parts: &[PathBuf]) -> bool {
+    Archive::open(parts).is_ok_and(|a| a.entries().iter().any(|e| e.is_encrypted()))
+}
+
+/// Does `password` open this container's encrypted entries?
+///
+/// Cheap by construction: it reads each scheme's own verifier out of the
+/// entry framing (WinZip AE's 2-byte password-verification value, or
+/// ZipCrypto's check byte) and decodes nothing. That is the same first
+/// gate [`Archive::read_entry_to_with`] applies, with the same standing:
+/// a verifier hit is a CANDIDATE, and the CRC32 or the AE HMAC over the
+/// real extraction remains the authority. A ZipCrypto check byte is one
+/// byte, so it accepts a wrong password once in 256 tries - which is why
+/// no caller may treat this as proof, only as "worth spending an
+/// extraction on".
+///
+/// An unencrypted container answers `true` for any password: nothing is
+/// locked, so nothing can be wrong.
+pub fn password_opens(parts: &[PathBuf], password: Option<&str>) -> bool {
+    let Ok(archive) = Archive::open(parts) else {
+        return false;
+    };
+    archive
+        .entries()
+        .iter()
+        .filter(|e| e.is_encrypted())
+        .all(|e| {
+            archive
+                .entry_data_offset(e)
+                .ok()
+                .and_then(|data| {
+                    let end = data.checked_add(e.compressed_size)?;
+                    Some(entry_crypto(&archive.parts, e, data, end, password).is_ok())
+                })
+                .unwrap_or(false)
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Reader: central-directory driven extraction (disk path)
 // ---------------------------------------------------------------------------
@@ -564,15 +612,15 @@ pub struct Entry {
     /// put it through its own sanitizer (zip-slip, drive letters,
     /// backslashes) before touching the filesystem.
     pub name: String,
-    pub method: u16,
-    pub crc32: u32,
-    pub compressed_size: u64,
-    pub uncompressed_size: u64,
+    pub(crate) method: u16,
+    pub(crate) crc32: u32,
+    pub(crate) compressed_size: u64,
+    pub(crate) uncompressed_size: u64,
     /// Whether the entry is a directory marker (trailing `/`, or the
     /// MS-DOS directory attribute).
     pub is_dir: bool,
     /// General-purpose bit flags (bit 0 = encrypted).
-    pub flags: u16,
+    pub(crate) flags: u16,
     /// DOS modification time - kept because it doubles as ZipCrypto's
     /// password-check byte when bit 3 is set (the CRC was unknown when
     /// the local header was written).
@@ -592,9 +640,9 @@ pub struct Entry {
 pub struct AesSpec {
     /// 1 = AE-1 (CRC present and checked), 2 = AE-2 (CRC field is
     /// zero BY SPEC; the HMAC is the integrity check).
-    pub vendor_version: u16,
+    pub(crate) vendor_version: u16,
     /// 1 = AES-128, 2 = AES-192, 3 = AES-256.
-    pub strength: u8,
+    pub(crate) strength: u8,
     /// The REAL compression method of the plaintext (store/deflate/…).
     pub method: u16,
 }
@@ -609,11 +657,20 @@ impl AesSpec {
 }
 
 impl Entry {
-    /// Encrypted entries are declined: we have no zip crypto, and
-    /// writing out ciphertext that passes no CRC would be worse than
-    /// saying so.
+    /// General-purpose bit 0: the entry's payload is encrypted. Both
+    /// schemes we read set it (WinZip AE and ZipCrypto), so it is the
+    /// question "does this need a password", not "is this refused" - the
+    /// wording it carried before [`Archive::read_entry_to_with`] learned
+    /// to decrypt.
     pub fn is_encrypted(&self) -> bool {
         self.flags & 0x0001 != 0
+    }
+
+    /// The entry's declared uncompressed size - what a successful
+    /// extraction writes, and therefore what an "is this already
+    /// unpacked beside its container" test compares against.
+    pub fn size(&self) -> u64 {
+        self.uncompressed_size
     }
 
     /// Where this entry's LOCAL header starts, in logical byte-space.
@@ -1003,8 +1060,8 @@ pub(crate) enum EntryCipher {
 /// each end (salt + verifier, or the ZipCrypto header; and the AE
 /// authentication code), so the caller reads `[data + head, end - tail)`.
 pub(crate) struct EntryCrypto {
-    pub head: u64,
-    pub tail: u64,
+    pub(crate) head: u64,
+    pub(crate) tail: u64,
     pub cipher: EntryCipher,
 }
 
@@ -2581,6 +2638,66 @@ mod tests {
             matches!(&e, ZipError::Io(err) if err.to_string().contains("authentication failed")),
             "{e}"
         );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The candidate probe the extraction ladder sweeps a passwords file
+    /// with: it must answer from each scheme's own verifier, accept the
+    /// right password and refuse a wrong one, for both schemes.
+    #[test]
+    fn password_opens_answers_from_the_entry_verifier() {
+        let data = payload(40_000, 11);
+        for (tag, enc) in [
+            (
+                "zipcrypto",
+                fixtures::Encrypt::ZipCrypto { password: "pw123" },
+            ),
+            (
+                "ae",
+                fixtures::Encrypt::Ae {
+                    password: "pw123",
+                    strength: 3,
+                    vendor_version: 2,
+                },
+            ),
+        ] {
+            let d = tmp(&format!("pwopens-{tag}"));
+            let p = write(
+                &d,
+                "c.zip",
+                &fixtures::zip_of(&[Spec {
+                    encrypt: Some(enc),
+                    ..Spec::deflated("a.bin", &data)
+                }]),
+            );
+            let parts = [p];
+            assert!(needs_password(&parts), "{tag}: the lock must be visible");
+            assert!(password_opens(&parts, Some("pw123")), "{tag}");
+            assert!(!password_opens(&parts, Some("wrong")), "{tag}");
+            // No password at all is not a match either - the caller uses
+            // this to decide whether it holds the key, and "None opens
+            // it" would make every locked container look unlocked.
+            assert!(!password_opens(&parts, None), "{tag}");
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+    }
+
+    /// A container with nothing encrypted in it needs no password and is
+    /// opened by any - including none. The extraction ladder relies on
+    /// that to leave plain zips alone.
+    #[test]
+    fn a_plain_container_needs_no_password_and_any_password_opens_it() {
+        let data = payload(9_000, 3);
+        let d = tmp("pwopens-plain");
+        let p = write(
+            &d,
+            "c.zip",
+            &fixtures::zip_of(&[Spec::stored("a.bin", &data)]),
+        );
+        let parts = [p];
+        assert!(!needs_password(&parts));
+        assert!(password_opens(&parts, None));
+        assert!(password_opens(&parts, Some("anything")));
         std::fs::remove_dir_all(&d).unwrap();
     }
 

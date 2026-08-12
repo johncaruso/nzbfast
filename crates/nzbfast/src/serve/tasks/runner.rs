@@ -1,0 +1,519 @@
+//! The download runner's own preamble and postamble (TODO 106 code motion
+//! out of `spawn_download_worker`).
+//!
+//! Three self-contained stretches of that loop, in the order it runs them:
+//! `download_guards` decides whether a pick may happen at all (and sleeps
+//! on the caller's behalf when it may not), `reset_hub_for_job` hands the
+//! shared hub over from the previous job to this one, and `settle_job_tail`
+//! reads the final per-job figures at network-drain, before the next
+//! iteration is free to zero them.
+//!
+//! A child of `tasks`, so `Daemon`'s and the module's private items stay
+//! in scope; `pub(super)` here means "pub in tasks", which is every call
+//! site there is.
+
+use super::*;
+
+/// Everything the loop still needs after the fetch has drained, read
+/// while the figures are still THIS job's.
+pub(super) struct JobTail {
+    pub(super) dl_bytes: u64,
+    pub(super) on_disk_bytes: u64,
+    pub(super) verifier: Option<Arc<nzbkit::live::LiveVerifier>>,
+    pub(super) shaper: Option<Arc<nzbkit::extract::Extractor>>,
+}
+
+/// The M14g guard ladder, run once per pass before anything is picked.
+///
+/// `None` means the runner must not pick this pass - the hold has already
+/// been recorded and slept on, so the caller just `continue`s. `Some` is
+/// the `only_force` verdict to pick with: a spent quota still lets Force
+/// jobs through (SAB semantics), a full disk lets nothing through, and
+/// the no-servers hold and offline do not return at all.
+pub(super) async fn download_guards(
+    d: &Arc<Daemon>,
+    config: &std::path::Path,
+    lane: &PostprocLane,
+    guard_reason: &mut Option<String>,
+    ledger: &mut Option<QuotaLedger>,
+    disk_probe: &mut Option<tokio::task::JoinHandle<Option<u64>>>,
+) -> Option<bool> {
+    // §129 2g: a scheduled quota_reset zeroes the window here,
+    // where the ledger lives - checked before every guard so a
+    // disk hold or offline spell cannot defer it. Opened if
+    // need be so the reset also lands on disk for a quota that
+    // is currently off but has spend recorded (re-enabling
+    // must not resurrect it).
+    if d.quota_reset.swap(false, Ordering::Relaxed) {
+        let period = d.quota_period.load(Ordering::Relaxed) as char;
+        let mut led = ledger
+            .take()
+            .unwrap_or_else(|| QuotaLedger::open(&d.spool, period));
+        led.bytes = 0;
+        led.save();
+        info!(
+            target: "guard",
+            "quota ledger reset by schedule - the period's spend starts from zero"
+        );
+        *ledger = Some(led);
+    }
+    // M14g guards. Low disk stops everything (a Force job
+    // can't write to a full disk either); a spent quota still
+    // lets Force jobs through (SAB semantics).
+    //
+    // statfs on an external or network volume can hang without
+    // bound (a NAS share that dropped, a sleeping USB disk), and
+    // this loop IS the runner - a hung probe here stops every
+    // pick. Probe on the blocking pool with a timeout; a timeout
+    // means "unknown", which must not block the pick (None
+    // already means the guard stands down, same as a missing
+    // directory). Keep the ONE stuck probe and re-await it next
+    // pass rather than stacking a new blocked thread per pass.
+    let min = d.min_free.load(Ordering::Relaxed);
+    let mut free_now: Option<u64> = None;
+    if min > 0 {
+        let mut probe = disk_probe.take().unwrap_or_else(|| {
+            let out = d.out_dir();
+            tokio::task::spawn_blocking(move || free_bytes(&out))
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(2), &mut probe).await {
+            Ok(res) => free_now = res.ok().flatten(),
+            Err(_) => *disk_probe = Some(probe),
+        }
+    }
+    if min > 0
+        && let Some(free) = free_now
+        && free < min
+    {
+        if guard_reason.as_deref() != Some("disk") {
+            info!(
+                target: "guard",
+                "pausing: {:.1} GB free < {:.1} GB min",
+                free as f64 / 1e9,
+                min as f64 / 1e9
+            );
+            *guard_reason = Some("disk".into());
+            // Marker on the transition only - this loop re-checks
+            // every 5 s and the row strip carries the live figure.
+            let msg = format!(
+                "downloads paused - {:.1} GB free is under the {:.1} GB minimum",
+                free as f64 / 1e9,
+                min as f64 / 1e9
+            );
+            // §129 2e: targets routed onto "disk" hear about it
+            // too - the same transition-only edge as the marker.
+            d.notify_event("disk", &msg);
+            // §129 4a: the schema's disk.low, same edge.
+            d.life_emit(
+                "disk.low",
+                json!({
+                    "message": msg,
+                    "free_bytes": free,
+                    "min_bytes": min,
+                }),
+            );
+            d.note_event("disk", msg);
+        }
+        // Refreshed every pass, not just on entry: the free
+        // figure moves while the user clears space, and the row
+        // strip shows it live.
+        *d.queue_hold.lock_ok() = Some(("disk".into(), free as f64 / 1e9, min as f64 / 1e9));
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        return None;
+    }
+    // §129 backpressure: tails piling up faster than they
+    // drain must not fill the disk with undone unpacks - same
+    // "pause with a reason" doctrine as the §108 storage pause.
+    if lane.saturated() {
+        if guard_reason.as_deref() != Some("postproc") {
+            let (n, cap) = (lane.backlog(), lane.cap());
+            info!(target: "guard", "pausing picks: {n} finishing job(s) at the lane bound {cap}");
+            *guard_reason = Some("postproc".into());
+            d.note_event(
+                "postproc",
+                "waiting for post-processing to catch up - the next \
+                 download starts when a finishing job completes",
+            );
+        }
+        *d.queue_hold.lock_ok() =
+            Some(("postproc".into(), lane.backlog() as f64, lane.cap() as f64));
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        return None;
+    }
+    if guard_reason.as_deref() == Some("postproc") {
+        *guard_reason = None;
+        *d.queue_hold.lock_ok() = None;
+        d.note_event("clear", "post-processing caught up - downloads resume");
+    }
+    // TODO §154: nothing to dial. With no enabled server the
+    // pick used to go ahead anyway, `get_with_progress` died
+    // with "config has no servers" inside ~500 ms, and the job
+    // filed to history Failed - `FailKind::Local`, which is
+    // correct and is also what makes it terminal, so no retry
+    // ladder ever looks at it again. On the SAB facade that
+    // Failed row is failed-download handling to an *arr:
+    // blocklist the release, search for another. "This box has
+    // no servers right now" says nothing about the post, so a
+    // setup-order mistake (Sonarr wired up before the servers
+    // are) silently burns a healthy release per poll. Hold the
+    // queue instead, and let it clear itself - the config is
+    // re-read here every tick, so adding a server starts the
+    // queue with no restart and no retry click.
+    //
+    // FORCE DOES NOT BYPASS THIS, which is the one place this
+    // hold differs from the quota hold below. Force means "run
+    // this even though the scheduler says wait"; a spent quota
+    // is a scheduling decision, and a Force job on a spent
+    // quota downloads fine. With no server there is nothing to
+    // dial, so letting Force through would only reproduce the
+    // instant fail this guard exists to prevent. Hence a
+    // `continue` gate rather than a term in `only_force`.
+    //
+    // The condition itself, and why it is narrower than "the
+    // config did not load", is `no_enabled_servers` above.
+    if no_enabled_servers(config) {
+        if guard_reason.as_deref() != Some("noservers") {
+            info!(
+                target: "guard",
+                "holding the queue: no enabled server is configured"
+            );
+            *guard_reason = Some("noservers".into());
+            d.note_event(
+                "servers",
+                "no servers configured - downloads wait until one is added",
+            );
+            // The §129 1b poll answers `"queue": null` for a
+            // client whose revision matches unless something is
+            // actively transferring, and under this hold every
+            // job sits Queued - so the revision is the ONLY
+            // thing that can move the payload, exactly as
+            // `slowstore::bump` documents for the storage pause.
+            // Without it an open dashboard never draws the
+            // banner this hold exists to draw.
+            d.queue_rev.fetch_add(1, Ordering::Relaxed);
+        }
+        *d.queue_hold.lock_ok() = Some(("noservers".into(), 0.0, 0.0));
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        return None;
+    }
+    if guard_reason.as_deref() == Some("noservers") {
+        *guard_reason = None;
+        *d.queue_hold.lock_ok() = None;
+        d.note_event("clear", "a server is configured - downloads resume");
+        // The clear edge needs the bump for the same reason the
+        // set edge does: nothing is transferring yet, so a
+        // matching revision would leave the banner on screen.
+        d.queue_rev.fetch_add(1, Ordering::Relaxed);
+    }
+    // Offline outranks everything below, INCLUDING Force.
+    //
+    // It has to be its own gate rather than a term in
+    // `only_force`, because Force is defined as the thing that
+    // walks past a paused queue - and offline only ever reached
+    // this loop as a pause it set on the way through. So a
+    // priority-2 job started while the header said Offline, the
+    // fleet reopened, and the operator's OTHER machine was
+    // refused at the account's connection cap with no reason to
+    // suspect this daemon (TODO 65). Force is not even reliably
+    // the user's own choice: the retry/start path hard-codes
+    // `priority = 2` on its behalf.
+    //
+    // Offline is not a scheduling state like pause; it is a
+    // promise about the network, made in absolute terms - the
+    // confirm dialog says every connection is closed "so you can
+    // use the account from another machine", and startup logs
+    // "touching no provider". Coming back online is the only act
+    // that releases it, which is one click and is what the
+    // button already says.
+    if d.offline.load(Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        return None;
+    }
+    let mut only_force = d.paused.load(Ordering::Relaxed);
+    let quota = d.quota.load(Ordering::Relaxed);
+    let period = d.quota_period.load(Ordering::Relaxed) as char;
+    if quota > 0 || ledger.is_some() {
+        // (Re)open on first use or a live period change; keep
+        // billing an open ledger even if the cap is lifted so
+        // re-enabling sees the true window usage.
+        if ledger.as_ref().is_none_or(|l| l.period != period) {
+            *ledger = Some(QuotaLedger::open(&d.spool, period));
+        }
+    }
+    // Publish what the period has cost so far, whether or not a
+    // cap is set: the facade's `left_quota` needs the running
+    // total, not just the exhausted case (L5).
+    d.quota_spent.store(
+        ledger.as_mut().map(|l| l.spent()).unwrap_or(0),
+        Ordering::Relaxed,
+    );
+    if let (Some(led), true) = (ledger.as_mut(), quota > 0)
+        && led.spent() >= quota
+    {
+        if guard_reason.as_deref() != Some("quota") {
+            info!(
+                target: "guard",
+                "quota spent ({:.1} of {:.1} GB) - only Force jobs until the period rolls over",
+                led.bytes as f64 / 1e9,
+                quota as f64 / 1e9
+            );
+            *guard_reason = Some("quota".into());
+            let msg = format!(
+                "download quota spent ({:.1} of {:.1} GB) - only Force \
+                 jobs run until the period rolls over",
+                led.bytes as f64 / 1e9,
+                quota as f64 / 1e9
+            );
+            // §129 2e: same transition-only edge as the marker.
+            d.notify_event("quota", &msg);
+            // §129 4a: the schema's quota.reached, same edge.
+            d.life_emit(
+                "quota.reached",
+                json!({
+                    "message": msg,
+                    "spent_bytes": led.bytes,
+                    "quota_bytes": quota,
+                }),
+            );
+            d.note_event("quota", msg);
+        }
+        *d.queue_hold.lock_ok() =
+            Some(("quota".into(), led.spent() as f64 / 1e9, quota as f64 / 1e9));
+        only_force = true;
+    }
+    if guard_reason.is_some() && !only_force {
+        info!(target: "guard", "cleared");
+        *guard_reason = None;
+        d.note_event(
+            "clear",
+            "the space and quota guards cleared - downloads resume",
+        );
+    }
+    if guard_reason.is_none() {
+        let mut h = d.queue_hold.lock_ok();
+        if h.is_some() {
+            *h = None;
+        }
+    }
+    Some(only_force)
+}
+
+/// Hand the shared hub over from the previous job to this one.
+///
+/// Two halves. First the block-account economics for this job's pool:
+/// hosts whose block spend is used up are ruled out, and every host with
+/// bytes LEFT is handed its remaining budget so the pool releases it
+/// mid-run if this job spends the rest (§96.5 - the exclusion alone only
+/// helps the next job). Then every per-job hub slot is REPLACED rather
+/// than merely left, because the tail of job N-1 and the queue payload
+/// both read these while job N runs: a slot still holding the previous
+/// job's value is a double-billed byte, a stale extractor served down
+/// /stream, or a password matched against the wrong record. Each `= None`
+/// below carries the specific hazard it closes.
+pub(super) fn reset_hub_for_job(
+    d: &Arc<Daemon>,
+    config: &std::path::Path,
+    nzo_id: &str,
+    failure_host: String,
+) {
+    // Block accounts: rule exhausted hosts out of this job's
+    // pool (block spend ≥ the configured block size), and hand
+    // every host with bytes LEFT its remaining budget, so the
+    // pool releases it mid-run if this job spends the rest
+    // (§96.5 - the exclusion alone only helps the next job).
+    {
+        let cfg_now = nzbkit::config::Config::load(config).ok();
+        let mut excluded: Vec<String> = Vec::new();
+        let mut budgets: std::collections::HashMap<String, u64> = Default::default();
+        for s in cfg_now
+            .as_ref()
+            .map(|c| c.servers.as_slice())
+            .unwrap_or(&[])
+        {
+            let Some(b) = s.block_bytes.filter(|b| *b > 0) else {
+                continue;
+            };
+            let spent = d.block_spent(&s.host);
+            if spent >= b {
+                excluded.push(s.host.clone());
+            } else {
+                budgets.insert(s.host.clone(), b - spent);
+            }
+        }
+        *d.hub.excluded_hosts.lock_ok() = excluded;
+        *d.hub.host_byte_budgets.lock_ok() = budgets;
+    }
+    // M2c.5: allow the engine's speculative recovery prefetch
+    // for the main job unless a period quota is configured -
+    // same reasoning as the sidecar guard: opportunistic
+    // fetches must not race a metered budget.
+    d.hub
+        .spec_prefetch
+        .store(d.quota.load(Ordering::Relaxed) == 0, Ordering::Relaxed);
+    *d.active_stream.lock_ok() = Some(nzo_id.to_string());
+    // Queue-row sub-line: fetching, from here until the pipeline
+    // itself advances the token at its section transitions.
+    d.hub
+        .activity
+        .lock_ok()
+        .insert(nzo_id.to_string(), "fetching");
+    // Clear the hub's per-job slots BEFORE the fetch spawns: if
+    // get_with_progress errors before repopulating them (bad
+    // NZB, config error), net_rx resolves by drop and the
+    // net-drain accounting below would otherwise re-read the
+    // PREVIOUS job's pool/verifier - double-billing its bytes
+    // and article counts and stamping its bad blocks here.
+    *d.hub.pool_live.lock_ok() = None;
+    *d.hub.verifier.lock_ok() = None;
+    // §96.5: same double-billing hazard as the two slots above,
+    // through the OTHER door - the periodic usage flush is
+    // delta-billed against this map, so a leftover high-water
+    // mark from the previous job would swallow the first bytes
+    // of this one. Cleared while pool_live is None, so a flush
+    // tick between the two stores sees no pool and bills
+    // nothing.
+    d.run_usage_flushed.lock_ok().clear();
+    // Same reason, for the resume credit: a leftover figure from
+    // the previous job would be subtracted from THIS job's
+    // network bytes, under-billing its quota and under-reporting
+    // its speed.
+    d.hub.resume_seeded.store(0, Ordering::Relaxed);
+    // M29 oracle: fresh per-job sink - the pool records each
+    // article's hit/430 into it; drained to the ledger below.
+    *d.hub.oracle.lock_ok() = Some(Arc::new(nzbkit::oracle::OracleSink::default()));
+    // M29 opt-in routing: install a ledger snapshot for this
+    // job only when `oracle_route` is on, so get_with_progress
+    // can skip providers confidently gone for the release's
+    // (family, age-bucket). Off → cleared, so a plain job never
+    // consults it. A wrong verdict costs only latency (the
+    // engine never removes the last usable provider).
+    #[cfg(feature = "indexer")]
+    {
+        *d.hub.route_gone.lock_ok() = if d.oracle_route.load(Ordering::Relaxed) {
+            d.with_index(|ix| ix.oracle_snapshot().ok())
+        } else {
+            None
+        };
+    }
+    // Slim build: no availability ledger, so no snapshot to route by.
+    #[cfg(not(feature = "indexer"))]
+    {
+        *d.hub.route_gone.lock_ok() = None;
+    }
+    // Also drop the previous job's extractor. It is otherwise
+    // left installed for post-completion streaming, but now that
+    // active_stream points at THIS job, a /stream/<this id>
+    // request passes the owner check while the fetch is still
+    // parsing the NZB / restoring the journal (or forever, if it
+    // errors first) - and pick_media would map the request onto
+    // the stale extractor and serve the PREVIOUS job's file. With
+    // it cleared, the stream blocks until this job installs its
+    // own extractor (main.rs), which is the correct wait.
+    *d.hub.extractor.lock_ok() = None;
+    // And the previous job's late-attached password (C1): the
+    // owner tag already keeps a stale entry from ever matching
+    // this job's reads, so this is hygiene, not correctness.
+    *d.hub.late_password.lock_ok() = None;
+    // Same owner-tag hygiene for the live wants-a-password
+    // signal and the probe's verified winner - a stale tag
+    // never matches this job's slot or record.
+    *d.hub.password_wanted.lock_ok() = None;
+    *d.hub.password_found.lock_ok() = None;
+    // §99: this job's NZB source host, so the probe tries the
+    // password last known to work for that site first.
+    // Replaces (never merely clears) the previous job's hint.
+    *d.hub.pw_assoc_site.lock_ok() = Some((nzo_id.to_string(), failure_host));
+    // And the seek handle with it: SeekCtl holds a STRONG
+    // extractor reference, so a stale one would pin the
+    // previous job's whole extractor graph until this job
+    // happens to overwrite it - or forever, if the fetch
+    // errors first or the daemon idles.
+    *d.hub.seek.lock_ok() = None;
+}
+
+/// Read this job's final figures at network-drain, before the next
+/// iteration is free to zero them, and bill what is already final.
+///
+/// The quota is billed here because the decoded-byte count is final at
+/// network-drain (the consumers are joined before the signal fires) and
+/// the NEXT job resets the counter; the per-server usage and reliability
+/// ledgers for the same reason - `pool_live` is still THIS job's, since
+/// the next one has not started.
+pub(super) fn settle_job_tail(
+    d: &Arc<Daemon>,
+    nzo_id: &str,
+    ledger: &mut Option<QuotaLedger>,
+) -> JobTail {
+    // Decoded-byte count is final at network-drain (consumers
+    // joined before the signal fires) - safe to bill the quota
+    // before the next job resets the counter.
+    if let Some(led) = ledger.as_mut() {
+        led.add(d.progress.load(Ordering::Relaxed));
+    }
+    // History stats: decoded bytes + network wall time, final
+    // at net-drain (the NEXT job resets the progress counter,
+    // so capture before looping).
+    let dl_bytes = d.progress.load(Ordering::Relaxed);
+    // ...and the same figure plus whatever a resume already had
+    // on disk, which is what a paused row needs to report. Read
+    // here for the same reason `dl_bytes` is: the tail task
+    // below runs concurrently with the next iteration, and that
+    // zeroes both.
+    let on_disk_bytes = dl_bytes.saturating_add(d.hub.resume_seeded.load(Ordering::Relaxed));
+    // Bill this job's per-server bytes to the usage history
+    // (pool_live is still THIS job's - the next one hasn't
+    // started yet), and its article tries/430s to the
+    // reliability ledger.
+    let per_server_rel: Vec<(String, u64, u64)> = d
+        .hub
+        .pool_live
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|l| {
+            l.servers
+                .iter()
+                .map(|s| {
+                    (
+                        s.host.clone(),
+                        s.articles_tried.load(Ordering::Relaxed),
+                        s.articles_missing.load(Ordering::Relaxed),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // §96.5: delta-billed against the flush task's high-water
+    // map, so bytes the periodic mid-job flush already billed
+    // are not billed twice here.
+    d.flush_run_usage();
+    d.add_reliability(&per_server_rel);
+    // M29 oracle: fold this job's per-article outcomes into
+    // the availability ledger (one batched transaction).
+    #[cfg(feature = "indexer")]
+    if let Some(sink) = d.hub.oracle.lock_ok().take() {
+        let samples = sink.drain();
+        if !samples.is_empty() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_secs() as i64)
+                .unwrap_or(0);
+            d.with_index(|ix| ix.oracle_ingest(&samples, now).ok());
+        }
+    }
+    // The verifier is still THIS job's too - keep the Arc so
+    // the tail task reads the final in-stream bad-block count
+    // even after the next job swaps the hub's slot.
+    let verifier = d.hub.verifier.lock_ok().clone();
+    // Same reason for the extractor: the shape is only final
+    // once the tail has settled (a late demote in
+    // finish/verify flips a set to "partly on disk"), and by
+    // then the next job may own the hub slot.
+    let shaper = d.hub.extractor_for(Some(nzo_id));
+    JobTail {
+        dl_bytes,
+        on_disk_bytes,
+        verifier,
+        shaper,
+    }
+}

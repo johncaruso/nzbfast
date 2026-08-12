@@ -308,8 +308,22 @@ mod tests {
                 .unwrap_or_else(|e| panic!("write {} failed on a healthy peer: {}", i, e));
             assert_eq!(n, buf.len());
         }
+        // This assertion is the whole regression guard - the loop above cannot
+        // be: even with the gaps wrongly counted, 4096 B per 50 ms is 80 KiB/s
+        // against an 8 KiB/s floor, so every write would still succeed. If the
+        // clock leaked wall time it would read the ten 50 ms gaps, ~500 ms.
+        //
+        // The bound is HALF the leak signature, deliberately not the 20 ms
+        // grace: the in-write clock legitimately accumulates scheduler
+        // preemption across ten write calls, and on a loaded 2x CI runner that
+        // measured 21.8 ms and 24.6 ms (runs 31489960984 and 31506507104,
+        // TODO 116g), hard-failing a grace-sized bound twice. Serializing the
+        // test - the fault_contract treatment - does not apply: nextest runs
+        // one process per test, so the load is the whole suite's, not this
+        // group's. A leak still overshoots this bound by 2x on an idle box
+        // and by an order of magnitude over the measured noise.
         assert!(
-            w.blocked < Duration::from_millis(20),
+            w.blocked < Duration::from_millis(250),
             "wall time leaked into the blocked-write clock: {:?}",
             w.blocked
         );

@@ -315,9 +315,20 @@ impl Index {
     /// re-promotion would compute: the claim is still about this
     /// release and this name, it just reads as independent of that
     /// re-promotion rather than identical to it. A row with no files
-    /// has no article set to bind to and is left as it is.
+    /// has no article set to bind to and is left as it is - it also has
+    /// nothing for a byte proof to read, so the grade cannot matter
+    /// there the way it does for a row the archive can still speak for.
+    ///
+    /// A row whose claim the ledger REFUSES is relabelled all the same:
+    /// see the note at that call.
     pub fn relabel_spot_names(&mut self, now: i64) -> rusqlite::Result<usize> {
-        if self.kv_get("spot_claim_ledger_v1").is_some() {
+        // v2: v1 left every row whose claim was refused on the legacy
+        // label, and set its guard anyway, so those rows could never
+        // heal. Bumping the key re-runs the pass once on an index that
+        // already ran v1 - cheap, because the driving query only ever
+        // sees rows still holding the legacy label, and by then that is
+        // just the residue v1 skipped.
+        if self.kv_get("spot_claim_ledger_v2").is_some() {
             return Ok(0);
         }
         let stale: Vec<(i64, String)> = {
@@ -356,9 +367,22 @@ impl Index {
                 key: msgid_set_key(payload.iter()),
                 source: SPOT_SOURCE.into(),
             };
-            if !self.record_name_claim(*rid, &claim, now)? {
-                continue;
-            }
+            // Relabel whether or not the claim could be FILED. The two
+            // are separable: `applied_strength` reads `pre_source`
+            // alone, so the label is the grade and the ledger row is
+            // provenance on top of it.
+            //
+            // Skipping the relabel on a refused claim stranded exactly
+            // the rows that most need grading down. `record_name_claim`
+            // refuses a name holding a path separator, and the 13 rows
+            // it refused on the live index are all spot titles where
+            // `/` is ordinary punctuation - "Upscaled/Remastered",
+            // "x86/x64", the Dutch "t/m 20". Today's promotion gate
+            // rejects such a title outright, so no new ones appear;
+            // these are pre-gate residue holding a name nothing can
+            // correct, pinned at `i32::MAX` above every byte proof by
+            // the very pass whose job was to make them arbitrable.
+            self.record_name_claim(*rid, &claim, now)?;
             // Counted on the UPDATE, not the loop: 59 of the live
             // index's spots are spot-to-spot dedups sharing one
             // release, so the driving join hands the same row out
@@ -370,7 +394,7 @@ impl Index {
                 rusqlite::params![rid, label, SPOT_SOURCE],
             )?;
         }
-        self.kv_set("spot_claim_ledger_v1", "1")?;
+        self.kv_set("spot_claim_ledger_v2", "1")?;
         Ok(done)
     }
 
@@ -1409,6 +1433,69 @@ mod tests {
         teardown(&d, ix);
     }
 
+    /// A legacy title the ledger REFUSES still gets graded down.
+    ///
+    /// `record_name_claim` rejects a name holding a path separator, and
+    /// on the live index every row it refused was a spot title using
+    /// `/` as punctuation ("Upscaled/Remastered", "x86/x64"). The first
+    /// backfill skipped the relabel on those and set its guard anyway,
+    /// so 13 rows kept the bare `spot` label - `i32::MAX`, above every
+    /// byte proof - which is the exact opposite of what the pass is
+    /// for: these are the WORST titles, and they were the ones made
+    /// permanently uncorrectable.
+    #[test]
+    fn a_legacy_title_the_ledger_refuses_is_still_graded_down() {
+        let d = dir("relabel_refused");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        // Promoted under the old gate: today `promote_spot` refuses a
+        // `/` title outright, so this shape only exists as residue.
+        let s = spot(
+            "<sp9@spot>",
+            "Nina Simone - Live [Upscaled/Remastered]",
+            "a10",
+        );
+        ix.insert_spot(&s).unwrap();
+        let nzb = crate::nzb::Nzb {
+            files: vec![nzb_file(
+                r#""oldblob01.part01.rar" yEnc (1/1)"#,
+                "alt.binaries.misc",
+                &[(1, "R1@x", 4 << 30)],
+            )],
+            meta: Vec::new(),
+        };
+        let rid = match ix
+            .promote_spot(&s.msgid, "Legit.Name.2026", &nzb, 2000)
+            .unwrap()
+        {
+            SpotPromotion::Promoted(rid) => rid,
+            other => panic!("expected a fresh release, got {other:?}"),
+        };
+        ix.db
+            .execute(
+                "UPDATE releases SET pre_source='spot', pre_title=?2 WHERE id=?1",
+                rusqlite::params![rid, "Nina Simone - Live [Upscaled/Remastered]"],
+            )
+            .unwrap();
+        ix.db
+            .execute("DELETE FROM name_claims WHERE release_id=?1", [rid])
+            .unwrap();
+
+        assert_eq!(ix.relabel_spot_names(3000).unwrap(), 1);
+        let src: String = ix
+            .db
+            .query_row("SELECT pre_source FROM releases WHERE id=?1", [rid], |x| {
+                x.get(0)
+            })
+            .unwrap();
+        // Graded down to msgid-set, so a body probe (a stronger tier)
+        // can now correct the title. That is the whole point.
+        assert_eq!(src, "proven:msgid-set:spot");
+        // ...and the ledger stays honest: the refused name is NOT on
+        // file, because a path is not a release name from any source.
+        assert!(ix.name_claims(rid).unwrap().is_empty());
+        teardown(&d, ix);
+    }
+
     /// Cards named with the spot XML's raw markup get the title that
     /// was inside it - and everything the old name derived is
     /// re-derived, so the card does not go on searching under
@@ -1900,7 +1987,7 @@ pub struct Spot {
     pub date: i64,
     pub spotter_id: String,
     /// RSA signature verified (always true for stored spots today).
-    pub verified: bool,
+    pub(crate) verified: bool,
     /// V2 hashcash proof-of-work passed (warning flag when false).
     pub hashcash_ok: bool,
     /// NZB payload segment ids, cached after the first fetch.

@@ -1608,3 +1608,63 @@ fn a_failed_staged_move_leaves_the_source_whole() {
     assert!(!dst.exists(), "nothing half-published at the destination");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A directory whose only lock is a zip: `encrypted_archive` must SEE
+/// it, and `unlock` must actually unpack it.
+///
+/// Both halves were broken and each hid the other. Detection was
+/// RAR+7z-only, so a locked zip never set `password_required` and the
+/// drawer offered "show the folder" for a job whose whole remedy is a
+/// password. And `unlock` reached its non-RAR arms only when
+/// `reextract_dir` FAILED - which a directory holding no RAR volumes
+/// never does (it answers "nothing to re-extract" and returns Ok(true)),
+/// so a typed password reported success over a set still packed.
+#[test]
+fn a_locked_zip_is_detected_and_the_password_unpacks_it() {
+    use nzbkit::zip::fixtures::{Encrypt, Spec, zip_of};
+    let payload: Vec<u8> = (0..40_000u32).map(|i| (i * 7 + 3) as u8).collect();
+    for (tag, enc) in [
+        ("zipcrypto", Encrypt::ZipCrypto { password: "pw123" }),
+        (
+            "ae",
+            Encrypt::Ae {
+                password: "pw123",
+                strength: 3,
+                vendor_version: 2,
+            },
+        ),
+    ] {
+        let d = scratch(&format!("lockedzip-{tag}"));
+        std::fs::write(
+            d.join("payload.zip"),
+            zip_of(&[Spec {
+                encrypt: Some(enc),
+                ..Spec::deflated("movie.mkv", &payload)
+            }]),
+        )
+        .unwrap();
+
+        let found = encrypted_archive(&d).unwrap_or_else(|| panic!("{tag}: lock not detected"));
+        assert_eq!(found.file_name().unwrap(), "payload.zip", "{tag}");
+        assert!(
+            !unlock(&d, "wrong"),
+            "{tag}: a wrong password must not pass"
+        );
+        assert!(
+            !d.join("movie.mkv").exists(),
+            "{tag}: nothing published on a wrong password"
+        );
+        assert!(unlock(&d, "pw123"), "{tag}: the right password must unlock");
+        assert_eq!(
+            std::fs::read(d.join("movie.mkv")).unwrap(),
+            payload,
+            "{tag}: the payload must be byte-correct"
+        );
+        // ...and once its content sits beside it, the spent container is
+        // no longer a lock anyone can act on.
+        assert!(
+            encrypted_archive(&d).is_none(),
+            "{tag}: a delivered container must not keep asking for a password"
+        );
+    }
+}

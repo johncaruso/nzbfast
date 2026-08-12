@@ -198,6 +198,15 @@ nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
 retaper vos identifiants : Paramètres → Serveurs Usenet → <b>Importer depuis
 SABnzbd / NZBGet…</b> trouve votre installation existante et copie ses serveurs. Il
 existe aussi <code>nzbfast import-sab</code> en ligne de commande.</div>
+<p>La carte de bienvenue demande aussi <b>comment vous comptez utiliser nzbfast</b>,
+avec quatre réponses : une appli comme Sonarr ou Radarr le pilote, vous venez de
+SABnzbd, vous venez de NZBGet, ou juste vous, depuis ce tableau de bord. Choisir
+une réponse ne change rien en soi. Elle affiche une courte liste à passer en
+revue - chaque recommandation avec le nom exact du réglage, sa valeur actuelle,
+la valeur recommandée et une ligne d'explication - et <b>Appliquer</b> ne modifie
+que les lignes que vous cochez. Chaque ligne est un réglage ordinaire que vous
+pouvez ensuite remettre comme avant, et la même liste reste disponible plus tard
+sous Paramètres → <b>Réglages recommandés selon votre usage</b>.</p>
 
 <h3 id="firstrun-key">Votre clé API</h3>
 <p>Sur une installation réellement neuve, nzbfast se fabrique une clé API au premier
@@ -383,6 +392,17 @@ indexeur externe requis. La ligne d'état montre la progression du scan ;
 correspondante apparaît dans l'index, elle est récupérée automatiquement, avec
 préférences de qualité et règles de montée en qualité (une meilleure copie remplace
 la moins bonne).</p>
+<p>La carte peut aussi suivre une liste que vous tenez dans Plex. Ajoutez une
+<b>source de liste</b> : soit en liant votre compte Plex (vous approuvez un code
+court sur la page de Plex, donc aucun mot de passe n'atteint jamais nzbfast), soit
+en collant l'adresse de votre liste de suivi Plex. Traitez cette adresse comme un
+mot de passe - quiconque la détient peut lire votre liste - c'est pourquoi elle est
+masquée une fois enregistrée. Les titres synchronisés apparaissent en lignes de
+lecture seule à côté des vôtres. Un compte lié voit toute votre liste : retirer un
+titre là-bas arrête aussi son suivi ici (les téléchargements terminés ne sont jamais
+touchés) ; une adresse ne montre que les entrées les plus récentes, un titre absent
+peut donc simplement être sorti de la fenêtre et rien n'est retiré. Chaque
+comportement peut être inversé source par source.</p>
 <h3 id="dash-history">Historique</h3>
 <p>Les téléchargements récents, une ligne chacun. Les tâches échouées proposent <b>Réessayer</b> (reprise depuis le journal). Les archives
 chiffrées affichent un contrôle de déverrouillage 🔑 - saisissez le mot de passe et
@@ -509,6 +529,34 @@ c'est le bon fichier. Ouvrez-le pendant qu'il se télécharge, vérifiez que le
 contenu, la langue et la qualité correspondent à ce que vous attendiez, et
 annulez tôt si ce n'est pas le cas - au lieu de le découvrir après le
 téléchargement complet.</p>
+<p>La première moitié de tout cela est déjà sur la page. Ouvrez la ligne d'un
+téléchargement dans la file (ou dans l'historique) : le tiroir montre ce que
+contient le fichier vidéo, lu dans les octets déjà arrivés : résolution, codecs
+vidéo et audio, langues audio, sous-titres, chapitres. Une release qui est le
+mauvais montage, la mauvaise langue ou un upscale se trahit dans ce panneau bien
+avant la fin du téléchargement.</p>
+<p>La page détermine aussi si <em>ce</em> navigateur peut lire le fichier, et le
+dit au lieu de deviner : les navigateurs diffèrent (Safari décode le HEVC là où
+Chrome ne le fait pas, et presque aucun ne décode l'audio AC-3 ou DTS), la
+question est donc posée au navigateur dans lequel vous êtes réellement. Quand la
+réponse est oui, <b>▶ Lire</b> ouvre un lecteur directement dans la page, qui
+montre le fichier pendant qu'il se télécharge. La plupart des versions sont en
+MKV, un format que beaucoup de navigateurs refusent d'ouvrir alors qu'ils savent
+décoder tout ce qu'il contient : nzbfast les ré-emballe donc au fil de la
+lecture. Rien n'est ré-encodé : l'image et le son sont les octets d'origine dans
+une autre enveloppe, et le déplacement dans le fichier fonctionne toujours. Si
+la bande-son est une que ce navigateur ne sait pas décoder et que la release en
+porte une seconde qu'il sait lire, c'est cette seconde piste qui est jouée, pour
+que l'image n'arrive pas muette. Ce n'est que lorsque le navigateur n'a pas de
+décodeur pour la vidéo elle-même que le bouton confie le fichier à votre propre
+lecteur multimédia, comme décrit ci-dessous.</p>
+<p>Un seul réglage gouverne tout cela : Paramètres → Interface → <b>Vérifier un
+fichier pendant qu'il se télécharge</b>. <b>Détails seulement</b>, la valeur par
+défaut, montre le panneau et n'offre aucun lecteur dans la page ; <b>Détails et
+un lecteur</b> ajoute le lecteur ; <b>Désactivé</b> empêche toute lecture du
+fichier - avec cette option désactivée, rien n'ouvrira un fichier à moitié
+téléchargé pour qui que ce soit.</p>
+<p>Pour vérifier dans votre propre lecteur multimédia à la place :</p>
 <ul>
 <li><b>▶ Lire</b> sur le mur (ou <code>/m3u/&lt;id&gt;</code>) tend une URL à votre
 lecteur multimédia ; le daemon démarre ou réutilise le téléchargement derrière.</li>
@@ -545,8 +593,21 @@ entrer ou sortir n'importe quel serveur du pool. Chaque serveur a :</p>
 <tr><td>Connexions</td><td>Connexions simultanées par serveur. Utilisez le <b>Réglage des connexions</b> (<a href="#performance">§13</a>) pour trouver l'optimum de chaque fournisseur plutôt que de viser haut au hasard.</td></tr>
 <tr><td>Niveau (tier)</td><td>0 = primaire ; les niveaux supérieurs sont des serveurs de fill, sollicités uniquement pour les articles manqués par tous les niveaux inférieurs. Mettez les comptes illimités à 0, les comptes à bloc à 1+.</td></tr>
 <tr><td>Taille du bloc (GB)</td><td>Pour les comptes à bloc (payés au GB) : nzbfast suit l'usage cumulé par rapport à cette taille et cesse d'utiliser le serveur une fois le bloc épuisé (avertissement à 85 %).</td></tr>
+<tr><td>Chaque octet est facturé</td><td>À activer pour un compte facturé au volume. Vos téléchargements utilisent le serveur exactement comme avant ; ce qui s'arrête, c'est le trafic que nzbfast lui enverrait de sa propre initiative - le réglage automatique des connexions, l'étape réseau du benchmark système et les scans d'en-têtes pour l'index intégré le sautent tous. Indépendant du niveau et de la taille du bloc, car un compte facturé au volume peut être votre seul fournisseur et un compte illimité peut être au niveau 2. Désactivé par défaut. Le <b>Tester</b> manuel du <b>Réglage des connexions</b> (<a href="#performance">§13</a>) fonctionne toujours sur un serveur ainsi marqué et demande d'abord, puisque là c'est vous qui choisissez de dépenser.</td></tr>
 </table></div>
 <p><b>Laissez un peu de marge sous la limite de connexions de votre compte.</b> Régler les connexions un cran en dessous de la limite ne coûte rien : le débit plafonne bien avant les une ou deux dernières connexions, et le <b>Réglage des connexions</b> (<a href="#performance">§13</a>) s'arrête de toute façon en dessous. Ce sont ces places libres qui permettent à un deuxième appareil, à un autre client ou à une nouvelle tentative après une coupure de socket de passer quand même, au lieu d'être refusés pendant que celui-ci occupe toutes les places.</p>
+<p><b>Vous n'avez pas à gérer la limite de fichiers ouverts de votre machine.</b> Le
+système compte chaque connexion comme un fichier ouvert, et macOS démarre un programme
+avec une limite de 256 fichiers, un plafond qu'un jeu complet de connexions réparties sur
+plusieurs serveurs peut dépasser. Sur macOS et Linux, nzbfast relève lui-même cette
+limite au démarrage : il demande 65536 fichiers ouverts, puis redescend par 16384, 4096 et
+1024 jusqu'à ce que le système accepte, sans jamais dépasser la limite stricte fixée par
+le système, et il continue avec la limite qu'il avait si toutes les étapes sont refusées.
+Windows n'a pas de limite de ce type par processus. Les autres clients se contentent de la
+limite que le shell leur a donnée, et celui qui manque de fichiers ouverts en cours de
+tâche peut s'arrêter sans rien laisser dans son journal pour l'expliquer. Réglez donc les
+connexions de chaque serveur d'après ce que permet votre abonnement, marge ci-dessus
+déduite, et non d'après ce que vous imaginez que la machine supportera.</p>
 <h3 id="passwords">Comment vos mots de passe fournisseur sont stockés</h3>
 <p>Les mots de passe fournisseur dans <code>config.local.json</code> sont
 <b>obscurcis, pas chiffrés</b>. Ils sont stockés sous la forme <code>obf1:</code>
@@ -690,6 +751,7 @@ devinés.</p>
 <tr><td>Inclure le groupe de release</td><td>Le marqueur <code>-GROUP</code> à la fin.</td></tr>
 <tr><td>Supprimer les fichiers superflus</td><td><b>Activé par défaut.</b> Supprime les <code>.par2</code>, <code>.nzb</code>, <code>.sfv</code>, <code>.nfo</code> restants et les extraits d'échantillon des dossiers film/série terminés. Jamais la vidéo ni ses sous-titres.</td></tr>
 <tr><td>Ne garder que le fichier média</td><td><b>Désactivé par défaut, et destructeur :</b> supprime définitivement tout le dossier sauf la ou les vidéos et les sous-titres. Chaque épisode d'un pack de saison est conservé. Prend le pas sur <b>Supprimer les fichiers superflus</b> si les deux sont actifs.</td></tr>
+<tr><td>Nommer les téléchargements d'après le fichier .nzb</td><td><b>Désactivé par défaut.</b> Le dossier terminé et son fichier principal prennent le nom du fichier <code>.nzb</code>, au lieu du nom mis au propre déduit de la release. Seul le plus gros fichier est renommé : le reste d'un pack d'épisodes, l'échantillon, les sous-titres et le <code>.nfo</code> gardent les noms avec lesquels ils sont arrivés. Chaque catégorie peut l'autoriser ou l'interdire pour elle-même sous <b>Vos catégories</b>, ce qui permet de l'avoir pour un type de téléchargement et pas pour un autre.</td></tr>
 <tr><td>Keep the other words in the name</td><td><b>Activé par défaut.</b> Le sport, les courses et les autres événements sont souvent un même titre répété toute la saison, à un mot ou deux près - "Round11 Hungary Race" contre "Round11 Hungary Qualifying". Garder ces mots est ce qui empêche toute une saison de se réduire au même nom. Ne s'applique que là où le nom ne pouvait être mis au propre autrement, si bien que les films et épisodes ordinaires ne sont pas touchés.</td></tr>
 </table></div>
 <p class="dim">L'ensemble s'exécute après réparation et décompression et avant
@@ -800,6 +862,16 @@ tous les autres, ils sont écrits dans <code>settings.json</code>.</p>
 vos préférences de qualité, c'est tout. Les nouvelles releases sont récupérées dès
 qu'elles apparaissent dans vos groupes indexés ; les copies de meilleure qualité
 remplacent les précédentes ; une vue calendrier montre ce qui arrive.</p>
+<p>Une <b>source de liste</b> alimente la liste de suivi depuis une liste que vous
+tenez dans Plex, de deux façons : liez votre compte Plex en approuvant un code court
+sur la page de Plex, ou collez l'adresse d'une liste de suivi Plex. Cette adresse
+est une clé d'accès : elle donne à quiconque la détient le droit de lire la liste,
+elle est donc masquée après enregistrement. La synchronisation des retraits diffère
+volontairement selon le mode : un compte lié voit toute la liste, donc un titre
+retiré là-bas cesse d'être suivi ici (les téléchargements déjà terminés restent) ;
+un flux par adresse ne porte que les entrées les plus récentes, l'absence ne prouve
+donc rien et les titres ne sont jamais qu'ajoutés. Les deux réglages par défaut se
+changent source par source.</p>
 <h3 id="auto-rss">Flux RSS</h3>
 <p>Paramètres → RSS : n'importe quelle URL RSS newznab/indexeur, avec intervalle,
 catégorie et règles de filtrage par flux (motifs de titre, bornes de taille). Les
@@ -815,8 +887,65 @@ prêts pour Plex/Jellyfin sans outil externe.</p>
 pause/reprise/vitesse selon l'heure de la journée.</p>
 <h3>Scripts</h3>
 <p>Un script de post-traitement reçoit les arguments positionnels de SABnzbd et les
-variables d'environnement <code>SAB_*</code> - le vaste écosystème de scripts SAB
-tourne tel quel.</p>
+variables d'environnement <code>SAB_*</code> : le vaste écosystème de scripts SAB
+tourne tel quel. Le dialecte de NZBGet est fourni à côté - les variables
+<code>NZBPP_*</code> (<code>DIRECTORY</code>, <code>NZBNAME</code>, <code>CATEGORY</code>,
+<code>TOTALSTATUS</code>, <code>PARSTATUS</code>, <code>UNPACKSTATUS</code>,
+<code>FINALDIR</code>) et les codes de sortie 93/94/95 - si bien que la logique de
+base d'un script d'extension NZBGet tourne aussi. La correspondance est honnête
+plutôt qu'une émulation : la réparation et la décompression se font à l'intérieur
+du téléchargement en une passe, donc une fin propre rapporte <code>PARSTATUS=0</code>
+et une fin réparée <code>PARSTATUS=2</code>.
+Les formes d'options par script (<code>NZBPO_*</code>) ne sont pas fournies.
+Un script peut laisser un assistant tourner en arrière-plan à sa sortie et
+nzbfast ne le tuera pas, mais nzbfast cesse de lire la sortie du script dès que
+le script lui-même se termine : donnez à un assistant en arrière-plan sa propre
+redirection de sortie, sinon il sera arrêté à sa première tentative d'écrire.</p>
+<h3>Script pré-file</h3>
+<p>Un second crochet s'exécute <em>avant</em> qu'un téléchargement n'entre dans la
+file (Paramètres → Dossiers → Script pré-file), avec le contrat pre-queue de
+SABnzbd : les arguments <code>name, pp, category, script, priority, size, group</code>
+plus l'environnement <code>SAB_*</code>. La première ligne de sa sortie accepte
+(<code>1</code>) ou rejette (<code>0</code>) le téléchargement ; les lignes 2 à 7
+peuvent le renommer, fixer <code>pp</code>, changer la catégorie, choisir un script
+ou changer la priorité (une ligne vide garde la valeur par défaut). Un
+téléchargement rejeté va dans l'historique comme Échec avec la raison, et Réessayer
+depuis l'historique le ramène sans redemander au script. Le crochet ne peut jamais
+perdre un téléchargement : si le script est absent, plante, dépasse son budget de
+temps ou imprime quelque chose qui n'est pas un verdict, l'ajout se poursuit
+intact et le journal dit pourquoi.</p>
+<h3>Événements de cycle de vie et webhooks signés</h3>
+<p>Chaque jalon d'une tâche est un événement versionné : <code>job.added</code>,
+<code>job.started</code>, <code>job.finishing</code>, <code>job.repaired</code>,
+<code>job.completed</code>, <code>job.failed</code>, plus
+<code>queue.idle</code>, <code>giveup.tripped</code>, <code>disk.low</code>,
+<code>storage.slow</code> et <code>quota.reached</code>. Chacun porte
+<code>schema_version</code> (actuellement 1 ; de nouvelles clés peuvent apparaître
+sans incrément - ignorez ce que vous ne connaissez pas), un <code>seq</code>
+monotone et un horodatage <code>at</code> en millisecondes.</p>
+<p>Pour les recevoir, ajoutez une cible de notification <b>webhook</b>
+(Paramètres → Automatisation) et listez dans son champ <i>events</i> les genres
+d'événements qu'elle doit recevoir - des genres exacts, ou un préfixe comme
+<code>job.*</code>. La cible reçoit alors un POST par événement : le JSON de
+l'événement comme corps, plus un identifiant <code>delivery</code>
+(<code>&lt;boot&gt;-&lt;seq&gt;</code>, la poignée pour dédupliquer), les en-têtes
+<code>X-NzbFast-Event</code> et <code>X-NzbFast-Delivery</code>, et - quand la
+cible a un secret de signature - <code>X-NzbFast-Signature: sha256=&lt;hex&gt;</code>,
+un HMAC-SHA256 des octets exacts du corps sous votre secret (la même forme que
+celle des webhooks GitHub). Vérification en Python :</p>
+<pre><code>expected = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
+ok = hmac.compare_digest(expected, request.headers["X-NzbFast-Signature"])</code></pre>
+<p>La livraison est au-moins-une-fois : une cible injoignable est retentée après
+10&nbsp;s, 60&nbsp;s et 5&nbsp;min, puis abandonnée, l'échec étant affiché sur la
+ligne de réglages de la cible. Une réponse d'erreur HTTP (404, 401...) n'est pas
+retentée - réparez le récepteur et utilisez Test. Chaque cible a sa propre voie de
+livraison, si bien qu'une cible lente ou injoignable n'en retarde jamais une
+autre ; au sein d'une voie, les livraisons gardent l'ordre dans lequel les
+événements se sont produits, et si l'une est abandonnée, les numéros de séquence
+montrent le trou. Les mots d'événement classiques
+(<code>completed</code>, <code>failed</code>, <code>repaired</code>,
+<code>disk</code>, <code>quota</code>) gardent leur sens de notification humaine
+sur la même cible.</p>
 
 <h2 id="arr">11 · Sonarr, Radarr &amp; compagnie</h2>
 <p>nzbfast parle nativement l'API SABnzbd, donc chaque *arr fonctionne d'emblée - et
@@ -828,6 +957,12 @@ il peut aussi jouer le rôle de leur <em>indexeur</em>.</p>
 complète (où la trouver : <a href="#firstrun-key">§2</a>).</li>
 <li>Catégorie au choix (ex. <code>tv</code> / <code>movies</code>). Test → coche verte → Save.</li>
 </ol>
+<p>Le tableau de bord vous tend l'adresse : sur une installation qui n'a encore
+rien téléchargé, le parcours « Laisser Sonarr, Radarr ou une appli ajouter des
+téléchargements » de la carte de bienvenue montre l'adresse exacte avec un bouton
+<b>Copier</b> à côté. La clé API n'est délibérément pas sur cette ligne ; elle
+reste derrière son propre bouton de révélation dans Paramètres → Sécurité
+(<a href="#firstrun-key">§2</a>).</p>
 <p>File, historique, statut par tâche, « retirer &amp; supprimer », réessai et
 routage par catégorie se comportent comme les *arr l'attendent.</p>
 <h3>Comme indexeur (newznab)</h3>
@@ -878,7 +1013,18 @@ Paramètres → Accès à distance affiche les URL exactes et un QR code à scan
 <h3 id="remote-proxy">Accéder à nzbfast depuis l'extérieur de chez vous</h3>
 <p>Il n'y a pas de page de connexion, et c'est délibéré. Une connexion par cookie de session est une surface de sécurité à maintenir indéfiniment, et elle resterait le maillon le plus faible de tout ce qui est exposé à Internet. nzbfast s'authentifie plutôt avec votre clé API, et il accepte cette clé dans un en-tête de requête aussi bien que dans l'URL (<code>X-Api-Key</code>, ou <code>Authorization: Bearer</code>) - c'est ce qui permet à un service placé devant lui de gérer correctement la connexion.</p>
 <p><b>La solution la plus simple est de ne rien publier du tout.</b> Installez <b>Tailscale</b> sur cette machine et sur votre téléphone : les deux rejoignent un même réseau privé, rien n'est exposé, aucun réglage de routeur ni de certificat n'est nécessaire, et Réglages → Accès à distance affiche une adresse qui fonctionne de partout dès qu'il détecte Tailscale. Préférez cette voie sauf si vous avez besoin d'un domaine public.</p>
-<p><b>Si vous en avez vraiment besoin</b>, placez un proxy inverse devant, confiez-lui le certificat et laissez-le assurer l'authentification. Démarrez nzbfast avec <code>--bind 127.0.0.1</code> pour que le proxy soit la seule entrée, et pointez le proxy vers <code>http://127.0.0.1:6789</code> :</p>
+<p><b>nzbfast sait aussi servir le HTTPS lui-même.</b> Pointez Paramètres → Sécurité →
+Certificat HTTPS / Clé privée HTTPS vers un certificat PEM et sa clé (ou démarrez
+avec <code>--tls-cert cert.pem --tls-key key.pem</code>), redémarrez, et le tableau
+de bord et l'API répondent en <code>https://</code> au lieu du HTTP en clair - une
+seule écoute, un seul schéma. Utilisez le certificat que votre domaine possède déjà
+(par exemple de Let's Encrypt via certbot), ou un certificat auto-signé pour le
+LAN, que les navigateurs acceptent après un avertissement unique. Un certificat
+invalide ou expiré refuse le démarrage en nommant le fichier, l'erreur est donc
+visible là où vous l'avez faite ; renouvelez en remplaçant les fichiers et en
+redémarrant. Le HTTPS natif chiffre le trafic mais n'ajoute pas de connexion,
+gardez donc la clé API définie.</p>
+<p><b>S'il vous faut un domaine public</b>, placez un proxy inverse devant, confiez-lui le certificat et laissez-le assurer l'authentification. Démarrez nzbfast avec <code>--bind 127.0.0.1</code> pour que le proxy soit la seule entrée, et pointez le proxy vers <code>http://127.0.0.1:6789</code> :</p>
 <pre><code># Caddy
 example.com {
     reverse_proxy 127.0.0.1:6789
@@ -892,7 +1038,11 @@ location / {
     proxy_set_header X-Forwarded-Proto $scheme;
 }</code></pre>
 <p>Ajoutez par-dessus ce que propose votre proxy : authentification basique, un service de forward-auth comme Authelia ou Authentik, ou des certificats client. Un détail piège tout le monde - Sonarr, Radarr et les applications mobiles ne peuvent pas effectuer une connexion via navigateur, laissez-leur donc un passage. La plupart des proxys savent laisser passer une requête portant un en-tête <code>X-Api-Key</code> valide et exiger l'authentification pour tout le reste.</p>
-<div class="warn-box"><b>Ne redirigez pas simplement le port 6789 sur votre routeur.</b> Le tableau de bord parle du HTTP en clair : votre clé API et tout ce que vous en faites traverseraient Internet lisibles par quiconque sur le trajet, et une installation sans aucune clé est ouverte à qui la trouve. Si vous redirigez un port malgré tout, définissez d'abord une clé API.</div>
+<div class="warn-box"><b>Ne redirigez pas simplement le port 6789 sur votre routeur.</b>
+Sans certificat configuré, le tableau de bord parle du HTTP en clair : votre clé API
+et tout ce que vous en faites traverseraient Internet lisibles par quiconque sur le
+trajet, et une installation sans aucune clé est ouverte à qui la trouve. Si vous
+redirigez un port malgré tout, définissez d'abord une clé API et activez le HTTPS.</div>
 
 <h2 id="performance">13 · Outils de performance</h2>
 <h3 id="perf-benchmark">Benchmark système</h3>

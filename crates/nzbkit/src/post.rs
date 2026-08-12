@@ -73,9 +73,9 @@ pub struct PostOpts {
 #[derive(Debug, Clone)]
 pub struct PostedSegment {
     /// 1-based part number within the file.
-    pub number: u32,
+    pub(crate) number: u32,
     /// Message-ID without angle brackets.
-    pub message_id: String,
+    pub(crate) message_id: String,
     /// Encoded (yEnc body) size in bytes.
     pub bytes: u64,
 }
@@ -83,10 +83,10 @@ pub struct PostedSegment {
 /// One posted file with its article set.
 #[derive(Debug, Clone)]
 pub struct PostedFile {
-    pub name: String,
-    pub subject: String,
+    pub(crate) name: String,
+    pub(crate) subject: String,
     /// Unix time stamped into the articles' Date headers.
-    pub date: i64,
+    pub(crate) date: i64,
     /// Decoded file size.
     pub size: u64,
     pub segments: Vec<PostedSegment>,
@@ -95,7 +95,7 @@ pub struct PostedFile {
 /// A completed post: everything the NZB needs.
 #[derive(Debug, Clone)]
 pub struct PostedSet {
-    pub group: String,
+    pub(crate) group: String,
     pub from: String,
     pub files: Vec<PostedFile>,
 }

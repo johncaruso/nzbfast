@@ -1,6 +1,7 @@
 use super::*;
 use crate::volume_extract::{FragmentOpener, LazyChainedReader, SplitVolumeState, SplitVolumeStep};
 use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
 
 enum CodecState {
     Unpack15(Box<Unpack15>),
@@ -151,11 +152,12 @@ impl CodecState {
     /// back instead of being checked here.
     ///
     /// A split member's expected CRC is its LAST fragment's - every
-    /// earlier fragment carries a running value, measured on the RAR 3.00
-    /// multivolume fixtures - and the incremental split path drives the
-    /// decode from the FIRST fragment's shape, which is all that is
-    /// needed (name, method, unpack version and unpacked size repeat
-    /// across fragments, and the walk validates that they do).
+    /// earlier fragment carries the CRC of its own PACKED bytes instead
+    /// (see [`FileHeader::split_fragment_packed_crc`]), measured on the
+    /// RAR 3.00 multivolume fixtures - and the incremental split path
+    /// drives the decode from the FIRST fragment's shape, which is all
+    /// that is needed (name, method, unpack version and unpacked size
+    /// repeat across fragments, and the walk validates that they do).
     fn decode_split_to(
         &mut self,
         input: &mut impl Read,
@@ -305,6 +307,21 @@ impl<'a> DecoderSession<'a> {
 impl FileHeader {
     fn is_empty_compressed_payload(&self) -> bool {
         !self.is_stored() && self.pack_size == 0 && self.unp_size == 0
+    }
+
+    /// The CRC this fragment's PACKED bytes must hash to, when the header
+    /// carries one. WinRAR stamps every NON-final fragment of a split
+    /// member (unpack version 2.0 and later; 1.5x writes 0xffffffff
+    /// there) with the CRC of that fragment's stored bytes - the raw
+    /// ciphertext for encrypted members - while the FINAL fragment
+    /// carries the whole member's unpacked CRC. unrar checks it at every
+    /// volume boundary (UIERROR_CHECKSUMPACKED), which is what localizes
+    /// damage to one volume instead of failing the member at its end;
+    /// both split walks do the same. Measured on the RAR 1.54 and 3.00
+    /// multivolume fixtures.
+    fn split_fragment_packed_crc(&self) -> Option<u32> {
+        (self.is_split_after() && self.unp_ver >= 20 && self.file_crc != 0xffff_ffff)
+            .then_some(self.file_crc)
     }
 }
 
@@ -771,6 +788,11 @@ struct GrowingChainedReader<'a, P, C> {
     /// the decoder has read.
     frag_start: u64,
     frag_pos: u64,
+    /// Running CRC of the fragment's packed bytes, checked against
+    /// [`FileHeader::split_fragment_packed_crc`] when the fragment reads
+    /// out - the check that localizes damage to one volume.
+    frag_crc: Crc32,
+    frag_expected_crc: Option<u32>,
     /// The finish fragment (no SPLIT_AFTER) has been appended.
     last_seen: bool,
     /// Fragments already reported wholly consumed.
@@ -807,6 +829,8 @@ where
             cursor: None,
             frag_start: 0,
             frag_pos: 0,
+            frag_crc: Crc32::new(),
+            frag_expected_crc: None,
             last_seen: !first.is_split_after(),
             reported: 0,
             error: None,
@@ -924,6 +948,8 @@ where
         let range = file.packed_range.clone();
         self.frag_start = range.start as u64;
         self.frag_pos = 0;
+        self.frag_crc = Crc32::new();
+        self.frag_expected_crc = file.split_fragment_packed_crc();
         self.cursor = Some(archive.owned_range_reader(range)?);
         Ok(())
     }
@@ -952,11 +978,26 @@ where
                 let read = cursor.read(out)?;
                 if read != 0 {
                     self.frag_pos += read as u64;
+                    self.frag_crc.update(&out[..read]);
                     self.report();
                     return Ok(read);
                 }
                 // Drop the finished fragment BEFORE opening the next one.
                 self.cursor = None;
+                // The fragment is read out; its own header says what its
+                // packed bytes must hash to. Checked BEFORE the volume is
+                // reported consumed - the caller may act on that report.
+                if let Some(expected) = self.frag_expected_crc.take() {
+                    let actual = self.frag_crc.finish();
+                    if actual != expected {
+                        let (volume_index, _) = self.pending.fragments[self.at];
+                        return Err(self.fail(Error::SplitFragmentCrc32Mismatch {
+                            volume: volume_index,
+                            expected,
+                            actual,
+                        }));
+                    }
+                }
                 if self.last_seen && self.at + 1 == self.pending.fragments.len() {
                     self.report();
                     return Ok(0);
@@ -1015,6 +1056,64 @@ fn validate_split_continuation_refs(
         return Err(Error::InvalidHeader("RAR 3.x split entry salt changed"));
     }
     Ok(())
+}
+
+/// The typed error behind the io error a [`FragmentCrcReader`] hands the
+/// decoder - `Read::read` has no other channel, and the whole-set walk
+/// recovers it after the decode stops (the incremental path has
+/// [`GrowingChainedReader::take_error`] for the same job). Shared because
+/// the wrapper lives inside a fragment opener while the walk holds the
+/// other end.
+type SharedFragmentError = Arc<Mutex<Option<Error>>>;
+
+/// One split fragment's packed bytes, verified against the CRC the
+/// fragment's OWN header carries as the chain reads it out - see
+/// [`FileHeader::split_fragment_packed_crc`]. This is what fails a
+/// damaged set at the first bad volume, naming it, instead of decoding
+/// the whole member and failing on the final unpacked CRC.
+struct FragmentCrcReader<'a> {
+    inner: Box<dyn Read + Send + 'a>,
+    crc: Crc32,
+    expected: u32,
+    volume: usize,
+    slot: SharedFragmentError,
+    failed: bool,
+}
+
+impl Read for FragmentCrcReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        // Keep failing on any read after a mismatch: a caller that
+        // swallowed the first error must not see a clean EOF, advance the
+        // chain and finish the member as if the fragment were sound.
+        if self.failed {
+            return Err(std::io::Error::other(
+                "RAR 1.5 split fragment packed data checksum mismatch",
+            ));
+        }
+        // An empty read must not look like fragment EOF and trigger the
+        // check early.
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let read = self.inner.read(out)?;
+        if read != 0 {
+            self.crc.update(&out[..read]);
+            return Ok(read);
+        }
+        let actual = self.crc.finish();
+        if actual != self.expected {
+            self.failed = true;
+            let error = Error::SplitFragmentCrc32Mismatch {
+                volume: self.volume,
+                expected: self.expected,
+                actual,
+            };
+            let message = error.to_string();
+            *self.slot.lock().unwrap() = Some(error);
+            return Err(std::io::Error::other(message));
+        }
+        Ok(0)
+    }
 }
 
 struct PendingSplitRefs {
@@ -1089,46 +1188,56 @@ impl PendingSplitRefs {
         let spent = spent.map(|f| {
             Box::new(move |volume: usize| f(volume)) as Box<dyn FnMut(usize) + Send + '_>
         });
-        let mut reader = self.fragment_reader(volumes, password, spent)?;
+        let fragment_error: SharedFragmentError = Arc::default();
+        let mut reader = self.fragment_reader(volumes, password, spent, &fragment_error)?;
 
-        if final_file.is_stored() {
-            let expected_len = usize::try_from(final_file.unp_size)
-                .map_err(|_| Error::InvalidHeader("RAR 1.5 split unpacked size overflows usize"))?;
-            let actual_len = self.packed_size(volumes)?;
-            let expected_packed_len =
-                if self.encrypted && self.unp_ver >= 20 {
-                    expected_len.checked_add(15).map(|len| len & !15).ok_or(
-                        Error::InvalidHeader("RAR 2.x encrypted split stored size overflows"),
-                    )?
-                } else {
-                    expected_len
+        let result = (|| {
+            if final_file.is_stored() {
+                let expected_len = usize::try_from(final_file.unp_size).map_err(|_| {
+                    Error::InvalidHeader("RAR 1.5 split unpacked size overflows usize")
+                })?;
+                let actual_len = self.packed_size(volumes)?;
+                let expected_packed_len =
+                    if self.encrypted && self.unp_ver >= 20 {
+                        expected_len.checked_add(15).map(|len| len & !15).ok_or(
+                            Error::InvalidHeader("RAR 2.x encrypted split stored size overflows"),
+                        )?
+                    } else {
+                        expected_len
+                    };
+                if actual_len != expected_packed_len {
+                    return Err(Error::InvalidHeader(
+                        "RAR 1.5 split stored file has wrong reassembled size",
+                    ));
+                }
+
+                let mut crc = Crc32::new();
+                let mut crc_writer = CrcWriter {
+                    inner: &mut writer,
+                    crc: &mut crc,
                 };
-            if actual_len != expected_packed_len {
-                return Err(Error::InvalidHeader(
-                    "RAR 1.5 split stored file has wrong reassembled size",
-                ));
+                let copied =
+                    std::io::copy(&mut reader.take(expected_len as u64), &mut crc_writer)?;
+                if copied != expected_len as u64 {
+                    return Err(Error::InvalidHeader(
+                        "RAR 1.5 split stored file ended before unpacked size",
+                    ));
+                }
+                let actual = crc.finish();
+                final_file
+                    .crc_result(actual, password)
+                    .map_err(|error| final_file.entry_error("extracting", error))
+            } else {
+                session
+                    .write_split_to(&mut reader, final_file, &mut writer)
+                    .map_err(|error| final_file.entry_error("extracting", error))
             }
-
-            let mut crc = Crc32::new();
-            let mut crc_writer = CrcWriter {
-                inner: &mut writer,
-                crc: &mut crc,
-            };
-            let copied = std::io::copy(&mut reader.take(expected_len as u64), &mut crc_writer)?;
-            if copied != expected_len as u64 {
-                return Err(Error::InvalidHeader(
-                    "RAR 1.5 split stored file ended before unpacked size",
-                ));
-            }
-            let actual = crc.finish();
-            final_file
-                .crc_result(actual, password)
-                .map_err(|error| final_file.entry_error("extracting", error))
-        } else {
-            session
-                .write_split_to(&mut reader, final_file, &mut writer)
-                .map_err(|error| final_file.entry_error("extracting", error))
-        }
+        })();
+        // A fragment CRC mismatch reaches here as the io error the decoder
+        // (or the stored copy) stopped on; the typed error it wraps names
+        // the bad volume and is the one to report - bare, exactly as the
+        // incremental path reports it through `take_error`.
+        result.map_err(|error| fragment_error.lock().unwrap().take().unwrap_or(error))
     }
 
     fn packed_size(&self, volumes: &[Archive]) -> Result<usize> {
@@ -1157,6 +1266,7 @@ impl PendingSplitRefs {
         volumes: &'a [Archive],
         password: Option<&[u8]>,
         spent: Option<Box<dyn FnMut(usize) + Send + 'a>>,
+        fragment_error: &SharedFragmentError,
     ) -> Result<Box<dyn Read + Send + 'a>> {
         // Fragments are RESOLVED here (a missing volume or entry still fails
         // before a byte is read) but opened one at a time as the chain
@@ -1178,8 +1288,21 @@ impl PendingSplitRefs {
                 .nth(file_index)
                 .ok_or(Error::InvalidHeader("RAR 1.5 split entry is missing"))?;
             let range = file.packed_range.clone();
+            let expected_crc = file.split_fragment_packed_crc();
+            let slot = Arc::clone(fragment_error);
             openers.push(Box::new(move || {
-                archive.range_reader(range).map_err(std::io::Error::other)
+                let reader = archive.range_reader(range).map_err(std::io::Error::other)?;
+                Ok(match expected_crc {
+                    Some(expected) => Box::new(FragmentCrcReader {
+                        inner: reader,
+                        crc: Crc32::new(),
+                        expected,
+                        volume: volume_index,
+                        slot,
+                        failed: false,
+                    }) as Box<dyn Read + Send + 'a>,
+                    None => reader,
+                })
             }));
             marks.push((position + 1 < self.fragments.len()).then_some(volume_index));
         }
@@ -1467,6 +1590,29 @@ mod tests {
         assert_eq!(out, plain);
     }
 
+    /// The per-fragment packed CRC gate: only NON-final fragments carry
+    /// one, RAR 1.5x stamps 0xffffffff there instead of a hash, and the
+    /// final fragment's CRC is the member's unpacked one - never a
+    /// packed-bytes expectation.
+    #[test]
+    fn split_fragment_packed_crc_applies_to_nonfinal_modern_fragments_only() {
+        let mut middle = file(b"a", FHD_SPLIT_BEFORE | FHD_SPLIT_AFTER);
+        middle.file_crc = 0x1234_5678;
+        assert_eq!(middle.split_fragment_packed_crc(), Some(0x1234_5678));
+
+        let mut last = middle.clone();
+        last.block.flags = FHD_SPLIT_BEFORE;
+        assert_eq!(last.split_fragment_packed_crc(), None);
+
+        let mut old = middle.clone();
+        old.unp_ver = 15;
+        assert_eq!(old.split_fragment_packed_crc(), None);
+
+        let mut unstamped = middle.clone();
+        unstamped.file_crc = 0xffff_ffff;
+        assert_eq!(unstamped.split_fragment_packed_crc(), None);
+    }
+
     #[test]
     fn validate_split_fragment_rejects_directories_and_demands_password_for_encrypted() {
         let dir = file(b"d", FHD_DIRECTORY_MASK | FHD_SPLIT_AFTER);
@@ -1590,6 +1736,9 @@ mod tests {
         first.unp_ver = 20;
         first.pack_size = split as u64;
         first.packed_range = 0..split;
+        // The non-final fragment's header CRC is the CRC of its own
+        // PACKED bytes - the ciphertext - and the chain verifies it.
+        first.file_crc = crate::crc32::crc32(&encrypted[..split]);
 
         let mut second = file(b"a.txt", FHD_PASSWORD | FHD_SPLIT_BEFORE);
         second.unp_ver = 20;
@@ -1603,7 +1752,9 @@ mod tests {
             archive_with_source(vec![Block::File(second)], encrypted[split..].to_vec()),
         ];
 
-        let reader = pending.fragment_reader(&volumes, Some(b"pw"), None).unwrap();
+        let reader = pending
+            .fragment_reader(&volumes, Some(b"pw"), None, &Arc::default())
+            .unwrap();
         let out = read_in_small_chunks(reader);
 
         assert_eq!(out, plain);
@@ -1875,7 +2026,7 @@ mod tests {
         let pending = PendingSplitRefs::new(&f, 9, 0);
         let no_volumes: Vec<Archive> = Vec::new();
         assert!(matches!(
-            pending.fragment_reader(&no_volumes, None, None),
+            pending.fragment_reader(&no_volumes, None, None, &Arc::default()),
             Err(Error::InvalidHeader(_))
         ));
 
@@ -1883,7 +2034,7 @@ mod tests {
         pending.fragments[0] = (0, 7);
         let one_volume = vec![archive_with(vec![Block::File(f)])];
         assert!(matches!(
-            pending.fragment_reader(&one_volume, None, None),
+            pending.fragment_reader(&one_volume, None, None, &Arc::default()),
             Err(Error::InvalidHeader(_))
         ));
     }
@@ -1896,7 +2047,7 @@ mod tests {
         let pending = PendingSplitRefs::new(&first, 0, 0);
         let volumes = vec![archive_with_source(vec![Block::File(first)], Vec::new())];
         assert!(matches!(
-            pending.fragment_reader(&volumes, None, None),
+            pending.fragment_reader(&volumes, None, None, &Arc::default()),
             Err(Error::NeedPassword)
         ));
     }
@@ -1909,6 +2060,9 @@ mod tests {
         let mut first = file(b"a.txt", FHD_SPLIT_AFTER);
         first.pack_size = split as u64;
         first.packed_range = 0..split;
+        // The non-final fragment's header CRC is the CRC of its own
+        // PACKED bytes, and the chain verifies it.
+        first.file_crc = crate::crc32::crc32(&plain[..split]);
         let mut second = file(b"a.txt", FHD_SPLIT_BEFORE);
         second.pack_size = (plain.len() - split) as u64;
         second.packed_range = 0..(plain.len() - split);
@@ -1920,9 +2074,49 @@ mod tests {
             archive_with_source(vec![Block::File(second)], plain[split..].to_vec()),
         ];
 
-        let reader = pending.fragment_reader(&volumes, None, None).unwrap();
+        let reader = pending
+            .fragment_reader(&volumes, None, None, &Arc::default())
+            .unwrap();
         let out = read_in_small_chunks(reader);
         assert_eq!(out, plain);
+    }
+
+    /// A middle fragment whose packed bytes do not hash to its own
+    /// header CRC fails the chain at THAT fragment, and the typed error
+    /// naming the volume is recoverable from the shared slot.
+    #[test]
+    fn pending_split_refs_fragment_reader_fails_a_fragment_with_a_wrong_packed_crc() {
+        let plain: &[u8] = b"hello, this string is split across two volumes!";
+        let split = 11usize;
+
+        let mut first = file(b"a.txt", FHD_SPLIT_AFTER);
+        first.pack_size = split as u64;
+        first.packed_range = 0..split;
+        first.file_crc = crate::crc32::crc32(&plain[..split]) ^ 0xdead_beef;
+        let mut second = file(b"a.txt", FHD_SPLIT_BEFORE);
+        second.pack_size = (plain.len() - split) as u64;
+        second.packed_range = 0..(plain.len() - split);
+
+        let mut pending = PendingSplitRefs::new(&first, 0, 0);
+        pending.append(&second, 1, 0).unwrap();
+        let volumes = vec![
+            archive_with_source(vec![Block::File(first)], plain[..split].to_vec()),
+            archive_with_source(vec![Block::File(second)], plain[split..].to_vec()),
+        ];
+
+        let slot: SharedFragmentError = Arc::default();
+        let mut reader = pending.fragment_reader(&volumes, None, None, &slot).unwrap();
+        let mut out = Vec::new();
+        let error = reader.read_to_end(&mut out).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(out.len(), split, "the chain stops at the bad boundary");
+        assert!(matches!(
+            slot.lock().unwrap().take(),
+            Some(Error::SplitFragmentCrc32Mismatch { volume: 0, .. })
+        ));
+        // Any read after the mismatch keeps failing - the chain must not
+        // resume as if the fragment were sound.
+        assert!(reader.read(&mut [0u8; 4]).is_err());
     }
 
     #[test]
@@ -2059,7 +2253,9 @@ mod tests {
         first.pack_size = split as u64;
         first.unp_size = payload.len() as u64;
         first.packed_range = 0..split;
-        first.file_crc = super::super::crc32(&payload);
+        // A non-final fragment carries the CRC of its OWN packed bytes;
+        // only the final one carries the member's unpacked CRC.
+        first.file_crc = super::super::crc32(&payload[..split]);
 
         let mut second = file(b"split.txt", FHD_SPLIT_BEFORE);
         second.unp_ver = 20;
@@ -2248,7 +2444,10 @@ mod tests {
         first.pack_size = split as u64;
         first.unp_size = unpacked_len as u64;
         first.packed_range = 0..split;
-        first.file_crc = crc;
+        // A non-final fragment carries the CRC of its OWN packed bytes -
+        // the ciphertext for an encrypted member; only the final one
+        // carries the member's unpacked CRC.
+        first.file_crc = super::super::crc32(&encrypted[..split]);
 
         let mut second = file(b"split.bin", FHD_PASSWORD | FHD_SPLIT_BEFORE);
         second.unp_ver = 20;

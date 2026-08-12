@@ -157,8 +157,11 @@ fn ntt_gates_route_field_shapes_correctly() {
     // Light/medium damage: fold.
     assert!(!ntt_gates_pass(65536, 16381, 3, 2, 4 * gib));
     assert!(!ntt_gates_pass(65536, 16283, 101, 100, 4 * gib));
-    // Below the measured crossover margin: fold.
-    assert!(!ntt_gates_pass(65536, 15934, 450, 449, 4 * gib));
+    // Below the measured crossover margin: fold. 300 sits under the
+    // m~288 end-to-end crossover measured on both the 32-core and the
+    // 20-core box; 384 (the gate) sits above it.
+    assert!(!ntt_gates_pass(65536, 16084, 300, 299, 4 * gib));
+    assert!(ntt_gates_pass(65536, 16000, 384, 383, 4 * gib));
     // Small source set (640 KiB / 1 MiB blocks at ~1 GiB): fold,
     // regardless of damage fraction.
     assert!(!ntt_gates_pass(655360, 870, 768, 767, 4 * gib));
@@ -221,18 +224,22 @@ fn ntt_syndrome_path_matches_fold_path() {
 }
 
 /// The smallest `(block_size, n_inputs, n_missing)` that clears
-/// every clause of [`ntt_gates_pass`]: 8192 present slices, 512
-/// missing, max exponent 511 under the 3x factor. At a 1 KiB block
-/// the stripe geometry is one stripe wide, so the worker count
-/// clamps to 1 on EVERY machine and the whole footprint is ~17 MB
-/// (8 MB corpus + 9 MB arena). The admission tests use this rather
-/// than the 64 KiB/16384/1500 benchmark leg because that leg needs
-/// 930 MB of corpus budget on top of a core-count-dependent arena
-/// charge, which made the expected value a function of the host's
-/// RAM, its cgroup limit and its visible parallelism: red on a
-/// 4 GiB dev box, in a `--memory=4g` container on a many-core
-/// host, and under any exported `NZBFAST_NTT_BUDGET`.
-const MINIMAL_NTT_SHAPE: (usize, usize, usize) = (1024, 8704, 512);
+/// every clause of [`ntt_gates_pass`]: 8192 present slices,
+/// `NTT_MIN_MISSING` missing, max exponent one under it and so
+/// inside the 3x factor. At a 1 KiB block the stripe geometry is one
+/// stripe wide, so the worker count clamps to 1 on EVERY machine and
+/// the whole footprint is 8 MB of corpus plus a single worker's
+/// arena. The admission tests use this rather than the
+/// 64 KiB/16384/1500 benchmark leg because that leg needs 930 MB of
+/// corpus budget on top of a core-count-dependent arena charge,
+/// which made the expected value a function of the host's RAM, its
+/// cgroup limit and its visible parallelism: red on a 4 GiB dev box,
+/// in a `--memory=4g` container on a many-core host, and under any
+/// exported `NZBFAST_NTT_BUDGET`.
+///
+/// Tracks `NTT_MIN_MISSING` deliberately: a shape that stops being
+/// minimal when the gate moves stops testing the gate's boundary.
+const MINIMAL_NTT_SHAPE: (usize, usize, usize) = (1024, 8192 + NTT_MIN_MISSING, NTT_MIN_MISSING);
 
 /// True when any NTT knob is exported. All four move what
 /// [`resolve_syndrome_path`] returns - the budget directly, `W` and

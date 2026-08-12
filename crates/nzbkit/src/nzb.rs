@@ -18,6 +18,14 @@ pub enum NzbError {
     Encoding(#[from] quick_xml::encoding::EncodingError),
     #[error("NZB contains no files")]
     Empty,
+    #[error("NZB truncated: document ends inside an open element")]
+    Truncated,
+    /// An entity in element text that is neither predefined, a character
+    /// reference, nor one of the HTML latin-1 names indexers write.
+    /// Refused rather than dropped: see the `GeneralRef` arm in
+    /// [`Nzb::parse`].
+    #[error("NZB uses an undefined entity: &{0};")]
+    UnknownEntity(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +92,125 @@ pub(crate) fn is_wire_safe(s: &str) -> bool {
         .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>'))
 }
 
+/// HTML's ISO-8859-1 named entities (U+00A0..U+00FF), which are NOT
+/// defined in XML. NZBIndex-era generators emitted subjects like
+/// `gesch&auml;ndeten` straight from HTML-escaped listings, so real
+/// NZBs in the wild carry them (nzbget hit the same files: its issue
+/// #699 is exactly this, and SABnzbd accepts them). Resolving just this
+/// closed set keeps everything else strict - an entity outside the
+/// table still fails the parse.
+fn html_latin1_entity(name: &str) -> Option<&'static str> {
+    Some(match name {
+        // The XML predefined five: quick-xml's `*_with` normalizer uses
+        // the supplied resolver INSTEAD of its predefined table (the
+        // fallback documented on `unescape_with` does not apply on the
+        // attribute-normalization path), so they must be listed here or
+        // `&quot;` stops resolving.
+        "amp" => "&",
+        "lt" => "<",
+        "gt" => ">",
+        "quot" => "\"",
+        "apos" => "'",
+        "nbsp" => "\u{a0}",
+        "iexcl" => "¡",
+        "cent" => "¢",
+        "pound" => "£",
+        "curren" => "¤",
+        "yen" => "¥",
+        "brvbar" => "¦",
+        "sect" => "§",
+        "uml" => "¨",
+        "copy" => "©",
+        "ordf" => "ª",
+        "laquo" => "«",
+        "not" => "¬",
+        "shy" => "\u{ad}",
+        "reg" => "®",
+        "macr" => "¯",
+        "deg" => "°",
+        "plusmn" => "±",
+        "sup2" => "²",
+        "sup3" => "³",
+        "acute" => "´",
+        "micro" => "µ",
+        "para" => "¶",
+        "middot" => "·",
+        "cedil" => "¸",
+        "sup1" => "¹",
+        "ordm" => "º",
+        "raquo" => "»",
+        "frac14" => "¼",
+        "frac12" => "½",
+        "frac34" => "¾",
+        "iquest" => "¿",
+        "Agrave" => "À",
+        "Aacute" => "Á",
+        "Acirc" => "Â",
+        "Atilde" => "Ã",
+        "Auml" => "Ä",
+        "Aring" => "Å",
+        "AElig" => "Æ",
+        "Ccedil" => "Ç",
+        "Egrave" => "È",
+        "Eacute" => "É",
+        "Ecirc" => "Ê",
+        "Euml" => "Ë",
+        "Igrave" => "Ì",
+        "Iacute" => "Í",
+        "Icirc" => "Î",
+        "Iuml" => "Ï",
+        "ETH" => "Ð",
+        "Ntilde" => "Ñ",
+        "Ograve" => "Ò",
+        "Oacute" => "Ó",
+        "Ocirc" => "Ô",
+        "Otilde" => "Õ",
+        "Ouml" => "Ö",
+        "times" => "×",
+        "Oslash" => "Ø",
+        "Ugrave" => "Ù",
+        "Uacute" => "Ú",
+        "Ucirc" => "Û",
+        "Uuml" => "Ü",
+        "Yacute" => "Ý",
+        "THORN" => "Þ",
+        "szlig" => "ß",
+        "agrave" => "à",
+        "aacute" => "á",
+        "acirc" => "â",
+        "atilde" => "ã",
+        "auml" => "ä",
+        "aring" => "å",
+        "aelig" => "æ",
+        "ccedil" => "ç",
+        "egrave" => "è",
+        "eacute" => "é",
+        "ecirc" => "ê",
+        "euml" => "ë",
+        "igrave" => "ì",
+        "iacute" => "í",
+        "icirc" => "î",
+        "iuml" => "ï",
+        "eth" => "ð",
+        "ntilde" => "ñ",
+        "ograve" => "ò",
+        "oacute" => "ó",
+        "ocirc" => "ô",
+        "otilde" => "õ",
+        "ouml" => "ö",
+        "divide" => "÷",
+        "oslash" => "ø",
+        "ugrave" => "ù",
+        "uacute" => "ú",
+        "ucirc" => "û",
+        "uuml" => "ü",
+        "yacute" => "ý",
+        "thorn" => "þ",
+        "yuml" => "ÿ",
+        _ => return None,
+    })
+}
+
 impl Nzb {
     // quick_xml deprecated `unescape_value` in favour of
     // `normalized_value`, which ALSO applies XML attribute-value
@@ -105,56 +232,72 @@ impl Nzb {
         let mut cur_file: Option<NzbFile> = None;
         let mut cur_segment: Option<Segment> = None;
         let mut cur_meta: Option<(String, String)> = None;
-        let mut in_group = false;
+        // Group names accumulate like meta values rather than being
+        // pushed per text EVENT: an entity splits one name into
+        // Text/GeneralRef/Text, and pushing each fragment invented two
+        // groups out of one ("alt.bin&amp;ary" became `alt.bin` + `ary`,
+        // neither of which exists).
+        let mut cur_group: Option<String> = None;
+        // quick-xml reports Eof, not an error, when the input ends with
+        // elements still open - a truncated NZB would otherwise "parse"
+        // as whatever files happened to close before the cut, and the
+        // shrunken manifest finishes green with data missing.
+        let mut depth: usize = 0;
         let mut buf = Vec::new();
 
         loop {
             match reader.read_event_into(&mut buf)? {
-                Event::Start(e) => match e.local_name().as_ref() {
-                    b"file" => {
-                        let mut f = NzbFile::default();
-                        for attr in e.attributes() {
-                            let attr = attr?;
-                            let val = attr.unescape_value()?;
-                            match attr.key.local_name().as_ref() {
-                                b"subject" => f.subject = val.into_owned(),
-                                b"poster" => f.poster = val.into_owned(),
-                                b"date" => f.date = val.trim().parse().unwrap_or(0),
-                                _ => {}
+                Event::Start(e) => {
+                    depth += 1;
+                    match e.local_name().as_ref() {
+                        b"file" => {
+                            let mut f = NzbFile::default();
+                            for attr in e.attributes() {
+                                let attr = attr?;
+                                let val = attr.unescape_value_with(html_latin1_entity)?;
+                                match attr.key.local_name().as_ref() {
+                                    b"subject" => f.subject = val.into_owned(),
+                                    b"poster" => f.poster = val.into_owned(),
+                                    b"date" => f.date = val.trim().parse().unwrap_or(0),
+                                    _ => {}
+                                }
                             }
+                            cur_file = Some(f);
                         }
-                        cur_file = Some(f);
-                    }
-                    b"group" => in_group = true,
-                    b"meta" => {
-                        let mut ty = String::new();
-                        for attr in e.attributes() {
-                            let attr = attr?;
-                            if attr.key.local_name().as_ref() == b"type" {
-                                ty = attr.unescape_value()?.trim().to_lowercase();
+                        b"group" => cur_group = Some(String::new()),
+                        b"meta" => {
+                            let mut ty = String::new();
+                            for attr in e.attributes() {
+                                let attr = attr?;
+                                if attr.key.local_name().as_ref() == b"type" {
+                                    ty = attr
+                                        .unescape_value_with(html_latin1_entity)?
+                                        .trim()
+                                        .to_lowercase();
+                                }
                             }
+                            cur_meta = Some((ty, String::new()));
                         }
-                        cur_meta = Some((ty, String::new()));
-                    }
-                    b"segment" => {
-                        let mut seg = Segment {
-                            number: 0,
-                            bytes: 0,
-                            message_id: String::new(),
-                        };
-                        for attr in e.attributes() {
-                            let attr = attr?;
-                            let val = attr.unescape_value()?;
-                            match attr.key.local_name().as_ref() {
-                                b"bytes" => seg.bytes = val.trim().parse().unwrap_or(0),
-                                b"number" => seg.number = val.trim().parse().unwrap_or(0),
-                                _ => {}
+                        b"segment" => {
+                            let mut seg = Segment {
+                                number: 0,
+                                bytes: 0,
+                                message_id: String::new(),
+                            };
+                            for attr in e.attributes() {
+                                let attr = attr?;
+                                let val = attr.unescape_value_with(html_latin1_entity)?;
+                                match attr.key.local_name().as_ref() {
+                                    b"bytes" => seg.bytes = val.trim().parse().unwrap_or(0),
+                                    b"number" => seg.number = val.trim().parse().unwrap_or(0),
+                                    _ => {}
+                                }
                             }
+                            cur_segment = Some(seg);
                         }
-                        cur_segment = Some(seg);
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
                 Event::Text(t) => {
                     let text = t.xml10_content()?;
                     // Meta values keep their fragments UNTRIMMED and are
@@ -170,16 +313,18 @@ impl Nzb {
                         buf.clear();
                         continue;
                     }
+                    if cur_segment.is_none()
+                        && let Some(g) = cur_group.as_mut()
+                    {
+                        g.push_str(&text);
+                        buf.clear();
+                        continue;
+                    }
                     let text = text.trim();
                     if text.is_empty() {
                         // nothing
                     } else if let Some(seg) = cur_segment.as_mut() {
                         seg.message_id.push_str(text);
-                    } else if in_group
-                        && let Some(f) = cur_file.as_mut()
-                        && is_wire_safe(text)
-                    {
-                        f.groups.push(text.to_string());
                     }
                 }
                 Event::CData(c) => {
@@ -198,16 +343,18 @@ impl Nzb {
                         buf.clear();
                         continue;
                     }
+                    if cur_segment.is_none()
+                        && let Some(g) = cur_group.as_mut()
+                    {
+                        g.push_str(&raw);
+                        buf.clear();
+                        continue;
+                    }
                     let text = raw.trim();
                     if text.is_empty() {
                         // nothing
                     } else if let Some(seg) = cur_segment.as_mut() {
                         seg.message_id.push_str(text);
-                    } else if in_group
-                        && let Some(f) = cur_file.as_mut()
-                        && is_wire_safe(text)
-                    {
-                        f.groups.push(text.to_string());
                     }
                 }
                 Event::GeneralRef(r) => {
@@ -216,58 +363,105 @@ impl Nzb {
                     // predefined five + char refs and append wherever the
                     // surrounding text is accumulating.
                     let resolved = if let Some(c) = r.resolve_char_ref()? {
-                        Some(c.to_string())
+                        c.to_string()
                     } else {
-                        match r.xml10_content()?.as_ref() {
-                            "amp" => Some("&".to_string()),
-                            "lt" => Some("<".to_string()),
-                            "gt" => Some(">".to_string()),
-                            "quot" => Some("\"".to_string()),
-                            "apos" => Some("'".to_string()),
-                            _ => None,
+                        let name = r.xml10_content()?;
+                        match name.as_ref() {
+                            "amp" => "&".to_string(),
+                            "lt" => "<".to_string(),
+                            "gt" => ">".to_string(),
+                            "quot" => "\"".to_string(),
+                            "apos" => "'".to_string(),
+                            // REJECT, never drop. An entity this parser
+                            // cannot resolve used to vanish, so
+                            // `abc&bogus;def@news` silently became
+                            // `abcdef@news` - a message-id that does not
+                            // exist, fetched, 430'd and counted missing,
+                            // with no parse error anywhere. The
+                            // attribute path has always errored on the
+                            // same input (quick-xml's own resolver
+                            // call); text now matches it.
+                            _ => match html_latin1_entity(name.as_ref()) {
+                                Some(c) => c.to_string(),
+                                None => return Err(NzbError::UnknownEntity(name.into_owned())),
+                            },
                         }
                     };
-                    if let Some(text) = resolved {
-                        if let Some(seg) = cur_segment.as_mut() {
-                            seg.message_id.push_str(&text);
-                        } else if let Some((_, v)) = cur_meta.as_mut() {
-                            v.push_str(&text);
-                        }
+                    if let Some(seg) = cur_segment.as_mut() {
+                        seg.message_id.push_str(&resolved);
+                    } else if let Some((_, v)) = cur_meta.as_mut() {
+                        v.push_str(&resolved);
+                    } else if let Some(g) = cur_group.as_mut() {
+                        // Groups accumulate like meta values - see
+                        // `cur_group`.
+                        g.push_str(&resolved);
                     }
                 }
-                Event::End(e) => match e.local_name().as_ref() {
-                    b"file" => {
-                        if let Some(mut f) = cur_file.take() {
-                            // Segments arrive in document order which is not
-                            // guaranteed to be part order.
-                            f.segments.sort_by_key(|s| s.number);
-                            files.push(f);
-                        }
-                    }
-                    b"group" => in_group = false,
-                    b"meta" => {
-                        if let Some((ty, val)) = cur_meta.take() {
-                            // One whole-value trim, replacing the old
-                            // per-fragment trims: element-formatting
-                            // whitespace goes, interior spaces stay.
-                            let val = val.trim().to_string();
-                            if !ty.is_empty() && !val.is_empty() {
-                                meta.push((ty, val));
+                Event::End(e) => {
+                    depth = depth.saturating_sub(1);
+                    match e.local_name().as_ref() {
+                        b"file" => {
+                            if let Some(mut f) = cur_file.take() {
+                                // Segments arrive in document order which is not
+                                // guaranteed to be part order.
+                                f.segments.sort_by_key(|s| s.number);
+                                files.push(f);
                             }
                         }
-                    }
-                    b"segment" => {
-                        if let (Some(f), Some(seg)) = (cur_file.as_mut(), cur_segment.take()) {
-                            if !seg.message_id.is_empty() && is_wire_safe(&seg.message_id) {
-                                f.segments.push(seg);
-                            } else {
-                                f.dropped_segments += 1;
+                        b"group" => {
+                            if let Some(g) = cur_group.take()
+                                && let Some(f) = cur_file.as_mut()
+                            {
+                                let g = g.trim();
+                                if !g.is_empty() && is_wire_safe(g) {
+                                    f.groups.push(g.to_string());
+                                }
                             }
                         }
+                        b"meta" => {
+                            if let Some((ty, val)) = cur_meta.take() {
+                                // One whole-value trim, replacing the old
+                                // per-fragment trims: element-formatting
+                                // whitespace goes, interior spaces stay.
+                                let val = val.trim().to_string();
+                                if !ty.is_empty() && !val.is_empty() {
+                                    meta.push((ty, val));
+                                }
+                            }
+                        }
+                        b"segment" => {
+                            if let (Some(f), Some(seg)) = (cur_file.as_mut(), cur_segment.take()) {
+                                if !seg.message_id.is_empty() && is_wire_safe(&seg.message_id) {
+                                    f.segments.push(seg);
+                                } else {
+                                    f.dropped_segments += 1;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                },
-                Event::Eof => break,
+                }
+                // Self-closing elements never pair with an End, and
+                // `expand_empty_elements` is off, so `<segment ... />`
+                // reached neither the Start nor the End arm: a declared
+                // segment vanished with nothing counted, which is
+                // exactly what `dropped_segments` exists to prevent (the
+                // same segment written `<segment …></segment>` does
+                // count). It carries no message-id by construction, so
+                // there is nothing to fetch - only something to declare.
+                Event::Empty(e) => {
+                    if e.local_name().as_ref() == b"segment"
+                        && let Some(f) = cur_file.as_mut()
+                    {
+                        f.dropped_segments += 1;
+                    }
+                }
+                Event::Eof => {
+                    if depth > 0 {
+                        return Err(NzbError::Truncated);
+                    }
+                    break;
+                }
                 _ => {}
             }
             buf.clear();
@@ -410,6 +604,126 @@ pub fn par2_vol_count(name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real NZBIndex-generated NZB (nzbget issue #699): subjects carry
+    /// `&auml;`, an HTML latin-1 entity undefined in XML. nzbget
+    /// rejected it ("Reference to undefined entity"); SABnzbd accepts.
+    /// We resolve the latin-1 set so these download.
+    #[test]
+    fn html_latin1_entities_in_attributes_resolve() {
+        let xml = include_bytes!("../testdata/nzb/gh-nzbget699-undefined-entity.nzb");
+        let nzb = Nzb::parse(xml).expect("latin-1 entity NZB parses");
+        assert!(!nzb.files.is_empty());
+        let with_auml: Vec<_> = nzb
+            .files
+            .iter()
+            .filter(|f| f.subject.contains("geschändeten"))
+            .collect();
+        assert!(
+            !with_auml.is_empty(),
+            "&auml; should resolve to ä in subjects: {:?}",
+            nzb.files[0].subject
+        );
+        assert!(
+            nzb.files.iter().all(|f| !f.subject.contains("&auml;")),
+            "no subject may keep the raw entity"
+        );
+    }
+
+    /// The same entities must resolve in element text (message-ids, meta
+    /// values), where they arrive as GeneralRef events - and an entity
+    /// outside the latin-1 table must still fail the parse: tolerance is
+    /// scoped to the known HTML set, not entities in general.
+    #[test]
+    fn html_latin1_entities_in_text_resolve_unknown_still_rejected() {
+        let xml = br#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <head><meta type="password">stra&szlig;e</meta></head>
+  <file subject="s" poster="p" date="1700000000">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="1" number="1">a@example.com</segment></segments>
+  </file>
+</nzb>"#;
+        let nzb = Nzb::parse(xml).expect("parses");
+        assert_eq!(nzb.password(), Some("straße"));
+
+        let unknown = br#"<?xml version="1.0"?>
+<nzb><file subject="x&bogus;y" poster="p" date="1">
+  <groups><group>a.b</group></groups>
+  <segments><segment bytes="1" number="1">a@b.c</segment></segments>
+</file></nzb>"#;
+        assert!(
+            Nzb::parse(unknown).is_err(),
+            "entities outside the latin-1 table must still reject"
+        );
+    }
+
+    /// Three ways a well-formed NZB used to be quietly rewritten rather
+    /// than parsed or refused. All three are silent-data shapes: nothing
+    /// logged, nothing counted, a green job with the wrong bytes.
+    #[test]
+    fn undefined_entities_and_self_closing_segments_do_not_rewrite_the_manifest() {
+        // 1. An undefined entity inside a message-id was DROPPED, so the
+        // id parsed as a different, non-existent article.
+        let in_text = br#"<?xml version="1.0"?>
+<nzb><file subject="s" poster="p" date="1">
+  <groups><group>a.b</group></groups>
+  <segments><segment bytes="1" number="1">abc&bogus;def@news.example</segment></segments>
+</file></nzb>"#;
+        let err = Nzb::parse(in_text).expect_err("an undefined entity in text must reject");
+        assert!(
+            matches!(&err, NzbError::UnknownEntity(name) if name == "bogus"),
+            "{err:?}"
+        );
+
+        // 2. An entity in a group name split it into two invented names.
+        let split_group = br#"<?xml version="1.0"?>
+<nzb><file subject="s" poster="p" date="1">
+  <groups><group>alt.bin&amp;ary</group></groups>
+  <segments><segment bytes="1" number="1">a@b.c</segment></segments>
+</file></nzb>"#;
+        let nzb = Nzb::parse(split_group).expect("parses");
+        assert_eq!(
+            nzb.files[0].groups,
+            vec!["alt.bin&ary".to_string()],
+            "one group element is one group name"
+        );
+
+        // 3. A self-closing segment vanished without being counted, so
+        // the manifest shrank in silence.
+        let empty_seg = br#"<?xml version="1.0"?>
+<nzb><file subject="s" poster="p" date="1">
+  <groups><group>a.b</group></groups>
+  <segments>
+    <segment bytes="700000" number="1">a@b.c</segment>
+    <segment bytes="700000" number="2"/>
+  </segments>
+</file></nzb>"#;
+        let nzb = Nzb::parse(empty_seg).expect("parses");
+        assert_eq!(nzb.files[0].segments.len(), 1);
+        assert_eq!(
+            nzb.files[0].dropped_segments, 1,
+            "a declared segment we cannot fetch must be counted, not lost"
+        );
+    }
+
+    /// Soak corpus strictness guards: entity tolerance must not loosen
+    /// the parser elsewhere. An element name starting with a digit
+    /// (crashed nzbget, their issue #744 shape) and a document truncated
+    /// mid-element both stay rejected.
+    #[test]
+    fn garbled_and_truncated_nzbs_still_rejected() {
+        let garbled = include_bytes!("../testdata/nzb/synth-744-garbled-element.nzb");
+        assert!(
+            Nzb::parse(garbled).is_err(),
+            "element name starting with a digit must reject"
+        );
+        let truncated = include_bytes!("../testdata/nzb/synth-truncated.nzb");
+        assert!(
+            Nzb::parse(truncated).is_err(),
+            "document truncated mid-element must reject"
+        );
+    }
 
     /// A message-id carrying CR/LF would end our `BODY <id>` command and start
     /// the attacker's next command on the user's authenticated, paid provider

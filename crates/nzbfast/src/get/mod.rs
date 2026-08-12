@@ -21,8 +21,8 @@ use settle::{SettleVerdict, fetch_matched_deferred, settle_verify_repair};
 mod rig;
 mod workers;
 use workers::{
-    Counters, build_counters, drain_network, spawn_deadlock_watchdog, spawn_decode_consumers,
-    spawn_par_race, spawn_rate_ticker, spawn_spec_prefetch,
+    Counters, TailWatchers, build_counters, drain_network, spawn_deadlock_watchdog,
+    spawn_decode_consumers, spawn_rate_ticker, spawn_tail_watchers,
 };
 
 /// Queue-row activity token, advanced at section transitions only
@@ -352,38 +352,29 @@ pub(crate) async fn get_with_progress(
     );
 
     let t0 = Instant::now();
-    // M2c.5 speculative recovery prefetch: see spawn_spec_prefetch.
-    let prefetched: Arc<std::sync::Mutex<Vec<(usize, Vec<PathBuf>)>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    let prefetch_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let spec_prefetch_task: Option<tokio::task::JoinHandle<()>> = {
-        let allowed = match &hub {
-            Some(h) => h.spec_prefetch.load(Ordering::Relaxed),
-            None => std::env::var_os("NZBFAST_NO_SPEC_PREFETCH").is_none(),
-        };
-        spawn_spec_prefetch(
-            allowed,
-            has_main,
-            &nzb,
-            &servers,
-            &slots,
-            out_dir,
-            &buf_pool,
-            &prefetched,
-            &prefetch_stop,
-        )
-    };
-    // PAR2-race experiment (dark): see spawn_par_race.
-    let par_race_task = spawn_par_race(
+    // The recovery-side watchers - spec prefetch (M2c.5), the dark PAR2
+    // race, the §146 tail give-up - and the scratch state they share:
+    // see spawn_tail_watchers in get/workers.rs. The destructure keeps
+    // downstream reads on the inline names.
+    let TailWatchers {
+        prefetched,
+        prefetch_stop,
+        spec_prefetch_task,
+        par_race_task,
+        tail_giveup_task,
+    } = spawn_tail_watchers(
+        &hub,
+        has_main,
+        &nzb,
+        &servers,
         &slots,
+        out_dir,
+        &buf_pool,
         &verifier,
         &queue_ctl,
-        &prefetch_stop,
-        &prefetched,
         &fetch_done,
         &decoded_bytes,
         &slot_file,
-        &nzb,
     );
     // D1 (big-link): how many I/O runtimes this fleet is worth - see
     // `shard_count`.
@@ -410,6 +401,7 @@ pub(crate) async fn get_with_progress(
         &prefetch_stop,
         spec_prefetch_task,
         par_race_task,
+        tail_giveup_task,
         consumers,
         &pending_d,
         &pending_r,
@@ -608,5 +600,10 @@ pub(crate) async fn get_with_progress(
         &backbones,
         post_age_days,
         repair_shortfall,
+        &ex_report
+            .extracted
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect::<Vec<_>>(),
     )
 }

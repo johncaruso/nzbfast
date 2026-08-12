@@ -62,7 +62,7 @@ pub(in crate::serve) fn spawn_live_tuner(daemon: &Arc<Daemon>, config: &std::pat
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(60)
-            .max(5);
+            .max(2);
         let epoch = std::time::Duration::from_secs(epoch_secs);
         /// Bucket writes per host are throttled to one per this window
         /// (plus the bucket-boundary flush) - linkpeak's SAVE_MIN_SECS
@@ -92,6 +92,16 @@ pub(in crate::serve) fn spawn_live_tuner(daemon: &Arc<Daemon>, config: &std::pat
             if v.is_empty() { 0.0 } else { v[v.len() / 2] }
         }
         let mut announced = false;
+        // The shared probe metronome (livetune::EpochObs::cycle_gate):
+        // every server may START a cycle only on the same epochs, so
+        // multi-server down-probes shrink together and stay
+        // share-neutral on a saturated link. 6 = exactly one full
+        // cycle (PAIRS*2 epochs): a kept verdict lands on the epoch
+        // before the next gate, so momentum chains run back-to-back
+        // and every server's pairs stay in lockstep.
+        const CYCLE_SYNC_EPOCHS: u64 = 6;
+        let mut epoch_idx: u64 = 0;
+        let mut announced_saturated = false;
         let mut hosts: std::collections::HashMap<String, HostState> = Default::default();
         // (pool identity, per-host cumulative bytes) at epoch start.
         let mut prev: Option<(Arc<nzbkit::pool::LiveStats>, Vec<(String, u64)>)> = None;
@@ -217,7 +227,33 @@ pub(in crate::serve) fn spawn_live_tuner(daemon: &Arc<Daemon>, config: &std::pat
                 .collect();
             let total: u64 = deltas.iter().map(|(_, b)| *b).sum();
             let cap = d.hub.rate.get();
-            let rate_limited = cap > 0 && (total as f64 / epoch.as_secs_f64()) >= cap as f64 * 0.85;
+            let total_rate = total as f64 / epoch.as_secs_f64();
+            let rate_limited = cap > 0 && total_rate >= cap as f64 * 0.85;
+            epoch_idx += 1;
+            let cycle_gate = epoch_idx.is_multiple_of(CYCLE_SYNC_EPOCHS);
+            // The link anchor: the linkpeak learner when it has one,
+            // else the typed line speed, else 0 = unknown. With the
+            // aggregate at ~the anchor the LINK is the binding
+            // constraint, and per-server up-probes can only share-grab
+            // (livetune::EpochObs::line_saturated). Unknown anchor
+            // reads as never-saturated - the James-safe direction: a
+            // wrongly-suppressed up-walk is a lasting cap, a wrongly
+            // permitted one is walked back by the next down cycles.
+            let (anchor, _) = d.link_peak.effective(d.line_speed.load(Ordering::Relaxed));
+            let line_saturated = anchor > 0 && total_rate >= anchor as f64 * 0.85;
+            if line_saturated != announced_saturated {
+                info!(
+                    "live-tune: link {} (fleet {:.0} Mbps vs anchor {:.0} Mbps)",
+                    if line_saturated {
+                        "saturated - up-probes parked"
+                    } else {
+                        "below its anchor - up-probes free"
+                    },
+                    total_rate * 8.0 / 1e6,
+                    anchor as f64 * 8.0 / 1e6
+                );
+                announced_saturated = line_saturated;
+            }
             // The index scan contaminates every server's epoch alike -
             // same shape as the limiter, so it rides the same flag.
             let scan_active = d.scan_active.load(Ordering::Relaxed);
@@ -333,7 +369,20 @@ pub(in crate::serve) fn spawn_live_tuner(daemon: &Arc<Daemon>, config: &std::pat
                     busy: delta > 0 && !tail_latched,
                     rate_limited: rate_limited || scan_active || steered,
                     capacity_pressure: cap_events.contains(&sl.host),
-                    fleet_met: connected >= target.get(),
+                    // A band, not a floor: an epoch measures its rung
+                    // only if the fleet ENDED the epoch near the count
+                    // it was asked to run. Below = the ramp; above =
+                    // park drain still in flight from a down-step, so
+                    // the bytes belong to a bigger fleet than the rung
+                    // claims (rig 7 caught the walk trusting those and
+                    // trimming through the knee). The slack covers the
+                    // hot spare and prober extras.
+                    fleet_met: {
+                        let tgt = target.get();
+                        connected >= tgt && connected <= tgt + (tgt / 32).max(2)
+                    },
+                    cycle_gate,
+                    line_saturated,
                 };
                 let clean =
                     obs.busy && !obs.rate_limited && !obs.capacity_pressure && obs.fleet_met;
@@ -640,6 +689,21 @@ pub(in crate::serve) fn spawn_auto_connections(daemon: &Arc<Daemon>, config: &st
             }
             let Some(d) = dw.upgrade() else { return };
             if !d.auto_connections.load(Ordering::Relaxed) {
+                continue;
+            }
+            // Offline is a promise that this machine is touching no
+            // provider - the whole point of the switch is freeing the
+            // account for another box - and a ladder is the single
+            // heaviest thing this daemon does unasked: up to 64
+            // concurrent connections pulling real article bodies for as
+            // long as four minutes. Measured on a live daemon 11 Aug
+            // 2026: two full ladders against the user's provider (07:41
+            // and 13:41) while `offline` had been true since 03:25, the
+            // second of which APPLIED its knee. A number measured in
+            // a state the operator declared provider-free is not one to
+            // trust either. The manual Test button is unaffected - that
+            // one is asked for.
+            if d.offline.load(Ordering::Relaxed) {
                 continue;
             }
             let busy = d.queue.lock_ok().iter().any(|j| {

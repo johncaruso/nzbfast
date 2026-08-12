@@ -193,6 +193,15 @@ nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
 Ajustes → Servidores Usenet → <b>Importar do SABnzbd / NZBGet…</b> encontra sua instalação
 existente e copia os servidores dela. Também há <code>nzbfast import-sab</code>
 na linha de comando.</div>
+<p>O cartão de boas-vindas também pergunta <b>como você pretende usar o nzbfast</b>, com quatro
+respostas: um app como Sonarr ou Radarr o comanda, vindo do SABnzbd,
+vindo do NZBGet, ou só você, por este painel. Escolher uma delas não muda
+nada por si só. Ela mostra uma pequena lista de revisão - cada recomendação com
+o nome próprio do ajuste, o valor atual, o valor recomendado e uma linha
+de porquê - e <b>Aplicar</b> define apenas as linhas que você marcar. Cada linha é um
+ajuste comum que você pode reverter sozinho depois, e a mesma lista
+continua disponível mais tarde em Ajustes → <b>Ajustes recomendados para o seu jeito de
+usar</b>.</p>
 
 <h3 id="firstrun-key">Sua chave de API</h3>
 <p>Numa instalação realmente nova, o nzbfast cria para si mesmo uma chave de API na
@@ -354,6 +363,15 @@ externo. A linha de status mostra o progresso da varredura; <b>Varrer agora</b> 
 <p>Adicione títulos pelo nome - inclusive os ainda não publicados. Quando um lançamento
 correspondente aparece no índice, ele é capturado automaticamente, com preferências de qualidade e
 regras de melhoria (uma cópia melhor substitui uma pior).</p>
+<p>O cartão também pode seguir uma lista que você mantém no Plex. Adicione uma <b>fonte de lista</b>:
+vincule sua conta do Plex (você aprova um código curto na própria página do Plex, então nenhuma senha
+chega ao nzbfast) ou cole o endereço da sua lista de acompanhamento do Plex. Trate esse endereço como
+uma senha - qualquer pessoa que o tiver pode ler sua lista - e por isso ele fica mascarado depois de
+salvo. Os títulos sincronizados aparecem como linhas somente leitura ao lado dos seus. Uma conta
+vinculada vê a lista inteira, então remover um título lá faz com que ele deixe de ser acompanhado
+aqui também (downloads concluídos nunca são tocados); um endereço mostra apenas as entradas mais
+recentes, então um título ausente pode simplesmente ter saído da janela e nada é removido. Qualquer
+um dos dois comportamentos pode ser invertido por fonte.</p>
 <h3 id="dash-history">Histórico</h3>
 <p>Downloads recentes, uma linha cada. Trabalhos que falharam oferecem <b>Repetir</b>
 (retoma a partir do diário). Arquivos criptografados mostram um controle de desbloqueio 🔑 - digite a
@@ -466,6 +484,32 @@ emblema <b>varrido</b>.</li>
 <p>Você não precisa esperar um download terminar para saber se é o arquivo certo.
 Abra-o enquanto ele baixa, confira se o conteúdo, o idioma e a qualidade são o que você
 esperava, e cancele cedo se não forem - em vez de descobrir depois do download completo.</p>
+<p>A primeira metade disso já está na página. Abra a linha de um download na
+fila (ou no histórico) e a gaveta mostra o que há dentro do arquivo de vídeo, lido
+dos bytes que chegaram até agora: resolução, codecs de vídeo e áudio,
+idiomas de áudio, legendas, capítulos. Uma release que é o corte errado, o
+idioma errado ou um upscale se entrega nesse painel muito antes de o
+download terminar.</p>
+<p>A página também descobre se <em>este</em> navegador consegue reproduzir o
+arquivo, e diz isso em vez de adivinhar: os navegadores diferem (o Safari
+decodifica HEVC onde o Chrome não, e quase nenhum decodifica áudio AC-3 ou DTS),
+então a pergunta é feita ao navegador em que você realmente está. Quando a
+resposta é sim, <b>▶ Reproduzir</b> abre um reprodutor ali mesmo na página,
+mostrando o arquivo enquanto ele baixa. A maioria dos lançamentos é MKV, que
+muitos navegadores se recusam a abrir mesmo sabendo decodificar tudo o que há
+dentro, então o nzbfast os reempacota enquanto tocam. Nada é recodificado: a
+imagem e o som são os bytes originais em outro invólucro, e pular para outro
+ponto continua funcionando. Se a faixa de áudio for uma que este navegador não
+consegue decodificar e o lançamento trouxer uma segunda que ele consegue, é essa
+segunda faixa que toca, para a imagem não chegar muda. Só quando o navegador não
+tem decodificador para o próprio vídeo é que o botão entrega o arquivo ao seu
+próprio reprodutor multimídia, como descrito abaixo.</p>
+<p>Um único ajuste governa tudo isso: Ajustes → Interface → <b>Conferir um arquivo
+enquanto ele baixa</b>. <b>Só detalhes</b>, o padrão, mostra o painel e
+não oferece reprodutor na página; <b>Detalhes e um reprodutor</b> adiciona o reprodutor;
+<b>Desligado</b> impede por completo a leitura do arquivo - com ele desligado, nada abrirá
+um arquivo baixado pela metade para ninguém.</p>
+<p>Para conferir no seu próprio reprodutor multimídia:</p>
 <ul>
 <li><b>▶ Reproduzir</b> no mural (ou <code>/m3u/&lt;id&gt;</code>) entrega ao seu reprodutor multimídia
 uma URL; o daemon inicia ou reaproveita o download por trás dela.</li>
@@ -498,8 +542,20 @@ do pool qualquer servidor. Cada servidor tem:</p>
 <tr><td>Conexões</td><td>Conexões simultâneas por servidor. Use o <b>Ajuste de conexões</b> (<a href="#performance">§13</a>) para achar o ponto ideal de cada provedor em vez de chutar alto.</td></tr>
 <tr><td>Nível (camada)</td><td>0 = primário; níveis mais altos são servidores de preenchimento, consultados apenas para os artigos que todo nível inferior não tinha. Coloque contas ilimitadas em 0 e contas de bloco em 1+.</td></tr>
 <tr><td>Tamanho do bloco (GB)</td><td>Para contas de bloco (pago por GB): o nzbfast registra o uso acumulado contra isto e para de usar o servidor quando ele se esgota (aviso aos 85%).</td></tr>
+<tr><td>Cada byte é cobrado</td><td>Ligue para uma conta tarifada por consumo. Seus downloads usam o servidor exatamente como antes; o que para é o nzbfast mandar tráfego próprio para ele - o ajuste automático de conexões, a etapa de rede do benchmark do sistema e as varreduras de cabeçalhos para o índice integrado o pulam todos. Independente do nível e do tamanho do bloco, porque uma conta medida pode ser seu único provedor e uma ilimitada pode estar no nível 2. Desligado por padrão. O <b>Test</b> manual em <b>Ajuste de conexões</b> (<a href="#performance">§13</a>) ainda funciona num servidor marcado e pergunta antes, já que ali é você escolhendo gastar.</td></tr>
 </table></div>
 <p><b>Deixe uma folga abaixo do limite de conexões da sua conta.</b> Definir as conexões um pouco abaixo do limite não custa nada: a taxa de transferência estabiliza bem antes das últimas uma ou duas conexões, e o <b>Ajuste de conexões</b> (<a href="#performance">§13</a>) fica abaixo dele de qualquer forma. São esses lugares livres que deixam um segundo dispositivo, outro cliente ou uma nova tentativa após um socket caído entrarem mesmo assim, em vez de serem recusados enquanto este ocupa todos os lugares.</p>
+<p><b>Você não precisa administrar o limite de arquivos abertos da sua máquina.</b> O
+sistema conta cada conexão como um arquivo aberto, e o macOS inicia um programa com um
+limite de 256 deles, um teto que um conjunto completo de conexões espalhadas por vários
+servidores pode ultrapassar. No macOS e no Linux o nzbfast eleva esse limite por conta
+própria ao iniciar: pede 65536 arquivos abertos e desce por 16384, 4096 e 1024 até o
+sistema aceitar, sem nunca passar do limite rígido que o sistema define, e segue com o
+limite que tinha se todos os passos forem recusados. O Windows não tem um limite desse tipo
+por processo. Os outros clientes ficam com o limite que o shell lhes deu, e um que fica sem
+arquivos abertos no meio de um trabalho pode parar sem dizer no seu log o motivo. Portanto,
+defina as conexões de cada servidor pelo que o seu plano permite, menos a folga acima, e
+não pelo que você acha que a máquina aguenta.</p>
 <h3 id="passwords">Como as senhas dos seus provedores são guardadas</h3>
 <p>As senhas de provedor em <code>config.local.json</code> ficam <b>ofuscadas, não
 criptografadas</b>. São gravadas como <code>obf1:</code> seguido de uma forma
@@ -631,6 +687,7 @@ exatamente como foram publicados, em vez de adivinhados.</p>
 <tr><td>Incluir grupo de lançamento</td><td>A etiqueta <code>-GROUP</code> no fim.</td></tr>
 <tr><td>Remover arquivos inúteis</td><td><b>Ligado por omissão.</b> Apaga <code>.par2</code>, <code>.nzb</code>, <code>.sfv</code>, <code>.nfo</code> que sobrem e clipes de amostra das pastas de filmes e séries concluídas. Nunca o vídeo nem as suas legendas.</td></tr>
 <tr><td>Manter apenas o arquivo de mídia</td><td><b>Desligado por omissão, e destrutivo:</b> apaga em definitivo tudo o que está na pasta exceto o vídeo (ou vídeos) e as legendas. Todos os episódios de um pacote de temporada são mantidos. Prevalece sobre <b>Remover arquivos inúteis</b> quando ambos estão ligados.</td></tr>
+<tr><td>Nomear downloads como o arquivo .nzb</td><td><b>Desligado por padrão.</b> A pasta concluída e seu arquivo principal recebem o nome do arquivo <code>.nzb</code>, em vez do nome arrumado deduzido da release. Só o arquivo maior é renomeado: o resto de um pacote de episódios, o sample, as legendas e o <code>.nfo</code> mantêm os nomes com que chegaram. Qualquer categoria pode permitir ou proibir isso por conta própria em <b>Suas categorias</b>, que é como você consegue isso para um tipo de download e não para outro.</td></tr>
 <tr><td>Keep the other words in the name</td><td><b>Ligado por padrão.</b> Esporte, corridas e outros eventos costumam ser um mesmo título repetido a temporada inteira, a uma ou duas palavras de distância - "Round11 Hungary Race" contra "Round11 Hungary Qualifying". Manter essas palavras é o que impede uma temporada inteira de virar o mesmo nome. Só se aplica onde o nome não pôde ser arrumado de outra forma, então filmes e episódios comuns ficam intocados.</td></tr>
 </table></div>
 <p class="dim">Todo o grupo corre depois da reparação e da descompactação e antes de
@@ -733,6 +790,14 @@ todos os outros, ficam guardados em <code>settings.json</code>.</p>
 <p>A automação mais simples: adicione um título no painel, defina as preferências de qualidade,
 pronto. Novos lançamentos são capturados conforme aparecem nos seus grupos indexados;
 cópias de melhor qualidade substituem capturas anteriores; uma visão de calendário mostra o que está por vir.</p>
+<p>Uma <b>fonte de lista</b> alimenta a lista de acompanhamento a partir de uma lista que você mantém
+no Plex, de duas formas: vincule sua conta do Plex aprovando um código curto na página do Plex, ou
+cole um endereço de lista de acompanhamento do Plex. O endereço é uma credencial - dá a quem o possui
+o direito de ler a lista - por isso ele fica mascarado depois de salvo. A sincronização de remoções
+difere por modo de propósito: uma conta vinculada vê a lista inteira, então um título removido lá
+deixa de ser acompanhado aqui (downloads já concluídos permanecem); um feed por endereço traz apenas
+as entradas mais recentes, então a ausência não prova nada e os títulos são apenas adicionados. Os
+dois padrões podem ser alterados por fonte.</p>
 <h3 id="auto-rss">Feeds RSS</h3>
 <p>Ajustes → RSS: qualquer URL RSS newznab/indexador com intervalo por feed, categoria e
 regras de filtro (padrões de título, limites de tamanho). Os itens correspondentes são baixados
@@ -747,8 +812,63 @@ prontos para Plex/Jellyfin sem uma ferramenta externa.</p>
 por hora do dia.</p>
 <h3>Scripts</h3>
 <p>Um script de pós-processamento recebe os argumentos posicionais do SABnzbd e as
-variáveis de ambiente <code>SAB_*</code> - o grande ecossistema de scripts SAB roda
-como está.</p>
+variáveis de ambiente <code>SAB_*</code>: o grande ecossistema de scripts SAB roda
+como está. O dialeto do NZBGet é fornecido ao lado - as variáveis <code>NZBPP_*</code>
+(<code>DIRECTORY</code>, <code>NZBNAME</code>, <code>CATEGORY</code>,
+<code>TOTALSTATUS</code>, <code>PARSTATUS</code>, <code>UNPACKSTATUS</code>,
+<code>FINALDIR</code>) e os códigos de saída 93/94/95 - então a lógica central
+de um script de extensão do NZBGet também roda. O mapeamento é honesto, não uma
+emulação: reparo e extração acontecem dentro do download de passada única, então uma
+conclusão limpa reporta <code>PARSTATUS=0</code> e uma reparada
+<code>PARSTATUS=2</code>. As formas de opção por script (<code>NZBPO_*</code>) não
+são fornecidas.
+Um script pode deixar um auxiliar rodando em segundo plano ao sair e o
+nzbfast não vai matá-lo, mas o nzbfast para de ler a saída do script
+no momento em que o próprio script termina: dê a um auxiliar em segundo plano o seu
+próprio redirecionamento de saída, ou ele será interrompido na primeira vez que tentar imprimir.</p>
+<h3>Script pré-fila</h3>
+<p>Um segundo gancho roda <em>antes</em> de um download entrar na fila
+(Ajustes → Pastas → Script pré-fila), com o contrato pre-queue do SABnzbd:
+os argumentos <code>name, pp, category, script, priority, size, group</code> mais o
+ambiente <code>SAB_*</code>. Sua primeira linha de saída aceita (<code>1</code>)
+ou rejeita (<code>0</code>) o download; as linhas 2-7 podem renomeá-lo, definir
+<code>pp</code>, mudar a categoria, escolher um script ou mudar a prioridade
+(linhas em branco mantêm o padrão). Um download rejeitado vai para o histórico como Falhou
+com o motivo, e Repetir a partir do histórico o traz de volta sem consultar o
+script de novo. O gancho nunca pode perder um download: se o script está faltando,
+trava, estoura seu orçamento de tempo ou imprime algo que não é um veredito,
+a adição segue intocada e o log diz por quê.</p>
+<h3>Eventos de ciclo de vida e webhooks assinados</h3>
+<p>Cada marco de um trabalho é um evento versionado: <code>job.added</code>,
+<code>job.started</code>, <code>job.finishing</code>, <code>job.repaired</code>,
+<code>job.completed</code>, <code>job.failed</code>, mais
+<code>queue.idle</code>, <code>giveup.tripped</code>, <code>disk.low</code>,
+<code>storage.slow</code> e <code>quota.reached</code>. Cada um carrega
+<code>schema_version</code> (atualmente 1; chaves novas podem aparecer sem incremento -
+ignore o que você não conhece), um <code>seq</code> monotônico e um
+carimbo de tempo <code>at</code> em milissegundos.</p>
+<p>Para recebê-los, adicione um destino de notificação <b>webhook</b>
+(Ajustes → Automação) e liste no campo <i>events</i> dele os tipos de evento
+que ele deve receber - tipos exatos, ou um prefixo como <code>job.*</code>. O
+destino então recebe um POST por evento: o JSON do evento como corpo mais um
+id <code>delivery</code> (<code>&lt;boot&gt;-&lt;seq&gt;</code>, a alça pela qual
+deduplicar), os cabeçalhos <code>X-NzbFast-Event</code> e
+<code>X-NzbFast-Delivery</code>, e - quando o destino tem um segredo de
+assinatura - <code>X-NzbFast-Signature: sha256=&lt;hex&gt;</code>, um HMAC-SHA256
+dos bytes exatos do corpo sob o seu segredo (o mesmo formato que os webhooks do GitHub usam).
+Verifique em Python:</p>
+<pre><code>expected = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
+ok = hmac.compare_digest(expected, request.headers["X-NzbFast-Signature"])</code></pre>
+<p>A entrega é pelo-menos-uma-vez: um destino que não pode ser alcançado é tentado de novo após
+10&nbsp;s, 60&nbsp;s e 5&nbsp;min, e então descartado com a falha mostrada na
+linha de ajustes do destino. Uma resposta HTTP de erro (404, 401...) não é repetida - conserte
+o receptor e use Test. Cada destino tem sua própria pista de entrega, então um que
+esteja lento ou inalcançável nunca atrasa outro; dentro de uma pista, as entregas mantêm
+a ordem em que os eventos aconteceram, e se uma for descartada os números de sequência
+mostram a lacuna. As palavras clássicas de evento
+(<code>completed</code>, <code>failed</code>, <code>repaired</code>,
+<code>disk</code>, <code>quota</code>) mantêm seu significado de notificação humana no
+mesmo destino.</p>
 
 <h2 id="arr">11 · Sonarr, Radarr e companhia</h2>
 <p>O nzbfast fala a API do SABnzbd nativamente, então todo *arr funciona de imediato -
@@ -760,6 +880,11 @@ e ele também pode atuar como <em>indexador</em> deles.</p>
 (onde encontrá-la: <a href="#firstrun-key">§2</a>).</li>
 <li>Categoria conforme desejado (ex.: <code>tv</code> / <code>movies</code>). Test → check verde → Save.</li>
 </ol>
+<p>O painel lhe entrega o endereço: numa instalação que ainda não baixou
+nada, o caminho "Deixe o Sonarr, o Radarr ou um app adicionar downloads" do cartão de
+boas-vindas mostra o endereço exato com um botão <b>Copiar</b> ao lado. A chave de API
+deliberadamente não está nessa linha; ela fica atrás da sua própria revelação em
+Ajustes → Segurança (<a href="#firstrun-key">§2</a>).</p>
 <p>Fila, histórico, status por trabalho, "remover e excluir", repetição e roteamento por categoria
 se comportam como os *arrs esperam.</p>
 <h3>Como indexador (newznab)</h3>
@@ -807,7 +932,17 @@ as URLs exatas e um código QR para escanear.</p>
 <h3 id="remote-proxy">Chegar ao nzbfast a partir de fora de casa</h3>
 <p>Não existe página de início de sessão, e isso é propositado. Um login com cookie de sessão é uma superfície de segurança para manter para sempre, e continuaria a ser a fechadura mais fraca de qualquer coisa exposta à Internet. Em vez disso o nzbfast autentica-se com a sua chave API, e aceita essa chave tanto num cabeçalho do pedido como no URL (<code>X-Api-Key</code>, ou <code>Authorization: Bearer</code>) - é isso que permite a algo colocado à frente tratar do início de sessão como deve ser.</p>
 <p><b>O mais simples é não o publicar de todo.</b> Instale o <b>Tailscale</b> nesta máquina e no telemóvel: ambos entram na mesma rede privada, nada fica exposto, não é preciso mexer no router nem em certificados, e Definições → Acesso remoto mostra um endereço que funciona em qualquer lado assim que detetar o Tailscale. Prefira este caminho a não ser que precise mesmo de um domínio público.</p>
-<p><b>Se precisar</b>, coloque um proxy inverso à frente, entregue-lhe o certificado e deixe-o fazer a autenticação. Inicie o nzbfast com <code>--bind 127.0.0.1</code> para que o proxy seja a única entrada, e aponte o proxy a <code>http://127.0.0.1:6789</code>:</p>
+<p><b>O nzbfast também pode servir HTTPS por si próprio.</b> Aponte Ajustes → Segurança →
+Certificado HTTPS / Chave privada HTTPS para um certificado PEM e a sua chave (ou
+inicie com <code>--tls-cert cert.pem --tls-key key.pem</code>), reinicie, e o
+painel e a API respondem em <code>https://</code> em vez de HTTP simples - um só
+escutador, um só esquema. Use o certificado que o seu domínio já tem (por exemplo
+do Let's Encrypt via certbot), ou um autoassinado para a LAN, que os
+navegadores aceitam depois de um aviso único. Um certificado inválido ou expirado recusa o
+arranque nomeando o ficheiro, para que o erro fique visível onde o cometeu; renove
+substituindo os ficheiros e reiniciando. O HTTPS nativo cifra o tráfego mas
+não acrescenta um início de sessão, por isso mantenha a chave API definida.</p>
+<p><b>Se precisar de um domínio público</b>, coloque um proxy inverso à frente, entregue-lhe o certificado e deixe-o fazer a autenticação. Inicie o nzbfast com <code>--bind 127.0.0.1</code> para que o proxy seja a única entrada, e aponte o proxy a <code>http://127.0.0.1:6789</code>:</p>
 <pre><code># Caddy
 example.com {
     reverse_proxy 127.0.0.1:6789
@@ -821,7 +956,11 @@ location / {
     proxy_set_header X-Forwarded-Proto $scheme;
 }</code></pre>
 <p>Acrescente por cima o que o seu proxy oferecer: autenticação básica, um serviço de forward-auth como o Authelia ou o Authentik, ou certificados de cliente. Há uma coisa que apanha toda a gente - o Sonarr, o Radarr e as apps de telemóvel não conseguem concluir um login de navegador, por isso deixe-lhes passagem. A maioria dos proxies consegue deixar passar um pedido com um cabeçalho <code>X-Api-Key</code> válido e exigir autenticação a tudo o resto.</p>
-<div class="warn-box"><b>Não se limite a encaminhar a porta 6789 no router.</b> O painel fala HTTP simples: a sua chave API e tudo o que fizer com ela atravessariam a Internet legíveis por qualquer pessoa no caminho, e uma instalação sem chave nenhuma fica aberta a quem a encontrar. Se encaminhar uma porta mesmo assim, defina primeiro uma chave API.</div>
+<div class="warn-box"><b>Não se limite a encaminhar a porta 6789 no router.</b>
+Sem um certificado configurado o painel fala HTTP simples, por isso a sua chave API
+e tudo o que fizer com ela atravessariam a Internet legíveis por qualquer pessoa no
+caminho, e uma instalação sem chave nenhuma fica aberta a quem a encontrar. Se
+encaminhar uma porta mesmo assim, defina primeiro uma chave API e ligue o HTTPS.</div>
 
 <h2 id="performance">13 · Ferramentas de desempenho</h2>
 <h3 id="perf-benchmark">Benchmark do sistema</h3>

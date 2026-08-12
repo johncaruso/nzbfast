@@ -424,16 +424,110 @@ fn the_dashboard_says_when_a_change_is_live_but_not_durable() {
         );
     }
     // Both key paths still adopt the new key: the daemon is on it.
+    // Adoption goes through adoptKey() now (it also bumps the epoch a
+    // refused in-flight call is judged against), so either idiom counts -
+    // what must never come back is a mint that leaves the page on the
+    // key the daemon has just thrown away.
     for sig in [
         "async function newApiKey(){",
         "async function openApiFix(btn){",
     ] {
+        let body = body_of(sig);
         assert!(
-            body_of(sig).contains("localStorage.nzbfastKey = j.apikey")
-                || body_of(sig).contains("localStorage.nzbfastKey=j.apikey"),
+            body.contains("adoptKey(j.apikey)")
+                || body.contains("localStorage.nzbfastKey = j.apikey")
+                || body.contains("localStorage.nzbfastKey=j.apikey"),
             "a saved:false path stopped adopting the key, which locks the page out"
         );
+        // And it must adopt INSIDE the rotation gate: every poll in
+        // flight is refused the moment the daemon swaps its key, and
+        // without the gate one of them opens the key modal over the one
+        // screen that is showing the replacement.
+        assert!(
+            body.contains("keyRotateStart()") && body.contains("keyRotateEnd()"),
+            "{sig} mints without the rotation gate: an old-key 403 can \
+             open the key modal before the new key is adopted"
+        );
     }
+}
+
+/// A refusal is only ever news about the key the request CARRIED.
+///
+/// The same-tab race behind the "keeps asking for a key and nothing
+/// stops it" report: press Create new, and for as long as the mint is in
+/// flight the daemon has already rotated while the page has not. Every
+/// poll already out there - the loop runs at 1 Hz, so there is always
+/// one - comes back refused, and the first of them used to open the
+/// shared key modal, asking for a key that did not exist when it sent
+/// its request. Worse, the call it parked there was often a
+/// loadSettings, which resumed after the mint had painted the new key
+/// into the Security box and blanked it: on a plain-http LAN origin
+/// (what the Remote access QR codes hand out) navigator.clipboard does
+/// not exist, so that box was the only copy of the key in the world.
+///
+/// Source-level guard, like its neighbours - the page is one file with
+/// no test harness of its own, and every one of these pieces is load
+/// bearing on its own.
+#[test]
+fn a_stale_refusal_can_never_ask_for_a_key() {
+    for (name, src) in [("dashboard", DASHBOARD_HTML), ("wall", WALL_HTML)] {
+        // Every adoption bumps an epoch, and every request records the
+        // epoch it goes out under. Without the pair there is nothing to
+        // tell "this key is wrong" from "this key is old".
+        assert!(
+            src.contains("function adoptKey(") && src.contains("keyEpoch++"),
+            "{name}: key adoption no longer bumps an epoch"
+        );
+        assert!(
+            src.contains("const epoch = keyEpoch"),
+            "{name}: requests no longer record the key generation they were sent under"
+        );
+        assert!(
+            src.contains("keyEpoch !== epoch"),
+            "{name}: a refusal from an older key generation can reach the prompt again"
+        );
+        // localStorage is shared across every tab on this origin, but
+        // each page cached its own copy at load: a key entered or minted
+        // in one surface must re-pair the others rather than ask twice.
+        assert!(
+            src.contains("localStorage.nzbfastKey || ''") && src.contains("stored !== sent"),
+            "{name}: a refused call no longer re-reads the shared store before asking"
+        );
+        assert!(
+            src.contains("addEventListener('storage'"),
+            "{name}: a sibling tab's re-pairing no longer reaches this page"
+        );
+    }
+    // The dashboard is the surface that rotates, so it carries the gate
+    // and the latch. (newApiKey/openApiFix are checked for the gate in
+    // the durability test above.)
+    let src = DASHBOARD_HTML;
+    assert!(
+        src.contains("function keyRotateStart(") && src.contains("function keyRotateEnd("),
+        "the rotation gate is gone: an old-key 403 can open the modal mid-mint"
+    );
+    assert!(
+        src.contains("if (keyRotating) await keyRotating"),
+        "a refused call no longer waits out a rotation this page started"
+    );
+    // The minted key stays on screen until the user puts it away, even
+    // if some other loadSettings lands in between.
+    assert!(
+        src.contains("mintedKey") && src.contains("function mintedShow("),
+        "a freshly minted key is no longer held on screen"
+    );
+    assert!(
+        src.contains("ak.value=mintedKey.s_apikey") && src.contains("nk.value=mintedKey.s_nzbkey"),
+        "loadSettings blanks the key boxes again, minted value and all"
+    );
+    assert!(
+        DASHBOARD_HTML
+            .split("async function showApiKey(")
+            .nth(1)
+            .is_some_and(|b| b[..b.find("\nasync function ").unwrap_or(b.len())]
+                .contains("mintedClear('s_apikey')")),
+        "Hide no longer releases the latch, so the box can never be cleared"
+    );
 }
 
 /// One design system, actually reaching every page. Each surface must

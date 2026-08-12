@@ -1744,3 +1744,92 @@ fn concurrent_bench_appends_lose_no_rows() {
     assert_eq!(d.bench_history().len(), 200, "every appended row survives");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// §96 (AltMount audit, item 2): a Completed history row whose output
+/// folder the user has since deleted presents as Failed - the *arr's
+/// import loop against a path that is not there ends in its
+/// failed-download handling instead. The guard is the §154 half: the
+/// flip fires only while the PARENT directory still exists, so an
+/// unmounted NAS (parent gone too) keeps every row Completed and no
+/// healthy release is mass-blocklisted. Render-time only - the store
+/// keeps Completed throughout, so a restored folder restores the row.
+#[test]
+fn a_completed_row_with_a_deleted_folder_presents_failed_unless_the_volume_is_down() {
+    use crate::serve::job::job_from_json;
+    use crate::serve::testutil::test_daemon;
+    let dir = std::env::temp_dir().join(format!("nzbfast-histgone-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = test_daemon(&dir);
+    let vol = dir.join("vol");
+    let out = vol.join("Some.Job");
+    std::fs::create_dir_all(&out).unwrap();
+    let job = Arc::new(Mutex::new(
+        job_from_json(&json!({
+            "nzo_id": "SABnzbd_nzo_histgone",
+            "name": "Some.Job",
+            "nzb_path": dir.join("some.nzb").to_string_lossy(),
+            "out_dir": out.to_string_lossy(),
+            "state": "Completed",
+        }))
+        .unwrap(),
+    ));
+    d.history.lock_ok().push(job.clone());
+    let facade_row = |d: &Daemon| {
+        history_json(d, &std::collections::HashMap::new())["history"]["slots"][0].clone()
+    };
+    let summary_row = |d: &Daemon| {
+        let q = HistQuery {
+            failed_only: false,
+            category: None,
+            ids: None,
+            search: None,
+            bucket: None,
+            start: 0,
+            limit: 0,
+        };
+        history_page(d, &q, true).0[0].clone()
+    };
+
+    // Folder present: the row is what the store says.
+    let r = facade_row(&d);
+    assert_eq!(r["status"], "Completed", "{r}");
+    assert_eq!(r["fail_message"], "", "{r}");
+
+    // Folder deleted, volume present: Failed, with the remedy tokens the
+    // drawer needs - `deleted`'s own hint (local's generic guidance
+    // points at a folder that is gone) and a genuine retry.
+    std::fs::remove_dir_all(&out).unwrap();
+    let r = facade_row(&d);
+    assert_eq!(r["status"], "Failed", "{r}");
+    assert!(
+        r["fail_message"]
+            .as_str()
+            .unwrap()
+            .starts_with("the downloaded files are no longer on disk"),
+        "{r}"
+    );
+    assert_eq!(r["fail_kind"], "local", "{r}");
+    assert_eq!(r["fail_hint"], "deleted", "{r}");
+    assert_eq!(r["fail_action"], "retry", "{r}");
+    assert_eq!(r["retry"], true, "{r}");
+    // The compact dashboard row flips with it - one record, one story.
+    let s = summary_row(&d);
+    assert_eq!(s["status"], "Failed", "{s}");
+    assert_eq!(s["fail_action"], "retry", "{s}");
+
+    // Mid-move the directory is legitimately absent: no flip.
+    job.lock_ok().move_pending = true;
+    let r = facade_row(&d);
+    assert_eq!(r["status"], "Completed", "{r}");
+    job.lock_ok().move_pending = false;
+
+    // Volume down (the parent is gone too, the unmounted-NAS shape):
+    // the guard stands down and the row stays Completed.
+    std::fs::remove_dir_all(&vol).unwrap();
+    let r = facade_row(&d);
+    assert_eq!(r["status"], "Completed", "{r}");
+    assert_eq!(r["fail_message"], "", "{r}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

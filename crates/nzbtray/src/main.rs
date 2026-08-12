@@ -87,39 +87,61 @@ mod probe_body {
         from_settings().or_else(from_keyfile)
     }
 
-    /// Did the last successful probe PROVE the listener's identity - a
+    /// Evidence that THIS process proved the listener's identity - a
     /// matching runtime.json token challenge, or a child this tray
-    /// spawned itself? Legacy adoption (an nzbfast-shaped reply with no
-    /// runtime.json to hold it to) attaches but stays `false`: sending
-    /// the stored API key to a listener whose identity is only a reply
-    /// shape hands any local port-squatter daemon control and, through
-    /// `mode=server_secret`, the provider password (Codex sweep 10 Aug
-    /// M10). Every key-bearing URL passes this through `keyed_url` /
-    /// `dash_url`; unproven means the calls go keyless and the
-    /// dashboard prompts instead.
-    // App-side only: the tests exercise `keyed_url`/`dash_url` with an
-    // explicit `proven` argument instead of this process-wide latch.
+    /// spawned itself. Legacy adoption (an nzbfast-shaped reply with no
+    /// runtime.json to hold it to) attaches but never yields one:
+    /// sending the stored API key to a listener whose identity is only
+    /// a reply shape hands any local port-squatter daemon control and,
+    /// through `mode=server_secret`, the provider password (Codex sweep
+    /// 10 Aug M10).
+    ///
+    /// The token is the WHOLE point of the type (§148): `keyed_url` /
+    /// `dash_url` demand one, the private field means no call site can
+    /// fabricate it, and the only mints are `record_identity_proven`
+    /// (called by the two paths that actually verify - the token
+    /// challenge in `probe`, and a spawn of our own child) read back
+    /// through [`identity_proof`]. v1.0.22 shipped a bool latch every
+    /// path had to remember to arm; the type replaces that discipline.
+    #[derive(Clone, Copy)]
+    pub struct IdentityProof(());
+
+    /// Test-only mint: the URL tests need a proof without a live
+    /// daemon to challenge. Does not exist in a shipping binary.
+    #[cfg(test)]
+    pub fn proof_minted_for_tests() -> IdentityProof {
+        IdentityProof(())
+    }
+
+    // The per-process latch behind [`identity_proof`]. Private on
+    // purpose: the app reads it only as a token, so "armed" and "who
+    // may claim to be armed" cannot drift apart again.
     #[cfg(windows)]
-    pub static IDENTITY_PROVEN: std::sync::atomic::AtomicBool =
+    static IDENTITY_PROVEN: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
+    /// The token, if this process has proven the listener (see
+    /// [`IdentityProof`]). None means keyed URLs go keyless and the
+    /// dashboard prompts instead.
     #[cfg(windows)]
-    pub fn identity_proven() -> bool {
-        IDENTITY_PROVEN.load(std::sync::atomic::Ordering::SeqCst)
+    pub fn identity_proof() -> Option<IdentityProof> {
+        IDENTITY_PROVEN
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then_some(IdentityProof(()))
     }
 
     #[cfg(windows)]
-    pub fn set_identity_proven(v: bool) {
+    pub fn record_identity_proven(v: bool) {
         IDENTITY_PROVEN.store(v, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// An API URL that already has a query string, plus our credential -
-    /// but ONLY for a listener whose identity is proven (see
-    /// [`IDENTITY_PROVEN`]). A legacy-adopted listener gets the keyless
+    /// but ONLY with a proof of the listener's identity in hand (see
+    /// [`IdentityProof`]). A legacy-adopted listener gets the keyless
     /// URL: the daemon refuses, which is strictly better than
     /// disclosing the key to something we cannot tell from an impostor.
-    pub fn keyed_url(mut url: String, data_dir: &Path, proven: bool) -> String {
-        if !proven {
+    pub fn keyed_url(mut url: String, data_dir: &Path, proof: Option<IdentityProof>) -> String {
+        if proof.is_none() {
             return url;
         }
         if let Some(k) = apikey(data_dir) {
@@ -148,16 +170,16 @@ mod probe_body {
         format!("{scheme}://127.0.0.1:{port}")
     }
 
-    /// Dashboard URL, carrying the API key when we know one AND the
-    /// listener proved its identity (same rule as [`keyed_url`]). The
-    /// page adopts the key into localStorage and strips it from the
+    /// Dashboard URL, carrying the API key when we know one AND hold a
+    /// proof of the listener's identity (same rule as [`keyed_url`]).
+    /// The page adopts the key into localStorage and strips it from the
     /// address bar, so the tray's own "Open dashboard" does not land the
     /// user on a prompt for a key that was generated for them and never
     /// shown. Unproven, the plain URL: the dashboard prompts, and the
     /// user pastes the key only if they trust what they see.
-    pub fn dash_url(port: u16, tls: bool, data_dir: &Path, proven: bool) -> String {
+    pub fn dash_url(port: u16, tls: bool, data_dir: &Path, proof: Option<IdentityProof>) -> String {
         let base = origin(port, tls);
-        match apikey(data_dir).filter(|_| proven) {
+        match apikey(data_dir).filter(|_| proof.is_some()) {
             Some(k) => format!("{base}/?apikey={}", query_value(&k)),
             None => format!("{base}/"),
         }
@@ -419,7 +441,7 @@ mod probe_body {
     mod tests {
         use super::{
             EngineVersion, apikey, body_version, bundled_version, dash_url, is_nzbfast, keyed_url,
-            query_value, stored_key,
+            proof_minted_for_tests, query_value, stored_key,
         };
         use std::path::PathBuf;
 
@@ -571,31 +593,33 @@ mod probe_body {
         #[test]
         fn urls_carry_the_key_escaped() {
             let d = data_dir("url", Some(r#"{"apikey":"a b&c"}"#), None);
+            let p = || Some(proof_minted_for_tests());
             assert_eq!(
-                keyed_url("http://127.0.0.1:6789/api?mode=queue".into(), &d, true),
+                keyed_url("http://127.0.0.1:6789/api?mode=queue".into(), &d, p()),
                 "http://127.0.0.1:6789/api?mode=queue&apikey=a%20b%26c"
             );
             assert_eq!(
-                dash_url(6789, false, &d, true),
+                dash_url(6789, false, &d, p()),
                 "http://127.0.0.1:6789/?apikey=a%20b%26c"
             );
 
             // Keyless: no empty parameter left dangling on either URL.
             let d = data_dir("urlnone", None, None);
             assert_eq!(
-                keyed_url("http://127.0.0.1:6789/api?mode=queue".into(), &d, true),
+                keyed_url("http://127.0.0.1:6789/api?mode=queue".into(), &d, p()),
                 "http://127.0.0.1:6789/api?mode=queue"
             );
-            assert_eq!(dash_url(6789, false, &d, true), "http://127.0.0.1:6789/");
+            assert_eq!(dash_url(6789, false, &d, p()), "http://127.0.0.1:6789/");
         }
 
         /// M1: a TLS daemon is addressed as https everywhere, or the tray
         /// cannot manage its own engine. `origin` is the single decider,
         /// so pinning it pins every URL the tray builds.
         ///
-        /// The two flags are independent, and the last case here says so:
-        /// `tls` picks the scheme, `proven` picks whether the key rides
-        /// along. An unproven TLS listener gets https WITHOUT the key.
+        /// Scheme and proof are independent, and the last case here says
+        /// so: `tls` picks the scheme, the proof token picks whether the
+        /// key rides along. An unproven TLS listener gets https WITHOUT
+        /// the key.
         #[test]
         fn a_tls_daemon_is_addressed_as_https() {
             use super::origin;
@@ -603,13 +627,14 @@ mod probe_body {
             assert_eq!(origin(6789, false), "http://127.0.0.1:6789");
 
             let d = data_dir("urltls", Some(r#"{"apikey":"a b&c"}"#), None);
+            let p = || Some(proof_minted_for_tests());
             assert_eq!(
-                dash_url(6789, true, &d, true),
+                dash_url(6789, true, &d, p()),
                 "https://127.0.0.1:6789/?apikey=a%20b%26c"
             );
-            assert_eq!(dash_url(6789, true, &d, false), "https://127.0.0.1:6789/");
+            assert_eq!(dash_url(6789, true, &d, None), "https://127.0.0.1:6789/");
             let d = data_dir("urltlsnone", None, None);
-            assert_eq!(dash_url(6789, true, &d, true), "https://127.0.0.1:6789/");
+            assert_eq!(dash_url(6789, true, &d, p()), "https://127.0.0.1:6789/");
         }
 
         /// Where that flag comes from: `runtime.json`, and only when the
@@ -670,48 +695,44 @@ mod probe_body {
         #[test]
         fn an_unproven_listener_never_receives_the_stored_key() {
             let d = data_dir("unproven", Some(r#"{"apikey":"SECRETKEY123"}"#), None);
-            let url = keyed_url("http://127.0.0.1:6789/api?mode=queue".into(), &d, false);
+            let url = keyed_url("http://127.0.0.1:6789/api?mode=queue".into(), &d, None);
             assert_eq!(url, "http://127.0.0.1:6789/api?mode=queue");
             assert!(!url.contains("SECRETKEY123"));
-            assert_eq!(dash_url(6789, false, &d, false), "http://127.0.0.1:6789/");
-            // Proven, the same data dir carries the key as before.
-            assert!(keyed_url("http://x/api?mode=queue".into(), &d, true).contains("SECRETKEY123"));
+            assert_eq!(dash_url(6789, false, &d, None), "http://127.0.0.1:6789/");
+            // With a proof in hand, the same data dir carries the key as
+            // before.
+            let p = Some(proof_minted_for_tests());
+            assert!(keyed_url("http://x/api?mode=queue".into(), &d, p).contains("SECRETKEY123"));
         }
 
-        /// v1.0.22 shipped the M10 latch without arming it on the one
-        /// path Windows users hit every day: the second-instance
-        /// hand-off (a double-clicked .nzb while the tray already
-        /// runs). That branch read `identity_proven()` in a process
-        /// where no probe had ever run, so the latch was its initial
-        /// `false`, every add went keyless, and the daemon refused it
-        /// with the 403 dialog. The latch is process-global Windows-only
-        /// state, so the branch itself cannot run under test on this
-        /// host - pin the source instead: between taking the
-        /// already-running arm and the first post there must be a probe,
-        /// because the probe is the only thing that can set the latch.
+        /// §148: the proof is a TYPE, not a call-site discipline. The
+        /// bool latch this replaces had to be armed by every path
+        /// before it built a keyed URL - v1.0.22's second-instance
+        /// hand-off forgot, every add went keyless, and the fix was
+        /// pinned by a source-reflection test (retired with this one).
+        /// Now `keyed_url`/`dash_url` demand an `IdentityProof`, whose
+        /// only shipping mints are the token challenge in `probe` and
+        /// the tray's own spawn, read back through `identity_proof()` -
+        /// and the app's `proof()` accessor PERFORMS the probe when the
+        /// process has not proven yet, so there is no ordering left to
+        /// forget. What a test can still pin is the fail-closed half:
+        /// the latch unarmed, `identity_proof()` hands out nothing, so
+        /// no key-bearing URL can exist in an unproven process.
+        #[cfg(windows)]
         #[test]
-        fn the_second_instance_probes_before_it_posts() {
-            let src = include_str!("main.rs");
-            // Built in halves so this test's own source cannot satisfy
-            // the searches below.
-            let arm = format!("GetLastError() == {}", "ERROR_ALREADY_EXISTS");
-            let start = src.find(&arm).expect("the second-instance arm exists");
-            let end = src[start..]
-                .find("ensure_daemon")
-                .map(|i| start + i)
-                .unwrap_or(src.len());
-            let block = &src[start..end];
-            let probe = block
-                .find(&format!("probe(port, {}data_dir)", "&"))
-                .expect("the hand-off must probe so the identity latch can arm");
-            for post in ["post_nzb(", "post_nzblnk(", "dash_url("] {
-                if let Some(at) = block.find(post) {
-                    assert!(
-                        probe < at,
-                        "{post} runs before the probe - it will build a keyless URL"
-                    );
-                }
-            }
+        fn no_proof_token_exists_before_the_identity_is_recorded() {
+            use super::{identity_proof, record_identity_proven};
+            // Fresh-process default: unarmed. Other tests exercise the
+            // URL builders with an explicit minted proof, never this
+            // process-global latch, so the sequence below owns it.
+            assert!(
+                identity_proof().is_none(),
+                "unproven process holds no token"
+            );
+            record_identity_proven(true);
+            assert!(identity_proof().is_some(), "the recording is the only mint");
+            record_identity_proven(false);
+            assert!(identity_proof().is_none(), "a later legacy probe disarms");
         }
 
         /// The launcher handshake, which is what stands between "something
@@ -1036,7 +1057,7 @@ mod app {
         let url = keyed_url(
             format!("{}/api?mode={mode}&output=json", origin(port, tls)),
             data_dir,
-            crate::probe_body::identity_proven(),
+            proof(port, data_dir),
         );
         let body = agent(timeout_ms, tls)
             .get(&url)
@@ -1110,11 +1131,28 @@ mod app {
             // challenged. The legacy `None` arm attaches but must not
             // carry the stored key (Codex sweep 10 Aug M10); a spawn we
             // performed ourselves overrides this at the spawn site.
-            crate::probe_body::set_identity_proven(rt.is_some());
+            crate::probe_body::record_identity_proven(rt.is_some());
             Probe::Nzbfast
         } else {
             Probe::Other
         }
+    }
+
+    /// The proof token every keyed URL needs, establishing it when this
+    /// process has not yet done so. v1.0.22 regressed because arming
+    /// the latch was a separate step each path had to remember - the
+    /// second-instance hand-off did not, so every file-association add
+    /// went keyless and the daemon 403ed it. Now asking for the proof
+    /// IS the step: unproven means one probe here, so the runtime.json
+    /// token challenge can arm it, and a listener that fails the
+    /// challenge still gets only keyless URLs. No path can skip this
+    /// and still build a key-bearing URL: `keyed_url`/`dash_url` take
+    /// the token, and this is the only place the app obtains one.
+    fn proof(port: u16, data_dir: &Path) -> Option<crate::probe_body::IdentityProof> {
+        crate::probe_body::identity_proof().or_else(|| {
+            let _ = probe(port, data_dir);
+            crate::probe_body::identity_proof()
+        })
     }
 
     /// The user's real Downloads folder via the known-folder API - a
@@ -1273,7 +1311,7 @@ mod app {
         let url = keyed_url(
             format!("{base}/api?mode=version&output=json"),
             data_dir,
-            crate::probe_body::identity_proven(),
+            proof(port, data_dir),
         );
         let Some(running) = agent(3000, tls)
             .get(&url)
@@ -1290,7 +1328,7 @@ mod app {
         let url = keyed_url(
             format!("{base}/api?mode=shutdown&output=json"),
             data_dir,
-            crate::probe_body::identity_proven(),
+            proof(port, data_dir),
         );
         let _ = agent(5000, tls).post(&url).send_string("");
         let t0 = Instant::now();
@@ -1368,7 +1406,7 @@ mod app {
                 // is established by the spawn itself, even if its
                 // runtime.json write has not landed yet when the first
                 // probe answers.
-                crate::probe_body::set_identity_proven(true);
+                crate::probe_body::record_identity_proven(true);
                 return (port, Some(child));
             }
             std::thread::sleep(Duration::from_millis(250));
@@ -1410,7 +1448,7 @@ mod app {
         let url = keyed_url(
             format!("{}/api?mode=addfile&output=json", origin(port, tls)),
             data_dir,
-            crate::probe_body::identity_proven(),
+            proof(port, data_dir),
         );
         let resp = agent(10_000, tls)
             .post(&url)
@@ -1451,7 +1489,7 @@ mod app {
                 query_value(link)
             ),
             data_dir,
-            crate::probe_body::identity_proven(),
+            proof(port, data_dir),
         );
         let resp = agent(45_000, tls)
             .get(&url)
@@ -1549,7 +1587,7 @@ mod app {
             let url = keyed_url(
                 format!("{}/api?mode=shutdown&output=json", origin(port, tls)),
                 data_dir,
-                crate::probe_body::identity_proven(),
+                proof(port, data_dir),
             );
             let _ = agent(2000, tls).post(&url).send_string("");
             let t0 = Instant::now();
@@ -1798,7 +1836,7 @@ mod app {
                 port,
                 tls_for(port, data_dir),
                 data_dir,
-                crate::probe_body::identity_proven(),
+                proof(port, data_dir),
             )),
             ID_DOWNLOADS => {
                 // Prefer the daemon's live out_dir (an attached daemon may
@@ -1861,7 +1899,7 @@ mod app {
                 let url = keyed_url(
                     format!("{}/api?mode=shutdown&output=json", origin(app.port, tls)),
                     &app.data_dir,
-                    crate::probe_body::identity_proven(),
+                    proof(app.port, &app.data_dir),
                 );
                 let _ = agent(2000, tls).post(&url).send_string("");
                 let t0 = Instant::now();
@@ -1904,7 +1942,7 @@ mod app {
                                 port,
                                 tls_for(port, &data_dir),
                                 &data_dir,
-                                crate::probe_body::identity_proven(),
+                                proof(port, &data_dir),
                             ));
                         }
                         WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
@@ -2079,22 +2117,21 @@ mod app {
             );
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 let port = crate::probe_body::load_port(&data_dir).unwrap_or(BASE_PORT);
-                // IDENTITY_PROVEN is a per-PROCESS latch, and this is a
-                // fresh process: the tray holding the mutex proved the
-                // daemon at its own startup, but that proof lives over
-                // there. Probe once so the runtime.json token challenge
-                // can set our latch, or every hand-off below is built
-                // keyless and the daemon 403s it - v1.0.22 shipped
-                // without this line and every file-association add
-                // failed while the tray was running. An impostor on the
-                // port still fails the challenge and still gets no key.
-                let _ = probe(port, &data_dir);
+                // The identity proof is per-PROCESS and this is a fresh
+                // process: the tray holding the mutex proved the daemon
+                // at its own startup, but that proof lives over there.
+                // Each hand-off below establishes its own through
+                // `proof()`, which probes on demand - v1.0.22 shipped a
+                // latch this branch had to arm by hand, did not, and
+                // every file-association add went keyless into the 403
+                // dialog. An impostor on the port still fails the
+                // challenge and still gets no key.
                 if args.is_empty() && links.is_empty() {
                     open_url(&dash_url(
                         port,
                         tls_for(port, &data_dir),
                         &data_dir,
-                        crate::probe_body::identity_proven(),
+                        proof(port, &data_dir),
                     ));
                 } else {
                     for p in &args {
@@ -2204,7 +2241,7 @@ mod app {
                 port,
                 tls_for(port, &data_dir),
                 &data_dir,
-                crate::probe_body::identity_proven(),
+                proof(port, &data_dir),
             ));
         }
 

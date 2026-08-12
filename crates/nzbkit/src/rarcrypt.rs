@@ -64,17 +64,17 @@ pub enum AesKey {
 /// parsed crypt parameters.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EntryKeys {
-    pub aes: AesKey,
-    pub iv: [u8; 16],
+    pub(crate) aes: AesKey,
+    pub(crate) iv: [u8; 16],
     /// RAR5 tweaked-checksum MAC key. `None` for RAR4, which has no
     /// tweaked-checksum flag at all - a RAR4 file header always stores
     /// the bare CRC32 of the PLAINTEXT.
-    pub hash_key: Option<[u8; 32]>,
+    pub(crate) hash_key: Option<[u8; 32]>,
     /// RAR5 8-byte password check value. `None` for RAR4, which stores
     /// nothing a password can be tested against before decrypting - the
     /// reason RAR4 entries always take the unverified route (ciphertext
     /// assembly, checksum verdict at finish).
-    pub psw_check: Option<[u8; 8]>,
+    pub(crate) psw_check: Option<[u8; 8]>,
 }
 
 /// View a 16-aligned byte buffer as AES blocks - the batched
@@ -94,12 +94,12 @@ pub const MAX_KDF_LG2: u8 = 24;
 #[derive(Clone, PartialEq, Eq)]
 pub struct Rar5Keys {
     /// AES-256 key.
-    pub key: [u8; 32],
+    pub(crate) key: [u8; 32],
     /// Tweaked-checksum HMAC key: folds a plaintext CRC32 the way
     /// WinRAR stores it when the crypt record's tweaked flag is set (see
     /// [`mac_crc32`]), so such an entry's stored checksum still verifies
     /// the decrypted output.
-    pub hash_key: [u8; 32],
+    pub(crate) hash_key: [u8; 32],
     /// 8-byte password check value - compare against a header's stored
     /// check to reject a wrong password BEFORE writing garbage.
     pub psw_check: [u8; 8],
@@ -199,8 +199,8 @@ const RAR4_ROUNDS: u32 = 0x40000;
 /// outputs and the format stores nothing else.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Rar4Keys {
-    pub key: [u8; 16],
-    pub iv: [u8; 16],
+    pub(crate) key: [u8; 16],
+    pub(crate) iv: [u8; 16],
 }
 
 /// Its own cache: the RAR3 schedule is 0x40000 SHA-1 rounds (~50 ms), and

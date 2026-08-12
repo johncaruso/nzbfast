@@ -4,7 +4,8 @@
 //! time; facts change (provider load, time of day, an external party on
 //! the account). This module is the slow, epoch-based controller that
 //! tracks it DURING real downloads: hold the fleet for an epoch, measure
-//! delivered bytes, perturb by ONE connection, keep what measured
+//! delivered bytes, perturb by a step the verdict can actually see
+//! (>= ~3% of the fleet, +/-1 on small fleets), keep what measured
 //! better. The offline knee stays the prior; the account's configured
 //! `connections` is the hard ceiling and is never written by anything
 //! here - the target is state, not a setting.
@@ -36,12 +37,12 @@
 //! `tests/live_tune.rs` only ask whether the whole thing hangs together
 //! against a real pool and a mock provider.
 
-/// Minimum relative gain a +1 connection must show (median over pairs)
-/// to be kept. 4% sits above the paired-epoch noise floor the rigs can
-/// defend while keeping a one-socket step detectable up to ~25
-/// connections; past that a single socket's honest contribution is
-/// inside the noise and the controller is DESIGNED to stop, leaving the
-/// prior/ceiling in charge.
+/// Minimum relative gain an up-probe must show (median over pairs) to
+/// be kept. 4% sits above the paired-epoch noise floor the rigs can
+/// defend; the probe step scales with the fleet ([`UP_STEP_DIV`]) so
+/// the expected below-knee gain (~6%) clears this bar at any size -
+/// with a fixed +1 step, past ~25 connections a single socket's honest
+/// contribution was inside the noise and the walk went blind.
 pub const UP_GAIN: f64 = 1.04;
 
 /// A -1 connection is kept while the smaller fleet still delivers at
@@ -62,6 +63,36 @@ pub const EARLY_UP_GAIN: f64 = 1.15;
 /// A/B pairs per probe cycle (median-of-3, the offline run-off's
 /// best-of-three carried over).
 pub const PAIRS: u32 = 3;
+
+/// Probe step floor as a fraction of the current target: step >=
+/// target/16 (~6%). This is the DETECTABILITY limit, not a speed knob:
+/// below the knee a k-socket trim loses k/m of the rate, so a step
+/// near m*(1-DOWN_KEEP) is invisible to the down verdict - at one
+/// socket per cycle a 100-socket fleet could walk BELOW its knee
+/// losing 1% per step forever, each step individually passing the bar
+/// (the ratchet leak the 10 Aug five-client re-cut motivated fixing:
+/// 360 vs 40 sockets ran the same wall, and +/-1 could neither trim
+/// the surplus in useful time nor stop at the knee once it mattered).
+/// A 6% floor costs ~6% when the trim is wrong, a 4.5-point margin
+/// over DOWN_KEEP's 1.5% bar that paired-median noise cannot bridge;
+/// at 3% the margin was 1.5 points and the rigs' own +/-2% wobble
+/// could sneak a below-knee trim through. Small fleets (target < 16)
+/// keep today's exact +/-1 behavior.
+pub const STEP_FLOOR_DIV: usize = 16;
+
+/// Probe step ceiling as a fraction of the current target (target/4):
+/// however boosted, one cycle never wagers more than a quarter of the
+/// fleet on a single verdict.
+pub const STEP_CAP_DIV: usize = 4;
+
+/// Up-probe step: target/16 (~6%). An up-move must clear UP_GAIN (4%),
+/// and one socket's honest below-knee contribution is 1/m - so past
+/// ~25 connections a +1 can never earn its keep and a fleet seeded
+/// wrongly low would be stuck there. A 6% step clears the bar with
+/// margin when sockets genuinely help and still reads ~0 above the
+/// knee. No acceleration: over-asking is what providers punish, so
+/// the up-walk earns every step at the same size.
+pub const UP_STEP_DIV: usize = 16;
 
 /// One measured epoch: everything the controller is allowed to know
 /// about it. The caller owns HOW these are measured (which gauges,
@@ -84,6 +115,34 @@ pub struct EpochObs {
     /// (connected >= desired for the measuring stretch). An epoch that
     /// never reached its fleet measures the ramp, not the rung.
     pub fleet_met: bool,
+    /// A probe cycle may START on this epoch. The caller raises this on
+    /// the SAME epochs for every server (a shared metronome), which is
+    /// what makes multi-server down-probes share-neutral: on a shared
+    /// saturated link a SOLO -k probe loses exactly its k/m share of
+    /// the line to the servers holding steady, so the verdict reads
+    /// "these sockets carried rate" for sockets that were pure surplus
+    /// - measured live on a 10 GbE five-provider fleet: the first
+    /// (accidentally synchronized) cycle trimmed all three fast hosts,
+    /// then the phases diverged on differing verdicts and every later
+    /// solo probe failed, freezing 340 sockets against a knee well
+    /// under a hundred. With
+    /// a common gate every server shrinks ~6% in the same epochs,
+    /// shares stay proportional, and per-server rate stays flat until
+    /// the FLEET reaches the collective knee. A shaped host still
+    /// fails its own verdict inside the shared window (its per-conn
+    /// rate cannot rise to compensate) and holds - the per-server
+    /// guarantee survives synchronization.
+    pub cycle_gate: bool,
+    /// The link itself is the binding constraint this epoch (fleet
+    /// aggregate at the learned link anchor). Up-probes are suppressed
+    /// while it holds: at saturation a +k probe GAINS k-proportional
+    /// share from every other server - a real measured gain on this
+    /// server that bought the install nothing - and with proportional
+    /// steps (~6%) that grab clears UP_GAIN, so an unguarded fleet
+    /// would inflate back to its ceilings one share-theft at a time.
+    /// When false (link not the constraint), an up-probe's gain is
+    /// genuine new throughput and the walk is free to earn it.
+    pub line_saturated: bool,
 }
 
 impl EpochObs {
@@ -114,10 +173,13 @@ enum Phase {
     /// again - the heavy hysteresis. `next` is the direction the next
     /// cycle will try.
     Hold { left: u32, next: Dir },
-    /// Mid-cycle: epochs alternate base target and base +/- 1, one pair
-    /// at a time, base first (`on_probe` flips every epoch).
+    /// Mid-cycle: epochs alternate base target and base +/- step, one
+    /// pair at a time, base first (`on_probe` flips every epoch).
+    /// `step` is fixed for the whole cycle so every pair measures the
+    /// same rung.
     Probe {
         dir: Dir,
+        step: usize,
         on_probe: bool,
         base: Vec<f64>,
         probe: Vec<f64>,
@@ -138,6 +200,22 @@ pub struct ServerTuner {
     ceiling: usize,
     /// Clean epochs a fresh verdict must wait out between cycles.
     hold_epochs: u32,
+    /// The down-probe step in sockets, doubled after every kept down
+    /// verdict and halved after a failed one, always re-clamped to
+    /// [target/STEP_FLOOR_DIV, target/STEP_CAP_DIV] (min 1) when a
+    /// cycle starts. This is what turns "a surplus fleet trims" from a
+    /// 30-hour +/-1 walk into a geometric one: 360 sockets against a
+    /// knee of 40 converges in ~13 kept cycles, every one of them an
+    /// earned median-of-pairs verdict.
+    down_step: usize,
+    /// Consecutive FAILED down cycles. Each one doubles the hold before
+    /// the next (capped), because a failed down probe is not free: its
+    /// probe epochs ran the fleet below the knee, ~6% under line, and a
+    /// fleet parked AT its knee re-asking every window would pay ~2% of
+    /// the line forever just to keep hearing "no". Reset by any kept
+    /// verdict (the facts moved) and by capacity pressure (the provider
+    /// moved them for us).
+    down_fails: u32,
     phase: Phase,
 }
 
@@ -150,6 +228,8 @@ impl ServerTuner {
             target: prior.clamp(1, ceiling),
             ceiling,
             hold_epochs,
+            down_step: 1,
+            down_fails: 0,
             // Down first: freeing sockets the line does not need is the
             // cheap direction, and a too-high prior is the harmful one
             // (over-asking is what providers punish).
@@ -166,17 +246,35 @@ impl ServerTuner {
     pub fn desired(&self) -> usize {
         match &self.phase {
             Phase::Hold { .. } => self.target,
-            Phase::Probe { dir, on_probe, .. } => {
+            Phase::Probe {
+                dir,
+                step,
+                on_probe,
+                ..
+            } => {
                 if *on_probe {
                     match dir {
-                        Dir::Up => (self.target + 1).min(self.ceiling),
-                        Dir::Down => self.target.saturating_sub(1).max(1),
+                        Dir::Up => (self.target + step).min(self.ceiling),
+                        Dir::Down => self.target.saturating_sub(*step).max(1),
                     }
                 } else {
                     self.target
                 }
             }
         }
+    }
+
+    /// The step a down cycle starting NOW would probe with: the boosted
+    /// state clamped to the detectability floor and the wager cap for
+    /// the current target.
+    fn down_step_now(&self) -> usize {
+        let floor = (self.target / STEP_FLOOR_DIV).max(1);
+        let cap = (self.target / STEP_CAP_DIV).max(1);
+        self.down_step.clamp(floor, cap)
+    }
+
+    fn up_step_now(&self) -> usize {
+        (self.target / UP_STEP_DIV).max(1)
     }
 
     /// The kept target (what the controller believes, ignoring any
@@ -214,7 +312,11 @@ impl ServerTuner {
         // live analogue of the 481/502 capacity yield, expressed as a
         // kept verdict instead of a one-way worker exit.
         if obs.capacity_pressure {
-            self.target = self.target.saturating_sub(1).max(1);
+            // Scaled like a probe step: on a 300-socket fleet a -1
+            // answer to a provider veto is no answer at all.
+            let step = (self.target / STEP_FLOOR_DIV).max(1);
+            self.target = self.target.saturating_sub(step).max(1);
+            self.down_fails = 0;
             self.phase = Phase::Hold {
                 left: self.hold_epochs.max(1) * 2,
                 next: Dir::Down,
@@ -226,7 +328,16 @@ impl ServerTuner {
             // Hold does not tick down, so probing never starts on the
             // heels of dirt (the "never probe upward when the queue is
             // near empty / limiter engaged" rule falls out of this).
-            if let Phase::Probe { .. } = self.phase {
+            if let Phase::Probe { dir, step, .. } = &self.phase {
+                let (dir, step) = (*dir, *step);
+                if dir == Dir::Down {
+                    // A big down-step is itself a common CAUSE of dirt:
+                    // the park wave has not drained by the epoch's end,
+                    // fleet_met's band flags it, and an unchanged step
+                    // would abort identically forever. Halve toward a
+                    // size the fleet can actually settle into.
+                    self.down_step = (step / 2).max(1);
+                }
                 self.phase = Phase::Hold {
                     left: self.hold_epochs,
                     next: Dir::Down,
@@ -240,7 +351,16 @@ impl ServerTuner {
                     *left -= 1;
                     return;
                 }
+                // Cycles start only on the caller's shared metronome,
+                // so every server's probe epochs line up (see
+                // EpochObs::cycle_gate for why that is load-bearing).
+                if !obs.cycle_gate {
+                    return;
+                }
                 let dir = *next;
+                // At link saturation an up-probe can only share-grab
+                // (see EpochObs::line_saturated); probe down instead.
+                let dir = if obs.line_saturated { Dir::Down } else { dir };
                 // A rung with no room in the probed direction flips.
                 let dir = match dir {
                     Dir::Up if self.target >= self.ceiling => Dir::Down,
@@ -251,8 +371,17 @@ impl ServerTuner {
                     // ceiling 1: nothing to tune.
                     return;
                 }
+                if dir == Dir::Up && obs.line_saturated {
+                    // target 1 under saturation: nowhere to go.
+                    return;
+                }
+                let step = match dir {
+                    Dir::Up => self.up_step_now(),
+                    Dir::Down => self.down_step_now(),
+                };
                 self.phase = Phase::Probe {
                     dir,
+                    step,
                     on_probe: true, // this epoch ran at base; next runs the probe rung
                     base: vec![obs.rate_bps],
                     probe: Vec::new(),
@@ -260,6 +389,7 @@ impl ServerTuner {
             }
             Phase::Probe {
                 dir,
+                step,
                 on_probe,
                 base,
                 probe,
@@ -270,6 +400,17 @@ impl ServerTuner {
                     base.push(obs.rate_bps);
                 }
                 let dir = *dir;
+                let step = *step;
+                if dir == Dir::Up && obs.line_saturated {
+                    // Saturation arrived mid-cycle: whatever this
+                    // up-probe is reading from here on is share-grab,
+                    // not throughput. Abort rather than bend.
+                    self.phase = Phase::Hold {
+                        left: self.hold_epochs,
+                        next: Dir::Down,
+                    };
+                    return;
+                }
                 // Early keep for gross under-tuning: the first complete
                 // pair alone may be unambiguous.
                 let early = dir == Dir::Up
@@ -283,24 +424,46 @@ impl ServerTuner {
                 }
                 let gain = median(probe) / median(base).max(1.0);
                 let (kept, next) = match dir {
-                    Dir::Up if gain >= UP_GAIN => (Some(self.target + 1), Dir::Up),
+                    Dir::Up if gain >= UP_GAIN => (Some(self.target + step), Dir::Up),
                     Dir::Down if gain >= DOWN_KEEP => {
-                        (Some(self.target.saturating_sub(1).max(1)), Dir::Down)
+                        (Some(self.target.saturating_sub(step).max(1)), Dir::Down)
                     }
                     d => (None, d.flip()),
                 };
+                // Step bookkeeping for the NEXT down cycle: a kept trim
+                // doubles the wager (a surplus fleet converges
+                // geometrically), a failed one halves it back toward
+                // the floor (fine steps near the knee). The clamp in
+                // down_step_now re-fences either against the target it
+                // will actually probe from.
+                if dir == Dir::Down {
+                    self.down_step = if kept.is_some() {
+                        step.saturating_mul(2)
+                    } else {
+                        (step / 2).max(1)
+                    };
+                }
                 if let Some(t) = kept {
                     self.target = t.clamp(1, self.ceiling);
+                    self.down_fails = 0;
                     // Momentum: a kept move re-probes the same
-                    // direction immediately - a grossly mistuned fleet
-                    // walks to the knee in consecutive cycles instead
-                    // of one step per hold window.
+                    // direction immediately (the next shared gate) - a
+                    // grossly mistuned fleet walks to the knee in
+                    // consecutive cycles instead of one step per hold
+                    // window.
                     self.phase = Phase::Hold { left: 0, next };
                 } else {
-                    self.phase = Phase::Hold {
-                        left: self.hold_epochs,
-                        next,
+                    // A failed DOWN was not free (its probe epochs ran
+                    // below the knee), so consecutive ones back the
+                    // re-ask off exponentially; a failed UP costs
+                    // nothing and keeps the ordinary hold.
+                    let hold = if dir == Dir::Down {
+                        self.down_fails = (self.down_fails + 1).min(4);
+                        self.hold_epochs << self.down_fails
+                    } else {
+                        self.hold_epochs
                     };
+                    self.phase = Phase::Hold { left: hold, next };
                 }
             }
         }
@@ -345,6 +508,8 @@ mod tests {
                 rate_limited: false,
                 capacity_pressure: false,
                 fleet_met: true,
+                cycle_gate: true,
+                line_saturated: false,
             });
         }
     }
@@ -418,6 +583,8 @@ mod tests {
                     rate_limited: limited,
                     capacity_pressure: false,
                     fleet_met: true,
+                    cycle_gate: true,
+                    line_saturated: false,
                 });
             }
             assert_eq!(t.target(), 4, "moved on dirty epochs (busy={busy})");
@@ -435,6 +602,8 @@ mod tests {
             rate_limited: false,
             capacity_pressure: true,
             fleet_met: false,
+            cycle_gate: true,
+            line_saturated: false,
         });
         assert_eq!(t.target(), 11);
         assert_eq!(t.desired(), 11);
@@ -499,6 +668,231 @@ mod tests {
             t.target()
         );
         assert!((19..=21).contains(&t.target()), "phase 2: {}", t.target());
+    }
+
+    /// The 10 Aug five-client re-cut in pure form: 360 sockets and 40
+    /// sockets ran the same wall, so a fleet pinned at the published
+    /// maxima is carrying ~320 sockets of pure CPU overhead. The
+    /// controller must trim a large surplus fleet down to the knee in
+    /// useful time - the accelerating step makes this geometric, and
+    /// every step is still an earned median-of-pairs verdict.
+    #[test]
+    fn a_big_surplus_fleet_trims_to_the_knee_fast() {
+        let mut t = ServerTuner::new(360, 360, 2);
+        let mut seed = 0xa11_0c8e;
+        let mut epochs_to_band = None;
+        for e in 0..400 {
+            drive(&mut t, 40, 1, &mut seed);
+            if epochs_to_band.is_none() && t.target() <= 48 {
+                epochs_to_band = Some(e + 1);
+            }
+        }
+        assert!(
+            (40..=48).contains(&t.target()),
+            "settled at {} against a knee of 40",
+            t.target()
+        );
+        let reached = epochs_to_band.expect("never reached the knee band");
+        // ~10 kept cycles of 6 epochs each, plus the noise tax: near
+        // the knee a genuine trim's gain sits at ~1.0 and the +/-2%
+        // wobble spuriously fails ~1 in 5 of them (each fail costs a
+        // hold and halves the step). Measured ~170 under this rig's
+        // wobble; the bound pins the ORDER: geometric, not +/-1
+        // (which would need ~1900 epochs to walk 320 sockets).
+        assert!(
+            reached <= 220,
+            "took {reached} epochs to trim 360 -> <=48 - the walk is not geometric"
+        );
+    }
+
+    /// The ratchet leak the proportional floor exists to close: on a
+    /// large fleet sitting AT its knee, a -1 probe loses only 1/m of
+    /// the rate - inside DOWN_KEEP's bar for m > ~67 - so the old
+    /// fixed-step walk would keep every step and creep below the knee
+    /// indefinitely, 1% of the line at a time. The floored step makes
+    /// a below-knee trim cost ~3%, which the bar rejects.
+    #[test]
+    fn a_large_fleet_at_the_knee_does_not_creep_below_it() {
+        let mut t = ServerTuner::new(100, 100, 2);
+        let mut seed = 0xc4ee_9001;
+        drive(&mut t, 100, 600, &mut seed);
+        assert!(
+            t.target() >= 92,
+            "crept to {} on a fleet whose knee is its size",
+            t.target()
+        );
+    }
+
+    /// The giganews shape (nzbfast-giganews-shaping): a per-connection
+    /// shaped host delivers rate proportional to sockets with no knee
+    /// in reach, so every socket is genuinely needed - the trim must
+    /// hold such a fleet, not bank its CPU. Modeled as a knee far above
+    /// the ceiling: every down-probe loses its full share and fails.
+    #[test]
+    fn a_per_conn_shaped_host_keeps_its_needed_fleet() {
+        let mut t = ServerTuner::new(100, 100, 2);
+        let mut seed = 0x5a4e_d000;
+        drive(&mut t, 1000, 400, &mut seed);
+        assert_eq!(
+            t.target(),
+            100,
+            "trimmed a fleet where every socket carries rate"
+        );
+    }
+
+    /// The recovery direction after a trim, at scale: a fleet seeded
+    /// far below a large knee must be able to EARN its way back up -
+    /// with a fixed +1 step the 4% bar went blind past ~25 sockets and
+    /// a wrongly-low seed was permanent.
+    #[test]
+    fn a_big_fleet_seeded_low_climbs_back_to_a_high_knee() {
+        let mut t = ServerTuner::new(40, 360, 2);
+        let mut seed = 0x0c11_3b12;
+        drive(&mut t, 200, 600, &mut seed);
+        assert!(
+            t.target() >= 180,
+            "stuck at {} against a knee of 200",
+            t.target()
+        );
+    }
+
+    /// Shared-line waterfill: each server offers m_i * percap_i;
+    /// if the sum exceeds the line, per-conn-capped servers keep
+    /// min(offer, fair share) and the elastic remainder splits the
+    /// rest by socket count - the TCP-fairness cartoon the live
+    /// shared-line stall was measured against.
+    fn shared_rates(fleets: &[(usize, f64)], line: f64) -> Vec<f64> {
+        let offers: Vec<f64> = fleets.iter().map(|(m, cap)| *m as f64 * cap).collect();
+        let total: f64 = offers.iter().sum();
+        if total <= line {
+            return offers;
+        }
+        // One waterfill pass is enough for these tests: servers whose
+        // offer is under their socket-proportional share keep it, the
+        // rest split the remainder by sockets.
+        let msum: f64 = fleets.iter().map(|(m, _)| *m as f64).sum();
+        let mut rates = vec![0.0; fleets.len()];
+        let mut spare = line;
+        let mut elastic_m = 0.0;
+        for (i, (m, _)) in fleets.iter().enumerate() {
+            let fair = *m as f64 / msum * line;
+            if offers[i] <= fair {
+                rates[i] = offers[i];
+                spare -= offers[i];
+            } else {
+                elastic_m += *m as f64;
+            }
+        }
+        for (i, (m, _)) in fleets.iter().enumerate() {
+            if rates[i] == 0.0 {
+                rates[i] = *m as f64 / elastic_m * spare;
+            }
+        }
+        rates
+    }
+
+    /// Drive N tuners against one shared line for `epochs`, with the
+    /// caller's gate cadence and saturation flag computed per epoch.
+    fn drive_shared(
+        tuners: &mut [ServerTuner],
+        percaps: &[f64],
+        line: f64,
+        epochs: usize,
+        sync: u64,
+        seed: &mut u32,
+    ) {
+        for e in 0..epochs {
+            let fleets: Vec<(usize, f64)> = tuners
+                .iter()
+                .zip(percaps)
+                .map(|(t, c)| (t.desired(), *c))
+                .collect();
+            let rates = shared_rates(&fleets, line);
+            let total: f64 = rates.iter().sum();
+            let saturated = total >= line * 0.85;
+            for (i, t) in tuners.iter_mut().enumerate() {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 17;
+                *seed ^= *seed << 5;
+                let wobble = 1.0 + ((*seed % 400) as f64 - 200.0) / 10_000.0;
+                t.on_epoch(EpochObs {
+                    rate_bps: rates[i] * wobble,
+                    busy: true,
+                    rate_limited: false,
+                    capacity_pressure: false,
+                    fleet_met: true,
+                    cycle_gate: (e as u64).is_multiple_of(sync),
+                    line_saturated: saturated,
+                });
+            }
+        }
+    }
+
+    /// The measured shared-line stall, pinned: two elastic servers on a
+    /// saturated shared line. WITHOUT the shared gate (every server
+    /// free-running), phases diverge after the first verdicts and a
+    /// solo down-probe loses its share of the line to the holder, so
+    /// the fleet freezes far above the collective knee. WITH the gate,
+    /// probes coincide, shares stay proportional, and the fleet trims
+    /// to ~the knee. One test, both halves - the gate must MATTER.
+    #[test]
+    fn synchronized_gates_trim_a_shared_saturated_line() {
+        // Two servers, 100 sockets each; per-conn capacity 1.0; line
+        // 40: collective knee = 40 sockets total.
+        let mut seed = 0x51ac_e001;
+        let mut tuners = vec![ServerTuner::new(100, 100, 2), ServerTuner::new(100, 100, 2)];
+        drive_shared(&mut tuners, &[1.0, 1.0], 40.0, 700, 8, &mut seed);
+        let total: usize = tuners.iter().map(|t| t.target()).sum();
+        assert!(
+            total <= 60,
+            "gated fleet kept {total} sockets against a collective knee of 40 ({} + {})",
+            tuners[0].target(),
+            tuners[1].target()
+        );
+        assert!(total >= 38, "gated fleet cut into the knee: {total}");
+    }
+
+    /// The giganews guard inside the shared window: a per-conn-shaped
+    /// host on the same saturated line as an elastic one. The shaped
+    /// host's rate falls with every socket it gives up (its per-conn
+    /// cannot rise to compensate), so ITS verdicts fail and it keeps
+    /// its fleet while the elastic host absorbs the trim.
+    #[test]
+    fn a_shaped_host_keeps_its_fleet_inside_the_shared_window() {
+        // Server 0: shaped, 100 sockets at 0.15/conn = 15 total,
+        // always under its fair share (needs every socket).
+        // Server 1: elastic, 100 sockets at 1.0/conn on a line of 40.
+        let mut seed = 0x9a4e_d0d0;
+        let mut tuners = vec![ServerTuner::new(100, 100, 2), ServerTuner::new(100, 100, 2)];
+        drive_shared(&mut tuners, &[0.15, 1.0], 40.0, 700, 8, &mut seed);
+        assert!(
+            tuners[0].target() >= 85,
+            "trimmed a shaped host to {} - every one of its sockets carried rate",
+            tuners[0].target()
+        );
+        assert!(
+            tuners[1].target() <= 45,
+            "the elastic host kept {} sockets beside a 25-socket need",
+            tuners[1].target()
+        );
+    }
+
+    /// The inflation guard: a fleet at the collective knee on a
+    /// saturated line must not walk UP - at saturation a solo up-probe
+    /// gains share, not throughput, and with proportional steps that
+    /// grab clears UP_GAIN. line_saturated parks the up-walk.
+    #[test]
+    fn saturation_parks_the_up_walk() {
+        let mut seed = 0x0bad_9a1b;
+        let mut tuners = vec![ServerTuner::new(25, 100, 2), ServerTuner::new(25, 100, 2)];
+        drive_shared(&mut tuners, &[1.0, 1.0], 40.0, 500, 8, &mut seed);
+        for t in &tuners {
+            assert!(
+                t.target() <= 27,
+                "walked up to {} on a saturated line - share-grab inflation",
+                t.target()
+            );
+        }
     }
 
     /// A ceiling of one is not tunable and must simply sit still.

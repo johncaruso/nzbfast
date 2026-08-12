@@ -47,17 +47,15 @@ const RECHECK_MAX: usize = 2_000;
 /// Rows per lock hold within the recheck pass (see the chunk loop).
 const RECHECK_CHUNK: usize = 200;
 
-/// The sampled categories: newznab's standard top-level thousands.
-/// One request each per day; labels are the stored aggregate keys.
-const CATEGORIES: &[(u32, &str)] = &[
-    (2000, "movies"),
-    (5000, "tv"),
-    (3000, "audio"),
-    (7000, "books"),
-];
-
 /// The daily driver. Polls cheap gates every few minutes and hands the
 /// actual run to a blocking thread, predb_seed style.
+///
+/// The sampled categories are `SCOREBOARD_CATEGORIES` narrowed by the
+/// user's `scoreboard_cats` pick - resolved per run through
+/// `Daemon::scoreboard_categories()`, because indexers meter every call
+/// and the user is allowed to spend fewer than four a day. That filter
+/// can only ever REMOVE a category, so this run is never more than one
+/// request per built-in category and never fewer than one in total.
 #[cfg(feature = "indexer")]
 pub(in crate::serve) fn spawn_scoreboard(daemon: &Arc<Daemon>) {
     let d = daemon.clone();
@@ -204,7 +202,10 @@ fn run(d: &Arc<Daemon>) -> Result<String, String> {
     // always has an origin behind it.
     let mut origin: Option<SourceOrigin> = None;
     let mut requests = 0u32;
-    for (cat, label) in CATEGORIES {
+    // Read once, so a mid-run settings change cannot make the run cost
+    // more than the figure the card quoted when it started.
+    let categories = d.scoreboard_categories();
+    for (cat, label) in &categories {
         say(&format!("sampling {label} from {source}"));
         std::thread::sleep(std::time::Duration::from_millis(PACE_MS));
         requests += 1;
@@ -283,7 +284,7 @@ fn run(d: &Arc<Daemon>) -> Result<String, String> {
         .with_index_mut(|ix| ix.scoreboard_store(&samples, now).ok())
         .ok_or_else(|| "the index was unavailable while storing".to_string())?;
     let calibrated = match (d.scoreboard_calibrate.load(Ordering::Relaxed), &origin) {
-        (true, Some(origin)) => calibrate(d, &source, origin, cal_pool, now),
+        (true, Some(origin)) => calibrate(d, &source, origin, &categories, cal_pool, now),
         _ => 0,
     };
     // scoreboard_last_run is stamped by the caller, success or failure.
@@ -307,16 +308,19 @@ fn calibrate(
     d: &Arc<Daemon>,
     source: &str,
     origin: &SourceOrigin,
+    categories: &[(u32, &'static str)],
     pool: Vec<CalPick>,
     now: i64,
 ) -> usize {
-    // Spread the budget across categories rather than burning it all
-    // on whichever category was sampled first.
+    // Spread the budget across the categories THIS run sampled rather
+    // than burning it all on whichever was sampled first. A category
+    // the user turned off contributed nothing to the pool, so it takes
+    // no share of the grab budget either.
     let mut picks: Vec<CalPick> = Vec::new();
     let mut round = 0usize;
     while picks.len() < CAL_MAX {
         let before = picks.len();
-        for (_, label) in CATEGORIES {
+        for (_, label) in categories {
             if picks.len() >= CAL_MAX {
                 break;
             }

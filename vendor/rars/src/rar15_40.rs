@@ -578,6 +578,11 @@ impl FileHeader {
             | Error::Io(_)
             | Error::AtArchiveOffset { .. }
             | Error::AtEntry { .. }
+            // The fragment CRC covers the PACKED bytes as stored - the
+            // ciphertext for an encrypted member - so a mismatch proves
+            // on-disk damage and is never a wrong-password symptom.
+            | Error::SplitFragmentCrc32Mismatch { .. }
+            | Error::SplitFragmentHashMismatch { .. }
             | Error::Cancelled => error,
             Error::InvalidHeader(_)
             | Error::Codec(_)

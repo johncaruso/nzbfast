@@ -198,6 +198,15 @@ nzbfast serve --open     # start the daemon and open the dashboard</code></pre>
 Abtippen der Zugangsdaten: Einstellungen → Usenet-Server → <b>Aus SABnzbd / NZBGet
 importieren…</b> findet deine bestehende Installation und übernimmt ihre Server.
 Auf der Kommandozeile gibt es außerdem <code>nzbfast import-sab</code>.</div>
+<p>Die Willkommenskarte fragt außerdem, <b>wie du nzbfast nutzen willst</b>, mit
+vier Antworten: eine App wie Sonarr oder Radarr steuert es, Umstieg von SABnzbd,
+Umstieg von NZBGet, oder nur du, von diesem Dashboard aus. Eine Antwort zu wählen
+ändert für sich genommen nichts. Sie zeigt eine kurze Liste zum Durchsehen - jede
+Empfehlung mit dem eigenen Namen der Einstellung, ihrem aktuellen Wert, dem
+empfohlenen Wert und einer Zeile Begründung - und <b>Anwenden</b> setzt nur die
+Zeilen, die du ankreuzt. Jede Zeile ist eine gewöhnliche Einstellung, die du danach
+einzeln zurückstellen kannst, und dieselbe Liste bleibt später unter
+Einstellungen → <b>Empfohlene Einstellungen für deine Nutzung</b> verfügbar.</p>
 
 <h3 id="firstrun-key">Dein API-Key</h3>
 <p>Auf einer wirklich neuen Installation macht sich nzbfast beim ersten Start des
@@ -376,6 +385,17 @@ einem Klick - kein externer Indexer nötig. Die Statuszeile zeigt den Scan-Forts
 <p>Füge Titel per Name hinzu - auch solche, die noch gar nicht gepostet wurden. Taucht
 ein passendes Release im Index auf, wird es automatisch geholt, mit Qualitätsvorlieben
 und Upgrade-Regeln (eine bessere Kopie ersetzt eine schlechtere).</p>
+<p>Die Karte kann auch einer Liste folgen, die du in Plex pflegst. Füge eine
+<b>Listenquelle</b> hinzu: Verknüpfe entweder dein Plex-Konto (du bestätigst einen
+kurzen Code auf Plex' eigener Seite, ein Passwort erreicht nzbfast also nie) oder
+füge die Adresse deiner Plex-Watchlist ein. Behandle diese Adresse wie ein
+Passwort - wer sie hat, kann deine Liste lesen - deshalb wird sie nach dem Speichern
+maskiert. Synchronisierte Titel erscheinen als schreibgeschützte Zeilen neben deinen
+eigenen. Ein verknüpftes Konto sieht deine ganze Liste: Entfernst du dort einen
+Titel, wird er auch hier nicht mehr beobachtet (fertige Downloads bleiben
+unangetastet); eine Adresse zeigt nur die neuesten Einträge - ein fehlender Titel
+kann also einfach herausgerutscht sein, und es wird nichts entfernt. Beides lässt
+sich pro Quelle umstellen.</p>
 <h3 id="dash-history">Verlauf</h3>
 <p>Die jüngsten Downloads, eine Zeile je Download. Fehlgeschlagene Jobs bieten <b>Erneut</b> (setzt aus dem Journal fort). Verschlüsselte Archive zeigen ein
 🔑-Entsperr-Element - gib das Passwort ein und der Job wird an Ort und Stelle fertig.
@@ -498,6 +518,32 @@ tragen ein <b>abgeräumt</b>-Abzeichen.</li>
 richtige Datei ist. Öffne sie, während sie lädt, prüfe, ob Inhalt, Sprache und
 Qualität deinen Erwartungen entsprechen, und brich früh ab, wenn nicht - statt es
 erst nach dem kompletten Download festzustellen.</p>
+<p>Die erste Hälfte davon steht schon auf der Seite. Öffne die Zeile eines Downloads
+in der Warteschlange (oder im Verlauf), und die Schublade zeigt, was in der
+Videodatei steckt, gelesen aus den bereits angekommenen Bytes: Auflösung, Video- und
+Audio-Codecs, Audiosprachen, Untertitel, Kapitel. Ein Release, das der falsche
+Schnitt, die falsche Sprache oder ein Upscale ist, verrät sich in diesem Panel lange
+bevor der Download fertig ist.</p>
+<p>Die Seite findet außerdem heraus, ob <em>dieser</em> Browser die Datei abspielen
+kann, und sagt es, statt zu raten: Browser unterscheiden sich (Safari dekodiert
+HEVC, wo Chrome es nicht tut, und fast keiner dekodiert AC-3- oder DTS-Audio),
+die Frage wird also dem Browser gestellt, in dem du tatsächlich bist. Lautet die
+Antwort ja, öffnet <b>▶ Abspielen</b> einen Player direkt auf der Seite, der die
+Datei zeigt, während sie lädt. Die meisten Releases sind MKV, das viele Browser
+nicht öffnen, obwohl sie alles darin dekodieren können, also packt nzbfast diese
+beim Abspielen um. Nichts wird neu kodiert: Bild und Ton sind die ursprünglichen
+Bytes in einer anderen Hülle, und das Springen im Film funktioniert weiterhin.
+Ist die Tonspur eine, die dieser Browser nicht dekodieren kann, und das Release
+führt eine zweite mit, die er kann, läuft diese zweite Spur, damit das Bild
+nicht stumm ankommt. Erst wenn dem Browser der Dekoder für das Video selbst
+fehlt, reicht der Knopf die Datei stattdessen an deinen eigenen Medienplayer
+weiter, wie unten beschrieben.</p>
+<p>Eine Einstellung regelt das alles: Einstellungen → Oberfläche → <b>Eine Datei
+prüfen, während sie lädt</b>. <b>Nur Details</b>, der Standard, zeigt das Panel und
+bietet keinen Player auf der Seite an; <b>Details und ein Player</b> fügt den Player
+hinzu; <b>Aus</b> verhindert, dass die Datei überhaupt gelesen wird - damit öffnet
+nichts für niemanden eine halb geladene Datei.</p>
+<p>So prüfst du stattdessen in deinem eigenen Medienplayer:</p>
 <ul>
 <li><b>▶ Abspielen</b> auf der Wand (oder <code>/m3u/&lt;id&gt;</code>) reicht deinem
 Medienplayer eine URL; der Daemon startet den Download dahinter oder nutzt den
@@ -534,8 +580,20 @@ jeden Server in den Pool holen oder aus ihm herausnehmen. Jeder Server hat:</p>
 <tr><td>Verbindungen</td><td>Gleichzeitige Verbindungen pro Server. Nutz <b>Verbindungs-Tuning</b> (<a href="#performance">§13</a>), um den Sweet Spot jedes Providers zu finden, statt einfach hoch zu raten.</td></tr>
 <tr><td>Level (Tier)</td><td>0 = primär; höhere Level sind Fill-Server und werden nur nach Artikeln gefragt, die alle niedrigeren Level verpasst haben. Flatrate-Konten auf 0, Block-Konten auf 1+.</td></tr>
 <tr><td>Blockgröße (GB)</td><td>Für Block-Konten (Bezahlung pro GB): nzbfast zählt die Lebenszeitnutzung dagegen und lässt den Server aus, sobald der Block aufgebraucht ist (Warnung bei 85 %).</td></tr>
+<tr><td>Jedes Byte wird abgerechnet</td><td>Für ein Konto mit Volumenabrechnung einschalten. Deine Downloads nutzen den Server genau wie zuvor; was aufhört, ist Verkehr, den nzbfast von sich aus schickt - das automatische Verbindungs-Tuning, die Netzwerk-Etappe des System-Benchmarks und die Header-Scans für den eingebauten Index lassen ihn alle aus. Unabhängig vom Level und von der Blockgröße, denn ein Volumen-Konto kann dein einziger Provider sein und ein Flatrate-Konto auf Level 2 sitzen. Standardmäßig aus. Der manuelle <b>Test</b> im <b>Verbindungs-Tuning</b> (<a href="#performance">§13</a>) funktioniert auf einem so markierten Server weiterhin und fragt vorher, denn dort entscheidest du selbst, etwas auszugeben.</td></tr>
 </table></div>
 <p><b>Lass etwas Luft unter dem Verbindungslimit deines Kontos.</b> Die Verbindungszahl etwas unter das Limit zu setzen kostet nichts: der Durchsatz flacht schon vor den letzten ein, zwei Verbindungen ab, und <b>Verbindungs-Tuning</b> (<a href="#performance">§13</a>) landet ohnehin meist darunter. Die freien Plätze sind es, durch die ein zweites Gerät, ein anderes Programm oder ein neuer Versuch nach einem abgebrochenen Socket noch hineinkommt, statt abgewiesen zu werden, während hier jeder Platz belegt ist.</p>
+<p><b>Um das Limit offener Dateien deiner Maschine musst du dich nicht kümmern.</b> Das
+System zählt jede Verbindung als offene Datei, und macOS startet ein Programm mit einem
+Limit von 256 davon, das ein voller Satz Verbindungen über mehrere Server hinweg
+überschreiten kann. Unter macOS und Linux hebt nzbfast dieses Limit beim Start selbst an:
+es fragt nach 65536 offenen Dateien und geht über 16384, 4096 und 1024 herunter, bis das
+System zustimmt, nie über das harte Limit hinaus, das das System setzt, und es läuft mit
+dem Limit weiter, das es hatte, wenn jede Stufe abgelehnt wird. Windows kennt kein solches
+Limit pro Prozess. Andere Programme nehmen das Limit, das die Shell ihnen mitgegeben hat,
+und eines, dem mitten im Job die offenen Dateien ausgehen, kann stehen bleiben, ohne dass
+im Log steht, warum. Stell die Verbindungen pro Server also nach dem ein, was dein Tarif
+erlaubt, abzüglich der Luft von oben, und nicht danach, was die Maschine wohl mitmacht.</p>
 <h3 id="passwords">Wie deine Provider-Passwörter gespeichert werden</h3>
 <p>Provider-Passwörter in <code>config.local.json</code> sind <b>verschleiert, nicht
 verschlüsselt</b>. Sie werden als <code>obf1:</code> gefolgt von einer kodierten Form
@@ -674,6 +732,7 @@ geraten zu werden.</p>
 <tr><td>Release-Gruppe einbeziehen</td><td>Das <code>-GROUP</code>-Kennzeichen am Ende.</td></tr>
 <tr><td>Müll-Dateien entfernen</td><td><b>Standardmäßig an.</b> Löscht übrig gebliebene <code>.par2</code>, <code>.nzb</code>, <code>.sfv</code>, <code>.nfo</code> und Sample-Clips aus fertigen Film- und Serienordnern. Nie das Video oder seine Untertitel.</td></tr>
 <tr><td>Nur die Mediendatei behalten</td><td><b>Standardmäßig aus, und destruktiv:</b> löscht dauerhaft alles im Ordner außer dem Video (oder den Videos) und den Untertiteln. Jede Episode eines Staffelpakets bleibt erhalten. Hat Vorrang vor <b>Müll-Dateien entfernen</b>, wenn beides an ist.</td></tr>
+<tr><td>Downloads nach der .nzb-Datei benennen</td><td><b>Standardmäßig aus.</b> Der fertige Ordner und seine Hauptdatei bekommen den Namen der <code>.nzb</code>-Datei statt des aufgeräumten Namens, der aus dem Release ermittelt wurde. Nur die größte Datei wird umbenannt: der Rest eines Episodenpakets, das Sample, die Untertitel und die <code>.nfo</code> behalten die Namen, mit denen sie angekommen sind. Jede Kategorie kann es unter <b>Deine Kategorien</b> für sich erlauben oder verbieten - so bekommst du es für eine Art von Download und für eine andere nicht.</td></tr>
 <tr><td>Keep the other words in the name</td><td><b>Standardmäßig an.</b> Sport, Rennen und andere Events sind oft ein und derselbe Titel, die ganze Saison lang wiederholt und nur ein oder zwei Wörter auseinander - "Round11 Hungary Race" gegen "Round11 Hungary Qualifying". Diese Wörter zu behalten ist das, was verhindert, dass eine ganze Saison zum selben Namen zusammenfällt. Greift nur dort, wo der Name sich anders nicht aufräumen ließ, gewöhnliche Filme und Folgen bleiben also unberührt.</td></tr>
 </table></div>
 <p class="dim">Die ganze Gruppe läuft nach Reparatur und Entpacken und vor <b>Fertige
@@ -784,6 +843,16 @@ alle anderen landen sie dauerhaft in <code>settings.json</code>.</p>
 setzen, fertig. Neue Releases werden geholt, sobald sie in deinen indexierten Gruppen
 auftauchen; Kopien in besserer Qualität ersetzen frühere Grabs; eine Kalenderansicht
 zeigt, was ansteht.</p>
+<p>Eine <b>Listenquelle</b> speist die Watchlist aus einer Liste, die du in Plex
+pflegst, auf eine von zwei Arten: Verknüpfe dein Plex-Konto, indem du einen kurzen
+Code auf der Plex-Seite bestätigst, oder füge eine Plex-Watchlist-Adresse ein. Die
+Adresse ist ein Zugangsschlüssel - wer sie besitzt, darf die Liste lesen - deshalb
+wird sie nach dem Speichern maskiert. Das Synchronisieren von Entfernungen
+unterscheidet sich absichtlich je nach Modus: Ein verknüpftes Konto sieht die ganze
+Liste, ein dort entfernter Titel wird also auch hier nicht mehr beobachtet (bereits
+fertige Downloads bleiben); ein Adress-Feed enthält nur die neuesten Einträge,
+Abwesenheit beweist also nichts und Titel werden immer nur hinzugefügt. Beide
+Vorgaben lassen sich pro Quelle ändern.</p>
 <h3 id="auto-rss">RSS-Feeds</h3>
 <p>Einstellungen → RSS: jede newznab-/Indexer-RSS-URL, mit Intervall, Kategorie und
 Filterregeln pro Feed (Titelmuster, Größengrenzen). Passende Einträge werden
@@ -800,7 +869,64 @@ Pause/Fortsetzen/Tempo nach Tageszeit.</p>
 <h3>Skripte</h3>
 <p>Ein Nachbearbeitungs-Skript bekommt SABnzbds Positionsargumente und
 <code>SAB_*</code>-Umgebungsvariablen - das große Ökosystem an SAB-Skripten läuft
-unverändert.</p>
+unverändert. NZBGets Dialekt wird daneben bereitgestellt - <code>NZBPP_*</code>-Variablen
+(<code>DIRECTORY</code>, <code>NZBNAME</code>, <code>CATEGORY</code>,
+<code>TOTALSTATUS</code>, <code>PARSTATUS</code>, <code>UNPACKSTATUS</code>,
+<code>FINALDIR</code>) und die Exit-Codes 93/94/95 - sodass auch die Kernlogik
+eines NZBGet-Erweiterungsskripts läuft. Die Abbildung ist ehrlich statt einer
+Emulation: Reparatur und Entpacken passieren im Ein-Pass-Download, eine saubere
+Fertigstellung meldet also <code>PARSTATUS=0</code> und eine reparierte
+<code>PARSTATUS=2</code>.
+Formen für Optionen pro Skript (<code>NZBPO_*</code>) werden nicht bereitgestellt.
+Ein Skript darf beim Beenden einen Helfer im Hintergrund weiterlaufen lassen und
+nzbfast wird ihn nicht töten, aber nzbfast hört in dem Moment auf, die Ausgabe des
+Skripts zu lesen, in dem das Skript selbst endet: gib einem Hintergrund-Helfer
+eine eigene Ausgabe-Umleitung, sonst wird er beim ersten Druckversuch gestoppt.</p>
+<h3>Pre-Queue-Skript</h3>
+<p>Ein zweiter Haken läuft, <em>bevor</em> ein Download in die Warteschlange kommt
+(Einstellungen → Ordner → Pre-Queue-Skript), mit SABnzbds Pre-Queue-Vertrag:
+Argumente <code>name, pp, category, script, priority, size, group</code> plus die
+<code>SAB_*</code>-Umgebung. Die erste Zeile seiner Ausgabe akzeptiert den Download
+(<code>1</code>) oder lehnt ihn ab (<code>0</code>); die Zeilen 2 bis 7 können ihn
+umbenennen, <code>pp</code> setzen, die Kategorie ändern, ein Skript wählen oder
+die Priorität ändern (leere Zeilen behalten den Standard). Ein abgelehnter
+Download geht als Fehlgeschlagen mit dem Grund in den Verlauf, und Retry aus dem
+Verlauf holt ihn zurück, ohne das Skript erneut zu fragen. Der Haken kann nie
+einen Download verlieren: Fehlt das Skript, stürzt es ab, überzieht es sein
+Zeitbudget oder druckt es etwas, das kein Urteil ist, geht das Hinzufügen
+unangetastet weiter, und das Log sagt warum.</p>
+<h3>Lebenszyklus-Ereignisse und signierte Webhooks</h3>
+<p>Jeder Job-Meilenstein ist ein versioniertes Ereignis: <code>job.added</code>,
+<code>job.started</code>, <code>job.finishing</code>, <code>job.repaired</code>,
+<code>job.completed</code>, <code>job.failed</code>, dazu
+<code>queue.idle</code>, <code>giveup.tripped</code>, <code>disk.low</code>,
+<code>storage.slow</code> und <code>quota.reached</code>. Jedes trägt
+<code>schema_version</code> (derzeit 1; neue Schlüssel können ohne Erhöhung
+auftauchen - ignoriere, was du nicht kennst), eine monotone <code>seq</code> und
+einen <code>at</code>-Zeitstempel in Millisekunden.</p>
+<p>Um sie zu empfangen, leg ein <b>Webhook</b>-Benachrichtigungsziel an
+(Einstellungen → Automatisierung) und liste in seinem <i>events</i>-Feld die
+Ereignisarten auf, die es bekommen soll - exakte Arten oder ein Präfix wie
+<code>job.*</code>. Das Ziel bekommt dann einen POST pro Ereignis: das
+Ereignis-JSON als Body plus eine <code>delivery</code>-Kennung
+(<code>&lt;boot&gt;-&lt;seq&gt;</code>, der Griff zum Deduplizieren), die Header
+<code>X-NzbFast-Event</code> und <code>X-NzbFast-Delivery</code>, und - wenn das
+Ziel ein Signier-Geheimnis hat - <code>X-NzbFast-Signature: sha256=&lt;hex&gt;</code>,
+ein HMAC-SHA256 der exakten Body-Bytes unter deinem Geheimnis (dieselbe Form, die
+GitHub-Webhooks nutzen). Prüfung in Python:</p>
+<pre><code>expected = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
+ok = hmac.compare_digest(expected, request.headers["X-NzbFast-Signature"])</code></pre>
+<p>Die Zustellung ist mindestens-einmal: ein nicht erreichbares Ziel wird nach
+10&nbsp;s, 60&nbsp;s und 5&nbsp;min erneut versucht, dann fallen gelassen, wobei
+der Fehlschlag auf der Einstellungszeile des Ziels erscheint. Eine
+HTTP-Fehlerantwort (404, 401...) wird nicht wiederholt - reparier den Empfänger
+und nutz Test. Jedes Ziel hat seine eigene Zustellspur, sodass ein langsames oder
+unerreichbares nie ein anderes aufhält; innerhalb einer Spur behalten Zustellungen
+die Reihenfolge, in der die Ereignisse passiert sind, und wird eine fallen
+gelassen, zeigen die Sequenznummern die Lücke. Die klassischen Ereigniswörter
+(<code>completed</code>, <code>failed</code>, <code>repaired</code>,
+<code>disk</code>, <code>quota</code>) behalten auf demselben Ziel ihre Bedeutung
+für menschliche Benachrichtigungen.</p>
 
 <h2 id="arr">11 · Sonarr, Radarr &amp; Co.</h2>
 <p>nzbfast spricht die SABnzbd-API nativ, also funktioniert jedes *arr out of the
@@ -812,6 +938,12 @@ box - und es kann obendrein ihr <em>Indexer</em> sein.</p>
 (wo du ihn findest: <a href="#firstrun-key">§2</a>).</li>
 <li>Kategorie nach Wunsch (z.&nbsp;B. <code>tv</code> / <code>movies</code>). Test → grüner Haken → Save.</li>
 </ol>
+<p>Das Dashboard reicht dir die Adresse: Auf einer Installation, die noch nichts
+geladen hat, zeigt die Route „Sonarr, Radarr oder eine App Downloads hinzufügen
+lassen“ der Willkommenskarte die exakte Adresse mit einem <b>Kopieren</b>-Knopf
+daneben. Der API-Key steht absichtlich nicht auf dieser Zeile; er bleibt hinter
+seiner eigenen Enthüllung in Einstellungen → Sicherheit
+(<a href="#firstrun-key">§2</a>).</p>
 <p>Warteschlange, Verlauf, Status pro Job, „remove &amp; delete“, Retry und
 Kategorie-Routing verhalten sich alle so, wie die *arrs es erwarten.</p>
 <h3>Als Indexer (newznab)</h3>
@@ -861,7 +993,18 @@ Fernzugriff zeigt die genauen URLs und einen QR-Code zum Scannen.</p>
 <h3 id="remote-proxy">nzbfast von außerhalb erreichen</h3>
 <p>Es gibt keine Anmeldeseite, und das ist Absicht. Eine Anmeldung per Session-Cookie ist eine Sicherheitsfläche, die dauerhaft gepflegt werden muss, und sie wäre trotzdem das schwächste Schloss an allem, was im offenen Internet steht. nzbfast authentifiziert stattdessen mit Ihrem API-Schlüssel und nimmt diesen Schlüssel ebenso im Anfrage-Header wie in der URL entgegen (<code>X-Api-Key</code> oder <code>Authorization: Bearer</code>) - genau das erlaubt es einer vorgeschalteten Instanz, die Anmeldung sauber zu übernehmen.</p>
 <p><b>Am einfachsten ist es, gar nichts zu veröffentlichen.</b> Installieren Sie <b>Tailscale</b> auf diesem Rechner und auf Ihrem Telefon, und beide sind im selben privaten Netz: nichts ist exponiert, weder Router- noch Zertifikatsarbeit fällt an, und Einstellungen → Fernzugriff zeigt eine Adresse für überall, sobald Tailscale läuft. Nehmen Sie diesen Weg, sofern Sie nicht ausdrücklich eine öffentliche Domain brauchen.</p>
-<p><b>Falls doch</b>, setzen Sie einen Reverse-Proxy davor, geben Sie ihm das Zertifikat und lassen Sie ihn die Authentifizierung erledigen. Starten Sie nzbfast mit <code>--bind 127.0.0.1</code>, damit der Proxy der einzige Weg hinein ist, und richten Sie den Proxy auf <code>http://127.0.0.1:6789</code>:</p>
+<p><b>nzbfast kann auch selbst HTTPS ausliefern.</b> Zeigen Sie Einstellungen →
+Sicherheit → HTTPS-Zertifikat / privater HTTPS-Schlüssel auf ein PEM-Zertifikat und
+seinen Schlüssel (oder starten Sie mit <code>--tls-cert cert.pem --tls-key key.pem</code>),
+starten Sie neu, und Dashboard und API antworten auf <code>https://</code> statt auf
+unverschlüsseltem HTTP - ein Listener, ein Schema. Nehmen Sie das Zertifikat, das
+Ihre Domain schon hat (etwa von Let's Encrypt via certbot), oder ein
+selbstsigniertes fürs LAN, das Browser nach einer einmaligen Warnung akzeptieren.
+Ein defektes oder abgelaufenes Zertifikat verweigert den Start und nennt die Datei,
+der Fehler ist also dort sichtbar, wo Sie ihn gemacht haben; erneuern Sie, indem
+Sie die Dateien ersetzen und neu starten. Natives HTTPS verschlüsselt den Verkehr,
+fügt aber keine Anmeldung hinzu, lassen Sie den API-Schlüssel also gesetzt.</p>
+<p><b>Wenn Sie eine öffentliche Domain brauchen</b>, setzen Sie einen Reverse-Proxy davor, geben Sie ihm das Zertifikat und lassen Sie ihn die Authentifizierung erledigen. Starten Sie nzbfast mit <code>--bind 127.0.0.1</code>, damit der Proxy der einzige Weg hinein ist, und richten Sie den Proxy auf <code>http://127.0.0.1:6789</code>:</p>
 <pre><code># Caddy
 example.com {
     reverse_proxy 127.0.0.1:6789
@@ -875,7 +1018,12 @@ location / {
     proxy_set_header X-Forwarded-Proto $scheme;
 }</code></pre>
 <p>Legen Sie darüber, was Ihr Proxy bietet: Basic Auth, einen Forward-Auth-Dienst wie Authelia oder Authentik, oder Client-Zertifikate. Eine Sache erwischt alle - Sonarr, Radarr und die Telefon-Apps können keine Browser-Anmeldung durchlaufen, lassen Sie ihnen also einen Weg daran vorbei. Die meisten Proxys können eine Anfrage mit gültigem <code>X-Api-Key</code>-Header durchlassen und alles andere abfragen.</p>
-<div class="warn-box"><b>Leiten Sie nicht einfach Port 6789 am Router weiter.</b> Das Dashboard spricht unverschlüsseltes HTTP, Ihr API-Schlüssel und alles, was Sie damit tun, liefe also für jeden auf dem Weg lesbar durchs Internet, und eine Installation ganz ohne Schlüssel steht jedem offen, der sie findet. Wenn Sie trotzdem einen Port weiterleiten, setzen Sie zuerst einen API-Schlüssel.</div>
+<div class="warn-box"><b>Leiten Sie nicht einfach Port 6789 am Router weiter.</b>
+Ohne konfiguriertes Zertifikat spricht das Dashboard unverschlüsseltes HTTP, Ihr
+API-Schlüssel und alles, was Sie damit tun, liefe also für jeden auf dem Weg lesbar
+durchs Internet, und eine Installation ganz ohne Schlüssel steht jedem offen, der
+sie findet. Wenn Sie trotzdem einen Port weiterleiten, setzen Sie zuerst einen
+API-Schlüssel und schalten Sie HTTPS ein.</div>
 
 <h2 id="performance">13 · Performance-Tools</h2>
 <h3 id="perf-benchmark">System-Benchmark</h3>

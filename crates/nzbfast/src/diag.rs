@@ -389,11 +389,33 @@ pub(crate) fn incomplete_reason(incomplete: usize, derrs: u64, causes: &LossCaus
         }
         msg
     } else {
-        let mut msg = format!(
-            "could not write the download: {derrs} decode/write error(s) and no missing \
-             segments - every article arrived, so check free space, permissions and the \
-             log above"
-        );
+        // DECODE and WRITE errors share one counter but have opposite
+        // remedies, and the sample says which happened: a decode error
+        // means the SERVER handed us bytes that failed their own yEnc
+        // CRC or length check, where free space and permissions are
+        // irrelevant and a re-fetch (often from another provider) is the
+        // fix. Sending someone to check their disk over a corrupt
+        // article is a wild goose chase - found by the wire-corruption
+        // leg of the 11 Aug soak, which serves deliberately damaged
+        // articles from a healthy machine.
+        let corrupt = causes
+            .decode_sample
+            .as_deref()
+            .is_some_and(|s| s.starts_with("decode error"));
+        let mut msg = if corrupt {
+            format!(
+                "the articles did not decode: {derrs} damaged article(s) and no missing \
+                 segments - every article arrived, but their contents failed the yEnc \
+                 checks, so the copies on the server are corrupt. Retrying re-fetches \
+                 them, and a second provider usually carries a clean copy"
+            )
+        } else {
+            format!(
+                "could not write the download: {derrs} decode/write error(s) and no missing \
+                 segments - every article arrived, so check free space, permissions and the \
+                 log above"
+            )
+        };
         if let Some(e) = &causes.decode_sample {
             msg.push_str(&format!(" (first error: {e})"));
         }
@@ -477,7 +499,21 @@ pub(crate) fn unsupported_archive_present(root: &std::path::Path) -> Option<Unsu
     let mut parts: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for d in &dirs {
         for f in nzbkit::zip::scan(d) {
+            // Still a zip part either way: whether or not we unpacked it,
+            // the container is not the user's payload, so the test below
+            // must not count it as one.
             parts.extend(f.parts.iter().cloned());
+            // ...but a container whose contents ALREADY sit beside it is
+            // not a gap. The spent-intermediate sweep keeps a container
+            // whenever two independent sets share a directory (it cannot
+            // prove either is consumed), so a job that unlocked two
+            // encrypted zips from the passwords file and delivered both
+            // payloads still ends with the containers on disk - and this
+            // function reported one of them as "left packed ... it could
+            // not be unpacked", which is the opposite of what happened.
+            if zip_already_delivered(d, &f) {
+                continue;
+            }
             if first.is_none() {
                 first = Some((f, d.clone()));
             }
@@ -527,6 +563,37 @@ pub(crate) fn unsupported_archive_present(root: &std::path::Path) -> Option<Unsu
         display,
         shape: found.shape.label(),
         blocking: !payload,
+    })
+}
+
+/// Has this container's content already been written beside it?
+///
+/// True only when EVERY file entry exists at its own path under `dir`
+/// with the declared uncompressed size. That is deliberately strict: a
+/// partial match means some of the archive is still unexploded, which is
+/// exactly the gap this module exists to report, and a size match is what
+/// separates "we extracted it" from "an entry happens to share a name
+/// with something in the download".
+///
+/// A container we cannot open answers false - unreadable is a gap, not a
+/// delivery. So does one naming a path outside `dir` (`../`, absolute,
+/// or a Windows drive letter): the extractor refuses those, so nothing
+/// under `dir` can be its output, and resolving them here would let a
+/// crafted entry name point the check at an unrelated file.
+pub(crate) fn zip_already_delivered(dir: &std::path::Path, f: &nzbkit::zip::Finding) -> bool {
+    let Ok(archive) = nzbkit::zip::Archive::open(&f.parts) else {
+        return false;
+    };
+    let files: Vec<_> = archive.entries().iter().filter(|e| !e.is_dir).collect();
+    if files.is_empty() {
+        return false;
+    }
+    files.iter().all(|e| {
+        let name = e.name.replace('\\', "/");
+        let safe = !name.starts_with('/')
+            && !name.contains(':')
+            && name.split('/').all(|c| c != ".." && c != ".");
+        safe && std::fs::metadata(dir.join(&name)).is_ok_and(|m| m.is_file() && m.len() == e.size())
     })
 }
 

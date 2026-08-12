@@ -739,3 +739,181 @@ fn mapped_self_prove_covers_bytes_outside_the_rebuilt_blocks() {
         }
     }
 }
+
+/// The resumed self-prove (TODO 133.1) against the full one, across
+/// every damage position that moves the snapshot boundary: block 0
+/// (resume covers the whole file - degenerate, nothing saved), a
+/// middle block, the last full block, the padded tail, a mid-block
+/// truncation, a truncation exactly on a block boundary, and no damage
+/// at all with trailing junk (the `needs_resize` shape, where the
+/// resume boundary is EOF and the proof costs no reread). For each:
+/// the snapshot lands on the first unproven block's start, and after
+/// an in-place "patch" that restores the pristine bytes the resumed
+/// verdict equals the full `md5_matches` one. A wrong patch must fail
+/// both.
+#[test]
+fn resumed_self_prove_matches_full_across_damage_positions() {
+    let dir = tmpdir("resume-positions");
+    let bs = RESUME_MIN_BLOCK; // smallest snapshotting block size
+    let len = bs * 6 + bs / 3; // 7 blocks, padded tail
+    let pristine = payload(len, 97);
+    let meta = meta_for("big.bin", &pristine, bs);
+    let p = dir.join("big.bin");
+
+    // (tag, damage) -> expected resume boundary (first unproven block).
+    let cases: Vec<(&str, Box<dyn Fn(&mut Vec<u8>)>, u64)> = vec![
+        ("block0", Box::new(move |d: &mut Vec<u8>| d[5] ^= 0x5a), 0),
+        (
+            "middle",
+            Box::new(move |d: &mut Vec<u8>| d[3 * bs + 100] ^= 0x5a),
+            3 * bs as u64,
+        ),
+        (
+            "last-full",
+            Box::new(move |d: &mut Vec<u8>| d[5 * bs + 1] ^= 0x5a),
+            5 * bs as u64,
+        ),
+        (
+            "tail",
+            Box::new(move |d: &mut Vec<u8>| {
+                let n = d.len();
+                d[n - 1] ^= 0x5a;
+            }),
+            6 * bs as u64,
+        ),
+        (
+            "trunc-mid-block",
+            Box::new(move |d: &mut Vec<u8>| d.truncate(4 * bs + 7)),
+            4 * bs as u64,
+        ),
+        (
+            "trunc-on-boundary",
+            Box::new(move |d: &mut Vec<u8>| d.truncate(4 * bs)),
+            4 * bs as u64,
+        ),
+        (
+            "trailing-junk",
+            Box::new(move |d: &mut Vec<u8>| d.extend_from_slice(&[7u8; 123])),
+            len as u64,
+        ),
+    ];
+    for (tag, damage, want_off) in cases {
+        let mut damaged = pristine.clone();
+        damage(&mut damaged);
+        std::fs::write(&p, &damaged).unwrap();
+        let out = verify_pass1(&p, &meta, bs, 1).unwrap();
+        let res = out
+            .resume
+            .as_ref()
+            .unwrap_or_else(|| panic!("{tag}: serial verify must carry a resume snapshot"));
+        assert_eq!(res.offset, want_off, "{tag}: resume boundary");
+        // The in-place patch: what write_blocks does - size the file,
+        // then rewrite everything from the boundary on with the
+        // pristine bytes (a real patch only writes the unproven
+        // blocks; rewriting the whole suffix is a superset with the
+        // same prefix-untouched property).
+        let mut fixed = damaged.clone();
+        fixed.resize(len, 0);
+        fixed[want_off as usize..].copy_from_slice(&pristine[want_off as usize..]);
+        std::fs::write(&p, &fixed).unwrap();
+        assert!(
+            md5_matches_resumed(&p, &meta, res).unwrap(),
+            "{tag}: resumed prove on a correct patch"
+        );
+        assert!(md5_matches(&p, &meta).unwrap(), "{tag}: full prove agrees");
+        // And a WRONG patch fails the resumed prove exactly like the
+        // full one - flip one byte at the boundary. Only meaningful
+        // when a patch can write at all: with the boundary at EOF
+        // (trailing-junk) there is no patched byte to get wrong, and
+        // bytes BEFORE the boundary are the verified prefix the
+        // resumed prove deliberately does not reread.
+        if (want_off as usize) < len {
+            let bad_at = want_off as usize;
+            let mut wrong = fixed.clone();
+            wrong[bad_at] ^= 0xff;
+            std::fs::write(&p, &wrong).unwrap();
+            assert!(
+                !md5_matches_resumed(&p, &meta, res).unwrap(),
+                "{tag}: resumed prove must reject a wrong patch"
+            );
+            assert!(
+                !md5_matches(&p, &meta).unwrap(),
+                "{tag}: full prove agrees on wrong"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The gates around the snapshot: a block size under RESUME_MIN_BLOCK
+/// must not snapshot (the per-block clone would dominate tiny blocks),
+/// the pool branch never snapshots (it has no MD5 state to save), and
+/// a set with no IFSC packets cannot place a boundary at all.
+#[test]
+fn resume_snapshot_gates() {
+    let dir = tmpdir("resume-gates");
+    let pristine = payload(HASH_PAR_MIN_BYTES as usize + 4096 * 3 + 17, 98);
+    let p = dir.join("t.bin");
+
+    // Small blocks: no snapshot, damaged or not.
+    let meta_small = meta_for("t.bin", &pristine, 4096);
+    let mut damaged = pristine.clone();
+    damaged[9000] ^= 1;
+    std::fs::write(&p, &damaged).unwrap();
+    let out = verify_pass1(&p, &meta_small, 4096, 1).unwrap();
+    assert!(!out.clean);
+    assert!(out.resume.is_none(), "4 KiB blocks must not snapshot");
+
+    // Pool branch (short file, threads > 1): no snapshot.
+    let meta_big = meta_for("t.bin", &pristine, RESUME_MIN_BLOCK);
+    std::fs::write(&p, &pristine[..pristine.len() - 4096]).unwrap();
+    let out = verify_pass1(&p, &meta_big, RESUME_MIN_BLOCK, 8).unwrap();
+    assert!(out.present.is_some());
+    assert!(out.resume.is_none(), "the pool branch has no MD5 to resume");
+
+    // No IFSC list: nothing to place a boundary with.
+    let mut meta_no_ifsc = meta_big.clone();
+    meta_no_ifsc.blocks = Vec::new();
+    std::fs::write(&p, &damaged).unwrap();
+    let out = verify_pass1(&p, &meta_no_ifsc, RESUME_MIN_BLOCK, 1).unwrap();
+    assert!(out.resume.is_none(), "no IFSC means no resume boundary");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// End to end through `repair_dir`: a damaged big-block member repairs
+/// from real recovery slices and self-proves through the resumed path
+/// (in place), and the repaired bytes are byte-identical to pristine.
+/// The temp-file arm (a wholly missing member) still proves through
+/// the full reread and lands correct bytes too.
+#[test]
+fn repair_dir_resumed_prove_lands_identical_bytes() {
+    let dir = tmpdir("resume-e2e");
+    let bs = RESUME_MIN_BLOCK;
+    let set_id = [9u8; 16];
+    let a = payload(bs * 4 + 1000, 61); // in-place arm
+    let b = payload(bs * 2 + 17, 62); // missing-member arm (temp path)
+    let files: Vec<(&str, &[u8])> = vec![("a.bin", &a), ("b.bin", &b)];
+    std::fs::write(dir.join("set.par2"), par2_index(set_id, bs, &files)).unwrap();
+    std::fs::write(
+        dir.join("set.vol0.par2"),
+        par2_volume(set_id, bs, &files, &[0, 1, 2, 3]),
+    )
+    .unwrap();
+    let mut damaged = a.clone();
+    for x in &mut damaged[2 * bs + 5..2 * bs + 40] {
+        *x ^= 0xa5;
+    }
+    std::fs::write(dir.join("a.bin"), &damaged).unwrap();
+    // b.bin absent entirely.
+    let st = repair_dir(&dir).expect("repair runs");
+    match st {
+        RepairStatus::Repaired(r) => {
+            assert_eq!(r.blocks_rebuilt, 4, "one damaged + three missing blocks");
+            assert!(r.files_created.contains(&"b.bin".to_string()));
+        }
+        other => panic!("expected Repaired, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), a, "a.bin bytes");
+    assert_eq!(std::fs::read(dir.join("b.bin")).unwrap(), b, "b.bin bytes");
+    let _ = std::fs::remove_dir_all(&dir);
+}

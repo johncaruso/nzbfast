@@ -161,11 +161,11 @@ async fn quit_all(parked: Vec<Parked>) {
 
 #[derive(Default)]
 pub struct WarmStats {
-    pub hits: AtomicU64,
-    pub misses: AtomicU64,
-    pub parked: AtomicU64,
-    pub evicted: AtomicU64,
-    pub reaped: AtomicU64,
+    pub(crate) hits: AtomicU64,
+    pub(crate) misses: AtomicU64,
+    pub(crate) parked: AtomicU64,
+    pub(crate) evicted: AtomicU64,
+    pub(crate) reaped: AtomicU64,
     /// Closed by the idle-release policy, as opposed to aged out one by
     /// one by `max_idle` (`evicted`). Separated because they answer
     /// different questions: `evicted` says sessions are outliving their
@@ -223,7 +223,7 @@ pub struct WarmPool {
     /// A std mutex on an `Instant`: never held across an await, and the
     /// tick reads it before taking the map lock.
     last_activity: std::sync::Mutex<Instant>,
-    pub stats: WarmStats,
+    pub(crate) stats: WarmStats,
 }
 
 /// Identity of a reusable session. Credentials are part of it: a

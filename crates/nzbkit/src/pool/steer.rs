@@ -775,6 +775,7 @@ mod tests {
                 dup_servers: 0,
                 tried_fail: 0,
                 suspect: false,
+                found: 0,
             },
         );
     }
@@ -839,12 +840,100 @@ mod tests {
                 dup_servers: 0,
                 tried_fail: 0,
                 suspect: false,
+                found: 0,
             },
         );
         let w = sh
             .pick_dup(0, 1, 1, 0, Pipeline::payload(0), 0)
             .expect("the verdict ladder is never throttled by the cap");
         assert_eq!(w.id, "<laddered@x>");
+    }
+
+    /// TODO 96.4: the block-account exemption stops at the ladder, and
+    /// this pins where. A flagged server never races on SPEED (the test
+    /// below), but the endgame 430 ladder is exempt from
+    /// `speculative_blocked` because its dispatch buys a verdict, and a
+    /// verdict is worth metered bytes in a way a second copy of a body
+    /// is not. So a level-0 block account DOES fan out - which is the
+    /// one shape where the duplicate bodies §96 item 4 is about are
+    /// paid for per gigabyte rather than spent on an idle line.
+    ///
+    /// A level>0 fill server cannot reach the same shape: `required`
+    /// holds it until every live lower level has refused, so by then
+    /// its body is the delivery rather than a copy. It takes a block
+    /// account sharing level 0 with servers that hold the article.
+    #[test]
+    fn the_endgame_ladder_spends_a_block_accounts_bytes_where_speed_may_not() {
+        let sh = racing_shared(true); // server 0 flagged block_account
+        // Endgame-scale remainder, article in flight on server 1 and
+        // already refused there: the ladder shape exactly.
+        sh.pending.store(4, Ordering::Release);
+        sh.inflight.lock_ok().insert(
+            "<laddered@x>".into(),
+            Inflight {
+                server: 1,
+                dispatched: Instant::now(),
+                dups: 0,
+                tried_430: server_bit(1),
+                dup_servers: 0,
+                tried_fail: 0,
+                suspect: false,
+                found: 0,
+            },
+        );
+        let w = sh
+            .pick_dup(0, 1, 1, 0, Pipeline::payload(0), 0)
+            .expect("the verdict ladder is exempt from the block gate");
+        assert_eq!(w.id, "<laddered@x>");
+        assert!(w.ladder, "a ladder pick must be classified as one");
+        assert!(
+            !w.probe,
+            "stat_probe is off here, so the dispatch is a BODY - the \
+             metered copy this test exists to record"
+        );
+    }
+
+    /// TODO 96.4: with the probe armed, that same metered dispatch asks
+    /// with STAT instead, so the block account answers the verdict
+    /// question for one line rather than one article.
+    #[test]
+    fn a_stat_probe_turns_the_metered_ladder_dispatch_into_a_question() {
+        let cfg = |block| PoolConfig {
+            race_envelope: true,
+            hedge: true,
+            block_account: block,
+            stat_probe: true,
+            ..PoolConfig::default()
+        };
+        let servers = vec![(server("a"), cfg(true)), (server("b"), cfg(false))];
+        let sh = Shared::new(fresh_n(100), &servers).0;
+        sh.alive[0].store(1, Ordering::Relaxed);
+        sh.alive[1].store(1, Ordering::Relaxed);
+        sh.pending.store(4, Ordering::Release);
+        sh.inflight.lock_ok().insert(
+            "<laddered@x>".into(),
+            Inflight {
+                server: 1,
+                dispatched: Instant::now(),
+                dups: 0,
+                tried_430: server_bit(1),
+                dup_servers: 0,
+                tried_fail: 0,
+                suspect: false,
+                found: 0,
+            },
+        );
+        let w = sh
+            .pick_dup(0, 1, 1, 0, Pipeline::payload(0), 0)
+            .expect("the verdict ladder still fires under the probe");
+        assert!(w.ladder && w.probe, "the metered racer must ask with STAT");
+        // And a holder found by a probe ends the fan-out: no further
+        // backbone is asked a question whose answer is already known.
+        sh.note_found("<laddered@x>", 1);
+        assert!(
+            sh.pick_dup(0, 1, 1, 0, Pipeline::payload(0), 0).is_none(),
+            "the ladder kept asking after a probe found a holder"
+        );
     }
 
     #[test]
@@ -896,6 +985,7 @@ mod tests {
             fenced: false,
             rearms: 0,
             ladder: false,
+            probe: false,
         };
         // Untrained everywhere: no clear winner, everyone takes it.
         assert!(!sh.faster_can_take(&w, 0));

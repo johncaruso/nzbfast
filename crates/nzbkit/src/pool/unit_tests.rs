@@ -57,6 +57,7 @@ fn work(id: &str) -> Work {
         fenced: false,
         rearms: 0,
         ladder: false,
+        probe: false,
     }
 }
 
@@ -2416,4 +2417,150 @@ async fn auth_blip_fails_fast_and_honest_by_design() {
         wall < Duration::from_secs(5),
         "an auth refusal must fail the job fast, not grind ({wall:?})"
     );
+}
+
+/// §146 tail give-up census: `verdict_walkers` answers Some only in the
+/// exact state the give-up is licensed to spend recovery blocks on -
+/// every pending article refusal-tainted - and None the moment any
+/// article is still plain payload, including the CORRUPT damage class's
+/// refetches, whose evidence is `tried_fail` and must never open this
+/// gate.
+#[test]
+fn verdict_walkers_census_opens_only_on_a_pure_refusal_tail() {
+    let ctl = QueueControl::default();
+    assert_eq!(
+        ctl.verdict_walkers(),
+        None,
+        "before attach there is no pool to ask"
+    );
+    let (sh, _) = Shared::new(
+        fresh(&["<a@x>", "<b@x>", "<c@x>"]),
+        &[(server("s"), PoolConfig::default())],
+    );
+    ctl.attach(&sh);
+    assert_eq!(
+        ctl.verdict_walkers(),
+        None,
+        "a queue of untried payload is a download, not a tail"
+    );
+    // Two walkers, one article whose only evidence is a transport
+    // failure - that is a refetch (the corrupt-body path), not a
+    // refusal, and it must keep the census closed.
+    {
+        let mut q = sh.queue.try_lock().expect("test owns the queue");
+        q[0].tried_430 = 0b01;
+        q[1].soft_430 = 0b01;
+        q[2].tried_fail = 0b01;
+    }
+    assert_eq!(
+        ctl.verdict_walkers(),
+        None,
+        "tried_fail is corrupt-class evidence, never a walker"
+    );
+    // The third article joins the ladder: census opens with all three.
+    {
+        let mut q = sh.queue.try_lock().expect("test owns the queue");
+        q[2].tried_430 = 0b01;
+    }
+    let walkers = ctl.verdict_walkers().expect("a pure refusal tail");
+    assert_eq!(walkers.len(), 3);
+    // An in-flight article with no refusal yet is payload on the wire.
+    {
+        let mut q = sh.queue.try_lock().expect("test owns the queue");
+        let w = q.pop_front().expect("three queued");
+        sh.register_inflight(&w, 0);
+    }
+    // NOTE: q[0] carried tried_430, so the entry is seeded refused and
+    // the census stays open - now split across queue and inflight.
+    let walkers = ctl
+        .verdict_walkers()
+        .expect("walker in flight still counts");
+    assert_eq!(walkers.len(), 3);
+    // A clean in-flight article closes it.
+    sh.pending.fetch_add(1, Ordering::AcqRel);
+    sh.register_inflight(&work("<clean@x>"), 0);
+    assert_eq!(
+        ctl.verdict_walkers(),
+        None,
+        "a clean article on the wire may still arrive - no trade"
+    );
+    sh.inflight.lock_ok().remove("<clean@x>");
+    // ...and so does an unaccounted article (pending without a home):
+    // the books must balance in one snapshot.
+    assert_eq!(
+        ctl.verdict_walkers(),
+        None,
+        "an article invisible between two locks vetoes the snapshot"
+    );
+    sh.pending.fetch_sub(1, Ordering::AcqRel);
+    assert!(ctl.verdict_walkers().is_some());
+    // A dup-union verdict claims an article terminal while its ORIGINAL
+    // is still mid-read - the inflight entry lingers until that answer
+    // lands, seconds on a slow refusal. The census must look straight
+    // through it: it is not pending, and counting it failed the books
+    // for every tick of the loopback gone rig's tail.
+    let mut lingering = work("<claimed@x>");
+    lingering.tried_430 = 0b01;
+    sh.register_inflight(&lingering, 0);
+    assert!(sh.claim_done("<claimed@x>"));
+    let walkers = ctl
+        .verdict_walkers()
+        .expect("a lingering terminal original must not close the census");
+    assert!(
+        !walkers.contains(&"<claimed@x>".to_string()),
+        "a terminal article is never handed back as a walker"
+    );
+    sh.inflight.lock_ok().remove("<claimed@x>");
+    // A drain keeps its queue: no give-up during a graceful pause.
+    sh.draining.store(true, Ordering::Release);
+    assert_eq!(ctl.verdict_walkers(), None, "a pause must resume intact");
+    sh.draining.store(false, Ordering::Release);
+}
+
+/// §146 tail give-up commit: queued walkers cancel, in-flight walkers
+/// are claimed where they stand, the run seals when the last one goes,
+/// and nothing is ever returned twice.
+#[test]
+fn give_up_covered_claims_queue_and_flight_and_seals_the_run() {
+    let ctl = QueueControl::default();
+    let (sh, _) = Shared::new(
+        fresh(&["<a@x>", "<b@x>", "<c@x>"]),
+        &[(server("s"), PoolConfig::default())],
+    );
+    ctl.attach(&sh);
+    let finished = sh.finished.subscribe();
+    // a stays queued; b goes in flight; c already reached a terminal
+    // outcome on its own.
+    {
+        let mut q = sh.queue.try_lock().expect("test owns the queue");
+        q[0].tried_430 = 0b01;
+        let mut b = q.remove(1).expect("b queued");
+        b.tried_430 = 0b01;
+        sh.register_inflight(&b, 0);
+        q.pop_back(); // c leaves the queue...
+    }
+    assert!(sh.claim_done("<c@x>")); // ...and completes on its own
+    sh.complete_one();
+    let ids: HashSet<String> = ["<a@x>", "<b@x>", "<c@x>"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut claimed = ctl.give_up_covered(&ids);
+    claimed.sort();
+    assert_eq!(
+        claimed,
+        vec!["<a@x>".to_string(), "<b@x>".to_string()],
+        "c's own outcome stands - the give-up never claims it"
+    );
+    assert_eq!(sh.pending.load(Ordering::Acquire), 0);
+    assert!(
+        *finished.borrow(),
+        "the last claimed walker seals the run and the fleet winds down"
+    );
+    assert!(
+        ctl.give_up_covered(&ids).is_empty(),
+        "a second commit finds everything already terminal"
+    );
+    // The in-flight walker's eventual verdict lands as a no-op.
+    assert!(!sh.claim_done("<b@x>"));
 }

@@ -450,6 +450,16 @@ pub(super) fn build_intake(
     // exact NZB are already on disk - at final offsets in their own file
     // (v1 lines) or at journal-recorded placements (direct-extracted
     // spans), which the restore pass copies back into volume files now.
+    // A previous attempt that FAILED renamed its unverified payload out
+    // of the way (see quarantine_partials). Put the names back first:
+    // the placement records below address fragments by their offsets
+    // inside those files, so a resume that ran with the suffix still on
+    // would refetch every direct-extracted article instead of copying it
+    // off the local disk. Before Journal::open, so nothing in the resume
+    // path ever sees the quarantined name.
+    for name in nzbkit::journal::unquarantine_partials(out_dir) {
+        info!(target: "resume", "{name}: restoring the previous attempt's partial for resume");
+    }
     let (journal, resume_state) =
         crate::persist::blocking_db(|| nzbkit::journal::Journal::open(out_dir, &xml))?;
     let journal = Arc::new(journal);

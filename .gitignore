@@ -77,3 +77,9 @@ runtime.json
 .vscode/
 .idea/
 .scan-stamps
+
+# Torture-soak corpora: built by make_adversarial*.sh / fetch_fixtures*.sh,
+# large (round 4's is 1.5 GB with its 1 GiB advYA payload) and disposable.
+# The generators and the ground-truth manifests are what get committed.
+research/torture-soak-2026-08-11/adversarial*/
+research/torture-soak-2026-08-11/fixtures*/

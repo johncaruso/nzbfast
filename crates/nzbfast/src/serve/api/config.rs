@@ -205,7 +205,7 @@ fn m_get_config(
                             "retention_days": s.retention_days,
                             "block_bytes": s.block_bytes.unwrap_or(0),
                             "block_account": s.block_account,
-                            "block_used": d.usage_lifetime(&s.host),
+                            "block_used": d.block_spent(&s.host),
                             "enabled": s.enabled,
                             "warm_pool": s.warm_pool,
                             "idle_release_secs": s.idle_release_secs,

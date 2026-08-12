@@ -38,7 +38,14 @@ fn m_index_stats(
         // Never blocks: served from a try_lock + cache, so
         // this poll cannot park an HTTP worker behind a long
         // scan batch (the 28 Jul all-workers-wedged hang).
-        let (total, complete, db_bytes, live_bytes) = d.index_stats_snapshot();
+        // None = every read path was busy and nothing has
+        // seeded the cache yet (the restart window). The
+        // zeros below are placeholders then, and stats_cold
+        // tells the dashboard to say "reading" instead of
+        // presenting them as counts.
+        let snap = d.index_stats_snapshot();
+        let stats_cold = snap.is_none();
+        let (total, complete, db_bytes, live_bytes) = snap.unwrap_or((0, 0, 0, 0));
         // Several groups can scan at once (M28): report the
         // set joined + headers summed (dashboard shows one
         // status line either way).
@@ -83,6 +90,7 @@ fn m_index_stats(
             // it must not need the settings block to do it.
             "enabled": !d.indexer_off(),
             "paused": paused,
+            "stats_cold": stats_cold,
             "releases": total,
             "complete": complete,
             "groups": d.index_groups.lock_ok().clone(),
@@ -207,6 +215,110 @@ fn m_pesto_stats(
     }))
 }
 
+/// §131 D3 search-miss readout: the queries this index was asked for
+/// and answered with nothing (or with almost nothing), worst first.
+///
+/// The point of the list is that it tells the scanner what to deepen
+/// or backfill next, and it tells the naming lanes which vocabulary
+/// they are short of. Acting on it is a human's job - nothing here
+/// starts a scan.
+///
+/// `with_index_read`, like every other settings-card readout: this is
+/// polled by whoever has the page open, and parking an HTTP worker
+/// behind a scan batch for a counter is the 28 Jul wedge.
+fn m_search_misses(
+    d: &Arc<Daemon>,
+    _req: &mut tiny_http::Request,
+    params: &std::collections::HashMap<String, String>,
+    _ctx: &ApiCtx<'_>,
+    _api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    Some({
+        let days = params
+            .get("days")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(30)
+            .clamp(1, 365);
+        // How few results still counts as a miss. 0 is only the true
+        // zeroes; 3 is the useful "we technically matched something,
+        // but not what they wanted" setting.
+        let thin = params
+            .get("thin")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(1_000);
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(50)
+            .clamp(1, 500);
+        let surface = params
+            .get("surface")
+            .map(String::as_str)
+            .filter(|s| matches!(*s, "wall" | "newznab"))
+            .map(String::from);
+        let now = epoch_secs() as i64;
+        let since = now - days * 86_400;
+        let rows = d
+            .with_index_read(|ix| {
+                ix.search_misses(since, thin, surface.as_deref(), limit)
+                    .ok()
+            })
+            .unwrap_or_default();
+        let summary = d
+            .with_index_read(|ix| ix.search_log_summary(since, thin).ok())
+            .unwrap_or_default();
+        json!({
+            "enabled": d.index_search_log.load(Ordering::Relaxed),
+            "index_enabled": d.index_enabled.load(Ordering::Relaxed),
+            "window_days": days,
+            "thin": thin,
+            "surface": surface,
+            // Retention, echoed so the readout can say what it is a
+            // window ONTO rather than implying it holds everything.
+            "keep_days": crate::serve::SEARCH_LOG_DAYS,
+            "keep_rows": crate::serve::SEARCH_LOG_ROWS,
+            "searches": summary.searches,
+            "distinct": summary.distinct,
+            "zero_searches": summary.zero_searches,
+            // Distinct queries still unanswered, and the ones the
+            // scanner has since caught up with - the second number is
+            // what says whether deepening is working.
+            "missing": summary.missing,
+            "resolved": summary.resolved,
+            "miss_pct": if summary.searches > 0 {
+                (summary.zero_searches as f64 * 100.0 / summary.searches as f64 * 10.0)
+                    .round() / 10.0
+            } else { 0.0 },
+            "misses": rows.iter().map(|m| json!({
+                "q": m.q,
+                "surface": m.surface,
+                "kind": m.kind,
+                "n": m.n,
+                "zero_n": m.zero_n,
+                "first_at": m.first_at,
+                "last_at": m.last_at,
+                "last_hits": m.last_hits,
+                "best_hits": m.best_hits,
+            })).collect::<Vec<_>>(),
+        })
+    })
+}
+
+/// Forget every recorded search, without touching the setting. The
+/// switch itself clears too (see `apply_setting`); this is the "clear
+/// it but keep recording" half.
+fn m_search_log_clear(
+    d: &Arc<Daemon>,
+    _req: &mut tiny_http::Request,
+    _params: &std::collections::HashMap<String, String>,
+    _ctx: &ApiCtx<'_>,
+    _api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    let cleared = d.clear_search_log();
+    Some(json!({"status": true, "cleared": cleared}))
+}
+
 fn m_scoreboard(
     d: &Arc<Daemon>,
     _req: &mut tiny_http::Request,
@@ -249,8 +361,22 @@ fn m_scoreboard(
                 .lock_ok()
                 .iter()
                 .any(|i| i.enabled && i.name == sb_source);
+        // What the day actually costs, and the menu it was picked from.
+        // `cats` is the resolved subset (never wider than `all_cats`,
+        // never empty), `requests_per_day` is its length said plainly -
+        // the card must be able to quote the cost without re-deriving
+        // it, and a category left out of `cats` must be drawn as NOT
+        // MEASURED rather than as zero coverage.
+        let sb_cats: Vec<&str> = d
+            .scoreboard_categories()
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
         json!({
             "enabled": d.scoreboard_enabled.load(Ordering::Relaxed),
+            "cats": sb_cats,
+            "all_cats": SCOREBOARD_CATEGORIES.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            "requests_per_day": sb_cats.len(),
             "index_enabled": d.index_enabled.load(Ordering::Relaxed),
             // The URL is safe to echo (the key is not, and never is).
             "url": d.scoreboard_url.lock_ok().clone(),
@@ -953,6 +1079,11 @@ fn m_index_search(
             }
             Ok(hits) => hits.unwrap_or_default(),
         };
+        // §131 D3: what was asked, and how much of it we had. Buffered
+        // in memory and written by the flush task - never on this
+        // handler's read-only connection. A busy index returns above
+        // without recording, which is right: that is not a miss.
+        d.note_search("wall", &q, "", hits.len());
         let hints = corr_hints(
             d,
             hits.iter().filter(|r| r.pre_title.is_empty()).map(|r| r.id),
@@ -1072,6 +1203,12 @@ fn m_wall2(
         let aff_ctx = (sort == nzbkit::index::CardSort::Affinity)
             .then(|| d.affinity_ctx(&d.taste_profile()))
             .flatten();
+        // §131 D3: this is a SEARCH only when the user typed
+        // something and we are on the first page of it. A `key=`
+        // fetch is one card's hover preview, and page 4 is the same
+        // search as page 1.
+        let note = (!bq.q.trim().is_empty() && bq.offset == 0 && bq.title_key.is_none())
+            .then(|| (bq.q.clone(), bq.kind.clone().unwrap_or_default()));
         // index_read_checked, not with_index_read: a saturated read
         // pool is not an empty wall, and drawing one as the other is
         // how a busy index comes to be reported as a broken one.
@@ -1089,6 +1226,12 @@ fn m_wall2(
                 "error": "the index is busy - try again in a moment",
             }),
             Ok(Some((cards, total))) => {
+                // The honest count is `total`, not the page: a search
+                // that matched 400 cards did not miss because the
+                // first page holds 60.
+                if let Some((q, kind)) = note {
+                    d.note_search("wall", &q, &kind, total as usize);
+                }
                 // M30: "you have this" card badge - the
                 // newest release's dupe key against the
                 // library (movies mostly; a show card only
@@ -1341,8 +1484,15 @@ fn m_index_browse(
         // Rust function, and mirroring them in JS would let the
         // two drift apart.
         let qprefs = d.quality_prefs.lock_ok().clone();
+        // §131 D3, same rule as wall2: a typed query, first page, not
+        // a card's own sheet.
+        let note = (!bq.q.trim().is_empty() && bq.offset == 0 && bq.title_key.is_none())
+            .then(|| (bq.q.clone(), bq.kind.clone().unwrap_or_default()));
         match d.with_index_read(|ix| ix.browse(&bq).ok()) {
             Some((rows, total)) => {
+                if let Some((q, kind)) = note {
+                    d.note_search("wall", &q, &kind, total as usize);
+                }
                 let hints = corr_hints(
                     d,
                     rows.iter().filter(|r| r.pre_title.is_empty()).map(|r| r.id),
@@ -2167,6 +2317,13 @@ pub(in crate::serve) fn dispatch(
         // named% / lag over a rolling window, plus the run state.
         // Same non-blocking with_index_read contract as predb_stats.
         "scoreboard" => return m_scoreboard(d, _req, params, ctx, _api_body),
+        // §131 D3: the top queries this index was asked for and could
+        // not answer. The scoreboard says what a reference indexer
+        // has that we do not; this says what the PEOPLE HERE wanted
+        // and did not get, which is the list a backfill should work
+        // from. Nothing acts on it automatically - by design.
+        "search_misses" => return m_search_misses(d, _req, params, ctx, _api_body),
+        "search_log_clear" => return m_search_log_clear(d, _req, params, ctx, _api_body),
         // Phase 2: the ranked candidate list for one release (the
         // pick-a-name view). Read-only and on demand.
         "pre_candidates" => return m_pre_candidates(d, _req, params, ctx, _api_body),

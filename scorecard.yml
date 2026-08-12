@@ -1,0 +1,20 @@
+# OpenSSF Scorecard maintainer annotations.
+#
+# These add context to a check result. They do NOT change the score, and
+# they are not a place to explain away a real finding - only to say what
+# the tool cannot see for itself.
+#
+# See https://github.com/ossf/scorecard/blob/main/config/README.md for the
+# closed set of allowed `reason` values.
+annotations:
+  - checks:
+      - binary-artifacts
+    reasons:
+      # vendor/rars/tests/fixtures/rar13/SFXSRC.EXE and
+      # vendor/rars/tests/fixtures/rar15_40/rarvm/solid_e8_filter_payload.exe
+      # are decoder test corpus, not shipped code. A RAR engine has to be
+      # tested against real RAR-era executables: the RARVM x86 filter and
+      # the SFX-module path exist precisely to handle these bytes, and
+      # they cannot be synthesised without reimplementing the bug being
+      # tested for. Nothing in the build or the released binary reads them.
+      - reason: test-data

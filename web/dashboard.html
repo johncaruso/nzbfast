@@ -179,6 +179,12 @@ button.warn:hover{background:color-mix(in srgb,var(--warn) 12%,transparent)}
 #dashview{display:flex;flex-wrap:wrap;align-items:flex-start;gap:14px}
 #dashview>*{flex:1 1 100%;min-width:0;margin:0}
 #dashview>.half{flex:1 1 420px}
+/* The hero/tiles pairing shell is invisible outside dense (see the
+   markup comment); its children need the direct-child rules above
+   mirrored, because display:contents removes the shell from layout but
+   not from selector matching. */
+#heroTiles{display:contents}
+#heroTiles>*{flex:1 1 100%;min-width:0;margin:0}
 /* §Stage5: an h3 at 13px uppercase --dim was the same visual weight as
    the hint text inside its own card, so twenty sections offered nothing
    to scan by. The title takes --fg; --dim is left to the trailing hint
@@ -401,6 +407,79 @@ body.compact #dashview .legend,#dashview .card.compact .legend{gap:7px;margin-bo
 body.compact #dashview table,#dashview .card.compact table{font-size:12px}
 body.compact #dashview th,body.compact #dashview td,
 #dashview .card.compact th,#dashview .card.compact td{padding-top:3px;padding-bottom:3px}
+/* The Dense preset's layout layer. Applied by applyDensity() from the
+   uiDense flag; the preset button also switches uiCompact on, so every
+   body.compact rule above is already in force here - this block only
+   adds what compact alone does not do: cards pack into columns, the
+   hero collapses to a strip, and the graph canvases drop to sparkline
+   height (chartDetail already adapts what is drawn to the measured
+   height, same as idlecompact below).
+   Columns, not flex rows: a flex row is as tall as its tallest card, so
+   one tall card left a hole under every short one (the first cut of
+   this preset proved it). Multicol packs cards down balanced columns
+   with no holes, and cards stay flat #dashview children in DOM order,
+   so drag-reorder / hide / the saved layout are all untouched. The
+   full-width pieces (welcome, hero, tiles, queue, hidden bar) span all
+   columns; a span-all element also splits the flow, which is the
+   structure wanted: headline strips, monitor columns, the queue strip,
+   then content columns. On a narrow window multicol degrades to the
+   single stacked column by itself. */
+/* Grid masonry, not CSS multicol: multicol height-balances the block
+   between two column-span strips, and a card that does not fit the
+   balanced height is SLICED under the next strip instead of growing
+   the columns (Pipeline surfaced as a clipped sliver below Providers).
+   Here every card spans as many 8px grid rows as its measured height
+   needs - applyDenseMasonry() keeps the spans true via a
+   ResizeObserver - so packing is deterministic and nothing can be cut.
+   align-items:start keeps each card at its natural height (the span
+   only reserves rows), which is also what stops the observer looping. */
+/* gap shorthand, row-gap 0: the flex container's gap:14px would apply
+   as ROW-gap between the 8px masonry rows and inflate every span's
+   real height - vertical spacing is the cards' own bottom margin. */
+body.dense #dashview{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));grid-auto-rows:8px;grid-auto-flow:row dense;gap:0 10px;align-items:start}
+body.dense #dashview>*{margin:0 0 10px}
+body.dense #dashview>#welcomeCard,body.dense #dashview>#heroTiles,
+body.dense #dashview>#queueCard,
+body.dense #dashview>#layoutTip,body.dense #dashview>#hiddenBar{grid-column:1/-1}
+/* The headline: hero left half, tiles right half, one strip. The shell
+   is display:contents everywhere else - only dense makes it a row. */
+body.dense #heroTiles{display:flex;gap:10px;align-items:stretch}
+body.dense #heroTiles>#heroCard{flex:1 1 50%;min-width:0;padding:8px 14px}
+body.dense #heroTiles>.tiles{flex:1 1 50%;min-width:0;align-content:center}
+/* A card is never allowed to paint over its column neighbour: wide
+   tables scroll inside their own card instead (History's release names
+   were bleeding across the gutter). */
+body.dense #dashview .card{overflow:hidden}
+body.dense #dashview .cardscroll{overflow-x:auto}
+/* In a 360px column a release name cannot have the whole row: fixed
+   table layout + ellipsis keeps one line per entry, and the name's own
+   title attribute already carries the full text. Queue spans all
+   columns, so it keeps its natural layout. */
+body.dense #histCard table,body.dense #browseCard table,body.dense #usageCard table{table-layout:fixed;width:100%}
+body.dense #histCard td,body.dense #browseCard td,body.dense #usageCard td{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+body.dense #idx th:first-child{width:52%}
+body.dense #usageTbl th:first-child{width:40%}
+/* History: fixed layout splits leftover width evenly, which starved the
+   name next to the size column - the name is the row, give it the room. */
+body.dense #hist th:nth-child(2){width:55%}
+body.dense .hero{align-items:center;gap:14px}
+body.dense .hero>div:first-child{width:auto;display:flex;align-items:baseline;gap:8px}
+body.dense .hero .num{font-size:22px}
+body.dense .hero .num small{font-size:12px}
+body.dense .hero .sub{margin-bottom:0;font-size:11.5px}
+body.dense .hero .chartwrap{height:36px!important}
+body.dense #evLegend{display:none!important}
+/* The speed histogram is a direct child wrap of the hero card (the
+   speed chart's wrap sits inside .hero, so this cannot catch it). */
+body.dense #heroCard>.chartwrap{display:none!important}
+body.dense #active{margin-top:6px}
+body.dense #active .actline{font-size:11px}
+/* Sparkline heights for the two chart cards. !important because the
+   grab-resize writes an inline height; the grip hides with it so the
+   two mechanisms never fight (idlecompact set the precedent). */
+body.dense #rescard .chartwrap{height:40px!important}
+body.dense #provChartWrap{height:30px!important}
+body.dense #dashview .chgrip{display:none}
 /* Idle auto-compaction: after a minute with nothing downloading, the two
    chart cards stop reserving a full canvas for flat lines and the Queue
    card rises above the fold. Applied by tick(), never persisted, and
@@ -434,6 +513,17 @@ body.compact #dashview th,body.compact #dashview td,
 #shmodal{background:var(--surface);border:1px solid var(--line);border-radius:14px;
   width:min(420px,96vw);max-height:88vh;display:flex;flex-direction:column;
   box-shadow:0 24px 70px rgba(0,0,0,.5);overflow:hidden}
+/* §73 phase 2: the in-page player. Same modal shell; the body is one
+   video element on black, because that is the only thing in here whose
+   size matters. */
+#pvov{position:fixed;inset:0;z-index:72;display:none;place-items:center;
+  background:color-mix(in srgb,#000 70%,transparent);backdrop-filter:blur(2px);padding:16px}
+#pvov.on{display:grid}
+#pvmodal{background:var(--surface);border:1px solid var(--line);border-radius:14px;
+  width:min(960px,96vw);max-height:92vh;display:flex;flex-direction:column;
+  box-shadow:0 24px 70px rgba(0,0,0,.5);overflow:hidden}
+#pvvid{width:100%;max-height:70vh;background:#000;display:block}
+#pvnote{font-size:12.5px}
 .shbody{padding:12px 16px 16px;overflow-y:auto}
 .shbody table{width:100%;border-collapse:collapse}
 .shbody td{padding:5px 6px;border-bottom:1px solid var(--line);font-size:13px}
@@ -1073,6 +1163,17 @@ input.txt.sm{max-width:120px}
 .wlrow{display:grid;grid-template-columns:1fr 88px 64px 64px 78px 84px 84px 92px 112px 92px 32px;gap:7px;margin:10px 0 2px;align-items:center}
 .wlrow .wlst{grid-column:1/-1;font-size:12px;margin:-3px 0 5px}
 .wlrow label{display:flex;gap:5px;align-items:center;font-size:12px;white-space:nowrap}
+/* §151: a row the sync owns. Same grid, so the columns line up with the
+   user's own rows above it, but every control is read-only - the editor
+   below must never write these back into the `watchlist` setting. */
+.wlrow.synced input,.wlrow.synced select{opacity:.72}
+.wlrow .wlsrc{font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* §151 list-source editor. Two lines per source: the address line, then
+   the defaults it stamps on what it adds. */
+.lsrcrow{display:grid;grid-template-columns:120px 118px 1fr auto auto 32px;gap:8px;margin:10px 0 2px;align-items:center}
+.lsrcrow .lsdef{grid-column:1/-1;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px}
+.lsrcrow .lshealth{grid-column:1/-1;font-size:12px;margin:-1px 0 6px}
+.lsrcrow label{display:flex;gap:5px;align-items:center;font-size:12px;white-space:nowrap}
 /* `vertical-align:middle`, NOT a pixel nudge off the baseline. An
    inline-block takes its baseline from its own last line box - unless it
    has a non-visible overflow, in which case the baseline becomes its
@@ -1199,7 +1300,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
 .notifyrow .nbody{grid-column:1/-1;margin:-2px 0 4px}
 /* Phone: one column, so the control drops below its own explanation
    rather than hunting for a right-hand gutter that is no longer there. */
-@media(max-width:720px){.set .row{grid-template-columns:1fr}.set .row>label,.set .row>.hint{grid-area:auto;max-width:none}.set .row>*:not(label):not(.hint){grid-area:auto;justify-self:start;margin-top:3px}.schedrow{grid-template-columns:1fr 1fr}.feedrow{grid-template-columns:1fr 1fr}.smartrow{grid-template-columns:1fr 1fr}.wlrow{grid-template-columns:1fr 1fr}.notifyrow{grid-template-columns:1fr 1fr}.arrrow{grid-template-columns:1fr 1fr}.catrow{grid-template-columns:1fr 1fr}.catfilerow{grid-template-columns:1fr 1fr}.idxrow{grid-template-columns:1fr 1fr}}
+@media(max-width:720px){.lsrcrow{grid-template-columns:1fr 1fr}.set .row{grid-template-columns:1fr}.set .row>label,.set .row>.hint{grid-area:auto;max-width:none}.set .row>*:not(label):not(.hint){grid-area:auto;justify-self:start;margin-top:3px}.schedrow{grid-template-columns:1fr 1fr}.feedrow{grid-template-columns:1fr 1fr}.smartrow{grid-template-columns:1fr 1fr}.wlrow{grid-template-columns:1fr 1fr}.notifyrow{grid-template-columns:1fr 1fr}.arrrow{grid-template-columns:1fr 1fr}.catrow{grid-template-columns:1fr 1fr}.catfilerow{grid-template-columns:1fr 1fr}.idxrow{grid-template-columns:1fr 1fr}}
 
 /* ================= phone + touch layer - purely additive ================= */
 /* Tap targets ≥44px on touch screens (and in any phone-width window). */
@@ -1387,6 +1488,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <p style="margin:0 0 10px;display:flex;gap:8px;flex-wrap:wrap">
       <button class="ghost" onclick="applyPreset('classic')" data-i18n="welcome.look.classic">Classic - plain and minimal</button>
       <button class="ghost" onclick="applyPreset('full')" data-i18n="welcome.look.full">Full - graphs and all</button>
+      <button class="ghost" onclick="applyPreset('dense')" data-i18n="welcome.look.dense">Dense - everything, small</button>
     </p>
     <div id="welcomeLookBoxes" style="display:flex;flex-wrap:wrap;gap:6px 18px"></div>
   </div>
@@ -1396,6 +1498,14 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
   <button id="showAll" onclick="showAllCards()" data-i18n="setup.showall">Show the full dashboard anyway</button>
 </div>
 
+<!-- Dense-only pairing shell: display:contents everywhere else, so in
+     Full/Classic the hero and tiles stay direct flex items of #dashview
+     exactly as before (the #heroTiles>* rule mirrors #dashview>* for
+     that reason). In dense it becomes a flex row spanning the columns -
+     hero on the left half, tiles on the right - which multicol's
+     span-all cannot express on flat children. Neither child is a
+     movable card, so initLayout never touches this wrapper. -->
+<div id="heroTiles">
 <div class="card" id="heroCard">
   <div class="hero">
     <div>
@@ -1419,6 +1529,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
 </div>
 
 <div class="tiles" id="tiles"></div>
+</div><!-- /#heroTiles -->
 <!-- §12a/§6: one-time "these controls exist" line. NOT a .card - it must
      never become a movable/hideable block itself, and it sits between
      the tiles and the cards, which initLayout re-inserts before
@@ -1508,6 +1619,23 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
   <div id="wlStatus" class="dim" style="font-size:12.5px;margin-bottom:9px"></div>
   <div id="wlCal" style="display:none;margin-bottom:12px"></div>
   <div id="wlGiveup" style="display:none;margin-bottom:12px"></div>
+  <!-- §151 (issue #36): fill the watchlist from a list kept elsewhere.
+       Inside the watchlist card on purpose - a source is a way of adding
+       to THIS list, not a second list, and a Plex watchlist feed is not
+       an NZB feed, so it must not read as belonging in the RSS card. -->
+  <div id="wlSrc" style="margin-bottom:12px">
+    <!-- The standing paragraph this heading used to carry lives in its
+         tooltip now: read-once copy, one hover away instead of always-on
+         (same call as the queue reorder hint). -->
+    <h4 data-i18n="lsrc.title" data-i18n-title="lsrc.hint" title="Fill this watchlist from a list you keep somewhere else. Everything it adds is watched exactly like a row you typed here yourself. This is not the place for an NZB feed - those go in Settings, RSS feeds.">List sources</h4>
+    <div id="lsrcrows"></div>
+    <div style="display:flex;gap:9px;margin-top:8px;flex-wrap:wrap">
+      <button class="ghost" onclick="addListSrc('rss')" data-i18n="lsrc.add.rss">+ Plex watchlist address</button>
+      <button class="ghost" onclick="addListSrc('account')" data-i18n="lsrc.add.acct">+ Plex account</button>
+      <button class="ghost" onclick="listSyncNow(this)" data-i18n="lsrc.sync">Sync now</button>
+      <button onclick="saveListSrc(this)" data-i18n="lsrc.apply">Apply sources</button>
+    </div>
+  </div>
   <div class="cardscroll"><div id="wlrows"></div></div>
   <div style="display:flex;gap:9px;margin-top:10px">
     <button class="ghost" onclick="addWatchRow('tv')" data-i18n="watch.addtv">+ TV show</button>
@@ -1626,10 +1754,11 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
 <div class="card set" data-sg="look" data-sk="appearance">
   <h3 data-i18n="set.look.title">Appearance
     <span class="badge scope" data-i18n="badge.thisbrowser">this browser only</span></h3>
-  <div class="row"><label data-i18n="set.look.preset">Preset<span class="hint" data-i18n="set.look.preset.hint">Classic is a plain, light, compact dashboard with just the queue and history - the graphs and extra cards are hidden. Full brings the default back: auto theme, regular spacing, everything shown. Both simply set the controls on this page and the dashboard cards, so any part can be adjusted afterwards; stored in this browser</span></label>
+  <div class="row"><label data-i18n="set.look.preset">Preset<span class="hint" data-i18n="set.look.preset.hint">Classic is a plain, light, compact dashboard with just the queue and history - the graphs and extra cards are hidden. Full brings the default back: auto theme, regular spacing, everything shown. Dense keeps everything but shrinks it - small cards several to a row, short graphs, made for big screens. Each simply sets the controls on this page and the dashboard cards, so any part can be adjusted afterwards; stored in this browser</span></label>
     <span style="display:flex;gap:8px">
       <button class="ghost" onclick="applyPreset('classic')" data-i18n="set.look.classic">Classic</button>
       <button class="ghost" onclick="applyPreset('full')" data-i18n="set.look.full">Full</button>
+      <button class="ghost" onclick="applyPreset('dense')" data-i18n="set.look.dense">Dense</button>
     </span></div>
   <div class="row"><label data-i18n="set.look.theme">Theme<span class="hint" data-i18n="set.look.theme.hint">Auto follows your system's light or dark setting</span></label>
     <select class="sel" id="s_theme" onchange="setTheme(this.value)">
@@ -1758,6 +1887,9 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
       <input class="txt sm" type="number" min="0" id="sv_ret" value="0"></div>
     <div class="row"><label data-i18n="set.srv.block">Block size (GB)<span class="hint" data-i18n="set.srv.block.hint">prepaid block account: nzbfast tracks lifetime usage and stops using the server when the block is spent. 0 = flatrate. Pair with a tier ≥1 so the block only fills what primaries miss</span></label>
       <input class="txt sm" type="number" min="0" id="sv_block" value="0"></div>
+    <div class="row" id="sv_blockrefrow" style="display:none"><label data-i18n="set.srv.blockref">Bought a new block<span class="hint" data-i18n="set.srv.blockref.hint">when you top up this account, press the button to restart the used counter at zero. The usage history is kept</span></label>
+      <span><button class="ghost sm" onclick="blockRefilled(this)" data-i18n="set.srv.blockref.btn">Block refilled</button>
+      <span class="hint" id="sv_blockused"></span></span></div>
     <div class="row"><label data-i18n="set.srv.paid">Every byte is billed<span class="hint" data-i18n="set.srv.paid.hint">turn this on for a metered account, where you pay for what you download. Your files still come from this server exactly as before; what stops is nzbfast spending bytes here for its own benefit, such as automatic connection tests, benchmark traffic and header scans for the index. Leave it off for an unlimited plan</span></label>
       <span><input type="checkbox" id="sv_paid" onchange="paidSuggest()">
       <span class="hint" id="sv_paidsug"></span></span></div>
@@ -1966,6 +2098,8 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
       <option value="regrab" data-i18n="set.watchdir.faillink.regrab">report it and queue another copy</option></select></div>
   <div class="row" data-adv="1"><label data-i18n="set.watchdir.autoretry">Try a failed download again after<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.autoretry.hint">a download that failed because articles were missing is queued again once, this long afterwards: a post can still be arriving at your provider, and waiting is the only thing that fixes that. Minutes; 0 = never retry on its own. Default 20. A failure that was the connection rather than the post waits 2 minutes instead, and a job that has already had its one automatic try is left in History for you to decide about</span></label>
     <input class="txt sm" type="number" min="0" max="10080" id="s_auto_retry_mins" onchange="setCfg('auto_retry_mins',this.value)"></div>
+  <div class="row" data-adv="1"><label data-i18n="set.watchdir.outage">Give up on a server that is not answering after<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.watchdir.outage.hint">when a server stops accepting connections - it is unreachable, or your account is at its connection limit - anything only that server has is stuck until it comes back. This is how long a download waits, counting up all the time that server has been out, before carrying on without it. The download then ends as a connection failure, which is retried on its own a couple of minutes later and picks up where it left off, so nothing is lost. Minutes; default 15. Set 0 to wait however long it takes instead: the download will sit there rather than ever come back failed, which is what you want for something you may not find again - other downloads still go ahead of it. Either way its row names the server and how long it has been out</span></label>
+    <input class="txt sm" type="number" min="0" max="10080" id="s_server_outage_mins" onchange="setCfg('server_outage_mins',this.value)"></div>
 </div>
 
 <div class="card set" data-sg="alerts" data-sk="notifications">
@@ -2114,7 +2248,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
   <div id="interestRows"></div>
   <div class="row"><label data-i18n="set.idx.groups">Groups to scan<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.groups.hint">comma-separated, e.g. alt.binaries.teevee; feeds Browse, the wall and the newznab facade</span></label>
     <div class="pathrow"><input class="txt" id="s_index_groups" onchange="setCfg('index_groups',this.value)"><button class="mini" onclick="openGroupBrowser()" data-i18n-title="grp.open.title" title="Browse and search every group your server carries" data-i18n="grp.open">Find…</button></div></div>
-  <div class="row"><label data-i18n="set.idx.iscdesc">Fetch group descriptions<span class="badge next" data-i18n="badge.next">next fetch</span><span class="hint" data-i18n="set.idx.iscdesc.hint">most providers send no descriptions at all, which leaves the group search matching names only. This fetches about 45,000 of them from ISC, a public Usenet directory. It is the only request nzbfast makes to anywhere other than your news provider, so it is off unless you turn it on.</span></label>
+  <div class="row"><label data-i18n="set.idx.iscdesc">Fetch group descriptions<span class="badge next" data-i18n="badge.nextfetch">next fetch</span><span class="hint" data-i18n="set.idx.iscdesc.hint">most providers send no descriptions at all, which leaves the group search matching names only. This fetches about 45,000 of them from ISC, a public Usenet directory. It is the only request nzbfast makes to anywhere other than your news provider, so it is off unless you turn it on.</span></label>
     <span><input type="checkbox" id="s_group_desc_isc" onchange="setCfg('group_desc_isc',this.checked?'1':'0')"></span></div>
   <div class="row"><label data-i18n="set.idx.interval">Scan interval (seconds)<span class="badge live" data-i18n="badge.live">live</span></label>
     <input class="txt sm" type="number" min="30" id="s_index_interval_secs" onchange="setCfg('index_interval_secs',this.value)"></div>
@@ -2186,9 +2320,11 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
   <!-- The parity scoreboard: the yardstick every naming lane is measured
        by. It asks an indexer the user already has an account with what
        THAT indexer found, and scores our own index against the answer.
-       There is no shipped source on purpose: the only reference is the
-       user's own URL and key, riding their own quota. -->
-  <div class="row"><label data-i18n="set.idx.sb">Parity scoreboard<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.sb.hint">off unless you turn it on. Once a day this asks an indexer you already have an account with for its newest releases in four categories, then scores our own index against the answer: do we have each post, do we show the same name, and how far behind were we. The table below is the result. Four small requests a day, on your own account, and nothing is ever sent anywhere else</span></label>
+       There is no shipped source on purpose: the reference is always
+       one of the user's own accounts, riding their own quota - either
+       an indexer account they already configured (picked by name and
+       resolved at run time) or a URL and key entered just for this. -->
+  <div class="row"><label data-i18n="set.idx.sb">Parity scoreboard<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.sb.hint">off unless you turn it on. Once a day this asks an indexer you already have an account with for its newest releases, then scores our own index against the answer: do we have each post, do we show the same name, and how far behind were we. The table below is the result. One small request a day for each category you tick below, on your own account, and nothing is ever sent anywhere else</span></label>
     <input type="checkbox" id="s_scoreboard_enabled" onchange="setCfg('scoreboard_enabled',this.checked?1:0);setTimeout(refreshScoreboard,400)"></div>
   <div class="row sb-sub" style="padding-left:16px"><label data-i18n="set.idx.sbsrc">Measure against<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.sbsrc.hint">pick one of the indexer accounts you already added, and its saved address and key are reused - nothing to type twice, and a new key entered there carries over here. Or choose to enter a different account below, for a reference you do not otherwise search</span></label>
     <select class="sel" id="s_scoreboard_source" style="max-width:300px" onchange="setCfg('scoreboard_source',this.value);sbToggles();setTimeout(refreshScoreboard,400)"></select></div>
@@ -2196,8 +2332,20 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input class="txt" id="s_scoreboard_url" autocomplete="off" placeholder="https://api.example.org" onchange="setCfg('scoreboard_url',this.value);setTimeout(refreshScoreboard,400)"></div>
   <div class="row sb-sub" style="padding-left:16px"><label data-i18n="set.idx.sbkey">Its API key<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.sbkey.hint">your key from that indexer's account page. It is stored, never shown again, and only ever sent to the indexer it belongs to</span></label>
     <input class="txt" id="s_scoreboard_key" type="password" value="" autocomplete="new-password" onchange="setCfg('scoreboard_key',this.value);setTimeout(refreshScoreboard,400)"></div>
+  <!-- The requests-per-day dial. Indexers meter every call, so the user
+       is allowed to spend less than the full sample; the box beside it
+       says what the current pick costs, live, as it changes. Untick
+       only: the ceiling is the four categories the daemon knows, so
+       this control can never RAISE the day's cost. -->
+  <div class="row sb-sub" style="padding-left:16px"><label data-i18n="set.idx.sbcats">What to measure<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.sbcats.hint">one request a day per ticked category, so untick the ones you do not care about to spend less of your indexer's daily allowance. Anything unticked is simply not measured - the table says so, and reads nothing into the silence</span></label>
+    <span style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:13px">
+      <label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="s_sb_c_movies" onchange="saveScoreboardCats(this)"><span data-i18n="sb.cat.movies">Films</span></label>
+      <label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="s_sb_c_tv" onchange="saveScoreboardCats(this)"><span data-i18n="sb.cat.tv">TV shows</span></label>
+      <label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="s_sb_c_audio" onchange="saveScoreboardCats(this)"><span data-i18n="sb.cat.audio">Music</span></label>
+      <label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="s_sb_c_books" onchange="saveScoreboardCats(this)"><span data-i18n="sb.cat.books">Books</span></label>
+      <span id="sbCatCost" class="dim"></span></span></div>
   <div class="row sb-sub" style="padding-left:16px"><label data-i18n="set.idx.sbcal">Spot-check the estimate<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.sbcal.hint">a post uploaded with its name taken out can only be matched by size and timing, which is a guess. This checks up to 5 of those guesses exactly each day by fetching their NZBs from the reference, which spends up to 5 of that account's daily downloads. The result is the error bar under the table. Off unless you can spare the downloads</span></label>
-    <input type="checkbox" id="s_scoreboard_calibrate" onchange="setCfg('scoreboard_calibrate',this.checked?1:0)"></div>
+    <input type="checkbox" id="s_scoreboard_calibrate" onchange="setCfg('scoreboard_calibrate',this.checked?1:0);sbCatCost()"></div>
   <div class="row sb-sub" style="padding-left:16px"><label data-i18n="set.idx.sbstat">How it is going<span class="hint" data-i18n="set.idx.sbstat.hint">what the last daily sample did. A run that hit trouble says so here rather than pretending nothing happened</span></label>
     <span id="sbState" class="dim" style="font-size:12.5px;line-height:1.5"></span></div>
   <div class="row sb-sub" id="sbTblRow" style="grid-template-columns:1fr;padding-left:16px;display:none">
@@ -2368,6 +2516,15 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input type="checkbox" id="s_media_chip_color" onchange="setCfg('media_chip_color',this.checked?1:0);applyChipColor()"></div>
   <div class="row"><label data-i18n="set.ui.shapechipcolor">Colour the archive chip<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.ui.shapechipcolor.hint">tints the chip describing what unpacking took: violet for encrypted, blue when there was no compression to undo or nothing had to land on disk first. Off leaves it plain - the chip still says the same thing in words</span></label>
     <input type="checkbox" id="s_shape_chip_color" onchange="setCfg('shape_chip_color',this.checked?1:0);applyChipColor()"></div>
+  <!-- §73 phase 2. Three states rather than a switch, because the middle
+       one is what most people want: read the file and tell me what it
+       is, without a video appearing in my downloader. -->
+  <div class="row"><label data-i18n="set.ui.preview">Check a file while it downloads<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.ui.preview.hint">each download's details can be read out of the video file itself while it arrives: resolution, codecs, audio languages, subtitles, chapters. It is how you catch a release that is the wrong cut, the wrong language or upscaled, before the rest of it downloads. "Details and a player" also offers the file in this page for the formats your browser opens; anything it cannot open still opens in your own player, and nothing is ever converted. Off stops the file being read at all.</span></label>
+    <select class="sel" id="s_preview" style="max-width:280px" onchange="setCfg('preview',this.value)">
+      <option value="off" data-i18n="set.ui.preview.off">Off</option>
+      <option value="metadata-only" data-i18n="set.ui.preview.meta">Details only</option>
+      <option value="full" data-i18n="set.ui.preview.full">Details and a player</option>
+    </select></div>
   <div class="row"><label data-i18n="set.ui.notify">Desktop notifications<span class="hint" data-i18n="set.ui.notify.hint">a system notification when a download completes or fails; the browser will ask permission</span></label>
     <input type="checkbox" id="ui_notify" onchange="setNotify(this)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.ui.provsort">Provider re-sort interval<span class="hint" data-i18n="set.ui.provsort.hint">seconds between re-ordering the Providers list by live speed (rows slide to their new spot); default 10, 0 keeps the configured order; stored in this browser</span></label>
@@ -2562,6 +2719,18 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
 </div></div>
 <!-- §129 2f: keyboard shortcut sheet, opened with '?'. Same shell as the
      directory browser; Escape, backdrop and ✕ all close it. -->
+<!-- §73 phase 2: the file itself, in the page, for the formats this
+     browser can open. It lives out here rather than in the row drawer
+     because the drawer is rebuilt on every queue poll. -->
+<div id="pvov" onclick="if(event.target===this)pvClose()"><div id="pvmodal" role="dialog" aria-modal="true" aria-labelledby="pvtitle">
+  <div class="fshead"><b id="pvtitle"></b><span class="grow"></span>
+    <button class="ghost mini" onclick="pvClose()" data-i18n-title="btn.close.title"
+      title="Close this panel" aria-label="Close this panel">✕</button></div>
+  <video id="pvvid" controls playsinline preload="none" onerror="pvError()" onseeking="pvSeeking()"></video>
+  <div class="fsfoot"><span id="pvnote" class="dim"></span><span class="grow"></span>
+    <button class="ghost" onclick="pvHandoff()" data-i18n="probe.handoff">Open in your player</button>
+    <button class="ghost" onclick="pvClose()" data-i18n="cu.close">Close</button></div>
+</div></div>
 <div id="shov" onclick="if(event.target===this)shClose()"><div id="shmodal" role="dialog" aria-modal="true" aria-labelledby="shtitle">
   <div class="fshead"><b id="shtitle" data-i18n="sh.title">Keyboard shortcuts</b><span class="grow"></span>
     <button class="ghost mini" onclick="shClose()" data-i18n-title="btn.close.title"
@@ -3065,6 +3234,27 @@ function helpEsc(e){ if(e.key==='Escape') closeHelp(); }
 // provider happened to be fourth in the list.
 const PC = ['--id0','--id1','--id2','--id3','--id4','--id5'].map(v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim());
 let key = localStorage.nzbfastKey || '';
+// Every adoption of a different key goes through here, and every one of
+// them bumps the epoch. A 403 is only ever news about the key the
+// request CARRIED: if the page has moved on since it went out, the
+// refusal says nothing about the key the page holds now, and asking the
+// user for one would be asking about a credential that no longer exists.
+// api() compares the epoch it sent under against this one for exactly
+// that reason.
+let keyEpoch = 0;
+function adoptKey(v){ key = v; localStorage.nzbfastKey = v; keyEpoch++; }
+// A rotation THIS page is performing (Create new, or typing your own key
+// into Settings). Between the request going out and its answer being
+// adopted, the daemon's key and this page's key genuinely disagree, so
+// every poll already in flight comes back refused - the 1 Hz loop
+// guarantees at least one. Those refusals must wait for the mint rather
+// than open the key modal: this is the window the "keeps asking for a
+// key and nothing stops it" report came from, and the key it asked for
+// did not exist when the request was sent. Held as a promise so the
+// waiters resume the moment the new key is adopted.
+let keyRotating = null, keyRotateDone = null;
+function keyRotateStart(){ if(!keyRotating) keyRotating = new Promise(r => { keyRotateDone = r; }); }
+function keyRotateEnd(){ const r = keyRotateDone; keyRotating = null; keyRotateDone = null; if(r) r(); }
 // First run: the daemon mints an API key and the launcher opens this page
 // with ?apikey=<it>, so a double-click user isn't met by a prompt for a
 // credential they have never seen (it was printed to a log the .app and
@@ -3081,7 +3271,7 @@ let urlKey = '';
 (function(){
   const q = new URLSearchParams(location.search), k = q.get('apikey');
   if(!k) return;
-  if(!key){ key = k; localStorage.nzbfastKey = k; }
+  if(!key){ adoptKey(k); }
   else if(k !== key) urlKey = k;
   q.delete('apikey');
   const qs = q.toString();
@@ -3277,12 +3467,20 @@ function openApiHush(){
 async function openApiFix(btn){ await busy(btn, t('busy.working','Working…'), async()=>{
   // POST: a key rotation must never be reachable by navigation - see
   // `credential_mutation_allowed`.
-  const j = await api('apikey_new', undefined, undefined, true);
+  // Gated like newApiKey: this daemon was keyless a moment ago, so every
+  // poll in flight is about to be told a key is Required, and none of
+  // them may put a modal in front of the strip that is about to show the
+  // one key that answers it.
+  keyRotateStart();
+  let j;
+  try{
+    j = await api('apikey_new', undefined, undefined, true);
+    // This page authenticates with the key too from the next request on.
+    if (j && j.status !== false && j.apikey) adoptKey(j.apikey);
+  } finally { keyRotateEnd(); }
   if (!j || j.status === false || !j.apikey){
     toast(tErr(j && j.error) || t('open.fail','Could not create a key.'), true); return;
   }
-  // This page authenticates with the key too from the next request on.
-  key = j.apikey; localStorage.nzbfastKey = j.apikey;
   const el = document.getElementById('opennotice');
   openBarLatched = true;
   el.innerHTML = esc(t('open.done','Key created. Paste it into Sonarr, Radarr and any phone app, and they will connect again.'))
@@ -3366,6 +3564,20 @@ function keyCancel(){
   keyNotice(true);   // reversible via the strip
   keyFinish(false);
 }
+// Another tab on this origin paired or rotated. localStorage is shared
+// between every dashboard and wall tab, but each cached its own copy at
+// load, so without this the other surfaces sit refused - and ask, one
+// modal each, for a key the user has already handed over next door. The
+// event fires only in OTHER tabs, so it cannot loop back on the one that
+// did the rotating. If the new value is wrong too, the retry refuses and
+// the modal comes back on its own.
+addEventListener('storage', e => {
+  if (e.key !== 'nzbfastKey' || !e.newValue || e.newValue === key) return;
+  adoptKey(e.newValue);
+  keyDeclined = false; sessionStorage.removeItem('nzbfastKeyDeclined');
+  keyNotice(false);
+  if (keyPrompt) keyFinish(true);   // the open modal's question just got answered
+});
 function keyToggleShow(){
   const inp = document.getElementById('keyin'), btn = document.getElementById('keyshow');
   const show = inp.type === 'password';
@@ -3397,7 +3609,7 @@ async function keySubmit(){
       return;
     }
     if (j.status === false){ err.textContent = tErr(j.error) || String(j.error); return; }
-    key = v; localStorage.nzbfastKey = v;
+    adoptKey(v);
     keyDeclined = false; sessionStorage.removeItem('nzbfastKeyDeclined');
     keyNotice(false);
     keyFinish(true);
@@ -3440,6 +3652,9 @@ async function api(mode, extra, authKey, post){
   if (authKey == null && keyPrompt && !(await keyPrompt))
     return {status:false, error:'API Key Required'};
   const sent = authKey != null ? authKey : key;
+  // Which key generation this request goes out under - read BEFORE the
+  // fetch, compared after (see keyEpoch).
+  const epoch = keyEpoch;
   // Issue #4: the key rides the X-Api-Key header, not the query string,
   // so it stays out of reverse-proxy access logs, browser history and
   // Referer headers. Navigations (the /m3u player handoff) still use
@@ -3453,13 +3668,32 @@ async function api(mode, extra, authKey, post){
   // authKey set = an explicit one-shot credential (the apikey bootstrap):
   // never prompt for it, surface the error instead.
   if (authFail(j) && authKey == null){
+    // A rotation started in this page after this request went out: the
+    // refusal is about the key it carried, and the replacement is
+    // already on its way. Wait for it rather than putting a modal in
+    // front of the person who is pressing the button.
+    if (keyRotating) await keyRotating;
+    // The key moved on while this was in flight (the rotation above, a
+    // silent re-pair, another call's modal): retry under the current one
+    // before deciding anybody needs to be asked for anything.
+    if (keyEpoch !== epoch && key !== sent) return api(mode, extra, undefined, post);
+    // Another surface on this origin already re-paired. localStorage is
+    // shared between the dashboard and the wall, but each caches its own
+    // copy at load, so a key entered (or minted) in one tab leaves the
+    // other holding a stale one it can simply pick up.
+    const stored = localStorage.nzbfastKey || '';
+    if (stored && stored !== sent && stored !== key){
+      adoptKey(stored);
+      return api(mode, extra, undefined, post);
+    }
     // Stored key refused and a different one arrived on the launch URL:
     // adopt that one and retry before involving the user. This is the
     // silent re-pair after a rotation (stored key stale, launcher fresh);
     // if the URL key is the stale one instead it burns this one retry and
     // the modal is next.
     if (urlKey && urlKey !== sent){
-      key = urlKey; localStorage.nzbfastKey = urlKey; urlKey = '';
+      const uk = urlKey; urlKey = '';
+      adoptKey(uk);
       return api(mode, extra, undefined, post);
     }
     if (await ensureKey(sent)) return api(mode, extra, undefined, post);
@@ -3911,6 +4145,7 @@ const EVENT_STYLE = {
   wire:      {cls:'fault',    label:()=>t('ev.wire','memory ceiling reached')},
   disk:      {cls:'fault',    label:()=>t('ev.disk','low disk space')},
   quota:     {cls:'fault',    label:()=>t('ev.quota','quota spent')},
+  block:     {cls:'fault',    label:()=>t('ev.block','prepaid block spent')},
   late:      {cls:'fault',    label:()=>t('ev.late','slow to start')},
   racing:    {cls:'recovery', label:()=>t('ev.racing','racing slow articles')},
   sidecar:   {cls:'recovery', label:()=>t('ev.sidecar','early start')},
@@ -4496,9 +4731,9 @@ async function tick(){
     // drive instead of to their ISP. The evidence hangs off the tooltip
     // and the drawer; the pill carries the claim.
     const pstore = paused && q.pause_source==='storage' && q.storage_pause;
-    pill.title = pstore ? q.storage_pause.evidence : '';
+    pill.title = pstore ? storageEvidence(q.storage_pause) : '';
     pill.textContent = paused? t('status.paused','paused')+(
-        pstore? ` · output storage is not keeping up`
+        pstore? ` · ${t('queue.storage.reason','output storage is not keeping up')}`
         : pwhen? ` · ${t('status.paused.sched','by your schedule until {t}',{t:pwhen})}`
         : psched? ` · ${t('status.paused.sched.open','by your schedule')}`
         : pmin? ` · ${t('status.minleft','{n}m left',{n:pmin})}` : '')
@@ -4677,7 +4912,7 @@ async function tick(){
              : t('shape.title','What this download turned out to be.');
            return `<div class="${why.length?'warn':'dim'}" style="margin-top:5px;font-size:12.5px" title="${escA(tip)}">${why.length?'⚠ ':''}${esc(facts)}</div>`;
          })()}`);
-    } else setHtml('active',`<button type="button" class="dim idlepick">${t('queue.idle.drop','idle: drop a .nzb anywhere, or click here to choose one')}</button>`);
+    } else setHtml('active',`<button type="button" class="dim idlepick" title="${escA(t('queue.idle.drop.tip','drop it anywhere on this page, or click to choose a file'))}">${t('queue.idle.drop2','idle · drop a .nzb here')}</button>`);
 
     document.getElementById('qcount').textContent=q.slots.length
       ?`${tn('queue.count',q.slots.length,'{n} item','{n} items')}${runLeft>0&&mbps>0?` · ${t('queue.timeleft','{t} left',{t:fmtEta(runLeft/mbps)})}`:''}`:'';
@@ -4708,6 +4943,7 @@ async function tick(){
     // completion (handleLifeEvents), "never" not at all.
     pwPromptMode=q.password_prompt||'done';
     eatVolMode=q.unpack_eat_volumes||'off';
+    previewMode=q.preview||'metadata-only';
     if(pwPromptMode==='now') for(const s of q.slots){
       if(s.password_needed && !pwLiveAsked.has(s.nzo_id)){
         pwLiveAsked.add(s.nzo_id);
@@ -4962,9 +5198,23 @@ function mediaWhy(m){
 // The contradiction, spelled out. The row chip is glanceable and easy to
 // miss; a user who opens the drawer is asking "should I keep this?" and
 // deserves the sentences rather than a tooltip they have to hover for.
-// §129 3e: the drawer's account of a chronic slow-storage pause, shown
-// only on the job it actually stopped. English-only for now; the §129
-// phase 3 locale pass picks these up with the rest.
+// §129 3e: the measurement behind a storage pause, as one sentence.
+//
+// The daemon also sends `evidence`, the same sentence pre-composed - but
+// it builds that one in English for the log and the notification, and a
+// formatted sentence cannot be translated at the display edge the way a
+// bare status word can (the API-strings-stay-English rule). So the
+// numbers ride the payload too and the sentence is composed here, in the
+// reader's language and with their number formatting. The daemon's
+// string is the fallback for a payload from an older build.
+function storageEvidence(sp){
+  if(!sp) return '';
+  if(sp.window_secs==null) return sp.evidence||'';
+  return t('queue.storage.evidence','Write stalls: {a} s out of the last {b} s on {path}.',
+    {a:num(sp.stalled_secs||0,0),b:num(sp.window_secs,0),path:sp.path||''});
+}
+// The drawer's account of the same pause, shown only on the job it
+// actually stopped.
 //
 // The recovery line is the load-bearing half. A paused row with an
 // unexplained stop is exactly what has users deleting a job whose
@@ -4975,11 +5225,16 @@ function storagePauseBlock(s){
   const sp=lastQ&&lastQ.storage_pause;
   if(!sp||sp.nzo_id!==s.nzo_id) return '';
   const n=sp.healthy_probes|0, need=sp.probes_needed|0;
-  return `<div class="warn" style="font-size:12px;margin-top:7px">Paused: output storage is not keeping up.<br>
-    <span class="dim">${esc(sp.evidence||'')}<br>
-    Everything downloaded so far is kept. nzbfast is re-checking the folder
-    ${need?`and resumes after ${need} clean write checks in a row (${n} so far)`:'and resumes on its own'}.
-    ${sp.probe_ms?`Last check took ${Math.round(sp.probe_ms/100)/10} s.`:''}</span></div>`;
+  // The probe tally is a ratio, not a counted noun, so it needs no
+  // plural forms in any of the 27 catalogues - and it reads as progress,
+  // which is the point of showing it at all.
+  return `<div class="warn" style="font-size:12px;margin-top:7px">${
+      esc(t('drawer.storage.head','Paused: output storage is not keeping up.'))}<br>
+    <span class="dim">${esc(storageEvidence(sp))}<br>
+    ${esc(t('drawer.storage.kept','Everything downloaded so far is kept.'))}
+    ${esc(t('drawer.storage.recheck','nzbfast is re-checking the folder and starts the queue again by itself once it answers normally.'))}
+    ${need?esc(t('drawer.storage.probes','Clean write checks in a row: {n} of {need}.',{n:num(n,0),need:num(need,0)})):''}
+    ${sp.probe_ms?esc(t('drawer.storage.last','Last check took {s} s.',{s:num(sp.probe_ms/1000,1)})):''}</span></div>`;
 }
 function mediaWarnBlock(m){
   const why=m?mediaWhy(m):[];
@@ -5347,6 +5602,7 @@ function probeBody(id){
     ${(m.chapters||[]).length?`<div><span class="dim">${esc(t('probe.chapters','Chapters'))}</span> ${m.chapters.length}</div>`:''}
     ${m.title?`<div><span class="dim">${esc(t('probe.name','Title'))}</span> ${esc(m.title)}</div>`:''}
     ${m.complete?'':`<div class="dim">${esc(t('probe.partial','read from what has downloaded so far'))}</div>`}
+    ${pvBlock(id,j)}
   </div>`;
 }
 // The box renders from the cache, so a re-render (the queue drawer
@@ -5355,6 +5611,379 @@ function probeBody(id){
 function probeHtml(id){
   probeFetch(id);
   return `<div id="pv-${escA(id)}" style="margin-top:7px">${probeBody(id)}</div>`;
+}
+
+// ---------------------------------------------------------------------
+// §73 phase 2: can THIS browser open the file, and if so, open it here
+// ---------------------------------------------------------------------
+// The daemon says what the file IS; only the browser knows what it can
+// do with it, and they differ per browser and per machine (HEVC decodes
+// where the platform has it and nowhere else; AC-3 and E-AC-3 decode
+// almost nowhere). So the verdict is computed here, from the codec
+// strings the container itself spelled out, and it is allowed to say "I
+// do not know" - which beats a <video> that shows a black rectangle and
+// no reason.
+
+// One element, reused: canPlayType is a pure question and the answers
+// never change within a page load.
+const _pvEl=document.createElement('video'), _pvAsk={};
+function pvAsk(mime){
+  if(_pvAsk[mime]!==undefined) return _pvAsk[mime];
+  let r='';
+  try{ r=_pvEl.canPlayType(mime)||''; }catch(e){ r=''; }
+  // The second opinion, and the reason it is worth asking: a browser
+  // that will not commit through canPlayType often still answers
+  // isTypeSupported, which is the same decoder question asked of the
+  // Media Source API.
+  if(!r&&typeof MediaSource!=='undefined'&&MediaSource.isTypeSupported){
+    try{ if(MediaSource.isTypeSupported(mime)) r='maybe'; }catch(e){}
+  }
+  return _pvAsk[mime]=r;
+}
+// What a file of this container is served as. Matroska is the one that
+// matters and the one browsers disagree about - Chromium answers
+// "probably" for it, others say nothing at all and play it anyway -
+// which is why an unproven container is answered by trying, below.
+const PV_MIME={mkv:'video/x-matroska',webm:'video/webm',mp4:'video/mp4',avi:'video/x-msvideo'};
+// The fallback codec strings, for a container that carried no
+// configuration record to spell an exact one out of (AVI always).
+const PV_VFALL={h264:'avc1.42E01E',hevc:'hvc1.1.6.L93.B0',av1:'av01.0.05M.08',
+  vp9:'vp09.00.10.08',vp8:'vp8'};
+const PV_AFALL={aac:'mp4a.40.2',mp3:'mp4a.40.34',opus:'opus',flac:'flac',
+  vorbis:'vorbis',ac3:'ac-3',eac3:'ec-3',dts:'dtsc',truehd:'mlpa'};
+function pvVideoCodec(v){
+  if(!v) return '';
+  if(v.codec_rfc6381) return v.codec_rfc6381;
+  // No exact string, and one guess here would be a lie: browsers decode
+  // 8-bit H.264 and refuse High 10, so a deep track without a
+  // configuration record answers "unknown" rather than "fine".
+  if((v.bit_depth||8)>8) return '';
+  return PV_VFALL[v.codec]||'';
+}
+function pvAudioCodec(a){ return a?(a.codec_rfc6381||PV_AFALL[a.codec]||''):''; }
+// How a codec is SPELLED in a sentence. Format names, deliberately
+// untranslated (same rule as the row chip): they read the same
+// everywhere and they are the tokens a release name uses. Without this
+// the honest sentence about sound said "EAC3".
+const PV_NAME={h264:'H.264',hevc:'HEVC',av1:'AV1',vp9:'VP9',vp8:'VP8',mpeg2:'MPEG-2',
+  mpeg4:'MPEG-4',vc1:'VC-1',mjpeg:'MJPEG',aac:'AAC',ac3:'AC-3',eac3:'E-AC-3',dts:'DTS',
+  truehd:'TrueHD',mp3:'MP3',mp2:'MP2',opus:'Opus',flac:'FLAC',vorbis:'Vorbis',pcm:'PCM',wma:'WMA'};
+function pvName(c){ return PV_NAME[c]||(c||'').toUpperCase(); }
+// Does this browser have the DECODER, container aside? Asked in the two
+// containers every browser does advertise, so the answer is about the
+// codec alone.
+function pvDecodes(codec,audio){
+  if(!codec) return false;
+  const box=audio?['audio/mp4','audio/webm','audio/mpeg']:['video/mp4','video/webm'];
+  return box.some(b=>pvAsk(b+'; codecs="'+codec+'"'));
+}
+// §73 phase 3: what the daemon's remuxer can rewrap into the one
+// container every browser opens. It never re-encodes, so the question is
+// only whether these bytes have a place in an MP4 - which is why the
+// list is short and why "cannot decode this codec" stays a dead end no
+// amount of rewrapping fixes.
+const PV_RX_IN=['mkv','webm','mp4'], PV_RX_V=['h264','hevc','av1','vp9'];
+function pvRemuxable(m,v){
+  return PV_RX_IN.indexOf(m.container)>=0 && PV_RX_V.indexOf(v.codec)>=0;
+}
+// Containers this browser has been SEEN to refuse, remembered per
+// browser. Chrome plays Matroska it will not admit to in canPlayType,
+// so the honest first answer is "try it" - and the try teaches us.
+function pvRefused(c){
+  try{ return (localStorage.nzbfastPvNo||'').split(',').indexOf(c)>=0; }catch(e){ return false; }
+}
+function pvNoteRefusal(c){
+  try{
+    const l=(localStorage.nzbfastPvNo||'').split(',').filter(Boolean);
+    if(l.indexOf(c)<0){ l.push(c); localStorage.nzbfastPvNo=l.join(','); }
+  }catch(e){}
+}
+// The verdict. `kind` is a closed set the copy branches on:
+//   nothing   nothing parsed yet
+//   nocodec   this browser cannot decode the video - honest dead end
+//   silent    video yes, THIS audio track no (every AC-3 release)
+//   plays     both, and the container is one the browser admits to
+//   try       both, but the container is one it will not commit on
+// `remux` rides alongside: true when the daemon can rewrap this file as
+// it plays, which is what turns the container answers from a dead end
+// into playback. It never rescues `nocodec` on the CODEC - nothing but a
+// transcoder does that, and this build has none.
+function pvVerdict(m){
+  if(!m||!(m.video||[]).length) return {kind:'nothing'};
+  const v=(m.video||[]).find(x=>x.enabled!==false)||m.video[0];
+  // ENABLED tracks only, and the filter is load-bearing: this list's
+  // indices are what `a=` means. samples::select_mkv / select_mp4 both
+  // drop disabled tracks and THEN index, so a file with a disabled
+  // track selects the wrong one if this counts the raw list.
+  const auds=(m.audio||[]).filter(x=>x.enabled!==false);
+  const a=auds.find(x=>x.default)||auds[0]||null;
+  const vc=pvVideoCodec(v), ac=pvAudioCodec(a);
+  const mime=PV_MIME[m.container]||'';
+  if(!pvDecodes(vc,false)) return {kind:'nocodec',codec:v.codec,v:v,a:a,alt:-1};
+  const rx=pvRemuxable(m,v);
+  const audioOk=!a||pvDecodes(ac,true);
+  // The rescue for a soundtrack this browser cannot decode: an AC-3 or
+  // DTS release very often carries an AAC or Opus track beside it, and
+  // the remuxer can be told to carry that one instead. Only the remux
+  // path can choose - the raw bytes carry every track and the element
+  // takes the first it finds.
+  const alt=audioOk?-1:auds.findIndex(x=>pvDecodes(pvAudioCodec(x),true));
+  const altCodec=alt>=0?auds[alt].codec:'';
+  const container=(mime&&!pvRefused(m.container)&&(pvAsk(mime+(vc?'; codecs="'+vc+'"':''))||pvAsk(mime)))
+    ? 'yes' : (pvRefused(m.container)?'no':'try');
+  if(container==='no') return {kind:'nocodec',container:m.container,v:v,a:a,refused:true,remux:rx,alt:alt,altCodec:altCodec};
+  if(!audioOk) return {kind:'silent',codec:a.codec,v:v,a:a,soft:container==='try',remux:rx,alt:alt,altCodec:altCodec};
+  return {kind:container==='yes'?'plays':'try',v:v,a:a,remux:rx,alt:-1};
+}
+// The audio track the remuxer should be told to carry for this job, as
+// an index into the ENABLED audio tracks - or -1 to let it choose. Read
+// from the probe rather than passed around, because the two paths that
+// switch to the remuxer mid-playback (the stall watchdog and the error
+// handler) reach that decision without a verdict in hand.
+function pvAltAudio(id){
+  const m=(PROBE[id]||{}).j;
+  if(!m||!m.media) return -1;
+  const vd=pvVerdict(m.media);
+  return (vd.alt===undefined?-1:vd.alt);
+}
+// The panel's playback line, plus whatever action is honest for it.
+// Never a <video> the browser cannot fill: a file this browser will not
+// open still opens in the user's own player, which is what the ▶ button
+// and the .m3u handoff have always done.
+function pvBlock(id,j){
+  if(previewMode==='off'||!j||!j.media) return '';
+  const vd=pvVerdict(j.media);
+  if(vd.kind==='nothing') return '';
+  const name=j.file||'';
+  const full=previewMode==='full';
+  // The token is fetched here, as the button is drawn - see pvToken.
+  const btn=(rx,ai)=>full
+    ? (pvToken(id),`<button class="ghost mini" onclick="event.stopPropagation();pvOpen('${escA(id)}','${escA(name)}',${rx?1:0},${(ai===undefined?-1:ai)})">▶ ${esc(t('probe.testhere','Test it here'))}</button>`)
+    : '';
+  const play=btn(false);
+  const off=`<div class="dim">${esc(t('probe.playeroff','The player is off for this daemon; turn it on in Settings. Your own player opens the file either way.'))}</div>`;
+  if(vd.kind==='nocodec'){
+    // §73 phase 3: the browser refuses the CONTAINER but decodes what is
+    // inside it, which is the commonest case there is - so the honest
+    // sentence is no longer "your own player will". The daemon rewraps
+    // the same bytes as they play, and the file plays here.
+    if(vd.refused&&vd.remux&&full)
+      // A refused container whose default soundtrack this browser also
+      // cannot decode would rewrap into silence. Say so, and point the
+      // remuxer at the track that does decode.
+      return `<div style="margin-top:6px"><span class="ok">${esc(vd.alt>=0
+        ? t('probe.altaudio','This browser has no {c} sound, so the {c2} track plays instead.',
+            {c:pvName(vd.a&&vd.a.codec),c2:pvName(vd.altCodec)})
+        : t('probe.plays','This browser can play this file.'))}</span> ${btn(true,vd.alt)}</div>`;
+    return `<div style="margin-top:6px" class="warn">${esc(vd.refused
+      ? t('probe.no.container','This browser will not open {c} files. Your own player will.',{c:(vd.container||'').toUpperCase()})
+      // Bit depth belongs in the sentence when it is the reason: a
+      // browser that plays H.264 all day still refuses High 10, and
+      // "cannot decode H.264" would read as a lie to the user watching
+      // another H.264 file play in the next row.
+      : t('probe.no.codec','This browser cannot decode {c}, so check it in your own player.',
+          {c:((vd.v&&vd.v.bit_depth>8)?vd.v.bit_depth+'-bit ':'')+pvName(vd.codec)}))}</div>`
+      +((vd.refused&&vd.remux)?off:'');
+  }
+  if(vd.kind==='silent'){
+    // Sound, where before there was only a picture: the file's other
+    // track is one this browser decodes, and the remuxer carries that
+    // one instead. Needs the remux path - the raw bytes carry every
+    // track and the element takes the first.
+    if(vd.alt>=0&&vd.remux&&full)
+      return `<div style="margin-top:6px"><span class="ok">${esc(t('probe.altaudio',
+        'This browser has no {c} sound, so the {c2} track plays instead.',
+        {c:pvName(vd.codec),c2:pvName(vd.altCodec)}))}</span> ${btn(true,vd.alt)}</div>`;
+    return `<div style="margin-top:6px"><span class="warn">${esc(t('probe.silent',
+      'This browser has no {c} sound: the picture plays here, the audio does not.',{c:pvName(vd.codec)}))}</span>`
+      +(full?' '+play:'')+`</div>`+(full?'':off);
+  }
+  const line=vd.kind==='plays'
+    ? t('probe.plays','This browser can play this file.')
+    : t('probe.maybe','This browser plays these codecs. Whether it opens a {c} file at all, only trying will tell.',{c:(j.media.container||'').toUpperCase()});
+  return `<div style="margin-top:6px"><span class="ok">${esc(line)}</span>`+(full?' '+play:'')+`</div>`+(full?'':off);
+}
+// The player itself: a modal, deliberately NOT inside the row drawer.
+// The queue drawer is rebuilt on every poll, and a <video> rebuilt
+// every second is a <video> that restarts every second.
+let pvJob='';
+// The per-job token, never the API key: this string ends up in a <video
+// src>, which is the one place in the page a URL is visible to anything
+// that can read the DOM. It starts and serves this job only.
+//
+// Fetched when the button is DRAWN rather than when it is clicked, and
+// that is not an optimisation: a browser only autoplays inside the user
+// gesture that asked for it, and an await between the click and the
+// play() spends the gesture. With the token already in hand the whole
+// of pvOpen runs inside the click.
+const pvTok={};
+function pvToken(id){
+  if(pvTok[id]) return pvTok[id];
+  return pvTok[id]=api('stream_token','&value='+encodeURIComponent(id))
+    .then(j=>(j&&j.status)?j.token:null)
+    .catch(()=>null);
+}
+// §73 phase 3 state. `pvRemux` picks which endpoint the element is
+// pointed at: the raw bytes, or the same bytes rewrapped as they are
+// read. `pvTokVal` is kept because the remux path has to build a fresh
+// URL for every seek - a produced stream has no byte ranges to ask for.
+let pvRemux=false, pvTokVal='', pvStart=0, pvSeekBusy=false, pvRetry=0, pvWatch=0;
+// Which audio track the remuxer carries, as an index into the ENABLED
+// audio tracks (-1 lets it choose). It rides every URL the remux path
+// builds, seeks included: a reopen that dropped it would swap the
+// soundtrack halfway through.
+let pvAudio=-1;
+// How long a native attempt gets to understand the container before it
+// is treated as a refusal.
+//
+// Not every browser says no out loud. Some open the socket, read the
+// bytes and simply never reach HAVE_METADATA - no error event, no
+// message, a still frame forever - and until there was a remuxer there
+// was nothing to do about it anyway. There is now, so the silence gets a
+// deadline. Twelve seconds is long enough that a slow first article is
+// not mistaken for a refusal, and a false positive costs only a rewrap
+// of a file that would have played.
+const PV_STALL_MS=12000;
+function pvArmStall(){
+  clearTimeout(pvWatch);
+  if(pvRemux) return;
+  const job=pvJob;
+  pvWatch=setTimeout(()=>{
+    const v=document.getElementById('pvvid');
+    if(job!==pvJob||pvRemux||!v||v.error) return;
+    if(v.readyState>=1) return;                  // it understood the container
+    const m=(PROBE[pvJob]||{}).j, c=m&&m.media?m.media.container:'';
+    if(!c||!m.media||!pvRemuxable(m.media,(m.media.video||[])[0]||{})) return;
+    // Only NETWORK_LOADING earns a permanent note: bytes were arriving
+    // and none of them became media. Anything else may just be a slow
+    // download, and a wrong entry in the store follows the user around.
+    if(v.networkState===2) pvNoteRefusal(c);
+    pvRemux=true;
+    // Now that the remuxer is choosing tracks, it can be told to skip a
+    // soundtrack this browser cannot decode.
+    pvAudio=pvAltAudio(pvJob);
+    setHtml('pvnote', esc(t('probe.checking','reading the file…')));
+    pvReopen(0);
+  }, PV_STALL_MS);
+}
+function pvSrc(startMs){
+  const base=pvRemux?'/preview/media/':'/stream/';
+  return base+encodeURIComponent(pvJob)+'?t='+encodeURIComponent(pvTokVal)
+    +(pvRemux&&startMs?'&start_ms='+Math.max(0,Math.round(startMs)):'')
+    +(pvRemux&&pvAudio>=0?'&a='+pvAudio:'');
+}
+async function pvOpen(id,name,remux,audio){
+  const v=document.getElementById('pvvid');
+  if(!v) return;
+  const tok=await pvToken(id);
+  if(!tok){ delete pvTok[id]; toast(t('toast.pvfail','Could not open this file here.'),true); return; }
+  pvJob=id; pvTokVal=tok; pvRemux=!!remux; pvStart=0; pvRetry=0;
+  pvAudio=(audio===undefined?-1:audio);
+  setHtml('pvtitle', esc(name||t('probe.head','Inside the file')));
+  setHtml('pvnote','');
+  v.src=pvSrc(0);
+  document.getElementById('pvov').classList.add('on');
+  v.load();
+  const p=v.play(); if(p&&p.catch) p.catch(()=>{});
+  pvArmStall();
+}
+// Point the element at the same file from a different moment. Only the
+// remux path needs this: the raw one has byte ranges and the element
+// seeks by itself.
+function pvReopen(startMs){
+  const v=document.getElementById('pvvid');
+  if(!v||!pvJob) return;
+  pvStart=Math.max(0,Math.round(startMs||0));
+  pvSeekBusy=true;
+  v.src=pvSrc(pvStart);
+  v.load();
+  const p=v.play(); if(p&&p.catch) p.catch(()=>{});
+  // The element fires `seeking` again while it settles on the new
+  // source; without this latch that would reopen the source forever.
+  setTimeout(()=>{ pvSeekBusy=false; }, 1200);
+}
+// A remuxed response is produced as it is read, so it carries no byte
+// ranges and the element can only seek inside what it has already
+// buffered. Anything past that is answered by asking the daemon to
+// start muxing from there instead - which is a new request, and the
+// reason the endpoint takes a start time at all.
+function pvSeeking(){
+  const v=document.getElementById('pvvid');
+  if(!pvRemux||!pvJob||!v||pvSeekBusy) return;
+  const t0=v.currentTime;
+  for(let i=0;i<v.buffered.length;i++)
+    if(t0>=v.buffered.start(i)-0.25&&t0<=v.buffered.end(i)+0.25) return;
+  pvReopen(t0*1000);
+}
+function pvClose(){
+  const v=document.getElementById('pvvid');
+  document.getElementById('pvov').classList.remove('on');
+  if(v){
+    // Dropping the source is what closes the socket. A left-open
+    // request holds a reader on the download, and the reader is what
+    // steers which articles are fetched next.
+    v.pause();
+    v.removeAttribute('src');
+    try{ v.load(); }catch(e){}
+  }
+  clearTimeout(pvWatch); pvWatch=0;
+  pvJob=''; pvRemux=false; pvTokVal=''; pvRetry=0; pvSeekBusy=false; pvAudio=-1;
+}
+// The element found out what canPlayType would not say. Remember it, so
+// the next verdict for this container is honest from the start - and,
+// now that there is a remuxer, ACT on it: the same file rewrapped is
+// exactly what this browser was refusing to open.
+function pvError(){
+  const v=document.getElementById('pvvid');
+  clearTimeout(pvWatch); pvWatch=0;
+  const m=(PROBE[pvJob]||{}).j;
+  const c=m&&m.media?m.media.container:'';
+  const unsupported=v&&v.error&&v.error.code===4;   // MEDIA_ERR_SRC_NOT_SUPPORTED
+  if(unsupported&&!pvRemux){
+    if(c) pvNoteRefusal(c);
+    // The codecs were already checked before the button was drawn, so a
+    // refusal here is the container's. Rewrap and carry on: the viewer
+    // sees a pause, not a dead end.
+    if(c&&m&&m.media&&pvRemuxable(m.media,(m.media.video||[])[0]||{})){
+      pvRemux=true;
+      pvAudio=pvAltAudio(pvJob);
+      setHtml('pvnote', esc(t('probe.checking','reading the file…')));
+      pvReopen(v?v.currentTime*1000:0);
+      return;
+    }
+  }
+  if(pvRemux&&unsupported){ pvWhyRemuxFailed(); return; }
+  setHtml('pvnote', esc(unsupported
+    ? t('probe.err.open','This browser could not open the file. Use the button below to open it in your own player.')
+    : t('probe.err.read','The file stopped arriving. It carries on downloading; try again in a moment.')));
+}
+// A remuxed response that the element rejected could be a file we cannot
+// rewrap - or it could be a 425, which is the daemon saying "that part
+// has not downloaded yet". The element cannot tell them apart (both
+// arrive as "unsupported source"), so ask the endpoint the same question
+// in a form that has a status code on it. The init segment is a few
+// hundred bytes and needs only the container header, so this is cheap
+// and it is exactly the readiness question.
+async function pvWhyRemuxFailed(){
+  const job=pvJob;
+  try{
+    const r=await fetch(pvSrc(pvStart)+'&init_only=1');
+    if(job!==pvJob) return;                       // closed while we asked
+    if(r.status===425&&pvRetry<60){
+      pvRetry++;
+      setHtml('pvnote', esc(t('probe.pending','not enough of the file has arrived yet')));
+      setTimeout(()=>{ if(job===pvJob) pvReopen(pvStart); }, 2000);
+      return;
+    }
+  }catch(e){ if(job!==pvJob) return; }
+  setHtml('pvnote', esc(t('probe.err.open','This browser could not open the file. Use the button below to open it in your own player.')));
+}
+// The handoff that has always existed, from inside the player: the
+// .m3u the user's own player follows.
+function pvHandoff(){
+  if(!pvJob) return;
+  toast(t('toast.handoff','Handing playback to your player…'));
+  location.href=`/m3u/${encodeURIComponent(pvJob)}${key?`?apikey=${encodeURIComponent(key)}`:''}`;
 }
 
 // The live body of the drawer's "Disk space" row for a disk-full unpack
@@ -5542,7 +6171,8 @@ async function toggleHistRow(tr){
     const HINT={
       retention:t('hist.fix.retention','Some pieces were never even requested: they are older than the retention you have set for every server. Raise it (0 = unlimited) and try again.'),
       nopar2:t('hist.fix.nopar2','Pieces are missing and this post carries no repair data at all, so nothing can rebuild them. Another release is the only answer.'),
-      servers:t('hist.fix.servers','No server was available to download from - every one you have set up is switched off, busy, or out of block data.')
+      servers:t('hist.fix.servers','No server was available to download from - every one you have set up is switched off, busy, or out of block data.'),
+      deleted:t('hist.fix.deleted','This download finished, but its folder has since been deleted from disk. Retry downloads it again from the start.')
     };
     // A library row never wrote a byte: the entry came out of the index
     // and the post has since gone. The generic "gone" copy talks about a
@@ -5685,8 +6315,10 @@ async function toggleHistRow(tr){
   // audio tracks and subtitles and then offered no way to open the file:
   // that was a double-click on the row, or a right-click menu entry, and
   // neither exists on touch.
+  // §73 phase 2: with preview off the daemon will not read the file, so
+  // the row keeps its handoff button and drops the panel above it.
   if(!failed) rows.push([t('probe.head','Inside the file'),
-    mediaWarnBlock(s.media)+probeHtml(s.nzo_id)
+    mediaWarnBlock(s.media)+(previewMode==='off'?'':probeHtml(s.nzo_id))
     +`<div style="margin-top:6px"><button class="ghost mini" title="${escA(t('hist.play.title','Open the largest video file in the default player on the machine running nzbfast'))}" onclick="event.stopPropagation();openItem('${escA(s.nzo_id)}','file')">▶ ${esc(t('menu.play2','Play'))}</button></div>`]);
   // What an identity oracle said this release is. Only present when one
   // answered, and always attributed - "srrdb says" and "the video file
@@ -5920,6 +6552,14 @@ function pipeline(s,mbps,queued,done,failed){
           perm?t('prov.stat.rejected','sign-in rejected')
               :t('prov.stat.capped','at its connection limit')}</span>`;
         detail=refusalDetailHtml(sv.host, sv.refused.line, perm);
+      } else if(sv.down){
+        // The other half of the same silent double-cost: a server whose
+        // DIAL fails leaves no refusal line to show, so it fell through
+        // to "standby" below and read as a healthy backup the pool
+        // simply had not needed. It is not - it is out, and any article
+        // only it carries is waiting on it.
+        stat=` · <span class="bad" title="${escA(sv.down.detail||'')}">${
+          t('prov.stat.down','no connection for {n}s',{n:num(sv.down.secs,0)})}</span>`;
       } else if(sv.connected===0){
         const tried=sv.tried||0, miss=sv.missing||0;
         if(tried>0&&miss>=tried) stat=` · <span class="warn" title="${escA(t('prov.stat.nothere.title','{n} articles not found here: this content is not on this backbone',{n:num(miss,0)}))}">${t('prov.stat.nothere','not here')}</span>`;
@@ -6057,8 +6697,17 @@ async function refreshIdxStatus(){
         (s.releases?` <span>${t('idx.leftover','({n} releases from an earlier scan remain searchable.)',{n:s.releases})}</span>`:'');
     } else {
       const kf=n=>n>=1000?Math.round(n/1000)+'k':''+n;
-      el.innerHTML=t('idx.status','{n} releases indexed ({c} complete) · scanning {groups} every {min} min; grows in the background.',
-          {n:s.releases, c:s.complete, groups:esc(s.groups.join(', ')), min:Math.max(1,Math.round(s.interval_secs/60))})+' '+
+      // stats_cold: the daemon could not read the database yet (restart
+      // window, every read path busy). "0 releases indexed" there is the
+      // dashboard lying about a populated index - say it is still
+      // reading instead, and ask again shortly.
+      el.innerHTML=(s.stats_cold
+          ?t('idx.cold','Still reading the index; figures appear in a moment.')
+          // The scanned-group list is read-once detail: the count stays
+          // on screen, the names ride in the tooltip.
+          :`<span title="${escA(s.groups.join(', '))}">`
+            +t('idx.status2','{n} releases indexed ({c} complete) · scanning {g} newsgroups every {min} min; grows in the background.',
+            {n:s.releases, c:s.complete, g:s.groups.length, min:Math.max(1,Math.round(s.interval_secs/60))})+'</span>')+' '+
         (s.paused==='paused'
           ?`<b>${t('idx.paused','paused')}</b> <button class="ghost mini" onclick="setIdxPaused(this,0)">${t('idx.resume','Resume indexing')}</button>`
         :s.paused==='downloading'
@@ -6073,9 +6722,11 @@ async function refreshIdxStatus(){
             :`<button class="ghost mini" onclick="scanNow(this)">${t('set.idx.scannow.btn','Scan now')}</button>`
           } <button class="ghost mini" onclick="setIdxPaused(this,1)">${t('idx.pause','Pause indexing')}</button>`);
     }
-    // Poll fast while a scan runs so the header count visibly moves.
+    // Poll fast while a scan runs so the header count visibly moves -
+    // and while the stats are cold, so "still reading" resolves into
+    // real figures as soon as the daemon can answer.
     clearTimeout(idxQuick); idxQuick=null;
-    if(s.scanning) idxQuick=setTimeout(refreshIdxStatus, 2000);
+    if(s.scanning||s.stats_cold) idxQuick=setTimeout(refreshIdxStatus, 2000);
   }catch(e){}
 }
 // The master switch. Unlike every other setting on the page this one
@@ -6108,6 +6759,10 @@ async function idxLeftoverLine(){
   const el=document.getElementById('idxLeftover'); if(!el) return;
   try{
     const s=await api('index_stats');
+    // Cold stats (restart window, database busy): the release count is
+    // a placeholder zero, and "{size}, 0 releases" would be a lie about
+    // a kept database. Leave the line for the retry to fill in.
+    if(s.stats_cold&&s.file_bytes){ setTimeout(idxLeftoverLine, 2000); return; }
     el.innerHTML=s.file_bytes
       ? t('set.idx.leftover','An index from earlier scanning is still on disk: <b>{size}</b>, {n} releases. It is not being read or added to.',
           {size:sizeStr(s.file_bytes), n:num(s.releases||0,0)})
@@ -6147,6 +6802,15 @@ function actLine(s){
     case 'connecting':return t('queue.act.connecting','connecting to {s}',{s:d});
     case 'reconnecting':return t('queue.act.reconnecting','reconnecting to {s}',{s:d});
     case 'waiting':return t('queue.act.waiting','no data for {n}s',{n:s.activity_secs||0});
+    // A flatline WITH a named cause. The plain 'waiting' above says how
+    // long; these say who and why, which is the difference between a row
+    // the user can act on and a row that just sits there (soak, 12 Aug:
+    // 25 minutes at zero bytes behind a capped account, and the only
+    // place that named the provider was a report the wedged job never
+    // reached).
+    case 'server_unreachable':return t('queue.act.srvdown','{s} has not answered for {n}s - waiting for it to come back',{s:d,n:s.activity_secs||0});
+    case 'server_capacity':return t('queue.act.srvcap','{s} is at its connection limit ({n}s) - waiting for a slot',{s:d,n:s.activity_secs||0});
+    case 'server_refused':return t('queue.act.srvrefused','{s} rejected the sign-in ({n}s) - check its username and password',{s:d,n:s.activity_secs||0});
     case 'fetching':return d?t('queue.act.fetching','downloading from {s}',{s:d}):t('queue.act.downloading','downloading');
     case 'verifying':return t('queue.act.verifying','verifying');
     case 'repairing':return t('queue.act.repairing','repairing');
@@ -6226,7 +6890,14 @@ function whyslowBlock(s){
       w.secs>5?` <span style="opacity:.7">(${t('diag.held','for {n}s',{n:w.secs})})</span>`:''}</span></div>
     ${barHtml}${srvHtml}${tlHtml}
     <div class="dim" style="font-size:11px;margin-top:4px;opacity:.8">${
-      t('diag.receipts','waiting on decode or disk {b}% of the time · CPU {c}%',{b:(+w.blocked_pct||0).toFixed(0),c:(+w.cpu_pct||0).toFixed(0)})}</div>
+      t('diag.receipts','waiting on decode or disk {b}% of the time · CPU {c}%',{b:(+w.blocked_pct||0).toFixed(0),c:(+w.cpu_pct||0).toFixed(0)})}${
+      // §108 option 2: the disk named without a pause in force. This
+      // verdict is a claim about the reader's hardware, so it carries
+      // the write test that produced it - and says plainly that nothing
+      // has stopped, which is the difference between this and the pause.
+      +w.storage_probe_ms>0?` · ${esc(t('diag.receipts.disk',
+        'a test write to the download folder took {s} s; the queue is still running',
+        {s:num(w.storage_probe_ms/1000,1)}))}`:''}</div>
   </div>`;
 }
 // Queue table renderer (runs each tick AND on drawer toggles). The
@@ -6273,6 +6944,11 @@ function renderQueue(){
         ? t('queue.hold.disk','Queue held: {free} GB free is below your {min} GB minimum. Downloads start again as soon as space is freed.',{free:(+hold.a).toFixed(1),min:(+hold.b).toFixed(1)})
         : hold.kind==='postproc'
         ? t('queue.hold.postproc','Queue held: {n} download(s) are still finishing (verify, repair, unpack). The next download starts as soon as one completes.',{n:(+hold.a).toFixed(0)})
+        // §154. Its own branch, not the fallthrough: the last arm is the
+        // quota sentence, so a new kind that skipped this would tell the
+        // user their quota was spent when they simply have no server.
+        : hold.kind==='noservers'
+        ? t('queue.hold.noservers','Queue held: no Usenet server is turned on. Downloads start as soon as you add one, or switch an existing one back on.')
         : t('queue.hold.quota','Quota spent: {used} of {cap} GB this period. Only Force items download until it rolls over.',{used:(+hold.a).toFixed(1),cap:(+hold.b).toFixed(1)}));
       // The control that answers the sentence, beside the sentence. The
       // setting that decided this is two cards deep in Settings, and a
@@ -6289,6 +6965,13 @@ function renderQueue(){
           gb.textContent=t('queue.hold.disk.btn','Change the minimum');
           gb.title=t('queue.hold.disk.btn.title','Open the Minimum free space setting.');
           gb.onclick=()=>landOnRow('s_min_free');
+        }else if(hold.kind==='noservers'){
+          // The whole card, not a row: there is no server row to land
+          // on yet, and this is the same target the first-run checklist
+          // sends "Add a server" to.
+          gb.textContent=t('queue.hold.noservers.btn','Add a server');
+          gb.title=t('queue.hold.noservers.btn.title','Open the Servers settings.');
+          gb.onclick=()=>goSetting('servers');
         }else{
           gb.textContent=t('queue.hold.quota.btn','Change the quota');
           gb.title=t('queue.hold.quota.btn.title','Open the Download quota setting.');
@@ -6378,7 +7061,7 @@ function renderQueue(){
       // header pill says the queue is paused; only this line says which
       // download it stopped, and the tooltip carries the numbers behind
       // the claim.
-      (sp&&sp.nzo_id===s.nzo_id?` <span class="warn" title="${escA(sp.evidence||'')}">· paused: output storage is not keeping up</span>`:'')+
+      (sp&&sp.nzo_id===s.nzo_id?` <span class="warn" title="${escA(storageEvidence(sp))}">· ${t('queue.storage.row','paused: output storage is not keeping up')}</span>`:'')+
       // Spotted in the NZB's file list at add time: this post is packed
       // in a format we have no unpacker for, so it will arrive complete
       // and still packed. Better said now than after the download.
@@ -6420,9 +7103,9 @@ function renderQueue(){
       <td><div class="bar"><i style="width:${s.percentage}%"></i></div>${actSub(s)}</td>
       <td class="nowrap" style="text-align:end">${ctl}</td></tr>`+
       (open?`<tr class="drawer"><td colspan="7">${drawerHtml(s)}</td></tr>`:'');
-  }).join('')||`<tr><td colspan="7" class="dim"><button type="button" class="idlepick">${
-      t('queue.empty.drop','Nothing downloading. Drop a .nzb anywhere, or click here to choose one.')}</button><br><span class="dim">${
-      t('queue.empty.nzblnk','An nzblnk link works too: paste it anywhere on this page.')}</span></td></tr>`);
+  }).join('')||`<tr><td colspan="7" class="dim"><button type="button" class="idlepick" title="${
+      escA(t('queue.empty.nzblnk','An nzblnk link works too: paste it anywhere on this page.'))}">${
+      t('queue.empty.drop','Nothing downloading. Drop a .nzb anywhere, or click here to choose one.')}</button></td></tr>`);
   updateSelBar('q');
   restoreKbdFocus();
 }
@@ -6844,7 +7527,8 @@ function drawerHtml(s){
     // that never said.
     const oline=dol?`<div class="dim" style="font-size:12px;margin-top:7px">${t('drawer.origin','added by')} ${originIconHtml(s.origin)}${esc(dol)}</div>`:'';
     return files+vline+sline+oline+whyslowBlock(s)+mediaWarnBlock(s.media)+pwBlock(s)
-      +`<div style="font-size:12px;margin-top:7px">${nzbBlock(s)}</div>`+probeHtml(s.nzo_id);
+      +`<div style="font-size:12px;margin-top:7px">${nzbBlock(s)}</div>`
+      +(previewMode==='off'?'':probeHtml(s.nzo_id));
   }
   // Finishing: neither of the two branches around this one fits. The
   // live-download block above reads the ACTIVE job's per-file and
@@ -7065,13 +7749,36 @@ function wlKind(sel){
     r.querySelector(`[data-k=${f}]`).style.visibility=on?'visible':'hidden';
   v('year',k!=='tv'); v('seasons',k!=='movie'); v('episodes',k!=='movie');
 }
-let wlStatusById={}, wlSlotCounts=null;
+// §151: the rows a list source owns. Drawn read-only, and carrying a
+// `data-src` the save path filters OUT - the editor rebuilds the whole
+// `watchlist` setting from what it finds, so a synced row that got
+// caught in that selector would be written into the user's own array and
+// the two writers would start destroying each other's rows.
+function syncedRowHtml(s){
+  const w=s.item||{}, kind=w.kind||'tv', tv=kind==='tv', mv=kind==='movie';
+  const q=(v,d)=>`<select class="sel" disabled><option>${esc(v||d)}</option></select>`;
+  const box=(on,label,tip)=>`<label class="dim" title="${escA(tip)}"><input type="checkbox" disabled${on?' checked':''}>${label}</label>`;
+  return `<div class="wlrow synced" data-id="${w.id||''}" data-src="${escA(String(s.src||''))}">
+    <input class="txt" value="${escA(w.title||'')}" disabled>
+    <select class="sel" disabled><option>${esc(kind==='tv'?t('watch.kind.tv','TV show'):kind==='movie'?t('watch.kind.movie','movie'):kind)}</option></select>
+    <input class="txt" value="${w.year||''}" disabled style="${tv?'visibility:hidden':''}">
+    <input class="txt" value="${escA(w.seasons||'')}" disabled style="${mv?'visibility:hidden':''}">
+    <input class="txt" value="${escA(w.episodes||'')}" disabled style="${mv?'visibility:hidden':''}">
+    ${q(w.min_quality==='any'?t('watch.qual.any','any'):w.min_quality,t('watch.qual.any','any'))}
+    ${q(w.target_quality,'1080p')}
+    ${box(w.upgrade!==false,t('watch.upgrade','upgrade'),t('watch.upgrade.title','keep grabbing better versions until the target quality is reached'))}
+    ${box(!!w.delete_old,t('watch.replace','replace old'),t('watch.replace.title','after an upgrade finishes downloading, delete the older version'))}
+    <input class="txt" value="${escA(w.category||'')}" disabled>
+    <span class="dim" title="${escA(t('watch.src.title','added by a list source. Change it on the list itself, or in the source’s settings above.'))}" aria-hidden="true">⇄</span>
+    <div class="wlst dim" data-st></div></div>`;
+}
+let wlStatusById={}, wlSlotCounts=null, wlSynced=[], wlOwn=[];
 function renderWatchlist(list){
-  setHtml('wlrows', list.map(watchRowHtml).join('')||
+  setHtml('wlrows', list.map(watchRowHtml).join('')+wlSynced.map(syncedRowHtml).join('')||
     // "a scanned group" was the built-in indexer's framing, printed
     // whether or not anything was scanning. Worded for both legs now:
     // the card cannot know which one will find it first.
-    `<div class="dim">${t('watch.none','nothing watched yet: add a show or film below (even one that hasn’t aired); it’s grabbed automatically the moment a matching post turns up.')}</div>`);
+    `<div class="dim" title="${escA(t('watch.none.tip','even one that hasn’t aired yet works; it’s grabbed automatically the moment a matching post turns up.'))}">${t('watch.none2','nothing watched yet: add a show or film below.')}</div>`);
   paintWatchStatus();
 }
 // What to call one grabbed slot in the status line: an episode reads as
@@ -7134,12 +7841,177 @@ function paintWatchStatus(){
     const st=wlStatusById[r.dataset.id], d=r.querySelector('[data-st]');
     if(!d) continue;
     const slots=(st&&st.slots)||[], got=slots.filter(s=>s.stem), dead=failedParts(slots);
+    // §151: say which list put this row here, so a title nobody typed
+    // is never a mystery.
+    const src=r.dataset.src&&(lsrcList.find(x=>String(x.id)===r.dataset.src)||{}).name;
+    const head=r.dataset.src?t('watch.st.from','from {name}',{name:src||t('watch.src.unknown','a list')})+' · ':'';
     const tail=(dead.length?' · '+dead.join(' · '):'')+instantLine(st)+skipLine(st);
-    if(!got.length){ d.textContent=t('watch.st.none','nothing grabbed yet: watching for a matching post')+tail; continue; }
+    if(!got.length){ d.textContent=head+t('watch.st.none','nothing grabbed yet: watching for a matching post')+tail; continue; }
     const parts=got.slice(0,4).map(s=>
       `${slotLabel(s.slot)}${s.quality||'?'}${s.upgrading?' ⬆ '+t('watch.st.upgrading','upgrading'):''}`);
-    d.textContent=`${t('watch.st.have','have:')} ${parts.join(' · ')}${got.length>4?` · ${t('watch.st.more','+{n} more',{n:got.length-4})}`:''}${tail}`;
+    d.textContent=`${head}${t('watch.st.have','have:')} ${parts.join(' · ')}${got.length>4?` · ${t('watch.st.more','+{n} more',{n:got.length-4})}`:''}${tail}`;
   }
+}
+// §151 (issue #36): list sources. A source is an address, a refresh
+// interval and the defaults it stamps on what it adds - not a second
+// watchlist and not a second grab path. Everything it creates is an
+// ordinary watched item, decided by the same pass as the rows above.
+//
+// Both credentials (a Plex watchlist address and a linked account's
+// token) are masked exactly like an indexer apikey: get_config never
+// echoes either, only has_url / has_token, and a blank field on save
+// keeps the stored one. That is also why "Forget" exists as its own
+// button - with blank-means-keep there is no other way to erase one.
+let lsrcList=[];
+// The per-mode default for "stop watching when it leaves the list".
+// MIRRORS `ListSource::remove_missing_default` in
+// crates/nzbfast/src/listsrc.rs, which is where the decision lives: OFF
+// for an address, because a Plex watchlist feed carries only the most
+// recent 50 titles and falling off the end of it looks exactly like
+// being removed; ON for a linked account, which returns the whole list.
+const LSRC_RM_DEFAULT=m=>m==='account';
+function lsrcRowHtml(s){
+  const mode=s.mode||'rss', acct=mode==='account';
+  const mins=Math.max(15,Math.round((+s.interval_secs||21600)/60));
+  const rm=s.remove_missing===undefined?LSRC_RM_DEFAULT(mode):!!s.remove_missing;
+  const scope=s.series_scope||'new';
+  const opt=(v,cur,l)=>`<option value="${escA(v)}"${v===cur?' selected':''}>${esc(l)}</option>`;
+  return `<div class="lsrcrow" data-id="${s.id||''}">
+    <input class="txt" data-k="name" value="${escA(s.name||'')}" placeholder="${escA(t('lsrc.name.ph','name'))}" title="${escA(t('lsrc.name.title','what you call this list; renaming it keeps everything it added'))}">
+    <select class="sel" data-k="mode" onchange="lsrcMode(this)" title="${escA(t('lsrc.mode.title','how this list is reached'))}">
+      ${opt('rss',mode,t('lsrc.mode.rss','Watchlist address'))}${opt('account',mode,t('lsrc.mode.acct','Plex account'))}</select>
+    <span data-k="addr" style="display:flex;gap:7px;align-items:center;min-width:0">
+      <input class="txt" data-k="url" type="password" autocomplete="new-password" value="" style="flex:1;min-width:0;${acct?'display:none':''}"
+        placeholder="${escA(s.has_url?t('lsrc.url.saved','address saved - leave blank to keep it'):t('lsrc.url.ph','your Plex watchlist address'))}"
+        title="${escA(t('lsrc.url.title','Plex gives you this address under Settings, Manage, Watchlist. Treat it like a password: anyone who has it can read your watchlist.'))}">
+      <button class="ghost" data-k="link" onclick="plexLink(this)" style="${acct?'':'display:none'}"
+        title="${escA(t('lsrc.link.title','Plex shows you a code, you approve it on Plex’s own page, and no password ever reaches us.'))}">${s.has_token?t('lsrc.relink','Link again'):t('lsrc.link','Link Plex account')}</button>
+      <button class="ghost" data-k="forget" onclick="plexForget(this)" style="${(acct?s.has_token:s.has_url)?'':'display:none'}"
+        title="${escA(t('lsrc.forget.title','Erase what is stored for this source. It stops syncing; nothing already downloaded is touched.'))}">${t('lsrc.forget','Forget')}</button></span>
+    <label class="dim" title="${escA(t('lsrc.every.title','how often to re-read the list. A watchlist does not change by the minute, and the cost of asking harder is borne by somebody else - use Sync now when you are impatient.'))}">${t('lsrc.every','every')}
+      <input class="txt sm" data-k="interval" type="number" min="15" value="${mins}" style="width:70px;max-width:70px"> ${t('lsrc.mins','min')}</label>
+    <label class="dim" title="${escA(t('lsrc.on.title','synced only while this is on'))}"><input type="checkbox" data-k="enabled"${s.enabled===false?'':' checked'}>${t('lsrc.on','on')}</label>
+    <button class="ghost" onclick="this.closest('.lsrcrow').remove()" title="${escA(t('lsrc.remove.title','Remove this source. It stops watching what it added; nothing already downloaded is touched.'))}" aria-label="${escA(t('lsrc.remove.title','Remove this source. It stops watching what it added; nothing already downloaded is touched.'))}">×</button>
+    <div class="lsdef"><span class="dim">${t('lsrc.def','it adds:')}</span>
+      ${wlQualSel('min',s.min_quality,'any',t('watch.min.title','minimum quality worth grabbing'))}
+      ${wlQualSel('target',s.target_quality,'1080p',t('watch.target.title','stop upgrading once a grab reaches this'))}
+      <input class="txt" data-k="category" value="${escA(s.category||'')}" placeholder="${escA(t('watch.cat.ph','category'))}" title="${escA(t('watch.cat.title','category folder for grabs'))}" style="width:112px">
+      <label class="dim" title="${escA(t('watch.upgrade.title','keep grabbing better versions until the target quality is reached'))}"><input type="checkbox" data-k="upgrade"${s.upgrade===false?'':' checked'}>${t('watch.upgrade','upgrade')}</label>
+      <select class="sel" data-k="scope" title="${escA(t('lsrc.scope.title','a list entry for a series says nothing about which episodes you meant, so this does'))}">
+        ${opt('new',scope,t('lsrc.scope.new','new episodes from now on'))}${opt('all',scope,t('lsrc.scope.all','everything on the list that is posted'))}</select>
+      <label class="dim" title="${escA(t('lsrc.rm.title','when a title leaves the list, stop watching it. It never deletes a download - it only stops grabbing more.'))}"><input type="checkbox" data-k="rm"${rm?' checked':''}>${t('lsrc.rm','stop watching when it leaves the list')}</label></div>
+    <div class="lshealth">${lsrcHealthHtml(s)}</div></div>`;
+}
+// What this source's last sync did. Four states, kept apart on purpose:
+// unfinished (no address yet - not broken, just not done), never synced,
+// parked with a visible error, and working. A broken source must never
+// go quiet: the whole point of the split is that a failed fetch changes
+// nothing, so the row is the only place the trouble can show.
+function lsrcHealthHtml(s){
+  const acct=(s.mode||'rss')==='account';
+  if(!s.id) return `<span class="dim">${t('lsrc.st.new','apply the sources to save this one, then link or paste the address.')}</span>`;
+  if(acct?!s.has_token:!s.has_url)
+    return `<span class="dim">${acct?t('lsrc.st.unlinked','not linked yet - nothing is being read.')
+                                   :t('lsrc.st.noaddr','no address yet - nothing is being read.')}</span>`;
+  if(s.last_error) return `<span class="bad">${t('lsrc.st.failed','last sync failed: {e}',{e:esc(s.last_error)})}</span> `
+    +`<span class="dim">${s.last_ok?t('lsrc.st.lastok','it last worked {when}, and nothing has been unwatched.',{when:esc(shortWhen(s.last_ok))})
+                                   :t('lsrc.st.neverok','it has not worked yet.')}</span>`;
+  if(!s.last_sync) return `<span class="dim">${t('lsrc.st.pending','not synced yet.')}</span>`;
+  return `<span class="dim">${t('lsrc.st.ok','synced {when}',{when:esc(shortWhen(s.last_sync))})} · `
+    +`${tn('lsrc.st.seen',s.items_seen||0,'{n} title on the list','{n} titles on the list')} · `
+    +`${tn('lsrc.st.watching',s.watching||0,'{n} title watched from here','{n} titles watched from here')}</span>`;
+}
+function renderListSrc(list){
+  lsrcList=list||[];
+  setHtml('lsrcrows', lsrcList.map(lsrcRowHtml).join('')||
+    `<div class="dim" title="${escA(t('lsrc.none.tip','everything on a connected list is watched here too.'))}">${t('lsrc.none2','no list sources: add your Plex watchlist.')}</div>`);
+}
+// An address row and an account row are the same source in two shapes,
+// so the mode select swaps which control is showing - and resets the
+// delete-sync checkbox to the new mode's default, because that default
+// is the whole reason the two modes differ (see LSRC_RM_DEFAULT).
+function lsrcMode(sel){
+  const acct=sel.value==='account', r=sel.closest('.lsrcrow'),
+        show=(k,on)=>{const el=r.querySelector(`[data-k=${k}]`); if(el) el.style.display=on?'':'none';};
+  const saved=lsrcList.find(s=>String(s.id)===r.dataset.id)||{};
+  show('url',!acct); show('link',acct);
+  // Forget is offered for either shape: with blank-means-keep on the
+  // address as well as the token, deleting the row is otherwise the
+  // only way to erase one.
+  show('forget',acct?!!saved.has_token:!!saved.has_url);
+  r.querySelector('[data-k=rm]').checked=LSRC_RM_DEFAULT(sel.value);
+}
+function addListSrc(mode){
+  const el=document.getElementById('lsrcrows');
+  if(el.firstElementChild&&!el.firstElementChild.classList.contains('lsrcrow')) el.innerHTML='';
+  el.insertAdjacentHTML('beforeend', lsrcRowHtml({mode, name:'Plex'}));
+  el.lastElementChild.querySelector('[data-k=name]').focus();
+}
+function lsrcRowData(r,i){
+  const g=k=>{const el=r.querySelector(`[data-k=${k}]`); return !el?'':el.type==='checkbox'?el.checked:el.value.trim();};
+  if(!r.dataset.id) r.dataset.id=Date.now()+i;
+  return { id:+r.dataset.id, name:g('name'), kind:'plex', mode:g('mode'),
+    // Blank means keep, on both credentials. The token is never in the
+    // page at all, so it is always blank from here - it is written by
+    // the link flow and erased by Forget, and by nothing else.
+    url:g('url'), token:'',
+    enabled:g('enabled'),
+    interval_secs:Math.max(15,+g('interval')||360)*60,
+    min_quality:g('min'), target_quality:g('target'), category:g('category'),
+    upgrade:g('upgrade'), series_scope:g('scope'), remove_missing:g('rm') };
+}
+async function saveListSrc(btn){ await busy(btn,t('busy.applying','Applying…'), async()=>{
+  const rows=[...document.querySelectorAll('#lsrcrows .lsrcrow')].map(lsrcRowData);
+  // setCfg toasts its own outcome, including a refusal.
+  if(await setCfg('list_sources', rows.length?JSON.stringify(rows):'')) setTimeout(loadListSrc, 1200);
+}); }
+async function loadListSrc(){
+  try{
+    const c=(await api('get_config')).config.nzbfast;
+    if(!document.querySelector('#lsrcrows :focus')) renderListSrc(c.list_sources||[]);
+  }catch(e){}
+}
+async function listSyncNow(btn){ await busy(btn,t('busy.checking','Checking…'), async()=>{
+  await api('list_sync_now');
+  toast(t('toast.lsrcSync','Reading your lists now.'));
+  setTimeout(loadListSrc, 3000);
+}); }
+// The plex.tv PIN flow. Plex shows the user a code, the user approves it
+// on Plex's own page, and we poll until a token appears. No password
+// ever reaches us, and the token never reaches this page either - the
+// daemon writes it onto the source and answers with a boolean.
+async function plexLink(btn){
+  const r=btn.closest('.lsrcrow'), out=r.querySelector('.lshealth'), id=+r.dataset.id;
+  if(!id){ toast(t('lsrc.saveFirst','Apply the sources first, then link the account.'), true); return; }
+  btn.disabled=true;
+  try{
+    const j=await api('plex_link_start',`&value=${id}`);
+    if(!j.status){ toast(tErr(j.error)||j.error||'', true); return; }
+    setHtml(out, `<b style="font-size:15px;letter-spacing:2px">${esc(j.code)}</b> `
+      +`<span class="dim">${t('lsrc.linkhow','enter this code on the Plex page that just opened, then come back - this waits for you.')}</span>`);
+    window.open(j.url,'_blank','noopener');
+    // Plex's strong pins last a quarter of an hour; stop well inside it.
+    for(let i=0;i<100;i++){
+      await new Promise(go=>setTimeout(go,3000));
+      const p=await api('plex_link_poll',`&value=${encodeURIComponent(j.id)}`);
+      if(!p.status){ setHtml(out, `<span class="bad">${esc(tErr(p.error)||p.error||'')}</span>`); return; }
+      if(p.linked){
+        toast(t('toast.plexLinked','Plex account linked. Reading your watchlist now.'));
+        await loadListSrc();
+        return;
+      }
+    }
+    setHtml(out, `<span class="dim">${t('lsrc.linkgaveup','that code was not used in time - try Link Plex account again.')}</span>`);
+  }finally{ btn.disabled=false; }
+}
+async function plexForget(btn){
+  const r=btn.closest('.lsrcrow'), id=+r.dataset.id;
+  if(!id) return;
+  if(!confirm(t('lsrc.forget.ask','Forget what is stored for this source? It stops syncing. Nothing already downloaded is touched.'))) return;
+  const j=await api('plex_forget',`&value=${id}`);
+  if(!j.status){ toast(tErr(j.error)||j.error||'', true); return; }
+  toast(t('toast.plexForgot','Forgotten. This source is no longer reading anything.'));
+  loadListSrc();
 }
 // §96.3 bundle D: the targets the give-up breaker has stopped chasing.
 // It unmonitors things inside the user's Sonarr and declines the target
@@ -7195,6 +8067,16 @@ async function refreshWatchStatus(){
   try{
     const j=await api('watchlist_status');
     wlStatusById=Object.fromEntries((j.items||[]).map(i=>[String(i.id),i]));
+    // §151: the rows the list sources own arrive here, not in the
+    // `watchlist` setting - that one is the editor's own array. Redraw
+    // only when the set actually changed, so a poll every fifteen
+    // seconds does not fight whatever the user is typing.
+    const syn=(j.items||[]).filter(i=>i.src&&i.item);
+    const key=a=>a.map(i=>i.id).join(',');
+    if(key(syn)!==key(wlSynced)){
+      wlSynced=syn;
+      if(!document.querySelector('#wlrows :focus')) renderWatchlist(wlOwn);
+    }else wlSynced=syn;
     // A watched title gaining a slot = the watchlist grabbed something.
     // First poll primes, so a page load stays quiet.
     const counts=Object.fromEntries((j.items||[]).map(i=>[String(i.id),(i.slots||[]).length]));
@@ -7245,7 +8127,9 @@ async function loadWatchlist(){
   try{
     const c=(await api('get_config')).config.nzbfast;
     wlCats=c.custom_categories||[];
-    if(!document.querySelector('#wlrows :focus')) renderWatchlist(c.watchlist||[]);
+    wlOwn=c.watchlist||[];
+    renderListSrc(c.list_sources||[]);
+    if(!document.querySelector('#wlrows :focus')) renderWatchlist(wlOwn);
     const s=await api('index_stats');
     // Three states, not two: matching locally, matching only through
     // your indexer accounts (the built-in indexer is off, which is now
@@ -7266,18 +8150,23 @@ async function loadWatchlist(){
     const fast=IDX_ON&&c.watchlist_instant!==false
       ?' · '+t('watch.instant.on','checked the moment a match is posted')
       :'';
+    // One short line on screen; the read-once detail (which groups,
+    // where to edit them, what min/upgrade-to mean) rides in the title.
+    const mm=t('watch.minmax.tip','min = quality floor, upgrade-to = ceiling.');
     setHtml('wlStatus', IDX_ON&&(s.groups||[]).length
-      ?t('watch.status','matches everything indexed from <b>{groups}</b> (the watched newsgroups; edit them in ⚙ settings → Indexing) · min = floor · upgrade-to = ceiling',{groups:esc(s.groups.join(', '))})+fast
+      ?`<span title="${escA(s.groups.join(', ')+' - '+t('watch.status.tip','the watched newsgroups; edit them in ⚙ settings → Indexing.')+' '+mm)}">`
+        +t('watch.status2','matches everything indexed from {n} watched newsgroups',{n:s.groups.length})+fast+'</span>'
       :!IDX_ON&&IDX_COUNT
       ?(c.watchlist_external
-        ?t('watch.extonly','asks your indexer accounts about wanted items a couple of times a day · min = floor · upgrade-to = ceiling')
+        ?`<span title="${escA(t('watch.extonly.tip','about twice a day, and only for things not found here; your daily limits still apply.')+' '+mm)}">`
+          +t('watch.extonly2','asks your indexer accounts about wanted items')+'</span>'
         // The switch that fixes this is the checkbox at the bottom of
         // this very card, so point at it rather than send anyone away.
         :t('watch.extoff','the built-in indexer is off, so there is no local index to match against. Tick “Also search my indexer accounts” below and this watchlist works off your indexer accounts instead.'))
       :!IDX_ON&&SPOT_ON
       // Spot promotions land as arrivals, so the watchlist has real
       // matter to match even with the header indexer off.
-      ?t('watch.spotsonly','matches new Spotnet spots as they are announced · min = floor · upgrade-to = ceiling')
+      ?`<span title="${escA(mm)}">`+t('watch.spotsonly2','matches new Spotnet spots as they are announced')+'</span>'
       :`⚠ ${t('watch.idxoff','indexing is off, so the watchlist has nothing to match against.')} <button class="ghost mini" onclick="goSetting('indexing')">${t('idx.choose','Choose what to index')}</button> ${t('watch.idxoff2','or pick newsgroups in ⚙ settings → Indexing.')}`);
   }catch(e){}
 }
@@ -7288,7 +8177,12 @@ function addWatchRow(kind){
   el.lastElementChild.querySelector('[data-k=title]').focus();
 }
 async function saveWatchlist(btn){ await busy(btn,t('busy.applying','Applying…'), async()=>{
-  const rows=[...document.querySelectorAll('#wlrows .wlrow')].map((r,i)=>{
+  // §151: `:not([data-src])` is load-bearing. The synced rows are drawn
+  // in this same list so their status is visible, and this save rewrites
+  // the WHOLE `watchlist` setting - so including them would copy a
+  // source's rows into the user's own array, where the next sync could
+  // no longer find or update them.
+  const rows=[...document.querySelectorAll('#wlrows .wlrow:not([data-src])')].map((r,i)=>{
     const g=k=>{const el=r.querySelector(`[data-k=${k}]`);return el.type==='checkbox'?el.checked:el.value.trim();};
     if(!r.dataset.id) r.dataset.id=Date.now()+i;
     const kind=g('kind'), mv=kind==='movie';
@@ -7375,6 +8269,7 @@ async function watchFrom(kind,title,year,btn){ await busy(btn,'…', async()=>{
   if(kind==='movie'&&+year) w.year=+year;
   list.push(w);
   await setCfg('watchlist', JSON.stringify(list));
+  wlOwn=list;
   if(!document.querySelector('#wlrows :focus')) renderWatchlist(list);
   refreshWatchStatus();
   toast('☆ '+(kind==='tv'?t('toast.wlAddedTv','Watching {title}. New episodes grab automatically.',{title})
@@ -8447,7 +9342,7 @@ function closeMenu(restore){
   if(o && (restore===true || inside) && document.contains(o)) o.focus();
 }
 addEventListener('click', ()=>closeMenu());
-addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeMenu(true); fsClose(); gbClose(); cuClose(); keyCancel(); shClose(); } });
+addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeMenu(true); fsClose(); gbClose(); cuClose(); keyCancel(); shClose(); pvClose(); } });
 // Arrow-walk the open menu. Wraps at both ends, the way a menu should.
 function menuKey(e){
   const m=document.getElementById('ctxmenu'); if(!m) return;
@@ -9192,6 +10087,10 @@ let pwPromptMode='done', pwLiveAsked=new Set();
 // TODO 101: off | low_disk | always, off the queue poll. Only
 // low_disk asks per download, so only low_disk draws the button.
 let eatVolMode='off';
+// §73 phase 2: off | metadata-only | full, off the queue poll for the
+// same reason as the two above. "off" hides the panel (the endpoint
+// refuses too); "full" is the only mode that puts a player in the page.
+let previewMode='metadata-only';
 function maybeNotify(title, body){
   if(!notifyOn || typeof Notification==='undefined' || Notification.permission!=='granted') return;
   try{ new Notification(title, {body}); }catch(e){}
@@ -10144,12 +11043,22 @@ function sizeStr(b){
 // instead of a query string - see setCfg.
 async function apiPost(mode, body, authKey){
   const sent = authKey != null ? authKey : key;
+  const epoch = keyEpoch;
   const r=await fetch(`/api?mode=${mode}`,
     {method:'POST', body:JSON.stringify(body), headers: sent?{'X-Api-Key': sent}:{}});
   const j=await readJson(r);
   // Never prompt for a one-shot credential: surface the error instead,
   // exactly as `api` does.
-  if(authFail(j) && authKey == null && await ensureKey(sent)) return apiPost(mode,body);
+  if(authFail(j) && authKey == null){
+    // Same stale-refusal rules as api(): a rotation in flight, a key
+    // that moved on, or a sibling tab that already re-paired all mean
+    // "retry", not "ask".
+    if (keyRotating) await keyRotating;
+    if (keyEpoch !== epoch && key !== sent) return apiPost(mode, body);
+    const stored = localStorage.nzbfastKey || '';
+    if (stored && stored !== sent && stored !== key){ adoptKey(stored); return apiPost(mode, body); }
+    if (await ensureKey(sent)) return apiPost(mode, body);
+  }
   return j;
 }
 // Config names whose VALUE is a credential. These always travel in a
@@ -10164,7 +11073,12 @@ async function apiPost(mode, body, authKey){
 // special-character bug: those requests worked perfectly and disclosed
 // the secret anyway.
 const SECRET_CFG = new Set(['apikey','nzbkey','omdb_key','notify_targets',
-  'arr_instances','indexers','feeds','unraid_key','scoreboard_key']);
+  'arr_instances','indexers','feeds','unraid_key','scoreboard_key',
+  // §151: a Plex watchlist address is a bearer capability, not an
+  // address - anyone holding it can read the list. One source is well
+  // under the length rule, so without this the commonest case would be
+  // the one that put it in an access log.
+  'list_sources']);
 // Auto-rename settings group: grey out the "include …" sub-toggles when
 // the master switch is off, and keep the live example in sync.
 function renameToggles(){
@@ -10256,6 +11170,23 @@ async function checkUpdateNow(btn){ await busy(btn,t('busy.checking','Checking�
   toast(j.available?t('toast.updAvail','v{v} is available. See the banner up top.',{v:j.available})
                    :t('toast.upToDate','Up to date (v{v}).',{v:j.current}));
 }); }
+// A key this page just minted, held on screen until the user puts it
+// away. get_config masks every credential and loadSettings therefore
+// treats both key boxes as write-only and blanks them - and loadSettings
+// can run at any moment (another call that was parked on the key modal,
+// a save elsewhere in Settings, a locale switch). On a LAN http origin
+// navigator.clipboard does not exist, so the box IS the delivery: blank
+// it at the wrong moment and the only copy of the key the user has ever
+// seen is gone, from a daemon that now demands it. Latched here so a
+// concurrent reload cannot take it away; cleared by Hide, by typing a
+// key by hand, or by minting another.
+const mintedKey={s_apikey:'', s_nzbkey:''};
+function mintedShow(id, v){
+  mintedKey[id]=v;
+  const el=document.getElementById(id);
+  if(el) el.value=v;
+}
+function mintedClear(id){ mintedKey[id]=''; }
 // The key exists from the first run, but until now nothing could show
 // it: get_config masks every credential, so anyone setting up Sonarr a
 // week later had to dig it out of the data folder or the URL bar. Both
@@ -10264,8 +11195,11 @@ async function checkUpdateNow(btn){ await busy(btn,t('busy.checking','Checking�
 async function showApiKey(btn){
   const el=document.getElementById('s_apikey');
   // Second press hides it again: this is a credential on a screen that
-  // may be shared, and leaving it up until a reload is worse.
+  // may be shared, and leaving it up until a reload is worse. This is
+  // also the dismissal for a freshly minted key - the button already
+  // reads "Hide" after a mint, so putting it away is the same gesture.
   if(btn.dataset.shown){
+    mintedClear('s_apikey');
     el.value=''; el.type='text';
     el.placeholder=t('ph.rotate','set: type a new key to rotate');
     delete btn.dataset.shown; setHtml(btn, t('set.sec.apikey.show','Show'));
@@ -10284,20 +11218,30 @@ async function showApiKey(btn){
 async function newApiKey(){
   if(!confirm(t('set.sec.apikey.confirm','Create a new API key?\n\nThe old one stops working immediately, so anything already connected (Sonarr, Radarr, NZB360) has to be given the new key.')))
     return;
-  const j=await api('apikey_new', undefined, undefined, true);
+  // The rotation gate covers the window this request is open for: the
+  // daemon swaps its key the moment it answers, so every poll already in
+  // flight is refused, and without the gate one of them opens the key
+  // modal over the very screen that is about to show the new key.
+  keyRotateStart();
+  let j;
+  try{
+    j=await api('apikey_new', undefined, undefined, true);
+    // Adopt INSIDE the gate: waiters resume the instant it lifts and
+    // must find the new key already in place, or they retry with the old
+    // one and land right back here.
+    if(j && j.status!==false && j.apikey) adoptKey(j.apikey);
+  } finally { keyRotateEnd(); }
   if(!j || j.status===false || !j.apikey){ toast(tErr(j&&j.error)||t('set.sec.apikey.err','Could not read the key.'), true); return; }
-  // This page authenticates with the key too, so adopt it right away or
-  // every request after this one fails.
-  key=j.apikey; localStorage.nzbfastKey=j.apikey;
-  // An old-key poll can 403 and open the shared key modal in the
-  // window between "regenerate" and this response; every later call
-  // then awaits that modal (see api()). The page now HOLDS a valid
-  // key, so resolve the modal instead of leaving the user staring at
-  // a prompt for a key they cannot know - the reported "keeps asking
-  // for a key and nothing stops it" loop.
+  // Belt for a modal or strip that was already up before the rotation
+  // (a page that had been locked out, fixed from another surface): this
+  // page now holds a key the daemon has just accepted, so there is
+  // nothing left to ask anyone - the reported "keeps asking for a key
+  // and nothing stops it" loop.
   if(keyPrompt) keyFinish(true);
+  if(keyDeclined){ keyDeclined=false; sessionStorage.removeItem('nzbfastKeyDeclined'); }
+  keyNotice(false);
   const el=document.getElementById('s_apikey');
-  el.value=j.apikey;
+  mintedShow('s_apikey', j.apikey);
   // The write failed, so this key is memory-only: say that instead of
   // "paste it into Sonarr", which is exactly the advice that hurts here.
   const lost = j.saved === false;
@@ -10310,15 +11254,24 @@ async function newApiKey(){
   const ok = lost ? t('toast.savedNotDurable','“{n}” is live now, but it could not be written to disk - it reverts when nzbfast restarts.',{n:t('set.sec.apikey','API key')})
                   : t('set.sec.apikey.new.ok','New API key created. Paste it into Sonarr, Radarr or anything else that connects to nzbfast.') + repair;
   try{ await navigator.clipboard.writeText(j.apikey); toast(lost?ok:t('set.sec.apikey.newcopied','New API key created and copied. Paste it into Sonarr, Radarr or anything else that connects to nzbfast.') + repair, lost); }
-  catch(e){ toast(ok, lost); }
+  catch(e){
+    // No clipboard: a plain-http LAN origin (exactly the address the
+    // Remote access QR codes hand out) does not have the API at all, and
+    // the toast used to claim nothing about it. Select the box so the
+    // manual copy is one keystroke, and say that is what happened.
+    el.select && el.select();
+    toast(ok + ' ' + t('open.copyfail','Could not reach the clipboard - the key is selected, copy it by hand.'), true);
+  }
   const b=document.getElementById('s_apikey_show');
   if(b){ b.dataset.shown='1'; setHtml(b, t('set.sec.apikey.hide','Hide')); }
   // loadSettings blanks the key box (it treats the field as write-only),
   // which on a LAN http origin - where the clipboard API does not exist -
   // wiped the ONLY copy of the fresh key before the user could read it.
-  // Reload, then put the minted value back while the Show state is on.
+  // The latch above is what makes that safe against a CONCURRENT
+  // loadSettings too (one parked on the key modal resumes whenever it
+  // pleases); this one is simply ours, awaited so the box is settled
+  // before the function returns.
   await loadSettings();
-  el.value=j.apikey;
 }
 
 // Same two buttons for the add-only NZB key (a Reddit ask: NZB Donkey
@@ -10328,6 +11281,7 @@ async function newApiKey(){
 async function showNzbKey(btn){
   const el=document.getElementById('s_nzbkey');
   if(btn.dataset.shown){
+    mintedClear('s_nzbkey');
     el.value='';
     el.placeholder=t('ph.rotate','set: type a new key to rotate');
     delete btn.dataset.shown; setHtml(btn, t('set.sec.apikey.show','Show'));
@@ -10353,19 +11307,23 @@ async function newNzbKey(){
   // open key prompt awaiting a value the page already holds.
   if(keyPrompt) keyFinish(true);
   const el=document.getElementById('s_nzbkey');
-  el.value=j.nzbkey;
+  mintedShow('s_nzbkey', j.nzbkey);
   const lost = j.saved === false;
   if(lost) durNotice('nzbkey', t('set.sec.nzbkey','NZB key')); else durNoticeSaved('nzbkey');
   const ok = lost ? t('toast.savedNotDurable','“{n}” is live now, but it could not be written to disk - it reverts when nzbfast restarts.',{n:t('set.sec.nzbkey','NZB key')})
                   : t('set.sec.nzbkey.new.ok','New NZB key created. Paste it into anything that submits NZBs with the add-only key.');
   try{ await navigator.clipboard.writeText(j.nzbkey); toast(lost?ok:t('set.sec.nzbkey.newcopied','New NZB key created and copied. Paste it into anything that submits NZBs with the add-only key.'), lost); }
-  catch(e){ toast(ok, lost); }
+  catch(e){
+    // Same no-clipboard LAN origin as newApiKey.
+    el.select && el.select();
+    toast(ok + ' ' + t('open.copyfail','Could not reach the clipboard - the key is selected, copy it by hand.'), true);
+  }
   const b=document.getElementById('s_nzbkey_show');
   if(b){ b.dataset.shown='1'; setHtml(b, t('set.sec.apikey.hide','Hide')); }
-  // Same as newApiKey: keep the minted value on screen after the
-  // reload - the clipboard write is not guaranteed to have worked.
+  // Same as newApiKey: the latch keeps the minted value on screen across
+  // this reload and any concurrent one - the clipboard write is not
+  // guaranteed to have worked.
   await loadSettings();
-  el.value=j.nzbkey;
 }
 
 // Settings backup: one JSON file with everything a lost /config takes
@@ -10409,8 +11367,22 @@ async function backupRestore(input){
 async function saveKey(name, el){
   const v=el.value.trim();
   if(!v) return; // blank = keep (never clear auth by accident)
-  if(await setCfg(name, v)){
-    if(name==='apikey'){ key=v; localStorage.nzbfastKey=v; }
+  // Typing your own key rotates the daemon exactly as Create new does,
+  // so it takes the same gate: the polls already in flight are about to
+  // be refused for a key this page is in the middle of setting, and they
+  // must wait for it rather than ask for one.
+  const rotating = name==='apikey';
+  let ok=false;
+  if(rotating) keyRotateStart();
+  try{
+    ok=await setCfg(name, v);
+    if(ok && rotating) adoptKey(v);
+  } finally { if(rotating) keyRotateEnd(); }
+  if(ok){
+    // Typed by hand, so it is not a minted value the page is holding on
+    // screen for them - drop any latch so loadSettings can go back to
+    // treating the box as write-only.
+    mintedClear(name==='apikey'?'s_apikey':'s_nzbkey');
     if(name==='nzbkey'){ nzbkeyMem=v; }   // remember to authorize an apikey bootstrap this session
     loadSettings();
   }
@@ -10516,6 +11488,7 @@ async function loadSettings(){
   put('s_cleanup_exts', (c.cleanup_exts||[]).join(', '));
   put('s_password_prompt', c.password_prompt||'done');
   put('s_unpack_eat_volumes', c.unpack_eat_volumes||'off');
+  put('s_preview', c.preview||'metadata-only');
   put('s_password_file', c.password_file||'');
   document.getElementById('s_pwfile_count').textContent=
     t('set.watchdir.pwfile.count','stored: {n}',{n:c.password_file_count??0});
@@ -10543,6 +11516,7 @@ async function loadSettings(){
   put('s_cleanup_delete_mode', c.cleanup_delete_mode||'follow');
   put('s_failure_link', c.failure_link||'off');
   put('s_auto_retry_mins', c.auto_retry_mins??20);
+  put('s_server_outage_mins', c.server_outage_mins??15);
   {
     // The four preferred-version pickers are one setting; the daemon
     // stores and validates them together.
@@ -10633,6 +11607,12 @@ async function loadSettings(){
   if(sbk&&document.activeElement!==sbk){ sbk.value=''; sbk.placeholder=c.has_scoreboard_key?t('ph.keyset','set: paste a new key to replace'):t('ph.unset','not set'); }
   const sbc=document.getElementById('s_scoreboard_calibrate');
   if(sbc&&document.activeElement!==sbc) sbc.checked=c.scoreboard_calibrate===true;
+  // Empty = every category, same convention as the eviction kinds list.
+  const sbcats=(Array.isArray(c.scoreboard_cats)?c.scoreboard_cats
+    :String(c.scoreboard_cats??'').split(',')).map(s=>String(s).trim()).filter(Boolean);
+  SB_CAT_BOXES
+    .forEach(([k,id])=>{ const el=document.getElementById(id);
+      if(el&&document.activeElement!==el) el.checked=!sbcats.length||sbcats.includes(k); });
   const ok=document.getElementById('s_omdb_key');
   if(document.activeElement!==ok){ ok.value=''; ok.placeholder=c.has_omdb?t('ph.keyset','set: paste a new key to replace'):t('ph.omdbunset','not set: paste your key here'); }
   put('s_index_db', c.index_db);
@@ -10674,8 +11654,13 @@ async function loadSettings(){
   if(ub && document.activeElement!==ub) ub.value=c.unit_bits?'bits':'bytes';
   if(!!c.unit_bits!==UNIT_BITS) applyUnitMode(!!c.unit_bits);
   const ak=document.getElementById('s_apikey'), nk=document.getElementById('s_nzbkey');
-  if(document.activeElement!==ak){ ak.value=''; ak.placeholder=c.has_apikey?t('ph.rotate','set: type a new key to rotate'):t('ph.apiunset','not set: type a key to require auth'); }
-  if(document.activeElement!==nk){ nk.value=''; nk.placeholder=c.has_nzbkey?t('ph.rotate','set: type a new key to rotate'):t('ph.unset','not set'); }
+  // Write-only fields - EXCEPT while a just-minted key is latched into
+  // one of them (mintedShow). This function is not only called by the
+  // panel: a concurrent one, or one that was parked on the key modal
+  // through the rotation, used to resume and wipe the single copy of a
+  // fresh key off the screen.
+  if(document.activeElement!==ak){ ak.value=mintedKey.s_apikey; ak.placeholder=c.has_apikey?t('ph.rotate','set: type a new key to rotate'):t('ph.apiunset','not set: type a key to require auth'); }
+  if(document.activeElement!==nk){ nk.value=mintedKey.s_nzbkey; nk.placeholder=c.has_nzbkey?t('ph.rotate','set: type a new key to rotate'):t('ph.unset','not set'); }
   // The terminal shouts about an open API; until now the page whispered
   // (an empty input) while the Remote access card above it handed out
   // LAN URLs and QR codes. Same fact, same volume, in both places.
@@ -11603,6 +12588,16 @@ function editServer(i){
   document.getElementById('sv_pin').checked=!!s.pin_connections;
   put('sv_group',s.group||''); put('sv_ret',s.retention_days||0);
   put('sv_block',Math.round((s.block_bytes||0)/1e9));
+  // The refill affordance only makes sense on a SAVED server with a
+  // block configured and bytes already counted against it - a fresh
+  // form has no counter to restart.
+  const refRow=document.getElementById('sv_blockrefrow');
+  if(i>=0&&s.block_bytes>0&&(s.block_used||0)>0){
+    refRow.style.display='';
+    document.getElementById('sv_blockused').textContent=
+      t('set.srv.blockused','block {used} of {total} GB used',
+        {used:num((s.block_used||0)/1e9,1),total:(s.block_bytes/1e9).toFixed(0)});
+  } else refRow.style.display='none';
   document.getElementById('sv_paid').checked=!!s.block_account;
   paidSuggest();
   document.getElementById('sv_warm').checked=!!s.warm_pool;
@@ -11653,6 +12648,19 @@ function showIdleEffective(e){
 }
 // Advanced: reveal the stored cleartext password so it can be copied to
 // another instance. The server list masks it; this is the explicit ask.
+// §96.5: the user bought a new block - restart the used counter at
+// zero. Keyed by host (the counter belongs to the account); the
+// lifetime usage history is kept, only the block's baseline moves.
+async function blockRefilled(btn){ await busy(btn,t('busy.saving','Saving…'), async()=>{
+  const s=srvEditIdx>=0?srvList[srvEditIdx]:null;
+  if(!s||!s.host) return;
+  if(!confirm(t('set.srv.blockref.confirm','Restart the used counter for {host} at zero? Do this after buying a new block - the usage history is kept.',{host:s.host}))) return;
+  const j=await api('server_block_refilled',`&value=${encodeURIComponent(s.host)}`);
+  if(!j.status){ toast(tErr(j.error)||t('err.failed','failed'), true); return; }
+  toast(t('toast.blockref','Block counter restarted at zero.'));
+  document.getElementById('sv_blockrefrow').style.display='none';
+  loadSettings();
+}); }
 async function revealServerPass(){
   if(srvEditIdx<0) return;
   const j=await api('server_secret',`&value=${srvEditIdx}`);
@@ -11875,9 +12883,48 @@ async function startPredbSeed(){
 // ---- Parity scoreboard ----
 // The scoreboard rows only mean anything while the switch is on -
 // greyed rather than hidden, like the relay settings above them.
+// The scoreboard's whole cost, per category, in the daemon's own order.
+// One request a day each - so the number of ticked boxes IS the
+// requests-per-day figure the card quotes.
+const SB_CAT_BOXES=[['movies','s_sb_c_movies'],['tv','s_sb_c_tv'],
+                    ['audio','s_sb_c_audio'],['books','s_sb_c_books']];
+// Untick to spend less. This control can only ever REDUCE the day's
+// requests: the four boxes are the whole menu the daemon knows, and it
+// refuses any name outside it, so there is no way to tick your way to a
+// fifth request.
+//
+// Same empty-means-all trap as the eviction kinds list: an all-unticked
+// save would store "" and read back as "measure everything". Refuse it
+// (put the box back) and send "" only when all four are ticked, which
+// is the same thing said the safe way.
+function saveScoreboardCats(src){
+  const on=SB_CAT_BOXES.filter(([,id])=>(document.getElementById(id)||{}).checked);
+  if(!on.length){
+    if(src) src.checked=true;
+    toast(t('toast.sbcatone','Keep at least one category ticked, or turn the scoreboard off.'), true);
+    sbCatCost();
+    return;
+  }
+  sbCatCost();
+  setCfg('scoreboard_cats', on.length===SB_CAT_BOXES.length?'':on.map(([c])=>c).join(','));
+}
+// The price tag, updated from the boxes themselves rather than from the
+// daemon, so it answers the moment a box is clicked instead of after
+// the round trip.
+function sbCatCost(){
+  const el=document.getElementById('sbCatCost'); if(!el) return;
+  const n=SB_CAT_BOXES.filter(([,id])=>(document.getElementById(id)||{}).checked).length;
+  const parts=[tn('sb.perday',n,'{n} request a day','{n} requests a day')];
+  // The spot-check spends metered NZB downloads on top of the searches,
+  // so a cost line that left it out would be understating the day.
+  if((document.getElementById('s_scoreboard_calibrate')||{}).checked)
+    parts.push(t('sb.perday.cal','plus up to {n} downloads for the spot-check',{n:5}));
+  setHtml(el, parts.join(', '));
+}
 function sbToggles(){
   const on=(document.getElementById('s_scoreboard_enabled')||{}).checked;
   document.querySelectorAll('.sb-sub input,.sb-sub select').forEach(el=>{ el.disabled=!on; });
+  sbCatCost();
   // With an account picked from the list, the manual address and key
   // boxes are not in use - greyed so nobody edits a field that does
   // nothing, exactly like the whole block when the switch is off.
@@ -11914,14 +12961,27 @@ async function refreshScoreboard(){
     if(!cats.length){ showTbl(false); return; }
     const NAMES={movies:t('sb.cat.movies','Films'),tv:t('sb.cat.tv','TV shows'),
                  audio:t('sb.cat.audio','Music'),books:t('sb.cat.books','Books')};
-    setHtml(document.querySelector('#sbTbl tbody'), cats.map(c=>{
+    // Every category the daemon knows gets a row, ticked or not, and an
+    // unticked one says NOT MEASURED across the whole row. It must never
+    // fall through to the 0% / 0% / - a missing stats row would print:
+    // "we did not look" and "we have none of it" are opposite claims,
+    // and confusing them is the one thing that would make this table
+    // worth less than nothing.
+    const all=(Array.isArray(s.all_cats)&&s.all_cats.length)?s.all_cats:Object.keys(NAMES);
+    const measured=Array.isArray(s.cats)?s.cats:all;
+    const byCat={}; cats.forEach(c=>{ byCat[c.category]=c; });
+    setHtml(document.querySelector('#sbTbl tbody'), all.map(k=>{
+      const name=`<td>${esc(NAMES[k]||k)}</td>`;
+      const c=measured.includes(k)?byCat[k]:null;
+      if(!c) return `<tr>${name}<td colspan="3" class="dim">`+
+        `${esc(t('sb.notmeasured','not measured'))}</td></tr>`;
       // A category where nothing was found has no lag to report - a
       // "0s" there would read as "instant", which is the opposite of
       // the truth.
       const present=(c.have_named||0)+(c.have_unnamed||0);
       const lag=(!present||c.lag_median_secs==null)?'-'
         :(c.lag_median_secs<=0?'0s':fmtEta(c.lag_median_secs));
-      return `<tr><td>${esc(NAMES[c.category]||c.category)}</td>`+
+      return `<tr>${name}`+
         `<td>${num(c.named_pct||0,0)}%</td>`+
         `<td>~${num(c.coverage_pct||0,0)}%</td>`+
         `<td>${esc(lag)}</td></tr>`;
@@ -11987,10 +13047,19 @@ async function refreshDbState(){
   const el=document.getElementById('dbState'); if(!el) return;
   try{
     const s=await api('index_stats');
-    const used=+s.db_bytes;
-    const live=+s.live_bytes;
+    // Cold stats (restart window, database busy): the size figures are
+    // placeholder zeros, so claiming "Database file: 0 B" would be the
+    // lie this card exists to avoid. Say it is still reading and retry.
+    const cold=!!s.stats_cold;
+    // Debounced: several sites call this on card open, and each cold
+    // answer must extend one retry chain, not start its own.
+    clearTimeout(refreshDbState.coldT);
+    if(cold) refreshDbState.coldT=setTimeout(refreshDbState, 2000);
+    const used=cold?NaN:+s.db_bytes;
+    const live=cold?NaN:+s.live_bytes;
     const cap=dbCapText(dbCapOf(s));
     const parts=[];
+    if(cold) parts.push(t('idx.cold','Still reading the index; figures appear in a moment.'));
     // Only claim a size when the daemon actually reported one - a missing
     // field must not render as "0 MB".
     if(Number.isFinite(used)) parts.push(t('set.db.stat.size','Database file: {size}',{size:fmtBytes(used)}));
@@ -12238,25 +13307,33 @@ function renderWelcomeLook(){
 function welcomeLookOne(id,on){ hideCard(id,!on); renderWelcomeLook(); }
 function welcomeLookAll(on){ welcomeLookIds().forEach(id=>hideCard(id,!on)); renderWelcomeLook(); }
 
-// The Classic preset: a plain, light, compact dashboard - queue, history
-// and the headline only - for people who want a downloader that looks
-// like a downloader. One function composing three EXISTING knobs (theme,
-// density, hidden cards), so there is no preset state stored anywhere:
-// pressing it is exactly ticking those settings by hand, and every part
-// can be changed back individually afterwards. Full is the shipped
-// default spelled out: auto theme, regular spacing, everything shown.
+// The look presets. Classic: a plain, light, compact dashboard - queue,
+// history and the headline only - for people who want a downloader that
+// looks like a downloader. Dense: everything Full shows at a fraction of
+// the space - compact spacing, cards packed several to a row, sparkline
+// graphs - for big screens and glance-at-everything monitoring. Full is
+// the shipped default spelled out: auto theme, regular spacing,
+// everything shown. Each composes the same knobs (theme, density,
+// hidden cards, plus the one dense layout flag), so pressing a button
+// is exactly ticking those settings by hand, and every part can be
+// changed back individually afterwards. Dense parks Setup and Benchmark
+// via the ordinary hideCard - they are reference cards, not monitoring,
+// and the Hidden bar brings either back with one click.
 function applyPreset(which){
-  const classic = which==='classic';
+  const classic = which==='classic', dense = which==='dense';
   setTheme(classic?'light':'auto');
-  setUiCompact(classic);
+  setUiCompact(classic||dense);
+  setDense(dense);
   // Both settings controls exist whether or not Settings is open; keep
   // them honest so flipping views never shows a stale checkbox.
-  const cb=document.getElementById('uiCompact'); if(cb) cb.checked=classic;
+  const cb=document.getElementById('uiCompact'); if(cb) cb.checked=classic||dense;
   const st=document.getElementById('s_theme'); if(st) st.value=classic?'light':'auto';
-  LOOK_CARDS.filter(id=>document.getElementById(id)).forEach(id=>hideCard(id,classic));
+  LOOK_CARDS.filter(id=>document.getElementById(id))
+    .forEach(id=>hideCard(id, classic || (dense && (id==='setupCard'||id==='benchCard'))));
   renderWelcomeLook();
   toast(classic?t('preset.classic.done','Classic look applied: light, compact, queue and history only.')
-               :t('preset.full.done','Full dashboard restored: graphs and extra cards are back.'));
+       :dense?t('preset.dense.done','Dense look applied: small cards, short graphs, the whole picture on one screen.')
+             :t('preset.full.done','Full dashboard restored: graphs and extra cards are back.'));
 }
 
 // ======================================================== §129 4c ========
@@ -12755,6 +13832,12 @@ function resetLayout(){ delete localStorage.layoutPrefs; toast(t('toast.layoutRe
 // height (chartDetail), so a chart dragged bigger genuinely shows more.
 function uiCompact(){ return localStorage.uiCompact==='1'; }
 function setUiCompact(on){ localStorage.uiCompact=on?'1':'0'; applyDensity(); }
+// The Dense preset's one flag (see body.dense in the stylesheet). Kept
+// separate from uiCompact on purpose: compact is a spacing choice that
+// works on any layout, dense is a layout choice that requires compact -
+// the preset sets both, and Classic/Full clear this one.
+function uiDense(){ return localStorage.uiDense==='1'; }
+function setDense(on){ localStorage.uiDense=on?'1':'0'; applyDensity(); }
 function toggleCardDensity(id){
   // History's ▤ toggles how MUCH is listed, not how tightly it is
   // padded. Padding was all it ever did there, which on a card whose
@@ -12795,8 +13878,31 @@ function dismissLayoutTip(){
 // as seen when the user finds a control on their own, and they cost
 // nothing now that nothing renders.
 function renderLayoutTip(){}
+// Dense masonry spans (see body.dense #dashview in the stylesheet):
+// each dashboard child reserves as many 8px grid rows as its measured
+// height (plus its 10px bottom margin) occupies. The observer keeps a
+// span honest when content changes height - queue rows arriving, a
+// card collapsing - and setting the span never changes the element's
+// own height (align-items:start), so it cannot re-trigger itself.
+let denseRO=null;
+function denseSpan(c){
+  if(!document.body.classList.contains('dense')||!c.offsetHeight){ c.style.gridRowEnd=''; return; }
+  c.style.gridRowEnd='span '+Math.max(1,Math.ceil((c.offsetHeight+10)/8));
+}
+function applyDenseMasonry(){
+  const kids=[...document.getElementById('dashview').children];
+  if(!document.body.classList.contains('dense')){
+    kids.forEach(c=>{ c.style.gridRowEnd=''; });
+    if(denseRO){ denseRO.disconnect(); denseRO=null; }
+    return;
+  }
+  if(!denseRO) denseRO=new ResizeObserver(es=>es.forEach(e=>denseSpan(e.target)));
+  kids.forEach(c=>{ denseSpan(c); denseRO.observe(c); });
+}
 function applyDensity(){
   document.body.classList.toggle('compact', uiCompact());
+  document.body.classList.toggle('dense', uiDense());
+  applyDenseMasonry();
   const p=layoutPrefs();
   movableCards().forEach(c=>{
     const on=p.density[c.id]==='compact';
@@ -13516,9 +14622,20 @@ if(LOCALE!=='en'){
     I18N=d||{};
     applyI18n();
     // §6 layout tooltips + Hidden bar were built before the catalogue
-    // arrived - rebuild the translated bits.
-    document.querySelectorAll('.draghandle').forEach(g=>g.title=t('layout.drag.title','drag to move this card'));
-    document.querySelectorAll('.cardhide').forEach(x=>x.title=t('layout.hide.title','hide this card: bring it back from the Hidden bar at the bottom, or Settings → Interface → Reset layout'));
+    // arrived - rebuild the translated bits. Both attributes, not just
+    // the tooltip: every one of these controls set aria-label from its
+    // English title at creation, and a re-stamp that only touches .title
+    // leaves a screen reader announcing English on a translated page.
+    const restamp=(sel,txt)=>document.querySelectorAll(sel).forEach(el=>{ el.title=txt; el.setAttribute('aria-label',txt); });
+    restamp('.draghandle', t('layout.drag.title','move this card: drag it, or press the up and down arrow keys'));
+    restamp('.carddense', t('layout.dense.title','compact this card: same figures, less space'));
+    restamp('.cardhide', t('layout.hide.title','hide this card: bring it back from the Hidden bar at the bottom, or Settings → Interface → Reset layout'));
+    restamp('.chgrip', t('chart.resize','Drag to make this chart taller or shorter'));
+    restamp('.cardgrip[data-wired]', t('card.grip','Drag to make this list shorter or taller'));
+    // The queue card's ? carries a compound tooltip (row hint + manual
+    // line), so it has no data-i18n-title for applyI18n to follow -
+    // rebuild it the same way injectHelp composed it.
+    restamp('#queueCard h3 a.hlp', t('queue.hint','click a row for detail · drag to reorder; Force/High still download first')+'\n'+t('hlp.title','Open the manual for this section'));
     colRelabel();   // table headings were named before the catalogue landed
     renderHiddenBar();
     renderSndEvents(); fillVoices(); checkWelcome(); idxNavPill();

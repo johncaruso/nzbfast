@@ -530,6 +530,54 @@ fn set_index_evict_kinds_validates_and_dedups() {
     assert_eq!(*d.index_evict_kinds.lock_ok(), vec!["movie", "tv"]);
 }
 
+/// The requests-per-day dial can only ever spend LESS. Every path in
+/// and out of the setting is checked for that here: an unknown name is
+/// refused rather than dropped, the resolved list is a subset of the
+/// built-in menu, the empty default is the full four (the ceiling), and
+/// an all-unticked list is refused rather than stored as the empty
+/// default - which would silently mean "measure everything".
+#[test]
+fn scoreboard_cats_can_only_reduce_the_daily_requests() {
+    let (_t, d) = daemon_in("sbcats");
+    let labels = |d: &Arc<Daemon>| -> Vec<&'static str> {
+        d.scoreboard_categories()
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect()
+    };
+    // Nothing stored = every category, which is the most this ever asks
+    // for: four requests a day.
+    assert_eq!(labels(&d), vec!["movies", "tv", "audio", "books"]);
+
+    // A name outside the menu cannot buy a fifth request - and it fails
+    // loudly rather than being quietly ignored.
+    let e = set_scoreboard_cats(&d, "scoreboard_cats", "movies,anime").unwrap_err();
+    assert!(e.contains("unknown category"), "{e}");
+    assert_eq!(labels(&d), vec!["movies", "tv", "audio", "books"]);
+
+    // A subset, case-folded and de-duplicated, and reported back in the
+    // built-in order rather than the order it was typed.
+    assert_eq!(
+        set_scoreboard_cats(&d, "scoreboard_cats", "TV, movies, tv").unwrap(),
+        (true, json!(["tv", "movies"]))
+    );
+    assert_eq!(labels(&d), vec!["movies", "tv"]);
+
+    // The floor: one category, one request a day.
+    set_scoreboard_cats(&d, "scoreboard_cats", "books").unwrap();
+    assert_eq!(labels(&d), vec!["books"]);
+
+    // All boxes cleared is refused. Stored, it would parse to the empty
+    // list, which means ALL FOUR - the opposite of what was asked.
+    let e = set_scoreboard_cats(&d, "scoreboard_cats", " , ").unwrap_err();
+    assert!(e.contains("at least one category"), "{e}");
+    assert_eq!(labels(&d), vec!["books"]);
+
+    // Emptying it deliberately returns to the full sample.
+    set_scoreboard_cats(&d, "scoreboard_cats", "").unwrap();
+    assert_eq!(labels(&d), vec!["movies", "tv", "audio", "books"]);
+}
+
 /// Arming the size cap wakes the scan loop, because that loop is what
 /// enforces it (`evict_pass_and_republish`, once per pass) and its sleep
 /// is the full `index_interval_secs` on any install with something to
@@ -766,4 +814,32 @@ fn apply_setting_tells_unknown_from_read_only() {
         (true, json!(42))
     );
     assert_eq!(d.history_rows.load(Ordering::Relaxed), 42);
+}
+
+// ---- §73 phase 2: the preview setting -----------------------------------
+
+/// Three values and nothing else, and a stored value nobody recognises
+/// reads as the DEFAULT rather than as "off". The endpoint is gated on
+/// this, so the failure mode of guessing wrong is a feature the user
+/// never turned off going quiet.
+#[test]
+fn preview_takes_three_modes_and_falls_back_to_the_default() {
+    let (_t, d) = daemon_in("previewset");
+    assert_eq!(preview_mode(&d), PREVIEW_DEFAULT);
+    for m in PREVIEW_MODES {
+        assert_eq!(apply_setting(&d, "preview", m).unwrap(), (true, json!(m)));
+        assert_eq!(preview_mode(&d), m);
+    }
+    // Case and padding are the user's, not the contract's.
+    assert_eq!(
+        apply_setting(&d, "preview", " Metadata-Only ").unwrap(),
+        (true, json!("metadata-only"))
+    );
+    let e = apply_setting(&d, "preview", "sometimes").unwrap_err();
+    assert!(e.contains("off, metadata-only or full"), "{e}");
+    // The live value is untouched by the refusal.
+    assert_eq!(preview_mode(&d), "metadata-only");
+    // A settings.json somebody edited by hand.
+    *d.preview.lock_ok() = "yes please".to_string();
+    assert_eq!(preview_mode(&d), PREVIEW_DEFAULT);
 }

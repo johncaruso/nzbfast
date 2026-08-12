@@ -422,8 +422,31 @@ fn obf_xor(bytes: &[u8]) -> Vec<u8> {
 
 /// Obfuscate a secret for writing to disk. Empty stays empty (an empty
 /// password is a meaningful "no password", not a secret worth hiding).
+///
+/// Idempotent on an already-encoded value, so a caller that may be
+/// holding either form is safe. That guess is what [`obfuscate_input`]
+/// exists to avoid: use this only for a value that may ALREADY be stored
+/// in our format.
 pub fn obfuscate(secret: &str) -> String {
-    if secret.is_empty() || secret.starts_with(OBF_PREFIX) {
+    if secret.starts_with(OBF_PREFIX) {
+        return secret.to_string();
+    }
+    obfuscate_input(secret)
+}
+
+/// Obfuscate a secret that is RAW USER INPUT - a typed password, a value
+/// out of an imported config - and so is never already encoded.
+///
+/// The distinction matters because the prefix is a guess and a password
+/// is free to start with it: `obf1:0000` is a legal provider password,
+/// and [`obfuscate`] wrote it to disk verbatim, after which
+/// `deobfuscate` decoded the "hex" and handed the connect path four
+/// different bytes. AUTHINFO PASS then failed forever, with the config
+/// looking correct (Codex sweep 12 Aug F16). Encoding unconditionally
+/// round-trips it: the stored form is `obf1:<hex of the whole literal>`,
+/// which `deobfuscate` reverses exactly.
+pub fn obfuscate_input(secret: &str) -> String {
+    if secret.is_empty() {
         return secret.to_string();
     }
     let mut out = String::with_capacity(OBF_PREFIX.len() + secret.len() * 2);
@@ -1149,6 +1172,38 @@ mod obf_tests {
             once,
             "must not double-obfuscate on re-save"
         );
+        assert_eq!(deobfuscate(&once), "secret");
+    }
+
+    /// A provider password is free to start with our own prefix.
+    /// `obfuscate` guesses from that prefix that the value is already
+    /// encoded and stores it verbatim; `deobfuscate` then decodes the
+    /// "hex" and hands the connect path different bytes, so AUTHINFO PASS
+    /// fails forever against a config that looks right. The raw-input
+    /// encoder makes no such guess (Codex sweep 12 Aug F16).
+    #[test]
+    fn a_literal_obf_prefixed_password_round_trips() {
+        for pw in [
+            "obf1:0000",     // valid even-length hex - the ambiguous one
+            "obf1:abcdef01", // ditto, longer
+            "obf1:zz",       // invalid hex
+            "obf1:abc",      // odd length
+            "obf1:",         // prefix alone
+            "obf1",          // near miss
+        ] {
+            let stored = obfuscate_input(pw);
+            assert_eq!(deobfuscate(&stored), pw, "round trip failed for {pw:?}");
+            assert!(
+                !stored[OBF_PREFIX.len()..].contains("obf1"),
+                "the literal survived into the stored form: {stored}"
+            );
+        }
+        // Empty is still "no password", not a secret worth hiding.
+        assert_eq!(obfuscate_input(""), "");
+        // And the idempotent wrapper is still idempotent, which is what
+        // the settings re-save paths rely on.
+        let once = obfuscate_input("secret");
+        assert_eq!(obfuscate(&once), once);
         assert_eq!(deobfuscate(&once), "secret");
     }
 

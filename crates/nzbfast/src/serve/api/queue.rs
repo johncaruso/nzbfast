@@ -216,7 +216,7 @@ fn m_watch_calendar(
             format!("{y:04}-{m:02}-{dd:02}")
         };
         let (today, lo, hi) = (civil_str(days), civil_str(days - 7), civil_str(days + 21));
-        let items = d.watchlist.lock_ok().clone();
+        let items = d.watch_items();
         let st = d.watch_state.lock_ok().clone();
         let mut entries: Vec<(String, String, Value)> = Vec::new();
         for item in items.iter().filter(|i| i.enabled && i.kind == "tv") {
@@ -277,7 +277,17 @@ fn m_watchlist_status(
     _api_body: &mut Option<Vec<u8>>,
 ) -> Option<Value> {
     Some({
-        let items = d.watchlist.lock_ok().clone();
+        // §151: the union, so a synced row has a status line too. Each
+        // item is tagged with the source that owns it (absent for the
+        // user's own), which is how the editor tells them apart.
+        let items = d.watch_items();
+        let owner: std::collections::HashMap<u64, u64> = d
+            .lists
+            .items
+            .lock_ok()
+            .iter()
+            .map(|i| (i.item.id, i.src))
+            .collect();
         let st = d.watch_state.lock_ok().clone();
         let out: Vec<Value> = items
             .iter()
@@ -312,6 +322,19 @@ fn m_watchlist_status(
                 slots.sort_by(|a, b| b.0.cmp(&a.0)); // newest episode first
                 json!({
                     "id": it.id,
+                    // §151: which list source owns this row, when one
+                    // does. The editor draws those read-only, and
+                    // `saveWatchlist` must skip them - otherwise the
+                    // save writes them into the user's own array and
+                    // the two lists start destroying each other.
+                    "src": owner.get(&it.id),
+                    // ...and the whole item for a synced row, which is
+                    // the only place the editor can read one from: the
+                    // `watchlist` setting is the user's own array and
+                    // deliberately does not contain these.
+                    "item": owner
+                        .get(&it.id)
+                        .and_then(|_| serde_json::to_value(it).ok()),
                     "slots": slots.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
                     // §74: the last grab this item got because the
                     // release ARRIVED, not because a pass came round.
@@ -872,6 +895,19 @@ fn m_stats(
                             // with nothing anywhere saying so.
                             "refused": s.refusal.lock_ok().as_ref().map(|r| {
                                 json!({"permanent": r.permanent, "line": r.line})
+                            }),
+                            // Granting NO sessions right now, and since
+                            // when. `connected: 0` says the same about a
+                            // worker mid-redial; this says it about a
+                            // provider that is out, with a duration and
+                            // a cause, while the job is still running.
+                            // `refused` above covers only the sign-in
+                            // flavour - an unreachable host produced
+                            // nothing at all before this.
+                            "down": s.down_secs().and_then(|secs| {
+                                s.down_reason.lock_ok().as_ref().map(|r| json!({
+                                    "secs": secs, "kind": r.kind, "detail": r.detail,
+                                }))
                             }),
                             // Lifetime completion% (reliability
                             // ledger) for the Providers card.
@@ -1612,6 +1648,29 @@ fn m_queue(
                             }
                         }
                         let to = pos.min(q.len());
+                        // §96 (AltMount audit, item 6): a move to the FRONT
+                        // means "run this next" - nzb360 sends value2=0
+                        // expecting exactly that. Position alone only breaks
+                        // ties within a priority, so a Normal job dragged
+                        // above a High one would still run second. Adopt the
+                        // highest priority present among the other runnable
+                        // jobs, capped at High: Force is never minted by a
+                        // reorder, because Force also runs through a queue
+                        // pause - a side effect no drag asked for.
+                        if to == 0 {
+                            let top = q
+                                .iter()
+                                .map(|o| o.lock_ok())
+                                .filter(|g| g.state == JobState::Queued && !g.tombstone)
+                                .map(|g| g.priority)
+                                .max()
+                                .unwrap_or(0)
+                                .min(1);
+                            let mut g = job.lock_ok();
+                            if top > g.priority {
+                                g.priority = top;
+                            }
+                        }
                         q.insert(to, job);
                         drop(q);
                         d.save_queue();
@@ -1996,6 +2055,36 @@ pub(in crate::serve) fn dispatch(
         // M23: items with what's been grabbed for each - the
         // dashboard's per-row status line.
         "watchlist_status" => return m_watchlist_status(d, req, params, ctx, api_body),
+        // §151: sync every external list source now, rather than at its
+        // own interval. Writes ENTRIES only - the watchlist pass still
+        // decides what is grabbed, so this cannot start a download on
+        // its own any more than editing the list can.
+        "list_sync_now" => {
+            d.lists.now.notify_one();
+            json!({"status": true})
+        }
+        // §151: link a Plex account, without a password ever reaching
+        // us. We ask plex.tv for a code, the user approves it on Plex's
+        // own page, and we poll until a token appears. The token is
+        // written onto the source and NEVER returned to the browser.
+        "plex_link_start" | "plex_link_poll" | "plex_forget" => {
+            let v = params.get("value").map(String::as_str).unwrap_or_default();
+            let r = match mode {
+                "plex_link_start" => v
+                    .parse::<u64>()
+                    .map_err(|_| "which list source?".to_string())
+                    .and_then(|id| listsrc::plex_link_start(d, id)),
+                "plex_link_poll" => listsrc::plex_link_poll(d, v),
+                _ => v
+                    .parse::<u64>()
+                    .map_err(|_| "which list source?".to_string())
+                    .and_then(|id| listsrc::plex_forget(d, id)),
+            };
+            match r {
+                Ok(v) => v,
+                Err(e) => json!({"status": false, "error": e}),
+            }
+        }
         // §96.3 bundle D: what the give-up breaker is counting, and what
         // it has already stopped chasing. The breaker used to act - it
         // unmonitors things inside the user's Sonarr - with its whole

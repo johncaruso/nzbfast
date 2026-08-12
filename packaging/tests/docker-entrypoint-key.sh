@@ -35,6 +35,13 @@ bad()  { echo "  FAIL - $1"; FAIL=$((FAIL + 1)); }
 # $4, when "warn", additionally requires the keyless WARNING to be
 # printed. Starting silently on an open API is its own failure: the
 # banner is the only thing standing between the owner and not knowing.
+#
+# Matched on the warning's OWN words ("no API key at"), not on the string
+# "WARNING". The entrypoint now legitimately prints a second, unrelated
+# warning - a config directory that is not a mounted volume, which is
+# exactly what a mktemp fixture has - so a bare WARNING match made every
+# KEYED case fail while claiming the opposite of what it found (Codex
+# sweep 12 Aug, packaging red 1).
 run_case() {
   local desc=$1 setup=$2 expect=$3 wantwarn=${4:-}
   local tmp cfgdir out
@@ -52,9 +59,9 @@ run_case() {
   if [ "$expect" = "start" ]; then
     if ! echo "$out" | grep -q STARTED; then
       bad "$desc: refused when it should have started: $(echo "$out" | head -2)"
-    elif [ "$wantwarn" = "warn" ] && ! echo "$out" | grep -q "WARNING"; then
+    elif [ "$wantwarn" = "warn" ] && ! echo "$out" | grep -q "no API key at"; then
       bad "$desc: started but did not warn that it is running keyless"
-    elif [ "$wantwarn" != "warn" ] && echo "$out" | grep -q "WARNING"; then
+    elif [ "$wantwarn" != "warn" ] && echo "$out" | grep -q "no API key at"; then
       bad "$desc: warned about a keyless API when a key is set"
     else
       ok "$desc"

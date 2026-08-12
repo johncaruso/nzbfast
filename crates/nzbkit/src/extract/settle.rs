@@ -719,10 +719,22 @@ impl Extractor {
         if let Some(ch) = inner.slots[slot].chase.take() {
             inner.slots[slot].mode = SlotMode::RarFallback;
             ch.buf.abort("demoted to materialized volume");
-            for (off, bytes) in ch.buf.take_spans() {
+            // Released UP FRONT, like the header stash below and for the
+            // same reason: the whole record leaves RAM here either way,
+            // and the loop can exit early on a scratch read or a write
+            // error. Leaving the release after it charged the budget for
+            // bytes nobody owns any more - the chase is already out of
+            // the slot, so nothing could ever give them back, and every
+            // later slot saw `budget.over()` and demoted.
+            inner.budget.sub(ch.charged);
+            // One span at a time: a stall-paged span reads back off the
+            // scratch only for its own write, so materializing a mostly-
+            // paged set never re-inflates it. A scratch read error fails
+            // the job here on purpose - the demote needs those very
+            // bytes, so demote-with-integrity is impossible without them.
+            while let Some((off, bytes)) = ch.buf.pop_span()? {
                 self.plain_span(inner, slot, off, &bytes)?;
             }
-            inner.budget.sub(ch.charged);
             return self.drain_holds(inner, slot);
         }
         inner.slots[slot].mode = SlotMode::RarFallback;

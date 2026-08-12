@@ -49,6 +49,10 @@ pub(super) enum Log {
     Feeds,
     /// M35 indexer entries carry a per-site `apikey` field: count only.
     Indexers,
+    /// §151 list sources carry a watchlist RSS url (itself a bearer
+    /// capability) and a Plex account token: count only. `Feeds` would
+    /// print the wrong noun and `Plain` would print the credential.
+    Lists,
     /// Everything else: how big it was, and nothing about what was in
     /// it. The default, so the next credential-bearing setting someone
     /// adds cannot silently reopen the log.
@@ -331,6 +335,9 @@ pub(super) const DOWNLOAD: &[Setting] = &[
     rw("auto_retry_mins", |c| {
         json!(c.d.auto_retry_secs.load(Ordering::Relaxed) / 60)
     }),
+    rw("server_outage_mins", |c| {
+        json!(c.d.server_outage_mins.load(Ordering::Relaxed))
+    }),
     rw("quota", |c| json!(c.d.quota.load(Ordering::Relaxed))),
     rw("quota_period", |c| {
         json!((c.d.quota_period.load(Ordering::Relaxed) as char).to_string())
@@ -573,6 +580,13 @@ pub(super) const INDEXING: &[Setting] = &[
     rw("index_nzbimport_budget", |c| {
         json!(c.d.index_nzbimport_budget.load(Ordering::Relaxed))
     }),
+    // §131 D3: record what this index was asked for and how much of
+    // it we answered, so the misses can say what to backfill. Local
+    // data that never leaves the box; switching it off also clears
+    // what was recorded.
+    rw("index_search_log", |c| {
+        json!(c.d.index_search_log.load(Ordering::Relaxed))
+    }),
     rw("group_desc_isc", |c| {
         json!(c.d.group_desc_isc.load(Ordering::Relaxed))
     }),
@@ -652,6 +666,13 @@ pub(super) const INDEXING: &[Setting] = &[
     rw("scoreboard_source", |c| {
         json!(c.d.scoreboard_source.lock_ok().clone())
     }),
+    // Which categories the daily sample asks for - one request each, so
+    // this is what the card's requests-per-day figure is counting.
+    // Empty = all four, the most it ever asks for; the list can only
+    // take categories away.
+    rw("scoreboard_cats", |c| {
+        json!(c.d.scoreboard_cats.lock_ok().clone())
+    }),
     rw("scoreboard_calibrate", |c| {
         json!(c.d.scoreboard_calibrate.load(Ordering::Relaxed))
     }),
@@ -722,9 +743,26 @@ pub(super) const AUTOMATION: &[Setting] = &[
         write: Write::Setting,
         log: Log::Indexers,
     },
+    // §151 external list sources. The user's OWN watchlist rows only -
+    // `watchlist` is what the dashboard editor round-trips, and the
+    // synced rows must not enter that array (see Daemon::watch_items).
     rw_opaque("watchlist", |c| {
         serde_json::to_value(&*c.d.watchlist.lock_ok()).unwrap_or(json!([]))
     }),
+    // §151. Neither credential is ever echoed: the UI learns `has_url` /
+    // `has_token`, and the writer merges a blank one back onto the
+    // stored one (the server-password convention), so an edit in the
+    // dashboard cannot leak or erase either. What each source's last
+    // sync did is merged in here rather than shipped as a second keyed
+    // list, exactly as `feeds` does and for the same reason - the key
+    // that would say which source a health block described is the
+    // source's own address.
+    Setting {
+        name: "list_sources",
+        expose: Expose::Config(|c| list_sources_config(c.d)),
+        write: Write::Setting,
+        log: Log::Lists,
+    },
     // The EFFECTIVE answer, not the raw bool: the dashboard checkbox has
     // to show what the watcher will actually do, and while the user has
     // not answered that is derived from whether any indexer exists.
@@ -761,6 +799,8 @@ pub(super) const AUTOMATION: &[Setting] = &[
     rw("unpack_eat_volumes", |c| {
         json!(c.d.unpack_eat_volumes.lock_ok().clone())
     }),
+    // §73 phase 2: off | metadata-only | full.
+    rw("preview", |c| json!(preview_mode(c.d))),
     rw("par_cleanup", |c| {
         json!(c.d.par_cleanup.load(Ordering::Relaxed))
     }),
@@ -980,6 +1020,10 @@ pub(super) fn log_value(name: &str, v: &str) -> String {
         },
         Some(Log::Indexers) => match serde_json::from_str::<Vec<Value>>(v) {
             Ok(f) => format!("{} indexers", f.len()),
+            Err(_) => shape_only(v),
+        },
+        Some(Log::Lists) => match serde_json::from_str::<Vec<Value>>(v) {
+            Ok(f) => format!("{} list sources", f.len()),
             Err(_) => shape_only(v),
         },
         Some(Log::Shape) | None => shape_only(v),
@@ -1932,6 +1976,7 @@ fn set_password_file(
         }
         *d.password_file.lock_ok() = path.clone();
         *d.hub.unpack_password_file.lock_ok() = Some(path.clone());
+        crate::smart::set_operator_password_file(Some(path.clone()));
         (true, json!(path.to_string_lossy()))
     })
 }
@@ -1959,6 +2004,24 @@ fn set_password_prompt(
             return Err("password_prompt must be now, done or never".into());
         }
         *d.password_prompt.lock_ok() = m.clone();
+        (true, json!(m))
+    })
+}
+
+fn set_preview(
+    d: &Arc<Daemon>,
+    _name: &str,
+    v: &str,
+) -> std::result::Result<(bool, Value), String> {
+    Ok({
+        // off | metadata-only | full. Live: the endpoint reads it per
+        // request and the dashboard reads it off the queue poll, so a
+        // change reaches an open page within the second.
+        let m = v.trim().to_ascii_lowercase();
+        if !PREVIEW_MODES.contains(&m.as_str()) {
+            return Err("preview must be off, metadata-only or full".into());
+        }
+        *d.preview.lock_ok() = m.clone();
         (true, json!(m))
     })
 }
@@ -2492,6 +2555,19 @@ pub(super) fn apply_setting(
             (true, json!(d.index_nzbimport.load(Ordering::Relaxed)))
         }
         "index_nzbimport_budget" => set_index_nzbimport_budget(d, name, v)?,
+        "index_search_log" => {
+            // §131 D3 search-miss logging. Turning it OFF also clears
+            // the table: a privacy switch that leaves the history
+            // behind is not one, and this is the user's own search
+            // history on the user's own box.
+            let on = flag();
+            d.index_search_log.store(on, Ordering::Relaxed);
+            #[cfg(feature = "indexer")]
+            if !on {
+                d.clear_search_log();
+            }
+            (true, json!(d.index_search_log.load(Ordering::Relaxed)))
+        }
         "bench_interval" => set_bench_interval(d, name, v)?,
         "auto_prefetch" => set_auto_prefetch(d, name, v)?,
         "race_stragglers" => set_race_stragglers(d, name, v)?,
@@ -2649,6 +2725,14 @@ pub(super) fn apply_setting(
             (true, json!(b))
         }
         "auto_retry_mins" => set_auto_retry_mins(d, name, v)?,
+        "server_outage_mins" => {
+            let m = v
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| "server_outage_mins must be a number")?;
+            d.server_outage_mins.store(m, Ordering::Relaxed);
+            (true, json!(m))
+        }
         "quota" => {
             let b = size()?;
             d.quota.store(b, Ordering::Relaxed);

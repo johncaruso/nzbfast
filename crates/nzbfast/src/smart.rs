@@ -2448,12 +2448,18 @@ pub fn sweep_junk(dir: &Path) -> usize {
         .and_then(|p| p.metadata().ok())
         .map(|m| m.len())
         .unwrap_or(0);
-    let mut removed = 0;
-    let mut sweep = |d: &Path| {
+    // Classify the whole sweep footprint BEFORE deleting any of it, so the
+    // all-junk guard below can see the release as it stands rather than as
+    // the sweep has already left it.
+    let classify = |d: &Path, doomed: &mut Vec<PathBuf>, survivors: &mut usize| {
         let Ok(rd) = std::fs::read_dir(d) else { return };
         for entry in rd.flatten() {
             let path = entry.path();
-            if !is_real_file(&path) || keep.as_ref() == Some(&path) {
+            if !is_real_file(&path) {
+                continue;
+            }
+            if keep.as_ref() == Some(&path) {
+                *survivors += 1;
                 continue;
             }
             let ext = ext_of(&path);
@@ -2467,23 +2473,59 @@ pub fn sweep_junk(dir: &Path) -> usize {
                 || is_deletable_sample(&path, keep_len)
                 || is_nameless_scrap(&path, &ext, keep_len, recoverable);
             if junk {
-                match remove_swept_file(&path, recoverable, staging.as_deref()) {
-                    Ok(_) => {
-                        info!(target: "cleanup", "junk {}", path.display());
-                        removed += 1;
-                    }
-                    Err(e) => warn!(target: "cleanup", "{}: {e}", path.display()),
-                }
+                doomed.push(path);
+            } else {
+                *survivors += 1;
             }
         }
     };
-    sweep(dir);
+    let mut doomed: Vec<PathBuf> = Vec::new();
+    let mut survivors = 0usize;
+    classify(dir, &mut doomed, &mut survivors);
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.flatten() {
             let path = entry.path();
             if is_real_dir(&path) {
-                sweep(&path);
+                classify(&path, &mut doomed, &mut survivors);
             }
+        }
+    }
+    // A sweep that would delete EVERY file in the release does nothing.
+    //
+    // This function's premise is "keep the payload, drop the furniture
+    // beside it" - and when every file it can see is furniture, the
+    // premise does not hold: there is nothing here it can tell payload
+    // FROM. Exactly the guard `keep_media_only` already applies when it
+    // finds no video, and for the same reason. The shapes this bites are
+    // real: a release whose whole payload is a text file (found 12 Aug on
+    // the torture corpus, where the SFX set unpacked correctly and then
+    // lost `test.txt.txt` to the `.txt` entry in JUNK_EXTS), an info-only
+    // post, a release that is nothing but its own recovery set. An empty
+    // output directory is a worse answer than one file the user can
+    // delete, and unlike the delete it is not something they can undo.
+    //
+    // Deliberately all-or-nothing rather than "keep the largest": ranking
+    // furniture invents a payload the sweep has no way to identify, and
+    // leaves the other files gone. Skipping says what actually happened.
+    if survivors == 0 && !doomed.is_empty() {
+        info!(
+            target: "cleanup",
+            "junk sweep skipped in {}: all {} file(s) look like furniture, \
+             and emptying the release is never the right answer",
+            dir.display(),
+            doomed.len()
+        );
+        prune_empty_dirs(dir, 0);
+        return 0;
+    }
+    let mut removed = 0;
+    for path in doomed {
+        match remove_swept_file(&path, recoverable, staging.as_deref()) {
+            Ok(_) => {
+                info!(target: "cleanup", "junk {}", path.display());
+                removed += 1;
+            }
+            Err(e) => warn!(target: "cleanup", "{}: {e}", path.display()),
         }
     }
     prune_empty_dirs(dir, 0);
@@ -3779,24 +3821,48 @@ pub fn read_password_file(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// First password-protected volume in a completed job's folder (top
-/// level), or None. Merely-compressed leftovers don't count - those
-/// failed for other reasons (e.g. no unrar) and a password won't help.
-pub fn encrypted_rar(dir: &Path) -> Option<PathBuf> {
-    let mut rars: Vec<PathBuf> = std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("rar")))
-        .collect();
-    rars.sort();
-    rars.into_iter().find(|p| nzbkit::rar::needs_password(p))
-}
+// Where the operator's passwords file lives for the code that cannot
+// reach the daemon, and the non-RAR half of `unlock`.
+mod unlockpw;
+use unlockpw::unlock_non_rar;
+pub use unlockpw::{
+    encrypted_archive, encrypted_rar, operator_passwords, set_operator_password_file,
+};
+
+// §99: the try-order heuristic over that file - remember which
+// password unlocked which site's / poster's downloads and try the
+// likely line first.
+mod pwassoc;
+pub use pwassoc::{dominant_poster, nzb_poster, order_passwords, record_password_assoc};
 
 /// Unlock a password-protected set: unrar with the password, and on
 /// success delete the volume files (the unpacked content is the
 /// deliverable, matching the engine's post-extraction behavior).
 pub fn unlock(dir: &Path, password: &str) -> bool {
+    // The non-RAR shapes are decided UP FRONT, not as a fall-through
+    // behind `reextract_dir`.
+    //
+    // That ordering is not a style choice. `reextract_dir` answers
+    // Ok(true) for a directory holding no RAR volumes at all ("no
+    // archive volumes on disk - nothing to re-extract"), which is
+    // correct for what it does and fatal as a gate: a directory whose
+    // only lock is a 7z or a zip has no RAR volumes BY DEFINITION, so
+    // the arms below never ran and this function reported the password
+    // as working over a set still packed - the exact failure the
+    // obfuscated-RAR branch inside `reextract_dir` was added to prevent,
+    // reproduced one level up. Observed on advP (12 Aug): "unpacked - 0
+    // volume file(s) spent", then "unlocked", with both containers
+    // untouched.
+    //
+    // Precedence matches `encrypted_archive`, which is what named the
+    // archive the caller is unlocking: RAR first claim, so a directory
+    // holding a locked RAR keeps the whole path below and these arms
+    // stay out of it.
+    if encrypted_rar(dir).is_none()
+        && let Some(unlocked) = unlock_non_rar(dir, password)
+    {
+        return unlocked;
+    }
     // Native path first: encrypted STORE sets (the obfuscated-release
     // norm) re-extract and AES-decrypt without unrar, deleting their
     // volumes on success. Compressed or RAR4-encrypted sets fall through
@@ -3846,7 +3912,11 @@ pub fn unlock(dir: &Path, password: &str) -> bool {
     };
     let before = vol_snapshot(dir);
     if !crate::reextract_dir(dir, Some(password)).unwrap_or(false) {
-        return false;
+        // No RAR set took the password. A directory holding a locked RAR
+        // *and* a locked container of another shape skipped the arms
+        // above (RAR had first claim) - so they get their turn here,
+        // before the password is called wrong.
+        return unlock_non_rar(dir, password).unwrap_or(false);
     }
     let removed = before.difference(&vol_snapshot(dir)).count();
     info!(

@@ -120,11 +120,21 @@ pub(super) fn normalized_server(
         // kept its provider password in cleartext in config.local.json
         // for the life of the install. That defeats the stated point
         // of obf1: these files end up in screenshots, forum posts and
-        // bug reports. Idempotent on an already-prefixed value, and
-        // ServerConfig's de_secret decodes before connect, so
-        // server_test is unaffected. MUST land with the reveal fix
+        // bug reports. ServerConfig's de_secret decodes before connect,
+        // so server_test is unaffected. MUST land with the reveal fix
         // below or reveal starts returning obf1 blobs for everyone.
-        ob.insert("password".into(), json!(nzbkit::config::obfuscate(p)));
+        //
+        // The RAW-INPUT encoder, guarded by "is this byte-for-byte what is
+        // already stored". `obfuscate`'s prefix guess is what broke a
+        // literal `obf1:`-prefixed password (Codex sweep 12 Aug F16), and
+        // `mode=server_secret` hands this field back as CLEARTEXT, so what
+        // arrives here is a typed password - except for a caller that
+        // echoes the stored value straight back, which the guard leaves
+        // exactly as it found it rather than encoding twice.
+        let stored = ob.get("password").and_then(Value::as_str);
+        if stored != Some(p) {
+            ob.insert("password".into(), json!(nzbkit::config::obfuscate_input(p)));
+        }
     }
     for key in ["level", "retention_days", "block_bytes"] {
         match incoming.get(key).and_then(Value::as_u64) {

@@ -1,5 +1,4 @@
 use super::*;
-use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum JobState {
@@ -558,372 +557,102 @@ impl Drop for IndexJobGuard {
     }
 }
 
-/// A secondary download running on ONLY the servers the active job
-/// leaves idle (their copies of its articles keep 430ing). Its own hub
-/// gives it independent abort control and pool stats; its writes land in
-/// the job's normal out_dir + journal, so however it ends - completion,
-/// abort at active-job end, or "these servers don't have it either" -
-/// nothing is lost: the eventual primary run resumes from the journal.
-pub struct Sidecar {
-    pub nzo_id: String,
-    /// `pub(crate)`: [`crate::StreamHub`] is crate-private, and the
-    /// field follows it (Q5, as with [`Job::health`]).
-    pub(crate) hub: Arc<crate::StreamHub>,
-    /// Decoded bytes so far (dashboard shows prefetch progress).
-    pub progress: Arc<AtomicU64>,
-    /// Pre-armed cancel: the pipeline installs its own abort flag into
-    /// the hub only once it starts - this one is checked by the task
-    /// BEFORE that, so a stop can never miss the install window.
-    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
-    pub task: tokio::task::JoinHandle<()>,
-    /// True when this sidecar runs on connections BORROWED from servers
-    /// busy on the active job (no healthy idle server existed). An idle
-    /// sidecar suppresses the defer verdict - the idle capacity is
-    /// already on the next job, so demoting the slow one buys nothing.
-    /// A borrowed sidecar claims no idle capacity, so that reasoning
-    /// does not apply and the watchdog stays armed.
-    pub borrowed: bool,
-}
-
-/// Abort the sidecar (if any) and wait for it to wind down. Called by
-/// the runner at every primary-job end - the next pick may be the very
-/// job the sidecar holds open, and two pipelines must never share an
-/// out_dir or a server's connection budget. The abort is re-fired on a
-/// short interval because the pipeline installs its hub abort/queue-ctl
-/// handles asynchronously after launch.
+/// A job FAILED holding what may be a locked archive: find it, and spend
+/// every password we already hold before the failure is filed.
 ///
-/// This waits for the DOWNLOAD only. A sidecar that completed its job
-/// hands the post-processing tail to a task of its own (see
-/// `spawn_sidecar`), so the queue never waits on a move to a NAS.
-pub(super) async fn stop_sidecar(d: &Arc<Daemon>) {
-    let sc = d.sidecar.lock_ok().take();
-    if let Some(mut sc) = sc {
-        d.note_event(
-            "sidecar",
-            "early start wound down - the main queue takes over",
-        );
-        sc.cancelled.store(true, Ordering::Relaxed);
-        loop {
-            if let Some(f) = sc.hub.abort.lock_ok().as_ref() {
-                f.store(true, Ordering::Relaxed);
-            }
-            if let Some(c) = sc.hub.queue_ctl.lock_ok().as_ref() {
-                c.abort();
-            }
-            // A timeout means the handles are not installed yet - re-fire.
-            if tokio::time::timeout(std::time::Duration::from_millis(250), &mut sc.task)
-                .await
-                .is_ok()
-            {
-                break;
-            }
-        }
-    }
-}
-
-/// Launch the idle-server prefetch pipeline for `job` (see Sidecar).
+/// Returns true when one of them worked - the job record is Completed by
+/// then and its tail still owes the sweep, rename and move.
 ///
-/// `fleet` is the host set the sidecar may download on:
-/// - `borrow == false`: the idle hosts. The exclusion list is every host
-///   that IS serving the active job plus exhausted block accounts and
-///   auth-refused hosts - the sidecar may only touch idle capacity.
-/// - `borrow == true`: healthy BUSY hosts, used when no healthy idle
-///   server exists (the 31 Jul soak state: the only idle server
-///   auth-refused, and cross-job tail-overlap simply never engaged -
-///   49 s line-idle of a 144 s queue vs ~2% healthy). Each host stays in
-///   the sidecar's fleet but its pool is capped (hub.host_conn_caps) to
-///   a 1-2 connection slice sized into the headroom between the active
-///   job's fleet and the provider cap, so the next job's tail-overlap
-///   engages without starving the active job. When there is no headroom
-///   (the active fleet already fills the account limit) the single
-///   borrowed connection may be capacity-refused; the sidecar's own pool
-///   answers 481s by yielding, never hammering (see AuthState in
-///   nzbkit::pool), and picks the slot up as the active job's tail
-///   releases it - which is exactly when tail-overlap wants it.
-pub(super) fn spawn_sidecar(
+/// Detection alone was half the story. The 11 Aug fix taught this path to
+/// SEE a locked archive on a failed job (so the drawer offers the 🔑
+/// rather than "show the folder"), but deliberately did no unlocking,
+/// because unlocking belonged to jobs that COMPLETE. The result: with the
+/// right line sitting in the operator's passwords file we raised a prompt
+/// for a password we had already read, while SABnzbd - which tries its
+/// `password_file` here - simply delivered the payload (advQ, the
+/// four-way correctness round, 12 Aug).
+///
+/// The ladder is the completed path's, in §99 order: the job's own
+/// password first, then the file's candidates, read fresh so a line added
+/// while the job ran still counts.
+///
+/// `was_unpack_failure` decides how far a hit may go. The probe runs for
+/// any local, hint-less failure - the gate the 11 Aug fix already vetted
+/// for raising the 🔑 - but only a job that failed BECAUSE something
+/// could not be unpacked has had its stated reason answered by the
+/// unlock, and only that one may be called a completion. Any other local
+/// failure keeps its verdict: the payload is out and the password is
+/// recorded, and whatever really went wrong still gets to say so.
+#[allow(clippy::too_many_arguments)]
+async fn settle_locked_failure(
     d: &Arc<Daemon>,
-    config: &Path,
     job: &Arc<Mutex<Job>>,
-    fleet: &[String],
-    deltas: &[(String, u64)],
-    budget: nzbkit::mem::MemBudget,
-    borrow: bool,
-) {
-    let (nzo_id, nzb_path, out_dir, password) = {
-        let g = job.lock_ok();
-        (
-            g.nzo_id.clone(),
-            g.nzb_path.clone(),
-            g.out_dir.clone(),
-            g.password.clone(),
-        )
+    out: &std::path::Path,
+    name: &str,
+    nzb: &std::path::Path,
+    site: &str,
+    job_pw: Option<&str>,
+    was_unpack_failure: bool,
+) -> bool {
+    // Header-parses every RAR volume, 7z and zip container in the folder:
+    // blocking file IO, off the runtime worker, exactly as the completed
+    // path runs it.
+    let probe_dir = out.to_path_buf();
+    let locked = tokio::task::spawn_blocking(move || crate::smart::encrypted_archive(&probe_dir))
+        .await
+        .unwrap_or(None);
+    let Some(locked) = locked else {
+        return false;
     };
-    let total: u64 = deltas.iter().map(|(_, b)| b).sum();
-    let cfg_loaded = nzbkit::config::Config::load(config).ok();
-    let block: std::collections::HashSet<String> = cfg_loaded
-        .as_ref()
-        .map(|c| {
-            c.servers
-                .iter()
-                .filter(|s| {
-                    s.block_bytes
-                        .is_some_and(|b| b > 0 && d.usage_lifetime(&s.host) >= b)
-                })
-                .map(|s| s.host.clone())
-                .collect()
-        })
-        .unwrap_or_default();
-    // Servers the active job's pool has recorded a refusal for (bad
-    // credential or connection/IP cap) moved no bytes, so the busy-host
-    // test below never catches them - but they are dead weight, not idle
-    // capacity, and the sidecar must not build its fleet on them. The
-    // pool clears the note on the next successful connect, so a cap that
-    // lifts re-qualifies the host for the NEXT spawn.
-    let refused: std::collections::HashSet<String> = d
-        .hub
-        .pool_live
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|l| {
-            l.servers
-                .iter()
-                .filter(|s| s.refusal.lock_ok().is_some())
-                .map(|s| s.host.clone())
-                .collect()
-        })
-        .unwrap_or_default();
-    // The caller filters too, but enforcement must not depend on it.
-    let fleet: Vec<String> = fleet
-        .iter()
-        .filter(|h| !refused.contains(*h) && !block.contains(*h))
-        .cloned()
+    let locked_name = locked
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let poster = crate::smart::nzb_poster(nzb);
+    let cands: Vec<String> = job_pw
+        .map(str::to_string)
+        .into_iter()
+        .chain(d.read_unpack_passwords_for(site, &poster))
         .collect();
-    if fleet.is_empty() {
-        return;
-    }
-    // The borrowed slice per host: the provider cap (config `connections`
-    // - "we typically use far fewer") minus the active job's fleet is
-    // free headroom; take up to 2 connections of it so active + sidecar
-    // never overcount the account limit. With zero headroom, take 1 and
-    // let the pool's capacity-refusal handling wait it out (doc above).
-    let caps: std::collections::HashMap<String, usize> = if borrow {
-        let global = d.connections.load(Ordering::Relaxed).max(1);
-        fleet
-            .iter()
-            .filter_map(|h| {
-                let acct = cfg_loaded
-                    .as_ref()?
-                    .servers
-                    .iter()
-                    .find(|s| &s.host == h)?
-                    .connections
-                    .max(1) as usize;
-                let headroom = acct.saturating_sub(global.min(acct));
-                Some((h.clone(), headroom.clamp(1, 2)))
-            })
-            .collect()
-    } else {
-        Default::default()
-    };
-    // A borrowed host without a computed cap (config unreadable, or the
-    // host vanished from it) must not join the fleet at all - an
-    // uncapped "borrow" would be a full second fleet on a busy server.
-    // Narrowed BEFORE the exclusion list is built, so a dropped host
-    // falls back into it (it is busy) instead of slipping through both.
-    let fleet: Vec<String> = if borrow {
-        let kept: Vec<String> = fleet.into_iter().filter(|h| caps.contains_key(h)).collect();
-        if kept.is_empty() {
-            return;
+    let unlock_dir = out.to_path_buf();
+    let winner = tokio::task::spawn_blocking(move || {
+        cands
+            .into_iter()
+            .find(|pw| crate::smart::unlock(&unlock_dir, pw))
+    })
+    .await
+    .unwrap_or(None);
+    match winner {
+        Some(pw) => {
+            info!(
+                target: "unlock",
+                "{name:?}: {locked_name} unlocked with a password we already held - \
+                 the job is a completion after all"
+            );
+            d.record_unlock_password(site, &poster, &pw);
+            {
+                let mut j = job.lock_ok();
+                j.password = Some(pw);
+                j.password_required = false;
+                if was_unpack_failure {
+                    j.fail_message.clear();
+                    j.state = JobState::Completed;
+                }
+            }
+            d.save_queue();
+            was_unpack_failure
         }
-        kept
-    } else {
-        fleet
-    };
-    let mut excl: Vec<String> = deltas
-        .iter()
-        .filter(|(_, b)| (*b as f64) >= total as f64 * 0.01)
-        // Borrow mode deliberately keeps its (busy) fleet hosts in.
-        .filter(|(h, _)| !(borrow && fleet.contains(h)))
-        .map(|(h, _)| h.clone())
-        .collect();
-    excl.extend(block);
-    excl.extend(refused);
-    let hub = Arc::new(crate::StreamHub::default());
-    *hub.excluded_hosts.lock_ok() = excl;
-    *hub.host_conn_caps.lock_ok() = caps.clone();
-    // M29 3d: the idle-server prefetch is real availability signal too.
-    // The primary job's OracleSink lives on the daemon hub; this sidecar
-    // runs on a FRESH hub, so without its own sink every 222/430 it sees
-    // was silently dropped. Give it one and drain it when it winds down.
-    *hub.oracle.lock_ok() = Some(Arc::new(nzbkit::oracle::OracleSink::default()));
-    let progress = Arc::new(AtomicU64::new(0));
-    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut sc_guard = d.sidecar.lock_ok();
-    if sc_guard.is_some() {
-        return; // raced another spawn - keep the first
+        None => {
+            info!(
+                target: "unlock",
+                "{name:?}: {locked_name} is password-protected - set a password and retry to unpack it"
+            );
+            job.lock_ok().password_required = true;
+            d.save_queue();
+            false
+        }
     }
-    if borrow {
-        let slice: Vec<String> = fleet
-            .iter()
-            .map(|h| format!("{h} x{}", caps.get(h).copied().unwrap_or(1)))
-            .collect();
-        info!(
-            target: "prefetch",
-            "{nzo_id} borrowing connection(s) from busy server(s) {} while the active job downloads (no healthy idle server)",
-            slice.join(", ")
-        );
-        d.note_event(
-            "sidecar",
-            "next job started early on connections borrowed from busy servers",
-        );
-    } else {
-        info!(
-            target: "prefetch",
-            "{nzo_id} starting on idle server(s) {} while the active job downloads",
-            fleet.join(", ")
-        );
-        d.note_event("sidecar", "next job started early on idle servers");
-    }
-    let eat_ok = job.lock_ok().eat_volumes_ok;
-    let task = {
-        let d = d.clone();
-        let config = config.to_path_buf();
-        let job = job.clone();
-        let hub = hub.clone();
-        let progress = progress.clone();
-        let cancelled = cancelled.clone();
-        let nzo_id = nzo_id.clone();
-        let connections = d.connections.load(Ordering::Relaxed).max(1);
-        let window = d.window.load(Ordering::Relaxed).max(1);
-        let decoders = d.decoders.load(Ordering::Relaxed).max(1);
-        let fast_verify = d.fast_verify.load(Ordering::Relaxed);
-        let verify_lean = d.verify_lean.load(Ordering::Relaxed);
-        let par_cleanup = d.par_cleanup.load(Ordering::Relaxed);
-        tokio::spawn(async move {
-            let t0 = Instant::now();
-            let res = if cancelled.load(Ordering::Relaxed) {
-                Err(anyhow::anyhow!("cancelled before start"))
-            } else {
-                crate::get_with_progress(
-                    &config,
-                    &nzb_path,
-                    &out_dir,
-                    connections,
-                    window,
-                    decoders,
-                    fast_verify,
-                    verify_lean,
-                    false,
-                    par_cleanup,
-                    password,
-                    // The sidecar prefetches ANOTHER job; its consent
-                    // travels with that job's record, not this one's.
-                    eat_ok,
-                    Some(progress.clone()),
-                    Some(hub.clone()),
-                    &nzo_id,
-                    None,
-                    budget,
-                )
-                .await
-            };
-            // Bill what moved to the per-server usage history either way
-            // (block accounts must see every byte).
-            let per: Vec<(String, u64)> = hub
-                .pool_live
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|l| {
-                    l.servers
-                        .iter()
-                        .map(|s| (s.host.clone(), s.bytes.load(Ordering::Relaxed)))
-                        .collect()
-                })
-                .unwrap_or_default();
-            d.add_usage(&per);
-            // M29 3d: fold the sidecar's per-article hit/430 outcomes into
-            // the availability ledger, exactly as the primary job does at
-            // net-drain. Partial/cancelled runs still carry real signal.
-            #[cfg(feature = "indexer")]
-            if let Some(sink) = hub.oracle.lock_ok().take() {
-                let samples = sink.drain();
-                if !samples.is_empty() {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|t| t.as_secs() as i64)
-                        .unwrap_or(0);
-                    d.with_index(|ix| ix.oracle_ingest(&samples, now).ok());
-                }
-            }
-            match res {
-                Ok(()) => {
-                    // The whole job fit on the idle servers - it's done.
-                    {
-                        let mut g = job.lock_ok();
-                        g.state = JobState::Completed;
-                        g.fetched = true;
-                        g.downloaded_bytes = progress.load(Ordering::Relaxed);
-                        g.elapsed_secs = t0.elapsed().as_secs_f64();
-                        g.finished_at = Some(Instant::now());
-                        g.finished_unix = Some(unix_now());
-                    }
-                    info!(
-                        target: "prefetch",
-                        "{nzo_id} completed entirely on {}",
-                        if borrow {
-                            "borrowed connections"
-                        } else {
-                            "idle servers"
-                        }
-                    );
-                    d.note_event(
-                        "sidecar",
-                        if borrow {
-                            "early start finished the whole job on borrowed connections"
-                        } else {
-                            "early start finished the whole job on idle servers"
-                        },
-                    );
-                    // A sidecar completion is a completion: it owes the
-                    // job the same tail the runner gives one (hand-over,
-                    // unlock, junk sweep, rename, move), and it must run
-                    // before the pp-script and history see the job.
-                    //
-                    // On its OWN task, because the runner awaits this one
-                    // (stop_sidecar) at every primary-job end before it may
-                    // pick the next: a tail that copies the payload to a NAS
-                    // would hold the whole queue for the length of that copy.
-                    // Nothing here needs the sidecar's abort handles - the
-                    // download is over and its connections are gone.
-                    let d2 = d.clone();
-                    tokio::spawn(async move {
-                        finalize_completed(&d2, &job).await;
-                        d2.run_post_job_hooks(&job);
-                        d2.park(job);
-                    });
-                }
-                Err(e) => {
-                    // A restricted attempt, not a verdict - the job stays
-                    // queued and its journal keeps everything landed.
-                    info!(target: "prefetch", "{nzo_id} stopped: {e} (progress kept in the journal)");
-                }
-            }
-            let mut g = d.sidecar.lock_ok();
-            if g.as_ref().is_some_and(|s| s.nzo_id == nzo_id) {
-                *g = None;
-            }
-        })
-    };
-    *sc_guard = Some(Sidecar {
-        nzo_id,
-        hub,
-        progress,
-        cancelled,
-        task,
-        borrowed: borrow,
-    });
 }
 
 /// M23/M24 post-download work on a SUCCESSFUL job, in order: passworded
@@ -941,7 +670,7 @@ pub(super) fn spawn_sidecar(
 /// that does not come through here is the M14i library metadata-only pick,
 /// which writes a .strm pointer and has nothing to unlock, rename or move.
 pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
-    let (done_ok, out2, name2, cat2, tv2, pw2, repl2, crc2, nzb2) = {
+    let (done_ok, failed, fail2, out2, name2, cat2, tv2, pw2, repl2, crc2, nzb2, site2) = {
         let j = job.lock_ok();
         (
             // A tombstoned job was deleted by the user while it ran. If
@@ -952,6 +681,8 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
             // moving it onto a NAS would publish a result nobody asked
             // to keep.
             j.state == JobState::Completed && !j.tombstone,
+            j.state == JobState::Failed && !j.tombstone,
+            j.fail_message.clone(),
             j.out_dir.clone(),
             j.name.clone(),
             j.category.clone(),
@@ -960,6 +691,9 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
             j.replaces.clone(),
             j.inner_crc,
             j.nzb_path.clone(),
+            // §99 try-order key: the indexer host the NZB was fetched
+            // from (empty for an uploaded file).
+            j.failure_host.clone(),
         )
     };
     let exts = {
@@ -973,6 +707,57 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
         }
         e
     };
+    // A job can FAIL because something in its output is locked, and the
+    // tail below runs for completions only - so the one question a
+    // locked failure turns on was never asked. An encrypted RAR set
+    // completes (the volumes are left for the unlock step), which is why
+    // this went unnoticed; a header-encrypted 7z instead reports
+    // `PasswordRequired` as an ordinary unpack failure, so the job ended
+    // Failed with "an archive in the output directory could not be
+    // unpacked" and the drawer offered "show the folder" for a job whose
+    // entire remedy is a password (soak round 3, 11 Aug, advQ).
+    //
+    // Detection ONLY: no unlock, no sweep, no move, no marker. Those
+    // belong to a successful job - and to the Retry that this flag is
+    // what enables, since `fail_action` returns "password" for any
+    // failure carrying it.
+    //
+    // Asked only of a failure that could BE a locked archive: `Local`,
+    // with no other remedy already named. The flag is not cosmetic -
+    // `auto_retry_eligible` refuses a job carrying it and `post_job_plan`
+    // then calls the failure final - so raising it on every failed job
+    // that happens to hold an encrypted volume took the automatic retry
+    // away from the ordinary encrypted release whose download hit a
+    // connection blip, and reported a live post to the indexer as failed.
+    // The disk-full and damaged-article failures are `Local` too and
+    // already carry their own remedy; a password answers neither.
+    let locked_probe = failed
+        && fail_kind(&fail2) == FailKind::Local
+        && fail_hint(&fail2).is_empty()
+        && !disk_full_failure(&fail2);
+    if locked_probe
+        && settle_locked_failure(
+            d,
+            job,
+            &out2,
+            &name2,
+            &nzb2,
+            &site2,
+            pw2.as_deref(),
+            // The one failure an unlock actually answers. Every unpack
+            // verdict in `get::tail` names itself this way.
+            fail2.contains("could not be unpacked"),
+        )
+        .await
+    {
+        // Unlocked, so the record now says Completed: the payload is
+        // unpacked but nothing else has run - no sweep, no rename, no
+        // move - so hand the job back to the completed tail rather than
+        // half-finishing it here. Exactly one re-entry is possible, since
+        // `locked_probe` asks `state == Failed`.
+        Box::pin(finalize_completed(d, job)).await;
+        return;
+    }
     if done_ok {
         // Write the intent down BEFORE touching anything. Everything
         // below can move the payload out from under the recorded
@@ -1013,6 +798,10 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
         // originals.
         let name_log = name2.clone();
         let out_log = out2.clone();
+        // For the §99 association record on the in-stream probe's
+        // winner, which lands after the closure returns.
+        let site3 = site2.clone();
+        let nzb3 = nzb2.clone();
         let (
             needs_pw,
             pw_used,
@@ -1049,23 +838,33 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
             let mut needs_pw = false;
             let mut pw_used: Option<String> = None;
             let mut locked_name = String::new();
-            if let Some(vol) = crate::smart::encrypted_rar(&out2) {
+            if let Some(vol) = crate::smart::encrypted_archive(&out2) {
                 locked_name = vol
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
+                // §99 try-order keys, read once per locked job: which
+                // site supplied the NZB, and who posted it.
+                let poster2 = crate::smart::nzb_poster(&nzb2);
                 match pw2.as_deref() {
-                    Some(pw) if crate::smart::unlock(&out2, pw) => {}
+                    Some(pw) if crate::smart::unlock(&out2, pw) => {
+                        // The job's own password worked - refresh the
+                        // §99 association so the next job from this
+                        // site or poster tries it first.
+                        d3.record_unlock_password(&site2, &poster2, pw);
+                    }
                     _ => {
                         // SAB/NZBGet-parity passwords file: the job's
                         // own password is absent (or just failed), so
-                        // try the file's candidates top to bottom -
-                        // read fresh, so a line added minutes ago
-                        // counts. The winner is recorded onto the job
-                        // below - history then shows has_password, and
-                        // a retry of this job reuses it directly.
+                        // try the file's candidates - read fresh, so a
+                        // line added minutes ago counts, in §99 order
+                        // (site association, poster association, then
+                        // the file top to bottom). The winner is
+                        // recorded onto the job below - history then
+                        // shows has_password, and a retry of this job
+                        // reuses it directly.
                         match d3
-                            .read_unpack_passwords()
+                            .read_unpack_passwords_for(&site2, &poster2)
                             .into_iter()
                             .find(|pw| crate::smart::unlock(&out2, pw))
                         {
@@ -1074,6 +873,7 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
                                     target: "unlock",
                                     "{name2:?}: unlocked with a password from the passwords file"
                                 );
+                                d3.record_unlock_password(&site2, &poster2, &pw);
                                 pw_used = Some(pw);
                             }
                             None => {
@@ -1224,6 +1024,9 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
                 (0, 0, false),
             )
         });
+        // The probe winner taken below, held past the job lock so the
+        // §99 association write (file IO) never runs under it.
+        let mut probe_pw: Option<String> = None;
         {
             let mut j = job.lock_ok();
             j.password_required = needs_pw;
@@ -1240,6 +1043,7 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
                 let mut g = d.hub.password_found.lock_ok();
                 if g.as_ref().is_some_and(|(o, _)| *o == j.nzo_id) {
                     j.password = g.take().map(|(_, pw)| pw);
+                    probe_pw = j.password.clone();
                 }
             }
             // In "never ask" mode the locked outcome is not presented
@@ -1326,6 +1130,17 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
             // Cleared in the same breath as the corrected out_dir: from
             // here the record describes where the payload actually is.
             j.finalizing = false;
+        }
+        // §99: the in-stream probe's winner is an unlock like any other
+        // - remember which site / poster it belongs to. Off the async
+        // tail (NZB re-parse plus a small file write).
+        if let Some(pw) = probe_pw {
+            let d4 = d.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let poster = crate::smart::nzb_poster(&nzb3);
+                d4.record_unlock_password(&site3, &poster, &pw);
+            })
+            .await;
         }
         // Outside the job lock - save_queue locks every job in turn.
         // The identity/cleanup stamps land on a record that may already
@@ -1715,6 +1530,17 @@ pub(crate) fn fail_hint(msg: &str) -> &'static str {
         "retention"
     } else if msg.contains("no PAR2 recovery data") {
         "nopar2"
+    } else if msg.starts_with("the articles did not decode") {
+        // The server's own copies are damaged - nothing on this machine
+        // is wrong. Both of the clauses below land in `Local` (they are
+        // neither missing articles nor a repair verdict), whose default
+        // move is "show the folder"; the folder answers neither of them.
+        "corrupt"
+    } else if msg.starts_with("post size header disagrees") {
+        // The poster's headers promise bytes that were never posted, so
+        // asking again returns the same short post. Another release is
+        // the only answer, exactly as for a takedown.
+        "shortpost"
     } else {
         ""
     }
@@ -1741,6 +1567,12 @@ pub(crate) fn fail_action(
 ) -> &'static str {
     // Both of these outrank the kind: a locked archive and a full disk
     // are `Local`, and "show the folder" answers neither of them.
+    // Password first is deliberate and pinned by
+    // `each_failure_gets_the_action_that_can_help` - the unlock is the
+    // one of the two that can be completed from the page. What must not
+    // happen is a job being FLAGGED locked because it failed on a full
+    // disk, and that is gated where the flag is raised (see the
+    // `locked_probe` in `finalize_completed`), not here.
     if password_required {
         return "password";
     }
@@ -1752,7 +1584,10 @@ pub(crate) fn fail_action(
     match hint {
         "servers" => return "servers",
         "retention" => return "retention",
-        "nopar2" => return "search",
+        "nopar2" | "shortpost" => return "search",
+        // Damaged copies on the server: a re-fetch (and, with more than
+        // one provider, a different one) is the whole remedy.
+        "corrupt" => return "retry",
         _ => {}
     }
     match kind {
@@ -2854,6 +2689,229 @@ mod finalize_marker_tests {
             j.unpack_blocked_by
         );
         drop(j);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ...and when we ALREADY HOLD the password, the affordance is not
+    /// the answer - delivering the payload is.
+    ///
+    /// The 11 Aug fix taught the failed path to SEE the lock but
+    /// deliberately stopped there, because unlocking belonged to jobs
+    /// that COMPLETE. So with the right line sitting in the operator's
+    /// passwords file we raised a prompt for a password we had already
+    /// read, while SABnzbd - which tries its `password_file` here -
+    /// simply unpacked it (advQ, the four-way correctness round, 12 Aug).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_job_spends_a_password_it_already_holds() {
+        use nzbkit::zip::fixtures::{Encrypt, Spec, zip_of};
+        let dir = std::env::temp_dir().join(format!("nzbfast-lockedspend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = test_daemon(&dir);
+        let list = dir.join("pw.txt");
+        // A wrong line first: the ladder must sweep, not take line one.
+        std::fs::write(&list, "not-this\nopensesame\n").unwrap();
+        *d.password_file.lock_ok() = list;
+
+        let out = dir.join("out").join("Locked.Job");
+        std::fs::create_dir_all(&out).unwrap();
+        let payload: Vec<u8> = (0..30_000u32).map(|i| (i * 3 + 7) as u8).collect();
+        std::fs::write(
+            out.join("payload.zip"),
+            zip_of(&[Spec {
+                encrypt: Some(Encrypt::Ae {
+                    password: "opensesame",
+                    strength: 3,
+                    vendor_version: 2,
+                }),
+                ..Spec::deflated("movie.mkv", &payload)
+            }]),
+        )
+        .unwrap();
+        let job = Arc::new(Mutex::new(
+            job_from_json(&json!({
+                "nzo_id": "SABnzbd_nzo_lockedspend",
+                "name": "Locked.Job",
+                "nzb_path": dir.join("locked.nzb").to_string_lossy(),
+                "out_dir": out.to_string_lossy(),
+                "state": "Failed",
+                "fail_message": "an archive in the output directory could not be unpacked",
+            }))
+            .unwrap(),
+        ));
+        finalize_completed(&d, &job).await;
+
+        assert_eq!(
+            std::fs::read(out.join("movie.mkv")).unwrap(),
+            payload,
+            "the payload we held the password for must be delivered"
+        );
+        let j = job.lock_ok();
+        assert_eq!(
+            j.state,
+            JobState::Completed,
+            "it is a completion, not a failure"
+        );
+        assert!(j.fail_message.is_empty(), "{:?}", j.fail_message);
+        assert!(!j.password_required, "nothing left to ask for");
+        assert_eq!(
+            j.password.as_deref(),
+            Some("opensesame"),
+            "the winner is recorded, so a retry needs no second sweep"
+        );
+        drop(j);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A FAILED job whose output holds a locked archive still owes the
+    /// user the password affordance. The whole post-processing tail runs
+    /// for completions only - an encrypted RAR set gets there because it
+    /// COMPLETES, but a header-encrypted 7z fails the unpack outright, so
+    /// before this the drawer offered "show the folder" for a job whose
+    /// only remedy is a password (soak round 3, 11 Aug, advQ).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_job_holding_a_locked_archive_still_asks_for_the_password() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-lockedfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = test_daemon(&dir);
+        let out = dir.join("out").join("Locked.Job");
+        std::fs::create_dir_all(&out).unwrap();
+        // The real thing: a `-mhe` container, same fixture the probe
+        // test pins. A stub would prove nothing - the detector reads
+        // the 7z header chain.
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../nzbkit/tests/fixtures/sevenz/header-encrypted.7z"
+            ),
+            out.join("payload.7z"),
+        )
+        .unwrap();
+        let job = Arc::new(Mutex::new(
+            job_from_json(&json!({
+                "nzo_id": "SABnzbd_nzo_lockedfail",
+                "name": "Locked.Job",
+                "nzb_path": dir.join("locked.nzb").to_string_lossy(),
+                "out_dir": out.to_string_lossy(),
+                "state": "Failed",
+                "fail_message": "an archive in the output directory could not be unpacked",
+            }))
+            .unwrap(),
+        ));
+        finalize_completed(&d, &job).await;
+
+        let j = job.lock_ok();
+        assert!(
+            j.password_required,
+            "a failed job sitting on a locked 7z must ask for the password"
+        );
+        assert_eq!(
+            fail_action(
+                fail_kind(&j.fail_message),
+                fail_hint(&j.fail_message),
+                &j.fail_message,
+                j.password_required,
+            ),
+            "password",
+            "and the drawer must offer the unlock, not the folder"
+        );
+        // Detection only: the payload is untouched (no sweep, no move).
+        assert!(out.join("payload.7z").exists(), "the archive was disturbed");
+        drop(j);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of that probe: a locked archive in the folder is
+    /// not an answer to a failure that was never about unpacking.
+    /// `password_required` gates `auto_retry_eligible`, so raising it on
+    /// a transport failure took the M32 automatic retry away from every
+    /// encrypted release whose download hit a connection blip - and
+    /// `post_job_plan` then reported that live post to the indexer as
+    /// failed. A full disk is `Local` too and already has its own
+    /// remedy; the unlock button must not cover it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failure_that_is_not_about_unpacking_keeps_its_own_remedy() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-lockedskip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = test_daemon(&dir);
+        for (id, message) in [
+            (
+                "transport",
+                "download failed on connection errors: every server refused",
+            ),
+            (
+                "diskfull",
+                "out of disk space - the output volume filled during the download",
+            ),
+            (
+                "corrupt",
+                "the articles did not decode: 4001 damaged article(s)",
+            ),
+        ] {
+            let out = dir.join("out").join(id);
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::copy(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../nzbkit/tests/fixtures/sevenz/header-encrypted.7z"
+                ),
+                out.join("payload.7z"),
+            )
+            .unwrap();
+            let job = Arc::new(Mutex::new(
+                job_from_json(&json!({
+                    "nzo_id": format!("SABnzbd_nzo_{id}"),
+                    "name": id,
+                    "nzb_path": dir.join("x.nzb").to_string_lossy(),
+                    "out_dir": out.to_string_lossy(),
+                    "state": "Failed",
+                    "fail_message": message,
+                }))
+                .unwrap(),
+            ));
+            finalize_completed(&d, &job).await;
+            let j = job.lock_ok();
+            assert!(
+                !j.password_required,
+                "{id}: a locked archive is not why this job failed"
+            );
+            assert_ne!(
+                fail_action(
+                    fail_kind(&j.fail_message),
+                    fail_hint(&j.fail_message),
+                    &j.fail_message,
+                    j.password_required,
+                ),
+                "password",
+                "{id}: the drawer must keep the remedy that fits"
+            );
+        }
+        // The transport failure is the one that also owed a retry.
+        let job = Arc::new(Mutex::new(
+            job_from_json(&json!({
+                "nzo_id": "SABnzbd_nzo_transport",
+                "name": "transport",
+                "nzb_path": dir.join("x.nzb").to_string_lossy(),
+                "out_dir": dir.join("out").join("transport").to_string_lossy(),
+                "state": "Failed",
+                "fail_message": "download failed on connection errors: every server refused",
+            }))
+            .unwrap(),
+        ));
+        finalize_completed(&d, &job).await;
+        assert!(
+            auto_retry_eligible(&job.lock_ok(), 300),
+            "the one automatic retry must survive an encrypted volume on disk"
+        );
+        // A locked archive DOES still answer a plain unpack failure.
+        assert!(
+            fail_kind("an archive in the output directory could not be unpacked")
+                == FailKind::Local
+                && fail_hint("an archive in the output directory could not be unpacked").is_empty(),
+            "the probe's own gate must still admit the unpack failure"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

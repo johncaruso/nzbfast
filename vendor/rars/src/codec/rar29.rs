@@ -2680,6 +2680,32 @@ struct Huffman {
     // Primary decode LUT: top HUFF29_LUT_BITS of the stream -> packed
     // (symbol << 8) | code_len; 0 means longer-than-LUT or invalid.
     lut: Vec<u32>,
+    // Fallback for oversubscribed length tables, which old WinRAR 2.x
+    // encoders really emitted (junk lengths past the used alphabet).
+    // unrar never validates subscription, so these sets extract there;
+    // this mirrors its exact decode so they extract here too. `symbols`
+    // and `lut` stay empty in this mode, which keeps the burst fast
+    // paths (gated on a non-empty LUT) off this table.
+    tolerant: Option<Box<TolerantHuffman>>,
+}
+
+/// Bit-exact port of unrar's MakeDecodeTables/DecodeNumber pair, which
+/// tolerates oversubscribed tables instead of rejecting them: the
+/// left-aligned upper limits are 32-bit, so an oversubscribed length
+/// saturates past 0xffff and every wider code becomes unreachable
+/// (truncation, not an error). Out-of-range positions clamp to slot 0,
+/// as upstream does for damaged archives. Only built when strict
+/// canonical construction refuses the table; the member CRC still gates
+/// the output, so genuinely corrupt streams keep failing.
+#[derive(Debug, Clone)]
+struct TolerantHuffman {
+    // decode_len[len]: left-aligned (16-bit field space) upper limit for
+    // codes of `len` bits, cumulative, monotone; [0] = 0.
+    decode_len: [u32; 16],
+    // decode_pos[len]: first index in `decode_num` for codes of `len` bits.
+    decode_pos: [usize; 16],
+    // Alphabet numbers ordered by (code length, appearance order).
+    decode_num: Vec<u16>,
 }
 
 const HUFF29_LUT_BITS: usize = 12;
@@ -2699,6 +2725,7 @@ impl Huffman {
             first_index: [0; 16],
             counts: [0; 16],
             lut: Vec::new(),
+            tolerant: None,
         }
     }
 
@@ -2715,7 +2742,11 @@ impl Huffman {
         if count.iter().all(|&value| value == 0) {
             return Ok(Self::empty());
         }
-        validate_huffman_counts(&count)?;
+        if validate_huffman_counts(&count).is_err() {
+            let mut table = Self::empty();
+            table.tolerant = Some(Box::new(TolerantHuffman::from_lengths(lengths, &count)));
+            return Ok(table);
+        }
 
         let mut first_code = [0u16; 16];
         let mut next_code = [0u16; 16];
@@ -2759,10 +2790,14 @@ impl Huffman {
             first_index,
             counts: count,
             lut,
+            tolerant: None,
         })
     }
 
     fn decode(&self, bits: &mut BitReader) -> Result<usize> {
+        if let Some(tolerant) = &self.tolerant {
+            return tolerant.decode(bits);
+        }
         if self.symbols.is_empty() {
             return Err(Error::InvalidData("RAR 2.9 empty Huffman table"));
         }
@@ -2806,6 +2841,72 @@ impl Huffman {
             }
         }
         Err(Error::InvalidData("RAR 2.9 invalid Huffman code"))
+    }
+}
+
+impl TolerantHuffman {
+    fn from_lengths(lengths: &[u8], count: &[u16; 16]) -> Self {
+        let mut decode_len = [0u32; 16];
+        let mut decode_pos = [0usize; 16];
+        let mut upper_limit = 0u32;
+        for len in 1..16 {
+            upper_limit += u32::from(count[len]);
+            decode_len[len] = upper_limit << (16 - len);
+            upper_limit *= 2;
+            decode_pos[len] = decode_pos[len - 1] + usize::from(count[len - 1]);
+        }
+
+        // Alphabet-order walk, exactly like upstream: within a length,
+        // symbols keep their order of appearance. No sort by code - with
+        // an oversubscribed table the canonical codes wrap, and a sort
+        // keyed on them would reorder the list.
+        let mut decode_num = vec![0u16; lengths.len()];
+        let mut next_pos = decode_pos;
+        for (symbol, &len) in lengths.iter().enumerate() {
+            if len != 0 {
+                decode_num[next_pos[len as usize]] = symbol as u16;
+                next_pos[len as usize] += 1;
+            }
+        }
+        Self {
+            decode_len,
+            decode_pos,
+            decode_num,
+        }
+    }
+
+    fn decode(&self, bits: &mut BitReader) -> Result<usize> {
+        // Left-aligned 16-bit field with bit 0 clear (upstream masks with
+        // 0xfffe). Near the input tail, fewer than 15 bits may be
+        // buffered; the padded low bits never decide a comparison,
+        // because `decode_len[len]` is zero below bit 16-len, so the
+        // outcome at each length depends only on the top `len` real bits.
+        let avail = bits.available_bits().min(15);
+        if avail == 0 {
+            return Err(Error::NeedMoreInput);
+        }
+        let field = bits.peek_bits(avail as u8)? << (16 - avail);
+
+        let mut code_len = 15usize;
+        for len in 1..15 {
+            if field < self.decode_len[len] {
+                code_len = len;
+                break;
+            }
+        }
+        if code_len > avail {
+            return Err(Error::NeedMoreInput);
+        }
+        bits.consume(code_len as u8);
+
+        let dist = (field - self.decode_len[code_len - 1]) >> (16 - code_len);
+        let mut pos = self.decode_pos[code_len] + dist as usize;
+        // Out-of-bounds guard for damaged streams, as upstream: clamp to
+        // slot 0. The member CRC rejects the garbage output downstream.
+        if pos >= self.decode_num.len() {
+            pos = 0;
+        }
+        Ok(usize::from(self.decode_num[pos]))
     }
 }
 
@@ -2914,6 +3015,12 @@ impl BitReader {
         if partial != 0 {
             self.consume(partial);
         }
+    }
+
+    /// Bits buffered and not yet consumed (cache plus unread input).
+    #[inline]
+    fn available_bits(&self) -> usize {
+        (self.input.len() - self.byte_pos) * 8 + self.cache_bits as usize
     }
 
     fn peek_bit(&mut self) -> Result<u8> {
@@ -3339,11 +3446,67 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversubscribed_rar29_huffman_tables() {
-        assert!(matches!(
-            Huffman::from_lengths(&[1, 1, 1]),
-            Err(Error::InvalidData("RAR 2.9 oversubscribed Huffman table"))
-        ));
+    fn tolerates_oversubscribed_rar29_huffman_tables() {
+        // Old WinRAR 2.x encoders emit these; unrar truncates instead of
+        // erroring, and so do we (via the tolerant fallback table).
+        let table = Huffman::from_lengths(&[1, 1, 1]).unwrap();
+        assert!(table.tolerant.is_some());
+
+        // counts[1] = 3 saturates the 1-bit limit past 0xffff, so every
+        // bit field decodes as one of the two reachable 1-bit codes and
+        // the third symbol is unreachable, exactly as unrar behaves.
+        let mut bits = BitReader::from_bytes(&[0b0100_0000, 0]);
+        assert_eq!(table.decode(&mut bits).unwrap(), 0);
+        assert_eq!(bits.position(), 1);
+        assert_eq!(table.decode(&mut bits).unwrap(), 1);
+        assert_eq!(bits.position(), 2);
+    }
+
+    #[test]
+    fn oversubscribed_low_offset_shape_from_the_field_decodes_as_unrar() {
+        // The exact 17-symbol low-offset table shape from the 11 Aug soak
+        // set (Rapala WII): two 1-bit codes up front, then 15 junk
+        // lengths. unrar resolves every field at 1 bit; the junk symbols
+        // are unreachable.
+        let lengths: [u8; 17] = [1, 1, 3, 3, 4, 5, 6, 6, 7, 8, 9, 11, 12, 12, 14, 14, 14];
+        let table = Huffman::from_lengths(&lengths).unwrap();
+        assert!(table.tolerant.is_some());
+        for pattern in 0u16..=0xff {
+            let mut bits = BitReader::from_bytes(&[pattern as u8, 0]);
+            let symbol = table.decode(&mut bits).unwrap();
+            assert_eq!(bits.position(), 1);
+            assert_eq!(symbol, usize::from(pattern >> 7));
+        }
+    }
+
+    #[test]
+    fn tolerant_decode_matches_strict_for_the_reachable_code_space() {
+        // A complete table plus one phantom max-length entry (the classic
+        // junk-tail shape) must decode the real code space bit-for-bit
+        // like the strict table without the phantom.
+        let valid: [u8; 6] = [2, 2, 3, 3, 3, 3];
+        let mut padded = [0u8; 7];
+        padded[..6].copy_from_slice(&valid);
+        padded[6] = 15;
+
+        let strict = Huffman::from_lengths(&valid).unwrap();
+        let tolerant = Huffman::from_lengths(&padded).unwrap();
+        assert!(strict.tolerant.is_none());
+        assert!(tolerant.tolerant.is_some());
+
+        for pattern in 0u16..=0xffff {
+            let input = pattern.to_be_bytes();
+            let mut strict_bits = BitReader::from_bytes(&input);
+            let mut tolerant_bits = BitReader::from_bytes(&input);
+            let strict_symbol = strict.decode(&mut strict_bits).unwrap();
+            let tolerant_symbol = tolerant.decode(&mut tolerant_bits).unwrap();
+            assert_eq!(strict_symbol, tolerant_symbol, "pattern {pattern:#06x}");
+            assert_eq!(
+                strict_bits.position(),
+                tolerant_bits.position(),
+                "pattern {pattern:#06x}"
+            );
+        }
     }
 
     #[test]

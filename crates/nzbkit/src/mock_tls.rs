@@ -307,7 +307,25 @@ async fn pump(
             Some(limit) if sent + n as u64 >= limit => (limit - sent) as usize,
             _ => n,
         };
+        // `write_all` is NOT delivery on a TLS stream, and the whole
+        // stall class this rig produced lives in that gap. tokio-rustls'
+        // `poll_write` accepts plaintext into the rustls session and
+        // then flushes what it can; when the socket write would block it
+        // returns `Ok(n)` for the plaintext it TOOK while the ciphertext
+        // tail stays queued in `sendable_tls`. `write_all` sees every
+        // byte consumed and returns happy, and nothing drains that queue
+        // until the next write - so a relay that goes straight back to
+        // `br.read()` and parks there (the mock has finished the body it
+        // was serving) strands the end of an article inside the front.
+        // The client is then waiting on a session carrying NO injected
+        // fault, and only its flat 30 s `read_timeout` ends it - which is
+        // exactly the `ends.stall` seen on windows-unit, where a loopback
+        // write really can block and a mac/Linux one at these sizes
+        // essentially never does. Flush before parking.
         if cw.write_all(&buf[..take]).await.is_err() {
+            break;
+        }
+        if cw.flush().await.is_err() {
             break;
         }
         sent += take as u64;

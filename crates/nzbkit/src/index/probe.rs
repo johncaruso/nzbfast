@@ -29,8 +29,8 @@ const RETRY_SECS: i64 = 21_600;
 #[derive(Debug, Clone)]
 pub struct ProbeCandidate {
     pub id: i64,
-    pub stem: String,
-    pub total_bytes: i64,
+    pub(crate) stem: String,
+    pub(crate) total_bytes: i64,
 }
 
 /// One file row of a candidate, segments decoded and msgids normalized

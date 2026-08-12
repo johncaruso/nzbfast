@@ -47,7 +47,7 @@ pub struct StreamCrypt {
     pub(super) key: rarcrypt::AesKey,
     pub(super) iv: [u8; 16],
     /// On-disk ciphertext length = align16(plain_len).
-    pub cipher_len: u64,
+    pub(crate) cipher_len: u64,
     /// Plaintext length the reader exposes (Content-Length).
     pub plain_len: u64,
     pub(super) st: Arc<StreamState>,
@@ -1332,6 +1332,14 @@ impl Extractor {
         inner.slots[slot]
             .holds
             .push((offset, HoldSpan::Ram(data.to_vec())));
+        // Parked ciphertext is cold until a probe hit or finish, so it
+        // pages to scratch beyond a small window instead of riding RAM
+        // to the holds cap (see `pw_await_spill`). A probe hit re-feeds
+        // paged spans off disk through `reclaim_span`, and the finish
+        // demote materializes them into volumes the same way.
+        if inner.budget.len() > pw_await_spill(inner.budget.cap()) {
+            self.page_pw_holds(inner, slot);
+        }
         if inner.budget.over() && !self.page_out_holds(inner) {
             // Same arbiter as every other hold. Demote with the ORIGINAL
             // blocker's reason so the finish ladder's remediation (the
@@ -1487,9 +1495,20 @@ impl Extractor {
         // is `Store && !encrypted`, so an encrypted entry never reached
         // it. Assembling ciphertext instead costs nothing: the volumes
         // stay byte-exact and can still materialize, and the disk path
-        // verifies the BLAKE2sp properly. nzbkit has no BLAKE2sp of its
-        // own, so verifying in place is not an option here.
-        if e.hash.is_some() && e.file_crc.is_none() {
+        // verifies the BLAKE2sp properly (`verify_integrity_with_keys`).
+        // nzbkit has no BLAKE2sp of its own, so verifying in place is not
+        // an option here.
+        //
+        // Asked of the whole FILE across the group, not of the fragment in
+        // front of us: only the tail fragment carries the whole-file
+        // checks, so reading them off a head answered "allowed" for a
+        // split hash-only set. That alone would be caught at finish, but
+        // the two fragments then disagreed - one route each for one output
+        // - and a half-plaintext file cannot be turned back into byte-exact
+        // volumes by the fallback shim. One answer per file keeps the route
+        // consistent whichever volume is mapped first (Codex sweep 12 Aug
+        // F2, extended).
+        if Self::hash_only_file(inner, slot, &e.name) {
             return false;
         }
         let Some(c) = e.crypt.as_ref() else {
@@ -1507,6 +1526,43 @@ impl Extractor {
         // again and again under the routing lock.
         let Some(r5) = c.rar5() else { return false };
         r5.check.is_some() && c.derive(pw).is_some_and(|keys| c.check_verifies(&keys))
+    }
+
+    /// Does this inner FILE state a plaintext digest and no CRC32?
+    ///
+    /// Every fragment of `name` in this slot's group is consulted, because
+    /// the whole-file checks live on the tail fragment alone and the answer
+    /// has to be the same for all of them - see the caller. Fragments that
+    /// have not arrived yet cannot contribute, which is why
+    /// `decrypt_finished` re-asks once the set is complete.
+    fn hash_only_file(inner: &Inner, slot: usize, name: &str) -> bool {
+        let mut any_hash = false;
+        let mut any_crc = false;
+        let mut scan = |m: &VolumeMapper| {
+            for e in m.entries.iter().filter(|e| e.name == name) {
+                any_hash |= e.hash.is_some();
+                any_crc |= e.file_crc.is_some();
+            }
+        };
+        match inner.slots[slot]
+            .group
+            .as_ref()
+            .and_then(|gk| inner.groups.get(gk))
+        {
+            Some(g) => {
+                for &si in &g.slots {
+                    if let Some(m) = inner.slots[si].mapper.as_ref() {
+                        scan(m);
+                    }
+                }
+            }
+            None => {
+                if let Some(m) = inner.slots[slot].mapper.as_ref() {
+                    scan(m);
+                }
+            }
+        }
+        any_hash && !any_crc
     }
 
     pub(super) fn crypto_for(
@@ -1724,6 +1780,11 @@ impl Extractor {
             /// password is simply the wrong one, and the ciphertext (=
             /// the volume bytes) is untouched.
             verified: bool,
+            /// The entry states a plaintext digest (FHEXTRA_HASH) and NO
+            /// CRC32 - `rar a -htb`. There is nothing this pass can check
+            /// such an output against, so it never publishes one; see the
+            /// demotion filter below.
+            hash_only: bool,
         }
         // Scratch from a killed earlier run. This pass is the only thing
         // that creates these names and every write of the job has landed
@@ -1749,7 +1810,7 @@ impl Extractor {
                 }
                 // One decrypt job per inner file, keyed off its head piece
                 // (split_before == false - whose IV starts the stream).
-                let mut heads: HashMap<String, (EntryCrypt, u64, String, Option<u32>)> =
+                let mut heads: HashMap<String, (EntryCrypt, u64, String, Option<u32>, bool)> =
                     HashMap::new();
                 // The WHOLE-FILE checksum lives on the entry's LAST piece
                 // (`split_after == false`) - per the RAR5 spec, earlier
@@ -1759,6 +1820,10 @@ impl Extractor {
                 // no verifiable checksum at all. By finish every volume
                 // has arrived, so the tail is simply here to be read.
                 let mut tail_crcs: HashMap<&str, u32> = HashMap::new();
+                // ...and, from the same piece, whether the entry states a
+                // digest instead of a CRC32. Read off the TAIL for the same
+                // reason: the whole-file checks live there.
+                let mut tail_hash_only: std::collections::HashSet<&str> = Default::default();
                 for &si in &grp.slots {
                     let Some(m) = inner.slots[si].mapper.as_ref() else {
                         continue;
@@ -1767,10 +1832,16 @@ impl Extractor {
                         if e.is_dir || !e.encrypted {
                             continue;
                         }
-                        if !e.split_after
-                            && let Some(crc) = e.file_crc
-                        {
-                            tail_crcs.insert(e.name.as_str(), crc);
+                        if !e.split_after {
+                            match e.file_crc {
+                                Some(crc) => {
+                                    tail_crcs.insert(e.name.as_str(), crc);
+                                }
+                                None if e.hash.is_some() => {
+                                    tail_hash_only.insert(e.name.as_str());
+                                }
+                                None => {}
+                            }
                         }
                     }
                 }
@@ -1798,16 +1869,19 @@ impl Extractor {
                             // would false-fail - it describes only that
                             // volume's bytes.
                             let whole_crc = tail_crcs.get(e.name.as_str()).copied();
+                            let hash_only =
+                                whole_crc.is_none() && tail_hash_only.contains(e.name.as_str());
                             heads.entry(e.name.clone()).or_insert((
                                 c.clone(),
                                 e.unpacked_size,
                                 out,
                                 whole_crc,
+                                hash_only,
                             ));
                         }
                     }
                 }
-                for (_fname, (c, unp, out, file_crc)) in heads {
+                for (_fname, (c, unp, out, file_crc, hash_only)) in heads {
                     let Some(w) = inner.inner_writers.get(&out) else {
                         continue;
                     };
@@ -1825,7 +1899,26 @@ impl Extractor {
                                 "encrypted RAR file failed its stored CRC after decryption",
                             ));
                         }
-                        if unp == 0 || cs.complete() {
+                        // The hash-only backstop, and the only ORDER-
+                        // INDEPENDENT place to put it.
+                        // `instream_decrypt_allowed` vetoes this shape from
+                        // the entry in front of it, which is right for an
+                        // unsplit file and blind for a split one: only the
+                        // TAIL fragment carries the whole-file checks, so a
+                        // head reading `hash: None, file_crc: None`
+                        // answered "allowed" and latched the plaintext-once
+                        // route for the whole file (`crypto_files` caches by
+                        // output name, first decision wins). Whether that
+                        // happened therefore depended on which volume was
+                        // mapped first - and when it did, plaintext was
+                        // published with no integrity verdict at all. By
+                        // finish every volume is mapped, so `hash_only` is
+                        // the truth: demote exactly as an incomplete cipher
+                        // record does, and the shim reproduces the posted
+                        // bytes for the fallback (Codex sweep 12 Aug F2).
+                        if unp > 0 && hash_only {
+                            instream_failed.insert(key.clone());
+                        } else if unp == 0 || cs.complete() {
                             instream_done.push(out);
                         } else {
                             instream_failed.insert(key.clone());
@@ -1850,6 +1943,7 @@ impl Extractor {
                         // not that every ciphertext block survived the wire.
                         expect_crc: aes.as_ref().and_then(|k| crc_gate(file_crc, &c, k)),
                         verified: aes.as_ref().is_some_and(|k| c.check_verifies(k)),
+                        hash_only,
                         crypt: c,
                     });
                 }
@@ -1875,8 +1969,27 @@ impl Extractor {
             // materialize and the disk path (which validates the password
             // itself) takes over, exactly where the mapper used to send
             // this set the moment it saw a missing check.
+            //
+            // `hash_only` is the same rule for the shape that DOES have a
+            // plaintext check we cannot compute. `instream_decrypt_allowed`
+            // diverts a `rar a -htb` entry (BLAKE2sp, no CRC32) here
+            // explicitly so "the disk path verifies the BLAKE2sp properly"
+            // - but nothing demoted it, so it arrived `verified = true,
+            // expect_crc = None`, sailed past the filter above, and
+            // published plaintext with NO integrity check. A verified RAR5
+            // password proves the KEY, never that every ciphertext block
+            // survived the wire: damage one before the yEnc/PAR2 pass and
+            // every outer check agrees while the payload is corrupt (Codex
+            // sweep 12 Aug F2). rars checks the keyed digest on the disk
+            // path (`verify_integrity_with_keys`), which is the verdict
+            // this pass has no BLAKE2sp of its own to reach. A zero-length
+            // entry has no plaintext to check and must not drag its group
+            // to disk over it.
             .filter(|j| {
-                j.key_bytes.is_none() || !j.covered || (!j.verified && j.expect_crc.is_none())
+                j.key_bytes.is_none()
+                    || !j.covered
+                    || (!j.verified && j.expect_crc.is_none())
+                    || (j.hash_only && j.unp > 0)
             })
             .map(|j| j.key.clone())
             .collect();

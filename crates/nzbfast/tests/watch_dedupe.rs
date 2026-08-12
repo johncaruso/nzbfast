@@ -312,15 +312,27 @@ fn recursive_watch_uses_the_first_subfolder_as_the_category() {
         !tv.join("show.nzb").exists(),
         "the subfolder file should have been ingested\n{log}"
     );
+    // The job may be in the QUEUE or already in HISTORY when we look:
+    // this config has no servers, so the runner's next pick (a 500 ms
+    // tick) dials, fails the job with "config has no servers" and parks
+    // it to .spool/history.jsonl - queue.json then holds an empty queue
+    // array. The category rides the record to history unchanged, so
+    // read both; on a fast box the park wins the race often enough to
+    // flake CI (seen on windows-unit as "got []").
     let queued: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join(".spool/queue.json")).unwrap())
             .unwrap();
-    let cats: Vec<String> = queued["queue"]
+    let mut cats: Vec<String> = queued["queue"]
         .as_array()
         .unwrap()
         .iter()
         .map(|j| j["category"].as_str().unwrap_or_default().to_string())
         .collect();
+    let hist = std::fs::read_to_string(dir.join(".spool/history.jsonl")).unwrap_or_default();
+    cats.extend(hist.lines().filter_map(|l| {
+        let j: serde_json::Value = serde_json::from_str(l).ok()?;
+        Some(j["category"].as_str().unwrap_or_default().to_string())
+    }));
     assert!(
         cats.contains(&"tv".to_string()),
         "the job's category should be the subfolder name, got {cats:?}\n--- log ---\n{}",

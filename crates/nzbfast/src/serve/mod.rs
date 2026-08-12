@@ -19,6 +19,12 @@ use tracing::{error, info, warn};
 mod job;
 pub use job::*;
 
+// The idle-server prefetch sidecar, moved out of job.rs by TODO 106. A
+// sibling rather than a child of `job`, so `pub(super)` still reads "pub
+// in serve" and no call site moved.
+mod sidecar;
+pub use sidecar::*;
+
 /// Default for the "fast par mode" setting (`fast_par`). ON since
 /// 2026-07-31: the verify-failure fold retry makes wrong
 /// output impossible to ship, the trip-breaker and this setting cover
@@ -229,6 +235,10 @@ use settings::*;
 
 mod watchlist;
 use watchlist::*;
+
+// TODO 151 (issue #36): external list sources feeding the watchlist.
+mod listsrc;
+use listsrc::*;
 
 mod servers;
 use servers::*;
@@ -706,6 +716,13 @@ mod stop_seam_tests {
 mod http;
 mod stream;
 use stream::*;
+
+// §73 phase 3: the remux half of the preview player. Its own file
+// because it is a second byte-serving path with a different contract -
+// chunked, no ranges, and a body that can say "not yet" - and reading it
+// beside /stream's is how the two stay honestly different.
+mod preview;
+use preview::*;
 
 mod httputil;
 use httputil::*;

@@ -59,6 +59,14 @@ starts from valid inputs and reaches the decode paths fast:
     # suite writes them out on request:
     NZBFAST_WRITE_FUZZ_SEEDS=$PWD/corpus/mediaprobe \
       cargo test -p nzbkit --test mediaprobe write_fuzz_seeds
+    # `remux` walks the same containers a layer deeper (sample tables,
+    # block lacing), so it wants the same seeds. The two fixtures that
+    # actually carry payload - mkv_remux, mp4_remux - are the ones that
+    # reach the sample walk at all; the header-only ones stop at track
+    # selection, which is worth fuzzing but is not where the arithmetic
+    # is.
+    NZBFAST_WRITE_FUZZ_SEEDS=$PWD/corpus/remux \
+      cargo test -p nzbkit --test mediaprobe write_fuzz_seeds
     # rar_recovery_scan needs CRC-valid headers to get past its first gate,
     # so seed it with real .rev volumes and RR-bearing archives.
     cp ../../../vendor/rars/tests/fixtures/rar*/**/*.rev \

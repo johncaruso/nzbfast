@@ -103,6 +103,189 @@ impl StallTracker {
     }
 }
 
+/// One watchdog tick's OBSERVATION half: copy any provider refusal
+/// somewhere that outlives the pool, warn once per server-outage
+/// episode, and open/clear the transfer-stall episode for the active
+/// fetch. Split out of `spawn_slow_job_watchdog` (size gate) - it is
+/// the half that runs unconditionally, BEFORE the auto-defer and
+/// prefetch gates, and nothing in it escapes the caller's loop.
+///
+/// `stall` and `outage_noted` carry episode state across ticks, so
+/// they are borrowed rather than rebuilt: both exist precisely to
+/// fire on the EDGE, and a fresh one every tick would log forever.
+fn observe_transfer_and_outages(
+    d: &Arc<Daemon>,
+    stall: &mut StallTracker,
+    outage_noted: &mut std::collections::HashMap<String, u64>,
+) {
+    // The fetch being observed: hub owner, Downloading, not
+    // pause-suspended (a pause legitimately stops bytes).
+    let fetching = d
+        .started_at
+        .lock_ok()
+        .is_some()
+        .then(|| d.active_stream.lock_ok().clone())
+        .flatten();
+    let job_info = fetching.and_then(|id| {
+        d.queue.lock_ok().iter().find_map(|j| {
+            let g = j.lock_ok();
+            (g.nzo_id == id && g.state == JobState::Downloading && !g.suspended)
+                .then(|| (id.clone(), g.name.clone()))
+        })
+    });
+    // Per-server (host, connections, bytes, refused) - the
+    // states the episode lines report.
+    let servers: Vec<(String, usize, u64, bool)> = d
+        .hub
+        .pool_live
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|l| {
+            l.servers
+                .iter()
+                .map(|s| {
+                    (
+                        s.host.clone(),
+                        s.connected.load(Ordering::Relaxed),
+                        s.bytes.load(Ordering::Relaxed),
+                        s.refusal.lock_ok().is_some(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // §G: copy any refusal somewhere that outlives the pool.
+    // The Providers card reads it from the live pool, which
+    // is gone the moment the queue drains - so the one
+    // sentence explaining why a paid-for provider did
+    // nothing disappeared exactly when the user went looking
+    // for it. Sampled here rather than in the stats handler
+    // because a headless run has no dashboard polling it.
+    //
+    // The clear arm is deliberately "moved bytes or holds a
+    // connection", not "has no refusal right now": every
+    // server starts each job with an empty refusal slot, so
+    // clearing on that alone would wipe the record a second
+    // after the next job began and refill it a second later.
+    // Bytes or a live connection are proof it authenticated.
+    {
+        let live = d.hub.pool_live.lock_ok();
+        if let Some(l) = live.as_ref() {
+            let mut keep = d.last_refusals.lock_ok();
+            for s in &l.servers {
+                if let Some(r) = s.refusal.lock_ok().as_ref() {
+                    keep.insert(
+                        s.host.clone(),
+                        ServerRefusal {
+                            permanent: r.permanent,
+                            line: r.line.clone(),
+                            at: unix_now(),
+                        },
+                    );
+                } else if s.connected.load(Ordering::Relaxed) > 0
+                    || s.bytes.load(Ordering::Relaxed) > 0
+                {
+                    keep.remove(&s.host);
+                }
+            }
+        }
+    }
+    // Servers granting nothing right now. The `warn!` below
+    // is the first thing anywhere that says a provider is
+    // dead WHILE the job that needs it is still running -
+    // the census line that named one only ever printed in
+    // the diagnostics block of a job that FINISHED, which a
+    // job wedged behind that provider never reaches.
+    let outages = server_outages(d);
+    {
+        let win = server_down_secs();
+        for o in &outages {
+            if o.secs < win {
+                continue;
+            }
+            // Keyed by when the episode STARTED, so a
+            // server that recovers and dies again is warned
+            // about twice and one that stays down once.
+            if outage_noted.get(&o.host) == Some(&o.since_ms) {
+                continue;
+            }
+            outage_noted.insert(o.host.clone(), o.since_ms);
+            let what = match o.kind {
+                "refused" => "it rejected the sign-in",
+                "capacity" => "it is at a connection or IP cap",
+                _ => "unreachable",
+            };
+            warn!(
+                target: "pool",
+                "{}: no usable connection for {}s ({what}: {}) - \
+                 any article only this server carries is waiting on it",
+                o.host, o.secs, o.detail
+            );
+        }
+        // Servers that came back drop out of the map, so the
+        // next outage is a fresh episode and the map cannot
+        // grow past the configured server count.
+        outage_noted.retain(|h, _| outages.iter().any(|o| &o.host == h));
+    }
+    let states = || -> String {
+        if servers.is_empty() {
+            return "pool not up yet".into();
+        }
+        servers
+            .iter()
+            .map(|(h, c, _, r)| {
+                // A named outage outranks both: "0 conn"
+                // reads like a worker mid-redial, which is
+                // exactly what a dead provider is not.
+                if let Some(o) = outages.iter().find(|o| &o.host == h) {
+                    format!("{h} down {}s ({})", o.secs, o.kind)
+                } else if *r {
+                    format!("{h} refused")
+                } else {
+                    format!("{h} {c} conn")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let total: u64 = servers.iter().map(|(_, _, b, _)| *b).sum();
+    let name = job_info
+        .as_ref()
+        .map(|(_, n)| n.clone())
+        .unwrap_or_default();
+    match stall.observe(
+        Instant::now(),
+        job_info.as_ref().map(|(i, n)| (i.as_str(), n.as_str())),
+        total,
+    ) {
+        Some(StallEvent::Opened { idle_secs, since }) => {
+            info!(
+                target: "stall",
+                "no data for {idle_secs}s on {name}; servers: {}",
+                states()
+            );
+            *d.stall_since.lock_ok() = job_info.as_ref().map(|(i, _)| (i.clone(), since));
+        }
+        Some(StallEvent::Cleared { idle_secs }) => {
+            info!(
+                target: "stall",
+                "data flowing again on {name} after {idle_secs}s; servers: {}",
+                states()
+            );
+            *d.stall_since.lock_ok() = None;
+        }
+        Some(StallEvent::Ended { idle_secs, name }) => {
+            info!(
+                target: "stall",
+                "stall on {name} not resolved after {idle_secs}s (job ended)"
+            );
+            *d.stall_since.lock_ok() = None;
+        }
+        None => {}
+    }
+}
+
 /// Slow-job watchdog (auto-defer + idle-server prefetch): a queue
 /// shouldn't sit behind one job whose articles live only on one slow
 /// server. Over a rolling window of per-server byte deltas:
@@ -165,135 +348,16 @@ pub(in crate::serve) fn spawn_slow_job_watchdog(
             "NZBFAST_STALL_LOG_SECS",
             10,
         )));
+        // Server-outage episodes already warned about, host -> the
+        // `down_since` stamp that was warned. A stamp is per episode by
+        // construction (the gauge clears on the first granted session),
+        // so this warns once per outage per server rather than once per
+        // tick - and warns AGAIN if the server comes back and dies
+        // again, which is a different fact worth a line.
+        let mut outage_noted: std::collections::HashMap<String, u64> = Default::default();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(tick)).await;
-            {
-                // The fetch being observed: hub owner, Downloading, not
-                // pause-suspended (a pause legitimately stops bytes).
-                let fetching = d
-                    .started_at
-                    .lock_ok()
-                    .is_some()
-                    .then(|| d.active_stream.lock_ok().clone())
-                    .flatten();
-                let job_info = fetching.and_then(|id| {
-                    d.queue.lock_ok().iter().find_map(|j| {
-                        let g = j.lock_ok();
-                        (g.nzo_id == id && g.state == JobState::Downloading && !g.suspended)
-                            .then(|| (id.clone(), g.name.clone()))
-                    })
-                });
-                // Per-server (host, connections, bytes, refused) - the
-                // states the episode lines report.
-                let servers: Vec<(String, usize, u64, bool)> = d
-                    .hub
-                    .pool_live
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|l| {
-                        l.servers
-                            .iter()
-                            .map(|s| {
-                                (
-                                    s.host.clone(),
-                                    s.connected.load(Ordering::Relaxed),
-                                    s.bytes.load(Ordering::Relaxed),
-                                    s.refusal.lock_ok().is_some(),
-                                )
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                // §G: copy any refusal somewhere that outlives the pool.
-                // The Providers card reads it from the live pool, which
-                // is gone the moment the queue drains - so the one
-                // sentence explaining why a paid-for provider did
-                // nothing disappeared exactly when the user went looking
-                // for it. Sampled here rather than in the stats handler
-                // because a headless run has no dashboard polling it.
-                //
-                // The clear arm is deliberately "moved bytes or holds a
-                // connection", not "has no refusal right now": every
-                // server starts each job with an empty refusal slot, so
-                // clearing on that alone would wipe the record a second
-                // after the next job began and refill it a second later.
-                // Bytes or a live connection are proof it authenticated.
-                {
-                    let live = d.hub.pool_live.lock_ok();
-                    if let Some(l) = live.as_ref() {
-                        let mut keep = d.last_refusals.lock_ok();
-                        for s in &l.servers {
-                            if let Some(r) = s.refusal.lock_ok().as_ref() {
-                                keep.insert(
-                                    s.host.clone(),
-                                    ServerRefusal {
-                                        permanent: r.permanent,
-                                        line: r.line.clone(),
-                                        at: unix_now(),
-                                    },
-                                );
-                            } else if s.connected.load(Ordering::Relaxed) > 0
-                                || s.bytes.load(Ordering::Relaxed) > 0
-                            {
-                                keep.remove(&s.host);
-                            }
-                        }
-                    }
-                }
-                let states = || -> String {
-                    if servers.is_empty() {
-                        return "pool not up yet".into();
-                    }
-                    servers
-                        .iter()
-                        .map(|(h, c, _, r)| {
-                            if *r {
-                                format!("{h} refused")
-                            } else {
-                                format!("{h} {c} conn")
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                let total: u64 = servers.iter().map(|(_, _, b, _)| *b).sum();
-                let name = job_info
-                    .as_ref()
-                    .map(|(_, n)| n.clone())
-                    .unwrap_or_default();
-                match stall.observe(
-                    Instant::now(),
-                    job_info.as_ref().map(|(i, n)| (i.as_str(), n.as_str())),
-                    total,
-                ) {
-                    Some(StallEvent::Opened { idle_secs, since }) => {
-                        info!(
-                            target: "stall",
-                            "no data for {idle_secs}s on {name}; servers: {}",
-                            states()
-                        );
-                        *d.stall_since.lock_ok() =
-                            job_info.as_ref().map(|(i, _)| (i.clone(), since));
-                    }
-                    Some(StallEvent::Cleared { idle_secs }) => {
-                        info!(
-                            target: "stall",
-                            "data flowing again on {name} after {idle_secs}s; servers: {}",
-                            states()
-                        );
-                        *d.stall_since.lock_ok() = None;
-                    }
-                    Some(StallEvent::Ended { idle_secs, name }) => {
-                        info!(
-                            target: "stall",
-                            "stall on {name} not resolved after {idle_secs}s (job ended)"
-                        );
-                        *d.stall_since.lock_ok() = None;
-                    }
-                    None => {}
-                }
-            }
+            observe_transfer_and_outages(&d, &mut stall, &mut outage_noted);
             if !d.auto_defer.load(Ordering::Relaxed) && !d.auto_prefetch.load(Ordering::Relaxed) {
                 win.clear();
                 continue;
@@ -401,6 +465,60 @@ pub(in crate::serve) fn spawn_slow_job_watchdog(
                     .as_ref()
                     .and_then(|c| c.tail_pending())
                     .is_some_and(|p| p > 0);
+            // ---- Wedged behind a dead server: defer and move on.
+            //
+            // "A wholly stalled job is the pool's retry logic's problem"
+            // (below) is true of a job whose articles are 430ing their
+            // way through a refusal ladder - that is real progress with
+            // no bytes to show for it. It is NOT true when a configured
+            // server has been granting no connection at all for the
+            // whole window: the pool is waiting on a socket, the retry
+            // logic has nothing to retry, and the whole QUEUE sits
+            // behind one job that cannot move. That case reached the
+            // `total == 0` bail below and stopped there, which is how
+            // two soak jobs held the queue for 25 minutes (11->12 Aug).
+            //
+            // Deferring is cheap and reversible: the journal keeps every
+            // landed article, `pick_job` runs a deferred job whenever
+            // nothing else is available, and if the whole queue is
+            // deferred it comes straight back. `others_waiting` is the
+            // point - with nothing else to run, sitting here is right.
+            if total == 0
+                && d.auto_defer.load(Ordering::Relaxed)
+                && now.duration_since(t0).as_secs() >= warmup
+                && defer_count < 3
+                && d.sidecar.lock_ok().as_ref().is_none_or(|s| s.borrowed)
+                && let Some(o) = server_outages(&d)
+                    .into_iter()
+                    .find(|o| o.secs >= span as u64 && o.secs >= server_down_secs())
+            {
+                let others_waiting = d.queue.lock_ok().iter().any(|j| {
+                    let g = j.lock_ok();
+                    g.state == JobState::Queued && !g.paused && !g.deferred
+                });
+                if others_waiting {
+                    let reason = format!(
+                        "{} has had no usable connection for {}s ({}) and nothing \
+                         has arrived for {:.0}s - the articles this job still needs \
+                         are only on that server",
+                        o.host, o.secs, o.kind, span
+                    );
+                    {
+                        let mut g = job.lock_ok();
+                        g.demote = true;
+                        g.defer_reason = reason.clone();
+                    }
+                    info!(target: "defer", "{id}: {reason} - moving to the back of the queue");
+                    if let Some(f) = d.hub.abort.lock_ok().as_ref() {
+                        f.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(c) = d.hub.queue_ctl.lock_ok().as_ref() {
+                        c.abort();
+                    }
+                    win.clear();
+                    continue;
+                }
+            }
             // A wholly stalled job is the pool's retry logic's
             // problem, and a single-server setup has nothing to
             // route around. (Unless the tail override is live: a dry

@@ -55,6 +55,10 @@ impl HoldsBudget {
     pub(super) fn peak(&self) -> usize {
         self.peak.load(Ordering::Relaxed)
     }
+
+    pub(super) fn len(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
 }
 
 /// One held span's bytes: in RAM (charging [`HoldsBudget`]) or paged out
@@ -347,9 +351,55 @@ pub(super) fn holds_page_env_off() -> bool {
 /// segment within the first round-trips (M3 scheduling), so real holds
 /// stay a few articles deep; an NZB with synthesized segment numbering
 /// never delivers offset 0 early and would pile the whole file here.
-/// A quarter of the holds slice, clamped [4 MB, 64 MB] - far above any
-/// legitimate out-of-order depth, far below "the entire download in RAM".
+/// A quarter of the holds slice, floored at 4 MB.
+///
+/// The ceiling scales with the budget on purpose - it used to be a flat
+/// 64 MB, and that flat number was a 3x I/O bug on damaged jobs
+/// (bench settle round, 11 Aug 2026, a big-RAM desktop against five
+/// real backbones): one RAR volume whose offset-0
+/// article ran late spilled to Plain at 64 MB against a 7.7 GB holds
+/// slice, and a damaged-but-unmapped file makes `try_mapped_repair`
+/// decline the WHOLE set - every volume then materialized for a
+/// disk-fed repair + re-extract pass (~18 GB of disk traffic for a
+/// 6.5 GB post, at 96% free budget). A box with gigabytes of holds
+/// room should ride out a late sniff; a small-RAM box keeps today's
+/// early spill because its budget slice is small, and a global breach
+/// still pages to scratch (or demotes) exactly as before.
 pub(super) fn unclassified_spill(holds_cap: usize) -> usize {
+    (holds_cap / 4).max(4 << 20)
+}
+
+/// Chain-wide RAM window for spans parked while a password probe may
+/// still rescue their slot (`pw_await`). Parked ciphertext is cold by
+/// construction - nothing reads it until a probe hit or finish - so it
+/// must not ride RAM up to the holds cap: a header-encrypted set with
+/// no password parks its ENTIRE payload, and on a big-RAM box the 45%
+/// budget slice let a 1.6 GB set sit fully resident (the 2026-08-10
+/// bench's peak-RSS outlier). The 64 MB ceiling is deliberate and must
+/// scale with NOTHING: unlike a late-sniff hold, paging parked spans
+/// never costs the set its one-pass rescue (a probe hit re-feeds them
+/// from scratch), so a bigger budget buys no reason to keep more of
+/// them resident.
+pub(super) fn pw_await_spill(holds_cap: usize) -> usize {
+    (holds_cap / 4).clamp(4 << 20, 64 << 20)
+}
+
+/// Chain-wide RAM window for a chased RAR set once the job has articles
+/// with TERMINAL verdicts (430 everywhere, out of retention, transport
+/// dead). The sequential decode wedges at the first unfillable gap, so
+/// every frontier byte beyond it is as cold as parked ciphertext - the
+/// pw_await argument exactly - yet it used to ride RAM to the holds cap:
+/// 45% of a big box's budget let a damaged 3.5 GB compressed set sit
+/// fully resident for the whole download (the 11 Aug 2026 soak's RSS
+/// stair). Beyond this window the cold spans page to the holds scratch
+/// ([`Extractor::page_stalled_chase`]); a gap that later fills (retry,
+/// PAR2 repair) reads them back through the frontier buffer's paged
+/// serving, and a demote materializes volumes from scratch byte-exact.
+/// Same deliberate non-scaling ceiling as [`pw_await_spill`], for the
+/// same reason: paging cold chase bytes never costs the set anything
+/// but preads on the rescue path, so a bigger budget buys no reason to
+/// keep more of them resident.
+pub(super) fn chase_stall_spill(holds_cap: usize) -> usize {
     (holds_cap / 4).clamp(4 << 20, 64 << 20)
 }
 
@@ -461,6 +511,64 @@ impl Extractor {
             println!("💾 held spans over the RAM cap - paging to scratch, set stays one-pass");
         }
         !budget.over()
+    }
+
+    /// Page password-parked slots' RAM spans to scratch, down to the
+    /// [`pw_await_spill`] window. Unlike [`Self::page_out_holds`] this
+    /// is not budget-breach relief - parked ciphertext goes to disk
+    /// long before the cap, keeping a password-less set's resident
+    /// footprint at the window instead of the payload. A refusal (gate
+    /// off, ceiling, scratch death) leaves spans in RAM, where the cap
+    /// arbiter still stands exactly as before.
+    ///
+    /// `first` is the slot that just parked: it is walked before the
+    /// others, newest span first, so the steady state (budget hovering
+    /// at the window) pages exactly the arriving span and stops -
+    /// without that ordering, every park rescans the thousands of
+    /// already-paged spans of a large set, and the per-article cost
+    /// goes quadratic in the payload.
+    pub(super) fn page_pw_holds(&self, inner: &mut Inner, first: usize) {
+        if !inner.holds_page_on {
+            return;
+        }
+        let budget = inner.budget.clone();
+        let scratch = inner.scratch.clone();
+        let cap = match scratch.cap.load(Ordering::Relaxed) {
+            0 => 4 * budget.cap() as u64,
+            c => c,
+        };
+        let window = pw_await_spill(budget.cap());
+        let mut paged_any = false;
+        let order: Vec<usize> = std::iter::once(first)
+            .chain((0..inner.slots.len()).filter(|&si| si != first))
+            .collect();
+        'outer: for si in order {
+            if inner.slots[si].pw_await.is_none() {
+                continue;
+            }
+            let s = &mut inner.slots[si];
+            for store in [&mut s.holds, &mut s.header_spans] {
+                for (_, span) in store.iter_mut().rev() {
+                    let HoldSpan::Ram(bytes) = span else { continue };
+                    if bytes.len() < HOLDS_PAGE_MIN {
+                        continue;
+                    }
+                    let Some(off) = scratch.append(bytes, cap) else {
+                        break 'outer;
+                    };
+                    let len = bytes.len();
+                    budget.sub(len);
+                    *span = HoldSpan::Paged { off, len };
+                    paged_any = true;
+                    if budget.len() <= window {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if paged_any && !scratch.announced.swap(true, Ordering::Relaxed) {
+            println!("🔒 spans parked for a password are paging to scratch");
+        }
     }
 
     /// Take one held span's bytes back into RAM, releasing whichever
@@ -998,6 +1106,79 @@ mod tests {
             "materialized volume must be byte-identical"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The unclassified ceiling scales with the holds budget (the
+    /// 11 Aug 2026 settle-round 3x-I/O bug): a RAR volume whose
+    /// offset-0 article runs late must NOT spill to Plain at a flat
+    /// 64 MB while the budget has gigabytes free - it holds, sniffs on
+    /// the late head, and the set still extracts one-pass with no
+    /// volume file ever touching disk. The small-budget spill is
+    /// pinned by `unclassified_slot_spills_to_plain_before_sniff`
+    /// above, which is the degradation this must not disturb.
+    #[test]
+    fn a_late_sniff_on_a_big_budget_holds_instead_of_spilling() {
+        let dir = tmpdir("latesniff-bigbudget");
+        let inner = "movie.mkv";
+        // Bigger than the old flat 64 MB ceiling, far under cap/4.
+        let data = payload(72 << 20, 11);
+        let vol = fixtures::rar5_volume(&[(inner, (72 << 20) as u64, &data, false, false)]);
+        let ex = Extractor::new(&dir, 1, true);
+        ex.set_holds_cap(1 << 30); // spill budget = max(256 MB, 4 MB)
+        let art = 256 * 1024;
+        let n = vol.len().div_ceil(art);
+        // Every article except offset-0, reversed - the whole volume
+        // piles into pre-classification holds.
+        for i in (1..n).rev() {
+            let s = i * art;
+            let e = (s + art).min(vol.len());
+            ex.write(0, "v.rar", vol.len() as u64, s as u64, &vol[s..e])
+                .unwrap();
+        }
+        assert!(
+            ex.holds_peak() > 64 << 20,
+            "fixture lost its teeth: holds peaked at {} - the old flat \
+             ceiling was never exceeded",
+            ex.holds_peak()
+        );
+        assert!(
+            !dir.join("v.rar").exists(),
+            "slot spilled to Plain under a nearly-empty budget"
+        );
+        // The head arrives dead last: sniff, map, drain, one-pass.
+        ex.write(0, "v.rar", vol.len() as u64, 0, &vol[..art])
+            .unwrap();
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join(inner)).unwrap(), data);
+        assert!(
+            !dir.join("v.rar").exists(),
+            "volume materialized despite the late sniff arriving"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The spill budget's shape, pinned directly: floor for small
+    /// slices, scaling (not a flat 64 MB) above it.
+    #[test]
+    fn unclassified_spill_scales_with_the_budget() {
+        assert_eq!(unclassified_spill(8 << 20), 4 << 20); // floor
+        assert_eq!(unclassified_spill(256 << 20), 64 << 20);
+        assert_eq!(unclassified_spill(1 << 30), 256 << 20); // past the old flat ceiling
+        // The field shape: 45% of a 16 GiB budget held a 64 MB window.
+        let field_holds = (16u64 << 30) as usize / 100 * 45;
+        assert!(unclassified_spill(field_holds) > 1 << 30);
+    }
+
+    /// The stalled-chase window's shape, pinned directly: floored for
+    /// small slices, and NEVER scaling past 64 MB - a bigger budget
+    /// buys no reason to keep cold frontier bytes resident (the same
+    /// deliberate ceiling as `pw_await_spill`).
+    #[test]
+    fn chase_stall_spill_window_shape() {
+        assert_eq!(chase_stall_spill(8 << 20), 4 << 20); // floor
+        assert_eq!(chase_stall_spill(256 << 20), 64 << 20);
+        assert_eq!(chase_stall_spill(16 << 30), 64 << 20); // the field shape
     }
 
     /// TODO 100 follow-up: an article that arrives before the offset-0

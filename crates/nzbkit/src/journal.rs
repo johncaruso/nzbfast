@@ -118,37 +118,37 @@ struct StashedArticle {
 /// once file) or by ordinary copy (a plain neighbor the span straddled
 /// into). Empty for `R` records.
 pub struct Article {
-    pub id: String,
-    pub frags: Vec<Frag>,
-    pub crypto_frag: Vec<bool>,
-    pub crypto: bool,
+    pub(crate) id: String,
+    pub(crate) frags: Vec<Frag>,
+    pub(crate) crypto_frag: Vec<bool>,
+    pub(crate) crypto: bool,
 }
 
 /// Per-slot placement parsed from a journal.
 pub struct SlotPlacement {
-    pub name: String,
-    pub size: u64,
-    pub articles: Vec<Article>,
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    pub(crate) articles: Vec<Article>,
 }
 
 /// Crypt facts for one plaintext-once output (`E`/`K`/`T` records).
 #[derive(Default, Clone)]
 pub struct CryptoFileMeta {
-    pub salt: [u8; 16],
-    pub lg2: u8,
-    pub iv: [u8; 16],
-    pub unp: u64,
+    pub(crate) salt: [u8; 16],
+    pub(crate) lg2: u8,
+    pub(crate) iv: [u8; 16],
+    pub(crate) unp: u64,
     /// Stored password check: a resume derives keys and PROVES the
     /// password against it before re-encrypting a single byte. Absent
     /// (archiver wrote none) means the password cannot be proven, so
     /// nothing restores and the articles refetch.
-    pub check: Option<[u8; 12]>,
+    pub(crate) check: Option<[u8; 12]>,
     /// Final-block plaintext beyond `unp` (`T` record; None until the
     /// tail block decrypted in the recorded run). Fragments touching the
     /// last cipher block are unrestorable without it.
-    pub pad: Option<Vec<u8>>,
+    pub(crate) pad: Option<Vec<u8>>,
     /// Chain checkpoints: cipher offset -> cipher block [off-16, off).
-    pub checkpoints: HashMap<u64, [u8; 16]>,
+    pub(crate) checkpoints: HashMap<u64, [u8; 16]>,
 }
 
 /// Everything a resume run learns from an existing journal.
@@ -158,7 +158,7 @@ pub struct ResumeState {
     /// file (includes par2-main records, which resume ignores anyway).
     pub completed: HashSet<String>,
     /// Placement-form articles, grouped by slot.
-    pub slots: HashMap<usize, SlotPlacement>,
+    pub(crate) slots: HashMap<usize, SlotPlacement>,
     /// Plaintext-once outputs by name (`E`/`K`/`T` facts).
     pub crypto_files: HashMap<String, CryptoFileMeta>,
 }
@@ -952,6 +952,101 @@ fn restore_crypto(
     }
 }
 
+/// Suffix worn by a failed job's unverified payload while it waits for a
+/// retry. Chosen to be inert everywhere it might be seen: it is not a
+/// media, archive or par2 extension, so no *arr import rule, media
+/// scanner, unpack ladder or `looks_like_named_rar` scan claims it, and
+/// a user reading their download folder can see at a glance that it is
+/// not the file they asked for.
+pub const PARTIAL_SUFFIX: &str = ".nzbfast-partial";
+
+/// Take a failed job's direct-extracted payload out of circulation
+/// WITHOUT throwing its bytes away.
+///
+/// A one-pass job writes the inner file straight to the output
+/// directory, so a job that fails on missing articles leaves a payload
+/// of exactly the right name and exactly the right size with a
+/// zero-filled hole in the middle of it. That is the same false artifact
+/// `drop_spared_metadata` deletes on the success path - "a holed .nfo
+/// looks exactly like a real .nfo" - one level up, and it is worse here
+/// because it is the deliverable itself: an *arr importing on name and
+/// size takes it, a player opens it, and nothing about the directory
+/// says otherwise.
+///
+/// Renamed rather than deleted, because those bytes are also the ONLY
+/// resume state a retry has. The journal's placement (`R`) records
+/// address fragments by their offsets INSIDE this file - direct-extracted
+/// articles never touched a volume file - so deleting it turns a retry
+/// that refetches one missing article into a retry that refetches the
+/// whole post. [`unquarantine_partials`] puts the name back at the start
+/// of the next attempt, before [`restore`] reads it, so the rename costs
+/// a resume nothing.
+///
+/// Scope is deliberately the direct-extracted payload alone. Volume
+/// files (`.rar`, `.par2`) left by a fallback or a resumed run stay
+/// exactly as they are: they are the classic resume target, and nothing
+/// mistakes a holed `.part03.rar` for a finished download.
+///
+/// Returns `(quarantined, failed)` by name. A failure is reported, never
+/// swallowed - the caller is already failing the job, but a payload that
+/// could not be renamed is still sitting there looking real.
+pub fn quarantine_partials(out_dir: &Path, payload: &[String]) -> (Vec<String>, Vec<String>) {
+    let (mut done, mut failed) = (Vec::new(), Vec::new());
+    for name in payload {
+        let from = out_dir.join(sanitize_filename(name));
+        if !from.exists() {
+            continue;
+        }
+        let mut to = from.clone().into_os_string();
+        to.push(PARTIAL_SUFFIX);
+        match std::fs::rename(&from, PathBuf::from(to)) {
+            Ok(()) => done.push(name.clone()),
+            Err(_) => failed.push(name.clone()),
+        }
+    }
+    (done, failed)
+}
+
+/// Undo [`quarantine_partials`] at the start of an attempt, so the
+/// journal's placement records find the file they address.
+///
+/// Must run BEFORE [`restore`]: a `.nzbfast-partial` file is invisible to
+/// the restore pass, which would drop every article whose bytes live in
+/// it and refetch them.
+///
+/// A base name that already exists is left alone and its quarantined
+/// copy is NOT clobbered. That case means something other than this
+/// mechanism put a file there - a re-add into an occupied directory, a
+/// user's own copy - and the live file wins; guessing between two
+/// candidates is how a resume ends up seeded with the wrong bytes.
+/// Returns the names it restored.
+pub fn unquarantine_partials(out_dir: &Path) -> Vec<String> {
+    let mut back = Vec::new();
+    let Ok(rd) = std::fs::read_dir(out_dir) else {
+        return back;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        let Some(n) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(base) = n.strip_suffix(PARTIAL_SUFFIX) else {
+            continue;
+        };
+        if base.is_empty() {
+            continue;
+        }
+        let dest = out_dir.join(base);
+        if dest.exists() {
+            continue;
+        }
+        if std::fs::rename(&p, &dest).is_ok() {
+            back.push(base.to_string());
+        }
+    }
+    back
+}
+
 /// Rebuild the volume files a resume run works with from a placement
 /// journal: identity fragments (bytes already at their final offsets in
 /// the destination) are trusted in place; translated fragments (bytes in
@@ -1182,6 +1277,120 @@ mod tests {
         assert!(resume.completed.is_empty());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn qdir(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("nzbfast-quarantine-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The round trip that makes the rename free: a failed job's payload
+    /// goes aside under a name nothing imports, and the next attempt
+    /// gets the ORIGINAL name back with the bytes untouched. If either
+    /// half broke, a retry would refetch the whole post instead of the
+    /// one article it is missing.
+    #[test]
+    fn a_quarantined_partial_comes_back_under_its_own_name_with_its_bytes() {
+        let d = qdir("roundtrip");
+        std::fs::write(d.join("movie.mkv"), b"holed payload").unwrap();
+        let (done, failed) = quarantine_partials(&d, &["movie.mkv".to_string()]);
+        assert_eq!(done, vec!["movie.mkv".to_string()]);
+        assert!(failed.is_empty());
+        assert!(
+            !d.join("movie.mkv").exists(),
+            "the payload name must not survive a failed job"
+        );
+        assert!(d.join(format!("movie.mkv{PARTIAL_SUFFIX}")).exists());
+
+        assert_eq!(unquarantine_partials(&d), vec!["movie.mkv".to_string()]);
+        assert_eq!(
+            std::fs::read(d.join("movie.mkv")).unwrap(),
+            b"holed payload",
+            "the bytes are the resume state - they must survive the round trip"
+        );
+        assert!(!d.join(format!("movie.mkv{PARTIAL_SUFFIX}")).exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Volume files and every other resident are none of this pass's
+    /// business: they are the classic resume target and nothing mistakes
+    /// a holed `.part02.rar` for a finished download. Only the names the
+    /// caller passes - the direct-extracted payload - move.
+    #[test]
+    fn quarantine_touches_only_the_named_payload() {
+        let d = qdir("scope");
+        for f in ["a.part01.rar", "a.par2", ".nzbfast.journal", "inner.mkv"] {
+            std::fs::write(d.join(f), b"x").unwrap();
+        }
+        let (done, _) = quarantine_partials(&d, &["inner.mkv".to_string()]);
+        assert_eq!(done, vec!["inner.mkv".to_string()]);
+        for f in ["a.part01.rar", "a.par2", ".nzbfast.journal"] {
+            assert!(d.join(f).exists(), "{f} must be left exactly where it is");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A payload the extractor reported but never wrote (a group that
+    /// fell back, a name that lost a race) is not an error: there is
+    /// nothing on disk to mislead anyone.
+    #[test]
+    fn a_payload_that_was_never_written_is_not_a_failure() {
+        let d = qdir("absent");
+        let (done, failed) = quarantine_partials(&d, &["never-written.mkv".to_string()]);
+        assert!(done.is_empty() && failed.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A traversal name cannot reach outside the output directory -
+    /// the same rule `drop_spared_metadata` relies on, and it matters
+    /// more here because this end RENAMES rather than deletes.
+    #[test]
+    fn a_traversal_payload_name_stays_inside_the_out_dir() {
+        let parent = qdir("traverse");
+        let out = parent.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(parent.join("evil.mkv"), b"keep me").unwrap();
+        quarantine_partials(&out, &["../evil.mkv".to_string()]);
+        assert!(
+            parent.join("evil.mkv").exists(),
+            "sanitize_filename must keep the rename inside the output dir"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// The live file wins. If something else already owns the base name
+    /// - a re-add into an occupied directory, a copy the user made -
+    /// the quarantined bytes must NOT clobber it, and must not vanish
+    /// either: guessing between two candidates is how a resume gets
+    /// seeded with the wrong bytes.
+    #[test]
+    fn unquarantine_never_clobbers_a_file_that_already_holds_the_name() {
+        let d = qdir("clobber");
+        std::fs::write(d.join(format!("m.mkv{PARTIAL_SUFFIX}")), b"old").unwrap();
+        std::fs::write(d.join("m.mkv"), b"live").unwrap();
+        assert!(unquarantine_partials(&d).is_empty());
+        assert_eq!(std::fs::read(d.join("m.mkv")).unwrap(), b"live");
+        assert!(
+            d.join(format!("m.mkv{PARTIAL_SUFFIX}")).exists(),
+            "the loser is kept, not deleted"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An ordinary directory has nothing to undo, and a bare suffix with
+    /// no base name in front of it is not ours to rename to "".
+    #[test]
+    fn unquarantine_is_a_no_op_without_quarantined_files() {
+        let d = qdir("noop");
+        std::fs::write(d.join("a.mkv"), b"x").unwrap();
+        std::fs::write(d.join(PARTIAL_SUFFIX), b"x").unwrap();
+        assert!(unquarantine_partials(&d).is_empty());
+        assert!(d.join("a.mkv").exists() && d.join(PARTIAL_SUFFIX).exists());
+        assert!(unquarantine_partials(Path::new("/nonexistent/nzbfast-q")).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     fn frag(file: &str, file_off: u64, vol_off: u64, len: u64) -> Frag {

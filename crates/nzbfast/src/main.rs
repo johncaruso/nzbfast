@@ -39,11 +39,15 @@ mod identity;
 mod import_sab;
 mod interests;
 mod lanegate;
+// TODO 151 (issue #36): external list sources for the watchlist.
+mod listsrc;
 mod logging;
 mod nettools;
 mod newznab;
 mod notify;
 mod persist;
+// TODO 151 (issue #36): the first list source's own wire formats.
+mod plex;
 mod post_cmd;
 mod rarfix;
 mod ratelimit;
@@ -53,6 +57,7 @@ mod rss;
 mod scan;
 mod serve;
 mod setup;
+mod sfx;
 mod smart;
 mod srrdb;
 mod tools;
@@ -67,6 +72,7 @@ mod wall;
 mod wall;
 mod watchlist;
 mod xrel;
+use sfx::*;
 use unpack::*;
 mod check;
 use check::*;
@@ -394,6 +400,27 @@ enum Command {
     #[cfg(feature = "indexer")]
     SpotSearch {
         query: String,
+        #[arg(long, default_value = "index.db")]
+        db: PathBuf,
+    },
+    /// What this index was asked for and could not answer (TODO 131
+    /// D3). Read it to decide what the scanner should deepen or
+    /// backfill next; nothing acts on it by itself.
+    #[cfg(feature = "indexer")]
+    SearchMisses {
+        /// Rolling window in days.
+        #[arg(long, default_value_t = 30)]
+        days: i64,
+        /// How few results still counts as a miss (0 = only the true
+        /// zeroes).
+        #[arg(long, default_value_t = 0)]
+        thin: u32,
+        /// Only one surface: wall (the dashboard and the wall's search
+        /// box) or newznab (Sonarr/Radarr and friends).
+        #[arg(long)]
+        surface: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
         #[arg(long, default_value = "index.db")]
         db: PathBuf,
     },
@@ -1044,6 +1071,14 @@ async fn run() -> Result<()> {
         } => spots_scan(&cli.config, &group, backfill, &db).await,
         #[cfg(feature = "indexer")]
         Command::SpotSearch { query, db } => spot_search(&query, &db),
+        #[cfg(feature = "indexer")]
+        Command::SearchMisses {
+            days,
+            thin,
+            surface,
+            limit,
+            db,
+        } => search_misses(&db, days, thin, surface.as_deref(), limit),
         #[cfg(feature = "indexer")]
         Command::SpotGet { msgid, nzb, db } => spot_get(&cli.config, &msgid, &nzb, &db).await,
         #[cfg(feature = "indexer")]

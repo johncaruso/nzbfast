@@ -442,6 +442,23 @@ pub(super) fn newznab_xml(
         d.with_index_read(|ix| ix.browse(&bq).ok())
             .unwrap_or_default()
     };
+    // §131 D3 search-miss log. The *arr surface is where the misses
+    // that matter most show up - Sonarr asks the same question every
+    // RSS sync, so a query it never gets an answer to is a coverage
+    // hole with a date on it. First page only (a deep page is the same
+    // search), and only when a query was actually typed: an id lookup
+    // that resolved to no title_key is an ENRICHMENT gap, not a
+    // catalogue one, and belongs in a different readout. `unavailable`
+    // is excluded outright: a Lidarr audio search we answer empty by
+    // POLICY is not a hole anyone should backfill.
+    if offset == 0 && !unavailable && !bq.q.trim().is_empty() {
+        d.note_search(
+            "newznab",
+            &bq.q,
+            bq.kind.as_deref().unwrap_or(""),
+            total as usize,
+        );
+    }
     let mut items = String::new();
     for r in hits.iter() {
         let link = format!(
@@ -777,6 +794,12 @@ fn hold_json(k: &str, a: f64, b: f64) -> Value {
             o.insert("finishing".into(), json!(a));
             o.insert("bound".into(), json!(b));
         }
+        // TODO §154: the only hold with no numbers behind it - there is
+        // no threshold to report, just the absence of a server. `a`/`b`
+        // stay in the object (both zero) because the shape is the
+        // contract; nothing else is added, and in particular NOT the
+        // quota pair the fallthrough arm below would have named them.
+        "noservers" => {}
         _ => {
             o.insert("spent_gb".into(), json!(a));
             o.insert("cap_gb".into(), json!(b));
@@ -967,6 +990,10 @@ struct SlotCtx {
     active_id: Option<String>,
     stall: Option<(String, Instant)>,
     pool_view: Vec<(String, usize, u64)>,
+    /// Servers granting no sessions right now, longest outage first.
+    /// Read here so a stalled row can say WHICH provider it is waiting
+    /// on instead of only how long it has been waiting.
+    outages: Vec<ServerOutage>,
     /// The post-processing script ladder as `(category -> script,
     /// global script)`, snapshotted here for the same reason everything
     /// else is: the row reports which script it will run (L4) and must
@@ -1005,6 +1032,7 @@ fn slot_json(
         active_id,
         stall,
         pool_view,
+        outages,
         cat_scripts,
         global_script,
     } = ctx;
@@ -1047,7 +1075,20 @@ fn slot_json(
                     1 => v[0].to_string(),
                     n => format!("{} +{}", v[0], n - 1),
                 };
-                if let Some((_, since)) = stall.as_ref().filter(|(sid, _)| *sid == j.nzo_id) {
+                // A provider that has been granting NO sessions for the
+                // whole window outranks "no data for Ns": both describe
+                // the same flatline, but only this one says whose it is
+                // and what to do about it. Gated on the stall episode
+                // deliberately - a dead BACKUP while the job downloads
+                // fine at full speed is a fact for the Providers card,
+                // not an alarm on a row that is working. (Soak, 12 Aug
+                // 2026: two jobs sat 25 minutes at zero bytes behind a
+                // capped Giganews account and the row said nothing but
+                // "no data for Ns" the whole time.)
+                let stalled = stall.as_ref().filter(|(sid, _)| *sid == j.nzo_id);
+                if let Some((tok, o)) = row_outage(stalled.is_some(), outages) {
+                    (tok, o.host.clone(), Some(o.secs))
+                } else if let Some((_, since)) = stalled {
                     ("waiting", String::new(), Some(since.elapsed().as_secs()))
                 } else if !pool_view.is_empty() && connected == 0 {
                     let all: Vec<&str> = pool_view.iter().map(|(h, _, _)| h.as_str()).collect();
@@ -1436,6 +1477,9 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
                 .collect()
         })
         .unwrap_or_default();
+    // Same instant as the pool view above, and read the same way: once,
+    // before the queue lock.
+    let outages = server_outages(d);
     // SAB's queue call takes the same category filter as history (the
     // *arrs pass category=<their cat> when one is configured).
     let cat_filter = params
@@ -1472,6 +1516,7 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         active_id,
         stall,
         pool_view,
+        outages,
         cat_scripts: d
             .cat_meta
             .lock_ok()
@@ -1655,6 +1700,12 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         // polls every second - the prompt decision is made there, and
         // get_config is only fetched when the settings view opens.
         "password_prompt": d.password_prompt.lock_ok().clone(),
+        // §73 phase 2, and here for the same reason as the two around
+        // it: the row drawers decide whether to offer the verify panel
+        // and the in-page player, and they are drawn off the queue poll
+        // rather than off get_config (only fetched with the settings
+        // view). off | metadata-only | full.
+        "preview": preview_mode(d),
         // TODO 101, and here for the same reason: the disk-full drawer
         // has to decide whether to offer "extract in place", and it is
         // drawn off the queue poll rather than off get_config (which is
@@ -2595,11 +2646,9 @@ pub(super) fn handle_jsonrpc(
     // before we read a 256 MiB body for them.
     let full_auth;
     if !keys.is_empty() {
-        let cred_pw = req
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Authorization"))
-            .and_then(|h| h.value.as_str().strip_prefix("Basic ").map(str::to_string))
+        // auth_credentials, not strip_prefix("Basic "): the scheme token
+        // is case-insensitive per RFC 7235 (Codex sweep 12 Aug F18).
+        let cred_pw = auth_credentials(&req, "basic")
             .and_then(|b| b64_decode(&b))
             .and_then(|raw| String::from_utf8(raw).ok())
             .and_then(|cred| cred.split_once(':').map(|(_, p)| p.to_string()));
@@ -2657,11 +2706,9 @@ pub(super) fn handle_jsonrpc(
             .into_iter()
             .flatten()
             .collect();
-        let cred_pw = req
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Authorization"))
-            .and_then(|h| h.value.as_str().strip_prefix("Basic ").map(str::to_string))
+        // auth_credentials, not strip_prefix("Basic "): the scheme token
+        // is case-insensitive per RFC 7235 (Codex sweep 12 Aug F18).
+        let cred_pw = auth_credentials(&req, "basic")
             .and_then(|b| b64_decode(&b))
             .and_then(|raw| String::from_utf8(raw).ok())
             .and_then(|cred| cred.split_once(':').map(|(_, p)| p.to_string()));
@@ -2803,154 +2850,4 @@ pub(super) fn handle_jsonrpc(
 }
 
 #[cfg(test)]
-mod tail_truth_tests {
-    use super::{JobState, sab_script_name, slot_progress};
-
-    const GB: u64 = 1_000_000_000;
-
-    /// Two jobs are `Downloading` whenever one is finishing, and only one
-    /// of them owns the daemon's progress counters. The finishing one
-    /// reading them anyway is the wrong-bar bleed: job A sat at ~98%,
-    /// job B started and zeroed the counters, and A's row, the hero card
-    /// and the drawer all redrew A's bar as B's - 98%, then 0%, then
-    /// climbing through a download that was not A's.
-    #[test]
-    fn a_finishing_job_never_reads_the_next_download_s_counters() {
-        // B owns the counters and has fetched 2 of its 40 GB.
-        let b = slot_progress(
-            JobState::Downloading,
-            Some((2 * GB, 40 * GB)),
-            false,
-            40 * GB,
-            0,
-        );
-        assert_eq!(b, (5, 38 * GB), "the owner reports the live counters");
-
-        // A is in its tail: same state, no ownership, a phase word.
-        let a = slot_progress(JobState::Downloading, None, true, 50 * GB, 0);
-        assert_eq!(
-            a,
-            (100, 0),
-            "a finishing job reports its own bytes as all in - never the \
-             other job's fraction"
-        );
-    }
-
-    /// The single-job case, which ownership alone does not cover: nothing
-    /// starts behind the last job of a queue, so it still holds the
-    /// counters through its whole tail. Reported off them it read
-    /// "Downloading, 100%, 0 MB/s" for however long the repair and unpack
-    /// took - indistinguishable from a pool that had died.
-    #[test]
-    fn the_tail_phase_outranks_ownership() {
-        let done = (10 * GB, 10 * GB);
-        assert_eq!(
-            slot_progress(JobState::Downloading, Some(done), true, 10 * GB, 0),
-            (100, 0),
-            "still the owner, but verifying: the phase wins"
-        );
-        assert_eq!(
-            slot_progress(JobState::Downloading, Some(done), false, 10 * GB, 0),
-            (100, 0),
-            "and the numbers agree when it is still downloading"
-        );
-    }
-
-    /// A job that has flipped to Downloading but has not yet claimed the
-    /// counters (the index-pause gate can hold that gap open). It has
-    /// fetched nothing; reading the previous job's counters to claim
-    /// otherwise is the same bug from the other side.
-    #[test]
-    fn a_job_that_has_not_claimed_the_counters_reports_nothing_fetched() {
-        assert_eq!(
-            slot_progress(JobState::Downloading, None, false, 8 * GB, 0),
-            (0, 8 * GB)
-        );
-    }
-
-    /// A paused or re-queued job reports what its journal is holding.
-    /// Reporting 0% with the full size still to fetch is what has users
-    /// deleting a job that would resume in seconds - and it contradicts
-    /// the "nothing is re-downloaded" promise three copy sites make.
-    #[test]
-    fn a_paused_job_reports_what_is_already_on_disk() {
-        assert_eq!(
-            slot_progress(JobState::Queued, None, false, 40 * GB, 25 * GB),
-            (62, 15 * GB)
-        );
-        // Never run: no record, no claim.
-        assert_eq!(
-            slot_progress(JobState::Queued, None, false, 40 * GB, 0),
-            (0, 40 * GB)
-        );
-    }
-
-    /// The move to the destination, unchanged from before this bundle.
-    #[test]
-    fn a_completed_job_is_all_in() {
-        assert_eq!(
-            slot_progress(JobState::Completed, None, false, 40 * GB, 40 * GB),
-            (100, 0)
-        );
-    }
-
-    /// Untrusted arithmetic: `total_bytes` comes from an NZB attribute
-    /// and `downloaded_bytes` from a previous run, so neither bounds the
-    /// other. A row must not divide by zero, and a bar must not overshoot
-    /// its own end.
-    #[test]
-    fn the_percentage_cannot_divide_by_zero_or_pass_100() {
-        assert_eq!(slot_progress(JobState::Queued, None, false, 0, 0), (0, 0));
-        assert_eq!(
-            slot_progress(JobState::Queued, None, false, 10, 999),
-            (100, 0),
-            "more on disk than the NZB claims: clamped, not 9990%"
-        );
-        assert_eq!(
-            slot_progress(JobState::Downloading, Some((0, 0)), false, 0, 0),
-            (0, 0)
-        );
-        // A hostile NZB can present a saturated total (nzb.rs sums the
-        // segment attribute with saturating_add rather than wrapping),
-        // and `done * 100` in u64 overflows long before it.
-        assert_eq!(
-            slot_progress(JobState::Queued, None, false, u64::MAX, u64::MAX),
-            (100, 0)
-        );
-        assert_eq!(
-            slot_progress(
-                JobState::Downloading,
-                Some((u64::MAX / 2, u64::MAX)),
-                false,
-                0,
-                0
-            ),
-            (49, u64::MAX - u64::MAX / 2)
-        );
-    }
-
-    /// SAB's `script` field is the script that RUNS, not just an
-    /// explicit per-job override.
-    ///
-    /// A job taking its category's script - or the global one - was
-    /// published to every SAB client as `"None"`, so a client's
-    /// "which jobs run my script" view was wrong for the ordinary case
-    /// (L4, 10 Aug sweep). Basename, because that is the vocabulary
-    /// `mode=get_scripts` and an add's `script=` both use.
-    #[test]
-    fn the_script_field_reports_the_script_that_will_run() {
-        use std::path::Path;
-        let global = Path::new("/opt/nzb/scripts/global.sh");
-        // The ladder, top down.
-        assert_eq!(
-            sab_script_name("/opt/nzb/scripts/job.py", "cat.sh", Some(global)),
-            "job.py"
-        );
-        assert_eq!(sab_script_name("", "cat.sh", Some(global)), "cat.sh");
-        assert_eq!(sab_script_name("", "", Some(global)), "global.sh");
-        assert_eq!(sab_script_name("", "", None), "None");
-        // SAB's own null suppresses the whole ladder.
-        assert_eq!(sab_script_name("None", "cat.sh", Some(global)), "None");
-        assert_eq!(sab_script_name("none", "", Some(global)), "None");
-    }
-}
+mod tail_truth_tests;

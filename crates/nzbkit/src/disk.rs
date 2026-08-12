@@ -576,6 +576,13 @@ pub struct FileWriter {
     /// of nanoseconds against a pwrite of tens to hundreds of KB.
     file: std::sync::RwLock<Option<File>>,
     pub path: PathBuf,
+    /// Set when the on-disk file is RENAMED under a live writer (PAR2
+    /// deobfuscation publishes the verified real name while the handle
+    /// is open). The open handle does not care - renames are inode-level
+    /// - but [`FileWriter::unpark`] reopens BY PATH, and the creation
+    /// path is ENOENT the moment the publish lands. Every by-path reopen
+    /// must go through [`FileWriter::current_path`].
+    renamed_to: std::sync::Mutex<Option<PathBuf>>,
     pub size: u64,
     written: AtomicU64,
     /// UNIQUE bytes covered (the sum of `note_written`'s fresh counts),
@@ -731,6 +738,7 @@ impl FileWriter {
         Ok(FileWriter {
             file: std::sync::RwLock::new(Some(file)),
             path: path.to_path_buf(),
+            renamed_to: std::sync::Mutex::new(None),
             size,
             written: AtomicU64::new(0),
             covered: AtomicU64::new(0),
@@ -775,6 +783,7 @@ impl FileWriter {
         Ok(FileWriter {
             file: std::sync::RwLock::new(Some(file)),
             path: path.to_path_buf(),
+            renamed_to: std::sync::Mutex::new(None),
             size,
             written: AtomicU64::new(0),
             covered: AtomicU64::new(0),
@@ -1189,7 +1198,29 @@ impl FileWriter {
         Ok(())
     }
 
-    /// Reopen a parked writer at its original path, without truncating and
+    /// Where the file lives RIGHT NOW: the publish target once
+    /// [`note_renamed`] has been called, the creation path before that.
+    ///
+    /// [`note_renamed`]: FileWriter::note_renamed
+    pub fn current_path(&self) -> PathBuf {
+        self.renamed_to
+            .lock_ok()
+            .clone()
+            .unwrap_or_else(|| self.path.clone())
+    }
+
+    /// Record that the on-disk file moved to `new` (the verified-name
+    /// publish renames it while this writer's handle is open). The live
+    /// handle is untouched - it follows the inode - but a later by-path
+    /// reopen must use the new name: before this existed, `unpark` after
+    /// the external par2 hit ENOENT on the old name and failed the whole
+    /// job on exactly the obfuscated posts that repair exists for
+    /// (soak 11 Aug, sab3287-stall).
+    pub fn note_renamed(&self, new: PathBuf) {
+        *self.renamed_to.lock_ok() = Some(new);
+    }
+
+    /// Reopen a parked writer at its current path, without truncating and
     /// without preallocating: the bytes on disk now are the external tool's
     /// repaired output and must survive verbatim. Idempotent - unparking a
     /// live writer is a no-op, so a caller may pair it with [`park`] on a path
@@ -1205,12 +1236,13 @@ impl FileWriter {
         if g.is_some() {
             return Ok(());
         }
-        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        let path = self.current_path();
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
         apply_cache_policy(&file);
         *g = Some(file);
         #[cfg(windows)]
         {
-            *self.aux.write_ok() = open_aux_handles(&self.path);
+            *self.aux.write_ok() = open_aux_handles(&path);
         }
         Ok(())
     }
@@ -1685,6 +1717,33 @@ mod tests {
         w.read_at(&mut buf, 4).unwrap();
         assert_eq!(&buf, b"efgh");
         assert_eq!(&std::fs::read(&path).unwrap()[..8], b"abcdefgh");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The soak 11 Aug shape (sab3287-stall): PAR2 deobfuscation renames the
+    /// file on disk while the writer's handle is open, then the external-par2
+    /// fallback parks and unparks. Without `note_renamed`, unpark reopens the
+    /// CREATION path, gets ENOENT, and the whole job dies with "reopening our
+    /// output handles after the external par2" - on the success path too,
+    /// throwing away a completed repair.
+    #[test]
+    fn unpark_follows_a_published_rename() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-repark-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let obfuscated = dir.join("cb124762578234ca");
+        let real = dir.join("yay.part04.rar");
+        let w = FileWriter::create(&obfuscated, 8).unwrap();
+        w.write_at(0, b"abcd").unwrap();
+
+        // The publish: on-disk rename under the live handle.
+        std::fs::rename(&obfuscated, &real).unwrap();
+        w.note_renamed(real.clone());
+        assert_eq!(w.current_path(), real);
+
+        w.park().unwrap();
+        w.unpark().unwrap();
+        w.write_at(4, b"efgh").unwrap();
+        assert_eq!(&std::fs::read(&real).unwrap()[..8], b"abcdefgh");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

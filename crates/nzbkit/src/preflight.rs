@@ -28,7 +28,7 @@ const MISSING: u8 = 2;
 
 /// Per-server result of a sweep: `matrix[server][article]`.
 pub struct SweepResult {
-    pub matrix: Vec<Vec<Avail>>,
+    pub(crate) matrix: Vec<Vec<Avail>>,
     pub elapsed: Duration,
 }
 

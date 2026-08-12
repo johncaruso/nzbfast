@@ -23,6 +23,11 @@ pub(super) struct FrontierBuffer {
     /// consumed bytes. None = ungated (no set, unclaimed slot, feature
     /// off): behavior is exactly the pre-gate code.
     gate: Option<(std::sync::Arc<crate::live::VerifyGate>, usize)>,
+    /// The chain's holds scratch, when this buffer may page cold spans
+    /// out of RAM ([`Self::page_cold`] - the terminally-stalled-chase
+    /// spill). None (the 7z/zip chases, tests): nothing ever pages and
+    /// every path behaves exactly as before paging existed.
+    scratch: Option<Arc<HoldsScratch>>,
 }
 
 #[derive(Default)]
@@ -37,10 +42,20 @@ pub(super) struct FrontierState {
     pub(super) data: Vec<u8>,
     /// Spans beyond the frontier, keyed by start offset.
     pub(super) pending: BTreeMap<u64, Vec<u8>>,
+    /// Spans paged out to the holds scratch (start offset -> scratch
+    /// region offset + length), disjoint among themselves. Created only
+    /// by [`FrontierBuffer::page_cold`] on a chase stalled behind
+    /// terminally-missing articles; bytes here always AGREE with any
+    /// overlapping RAM copy (write_span reconciles every delivery), so
+    /// duplicated coverage is harmless everywhere it can arise.
+    pub(super) paged: BTreeMap<u64, (u64, usize)>,
+    /// Sum of paged span lengths - the scratch live-count this buffer
+    /// still owes (released per span on read-back, remainder on Drop).
+    pub(super) paged_bytes: usize,
     /// Declared volume size (the level-1 entry's unpacked size).
     pub(super) total: u64,
-    /// Retained bytes (frontier + pending) - what the holds budget is
-    /// charged for.
+    /// Retained RAM bytes (frontier + pending; paged spans excluded) -
+    /// what the holds budget is charged for.
     pub(super) stored: usize,
     /// A rewrite arrived whose bytes DIFFERED from what was already
     /// retained for that range. Sticky, and never cleared: see
@@ -50,11 +65,49 @@ pub(super) struct FrontierState {
 }
 
 impl FrontierState {
-    /// One past the last contiguous byte, in VOLUME offsets. The single
-    /// place `base` and `data.len()` are combined - everything that used
-    /// to read `data.len()` as "the frontier" goes through here.
-    pub(super) fn frontier(&self) -> u64 {
+    /// One past the last byte of the contiguous RAM run, in VOLUME
+    /// offsets - where `data` ends. Appends, folds and the drop-behind
+    /// trim all work on this edge.
+    pub(super) fn frontier_ram(&self) -> u64 {
         self.base + self.data.len() as u64
+    }
+
+    /// One past the last contiguously-COVERED byte from `base`, in
+    /// volume offsets: the RAM run extended through any paged and
+    /// parked spans that continue it without a hole. This is the
+    /// "arrived" edge - completeness and `known_len` read it, and the
+    /// blocking readers can serve every byte below it (paged ones via
+    /// pread).
+    pub(super) fn frontier(&self) -> u64 {
+        let mut f = self.frontier_ram();
+        loop {
+            let paged = self
+                .paged
+                .range(..=f)
+                .next_back()
+                .map(|(&s, &(_, len))| s + len as u64)
+                .filter(|&e| e > f);
+            let pending = self
+                .pending
+                .range(..=f)
+                .next_back()
+                .map(|(&s, v)| s + v.len() as u64)
+                .filter(|&e| e > f);
+            match paged.max(pending) {
+                Some(e) => f = e,
+                None => return f,
+            }
+        }
+    }
+
+    /// The paged span covering `pos`, if any: `(start, region offset,
+    /// length)`.
+    fn paged_at(&self, pos: u64) -> Option<(u64, u64, usize)> {
+        self.paged
+            .range(..=pos)
+            .next_back()
+            .filter(|&(&s, &(_, len))| s + len as u64 > pos)
+            .map(|(&s, &(off, len))| (s, off, len))
     }
 }
 
@@ -65,6 +118,7 @@ impl std::fmt::Debug for FrontierBuffer {
             .field("base", &st.base)
             .field("frontier", &st.frontier())
             .field("pending", &st.pending.len())
+            .field("paged", &st.paged.len())
             .field("total", &st.total)
             .field("abort", &st.abort)
             .finish()
@@ -77,13 +131,15 @@ impl FrontierBuffer {
     /// tests, which exercise the buffer without a verify pipeline.
     #[cfg(test)]
     pub(super) fn new(total: u64) -> FrontierBuffer {
-        Self::new_gated(total, None)
+        Self::new_gated(total, None, None)
     }
 
-    /// Construction with an optional §94 B watermark gate attached.
+    /// Construction with an optional §94 B watermark gate attached, and
+    /// an optional holds scratch that arms [`Self::page_cold`].
     pub(super) fn new_gated(
         total: u64,
         gate: Option<(std::sync::Arc<crate::live::VerifyGate>, usize)>,
+        scratch: Option<Arc<HoldsScratch>>,
     ) -> FrontierBuffer {
         FrontierBuffer {
             state: Mutex::new(FrontierState {
@@ -92,6 +148,7 @@ impl FrontierBuffer {
             }),
             arrived: Condvar::new(),
             gate,
+            scratch,
         }
     }
 
@@ -144,7 +201,7 @@ impl FrontierBuffer {
         }
         let bytes = &bytes[..(end - offset) as usize];
         let base = st.base;
-        let frontier = st.frontier();
+        let frontier = st.frontier_ram();
         let mut accepted = false;
         let mut differed = false;
         // Whatever we already retain for this range, the newest delivery
@@ -164,6 +221,73 @@ impl FrontierBuffer {
             let dst = &mut st.data[di..di + n];
             if *dst != bytes[si..si + n] {
                 dst.copy_from_slice(&bytes[si..si + n]);
+                differed = true;
+            }
+        }
+        // Paged spans reconcile too - a delivery overlapping one is
+        // either a routing duplicate (identical bytes; the paged copy
+        // stands and this part of the span need not be re-retained) or
+        // a repair rewrite. Scratch regions are write-once, so a
+        // differing rewrite UN-PAGES the region: the corrected copy
+        // parks in RAM, where a demotion materializes it exactly, and
+        // the sticky conflict below forfeits the chase like any other
+        // rewrite. A scratch READ error also flags the conflict: the
+        // copies cannot be proven to agree, and the demote's own
+        // read-back will surface the I/O error as the job failure.
+        if !st.paged.is_empty() && end > base {
+            let overlapping: Vec<(u64, u64, usize)> = {
+                let lo = st
+                    .paged
+                    .range(..=offset)
+                    .next_back()
+                    .map(|(&s, _)| s)
+                    .unwrap_or(0);
+                st.paged
+                    .range(lo..end)
+                    .filter(|&(&s, &(_, len))| s + len as u64 > offset && s < end)
+                    .map(|(&s, &(off, len))| (s, off, len))
+                    .collect()
+            };
+            for (s, po, len) in overlapping {
+                let a = offset.max(s);
+                let b = end.min(s + len as u64);
+                let mut have = vec![0u8; (b - a) as usize];
+                let Some(sc) = self.scratch.as_ref() else {
+                    debug_assert!(false, "paged span with no scratch");
+                    differed = true;
+                    continue;
+                };
+                if sc.read(po + (a - s), &mut have).is_err() {
+                    differed = true;
+                    continue;
+                }
+                let src = &bytes[(a - offset) as usize..(b - offset) as usize];
+                if have == src {
+                    continue;
+                }
+                // Read the whole region back BEFORE releasing it (the
+                // idle truncate must never beat a read), apply the
+                // rewrite, and re-park the corrected bytes in RAM.
+                let mut whole = vec![0u8; len];
+                if sc.read(po, &mut whole).is_err() {
+                    differed = true;
+                    continue;
+                }
+                whole[(a - s) as usize..(b - s) as usize].copy_from_slice(src);
+                st.paged.remove(&s);
+                st.paged_bytes -= len;
+                sc.release(len);
+                match st.pending.get_mut(&s) {
+                    // A longer same-start park subsumes the region; the
+                    // corrected bytes overwrite its copy so every
+                    // retained record agrees.
+                    Some(old) if old.len() >= whole.len() => {
+                        old[..whole.len()].copy_from_slice(&whole);
+                    }
+                    _ => {
+                        st.pending.insert(s, whole);
+                    }
+                }
                 differed = true;
             }
         }
@@ -191,15 +315,48 @@ impl FrontierBuffer {
         }
         if offset <= frontier {
             if end > frontier {
-                st.data
-                    .extend_from_slice(&bytes[(frontier - offset) as usize..]);
-                accepted = true;
+                // The append stops where paged coverage begins: those
+                // bytes are already on scratch (reconciled above), and
+                // the extended `frontier()` walks straight through them.
+                let stop = if st.paged_at(frontier).is_some() {
+                    frontier
+                } else {
+                    st.paged
+                        .range(frontier..end)
+                        .next()
+                        .map(|(&s, _)| s)
+                        .unwrap_or(end)
+                };
+                if stop > frontier {
+                    st.data.extend_from_slice(
+                        &bytes[(frontier - offset) as usize..(stop - offset) as usize],
+                    );
+                    accepted = true;
+                }
+                if end > stop {
+                    // The remainder past a paged region parks - unless
+                    // the region covers it entirely, in which case it is
+                    // a pure duplicate of scratch bytes.
+                    let covered = st
+                        .paged_at(stop)
+                        .is_some_and(|(s, _, len)| s + len as u64 >= end);
+                    let keep = !covered
+                        && match st.pending.get(&stop) {
+                            Some(old) => old.len() < (end - stop) as usize,
+                            None => true,
+                        };
+                    if keep {
+                        st.pending
+                            .insert(stop, bytes[(stop - offset) as usize..].to_vec());
+                        accepted = true;
+                    }
+                }
             }
             // Fold parked spans the new frontier now reaches. Their
             // overlap with the frontier was reconciled when they were
             // written, so only the tail is new.
             while let Some((&s, _)) = st.pending.first_key_value() {
-                let f = st.frontier();
+                let f = st.frontier_ram();
                 if s > f {
                     break;
                 }
@@ -211,11 +368,17 @@ impl FrontierBuffer {
             }
         } else {
             // Park it; a shorter duplicate at the same start is subsumed
-            // (its bytes were just reconciled into the longer one).
-            let keep = match st.pending.get(&offset) {
-                Some(old) => old.len() < bytes.len(),
-                None => true,
-            };
+            // (its bytes were just reconciled into the longer one), and
+            // a span one paged region wholly covers is a duplicate of
+            // scratch bytes and stays off RAM.
+            let covered = st
+                .paged_at(offset)
+                .is_some_and(|(s, _, len)| s + len as u64 >= end);
+            let keep = !covered
+                && match st.pending.get(&offset) {
+                    Some(old) => old.len() < bytes.len(),
+                    None => true,
+                };
             if keep {
                 st.pending.insert(offset, bytes.to_vec());
                 // Parked spans wake waiters too: the 7z chase reads at
@@ -271,10 +434,10 @@ impl FrontierBuffer {
     }
 
     /// Non-blocking volume-view read for the verifier/repair read-back:
-    /// serves frontier AND parked bytes, errors if any hole intersects.
-    /// A trimmed prefix reads as a hole - those bytes are on disk, and
-    /// the slot-level read splits the request at [`Self::base`] before
-    /// getting here.
+    /// serves frontier, parked AND paged bytes (the last via pread),
+    /// errors if any hole intersects. A trimmed prefix reads as a hole -
+    /// those bytes are on disk, and the slot-level read splits the
+    /// request at [`Self::base`] before getting here.
     pub(super) fn peek(&self, off: u64, out: &mut [u8]) -> io::Result<()> {
         let st = self.state.lock_ok();
         let mut pos = off;
@@ -282,7 +445,7 @@ impl FrontierBuffer {
         if pos < st.base {
             return Err(nofile());
         }
-        let frontier = st.frontier();
+        let frontier = st.frontier_ram();
         if pos < frontier {
             let n = (frontier.min(end) - pos) as usize;
             let di = (pos - st.base) as usize;
@@ -296,14 +459,26 @@ impl FrontierBuffer {
                 .range(..=pos)
                 .next_back()
                 .filter(|&(&s, v)| s + v.len() as u64 > pos);
-            let Some((&s, v)) = hit else {
-                return Err(nofile());
-            };
-            let ve = s + v.len() as u64;
-            let n = (ve.min(end) - pos) as usize;
-            out[(pos - off) as usize..(pos - off) as usize + n]
-                .copy_from_slice(&v[(pos - s) as usize..(pos - s) as usize + n]);
-            pos += n as u64;
+            if let Some((&s, v)) = hit {
+                let ve = s + v.len() as u64;
+                let n = (ve.min(end) - pos) as usize;
+                out[(pos - off) as usize..(pos - off) as usize + n]
+                    .copy_from_slice(&v[(pos - s) as usize..(pos - s) as usize + n]);
+                pos += n as u64;
+                continue;
+            }
+            if let Some((s, po, len)) = st.paged_at(pos) {
+                let se = s + len as u64;
+                let n = (se.min(end) - pos) as usize;
+                let sc = self.scratch.as_ref().ok_or_else(nofile)?;
+                sc.read(
+                    po + (pos - s),
+                    &mut out[(pos - off) as usize..(pos - off) as usize + n],
+                )?;
+                pos += n as u64;
+                continue;
+            }
+            return Err(nofile());
         }
         Ok(())
     }
@@ -315,7 +490,7 @@ impl FrontierBuffer {
         let st = self.state.lock_ok();
         let end = off + len;
         let mut ivs: Vec<(u64, u64)> = Vec::new();
-        let frontier = st.frontier();
+        let frontier = st.frontier_ram();
         let lo = off.max(st.base);
         if lo < frontier && lo < end {
             ivs.push((lo, frontier.min(end)));
@@ -327,6 +502,13 @@ impl FrontierBuffer {
                 ivs.push((a, b));
             }
         }
+        for (&s, &(_, plen)) in st.paged.range(..end) {
+            let a = off.max(s);
+            let b = end.min(s + plen as u64);
+            if a < b {
+                ivs.push((a, b));
+            }
+        }
         merge_intervals(ivs)
     }
 
@@ -334,9 +516,13 @@ impl FrontierBuffer {
     /// one span AT ITS OWN OFFSET, parked spans follow as-is. The buffer
     /// is empty after. A trimmed prefix is not here and does not need to
     /// be: the trim already wrote it to the very file this demotion
-    /// materializes into.
+    /// materializes into. Test-only: the production demote goes through
+    /// [`Self::pop_span`], which also reads paged spans back one at a
+    /// time instead of re-inflating the whole set.
+    #[cfg(test)]
     pub(super) fn take_spans(&self) -> Vec<(u64, Vec<u8>)> {
         let mut st = self.state.lock_ok();
+        debug_assert!(st.paged.is_empty(), "take_spans on a paged buffer");
         let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
         let base = st.base;
         let data = std::mem::take(&mut st.data);
@@ -348,6 +534,45 @@ impl FrontierBuffer {
         }
         st.stored = 0;
         out
+    }
+
+    /// Consume one retained span for demotion: the contiguous frontier
+    /// first (at its own offset), then each paged span - read back off
+    /// the scratch with a single pread and released - then the parked
+    /// spans. `None` once the buffer is empty. One span in RAM at a
+    /// time, which is what keeps a demote of a mostly-paged set from
+    /// re-inflating it; a scratch read error deliberately fails the
+    /// caller rather than demoting short, because the demote path needs
+    /// exactly these bytes to materialize the volume.
+    pub(super) fn pop_span(&self) -> io::Result<Option<(u64, Vec<u8>)>> {
+        let mut st = self.state.lock_ok();
+        if !st.data.is_empty() {
+            let base = st.base;
+            let data = std::mem::take(&mut st.data);
+            st.stored = st.pending.values().map(|v| v.len()).sum::<usize>();
+            return Ok(Some((base, data)));
+        }
+        if let Some((&s, &(po, len))) = st.paged.iter().next() {
+            let sc = self
+                .scratch
+                .as_ref()
+                .ok_or_else(|| io::Error::other("paged span with no scratch"))?
+                .clone();
+            let mut b = vec![0u8; len];
+            // Read BEFORE release: the idle truncate must never beat a
+            // read of a region a span still references.
+            sc.read(po, &mut b)?;
+            st.paged.remove(&s);
+            st.paged_bytes -= len;
+            sc.release(len);
+            return Ok(Some((s, b)));
+        }
+        if let Some((s, v)) = st.pending.pop_first() {
+            st.stored = st.data.len() + st.pending.values().map(|v| v.len()).sum::<usize>();
+            return Ok(Some((s, v)));
+        }
+        st.stored = 0;
+        Ok(None)
     }
 
     /// Declared total size (the level-N entry's unpacked size).
@@ -398,7 +623,10 @@ impl FrontierBuffer {
         if st.conflict || st.abort.is_some() {
             return None;
         }
-        let cut = watermark.min(st.frontier());
+        // The RAM frontier, deliberately: only `data` leaves through a
+        // trim. A paged span below the watermark is already off RAM and
+        // stays on the scratch until the demote or Drop releases it.
+        let cut = watermark.min(st.frontier_ram());
         if cut < st.base + min_release.max(1) {
             return None;
         }
@@ -408,6 +636,120 @@ impl FrontierBuffer {
         st.base = cut;
         st.stored = st.data.len() + st.pending.values().map(|v| v.len()).sum::<usize>();
         Some((at, out))
+    }
+
+    /// Proactive spill for a chase stalled behind terminally-missing
+    /// articles: move up to `need` cold RAM bytes to the holds scratch.
+    /// Parked spans go first, newest (highest) offsets first - they are
+    /// cold by construction, the forward-only RAR reader cannot reach a
+    /// parked span until its gap fills. With `include_data` the tail of
+    /// the contiguous run pages too (a volume the engine has not
+    /// reached, or is wholly past); the paged span continues coverage
+    /// exactly where `data` now ends, so `frontier()` and the blocking
+    /// readers see the same bytes, just served by pread. Returns the
+    /// bytes that left RAM; the caller re-reads `stored()` and settles
+    /// the budget, the same contract as the drop-behind trim. A scratch
+    /// refusal (ceiling, dead) just stops - whatever stayed in RAM keeps
+    /// riding the cap arbiter exactly as before this spill existed.
+    pub(super) fn page_cold(&self, cap: u64, mut need: usize, include_data: bool) -> usize {
+        let Some(sc) = self.scratch.as_ref() else {
+            return 0;
+        };
+        let mut st = self.state.lock_ok();
+        // A conflicted or aborted buffer is about to demote; leave its
+        // spans where the demote expects them.
+        if st.conflict || st.abort.is_some() {
+            return 0;
+        }
+        let mut moved = 0usize;
+        let starts: Vec<u64> = st.pending.keys().rev().copied().collect();
+        for s in starts {
+            if need == 0 {
+                break;
+            }
+            let len = st.pending[&s].len();
+            if len < HOLDS_PAGE_MIN {
+                continue;
+            }
+            let e = s + len as u64;
+            // Overlap with an existing paged region: fully covered means
+            // an agreeing duplicate that re-parked - drop the RAM copy,
+            // no I/O. A same-start longer span replaces the shorter
+            // region below. Any other partial overlap stays in RAM:
+            // paged regions are kept DISJOINT (every covering lookup is
+            // a single `range(..=pos).next_back()`), and these shapes
+            // are rare re-delivery leftovers, not the pile.
+            //
+            // `range(..e)` finds the greatest paged key BELOW the span's
+            // end, which can start above `s` - a repair span mapped at a
+            // PAR2 block boundary reaches under a region paged at an
+            // article boundary. Covered means covered at BOTH ends
+            // (`ps <= s`): without that test the prefix `[s, ps)` is in
+            // no map, no scratch region and no file, and dropping the
+            // RAM copy loses bytes that had already arrived.
+            let overlap = st
+                .paged
+                .range(..e)
+                .next_back()
+                .map(|(&ps, &(_, plen))| (ps, plen))
+                .filter(|&(ps, plen)| ps + plen as u64 > s);
+            match overlap {
+                Some((ps, plen)) if ps <= s && ps + plen as u64 >= e => {
+                    st.pending.remove(&s);
+                    moved += len;
+                    need = need.saturating_sub(len);
+                    continue;
+                }
+                Some((ps, _)) if ps != s => continue,
+                _ => {}
+            }
+            let v = st.pending.remove(&s).unwrap();
+            let Some(off) = sc.append(&v, cap) else {
+                st.pending.insert(s, v);
+                break;
+            };
+            if let Some(&(_, old_len)) = st.paged.get(&s) {
+                // The same-start shorter region is subsumed (bytes
+                // agree; the longer copy covers it).
+                debug_assert!(old_len < v.len());
+                st.paged_bytes -= old_len;
+                sc.release(old_len);
+            }
+            st.paged_bytes += v.len();
+            moved += v.len();
+            need = need.saturating_sub(v.len());
+            st.paged.insert(s, (off, v.len()));
+        }
+        if include_data && need >= HOLDS_PAGE_MIN && !st.data.is_empty() {
+            let take = st.data.len().min(need);
+            let data_end = st.base + st.data.len() as u64;
+            let at = data_end - take as u64;
+            // A paged region overlapping the tail (a fold ran through
+            // one): leave the tail resident rather than create
+            // overlapping regions - same disjointness rule as above.
+            let overlap = st
+                .paged
+                .range(..data_end)
+                .next_back()
+                .is_some_and(|(&ps, &(_, plen))| ps + plen as u64 > at);
+            if take >= HOLDS_PAGE_MIN && !overlap {
+                let cut = st.data.len() - take;
+                let tail = st.data.split_off(cut);
+                match sc.append(&tail, cap) {
+                    Some(off) => {
+                        st.paged_bytes += tail.len();
+                        moved += tail.len();
+                        st.paged.insert(at, (off, tail.len()));
+                    }
+                    None => {
+                        // Refused: put the tail back where it was.
+                        st.data.extend_from_slice(&tail);
+                    }
+                }
+            }
+        }
+        st.stored = st.data.len() + st.pending.values().map(|v| v.len()).sum::<usize>();
+        moved
     }
 
     /// Blocking RANDOM-ACCESS read for the 7z chase. The trait method
@@ -452,7 +794,7 @@ impl FrontierBuffer {
                 st = self.state.lock_ok();
                 continue;
             }
-            let frontier = st.frontier();
+            let frontier = st.frontier_ram();
             if offset < frontier {
                 let start = (offset - st.base) as usize;
                 let take = buf
@@ -473,7 +815,39 @@ impl FrontierBuffer {
                 buf[..take].copy_from_slice(&v[a..a + take]);
                 return Ok(take);
             }
+            if let Some((s, po, len)) = st.paged_at(offset) {
+                let take = buf
+                    .len()
+                    .min(len - (offset - s) as usize)
+                    .min((lim - offset) as usize);
+                let sc = self
+                    .scratch
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("paged span with no scratch"))?;
+                sc.read(po + (offset - s), &mut buf[..take])?;
+                return Ok(take);
+            }
             st = self.arrived.wait(st).unwrap();
+        }
+    }
+}
+
+impl Drop for FrontierBuffer {
+    /// A buffer dropped with paged spans still in it (a successful
+    /// chase, an abandoned slot) hands their scratch live-count back so
+    /// the file can truncate; the regions themselves were write-once
+    /// and need no other unwind.
+    fn drop(&mut self) {
+        let st = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if st.paged_bytes > 0
+            && let Some(sc) = &self.scratch
+        {
+            sc.release(st.paged_bytes);
+            st.paged_bytes = 0;
+            st.paged.clear();
         }
     }
 }
@@ -510,7 +884,7 @@ impl rars::BlockingRangeSource for FrontierBuffer {
                 st = self.state.lock_ok();
                 continue;
             }
-            let frontier = st.frontier();
+            let frontier = st.frontier_ram();
             if offset < frontier {
                 let start = (offset - st.base) as usize;
                 let take = buf
@@ -522,6 +896,36 @@ impl rars::BlockingRangeSource for FrontierBuffer {
             }
             if offset >= st.total {
                 return Ok(0);
+            }
+            // Beyond the RAM run the coverage may continue through
+            // paged spans (served by pread) and the parked spans that
+            // follow them. The reader is forward-only, so it can only
+            // arrive here through contiguous coverage - serving a
+            // parked span early is strictly more bytes, never wrong
+            // ones (identical-delivery reconciliation holds for every
+            // retained copy).
+            if let Some((s, po, len)) = st.paged_at(offset) {
+                let take = buf
+                    .len()
+                    .min(len - (offset - s) as usize)
+                    .min((lim - offset) as usize);
+                let sc = self
+                    .scratch
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("paged span with no scratch"))?;
+                sc.read(po + (offset - s), &mut buf[..take])?;
+                return Ok(take);
+            }
+            let hit = st
+                .pending
+                .range(..=offset)
+                .next_back()
+                .filter(|&(&s, v)| s + v.len() as u64 > offset);
+            if let Some((&s, v)) = hit {
+                let a = (offset - s) as usize;
+                let take = buf.len().min(v.len() - a).min((lim - offset) as usize);
+                buf[..take].copy_from_slice(&v[a..a + take]);
+                return Ok(take);
             }
             st = self.arrived.wait(st).unwrap();
         }
@@ -540,6 +944,150 @@ impl rars::BlockingRangeSource for FrontierBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extract::testutil::tmpdir;
+
+    fn pat(off: usize, n: usize) -> Vec<u8> {
+        (off..off + n).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// The stalled-chase cold spill end to end at the buffer level:
+    /// parked spans and the contiguous tail page to scratch, coverage
+    /// stays whole (intervals, peek, completeness), a forward reader
+    /// runs the volume out through preads once the gap fills, and a
+    /// demotion pops every span back byte-exact with the scratch
+    /// live-count fully drained.
+    #[test]
+    fn stall_paging_serves_paged_spans_and_pops_them_back() {
+        use rars::BlockingRangeSource as _;
+        let dir = tmpdir("frontier-paged");
+        let sc = Arc::new(HoldsScratch::new(&dir));
+        let buf = FrontierBuffer::new_gated(40_000, None, Some(sc.clone()));
+        buf.write_span(0, &pat(0, 10_000)); // contiguous run
+        buf.write_span(20_000, &pat(20_000, 10_000)); // parks
+        buf.write_span(30_000, &pat(30_000, 10_000)); // parks
+        assert_eq!(buf.stored(), 30_000);
+        let moved = buf.page_cold(1 << 20, usize::MAX, true);
+        assert_eq!(moved, 30_000, "both parks and the data tail must page");
+        assert_eq!(buf.stored(), 0);
+        // Coverage is intact, just served differently.
+        assert_eq!(
+            buf.intervals(0, 40_000),
+            vec![(0, 10_000), (20_000, 40_000)]
+        );
+        let mut got = vec![0u8; 10_000];
+        buf.peek(25_000, &mut got).unwrap();
+        assert_eq!(got, pat(25_000, 10_000), "peek must pread across regions");
+        assert!(!buf.is_complete());
+        // The gap fills (a retry or a repair landing late): coverage
+        // completes and the forward-only reader streams the whole
+        // volume, paged regions served by pread.
+        buf.write_span(10_000, &pat(10_000, 10_000));
+        assert!(buf.is_complete(), "paged coverage must count as arrived");
+        let mut out = vec![0u8; 40_000];
+        let mut pos = 0usize;
+        while pos < 40_000 {
+            let n = buf.read_at(pos as u64, &mut out[pos..]).unwrap();
+            assert_ne!(n, 0, "reader starved at {pos} despite full coverage");
+            pos += n;
+        }
+        assert_eq!(out, pat(0, 40_000));
+        // Demotion consumes one span at a time, byte-exact.
+        let mut mat = vec![0u8; 40_000];
+        let mut popped = 0;
+        while let Some((off, bytes)) = buf.pop_span().unwrap() {
+            mat[off as usize..off as usize + bytes.len()].copy_from_slice(&bytes);
+            popped += 1;
+        }
+        assert!(popped >= 3, "expected data + paged spans, got {popped}");
+        assert_eq!(mat, pat(0, 40_000));
+        assert_eq!(sc.st().live, 0, "scratch live must drain with the pops");
+        drop(buf);
+        sc.cleanup();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Deliveries overlapping a paged region reconcile exactly like RAM
+    /// copies: an identical duplicate is absorbed without re-inflating
+    /// RAM or flagging anything, and a DIFFERING rewrite un-pages the
+    /// region with the correction applied and trips the sticky conflict
+    /// - the demote must materialize the corrected bytes.
+    #[test]
+    fn paged_span_rewrites_reconcile_and_conflict() {
+        let dir = tmpdir("frontier-paged-rw");
+        let sc = Arc::new(HoldsScratch::new(&dir));
+        let buf = FrontierBuffer::new_gated(30_000, None, Some(sc.clone()));
+        buf.write_span(10_000, &[3u8; 10_000]);
+        assert_eq!(buf.page_cold(1 << 20, usize::MAX, false), 10_000);
+        assert_eq!(buf.stored(), 0);
+        buf.write_span(10_000, &[3u8; 10_000]);
+        assert!(!buf.conflicted(), "an identical duplicate is not a rewrite");
+        assert_eq!(buf.stored(), 0, "an agreeing duplicate re-inflated RAM");
+        buf.write_span(12_000, &[3u8; 1_000]);
+        assert!(!buf.conflicted());
+        assert_eq!(buf.stored(), 0);
+        buf.write_span(12_000, &[9u8; 1_000]);
+        assert!(buf.conflicted(), "a differing rewrite must not be dropped");
+        let mut want = vec![3u8; 10_000];
+        want[2_000..3_000].fill(9);
+        let mut got = vec![0u8; 10_000];
+        buf.peek(10_000, &mut got).unwrap();
+        assert_eq!(got, want, "the corrected copy is what a demote ships");
+        let mut mat = vec![0u8; 10_000];
+        while let Some((off, bytes)) = buf.pop_span().unwrap() {
+            let at = (off - 10_000) as usize;
+            mat[at..at + bytes.len()].copy_from_slice(&bytes);
+        }
+        assert_eq!(mat, want);
+        assert_eq!(sc.st().live, 0);
+        drop(buf);
+        sc.cleanup();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A parked span reaching UNDER a paged region keeps its uncovered
+    /// prefix. `page_cold` finds the overlap with `range(..e).next_back()`
+    /// - the greatest paged key below the span's END - so the region it
+    /// finds can start above the span's start, which is what a repair
+    /// span mapped at a PAR2 block boundary looks like against a region
+    /// paged at an article boundary. Treating that as "fully covered"
+    /// dropped the prefix into no map, no file and no scratch region:
+    /// the frontier could never pass it, and a demote materialized a
+    /// volume with a hole at bytes that had already arrived.
+    #[test]
+    fn page_cold_keeps_the_prefix_a_paged_region_does_not_cover() {
+        let dir = tmpdir("frontier-paged-prefix");
+        let sc = Arc::new(HoldsScratch::new(&dir));
+        let buf = FrontierBuffer::new_gated(30_000, None, Some(sc.clone()));
+        // A span parks above the frontier and pages out.
+        buf.write_span(10_000, &pat(10_000, 10_000));
+        assert_eq!(buf.page_cold(1 << 20, usize::MAX, false), 10_000);
+        assert_eq!(buf.stored(), 0);
+        // A later delivery starts BELOW the paged region and ends inside
+        // it: nothing covers [5_000, 10_000), so it parks whole.
+        buf.write_span(5_000, &pat(5_000, 10_000));
+        assert_eq!(buf.stored(), 10_000);
+        // The next spill pass must not mistake it for a duplicate.
+        buf.page_cold(1 << 20, usize::MAX, false);
+        assert!(!buf.conflicted(), "the bytes agree - no rewrite happened");
+        buf.write_span(0, &pat(0, 5_000));
+        assert_eq!(
+            buf.frontier(),
+            20_000,
+            "coverage must run through the prefix"
+        );
+        let mut got = vec![0u8; 20_000];
+        buf.peek(0, &mut got).unwrap();
+        assert_eq!(got, pat(0, 20_000), "the prefix bytes must still be there");
+        let mut mat = vec![0u8; 20_000];
+        while let Some((off, bytes)) = buf.pop_span().unwrap() {
+            mat[off as usize..off as usize + bytes.len()].copy_from_slice(&bytes);
+        }
+        assert_eq!(mat, pat(0, 20_000), "a demote must materialize every byte");
+        assert_eq!(sc.st().live, 0);
+        drop(buf);
+        sc.cleanup();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// §94 B: a gated buffer serves only PAR2-vouched bytes. Bytes are
     /// PRESENT past the watermark and must still not reach the decode -
@@ -550,7 +1098,7 @@ mod tests {
     fn gated_reads_clamp_at_the_verified_watermark() {
         let gate = crate::live::VerifyGate::new(1);
         gate.engage(0);
-        let buf = FrontierBuffer::new_gated(30, Some((gate.clone(), 0)));
+        let buf = FrontierBuffer::new_gated(30, Some((gate.clone(), 0)), None);
         buf.write_span(0, &[7u8; 30]);
         // Watermark 10: a 16-byte read at 0 serves exactly 10.
         gate.advance(0, 10);
@@ -570,7 +1118,7 @@ mod tests {
         // An aborted buffer must not strand a gate-blocked reader.
         let gate2 = crate::live::VerifyGate::new(1);
         gate2.engage(0);
-        let b4 = std::sync::Arc::new(FrontierBuffer::new_gated(30, Some((gate2, 0))));
+        let b4 = std::sync::Arc::new(FrontierBuffer::new_gated(30, Some((gate2, 0)), None));
         b4.write_span(0, &[1u8; 30]);
         let b5 = b4.clone();
         let t = std::thread::spawn(move || {
