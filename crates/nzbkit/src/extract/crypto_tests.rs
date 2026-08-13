@@ -320,6 +320,148 @@ fn a_hash_plus_crc_encrypted_set_still_maps_one_pass() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// TODO 158 item 2: a head and a tail that DISAGREE about a check field
+/// must not route half an output each way.
+///
+/// `crypto_files` latches the plaintext-once route by output name on
+/// whichever fragment asks first, and the write-time decision used to read
+/// its check fields off the fragment in front of the writer. Only the tail
+/// carries the whole-file checks, so the two could answer differently for
+/// one file - and a half-plaintext output cannot be turned back into
+/// byte-exact volumes by the fallback shim, which is what a demoted group
+/// needs from it.
+///
+/// The fixture is synthetic on purpose: no real writer states a whole-file
+/// digest on a head piece, which is why this shape is unreachable in the
+/// field today and why it stops being unreachable the moment another
+/// per-file check field is added. Here the HEAD states a BLAKE2sp digest
+/// and no CRC32 (nothing this build can adjudicate) and the tail states a
+/// CRC32 (which adjudicates the whole file).
+///
+/// The head is the piece that makes the disagreement bite: its base is
+/// offset 0, so its spans WRITE while a tail's would still be holding for
+/// an unresolved base. Feeding part of the head, then the tail, then the
+/// rest of the head is therefore the order that used to write ciphertext
+/// under a veto and then latch plaintext-once when the tail's CRC32 lifted
+/// it - one output, both routes. Every order below must leave the file on
+/// one route and publish the same correct bytes.
+#[test]
+fn head_and_tail_disagreeing_about_the_digest_never_mix_routes() {
+    let plain = payload(300_007, 71);
+    let mut head = fixtures::encrypt_file("hunter2", &plain, 43);
+    // Head: a digest where no real archive puts one, and no CRC32.
+    head.with_hash = true;
+    head.checks_on_head = true;
+    let mut tail = fixtures::encrypt_file("hunter2", &plain, 43);
+    tail.with_crc = true;
+    let n = head.cipher.len();
+    let vols = [
+        fixtures::rar5_volume_enc(&[("movie.mkv", &head, 0..150_016, false, true)], Some(0)),
+        fixtures::rar5_volume_enc(&[("movie.mkv", &tail, 150_016..n, true, false)], Some(1)),
+    ];
+    // Sequential so the interleaved order is exactly the one described.
+    let put = |ex: &Extractor, slot: usize, vol: &[u8], r: std::ops::Range<usize>| {
+        let mut at = r.start;
+        while at < r.end {
+            let to = (at + 7000).min(r.end);
+            ex.write(
+                slot,
+                &format!("v{slot}.rar"),
+                vol.len() as u64,
+                at as u64,
+                &vol[at..to],
+            )
+            .unwrap();
+            at = to;
+        }
+    };
+    let cut = 70_000;
+    for label in ["head-split-around-tail", "head-first", "tail-first"] {
+        let dir = tmpdir(&format!("enc-disagree-digest-{label}"));
+        let ex = Extractor::new(&dir, vols.len(), true);
+        ex.set_password("hunter2");
+        match label {
+            "head-split-around-tail" => {
+                put(&ex, 0, &vols[0], 0..cut);
+                put(&ex, 1, &vols[1], 0..vols[1].len());
+                put(&ex, 0, &vols[0], cut..vols[0].len());
+            }
+            "head-first" => {
+                put(&ex, 0, &vols[0], 0..vols[0].len());
+                put(&ex, 1, &vols[1], 0..vols[1].len());
+            }
+            _ => {
+                put(&ex, 1, &vols[1], 0..vols[1].len());
+                put(&ex, 0, &vols[0], 0..vols[0].len());
+            }
+        }
+        let rep = ex.finish().unwrap();
+        // The tail's CRC32 covers the whole plaintext, so this set IS
+        // adjudicable and must publish - on whichever route it took.
+        assert!(
+            rep.fallbacks.is_empty(),
+            "{label}: the tail's CRC32 adjudicates this set: {:?}",
+            rep.fallbacks
+        );
+        assert_eq!(
+            std::fs::read(dir.join("movie.mkv")).unwrap(),
+            plain,
+            "{label}: the published plaintext must be whole and correct"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// The same disagreement one field over: the head omits the stored
+/// password check (crypt flag 0x01 clear) and the tail carries one.
+///
+/// Reading the check off the fragment in front answered "no proof, assemble
+/// ciphertext" for the head and "verified, decrypt in place" for the tail -
+/// two routes, one output. Resolved over the whole file it is one answer in
+/// both feed orders: the head's record is what keys the stream, an
+/// unproven key never decrypts at write time, and the finish pass
+/// adjudicates the assembled ciphertext against the tail's whole-file
+/// CRC32 - so the file publishes, correct, either way.
+#[test]
+fn head_and_tail_disagreeing_about_the_password_check_never_mix_routes() {
+    let plain = payload(300_007, 73);
+    let mut head = fixtures::encrypt_file("hunter2", &plain, 45);
+    head.no_check = true;
+    head.with_crc = true;
+    let mut tail = fixtures::encrypt_file("hunter2", &plain, 45);
+    tail.with_crc = true;
+    let n = head.cipher.len();
+    let vols = [
+        fixtures::rar5_volume_enc(&[("movie.mkv", &head, 0..150_016, false, true)], Some(0)),
+        fixtures::rar5_volume_enc(&[("movie.mkv", &tail, 150_016..n, true, false)], Some(1)),
+    ];
+    for (label, tail_first) in [("head-first", false), ("tail-first", true)] {
+        let dir = tmpdir(&format!("enc-disagree-check-{label}"));
+        let ex = Extractor::new(&dir, vols.len(), true);
+        ex.set_password("hunter2");
+        let order: Vec<usize> = if tail_first {
+            (0..vols.len()).rev().collect()
+        } else {
+            (0..vols.len()).collect()
+        };
+        for i in order {
+            feed(&ex, i, &format!("v{i}.rar"), &vols[i], 7000, 73 + i as u64);
+        }
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks.is_empty(),
+            "{label}: the tail's CRC32 adjudicates this set, nothing to demote: {:?}",
+            rep.fallbacks
+        );
+        assert_eq!(
+            std::fs::read(dir.join("movie.mkv")).unwrap(),
+            plain,
+            "{label}: the published plaintext must be whole and correct"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
 /// The decrypt pass shards a file across threads, seeding each shard's
 /// CBC chain from the ciphertext block before it and folding the shard
 /// CRCs back with `crc32_combine`. Every shard count must therefore

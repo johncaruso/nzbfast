@@ -48,8 +48,42 @@ jobs:
             crates/nzbkit/fuzz/target
           key: fuzz-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - name: install cargo-fuzz
-        # No-op (exit 0) when the cached binary already matches.
-        run: cargo install cargo-fuzz --locked
+        # Skip when the cache above restored the binary. `cargo install`
+        # does NOT no-op on an existing binary the way this step used to
+        # claim - it errors with "binary `cargo-fuzz` already exists in
+        # destination". That is what reds the SECOND push to any PR whose
+        # Cargo.lock is unchanged: the cache key hits, ~/.cargo/bin/
+        # cargo-fuzz comes back, and the install fails in ~60s (seen on
+        # PR #26, run 31703586147, after a green first push).
+        # Guarding rather than `--force` also skips a pointless rebuild.
+        run: |
+          bin="${CARGO_HOME:-$HOME/.cargo}/bin/cargo-fuzz"
+          [ -x "$bin" ] || cargo install cargo-fuzz --locked
+      # Carry the corpus forward between runs. Without this the burst
+      # starts COLD every time: the cache above covers ~/.cargo and the
+      # fuzz target dir but not `corpus/`, and the seed step below rebuilds
+      # it from in-tree fixtures, so every coverage-expanding input
+      # libFuzzer discovers is thrown away when the job ends. Sixty seconds
+      # from a fixed seed set is a fixed-depth sample, and it re-samples the
+      # same shallow shell nightly rather than going deeper.
+      #
+      # That is not theoretical. The `rar_name_probe` out-of-bounds panic in
+      # `v4_header_crc` (13 Aug) needed a torn 8-byte header, a shape no
+      # fixture has: three runs found it and run b8010a14 came back GREEN on
+      # a commit that did not contain the fix. A green burst was not
+      # evidence, and the reason was that nothing accumulated.
+      #
+      # Keyed on `run_id` so every run writes a fresh entry, with a prefix
+      # restore-key so each one resumes from the newest existing corpus.
+      # PR runs restore from the default branch's cache and write to their
+      # own scope, which expires with the branch - so a PR cannot poison
+      # what the nightly builds up.
+      - name: restore fuzz corpus
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: crates/nzbkit/fuzz/corpus
+          key: fuzz-corpus-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ runner.os }}-
       - name: seed corpora from in-tree fixtures
         working-directory: crates/nzbkit/fuzz
         run: |
@@ -71,6 +105,13 @@ jobs:
           cp ../tests/fixtures/mkv/*.mkv corpus/mkv_parse/ 2>/dev/null || true
           cp ../tests/fixtures/zip/*.zip corpus/zip_parse/ 2>/dev/null || true
           cp ../../../vendor/rars/tests/fixtures/rar*/*.rar corpus/rar_recovery_scan/ 2>/dev/null || true
+          # Committed repros (seeds/README.md): corpus/ is gitignored, so a
+          # crash CI found would be lost with its artifact. Replay them all.
+          for d in seeds/*/; do
+            t=$(basename "$d")
+            mkdir -p "corpus/$t"
+            find "$d" -type f ! -name README.md -exec cp {} "corpus/$t/" \;
+          done
           # url_authority_diff needs the scheme prefix in the corpus:
           # "http://" is a 7-byte magic that coverage feedback alone is
           # slow to discover, and everything interesting is behind it.
@@ -129,6 +170,33 @@ jobs:
           cargo +nightly fuzz run sevenz_name_probe -- \
             -max_total_time=60 -rss_limit_mb=512 -timeout=10
           echo "::endgroup::"
+      # Report what the corpus is costing before saving it. A corpus that
+      # accumulates forever eventually evicts itself against the repo-wide
+      # 10 GB cache ceiling, and it would do it SILENTLY - the burst would
+      # quietly go back to starting cold, which is the exact failure this
+      # step exists to prevent. `cargo fuzz cmin <target>` is the lever when
+      # these numbers get uncomfortable; libFuzzer only keeps inputs that
+      # expand coverage, so the growth is slow, not linear in runtime.
+      - name: corpus size
+        if: always()
+        working-directory: crates/nzbkit/fuzz
+        run: |
+          du -sh corpus 2>/dev/null || true
+          for d in corpus/*/; do
+            printf '%8s  %5s files  %s\n' \
+              "$(du -sh "$d" 2>/dev/null | cut -f1)" \
+              "$(find "$d" -type f | wc -l | tr -d ' ')" "$d"
+          done
+      # `always()` on purpose: a CRASHING run is the one whose corpus is
+      # most worth keeping - it holds the inputs that walked up to the
+      # crash. The default post-job save would skip exactly that case and
+      # discard the most valuable corpus the job ever built.
+      - name: save fuzz corpus
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: crates/nzbkit/fuzz/corpus
+          key: fuzz-corpus-${{ runner.os }}-${{ github.run_id }}
       - name: upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -477,6 +477,174 @@ fn dupe_action_discard_and_fail_change_what_a_duplicate_becomes() {
     });
 }
 
+/// #41: dupe_scope = "exact" narrows what collides. A different release
+/// of the same episode (an *arr quality upgrade) is not a duplicate and
+/// downloads normally; a re-add of the same release name still is, even
+/// across separator styles. "smart" (the default) keeps the identity
+/// match - pinned above.
+#[test]
+fn dupe_scope_exact_lets_a_different_release_of_the_same_episode_through() {
+    with_daemon("dupescope", |d| {
+        let nzb = |seg: &str| {
+            format!(
+                "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\
+                 <file poster=\"x\" date=\"0\" subject=\"&quot;a.bin&quot; yEnc (1/1)\">\
+                 <groups><group>g</group></groups><segments>\
+                 <segment bytes=\"1000\" number=\"1\">{seg}@x</segment>\
+                 </segments></file></nzb>"
+            )
+        };
+        let add = |seg: &str, name: &str| {
+            d.enqueue(
+                nzb(seg).as_bytes(),
+                name,
+                "",
+                -100,
+                None,
+                None,
+                "test",
+                false,
+            )
+        };
+        *d.dupe_scope.lock_ok() = "exact".into();
+        add("one", "Show.S01E02.1080p.WEB-DL.x264-Poke.nzb").unwrap();
+        // Same episode, different release: not a duplicate under "exact".
+        let upgrade = add("two", "Show.S01E02.1080p.HEVC.x265-MeGusta.nzb").unwrap();
+        assert!(!d.held_as_duplicate(&upgrade));
+        // Same release re-sent, different separators: still caught.
+        let resend = add("three", "Show S01E02 1080p WEB-DL x264-Poke.nzb").unwrap();
+        assert!(d.held_as_duplicate(&resend));
+        // Back to "smart": identity collides again.
+        *d.dupe_scope.lock_ok() = "smart".into();
+        let held = add("four", "Show.S01E02.2160p.nzb").unwrap();
+        assert!(d.held_as_duplicate(&held));
+    });
+}
+
+/// Codex sweep K, 13 Aug 2026: admission and promotion asked different
+/// questions. Under `dupe_scope = "exact"` a different release of the
+/// same episode is admitted and runs; when it failed, `park` promoted
+/// held rows by the shared EPISODE key - including one held against a
+/// completed original that is still sitting in history. The user got a
+/// second copy of something they already had.
+#[test]
+fn an_exact_mode_failure_does_not_release_another_releases_hold() {
+    with_daemon("dupe-promote", |d| {
+        let nzb = |seg: &str| {
+            format!(
+                "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\
+                 <file poster=\"x\" date=\"0\" subject=\"&quot;a.bin&quot; yEnc (1/1)\">\
+                 <groups><group>g</group></groups><segments>\
+                 <segment bytes=\"1000\" number=\"1\">{seg}@x</segment>\
+                 </segments></file></nzb>"
+            )
+        };
+        let add = |seg: &str, name: &str| {
+            d.enqueue(
+                nzb(seg).as_bytes(),
+                name,
+                "",
+                -100,
+                None,
+                None,
+                "test",
+                false,
+            )
+            .unwrap()
+        };
+        *d.dupe_scope.lock_ok() = "exact".into();
+        // A: completed, in history.
+        let a = add("k1", "Show.S05E05.1080p.WEB-DL.x264-Poke.nzb");
+        let ja = d.queue_job(&a).unwrap();
+        {
+            let mut g = ja.lock_ok();
+            g.state = JobState::Completed;
+        }
+        d.queue.lock_ok().retain(|j| j.lock_ok().nzo_id != a);
+        d.history.lock_ok().push(ja);
+
+        // B: a DIFFERENT release of the same episode - admitted under
+        // exact, and it runs.
+        let b = add("k2", "Show.S05E05.2160p.HEVC.x265-MeGusta.nzb");
+        assert!(!d.held_as_duplicate(&b));
+        // C: a re-send of A's release - held, against A.
+        let c = add("k3", "Show S05E05 1080p WEB-DL x264-Poke.nzb");
+        assert!(d.held_as_duplicate(&c));
+
+        // B fails. Its failure says nothing about A, which is still
+        // completed, so C must stay held.
+        let jb = d.queue_job(&b).unwrap();
+        {
+            let mut g = jb.lock_ok();
+            g.state = JobState::Failed;
+        }
+        d.park(jb);
+        assert!(
+            d.held_as_duplicate(&c),
+            "C was held against a COMPLETED original, not against B"
+        );
+        assert!(
+            d.history
+                .lock_ok()
+                .iter()
+                .any(|j| j.lock_ok().nzo_id == a && j.lock_ok().state == JobState::Completed),
+            "the original is still completed"
+        );
+    });
+}
+
+/// Codex sweep J, 13 Aug 2026: the exact identity was built with an
+/// ASCII-only filter, so every non-Latin letter became a space. Two
+/// DIFFERENT CJK titles sharing a tag tail reduced to the same key and
+/// the second was held as a duplicate of the first, while a wholly
+/// non-ASCII name reduced to the empty string - no identity at all, so
+/// a genuine re-send of it was admitted as new.
+#[test]
+fn exact_identity_keeps_non_ascii_titles_apart() {
+    with_daemon("dupe-unicode", |d| {
+        let nzb = |seg: &str| {
+            format!(
+                "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\
+                 <file poster=\"x\" date=\"0\" subject=\"&quot;a.bin&quot; yEnc (1/1)\">\
+                 <groups><group>g</group></groups><segments>\
+                 <segment bytes=\"1000\" number=\"1\">{seg}@x</segment>\
+                 </segments></file></nzb>"
+            )
+        };
+        let add = |seg: &str, name: &str| {
+            d.enqueue(
+                nzb(seg).as_bytes(),
+                name,
+                "",
+                -100,
+                None,
+                None,
+                "test",
+                false,
+            )
+            .unwrap()
+        };
+        *d.dupe_scope.lock_ok() = "exact".into();
+        let first = add("u1", "電影甲.2024.1080p.WEB-DL.x264-GRP.nzb");
+        assert!(!d.held_as_duplicate(&first));
+        // A different film, same year and tags: not the same release.
+        let other = add("u2", "電影乙.2024.1080p.WEB-DL.x264-GRP.nzb");
+        assert!(
+            !d.held_as_duplicate(&other),
+            "distinct titles must not share an exact identity"
+        );
+        // …and the same one re-sent IS caught, which needs the name to
+        // have had a nonempty identity in the first place.
+        let all_cjk = add("u3", "電影丙.nzb");
+        assert!(!d.held_as_duplicate(&all_cjk));
+        let resend = add("u4", "電影丙.nzb");
+        assert!(
+            d.held_as_duplicate(&resend),
+            "an all-letter non-ASCII name must still have an identity"
+        );
+    });
+}
+
 /// §129 4a: an add announces itself on the event ring BEFORE the job
 /// can be picked, so no consumer ever sees a job start before it
 /// exists. The runner picks under the queue lock (`pick_job`), which is
@@ -1588,6 +1756,174 @@ fn retry_keeps_an_out_dir_that_is_still_under_the_current_root() {
     });
 }
 
+/// The indexer-confirm lane end to end against a mock newznab, with
+/// the suggestion created by the REAL correlation machinery (seeded
+/// pre + dark scanned row + catchup walk - the design's own worked
+/// example numbers). Round one: the listing matches, its NZB
+/// msgid-joins at quorum, the row gains the pre title as a proven
+/// msgid-set name and the suggestion settles 'confirmed'. Round two:
+/// a second suggestion's NZB joins nothing - stamped out, nothing
+/// named, and the suggestion left standing rather than falsely
+/// settled.
+#[cfg(feature = "indexer")]
+#[test]
+fn an_indexer_confirmed_suggestion_becomes_a_proven_name() {
+    use nzbkit::predb::{PreKind, PreLine};
+    with_daemon("corrconfirm", |d| {
+        d.index_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let seed = |ix: &mut nzbkit::index::Index, stem: &str, tag: &str, title: &str| {
+            let entries: Vec<nzbkit::nntp::OverEntry> = (1..=3u64)
+                .map(|n| nzbkit::nntp::OverEntry {
+                    number: n,
+                    subject: format!(r#""{stem}" yEnc ({n}/3)"#),
+                    from: "p@x".into(),
+                    message_id: format!("<{tag}{n}@test>"),
+                    bytes: 1_666_666_666,
+                    date: 4_600,
+                })
+                .collect();
+            ix.ingest("alt.binaries.x264", &entries, 5_000).unwrap();
+            ix.predb_store(
+                &[PreLine {
+                    kind: PreKind::New,
+                    title: title.into(),
+                    category: "X264-HD".into(),
+                    size: 4_900_000_000,
+                    date: 1_000,
+                    source: "PRE".into(),
+                    ..Default::default()
+                }],
+                5_000,
+            )
+            .unwrap();
+        };
+        const TITLE: &str = "Test.Release.2026.1080p.WEB.H264-GRP";
+        d.with_index_mut(|ix| {
+            seed(ix, "x7Pq9RtK2mVb8NcJ4wZs", "cc", TITLE);
+            let (_, suggested, _) = ix.predb_corr_backlog(400, 0, false, 6_200).unwrap();
+            assert_eq!(suggested, 1, "the real scorer suggested the pairing");
+            let picks = ix.corr_confirm_pick(5).unwrap();
+            assert_eq!(picks.len(), 1);
+            assert_eq!(picks[0].1, TITLE);
+            Some(())
+        })
+        .unwrap();
+
+        // Mock newznab: request 1 = the search, request 2 = the NZB.
+        // Connection: close forces a fresh connection per request so
+        // the accept loop sees each one.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let nzb_ids: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(vec!["cc1", "cc2", "cc3"]));
+        let ids2 = nzb_ids.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming().take(4) {
+                let mut s = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = if req.contains("t=search") {
+                    format!(
+                        r#"<?xml version="1.0"?><rss><channel>
+<item><title>Test.Release.2026.1080p.WEB.H264-GRP</title><guid>g1</guid>
+<enclosure url="http://127.0.0.1:{port}/nzb" length="4900000000" type="application/x-nzb"/>
+</item></channel></rss>"#
+                    )
+                } else {
+                    let ids = ids2.lock().unwrap().clone();
+                    let segs: String = ids
+                        .iter()
+                        .enumerate()
+                        .map(|(i, id)| {
+                            format!(
+                                r#"<segment bytes="1666666666" number="{}">{id}@test</segment>"#,
+                                i + 1
+                            )
+                        })
+                        .collect();
+                    format!(
+                        r#"<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+<file poster="p@x" date="4600" subject="&quot;x&quot; yEnc (1/3)">
+<groups><group>alt.binaries.x264</group></groups>
+<segments>{segs}</segments></file></nzb>"#
+                    )
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+
+        d.indexers.lock_ok().push(crate::newznab::IndexerConfig {
+            name: "mock".into(),
+            url: format!("http://127.0.0.1:{port}"),
+            apikey: "k".into(),
+            enabled: true,
+            priority: 0,
+            hits_per_day: 0,
+            grabs_per_day: 0,
+        });
+        *d.corr_confirm_source.lock_ok() = "mock".into();
+        d.corr_confirm_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        assert!(super::tasks::corr_confirm_once(d), "budget was spent");
+        d.with_index(|ix| {
+            let r = &ix.search("x7Pq9RtK2mVb8NcJ4wZs", 5).unwrap()[0];
+            assert_eq!(r.pre_title, TITLE, "the join named the row");
+            let stats = ix.predb_corr_stats().unwrap();
+            let confirmed = stats
+                .iter()
+                .find(|(k, _)| k == "confirmed")
+                .map(|(_, v)| *v)
+                .unwrap_or(0);
+            assert_eq!(confirmed, 1, "the suggestion settled confirmed");
+            assert!(
+                ix.corr_confirm_pick(5).unwrap().is_empty(),
+                "checked once, never again"
+            );
+            Some(())
+        })
+        .unwrap();
+
+        // Round two: a fresh suggestion whose fetched NZB shares no
+        // message-ids with the row - the join must find nothing.
+        const TITLE2: &str = "Other.Show.S01E05.1080p.WEB.H264-GRP";
+        d.with_index_mut(|ix| {
+            seed(ix, "q2Wm8VbN5xKj3RtY7pLc", "dd", TITLE2);
+            // The backlog cursor parked below round one's rows; a seed
+            // generation bump is production's own re-open mechanism.
+            ix.kv_set("predb_seed_gen", "test2").unwrap();
+            let (_, suggested, _) = ix.predb_corr_backlog(400, 0, false, 6_300).unwrap();
+            assert_eq!(suggested, 1);
+            Some(())
+        })
+        .unwrap();
+        *nzb_ids.lock().unwrap() = vec!["ee1", "ee2", "ee3"];
+        assert!(
+            super::tasks::corr_confirm_once(d),
+            "budget spent on the miss too"
+        );
+        d.with_index(|ix| {
+            let r = &ix.search("q2Wm8VbN5xKj3RtY7pLc", 5).unwrap()[0];
+            assert_eq!(r.pre_title, "", "no join, no name");
+            assert!(
+                ix.corr_confirm_pick(5).unwrap().is_empty(),
+                "stamped regardless"
+            );
+            Some(())
+        })
+        .unwrap();
+        drop(server);
+    });
+}
+
 /// C4-4 (§131 identity substrate): an accepted NZB is a (name, payload
 /// message-id set) pairing. When its payload ids are rows the scanner
 /// holds, the add records a MsgidSet claim against them, provenance-
@@ -1811,4 +2147,266 @@ fn the_longest_outage_is_the_one_the_row_reports() {
         row_outage(true, &os).expect("reported").1.host,
         "old.example"
     );
+}
+
+// -- §158 item 7: neither store holds the record -----------------------------
+
+/// A second Daemon over the same spool directory, restored from whatever
+/// is on disk RIGHT NOW. The restart half of the crash harness: the
+/// assertions below are made against bytes a torn write actually left,
+/// not against a fixture written to match somebody's belief about it.
+fn restart(d: &Arc<Daemon>) -> Arc<Daemon> {
+    let dir = d.spool.parent().expect("spool has a parent").to_path_buf();
+    let d2 = super::super::testutil::test_daemon(&dir);
+    d2.load_queue();
+    d2
+}
+
+fn one_file_nzb(seg: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\
+         <file poster=\"x\" date=\"0\" subject=\"&quot;a.bin&quot; yEnc (1/1)\">\
+         <groups><group>g</group></groups><segments>\
+         <segment bytes=\"1000\" number=\"1\">{seg}@x</segment>\
+         </segments></file></nzb>"
+    )
+}
+
+fn stored_next_id(d: &Arc<Daemon>) -> u64 {
+    crate::persist::load_json_with_backup(&d.spool.join("queue.json"))
+        .and_then(|v| v.get("next_id").and_then(Value::as_u64))
+        .expect("queue.json carries next_id")
+}
+
+/// §158: a duplicate add with duplicates set to "fail" never joins the
+/// queue - it files straight to history - so its record reaches disk
+/// through TWO writes that are not one transaction. The record's own
+/// store goes first; `save_queue` runs second and carries nothing of this
+/// job but the id-allocator bump.
+///
+/// Cut between them, which is what a kill or an ENOSPC does there. The
+/// old order wrote the queue snapshot first, so the write that survived
+/// the cut was the one with no trace of the job in it and the record was
+/// lost from BOTH files - the spooled .nzb left on disk named by nothing,
+/// and the *arr that submitted it never told the grab had failed.
+#[test]
+fn a_never_queued_rejection_survives_a_kill_between_its_two_store_writes() {
+    with_daemon("lostboth-fail", |d| {
+        let add = |seg: &str, name: &str| {
+            d.enqueue(
+                one_file_nzb(seg).as_bytes(),
+                name,
+                "",
+                -100,
+                None,
+                None,
+                "test",
+                false,
+            )
+        };
+        // The original, so the next add collides with it. A name with a
+        // derivable identity (SxxEyy), or there is no dupe_key to match on.
+        add("one", "Show.S03E04.1080p.nzb").expect("the original add");
+        *d.dupe_action.lock_ok() = "fail".into();
+        let before = stored_next_id(d);
+
+        // One more durable store write lands; the process dies before the
+        // next one.
+        super::super::storecut::arm_cut(1);
+        let failed = add("two", "Show.S03E04.720p.nzb").expect("the duplicate add");
+        super::super::storecut::disarm();
+
+        let after = stored_next_id(d);
+        assert!(
+            d.queue
+                .lock_ok()
+                .iter()
+                .all(|j| j.lock_ok().nzo_id != failed),
+            "the rejected job must never have been queued"
+        );
+
+        // What a restart finds.
+        let d2 = restart(d);
+        assert!(
+            d2.history
+                .lock_ok()
+                .iter()
+                .any(|j| j.lock_ok().nzo_id == failed),
+            "the rejected record was lost from BOTH stores"
+        );
+        // ...and the cut has to have actually landed inside the pair, or
+        // the assertion above proves nothing: `save_queue` persists the id
+        // allocator, so a stale next_id is the receipt that it never ran.
+        assert_eq!(
+            after, before,
+            "the second write was supposed to be cut - this harness is not \
+             exercising the window"
+        );
+    });
+}
+
+/// §158: `park` moves a record the other way, and its window is a RACE
+/// rather than a kill - every queue mutation in the daemon calls
+/// `save_queue`, so any other thread saving between the row leaving the
+/// live queue and history.jsonl gaining it publishes a queue.json the
+/// record is no longer in while no store holds it at all.
+///
+/// The window is a few hundred microseconds, so the harness runs that
+/// save from inside it rather than racing for it, and then cuts every
+/// write park still had to make.
+#[test]
+fn a_park_survives_a_racing_queue_save_in_its_window() {
+    with_daemon("lostboth-park", |d| {
+        let job = jv("nzo-park-1", "Parked.Release", serde_json::json!({}));
+        d.queue.lock_ok().push_back(job.clone());
+        assert!(d.save_queue(), "the queue snapshot the park starts from");
+        {
+            let mut g = job.lock_ok();
+            g.state = JobState::Completed;
+            g.finished_unix = Some(1);
+        }
+
+        super::super::storecut::on_park_gap(|d| {
+            assert!(d.save_queue(), "the racing save must land");
+            // ...and the process dies there: nothing park writes after
+            // this point reaches disk.
+            super::super::storecut::arm_cut(0);
+        });
+        d.park(job);
+        super::super::storecut::disarm();
+
+        let queued = std::fs::read_to_string(d.spool.join("queue.json")).unwrap_or_default();
+        assert!(
+            !queued.contains("nzo-park-1"),
+            "the racing save was supposed to publish a queue without the row - \
+             this harness is not exercising the window"
+        );
+
+        let d2 = restart(d);
+        assert!(
+            d2.history
+                .lock_ok()
+                .iter()
+                .any(|j| j.lock_ok().nzo_id == "nzo-park-1"),
+            "the parked record was lost from BOTH stores"
+        );
+        assert!(
+            d2.queue.lock_ok().is_empty(),
+            "and it must not come back as a queued job as well"
+        );
+    });
+}
+
+/// The other end of the same reorder: a delete landing INSIDE a park,
+/// after its durable history row went down. The job is dropped rather
+/// than filed, so the row it already wrote has to be buried - or the
+/// early write would resurrect, at the next boot, exactly the job the
+/// user cancelled.
+#[test]
+fn a_delete_inside_the_park_window_buries_the_row_park_already_wrote() {
+    with_daemon("lostboth-park-del", |d| {
+        let job = jv("nzo-park-2", "Cancelled.Release", serde_json::json!({}));
+        d.queue.lock_ok().push_back(job.clone());
+        assert!(d.save_queue());
+        {
+            let mut g = job.lock_ok();
+            g.state = JobState::Completed;
+            g.finished_unix = Some(1);
+        }
+
+        let tombstoned = job.clone();
+        super::super::storecut::on_park_gap(move |_| {
+            tombstoned.lock_ok().tombstone = true;
+        });
+        d.park(job);
+        super::super::storecut::disarm();
+
+        assert!(
+            d.history.lock_ok().is_empty(),
+            "a tombstoned job is dropped, not filed"
+        );
+        let d2 = restart(d);
+        assert!(
+            d2.history.lock_ok().is_empty(),
+            "the early history row outlived the delete that cancelled it"
+        );
+    });
+}
+
+// -- issue #38 follow-up: queue-lock hold at 14,500 jobs ---------------------
+
+/// Manual perf probe for the large-queue lock work, NOT a CI assertion -
+/// it prints timings and asserts only that the snapshot is complete.
+/// Run it by hand:
+///
+///   cargo test -p nzbfast --bin nzbfast save_queue_lock_hold \
+///     -- --ignored --nocapture
+///
+/// Phase 1 reproduces the shape save_queue had before the fix (every
+/// job serialized UNDER the queue lock); phase 2 is the shipped shape
+/// (Arc snapshot under the lock, serialization after). A contender
+/// thread hammers the queue lock throughout and reports the worst
+/// single acquire wait it saw in each phase - that wait is exactly what
+/// an API request or the dashboard felt at issue #38's queue size.
+#[test]
+#[ignore = "manual perf probe: prints timings, run with --ignored --nocapture"]
+fn save_queue_lock_hold_at_15k_jobs() {
+    with_daemon("15k-bench", |d| {
+        const N: usize = 15_000;
+        {
+            let mut q = d.queue.lock_ok();
+            for i in 0..N {
+                q.push_back(jv(
+                    &format!("SABnzbd_nzo_bench{i:05}"),
+                    &format!("Some.Release.S01E{:02}.1080p.WEB.H264-GRP.{i}", i % 99),
+                    serde_json::json!({
+                        "total_bytes": 4_000_000_000u64,
+                        "downloaded_bytes": 1_234_567u64,
+                        "category": "tv",
+                    }),
+                ));
+            }
+        }
+        fn contend(d: &Arc<Daemon>, run: impl FnOnce()) -> (std::time::Duration, u64) {
+            let stop = Arc::new(AtomicBool::new(false));
+            let worst = Arc::new(AtomicU64::new(0));
+            let (d2, stop2, worst2) = (d.clone(), stop.clone(), worst.clone());
+            let contender = std::thread::spawn(move || {
+                while !stop2.load(Ordering::Relaxed) {
+                    let t = Instant::now();
+                    drop(d2.queue.lock_ok());
+                    worst2.fetch_max(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+            });
+            let t = Instant::now();
+            run();
+            let took = t.elapsed();
+            stop.store(true, Ordering::Relaxed);
+            contender.join().expect("contender");
+            (took, worst.load(Ordering::Relaxed))
+        }
+        // Phase 1: the pre-fix shape, serialization under the queue lock.
+        let mut n_old = 0;
+        let (old_took, old_worst) = contend(&d.clone(), || {
+            let q = d.queue.lock_ok();
+            let jobs: Vec<Value> = q.iter().map(|j| job_json(&j.lock_ok())).collect();
+            n_old = jobs.len();
+        });
+        // Phase 2: the shipped save_queue, four times over - what one
+        // completion used to cost in file rewrites.
+        let (new_took, new_worst) = contend(&d.clone(), || {
+            for _ in 0..4 {
+                assert!(d.save_queue(), "save_queue failed");
+            }
+        });
+        assert_eq!(n_old, N);
+        println!(
+            "15k-queue probe:\n\
+             \x20 old shape (serialize under queue lock, x1): {old_took:?}, \
+             worst contender lock wait {old_worst} us\n\
+             \x20 new save_queue x4 (full write to disk):     {new_took:?}, \
+             worst contender lock wait {new_worst} us"
+        );
+    });
 }

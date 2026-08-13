@@ -293,6 +293,11 @@ impl Daemon {
             media_rejudge: false,
             retries: 0,
             dupe_key: key,
+            // WHICH row this one is an alternative OF - see `Job::held_for`.
+            held_for: collision
+                .as_ref()
+                .map(|c| c.nzo_id.clone())
+                .unwrap_or_default(),
             library: self.library_cats.lock_ok().contains(&category),
             fetched: false,
             tombstone: false,
@@ -321,6 +326,8 @@ impl Daemon {
             move_failed: String::new(),
             move_attempts: 0,
             move_pending: false,
+            // A fresh job has never crossed between the two stores.
+            move_seq: 0,
             archive_shape: String::new(),
             inner_crc: 0,
             identity_name: String::new(),
@@ -365,8 +372,23 @@ impl Daemon {
                 "{nzo_id} filed to history as FAILED - rejected by the pre-queue \
                  script"
             );
-            self.save_queue();
+            // §158.7: the DESTINATION store first, then the queue
+            // snapshot. This job was never queued, so `save_queue` writes
+            // a queue.json that does not carry it either way - which is
+            // exactly what made the old order lossy rather than merely
+            // odd. A kill (or an ENOSPC) between the two writes left the
+            // record in NEITHER file: queue.json never had it and
+            // history.jsonl did not have it yet, so the spooled .nzb sat
+            // on disk named by no record anywhere and the *arr that
+            // submitted it was never told the grab failed. Ordered this
+            // way the torn state is "in history only", which is the whole
+            // truth for a job that never reached the queue. Nothing here
+            // depends on the queue write running first; all it carries of
+            // this job is the id-allocator bump, and the restore's
+            // wall-clock floor already covers an allocator bump that
+            // never landed.
             let _ = self.history_upsert(std::slice::from_ref(&job));
+            self.save_queue();
             self.life_emit_parked(&job);
             self.history_enforce_retention();
             return Ok(nzo_id);
@@ -400,8 +422,12 @@ impl Daemon {
                  duplicates are set to fail",
                 c.name, c.nzo_id
             );
-            self.save_queue();
+            // §158.7: the destination store first, for the reason
+            // spelled out on the pre-queue REJECT arm above - this job
+            // never queued either, so a kill between the two writes used
+            // to lose it from both files.
             let _ = self.history_upsert(std::slice::from_ref(&job));
+            self.save_queue();
             self.life_emit_parked(&job);
             self.history_enforce_retention();
             return Ok(nzo_id);

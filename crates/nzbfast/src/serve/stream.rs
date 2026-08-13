@@ -222,26 +222,12 @@ pub(super) fn stream_request(
                 }
             };
             if trigger {
-                let nzo = job.lock_ok().nzo_id.clone();
-                d.history.lock_ok().retain(|x| !Arc::ptr_eq(x, &job));
-                d.queue.lock_ok().push_front(job);
-                // Queue first, tombstone second - the same ordering as
-                // `Daemon::retry`, for the same reason. Tombstoning first
-                // and rewriting queue.json afterwards meant a kill or a
-                // failed write in between deleted the record from history
-                // while the queue snapshot had never heard of it: it
-                // survived in NEITHER store (Codex sweep 12 Aug F1).
-                if d.save_queue() {
-                    // Back into the queue: the history store must forget it
-                    // or a restart would show it in both places.
-                    d.history_tombstone(&[nzo]);
-                } else {
-                    error!(
-                        target: "library",
-                        "{nzo}: fetching now, but the queue could not be written - its \
-                         library record was left in place rather than deleted"
-                    );
-                }
+                // The history -> queue move itself: stamped, queue first,
+                // tombstone second, and never the tombstone alone. Shared
+                // with `Daemon::retry` (see `moveseq::activate_parked`) so
+                // the two paths cannot drift apart on the ordering their
+                // durability depends on.
+                d.activate_parked(&job);
                 info!(target: "library", "/stream/{id} → fetching now");
             } else {
                 // A download that already FINISHED: its bytes are on

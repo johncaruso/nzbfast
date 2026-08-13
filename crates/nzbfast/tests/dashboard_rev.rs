@@ -222,12 +222,22 @@ fn seed_legacy(dir: &Path, records: &[Value]) {
 }
 
 fn serve(dir: &Path) -> Running {
+    serve_env(dir, &[])
+}
+
+/// Same daemon, with extra environment on the child - the quota test
+/// pins TZ=UTC so a ledger seeded at UTC midnight stays this period's.
+fn serve_env(dir: &Path, envs: &[(&str, &str)]) -> Running {
     for attempt in 0..3 {
         let port = free_port();
         let log = dir.join(format!("daemon-{port}.log"));
         let out = std::fs::File::create(&log).unwrap();
         let err = out.try_clone().unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_nzbfast"))
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let child = cmd
             .env("NZBFAST_NO_ENRICH", "1")
             .env_remove("NZBFAST_OPEN")
             .arg("--config")
@@ -927,6 +937,109 @@ fn the_no_servers_hold_bumps_the_queue_revision_on_both_edges() {
     std::fs::write(&cfg, &server_cfg).unwrap();
     let cleared = poll_until(port, rev, |q| q["hold"].is_null());
     assert!(cleared["queue"]["hold"].is_null(), "{cleared}");
+}
+
+/// §156 item 6: the disk hold rides the same revisioned payload as the
+/// §154 no-servers hold above, and had the identical omission - it set
+/// and cleared `queue_hold` with no revision bump, so a long-poll client
+/// on an idle queue never drew the banner and kept it after the hold
+/// lifted.
+///
+/// The hold is driven through `min_free` over the API, and a settings
+/// write bumps the revision once itself (deliberately blunt - see
+/// `apply_and_save`), so `poll_edge` re-anchors on every payload it
+/// sees: after the settings bump is consumed, only the runner's own
+/// edge bump can deliver the payload that satisfies the predicate.
+#[test]
+fn the_disk_hold_bumps_the_queue_revision_on_both_edges() {
+    let dir = scratch_with_empty_server("diskrev");
+    let d = serve(&dir);
+    let port = d.port;
+
+    let first = api(port, "mode=dashboard");
+    let rev = first["queue_revision"].as_u64().expect("queue_revision");
+    assert!(first["queue"]["hold"].is_null(), "{first}");
+
+    // A minimum no disk satisfies.
+    let set = api(port, "mode=config&name=min_free&value=1000T");
+    assert_ne!(set["status"], false, "{set}");
+    let rev = poll_edge(port, rev, |q| q["hold"]["reason"] == "disk");
+    assert!(
+        api(port, &format!("mode=dashboard&queue_rev={rev}"))["queue"].is_null(),
+        "the standing hold must not re-publish the queue every pass"
+    );
+
+    let set = api(port, "mode=config&name=min_free&value=0");
+    assert_ne!(set["status"], false, "{set}");
+    poll_edge(port, rev, |q| q["hold"].is_null());
+}
+
+/// §156 item 6, the quota half - same defect, same shape as the disk
+/// test above. The spend is seeded into the period's ledger before the
+/// daemon opens it (the daemon.rs quota test's pattern): `start` is
+/// this period's UTC midnight and the daemon is pinned to TZ=UTC, or
+/// `open` treats the window as stale and zeroes the count.
+#[test]
+fn the_quota_hold_bumps_the_queue_revision_on_both_edges() {
+    let dir = scratch_with_empty_server("quotarev");
+    let spool = dir.join(".spool");
+    std::fs::create_dir_all(&spool).unwrap();
+    let midnight = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 86_400
+        * 86_400;
+    std::fs::write(
+        spool.join("quota.json"),
+        format!("{{\"start\":{midnight},\"bytes\":9000000000}}"),
+    )
+    .unwrap();
+    let d = serve_env(&dir, &[("TZ", "UTC")]);
+    let port = d.port;
+
+    let first = api(port, "mode=dashboard");
+    let rev = first["queue_revision"].as_u64().expect("queue_revision");
+    assert!(first["queue"]["hold"].is_null(), "{first}");
+
+    // A cap far under the 9 GB the ledger already says was spent.
+    let set = api(port, "mode=config&name=quota&value=1G");
+    assert_ne!(set["status"], false, "{set}");
+    let rev = poll_edge(port, rev, |q| q["hold"]["reason"] == "quota");
+    assert!(
+        api(port, &format!("mode=dashboard&queue_rev={rev}"))["queue"].is_null(),
+        "the standing hold must not re-publish the queue every pass"
+    );
+
+    // Lifting the cap clears the hold.
+    let set = api(port, "mode=config&name=quota&value=0");
+    assert_ne!(set["status"], false, "{set}");
+    poll_edge(port, rev, |q| q["hold"].is_null());
+}
+
+/// Like `poll_until`, but re-anchors: every answered poll advances the
+/// revision it polls with, so the predicate can only be satisfied by a
+/// payload published with a bump AFTER the last unrelated one - which
+/// is what pins a hold's own edge bump when the settings write that
+/// provoked it has already moved the revision once. The window is wider
+/// than `poll_until`'s because a standing disk hold paces the runner at
+/// one pass per five seconds. Returns the satisfying payload's revision.
+fn poll_edge(port: u16, mut rev: u64, want: impl Fn(&serde_json::Value) -> bool) -> u64 {
+    for _ in 0..100 {
+        let a = api(port, &format!("mode=dashboard&queue_rev={rev}"));
+        if !a["queue"].is_null() {
+            let got = a["queue_revision"].as_u64().expect("queue_revision");
+            if want(&a["queue"]) {
+                return got;
+            }
+            rev = got;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    panic!(
+        "no revision bump ever published the expected payload: {}",
+        api(port, &format!("mode=dashboard&queue_rev={rev}"))
+    );
 }
 
 /// Poll the revisioned dashboard endpoint from `rev` until the queue

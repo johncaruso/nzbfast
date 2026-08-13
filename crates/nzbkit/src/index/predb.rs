@@ -979,7 +979,12 @@ impl Index {
              VALUES(?1,?2,?3,?4,?5,?6,'suggested',?7)
              ON CONFLICT(release_id) DO UPDATE SET
                predb_id=excluded.predb_id, score=excluded.score, delta=excluded.delta,
-               ratio=excluded.ratio, runner_up=excluded.runner_up, at=excluded.at
+               ratio=excluded.ratio, runner_up=excluded.runner_up, at=excluded.at,
+               -- A different pre is a DIFFERENT pairing: the confirm
+               -- lane has never spent a lookup on it, so the old
+               -- pairing's retirement marker must not retire it too.
+               checked_at=CASE WHEN excluded.predb_id<>pre_corr.predb_id
+                               THEN 0 ELSE pre_corr.checked_at END
              WHERE pre_corr.status='suggested' AND excluded.score>=pre_corr.score",
             rusqlite::params![
                 rid,
@@ -1612,6 +1617,59 @@ impl Index {
             )?;
         }
         Ok(n > 0)
+    }
+
+    /// Suggestions worth spending an external indexer lookup on: STRONG
+    /// score, still 'suggested', never checked before. The
+    /// indexer-confirm lane searches the user's own newznab account for
+    /// each returned title and message-id-joins the answer - the only
+    /// scalable ground truth for a band no byte probe can reach (its
+    /// population rule deliberately excludes probe-reachable rows).
+    /// Ordered best-first so a small daily budget spends itself on the
+    /// pairs most likely to be real.
+    ///
+    /// Returns (release id, title, score, PREDB ID). The pre id is the
+    /// half that makes a stamp specific: see `corr_confirm_stamp`.
+    pub fn corr_confirm_pick(
+        &self,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(i64, String, i32, i64)>> {
+        let mut stmt = self.db.prepare_cached(
+            "SELECT c.release_id, p.title, c.score, c.predb_id
+               FROM pre_corr c JOIN predb p ON p.id=c.predb_id
+              WHERE c.status='suggested' AND c.checked_at=0 AND c.score>=?1
+              ORDER BY c.score DESC, c.release_id LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![crate::predb_corr::STRONG, limit as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Retire a suggestion from the confirm lane's pick, win or lose.
+    /// One suggestion never costs the user's indexer quota twice; the
+    /// verdict itself (confirmed/rejected) is `apply_proven_name`'s to
+    /// settle if the fetched NZB joined.
+    /// The stamp names the PAIRING it was minted for, not just the
+    /// release: a sweep can replace the stored pre while the lookup is
+    /// in flight, and a release-only stamp would then retire a
+    /// successor nobody has checked.
+    pub fn corr_confirm_stamp(
+        &self,
+        release_id: i64,
+        predb_id: i64,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        self.db
+            .prepare_cached(
+                "UPDATE pre_corr SET checked_at=?3
+                  WHERE release_id=?1 AND predb_id=?2",
+            )?
+            .execute(rusqlite::params![release_id, predb_id, now])?;
+        Ok(())
     }
 
     /// The download-time verdict: a byte-level oracle (srrdb CRC /

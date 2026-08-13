@@ -3,6 +3,18 @@
 //! extraction arm and the stub carve - split out of unpack.rs whole
 //! (size gate; nothing here changed in the move).
 //!
+//! Three families, found two different ways. RAR and 7-Zip are located by
+//! scanning the head for their magic; zip is located from its TAIL, by
+//! `nzbkit::zip::stubbed_archive`, because a forward scan for a zip
+//! signature claims ordinary programs (see [`sfx_kind`] for the numbers).
+//! Zip is also the one family that is never carved - its reader takes the
+//! stub's length from the container's own geometry.
+//!
+//! Whichever way a candidate is found, it is CONFIRMED against the
+//! container's own checksums before anything is claimed. A magic number
+//! is a string that appears inside ordinary programs; a valid header
+//! behind it is not.
+//!
 //! The two callers are `extract_one_level` step 3 (depth 0, the offline
 //! `extract` command's top level) and the get tail's downloaded-slot arm.
 //! Neither is reachable from the nested pass by design: a payload's own
@@ -18,32 +30,88 @@ use crate::*;
 /// the stub and conclude "not an archive".
 const SFX_SCAN_WINDOW: usize = 4 << 20;
 
-/// Is this file an SFX self-extractor - an executable-ish name whose head
-/// carries an archive signature past the launcher stub?
+/// Read past the scan window by this much, so a signature sitting at the
+/// window's very last byte still has its whole main header in the buffer
+/// to be confirmed against. Without it, confirmation would turn the
+/// window's edge into a silent "not an archive" for the one archive that
+/// straddles it.
+const SFX_HEADER_SLACK: usize = 64 << 10;
+
+/// Ceiling on how many signature matches one file may have confirmed.
+///
+/// Confirmation is cheap - a type byte and a size word reject almost
+/// everything before a CRC is computed - but the number of matches is
+/// attacker-chosen, so the total work must not be. A file that spends this
+/// budget on decoys and puts its real archive after them is not unpacked;
+/// that is a delivered `.exe`, which is what happens today for every
+/// self-extractor, so the failure is the benign direction.
+const SFX_MAX_CANDIDATES: usize = 256;
+
+/// Is this file an SFX self-extractor - an executable-ish name with a real
+/// archive sitting behind the launcher stub?
 ///
 /// The extension gate comes first because it is free, and because it is
-/// also the SAFETY gate: the head scan is a substring search, and running
-/// it over every file in a release would eventually match a data file
-/// that happens to contain `Rar!` or the 7z magic.
+/// still a SAFETY gate even now that every match is confirmed: a data file
+/// can legitimately CONTAIN an archive - a disk image, a backup, a nested
+/// container someone posted whole - and a header check says only that one
+/// is there, never that unpacking it is what the user wanted.
 ///
-/// A signature AT offset 0 is a bare archive wearing the wrong name, not
-/// a self-extractor - there is no stub to carve, `carve_sfx` declines it,
-/// and the SFX arm would report a failure over a file the ordinary paths
-/// can open. Both families are held to that rule; only RAR was before, so
-/// a bare 7z named `.exe` was collected as an SFX and then failed.
+/// An archive starting AT offset 0 is a bare one wearing the wrong name,
+/// not a self-extractor - there is no stub to carve, `carve_sfx` declines
+/// it, and the SFX arm would report a failure over a file the ordinary
+/// paths can open. All three families are held to that rule; only RAR was
+/// before, so a bare 7z named `.exe` was collected as an SFX and failed.
 ///
-/// One head read per candidate, so this is cheap enough for a directory
-/// gate: a release carries a handful of executables at most.
+/// One tail read plus at most one head read per candidate, so this is
+/// cheap enough for a directory gate: a release carries a handful of
+/// executables at most.
 pub(crate) fn is_sfx_archive(path: &std::path::Path) -> bool {
+    sfx_kind(path).is_some()
+}
+
+/// [`is_sfx_archive`] with the answer the extraction arm needs: which
+/// family sits behind the stub.
+///
+/// All three answers are CONFIRMED against the container's own checksums
+/// - zip from its tail geometry (`nzbkit::zip::stubbed_archive`), RAR and
+/// 7-Zip from a main header behind the signature (`sfx_payload_at`). None
+/// of the three can be satisfied by bytes that are not an archive, which
+/// is the property the gate needs: over 1,105 real binaries a bare
+/// substring rule claims 25, and confirmation takes the whole sweep to 10,
+/// all of them real self-extractors (TODO 159 items 6 and 7).
+///
+/// Zip is probed first only because its test is the cheapest to run to a
+/// verdict - one tail read, no scan - so a stubbed zip never pays for a
+/// 4 MiB head read it does not need.
+///
+/// A zip whose entries say it is the DELIVERABLE - a jar behind a Launch4j
+/// launcher, an NW.js resource bundle - is not an SFX for our purposes and
+/// is declined here, with a line saying so, because leaving it packed is
+/// the correct outcome and a silent decline reads as "we saw nothing".
+pub(crate) fn sfx_kind(path: &std::path::Path) -> Option<SfxKind> {
     let sfx_ext = path.extension().is_some_and(|x| {
         let x = x.to_string_lossy().to_lowercase();
         x == "exe" || x == "bin" || x == "sfx"
     });
     if !sfx_ext {
-        return false;
+        return None;
     }
-    let head = read_head(path, SFX_SCAN_WINDOW);
-    matches!(sfx_payload_at(&head), Some((off, _)) if off > 0)
+    match nzbkit::zip::stubbed_archive(path) {
+        Some(nzbkit::zip::Stubbed::Packaging { .. }) => return Some(SfxKind::Zip),
+        Some(nzbkit::zip::Stubbed::FinalFile { what, .. }) => {
+            println!(
+                "  {} carries {what} rather than packaging - left as it is",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            );
+            return None;
+        }
+        None => {}
+    }
+    let head = read_head(path, SFX_SCAN_WINDOW + SFX_HEADER_SLACK);
+    match sfx_payload_at(&head) {
+        Some((off, kind)) if off > 0 => Some(kind),
+        _ => None,
+    }
 }
 
 /// Read up to `cap` bytes from the start of `path`, looping until the
@@ -92,28 +160,81 @@ pub(crate) fn collect_sfx_archives(dir: &std::path::Path) -> Result<Vec<PathBuf>
 /// unextractable, it was invisible: nothing collected it and nothing
 /// said why. The 12 Aug competitor round found no client that unpacks
 /// either shape.
+///
+/// **Every match is CONFIRMED, and the scan does not stop at the first
+/// one.** Both magics occur as constants inside ordinary programs - the
+/// 7-Zip CLI carries the 7z magic, and so does every binary this project
+/// ships - so a bare substring hit claimed 25 of 1,105 real binaries,
+/// and a false claim is not cosmetic: `extract_sfx` fails on it and
+/// the get tail turns that into a Failed job. Each candidate now has to
+/// have a CRC-valid main header sitting behind it
+/// (`rar::archive_starts_here`, `nameprobe::sevenz_start`), and a
+/// candidate that has not is stepped over rather than believed - which is
+/// the half that matters, since the decoy constant in those binaries comes
+/// BEFORE any real payload would. TODO 159 item 7.
 pub(crate) fn sfx_payload_at(head: &[u8]) -> Option<(usize, SfxKind)> {
-    let rar = head
-        .windows(7)
-        .position(|w| w == b"Rar!\x1a\x07\x00" || w == b"Rar!\x1a\x07\x01")
-        .map(|p| (p, SfxKind::Rar));
-    let sevenz = head
-        .windows(6)
-        .position(|w| w == nzbkit::nameprobe::SEVENZ_MAGIC)
-        .map(|p| (p, SfxKind::SevenZ));
-    // The EARLIER signature wins: a 7z stub can mention "Rar!" in its
-    // own error strings, and vice versa, so trusting whichever comes
-    // first past the stub beats trusting a fixed order.
-    match (rar, sevenz) {
-        (Some(r), Some(s)) => Some(if r.0 <= s.0 { r } else { s }),
-        (r, s) => r.or(s),
+    let mut spent = 0usize;
+    for off in 0..head.len().min(SFX_SCAN_WINDOW) {
+        let rest = &head[off..];
+        let kind = if rest.starts_with(b"Rar!\x1a\x07\x00") || rest.starts_with(b"Rar!\x1a\x07\x01")
+        {
+            SfxKind::Rar
+        } else if rest.starts_with(nzbkit::nameprobe::SEVENZ_MAGIC) {
+            SfxKind::SevenZ
+        } else {
+            continue;
+        };
+        spent += 1;
+        if spent > SFX_MAX_CANDIDATES {
+            break;
+        }
+        // The EARLIEST CONFIRMED signature wins: a 7z stub can mention
+        // "Rar!" in its own error strings and vice versa, so position
+        // decides between two real archives, and the header decides
+        // whether a match is a real archive at all.
+        let real = match kind {
+            SfxKind::Rar => nzbkit::rar::archive_starts_here(rest),
+            SfxKind::SevenZ => nzbkit::nameprobe::sevenz_start(rest).is_some(),
+            SfxKind::Zip => false,
+        };
+        if real {
+            return Some((off, kind));
+        }
     }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SfxKind {
     Rar,
     SevenZ,
+    /// Found by [`sfx_kind`], never by [`sfx_payload_at`] - a zip is
+    /// located from its tail, not by a forward signature scan.
+    Zip,
+}
+
+impl SfxKind {
+    fn label(self) -> &'static str {
+        match self {
+            SfxKind::Rar => "RAR",
+            SfxKind::SevenZ => "7-Zip",
+            SfxKind::Zip => "zip",
+        }
+    }
+
+    /// What the carve names the archive it cuts out of the stub.
+    ///
+    /// `None` for zip, which never carves: the zip reader takes the
+    /// prefix's length from the container's own geometry and reads the
+    /// archive where it lies, so copying the tail out would buy nothing
+    /// but a second copy of the payload on disk.
+    fn carved_name(self) -> Option<&'static str> {
+        match self {
+            SfxKind::Rar => Some("carved.rar"),
+            SfxKind::SevenZ => Some("carved.7z"),
+            SfxKind::Zip => None,
+        }
+    }
 }
 
 /// Extract each SFX archive standalone (rars locates the archive past the
@@ -126,10 +247,23 @@ pub(crate) fn extract_sfx(
     let options = nzbkit::mem::rar_read_options(password.map(str::as_bytes));
     let mut all_ok = true;
     for path in archives {
-        println!(
-            "unpacking SFX archive {} natively…",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        );
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        // A stubbed zip needs no carve and no second reader: the zip
+        // reader infers the stub's length from the container's geometry
+        // and opens the archive where it sits, so this hands the file
+        // itself to the ordinary zip arm - the same staging, the same
+        // zip-slip and bomb guards, the same CRC gate.
+        if sfx_kind(path) == Some(SfxKind::Zip) {
+            println!("unpacking self-extracting zip {name}…");
+            let job = nzbkit::zip::Finding {
+                name: name.to_string(),
+                parts: vec![path.clone()],
+                shape: nzbkit::zip::Shape::Single,
+            };
+            all_ok &= crate::rarfix::extract_zip(dir, &[job], password);
+            continue;
+        }
+        println!("unpacking SFX archive {name} natively…");
         let direct = rars::ArchiveReader::read_path_with_options(path, options)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .and_then(|archive| write_archives_to(dir, &[archive], password));
@@ -147,10 +281,7 @@ pub(crate) fn extract_sfx(
                 // writing a second copy of the payload to disk.
                 match carve_sfx(path) {
                     Some((carved, kind)) => {
-                        let carved_path = carved.dir.join(match kind {
-                            SfxKind::Rar => "carved.rar",
-                            SfxKind::SevenZ => "carved.7z",
-                        });
+                        let carved_path = carved.dir.join(kind.carved_name().unwrap_or_default());
                         let ok = match kind {
                             SfxKind::Rar => {
                                 rars::ArchiveReader::read_path_with_options(&carved_path, options)
@@ -163,6 +294,11 @@ pub(crate) fn extract_sfx(
                                 &[vec![carved_path.clone()]],
                                 password,
                             ),
+                            // Unreachable: the carve locates its payload
+                            // with `sfx_payload_at`, which knows only the
+                            // two head-scanned families. Zip is handled
+                            // above and never carved at all.
+                            SfxKind::Zip => false,
                         };
                         if ok {
                             println!("SFX unpack complete ✔ (carved past the stub)");
@@ -199,7 +335,7 @@ pub(crate) fn extract_sfx(
 /// already downloaded.
 fn carve_sfx(path: &std::path::Path) -> Option<(ExtractStaging, SfxKind)> {
     use std::io::{Read, Seek, SeekFrom, Write};
-    let (off, kind) = sfx_payload_at(&read_head(path, SFX_SCAN_WINDOW))?;
+    let (off, kind) = sfx_payload_at(&read_head(path, SFX_SCAN_WINDOW + SFX_HEADER_SLACK))?;
     let mut f = std::fs::File::open(path).ok()?;
     if off == 0 {
         // Already a bare archive: the direct read above failed for some
@@ -209,10 +345,7 @@ fn carve_sfx(path: &std::path::Path) -> Option<(ExtractStaging, SfxKind)> {
     // Beside the payload, on the same filesystem, under the `.nzbfast`
     // prefix the nested pass's walkers already skip as scratch.
     let scratch = ExtractStaging::new(path.parent()?).ok()?;
-    let out = scratch.dir.join(match kind {
-        SfxKind::Rar => "carved.rar",
-        SfxKind::SevenZ => "carved.7z",
-    });
+    let out = scratch.dir.join(kind.carved_name()?);
     f.seek(SeekFrom::Start(off as u64)).ok()?;
     let mut w = std::io::BufWriter::new(std::fs::File::create(&out).ok()?);
     let mut buf = vec![0u8; 1 << 20];
@@ -226,10 +359,7 @@ fn carve_sfx(path: &std::path::Path) -> Option<(ExtractStaging, SfxKind)> {
     w.flush().ok()?;
     println!(
         "  carved {} archive from the SFX stub at offset {off}",
-        match kind {
-            SfxKind::Rar => "RAR",
-            SfxKind::SevenZ => "7-Zip",
-        }
+        kind.label()
     );
     Some((scratch, kind))
 }
@@ -237,6 +367,7 @@ fn carve_sfx(path: &std::path::Path) -> Option<(ExtractStaging, SfxKind)> {
 #[cfg(test)]
 mod sfx_tests {
     use super::*;
+    use nzbkit::zip::fixtures::Spec;
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("nzbfast-sfx-{tag}-{}", std::process::id()));
@@ -285,6 +416,70 @@ mod sfx_tests {
         // path, and carve_sfx declines it rather than copying it.
         assert_eq!(sfx_payload_at(&rar), Some((0, SfxKind::Rar)));
         assert_eq!(sfx_payload_at(b"no archive in here at all"), None);
+    }
+
+    /// A signature is a CANDIDATE, never an answer, and the scan does not
+    /// stop at the first one.
+    ///
+    /// Both magics live as constants inside ordinary programs: the 7-Zip
+    /// CLI carries the 7z magic in its own code, and so does every Windows
+    /// binary this project ships. The old gate took the first match on
+    /// faith, so `nzbfast extract` over a directory holding our own
+    /// `nzbfast.exe` carved at offset 1934516, failed, and - through
+    /// `reextract_failed` in the get tail - failed the JOB. Measured: the
+    /// bare substring rule claims 25 of 1,105 real binaries, this one
+    /// claims 10, and all 10 are real self-extractors (TODO 159 item 7).
+    ///
+    /// Stepping OVER a bad candidate rather than giving up on it is the
+    /// half that matters: in every one of those binaries the decoy
+    /// constant sits early, where a real payload would come later.
+    #[test]
+    fn a_signature_without_a_header_behind_it_is_stepped_over() {
+        let rar = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../vendor/rars/tests/fixtures/rar50/solid.rar"
+        ))
+        .unwrap();
+        let sevenz = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../nzbkit/tests/fixtures/sevenz/store-single.7z"
+        ))
+        .unwrap();
+
+        // A magic constant with nothing behind it is what a program's own
+        // code looks like. Claiming one used to fail the job.
+        let mut decoys = vec![0x90u8; 512];
+        decoys.extend(b"Rar!\x1a\x07\x01\x00");
+        decoys.extend([0u8; 64]);
+        decoys.extend(b"Rar!\x1a\x07\x00");
+        decoys.extend([0u8; 64]);
+        decoys.extend(nzbkit::nameprobe::SEVENZ_MAGIC);
+        decoys.extend([0u8; 64]);
+        assert_eq!(sfx_payload_at(&decoys), None, "no header, no claim");
+
+        // ...and the real archive BEHIND the decoys is still found, at its
+        // own offset. A scan that stopped at the first match would answer
+        // "not an archive" for exactly the file that is one.
+        for (payload, kind) in [(&rar, SfxKind::Rar), (&sevenz, SfxKind::SevenZ)] {
+            let mut buf = decoys.clone();
+            let at = buf.len();
+            buf.extend(payload);
+            assert_eq!(sfx_payload_at(&buf), Some((at, kind)));
+        }
+
+        // A real archive whose stored header checksum disagrees is not
+        // claimed either. `solid.rar` is RAR5, so its CRC32 sits in the
+        // four bytes straight after the 8-byte signature: corrupting those
+        // leaves every size and type field intact, so the CRC is the only
+        // thing that can refuse it.
+        let mut broken = vec![0x90u8; 512];
+        broken.extend(&rar);
+        broken[512 + 8] ^= 0xff;
+        assert_eq!(
+            sfx_payload_at(&broken),
+            None,
+            "a damaged header is no claim"
+        );
     }
 
     /// Collection keys on the signature, not the extension's promise -
@@ -380,6 +575,84 @@ mod sfx_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Build a self-extracting ZIP the way one is really built - a stub
+    /// with the container concatenated on - and return the container's
+    /// bytes so the caller can also write it bare.
+    fn zip_sfx(dir: &std::path::Path, name: &str, stub_len: usize, specs: &[Spec]) -> Vec<u8> {
+        let z = nzbkit::zip::fixtures::zip_of(specs);
+        let mut buf = vec![0x4du8, 0x5a];
+        buf.extend(std::iter::repeat_n(0x90u8, stub_len));
+        buf.extend(&z);
+        std::fs::write(dir.join(name), buf).unwrap();
+        z
+    }
+
+    /// A self-extracting zip is collected and unpacked, with no carve:
+    /// the reader takes the stub's length from the container's own
+    /// geometry, so the archive is opened where it lies and the `.exe`
+    /// is left intact beside the payload it produced.
+    #[test]
+    fn a_self_extracting_zip_is_collected_and_unpacked_in_place() {
+        let dir = tmp("zipsfx");
+        let bare = zip_sfx(
+            &dir,
+            "release.exe",
+            300_000,
+            &[
+                Spec::stored("Show.S01E01.mkv", b"the payload"),
+                Spec::deflated("Show.S01E01.nfo", b"about the payload"),
+            ],
+        );
+        let exe = dir.join("release.exe");
+        assert_eq!(sfx_kind(&exe), Some(SfxKind::Zip));
+        assert_eq!(collect_sfx_archives(&dir).unwrap(), vec![exe.clone()]);
+
+        assert!(extract_sfx(&dir, std::slice::from_ref(&exe), None));
+        assert_eq!(
+            std::fs::read(dir.join("Show.S01E01.mkv")).unwrap(),
+            b"the payload"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("Show.S01E01.nfo")).unwrap(),
+            b"about the payload"
+        );
+        assert!(exe.exists(), "the self-extractor itself must survive");
+
+        // Offset 0 is the same rule the other two families follow: a bare
+        // container wearing an executable name has no stub to get past,
+        // so this arm must not claim it.
+        std::fs::write(dir.join("bare.exe"), &bare).unwrap();
+        assert_eq!(sfx_kind(&dir.join("bare.exe")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The false positive the zip arm exists in tension with, and the one
+    /// shape a structural test cannot refuse on structure: a launcher in
+    /// front of a jar is a genuine appended zip. Exploding it would spray
+    /// an application's own class files over the release directory, so it
+    /// is refused on CONTENT - the content-side twin of the `.jar`/`.apk`
+    /// entry in `FINAL_FILE_EXTS`, which cannot fire here because the
+    /// stub has taken the name.
+    #[test]
+    fn a_launcher_wrapping_a_jar_is_never_collected() {
+        let dir = tmp("zipsfx-jar");
+        zip_sfx(
+            &dir,
+            "app.exe",
+            150_000,
+            &[
+                Spec::stored("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
+                Spec::deflated("com/acme/Main.class", b"\xca\xfe\xba\xbe not really"),
+            ],
+        );
+        assert_eq!(sfx_kind(&dir.join("app.exe")), None);
+        assert!(
+            collect_sfx_archives(&dir).unwrap().is_empty(),
+            "a Launch4j-style wrapper is the deliverable, not packaging"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The boundary the depth-0 restriction rests on. `is_extractable_
     /// archive` drives nested DESCENT - `is_new_nested_archive`,
     /// `dir_has_nested_extractable`, and `entry_archives`, whose
@@ -405,6 +678,25 @@ mod sfx_tests {
             "a produced setup.exe must never be re-exploded by the nested pass"
         );
         assert!(!dir_has_nested_extractable(&dir).unwrap());
+        // Same boundary for the zip family. It is the one whose payload
+        // is genuinely common inside ordinary programs, so teaching
+        // descent about it would be the worst version of this mistake.
+        let dir2 = tmp("descent-zip");
+        zip_sfx(
+            &dir2,
+            "installer.exe",
+            4096,
+            &[Spec::stored("data/app.dll", b"resources")],
+        );
+        let exe2 = dir2.join("installer.exe");
+        assert_eq!(sfx_kind(&exe2), Some(SfxKind::Zip));
+        assert!(!is_extractable_archive(&exe2));
+        assert!(!dir_has_nested_extractable(&dir2).unwrap());
+        assert!(
+            nzbkit::zip::scan(&dir2).is_empty(),
+            "the zip collector must not start claiming executables either"
+        );
+        let _ = std::fs::remove_dir_all(&dir2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -5,7 +5,14 @@
 //! orchestrator.
 
 use crate::*;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+// finish_run's own reach across the pipeline's other halves: the
+// post-drain census and the settle/repair ladder both run inside it.
+use super::census::{Census, take_census};
+use super::settle::{SettleVerdict, settle_verify_repair};
+use super::workers::{self, PendingR};
 use tracing::{info, warn};
 
 /// How the unpack tail left the job. The orchestrator destructures the
@@ -567,6 +574,8 @@ pub(super) fn finish_job(
     post_age_days: u32,
     repair_shortfall: Option<(usize, usize)>,
     extracted: &[String],
+    unhealed_slots: Option<&[usize]>,
+    extractor: &Arc<nzbkit::extract::Extractor>,
 ) -> Result<()> {
     // Download complete and verified (or repaired): the journal's job is
     // done. Anything less is a FAILED job - the daemon parks it in history
@@ -614,7 +623,7 @@ pub(super) fn finish_job(
     // failure returns. See quarantine_partials for why this is a rename
     // and not a delete. Deliberately AFTER the reextract_failed arm,
     // whose files really were verified and whose message says so.
-    quarantine_failed_payload(out_dir, extracted);
+    quarantine_failed_payload(out_dir, extracted, unhealed_slots, slots, extractor);
     if incomplete > 0 || derrs > 0 {
         let causes = LossCauses {
             missing_430: missing_430.load(Ordering::Relaxed),
@@ -647,7 +656,8 @@ pub(super) fn finish_job(
     }
 }
 
-/// Rename a failed job's direct-extracted payload aside, and SAY so.
+/// Rename a failed job's direct-extracted payload AND its downloaded
+/// files aside, and SAY so.
 ///
 /// The mechanism and the reasoning live in
 /// `nzbkit::journal::quarantine_partials`; this is the reporting half.
@@ -661,11 +671,59 @@ pub(super) fn finish_job(
 /// that cause under a filesystem complaint helps nobody. It still has
 /// to be said: the file it names is the false artifact the rename
 /// exists to prevent, and it is still sitting there.
-fn quarantine_failed_payload(out_dir: &Path, extracted: &[String]) {
-    if extracted.is_empty() {
-        return;
+///
+/// TODO 159 item 1 - `unhealed_slots` narrows this to the files that
+/// actually lost bytes. A post whose PAR2 set covers two of three
+/// archives, damaged on one covered volume and on the uncovered one,
+/// used to have all three payloads withheld: the two that verified and
+/// repaired perfectly went out of reach to keep the third from
+/// shipping. Withholding what we HAVE is a real cost - it is the
+/// difference between a user getting two of three files (SABnzbd's
+/// answer on that post) and none (NZBGet's), and the round-4 evidence
+/// says two is the better answer.
+/// M15 memory summary - the line benchmarks quote and budgets tune.
+/// Lifted out of `get_with_progress` for the size gate.
+pub(super) fn print_mem_summary(
+    verifier: &Arc<nzbkit::live::LiveVerifier>,
+    extractor: &Arc<nzbkit::extract::Extractor>,
+    budget: &nzbkit::mem::MemBudget,
+) {
+    let (pp_peak, pp_spilled) = verifier.partials_stats();
+    println!(
+        "mem: peak RSS {:.2} GB · holds peak {:.0} MB · verify partials peak {:.0} MB ({pp_spilled} blocks to read-back) · budget {:.2} GB",
+        nzbkit::mem::peak_rss().unwrap_or(0) as f64 / 1e9,
+        extractor.holds_peak() as f64 / 1e6,
+        pp_peak as f64 / 1e6,
+        budget.total as f64 / 1e9,
+    );
+}
+
+fn quarantine_failed_payload(
+    out_dir: &Path,
+    extracted: &[String],
+    unhealed_slots: Option<&[usize]>,
+    slots: &[Arc<FileSlot>],
+    extractor: &Arc<nzbkit::extract::Extractor>,
+) {
+    let (hold, spare) = partition_failed_payload(extracted, unhealed_slots, extractor);
+    if !spare.is_empty() {
+        println!(
+            "  {} extracted file(s) came out of archives the repair proved whole, and \
+             are left in place: {}",
+            spare.len(),
+            spare.join(", ")
+        );
     }
-    let (done, failed) = nzbkit::journal::quarantine_partials(out_dir, extracted);
+    let (mut done, mut failed) = nzbkit::journal::quarantine_partials(out_dir, &hold);
+    // TODO 159 item 1c: the downloaded files go the same way. A failed
+    // job's volume set used to keep wearing real names in the output
+    // directory - the one-pass answer to SABnzbd's incomplete/ and
+    // NZBGet's inter/ is a rename, not a move, and the retry's
+    // unquarantine puts every name back before the journal opens.
+    let (vol_done, vol_failed) =
+        nzbkit::journal::quarantine_paths(&held_downloaded_files(slots, unhealed_slots, extractor));
+    done.extend(vol_done);
+    failed.extend(vol_failed);
     if !done.is_empty() {
         println!(
             "  {} unverified file(s) renamed to *{} so nothing imports them: {} \
@@ -683,6 +741,117 @@ fn quarantine_failed_payload(out_dir: &Path, extracted: &[String]) {
         );
         warn!(target: "quarantine", "{name}: could not be renamed aside");
     }
+}
+
+/// Split the direct-extracted payload into (withhold, leave in place).
+///
+/// Two independent facts have to line up before a file is spared, and
+/// EITHER of them missing puts it back in the withhold pile:
+///
+/// 1. Settle said which slots are still holed and that everything else
+///    is proved (`unhealed_slots`). No claim - the pass could not make
+///    one - and every file is withheld, exactly as before.
+/// 2. The extractor can say which source volumes fed the file
+///    (`payload_sources`). A file it cannot speak for is withheld: the
+///    map is a positive claim about the names it lists, and a name it
+///    omits is a payload written through a path this reasoning has not
+///    modelled (a nested level's own output, a chase's members, an
+///    archive that fell back mid-job). Absent means unknown, and
+///    unknown means hold.
+///
+/// The mapping is at GROUP granularity, which is what makes it safe for
+/// the shapes the scope caution named: a solid or multi-volume set is
+/// one group, so damage to any of its volumes withholds every file the
+/// set produced, and a payload spanning two volumes cannot be spared by
+/// the healthy one alone.
+fn partition_failed_payload(
+    extracted: &[String],
+    unhealed_slots: Option<&[usize]>,
+    extractor: &Arc<nzbkit::extract::Extractor>,
+) -> (Vec<String>, Vec<String>) {
+    let Some(unhealed) = unhealed_slots else {
+        return (extracted.to_vec(), Vec::new());
+    };
+    let Some(sources) = extractor.payload_sources() else {
+        return (extracted.to_vec(), Vec::new());
+    };
+    let mut hold = Vec::new();
+    let mut spare = Vec::new();
+    for name in extracted {
+        let whole = sources
+            .get(name)
+            .is_some_and(|srcs| !srcs.iter().any(|s| unhealed.contains(s)));
+        if whole { &mut spare } else { &mut hold }.push(name.clone());
+    }
+    (hold, spare)
+}
+
+/// The downloaded files a failing finish takes out of circulation next
+/// to the extracted payload: every slot file still on disk, EXCEPT a
+/// plain file this job can prove whole.
+///
+/// advG (torture rounds 1-3, TODO 159 item 1c): a failed job's partial
+/// download used to keep wearing real volume names in the completed
+/// directory, so anything consuming that directory counted four `.rar`
+/// volumes as delivered files - where SABnzbd and NZBGet park the same
+/// bytes in `incomplete/` and `inter/`. One-pass extracts in place as
+/// articles arrive, so "somewhere else to live" has to be a rename
+/// rather than a move: the volumes join the payload under
+/// `*.nzbfast-partial`, and the next attempt's unquarantine puts every
+/// name back before the journal opens (`get/plan.rs`), so a retry
+/// still resumes from them.
+///
+/// The discrimination mirrors [`partition_failed_payload`]:
+/// - A volume (a materialized fallback) is ALWAYS held, whole or not.
+///   Its deliverable was the extraction, which this failing job did
+///   not produce; a complete `.part02.rar` of a failed set is
+///   furniture, not a result.
+/// - A par2 file is always held: recovery data for a job that just
+///   failed to recover is spent evidence, not a deliverable.
+/// - A plain file IS its own deliverable, so one that is provably
+///   whole stays delivered (SABnzbd's answer on partly recoverable
+///   posts, which the round-4 evidence prefers): proved by settle's
+///   claim when the repair earned one, otherwise by its own census -
+///   every segment arrived, decoded and wrote clean, and the writer's
+///   declared range is fully covered. The coverage gate is what keeps
+///   a lying `=ybegin size` from sparing a sparse tail.
+///
+/// The failure arms that reach this hold only damaged or unverifiable
+/// sets. A failure a password or a manual unpack actually answers
+/// keeps its volumes visible: it routes through the exempt
+/// `reextract_failed` arm, or completes with `locked_no_password` -
+/// so the daemon's locked-failure folder probe never loses an archive
+/// it could unlock.
+fn held_downloaded_files(
+    slots: &[Arc<FileSlot>],
+    unhealed_slots: Option<&[usize]>,
+    extractor: &Arc<nzbkit::extract::Extractor>,
+) -> Vec<PathBuf> {
+    (0..slots.len())
+        .filter_map(|i| {
+            let path = extractor.slot_path(i)?;
+            let s = &slots[i];
+            // Stably plain is the only shape whose on-disk file is its
+            // own deliverable; slot_uncovered answers None for every
+            // other mode (materialized volumes, chases).
+            let uncovered = extractor.slot_uncovered(i);
+            let whole = match unhealed_slots {
+                Some(unhealed) => !unhealed.contains(&i),
+                None => {
+                    uncovered == Some(0)
+                        && s.missing.load(Ordering::Relaxed) == 0
+                        && s.remaining.load(Ordering::Relaxed) == 0
+                        && s.errors.load(Ordering::Relaxed) == 0
+                        && s.abandoned.load(Ordering::Relaxed) == 0
+                }
+            };
+            if uncovered.is_some() && whole && !s.is_par2() {
+                None
+            } else {
+                Some(path)
+            }
+        })
+        .collect()
 }
 
 /// Issue #23: finish the job WITHOUT the metadata files no server had.
@@ -731,9 +900,234 @@ fn drop_spared_metadata(out_dir: &Path, spared: &[String]) -> Vec<String> {
     kept
 }
 
+/// Everything the run still has to do once the wire has gone quiet:
+/// post-drain accounting, the settle/repair ladder, the extraction
+/// summary, the disk-unpack tail and the journal's retirement. A
+/// verbatim move out of the orchestrator (TODO 106).
+///
+/// The network drain is `get_with_progress`'s natural seam - nothing
+/// above this line has finished, nothing below it is still filling
+/// slots from the pool - and this file is named for the half below it.
+/// Taken because the three self-contained cuts of 375e381b left the
+/// function 27 lines under the 500-line ceiling, and its whole recorded
+/// history is regrowth: round 5 trimmed it to 478 and it was back over
+/// 500 within two days. The long argument list is the house shape here,
+/// not an accident: `finish_job` below takes 26 and
+/// `settle_verify_repair` 24, and a bundle struct costs the same lines
+/// at the call site plus a definition to keep in step.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn finish_run(
+    servers: &[(ServerConfig, nzbkit::pool::PoolConfig)],
+    stats: &[nzbkit::pool::PoolStats],
+    nzb: &Arc<Nzb>,
+    slots: &[Arc<FileSlot>],
+    slot_file: &[usize],
+    sniff: &Arc<SniffCtl>,
+    verifier: &Arc<nzbkit::live::LiveVerifier>,
+    extractor: &Arc<nzbkit::extract::Extractor>,
+    journal: Arc<nzbkit::journal::Journal>,
+    out_dir: &Path,
+    buf_pool: &Arc<nzbkit::pool::BufPool>,
+    decode_errors: &Arc<AtomicU64>,
+    retention_excluded: &Arc<AtomicU64>,
+    decoded_bytes: &Arc<AtomicU64>,
+    missing_430: &Arc<AtomicU64>,
+    transport_failed: &Arc<AtomicU64>,
+    transport_sample: &Arc<std::sync::Mutex<Option<String>>>,
+    decode_error_sample: &Arc<std::sync::Mutex<Option<String>>>,
+    stalled: &Arc<std::sync::atomic::AtomicBool>,
+    pending_r: &std::sync::Mutex<PendingR>,
+    elapsed: std::time::Duration,
+    bootstrap_vol: Option<usize>,
+    resume_vols: &HashMap<usize, PathBuf>,
+    prefetched: &Arc<std::sync::Mutex<Vec<(usize, Vec<PathBuf>)>>>,
+    restored: &nzbkit::journal::Restored,
+    fast_verify: bool,
+    par_cleanup: bool,
+    password: Option<String>,
+    resuming: bool,
+    no_extract: bool,
+    resume_map: bool,
+    eat_consent: bool,
+    note_activity: &(dyn Fn(&'static str) + Sync),
+    cancel: Option<&crate::repair::SideCancel>,
+    hub: &Option<Arc<StreamHub>>,
+    stream_owner: &str,
+    budget: &nzbkit::mem::MemBudget,
+) -> Result<()> {
+    // Post-drain accounting: see take_census. The destructure keeps every
+    // downstream read on the same names the inline code used.
+    let Census {
+        total,
+        dead_servers,
+        backbones,
+        post_age_days,
+        sniff_bootstrap,
+        incomplete,
+        incomplete_spared,
+        missing_segments,
+        total_segments,
+        sparse_slots,
+        recovery_errs,
+        derrs,
+        retention_skipped,
+        recovery_missing,
+    } = take_census(
+        servers,
+        stats,
+        nzb,
+        slots,
+        sniff,
+        verifier,
+        extractor,
+        decode_errors,
+        retention_excluded,
+        decoded_bytes,
+        elapsed,
+    );
+
+    // Settle verification and the repair ladder: see get/settle.rs. The
+    // destructure keeps every downstream read on the inline names.
+    let SettleVerdict {
+        all_good,
+        reextract_failed,
+        repair_shortfall,
+        deferred_renames,
+        sniff_covered,
+        unhealed_slots,
+    } = settle_verify_repair(
+        verifier,
+        extractor,
+        &journal,
+        slots,
+        slot_file,
+        servers,
+        nzb,
+        out_dir,
+        buf_pool,
+        sniff,
+        sniff_bootstrap,
+        bootstrap_vol,
+        resume_vols,
+        prefetched,
+        fast_verify,
+        par_cleanup,
+        password.as_deref(),
+        incomplete,
+        derrs,
+        &sparse_slots,
+        recovery_errs,
+        recovery_missing,
+        &note_activity,
+        cancel,
+    )
+    .await?;
+
+    // Extraction summary: see report_extraction in get/tail.rs.
+    let (ex_report, outer_vol_stems, final_shape) =
+        report_extraction(extractor, &deferred_renames, out_dir)?;
+
+    // finish() is where end-of-download demotes fire (the non-uniform
+    // store set, the CRC gate, settle_unclassified), and their hold
+    // drains surface late placements for articles still parked from the
+    // network phase. Sweep them into the journal now - drain_network's
+    // final flush ran BEFORE finish(), so without this pass a retry
+    // refetched every held article whose bytes the materialized volumes
+    // already hold (measured 13 Aug 2026: 9 of the 10 articles a
+    // volumes-on-disk retry still pulled were exactly these).
+    workers::flush_pending_r(pending_r, extractor, &journal);
+
+    // Second late-attach read (C1): the settle/repair phase between the
+    // network drain and this ladder runs for minutes on a big damaged
+    // set, and a password typed during it must not miss this job too.
+    let password: Option<String> = hub
+        .as_ref()
+        .and_then(|h| h.late_password_for(stream_owner))
+        .or(password);
+    // Everything from here to the end of the run is unpack work (the
+    // disk-side ladders below, or the nested second pass) - close
+    // enough for the queue row even on jobs that skip them all, since
+    // those reach the finish within moments.
+    // The disk-unpack tail (eat-arm, unrar ladder, nested pass): see
+    // get/tail.rs. Off the scheduler core (Codex sweep 8 Aug H11): the
+    // tail is minutes of synchronous unrar work plus parked waits for
+    // the heavy-CPU permit and the §129 disk admission, and all of it
+    // used to run directly on this task's runtime worker - freezing
+    // sockets, timers and the API for the duration, and deadlocking
+    // outright when the permit holder needed the same worker to
+    // finish. `off_worker` (block_in_place, not spawn_blocking) keeps
+    // the tail on THIS thread, which the eat-arm's and the need
+    // ledger's thread-locals both rely on.
+    let UnpackVerdict {
+        all_good,
+        reextract_failed,
+    } = crate::lanegate::off_worker(|| {
+        unpack_tail(
+            extractor,
+            slots,
+            restored,
+            &ex_report,
+            &final_shape,
+            &outer_vol_stems,
+            out_dir,
+            password.as_deref(),
+            resuming,
+            no_extract,
+            resume_map,
+            eat_consent,
+            &note_activity,
+            all_good,
+            reextract_failed,
+        )
+    })?;
+    // M15 memory summary - the line benchmarks quote and budgets tune:
+    // see print_mem_summary in get/tail.rs.
+    print_mem_summary(verifier, extractor, budget);
+
+    // Issue #14 tail - the sniffed-leftover sweep: see get/tail.rs.
+    sweep_sniffed_leftovers(all_good, par_cleanup, sniff, sniff_covered, out_dir);
+
+    // Retire the journal on a good finish; otherwise print the
+    // diagnostics block and fail with the closest cause: see
+    // finish_job in get/tail.rs.
+    finish_job(
+        all_good,
+        out_dir,
+        &incomplete_spared,
+        journal,
+        servers,
+        stats,
+        reextract_failed,
+        incomplete,
+        derrs,
+        missing_430,
+        retention_skipped,
+        transport_failed,
+        transport_sample,
+        decode_error_sample,
+        &dead_servers,
+        slots,
+        stalled,
+        missing_segments,
+        total_segments,
+        total,
+        &backbones,
+        post_age_days,
+        repair_shortfall,
+        &ex_report
+            .extracted
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect::<Vec<_>>(),
+        unhealed_slots.as_deref(),
+        extractor,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     fn tdir(name: &str) -> PathBuf {
         let d =
@@ -830,6 +1224,33 @@ mod tests {
         repair_shortfall: Option<(usize, usize)>,
         extracted: &[String],
     ) -> Result<()> {
+        run_finish_full(
+            dir,
+            all_good,
+            reextract_failed,
+            incomplete,
+            derrs,
+            repair_shortfall,
+            extracted,
+            &[],
+            &Arc::new(nzbkit::extract::Extractor::new(dir, 0, true)),
+        )
+    }
+
+    /// The same again, with the slots and extractor the downloaded-file
+    /// quarantine reads.
+    #[allow(clippy::too_many_arguments)]
+    fn run_finish_full(
+        dir: &Path,
+        all_good: bool,
+        reextract_failed: Option<String>,
+        incomplete: usize,
+        derrs: u64,
+        repair_shortfall: Option<(usize, usize)>,
+        extracted: &[String],
+        slots: &[Arc<FileSlot>],
+        extractor: &Arc<nzbkit::extract::Extractor>,
+    ) -> Result<()> {
         let (j, _) = nzbkit::journal::Journal::open(dir, b"<nzb/>").unwrap();
         finish_job(
             all_good,
@@ -847,7 +1268,7 @@ mod tests {
             &Arc::new(std::sync::Mutex::new(None)),
             &Arc::new(std::sync::Mutex::new(None)),
             &[],
-            &[],
+            slots,
             &Arc::new(std::sync::atomic::AtomicBool::new(false)),
             0,
             0,
@@ -856,6 +1277,10 @@ mod tests {
             0,
             repair_shortfall,
             extracted,
+            // No settle claim: the whole-job quarantine, which is what
+            // every case below is about.
+            None,
+            extractor,
         )
     }
 
@@ -989,6 +1414,168 @@ mod tests {
         std::fs::write(d.join("payload.mkv"), b"whole").unwrap();
         assert!(run_finish_ex(&d, true, None, 0, 0, None, &["payload.mkv".to_string()]).is_ok());
         assert!(d.join("payload.mkv").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// TODO 159 item 1, the advYB shape as the partition sees it: three
+    /// archives, damage that survived repair on the third alone. The two
+    /// the repair proved whole go out; the third is withheld.
+    #[test]
+    fn only_the_unhealed_archives_payload_is_withheld() {
+        let d = tdir("quarantine-perfile");
+        let ex = Arc::new(nzbkit::extract::Extractor::new(&d, 3, true));
+        for (slot, vol, inner) in [(0usize, "c1.rar", "yb1.bin"), (1, "c2.rar", "yb2.bin")] {
+            let data = vec![slot as u8 + 1; 40_000];
+            let v = nzbkit::rar::fixtures::rar5_volume(&[(inner, 40_000, &data, false, false)]);
+            feed_volume(&ex, slot, vol, &v);
+        }
+        let bare = vec![9u8; 40_000];
+        let v = nzbkit::rar::fixtures::rar5_volume(&[("yb3.bin", 40_000, &bare, false, false)]);
+        feed_volume(&ex, 2, "bare.rar", &v);
+        ex.finish().unwrap();
+        let extracted: Vec<String> = ["yb1.bin", "yb2.bin", "yb3.bin"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (hold, spare) = partition_failed_payload(&extracted, Some(&[2]), &ex);
+        assert_eq!(spare, vec!["yb1.bin".to_string(), "yb2.bin".to_string()]);
+        assert_eq!(hold, vec!["yb3.bin".to_string()]);
+        // No claim from settle, or a name the extractor cannot speak
+        // for: everything is withheld, which is the pre-159 behaviour
+        // and the safe direction.
+        let (hold, spare) = partition_failed_payload(&extracted, None, &ex);
+        assert_eq!(hold.len(), 3);
+        assert!(spare.is_empty());
+        let stranger = vec!["from-a-nested-level.mkv".to_string()];
+        let (hold, spare) = partition_failed_payload(&stranger, Some(&[2]), &ex);
+        assert_eq!(hold, stranger, "an unattributable name is never spared");
+        assert!(spare.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Feed one whole volume into a slot, in order.
+    fn feed_volume(ex: &nzbkit::extract::Extractor, slot: usize, name: &str, vol: &[u8]) {
+        for off in (0..vol.len()).step_by(7000) {
+            let end = (off + 7000).min(vol.len());
+            ex.write(slot, name, vol.len() as u64, off as u64, &vol[off..end])
+                .unwrap();
+        }
+    }
+
+    /// A FileSlot with the given census; everything else healthy.
+    fn census_slot(is_par2: bool, missing: usize) -> Arc<FileSlot> {
+        Arc::new(FileSlot {
+            hint: String::new(),
+            is_par2_main: is_par2,
+            par2_sniffed: std::sync::atomic::AtomicBool::new(false),
+            total_segments: 1,
+            remaining: AtomicUsize::new(0),
+            missing: AtomicUsize::new(missing),
+            errors: AtomicUsize::new(0),
+            deferred: AtomicUsize::new(0),
+            abandoned: AtomicUsize::new(0),
+            capture: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// TODO 159 item 1c, the advG shape: a failing finish must take the
+    /// downloaded files out of circulation too, or the completed folder
+    /// keeps four real-named volumes of a job whose verdict says Failed
+    /// (SABnzbd and NZBGet park the same bytes out of sight). A
+    /// materialized volume is held even when its own bytes are whole -
+    /// its deliverable was the extraction, which never happened. A
+    /// plain file that provably arrived whole is its OWN deliverable
+    /// and stays; a holed plain file and a par2 go aside.
+    #[test]
+    fn a_failing_finish_holds_downloaded_volumes_and_spares_proven_plain_files() {
+        let suffix = nzbkit::journal::PARTIAL_SUFFIX;
+        let d = tdir("quarantine-volumes");
+        let ex = Arc::new(nzbkit::extract::Extractor::new(&d, 4, true));
+        // Slot 0: first volume of a split set whose successor never
+        // arrives - the mapper demotes it and materializes the volume
+        // file on disk, exactly advG's "volumes on disk" fallback.
+        let data = vec![7u8; 40_000];
+        let vol = nzbkit::rar::fixtures::rar5_volume(&[("g.bin", 80_000, &data, false, true)]);
+        feed_volume(&ex, 0, "advG.part1.rar", &vol);
+        // Slot 1: a plain file that arrived complete.
+        feed_volume(&ex, 1, "whole.bin", &vec![3u8; 10_000]);
+        // Slot 2: a plain file with a hole (half its declared range).
+        let half = vec![5u8; 10_000];
+        ex.write(2, "holed.bin", 20_000, 0, &half).unwrap();
+        // Slot 3: a complete par2 - recovery data, never a deliverable.
+        feed_volume(&ex, 3, "set.par2", &vec![0x50u8; 4_000]);
+        let _ = ex.finish();
+        let vol_path = ex.slot_path(0).expect("the demoted volume materializes");
+        assert!(vol_path.exists(), "the volume file must be on disk");
+        let slots = [
+            census_slot(false, 0),
+            census_slot(false, 0),
+            census_slot(false, 1),
+            census_slot(true, 0),
+        ];
+        assert!(
+            run_finish_full(&d, false, None, 1, 0, None, &[], &slots, &ex).is_err(),
+            "the job must still fail"
+        );
+        let renamed = |p: &Path| {
+            let mut q = p.as_os_str().to_owned();
+            q.push(suffix);
+            !p.exists() && PathBuf::from(q).exists()
+        };
+        assert!(
+            renamed(&vol_path),
+            "a whole volume of a failed set is furniture and must go aside"
+        );
+        assert!(
+            d.join("whole.bin").exists(),
+            "a plain file that provably arrived whole is delivered, not withheld"
+        );
+        assert!(
+            renamed(&d.join("holed.bin")),
+            "a holed plain file wearing its real name is the false artifact"
+        );
+        assert!(
+            renamed(&d.join("set.par2")),
+            "recovery data for a failed recovery is spent evidence"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// With a settle claim the claim wins the plain-file question in
+    /// both directions: a proved plain file is spared without
+    /// re-deriving its census, an unhealed one is held despite a clean
+    /// census - and a volume is held either way.
+    #[test]
+    fn the_settle_claim_decides_which_downloaded_files_are_held() {
+        let d = tdir("quarantine-vol-claim");
+        let ex = Arc::new(nzbkit::extract::Extractor::new(&d, 3, true));
+        let data = vec![7u8; 40_000];
+        let vol = nzbkit::rar::fixtures::rar5_volume(&[("g.bin", 80_000, &data, false, true)]);
+        feed_volume(&ex, 0, "set.part1.rar", &vol);
+        feed_volume(&ex, 1, "proved.bin", &vec![1u8; 8_000]);
+        feed_volume(&ex, 2, "unhealed.bin", &vec![2u8; 8_000]);
+        let _ = ex.finish();
+        let slots = [
+            census_slot(false, 0),
+            census_slot(false, 0),
+            census_slot(false, 0),
+        ];
+        let names = |claim: Option<&[usize]>| -> Vec<String> {
+            held_downloaded_files(&slots, claim, &ex)
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        let held = names(Some(&[2]));
+        assert!(held.iter().any(|n| n.contains("part1")), "{held:?}");
+        assert!(held.contains(&"unhealed.bin".to_string()), "{held:?}");
+        assert!(!held.contains(&"proved.bin".to_string()), "{held:?}");
+        // No claim: the volume is still held, both whole plain files
+        // are spared by their own census.
+        let held = names(None);
+        assert!(held.iter().any(|n| n.contains("part1")), "{held:?}");
+        assert!(!held.contains(&"proved.bin".to_string()), "{held:?}");
+        assert!(!held.contains(&"unhealed.bin".to_string()), "{held:?}");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

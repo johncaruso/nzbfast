@@ -1,0 +1,74 @@
+# The size gate (TODO 106), on EVERY branch instead of only on main.
+#
+# It already runs in ci-private's `check` job, and that is where it will
+# stay - this workflow does not replace it. What it fixes is WHEN you
+# hear about a breach.
+#
+# Measured 13 Aug 2026: main sat red on the `size gate` step from 12 Aug
+# to 13 Aug, and in the afternoon of the 13th five more targets crossed
+# the ceilings inside a few hours (zip.rs, rar.rs, repair.rs,
+# get_with_progress, then queue_json, boot and tasks/indexer.rs). Not one
+# of them was reported by CI. Every single one was found by whoever
+# merged next, running the gate by hand.
+#
+# The cause is structural, not bad luck. `pr-check.yml` is gated to the
+# PUBLIC repo, and ci-private's `check` job triggers on push to main
+# alone, so on this repo no branch and no pull request has ever run this
+# gate. A lane can breach a ceiling, pass every check it is shown, merge,
+# and the breach then surfaces on somebody else's push - which is also
+# why the fix is not "run the gate before pushing" advice: the lane that
+# broke it is not the lane that finds out.
+#
+# Two properties make it cheap enough to run on everything:
+#
+#   - No build. It is pure python over the source text - no toolchain, no
+#     cargo cache, no target dir. Checkout plus the script is the whole
+#     job, seconds of runner time, which is what makes running it on
+#     every branch push defensible against the cost rationale in
+#     pr-check.yml.
+#   - Its own concurrency group. In `check` the verdict is behind ~18
+#     minutes of toolchain, fmt, clippy and the unit suites, and on a
+#     main taking a push every ~90 seconds that job is usually queued or
+#     superseded (see ci-private.yml's long note - read verdicts per job,
+#     never per run). Here nothing queues behind a build, so a breach is
+#     reported while the lane that caused it is still at the keyboard.
+#
+# `lock-gate.py` and the overflow gate are the same shape - pure python,
+# no build, currently only visible on main - and belong here too. Left
+# out on purpose: this workflow is one change for one measured problem,
+# and adding them is a one-line follow-up if it earns its keep.
+name: size-gate
+on:
+  push:
+    paths:
+      - 'crates/**'
+      - 'tools/size-gate.py'
+      - '.github/workflows/size-gate.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  size-gate:
+    # Private repo only. The public repo has pr-check.yml; the cost
+    # rationale for that split lives there.
+    if: github.repository != 'nzbfast/nzbfast'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # On the JOB, not the workflow, which is ci-private.yml's hard-won
+    # lesson written down: a workflow-level group cancels every job in
+    # the run, so one slow leg kills the fast one. With a single job the
+    # two spellings are identical today - it is spelled this way so that
+    # adding a second gate here later cannot starve this one.
+    #
+    # Same rule as `check` otherwise: superseding is what you want on a
+    # topic branch, and main must always reach a verdict rather than be
+    # cancelled by the next push.
+    concurrency:
+      group: size-gate-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Deliberately the bare script, exactly as ci-private runs it, so
+      # the two can never disagree about what passes.
+      - name: size gate
+        run: tools/size-gate.py

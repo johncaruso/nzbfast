@@ -201,6 +201,11 @@ fn restore_job_settings(
     {
         *daemon.dupe_action.lock_ok() = m.to_string();
     }
+    if let Some(m) = saved.get("dupe_scope").and_then(Value::as_str)
+        && matches!(m, "smart" | "exact")
+    {
+        *daemon.dupe_scope.lock_ok() = m.to_string();
+    }
     if let Some(on) = saved.get("fast_par").and_then(Value::as_bool) {
         daemon.fast_par.store(on, Ordering::Relaxed);
     }
@@ -707,6 +712,26 @@ pub(super) fn seed_scoreboard_source(settings_path: &Path) -> Mutex<String> {
     Mutex::new(
         load_settings(settings_path)
             .get("scoreboard_source")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+    )
+}
+
+pub(super) fn seed_corr_confirm_enabled(settings_path: &Path) -> std::sync::atomic::AtomicBool {
+    std::sync::atomic::AtomicBool::new(
+        load_settings(settings_path)
+            .get("corr_confirm_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+}
+
+pub(super) fn seed_corr_confirm_source(settings_path: &Path) -> Mutex<String> {
+    Mutex::new(
+        load_settings(settings_path)
+            .get("corr_confirm_source")
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim()
@@ -1393,6 +1418,7 @@ pub(super) fn spawn_core_tasks(
 
     tasks::spawn_memory_trim(daemon);
     tasks::spawn_usage_flush(daemon);
+    tasks::spawn_queue_saver(daemon);
 
     tasks::spawn_auto_speed(daemon, config);
 
@@ -1448,6 +1474,13 @@ pub(super) fn spawn_core_tasks(
     // saved a reference indexer URL and switched it on.
     #[cfg(feature = "indexer")]
     tasks::spawn_scoreboard(daemon);
+
+    // The indexer-confirm lane: correlation suggestions -> proven
+    // names via the user's own indexer account. Inert until switched
+    // on AND aimed at an account; its NO_ENRICH gate lives inside the
+    // spawn (the env cannot change under a running process).
+    #[cfg(feature = "indexer")]
+    tasks::spawn_corr_confirm(daemon);
 
     tasks::spawn_health_prober(daemon, config);
 
@@ -1729,6 +1762,25 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
     let out_root = absolute_out_root(out_root);
     let tls_pair = resolve_tls_pair(&tls_cert, &tls_key);
     let server = take_listener(&bind, port, tls_pair)?;
+    // From here on the port is the one the LISTENER got, not the one that
+    // was asked for. They differ in exactly one case: `--port 0`, which
+    // asks the OS to pick a free one. Everything downstream reads this
+    // binding - runtime.json, the readiness banner, `Daemon::port` and the
+    // settings card's "what is this run actually serving" - so a caller
+    // that cannot name a port in advance still gets a daemon that names it
+    // afterwards.
+    //
+    // The Android app is the caller that needs it (TODO 158 item 4). Its
+    // on-device engine used to bind a hardcoded 6791, and Android apps
+    // share one loopback namespace, so a port a sibling app can predict is
+    // a port it can pre-bind. The app now passes 0 and reads the answer
+    // back out of runtime.json.
+    //
+    // For a port the caller DID name this is the identity - a bind on 6789
+    // reports 6789 - so no existing launch changes shape. `to_ip` is None
+    // only for a unix-socket listener, which this build never takes; the
+    // requested value is the honest fallback there.
+    let port = server.server_addr().to_ip().map_or(port, |a| a.port());
     let tls_on = tls_pair.is_some();
     let spool = spool_dir(&config, &out_root);
     // Windows has no dotfile convention, so `.spool` is plainly visible
@@ -1740,7 +1792,128 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
     let _ = std::fs::create_dir_all(&spool);
     nzbkit::disk::hide_from_user(&spool);
     let _serve_lock = acquire_serve_lock(&spool, &config)?;
-    let daemon = Arc::new(Daemon {
+    // The Daemon itself: see build_daemon. Only the argument list is
+    // new - the literal moved verbatim. `spool`, `mem_budget` and
+    // `index_db` are cloned because `Booted` below still returns them.
+    let daemon = build_daemon(
+        config,
+        settings_path,
+        out_root,
+        spool.clone(),
+        port,
+        tls_on,
+        tls_cert,
+        tls_key,
+        apikey,
+        nzbkey,
+        opts.group_desc_isc,
+        connections,
+        window,
+        decoders,
+        fast_verify,
+        verify_lean,
+        preflight,
+        auto_speed,
+        auto_retry_mins,
+        min_free,
+        out_umask,
+        quota,
+        quota_period,
+        watch,
+        script,
+        mem_budget,
+        library_cats,
+        library_recheck_secs,
+        index_enabled,
+        legacy_rename_punctuation,
+        #[cfg(feature = "indexer")]
+        index_db.clone(),
+        #[cfg(feature = "indexer")]
+        index_groups,
+        #[cfg(feature = "indexer")]
+        index_interval_secs,
+        #[cfg(feature = "indexer")]
+        index_backfill,
+        #[cfg(feature = "indexer")]
+        index_max_age_secs,
+        #[cfg(feature = "indexer")]
+        index_gates,
+    );
+    // Weakly, for the embedded host's reclamation test: one entry per
+    // run, and a generation that survives its own stop is a leak that
+    // shows up as a `Weak` still upgradable. Costs a pointer per run.
+    super::census_daemon(&daemon);
+
+    Ok(Booted {
+        daemon,
+        server,
+        _serve_lock,
+        spool,
+        bind,
+        port,
+        tls_on,
+        open,
+        schedule,
+        feeds,
+        speedlimit,
+        mem_budget,
+        #[cfg(feature = "indexer")]
+        index_db,
+    })
+}
+
+/// Build the `Daemon` from the resolved options (TODO 106).
+///
+/// The struct literal is 379 of `boot`'s 503 lines and cannot be cut
+/// any smaller than itself - it is one `field: value` per line for a
+/// hundred-odd fields - so the whole of it moves and `boot` keeps the
+/// resolution above it, whose ORDER is load-bearing (the key is settled
+/// before the bind, the bind before anything writes to the data dir).
+/// The literal is VERBATIM; only the argument list is new. Six
+/// parameters carry the same `#[cfg(feature = "indexer")]` they carry
+/// in `ServeOpts`, and `group_desc_isc` is passed as a bool because the
+/// destructure in `boot` leaves it un-moved on `opts` (its pattern is
+/// `_`), which is too subtle to re-create here.
+#[allow(clippy::too_many_arguments)]
+fn build_daemon(
+    config: PathBuf,
+    settings_path: PathBuf,
+    out_root: PathBuf,
+    spool: PathBuf,
+    port: u16,
+    tls_on: bool,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    apikey: Option<String>,
+    nzbkey: Option<String>,
+    group_desc_isc: bool,
+    connections: usize,
+    window: usize,
+    decoders: usize,
+    fast_verify: bool,
+    verify_lean: bool,
+    preflight: bool,
+    auto_speed: bool,
+    auto_retry_mins: u64,
+    min_free: Option<u64>,
+    out_umask: Option<u32>,
+    quota: Option<u64>,
+    quota_period: char,
+    watch: Option<PathBuf>,
+    script: Option<PathBuf>,
+    mem_budget: nzbkit::mem::MemBudget,
+    library_cats: Vec<String>,
+    library_recheck_secs: u64,
+    index_enabled: bool,
+    legacy_rename_punctuation: bool,
+    #[cfg(feature = "indexer")] index_db: PathBuf,
+    #[cfg(feature = "indexer")] index_groups: Vec<String>,
+    #[cfg(feature = "indexer")] index_interval_secs: u64,
+    #[cfg(feature = "indexer")] index_backfill: u64,
+    #[cfg(feature = "indexer")] index_max_age_secs: u64,
+    #[cfg(feature = "indexer")] index_gates: Option<crate::gates::Gates>,
+) -> Arc<Daemon> {
+    Arc::new(Daemon {
         hub: Arc::new(crate::StreamHub::default()),
         paused: std::sync::atomic::AtomicBool::new(false),
         offline: std::sync::atomic::AtomicBool::new(false),
@@ -1752,6 +1925,9 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         life_seq: AtomicU64::new(0),
         life_events: Mutex::new(VecDeque::new()),
         queue_idle_latch: AtomicBool::new(true),
+        save_soon: AtomicBool::new(false),
+        save_wake: tokio::sync::Notify::new(),
+        saver_armed: AtomicBool::new(false),
         hooks_tx: Mutex::new(None),
         history_keep_count: AtomicU64::new(0),
         history_keep_days: AtomicU64::new(0),
@@ -1962,6 +2138,8 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         scoreboard_enabled: seed_scoreboard_enabled(&settings_path),
         scoreboard_url: seed_scoreboard_url(&settings_path),
         scoreboard_source: seed_scoreboard_source(&settings_path),
+        corr_confirm_enabled: seed_corr_confirm_enabled(&settings_path),
+        corr_confirm_source: seed_corr_confirm_source(&settings_path),
         scoreboard_cats: seed_scoreboard_cats(&settings_path),
         scoreboard_key: seed_scoreboard_key(&settings_path),
         scoreboard_calibrate: seed_scoreboard_calibrate(&settings_path),
@@ -2033,6 +2211,7 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         quota_spent: AtomicU64::new(0),
         quota_reset: AtomicBool::new(false),
         dupe_action: Mutex::new("pause".to_string()),
+        dupe_scope: Mutex::new("smart".to_string()),
         cat_meta: Mutex::new(std::collections::HashMap::new()),
         quota_period: std::sync::atomic::AtomicU8::new(match quota_period {
             'm' => b'm',
@@ -2062,7 +2241,7 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         group_stats: Mutex::new(Arc::new(crate::groupstats::StatsCache::default())),
         #[cfg(feature = "indexer")]
         group_sampling: Mutex::new(std::collections::HashSet::new()),
-        group_desc_isc: std::sync::atomic::AtomicBool::new(opts.group_desc_isc),
+        group_desc_isc: std::sync::atomic::AtomicBool::new(group_desc_isc),
         script: Mutex::new(script),
         script_timeout: AtomicU64::new(3600),
         pre_queue_script: Mutex::new(None),
@@ -2115,27 +2294,6 @@ pub(super) fn boot(config: &Path, settings_path: &Path, opts: ServeOpts) -> Resu
         settings_path: settings_path.clone(),
         #[cfg(feature = "indexer")]
         taste_cache: Mutex::new(None),
-    });
-    // Weakly, for the embedded host's reclamation test: one entry per
-    // run, and a generation that survives its own stop is a leak that
-    // shows up as a `Weak` still upgradable. Costs a pointer per run.
-    super::census_daemon(&daemon);
-
-    Ok(Booted {
-        daemon,
-        server,
-        _serve_lock,
-        spool,
-        bind,
-        port,
-        tls_on,
-        open,
-        schedule,
-        feeds,
-        speedlimit,
-        mem_budget,
-        #[cfg(feature = "indexer")]
-        index_db,
     })
 }
 

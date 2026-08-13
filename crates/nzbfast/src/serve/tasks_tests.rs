@@ -671,7 +671,7 @@ fn sampler_cap_cooldown_needs_a_slots_full_refusal_or_a_declared_tight_cap() {
 }
 
 // ---------------------------------------------------------------------
-// 12. no_enabled_servers (TODO §154)
+// 12. server_verdict (TODO §154, §156 item 7)
 // ---------------------------------------------------------------------
 
 /// The runner's "nothing to dial" gate. Its whole job is to be narrower
@@ -679,53 +679,89 @@ fn sampler_cap_cooldown_needs_a_slots_full_refusal_or_a_declared_tight_cap() {
 /// waits and starts itself the moment one is added, while a job whose
 /// config is unreadable must still reach the download and report the
 /// real error rather than sit behind a hold that blames the server list.
+///
+/// §156 item 7: the last two shapes below are why this reads through
+/// `load_no_fallback`. This test USED to end at "a missing config stands
+/// the guard down", and whether it passed depended on whether the
+/// machine running it had SABnzbd installed - `Config::load` answers a
+/// missing file by finding and parsing the host's sabnzbd.ini, so on a
+/// box with SAB and no enabled server the verdict came back as this
+/// guard's own condition. A test whose verdict moves with what else is
+/// installed is not a test, so the ini is written into the fixture here
+/// and the guard must ignore it either way.
 #[test]
 fn no_enabled_servers_is_zero_enabled_and_not_every_config_error() {
+    use super::ServerVerdict::{Dialable, NoneEnabled, Unknown};
     let dir = tdir("noservers");
     let write = |name: &str, body: &str| {
         let p = dir.join(name);
         std::fs::write(&p, body).unwrap();
         p
     };
+    // The probe also hands back the parsed config for the pick that
+    // follows (§H); only the verdict half is under test here.
+    let verdict = |p: &std::path::Path| super::server_verdict(p).0;
 
     // The shape §154 was raised on. `Config::load` reports an EMPTY
     // list as the NoServers error, not as Ok with an empty vec, so a
     // guard written as `is_ok_and(|c| c.servers.is_empty())` would read
     // false here and never fire on the one case that matters.
-    assert!(super::no_enabled_servers(&write(
-        "empty.json",
-        r#"{"servers":[]}"#
-    )));
+    assert_eq!(
+        verdict(&write("empty.json", r#"{"servers":[]}"#)),
+        NoneEnabled
+    );
 
     // The second shape: servers exist, every one is switched off.
-    assert!(super::no_enabled_servers(&write(
-        "off.json",
-        r#"{"servers":[{"host":"a.example","port":119,"enabled":false},
+    assert_eq!(
+        verdict(&write(
+            "off.json",
+            r#"{"servers":[{"host":"a.example","port":119,"enabled":false},
                        {"host":"b.example","port":119,"enabled":false}]}"#
-    )));
+        )),
+        NoneEnabled
+    );
 
     // One enabled server is enough - including when others are off.
-    assert!(!super::no_enabled_servers(&write(
-        "one.json",
-        r#"{"servers":[{"host":"a.example","port":119,"enabled":false},
+    assert_eq!(
+        verdict(&write(
+            "one.json",
+            r#"{"servers":[{"host":"a.example","port":119,"enabled":false},
                        {"host":"b.example","port":119}]}"#
-    )));
+        )),
+        Dialable
+    );
 
     // `enabled` defaults to true, which is what an untouched
     // hand-written config looks like.
-    assert!(!super::no_enabled_servers(&write(
-        "default.json",
-        r#"{"servers":[{"host":"a.example","port":119}]}"#
-    )));
+    assert_eq!(
+        verdict(&write(
+            "default.json",
+            r#"{"servers":[{"host":"a.example","port":119}]}"#
+        )),
+        Dialable
+    );
 
     // Not our condition: a config that is missing, or that will not
     // parse. Both stand the guard down so the download runs and says
     // what is actually wrong.
-    assert!(!super::no_enabled_servers(&dir.join("nothing-here.json")));
-    assert!(!super::no_enabled_servers(&write(
-        "torn.json",
-        r#"{"servers":[{"#
-    )));
+    assert_eq!(verdict(&dir.join("nothing-here.json")), Unknown);
+    assert_eq!(verdict(&write("torn.json", r#"{"servers":[{"#)), Unknown);
+
+    // §156 item 7, and the reason this fixture writes a sabnzbd.ini:
+    // `Config::load`'s missing-file fallback searches next to the
+    // config first (issue #15's Docker case), so a SAB ini here is
+    // exactly what a typo'd `--config` path finds on a SAB box. An
+    // unreadable config stays unreadable whatever that file says -
+    // otherwise the guard holds the queue blaming a server list that
+    // belongs to another application, in the one case its own doc
+    // comment promises to stand down for.
+    let sab = dir.join("sabnzbd.ini");
+    std::fs::write(&sab, "[servers]\n[[a]]\nhost = news.example\nenable = 1\n").unwrap();
+    assert_eq!(verdict(&dir.join("nothing-here.json")), Unknown);
+    // The shape that used to publish "no server is configured" for a
+    // path nobody could read: SAB installed, no server enabled in it.
+    std::fs::write(&sab, "[servers]\n[[a]]\nhost = news.example\nenable = 0\n").unwrap();
+    assert_eq!(verdict(&dir.join("nothing-here.json")), Unknown);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -798,4 +834,123 @@ fn trim_meter_sees_madv_free_reusable_release() {
             after >> 20
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// index_gate_rendezvous - the runner's bounded wait on the index pass
+// gate (the 13 Aug issue-#38 audit's second silent-wedge candidate)
+// ---------------------------------------------------------------------
+
+/// The gate's holders all stand down on their own once the runner's
+/// job guard is up, so a wait past the bound means a lane is wedged
+/// mid-I/O against a mute peer. The old unbounded `gate.lock().await`
+/// parked the runner forever in exactly that case, with the job stuck
+/// in Downloading and nothing logged. The rendezvous must come back -
+/// true when the gate frees (even after a delay), false at the bound.
+/// Codex sweep I, 13 Aug 2026: the guard ladder bumped `queue_rev` on a
+/// hold's transition edge and stored the hold itself AFTER it. A §129 1b
+/// poll landing between the two sees the announcing revision with the
+/// old hold, adopts that revision, and - since the store carries no
+/// second bump and a held queue has nothing transferring - every
+/// matching poll after it omits the queue payload until some unrelated
+/// state change moves the revision. The banner is then never drawn.
+///
+/// `publish_hold` is the fix and this pins it: the store and the bump
+/// live in one place, in that order, and no other line in the ladder
+/// writes `queue_hold` on a set edge. Source-scanning, like
+/// `settings_catalogue` - the ordering is a property of the code, and a
+/// runtime test would have to lose the race to notice.
+#[test]
+fn every_queue_hold_set_edge_goes_through_one_helper() {
+    let src = include_str!("tasks/runner.rs");
+    let helper = src
+        .split_once("fn publish_hold(")
+        .expect("the helper exists")
+        .1;
+    let body = helper.split_once("\n}\n").expect("helper body").0;
+    let store = body.find("queue_hold").expect("the helper stores the hold");
+    let bump = body
+        .find("queue_rev")
+        .expect("the helper bumps the revision");
+    assert!(
+        store < bump,
+        "the hold must be stored BEFORE it is announced"
+    );
+
+    // Every OTHER `queue_hold` write in the ladder is a clear edge
+    // (`= None`); a `Some(` one would be a set edge bypassing the pair.
+    let (before, after) = src.split_at(src.find("fn publish_hold(").unwrap());
+    let after = after.split_once("\n}\n").expect("helper body").1;
+    for (n, line) in before.lines().chain(after.lines()).enumerate() {
+        let line = line.trim();
+        if !line.contains("queue_hold") || line.starts_with("//") {
+            continue;
+        }
+        assert!(
+            !line.contains("Some("),
+            "line {n} sets a hold outside publish_hold: {line}"
+        );
+    }
+}
+
+/// Codex sweep H, 13 Aug 2026: the no-servers guard reads the config on
+/// the blocking pool under a bound, and the pick that follows then took
+/// a SECOND, unbounded `Config::load` on the runner itself - with the
+/// job already Downloading and no fetch task yet to cancel. The snapshot
+/// the bounded probe already parsed is what feeds the block-account
+/// budgets now, so there is no second read to hang in.
+///
+/// The type signature is most of the assertion: `reset_hub_for_job`
+/// takes a config SNAPSHOT and no longer has a path to read. This pins
+/// the other half - that the snapshot is really carried, and that a
+/// later unreadable config leaves the last good one alone rather than
+/// silently dropping every server's budget.
+#[tokio::test]
+async fn the_server_probe_carries_the_config_the_pick_needs() {
+    let dir = tdir("probe-cfg");
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        r#"{"servers":[{"host":"a.example","port":119,"block_bytes":500}]}"#,
+    )
+    .unwrap();
+    let mut probe = super::runner::ServerProbe::default();
+    assert!(probe.config().is_none(), "nothing read yet");
+    assert_eq!(probe.verdict(&cfg).await, super::ServerVerdict::Dialable);
+    let snap = probe.config().expect("the probe kept what it parsed");
+    assert_eq!(snap.servers.len(), 1);
+    assert_eq!(snap.servers[0].host, "a.example");
+    assert_eq!(snap.servers[0].block_bytes, Some(500));
+
+    // Torn file: no verdict, and no news about the server list either.
+    std::fs::write(&cfg, r#"{"servers":[{"#).unwrap();
+    assert_eq!(probe.verdict(&cfg).await, super::ServerVerdict::Unknown);
+    assert_eq!(
+        probe.config().map(|c| c.servers.len()),
+        Some(1),
+        "the last good snapshot survives an unreadable read"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn index_gate_rendezvous_bounds_the_runners_wait() {
+    let gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    // Free gate: the rendezvous is immediate and clean.
+    assert!(super::index_gate_rendezvous(&gate, Duration::from_secs(5)).await);
+    // Held gate, standing in for a lane wedged on a black-holed peer:
+    // the wait returns false at the bound instead of parking forever.
+    // lock_owned so the guard can cross into the release task below.
+    let held = gate.clone().lock_owned().await;
+    let t0 = Instant::now();
+    assert!(!super::index_gate_rendezvous(&gate, Duration::from_millis(50)).await);
+    assert!(t0.elapsed() >= Duration::from_millis(50));
+    // A holder that releases DURING the wait (a lane's 100 ms
+    // preemption poll standing it down) still rendezvouses cleanly.
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(held);
+    });
+    assert!(super::index_gate_rendezvous(&gate, Duration::from_secs(5)).await);
+    release.await.unwrap();
 }

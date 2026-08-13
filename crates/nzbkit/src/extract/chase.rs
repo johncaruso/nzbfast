@@ -66,6 +66,16 @@ impl Extractor {
             self.shape.note(self.depth, bits);
         }
         let stashed = self.retain_header_bytes(inner, slot, offset, data);
+        // Header bytes parked in RAM hold this article's record exactly
+        // like a data hold does: report the span Held (same refeed
+        // exclusion as the hold-push sites) so the article parks instead
+        // of dropping to Persist::No. It completes if the stash ever
+        // lands on disk - the fallback reconstruction surfaces identity
+        // placements for it - and an article whose stash stays in RAM
+        // just refetches on resume, which was its record before too.
+        if stashed > 0 && !inner.refeed_active {
+            inner.span_held = true;
+        }
         // A slot that already carries a blocker takes the blocker's route
         // below instead of this one. Its reason is the specific, actionable
         // one - encrypted headers ask the user for a password, compressed
@@ -306,7 +316,13 @@ impl Extractor {
             // Arms the stalled-chase cold spill (RAR chases only - the
             // forward-only reader is what makes "beyond the gap" cold).
             Some(inner.scratch.clone()),
+            Some(inner.self_weak.clone()),
         ));
+        // §156.1: a terminal verdict that landed before this attach
+        // still marks the volume it doomed.
+        if inner.slots[slot].article_lost {
+            buf.mark_lost();
+        }
         // Seed with everything already seen. The header stash MOVES in
         // (like the holds): the buffer keeps every byte from offset 0
         // for the life of the chase - reads never consume it, and a
@@ -443,21 +459,28 @@ impl Extractor {
             // bytes, with every CRC on the path still passing.
             return self.chase_forfeit(inner, slot, "repair rewrote chased bytes");
         }
-        // Proactive cold spill: once the job carries a terminal article
-        // verdict, a RAR chase's bytes beyond its decode gap are as cold
-        // as parked ciphertext (nothing can decode past an unfillable
-        // gap), so they page to the holds scratch beyond a small window
-        // instead of riding RAM to the cap - the 11 Aug 2026 soak held
-        // a whole damaged 3.5 GB set resident this way. A gap that does
-        // fill later (retry, repair) reads paged spans straight back
-        // through the frontier buffer; a demote materializes from them
-        // byte-exact.
+        // Proactive cold spill: a RAR chase WEDGED behind an unfillable
+        // gap is holding bytes nothing can decode - as cold as parked
+        // ciphertext - so they page to the holds scratch beyond a small
+        // window instead of riding RAM to the cap (the 11 Aug 2026 soak
+        // held a whole damaged 3.5 GB set resident this way). §156.1:
+        // the wedge test is what arms this, not the verdict alone - a
+        // healthy chase that merely shares a job with a lost article
+        // used to skim its entire pile through scratch and pread it
+        // straight back (527 MB of doubled I/O on the A/B's 614 MB
+        // set). A gap that does fill later (retry, repair) reads paged
+        // spans straight back through the frontier buffer; a demote
+        // materializes from them byte-exact. The paging itself runs on
+        // the detached pager (§156.3b) - this path holds the extractor
+        // lock, and the pass does disk I/O.
         if inner.lost_articles.load(Ordering::Relaxed)
             && inner.slots[slot].sevenz.is_none()
             && inner.budget.len() > chase_stall_spill(inner.budget.cap())
             && let Some(ctl) = Self::rar_chase_of(inner, slot)
+            && Self::chase_first_doomed(&ctl).is_some()
+            && let Some(me) = inner.self_weak.upgrade()
         {
-            self.page_stalled_chase(inner, &ctl);
+            me.wake_pager();
         }
         if inner.budget.over() {
             // Drop-behind first: an archive whose decode is keeping up
@@ -534,36 +557,153 @@ impl Extractor {
             .sum();
         own + child.map_or(0, |c| c.chase_consumed_volumes())
     }
-    /// Report a TERMINAL article verdict: something in this job will
-    /// never arrive from the wire (a 430 on every provider, an article
-    /// outside retention, a dead transport). Sticky, idempotent and
-    /// chain-wide. A chased RAR set wedged on such a gap is holding
-    /// bytes nothing can decode, so this pages its cold frontier spans
-    /// to the holds scratch beyond the [`chase_stall_spill`] window
-    /// right away - verdicts typically land AFTER the pile has built
-    /// (retries exhaust last), and a fully-arrived wedged set sees no
-    /// further spans, so the arrival-path trigger alone would leave it
-    /// resident forever. A later repair (or a rescheduled fetch) that
-    /// fills the gap resumes the decode straight off the paged bytes.
-    pub fn note_article_lost(&self) {
-        let child = {
+    /// Report a TERMINAL article verdict for `slot`: that slot's bytes
+    /// will never all arrive from the wire (a 430 on every provider, an
+    /// article outside retention, a dead transport). Sticky and
+    /// idempotent; the chain-wide flag arms the arrival-path and
+    /// reader-path wedge checks, and the SLOT mark (§156.1) is what
+    /// makes the trigger honest: only volumes that can actually contain
+    /// the hole are marked, so a healthy chase that merely shares the
+    /// job with the loss never pages. The immediate pass here matters
+    /// because verdicts typically land AFTER the pile has built (retries
+    /// exhaust last), and a set already wedged at its hole sees no
+    /// further spans to re-arm from. A later repair (or a rescheduled
+    /// fetch) that fills the gap resumes the decode straight off the
+    /// paged bytes.
+    pub fn note_article_lost(&self, slot: usize) {
+        {
             let mut g = self.inner.lock_ok();
             let inner = &mut *g;
             inner.lost_articles.store(true, Ordering::Relaxed);
-            if inner.budget.len() > chase_stall_spill(inner.budget.cap()) {
-                let chases: Vec<Arc<ChaseCtl>> = inner
+            Self::mark_slot_lost(inner, slot);
+        }
+        // §156.3b: the pass does disk I/O - it runs with the extractor
+        // lock RELEASED (this is the decode consumer thread, which does
+        // its own pwrites anyway), taking it back only for the short
+        // per-volume guard and budget settles.
+        self.run_stalled_page_pass();
+    }
+
+    /// §156.1: sticky terminal-loss mark for one slot, propagated to
+    /// wherever the hole can actually live. A chased slot marks its own
+    /// frontier buffer. A mapped volume's hole lands in whichever inner
+    /// files its group routed to the child, so every routed child slot
+    /// is marked (the group IS the archive containing the hole; finer
+    /// than that would need the article's byte offset, which the caller
+    /// does not have). Routes created after the verdict pick the mark up
+    /// at the routing site, chases attached after it at the attach site.
+    pub(super) fn mark_slot_lost(inner: &mut Inner, slot: usize) {
+        if slot >= inner.slots.len() || std::mem::replace(&mut inner.slots[slot].article_lost, true)
+        {
+            return;
+        }
+        if let Some(ch) = inner.slots[slot].chase.as_ref() {
+            ch.buf.mark_lost();
+        }
+        if let Some(g) = inner.slots[slot]
+            .group
+            .as_ref()
+            .and_then(|gk| inner.groups.get(gk))
+            && let Some(child) = inner.child.clone()
+        {
+            for cs in g.routed.values().copied().collect::<Vec<_>>() {
+                child.mark_child_slot_lost(cs);
+            }
+        }
+    }
+
+    /// [`Self::mark_slot_lost`] across a nesting boundary: the parent
+    /// calls this holding its own lock (parent-then-child is the
+    /// established order - the read planners do the same).
+    pub(super) fn mark_child_slot_lost(&self, slot: usize) {
+        let mut g = self.inner.lock_ok();
+        Self::mark_slot_lost(&mut g, slot);
+    }
+
+    /// §156.1 wedge test for one chase: the LOWEST volume that is
+    /// terminally wedged - marked lost, coverage stopped short - if
+    /// any. The decode is strictly volume-ordered, so every byte beyond
+    /// that volume's frontier is provably cold: the engine cannot reach
+    /// it until the hole fills, wherever the engine currently is. That
+    /// is the whole narrowing - a chase none of whose volumes hold an
+    /// unfillable hole returns None here and never pages, however many
+    /// terminal verdicts the rest of the job collects. Volumes BELOW
+    /// the doomed one stay warm (the engine is still coming for them),
+    /// which `page_wedged_chase` enforces with this index.
+    pub(super) fn chase_first_doomed(ctl: &Arc<ChaseCtl>) -> Option<usize> {
+        let vols: Vec<(usize, Arc<FrontierBuffer>)> = {
+            let st = ctl.shared.lock_ok();
+            st.vols.iter().map(|(&i, v)| (i, v.buf.clone())).collect()
+        };
+        vols.into_iter()
+            .find(|(_, b)| b.terminally_wedged())
+            .map(|(i, _)| i)
+    }
+
+    /// Coalesced wake for the stalled-chase pager: a detached thread
+    /// that runs [`Self::run_stalled_page_pass`] until no wake is
+    /// pending, then exits. Callers hold arbitrary locks - this is
+    /// atomics and a spawn, nothing more. Reached weakly from the
+    /// blocking readers so a cancelled extractor can drop; the thread's
+    /// next upgrade fails and it exits.
+    pub(super) fn wake_pager(self: &Arc<Self>) {
+        self.pager_armed.store(true, Ordering::Release);
+        if self.pager_active.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let me = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("nzb-stall-pager".into())
+            .spawn(move || {
+                loop {
+                    let Some(ex) = me.upgrade() else { return };
+                    if !ex.pager_armed.swap(false, Ordering::AcqRel) {
+                        ex.pager_active.store(false, Ordering::Release);
+                        // A wake racing this shutdown saw `active` still
+                        // set and returned; re-take the slot ourselves.
+                        if ex.pager_armed.load(Ordering::Acquire)
+                            && !ex.pager_active.swap(true, Ordering::AcqRel)
+                        {
+                            continue;
+                        }
+                        return;
+                    }
+                    ex.run_stalled_page_pass();
+                }
+            });
+        if spawned.is_err() {
+            self.pager_active.store(false, Ordering::Release);
+        }
+    }
+
+    /// One stalled-chase paging pass over this extractor and its chain:
+    /// page every chase that is terminally wedged (§156.1) while the
+    /// shared budget sits past the [`chase_stall_spill`] window. Takes
+    /// no lock across any I/O; safe to run concurrently with itself
+    /// (`page_cold` commits re-verify, and a lost race just releases
+    /// the orphaned scratch region).
+    pub(super) fn run_stalled_page_pass(&self) {
+        let (armed, chases, child) = {
+            let inner = self.inner.lock_ok();
+            (
+                inner.holds_page_on && inner.lost_articles.load(Ordering::Relaxed),
+                inner
                     .groups
                     .values()
                     .filter_map(|g| g.chase.clone())
-                    .collect();
-                for ctl in chases {
-                    self.page_stalled_chase(inner, &ctl);
+                    .collect::<Vec<_>>(),
+                inner.child.clone(),
+            )
+        };
+        if armed {
+            for ctl in chases {
+                if let Some(doom) = Self::chase_first_doomed(&ctl) {
+                    self.page_wedged_chase(&ctl, doom);
                 }
             }
-            inner.child.clone()
-        };
+        }
         if let Some(c) = child {
-            c.note_article_lost();
+            c.run_stalled_page_pass();
         }
     }
 
@@ -662,23 +802,32 @@ impl Extractor {
         inner.budget.sub(released);
         Ok(())
     }
-    /// Page a stalled RAR chase's cold frontier bytes to the holds
+    /// Page a WEDGED RAR chase's cold frontier bytes to the holds
     /// scratch, until the shared budget sits back at the
     /// [`chase_stall_spill`] window. Volumes walk in DESCENDING index -
     /// the farthest-ahead arrivals are the coldest - and within one, the
     /// buffer pages parked spans (never engine-readable until their gap
-    /// fills) before anything else. The contiguous run pages only on
-    /// volumes the engine is not inside: ones past its current position,
-    /// or ones it has finished with entirely. Budget bookkeeping is the
-    /// drop-behind trim's exact contract: re-read `stored()` and release
-    /// the delta. A scratch refusal leaves the rest in RAM, where the
-    /// cap arbiter stands exactly as before this spill existed.
-    pub(super) fn page_stalled_chase(&self, inner: &mut Inner, ctl: &Arc<ChaseCtl>) {
-        if !inner.holds_page_on {
-            return;
-        }
-        let budget = inner.budget.clone();
-        let scratch = inner.scratch.clone();
+    /// fills) before anything else. `doom` (the lowest volume holding
+    /// an unfillable hole, from [`Self::chase_first_doomed`]) is the
+    /// coldness boundary: contiguous runs page only beyond it, volumes
+    /// below it are skipped wholesale unless the engine is wholly past
+    /// them. Budget bookkeeping is the drop-behind trim's exact
+    /// contract: re-read `stored()` and release the delta. A scratch
+    /// refusal leaves the rest in RAM, where the cap arbiter stands
+    /// exactly as before this spill existed.
+    ///
+    /// §156.3b: runs with NO caller-held locks. The extractor lock is
+    /// taken per volume for the guard and the budget settle only - the
+    /// paging I/O in between holds neither it nor (see `page_cold`) the
+    /// buffer's own state lock. The predecessor held the extractor lock
+    /// across the whole pass, disk writes included, so a pool teardown
+    /// sealing thousands of ids stalled every slot's deliveries behind
+    /// scratch I/O.
+    fn page_wedged_chase(&self, ctl: &Arc<ChaseCtl>, doom: usize) {
+        let (budget, scratch) = {
+            let inner = self.inner.lock_ok();
+            (inner.budget.clone(), inner.scratch.clone())
+        };
         // Auto ceiling: 4x the RAM cap, resolved per pass so a later
         // set_holds_cap is respected and an explicit ceiling wins.
         let cap = match scratch.cap.load(Ordering::Relaxed) {
@@ -686,30 +835,23 @@ impl Extractor {
             c => c,
         };
         let window = chase_stall_spill(budget.cap());
-        // Engine position: the highest volume it has opened and not yet
-        // finished; before it says anything, the lowest registered one.
+        // The coldness boundary is `doom`, the lowest volume with an
+        // unfillable hole (§156.1): everything beyond its frontier is
+        // unreachable until the hole fills. Volumes below it are warm -
+        // the engine is still coming for them - and stay untouched,
+        // except ones the engine is wholly PAST, whose leftovers page
+        // like any cold bytes. Inside the doomed volume only the parked
+        // pile beyond its hole pages, never its contiguous run (the
+        // engine will still decode up to the hole).
         let volumes: Vec<(Arc<FrontierBuffer>, usize, bool)> = {
             let st = ctl.shared.lock_ok();
             let low = ctl.low_water.lock_ok();
-            let cur = low
-                .iter()
-                .filter(|&(_, &w)| w != u64::MAX)
-                .map(|(&i, _)| i)
-                .max()
-                // Every volume it has reported is FINISHED, so it is
-                // inside the next one - which it has not marked yet.
-                // Falling back to the lowest registered volume here made
-                // `index > cur` true for the volume the engine had just
-                // opened, so its data tail paged and was pread straight
-                // back in.
-                .or_else(|| low.keys().max().map(|&i| i + 1))
-                .or_else(|| st.vols.keys().next().copied())
-                .unwrap_or(0);
             st.vols
                 .iter()
-                .map(|(&index, vol)| {
+                .filter_map(|(&index, vol)| {
                     let past = low.get(&index) == Some(&u64::MAX);
-                    (vol.buf.clone(), vol.slot, index > cur || past)
+                    (index >= doom || past)
+                        .then(|| (vol.buf.clone(), vol.slot, index > doom || past))
                 })
                 .collect()
         };
@@ -721,16 +863,27 @@ impl Extractor {
             }
             // The slot must still be chasing THIS buffer (same guard as
             // the trim): a demote takes the chase out of the slot.
-            match inner.slots[slot].chase.as_ref() {
-                Some(ch) if Arc::ptr_eq(&ch.buf, &buf) => {}
-                _ => continue,
+            {
+                let inner = self.inner.lock_ok();
+                match inner.slots[slot].chase.as_ref() {
+                    Some(ch) if Arc::ptr_eq(&ch.buf, &buf) => {}
+                    _ => continue,
+                }
             }
             if buf.page_cold(cap, need, cold_data) == 0 {
                 continue;
             }
             paged_any = true;
-            let now = buf.stored();
-            if let Some(ch) = inner.slots[slot].chase.as_mut() {
+            // Settle only while the slot still owns this buffer: a
+            // demote in the window has already released its full charge
+            // and drained the spans, so touching it again would
+            // double-release.
+            let mut g = self.inner.lock_ok();
+            let inner = &mut *g;
+            if let Some(ch) = inner.slots[slot].chase.as_mut()
+                && Arc::ptr_eq(&ch.buf, &buf)
+            {
+                let now = buf.stored();
                 let delta = ch.charged.saturating_sub(now);
                 ch.charged = now;
                 budget.sub(delta);
@@ -1833,7 +1986,7 @@ mod tests {
             0,
             "nothing may page before the verdict"
         );
-        ex.note_article_lost();
+        ex.note_article_lost(0);
         assert!(
             ex.holds_paged_total() > 1 << 20,
             "the cold frontier never paged: {}",
@@ -1856,6 +2009,104 @@ mod tests {
             assert_eq!(got, want, "{}", names[vi]);
         }
         assert!(!dir.join("F.bin").exists(), "partial chase output survived");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// TODO §156 item 8(b): the chase arm of `Extractor::read_at`
+    /// served a chased slot straight out of `FrontierBuffer::peek`,
+    /// which preads any paged span WHILE the global extractor mutex is
+    /// held. Once the stalled-chase spill above started moving cold
+    /// bytes to scratch, that arm's "RAM memcpy" comment stopped being
+    /// true: a request reaching a spilled span does real disk I/O with
+    /// every other extractor thread queued behind the one lock. The arm
+    /// now plans those sub-ranges and preads them after the guard
+    /// drops, like every other paged read in reader.rs.
+    ///
+    /// The oracle is WHERE the bytes come from, not just that they are
+    /// right. `HoldsScratch::read` is the under-a-lock route - exactly
+    /// what `peek` calls - and it bumps `locked_reads`; a deferred
+    /// `Plan::S` reads the file handle after the guard block and does
+    /// not. The range read back is lifted out of the buffer's own
+    /// `paged` map, so a request that never touched scratch cannot pass
+    /// this vacuously.
+    #[test]
+    fn chase_read_defers_its_paged_preads_off_the_extractor_lock() {
+        let dir = tmpdir("chase-read-defer");
+        let (_, vols, names) = chase_volume_set();
+        let ex = Arc::new(Extractor::new(&dir, vols.len() + 3, true));
+        ex.anchor();
+        ex.set_holds_cap(1); // floors at 8 MB; stall window = 4 MB
+        let packed: usize = vols.iter().map(|v| v.len()).sum();
+        eat_budget_to(&ex, vols.len(), packed + (1 << 20), 151);
+        // Volume 0 loses one article deep inside its packed stream, so
+        // the decode wedges and the verdict spills the cold frontier.
+        let art = 7000usize;
+        let lost = {
+            let mut m = VolumeMapper::new(vols[0].len() as u64);
+            m.feed(0, &vols[0]);
+            let e = &m.entries[0];
+            ((e.data_off + e.data_len / 2) / art as u64) as usize
+        };
+        for i in 0..vols[0].len().div_ceil(art) {
+            if i == lost {
+                continue;
+            }
+            let s = i * art;
+            let e = (s + art).min(vols[0].len());
+            ex.write(0, &names[0], vols[0].len() as u64, s as u64, &vols[0][s..e])
+                .unwrap();
+        }
+        for (vi, vol) in vols.iter().enumerate().skip(1) {
+            feed(&ex, vi, &names[vi], vol, art, 60 + vi as u64);
+        }
+        ex.note_article_lost(0);
+        assert!(
+            ex.holds_paged_total() > 1 << 20,
+            "the cold frontier never paged: {}",
+            ex.holds_paged_total()
+        );
+
+        // The widest paged span still registered to a chased slot: a
+        // volume range that is provably not in RAM.
+        let (slot, at, len) = {
+            let inner = ex.inner_read();
+            let mut best: Option<(usize, u64, usize)> = None;
+            for (slot, s) in inner.slots.iter().enumerate() {
+                let Some(ch) = s.chase.as_ref() else { continue };
+                let st = ch.buf.state.lock_ok();
+                for (&at, &(_, len)) in &st.paged {
+                    if best.is_none_or(|(_, _, best_len)| len > best_len) {
+                        best = Some((slot, at, len));
+                    }
+                }
+            }
+            best.expect("the spill left no paged span to read back")
+        };
+        assert!(
+            len >= 1 << 16,
+            "paged span too small to be a fair read: {len}"
+        );
+
+        let reads_before = ex.inner_read().scratch.locked_reads.load(Ordering::Relaxed);
+        let mut back = vec![0u8; len];
+        ex.read_at(slot, at, &mut back).unwrap();
+        assert_eq!(
+            ex.inner_read().scratch.locked_reads.load(Ordering::Relaxed),
+            reads_before,
+            "the chase arm pread the holds scratch under the extractor lock"
+        );
+        assert_eq!(
+            back,
+            vols[slot][at as usize..at as usize + len],
+            "the deferred plan must serve the paged span byte-exact"
+        );
+
+        // And reading through the plan consumed nothing: the demote
+        // still materializes that same range out of the paged spans.
+        let rep = ex.finish().unwrap();
+        assert!(!rep.fallbacks.is_empty(), "an unfillable gap must demote");
+        let got = std::fs::read(dir.join(&names[slot])).unwrap();
+        assert_eq!(got[at as usize..at as usize + len], back[..]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1902,7 +2153,7 @@ mod tests {
             ex.write(0, "v.rar", outer.len() as u64, s as u64, &outer[s..e])
                 .unwrap();
         }
-        ex.note_article_lost();
+        ex.note_article_lost(0);
         assert!(
             ex.holds_paged_total() > 300_000,
             "the cold frontier never paged: {}",
@@ -1919,6 +2170,113 @@ mod tests {
         want.extend((1..4).map(|i| format!("dummy{i}.bin")));
         want.sort();
         assert_eq!(dir_files(&dir), want);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// §156.1: the spill trigger is the WEDGE, not the verdict. A
+    /// terminal loss in a slot the chase does not own (the A/B's shape:
+    /// one article of an unrelated plain file, everything the chase
+    /// needs arriving fine) must page NOTHING - the old any-verdict
+    /// trigger skimmed the healthy chase's entire pile through scratch
+    /// and pread it straight back, 527 MB of doubled I/O on the A/B's
+    /// 614 MB set.
+    #[test]
+    fn healthy_chase_never_pages_on_a_loss_it_does_not_own() {
+        let dir = tmpdir("chase-healthy-no-page");
+        let (f, vols, names) = chase_volume_set();
+        let ex = Arc::new(Extractor::new(&dir, vols.len() + 3, true));
+        ex.anchor();
+        ex.set_holds_cap(1); // floors at 8 MB; stall window = 4 MB
+        let packed: usize = vols.iter().map(|v| v.len()).sum();
+        eat_budget_to(&ex, vols.len(), packed + (1 << 20), 155);
+        let art = 7000usize;
+        for (vi, vol) in vols.iter().enumerate() {
+            feed(&ex, vi, &names[vi], vol, art, 70 + vi as u64);
+        }
+        // The verdict lands on a junk slot, with the shared budget well
+        // past the window - exactly the state that used to page.
+        ex.note_article_lost(vols.len());
+        assert_eq!(
+            ex.holds_paged_total(),
+            0,
+            "a healthy chase paged on an unrelated loss"
+        );
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(ex.holds_paged_total(), 0, "paged during the finish");
+        assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), *f);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// §156.1: the coldness boundary is the lowest DOOMED volume, not
+    /// the engine's position. A hole ahead of the engine pages the
+    /// bytes beyond it right away (the engine provably cannot reach
+    /// them until the hole fills) while the volume the engine is parked
+    /// in - which lost nothing - stays warm; when the hole then fills,
+    /// the decode resumes straight through the paged spans and
+    /// completes one-pass, byte-exact.
+    #[test]
+    fn a_hole_ahead_of_the_engine_pages_beyond_it_and_still_resumes() {
+        let dir = tmpdir("chase-ahead-hole-page");
+        let (f, vols, names) = chase_volume_set();
+        let ex = Arc::new(Extractor::new(&dir, vols.len() + 3, true));
+        ex.anchor();
+        ex.set_holds_cap(1); // floors at 8 MB; stall window = 4 MB
+        let packed: usize = vols.iter().map(|v| v.len()).sum();
+        eat_budget_to(&ex, vols.len(), packed + (1 << 20), 156);
+        let art = 7000usize;
+        // Volume 0: everything but its LAST article, so the engine is
+        // provably parked inside a volume that lost nothing. Volume 1:
+        // one article deep in its packed stream never arrives.
+        let v0_tail = (vols[0].len() - 1) / art * art;
+        for i in 0..vols[0].len().div_ceil(art) {
+            if i * art == v0_tail {
+                continue;
+            }
+            let s = i * art;
+            let e = (s + art).min(vols[0].len());
+            ex.write(0, &names[0], vols[0].len() as u64, s as u64, &vols[0][s..e])
+                .unwrap();
+        }
+        let lost = {
+            let mut m = VolumeMapper::new(vols[1].len() as u64);
+            m.feed(0, &vols[1]);
+            let e = &m.entries[0];
+            ((e.data_off + e.data_len / 2) / art as u64) as usize
+        };
+        for i in 0..vols[1].len().div_ceil(art) {
+            if i == lost {
+                continue;
+            }
+            let s = i * art;
+            let e = (s + art).min(vols[1].len());
+            ex.write(1, &names[1], vols[1].len() as u64, s as u64, &vols[1][s..e])
+                .unwrap();
+        }
+        for (vi, vol) in vols.iter().enumerate().skip(2) {
+            feed(&ex, vi, &names[vi], vol, art, 80 + vi as u64);
+        }
+        ex.note_article_lost(1);
+        assert!(
+            ex.holds_paged_total() > 0,
+            "the bytes beyond the doomed volume never paged"
+        );
+        // Volume 0 completes and the hole fills - the engine decodes
+        // through the paged spans to the end.
+        ex.write(
+            0,
+            &names[0],
+            vols[0].len() as u64,
+            v0_tail as u64,
+            &vols[0][v0_tail..],
+        )
+        .unwrap();
+        let (s, e) = (lost * art, ((lost + 1) * art).min(vols[1].len()));
+        ex.write(1, &names[1], vols[1].len() as u64, s as u64, &vols[1][s..e])
+            .unwrap();
+        let rep = ex.finish().unwrap();
+        assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+        assert_eq!(std::fs::read(dir.join("F.bin")).unwrap(), *f);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

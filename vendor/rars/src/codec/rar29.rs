@@ -1637,7 +1637,12 @@ fn canonical_codes(lengths: &[u8]) -> Result<Vec<Option<HuffmanCode>>> {
             count[len as usize] += 1;
         }
     }
-    validate_huffman_counts(&count)?;
+    // Encoder side stays strict about oversubscription - we never emit a
+    // table that claims more code space than exists. An incomplete one is
+    // fine and normal here (a single used symbol gets a 1-bit code).
+    if canonical_shape(&count) == CanonicalShape::Oversubscribed {
+        return Err(Error::InvalidData("RAR 2.9 oversubscribed Huffman table"));
+    }
 
     let mut next_code = [0u16; 16];
     let mut code = 0u16;
@@ -2680,23 +2685,37 @@ struct Huffman {
     // Primary decode LUT: top HUFF29_LUT_BITS of the stream -> packed
     // (symbol << 8) | code_len; 0 means longer-than-LUT or invalid.
     lut: Vec<u32>,
-    // Fallback for oversubscribed length tables, which old WinRAR 2.x
-    // encoders really emitted (junk lengths past the used alphabet).
-    // unrar never validates subscription, so these sets extract there;
-    // this mirrors its exact decode so they extract here too. `symbols`
-    // and `lut` stay empty in this mode, which keeps the burst fast
-    // paths (gated on a non-empty LUT) off this table.
+    // Present whenever the strict canonical form is not COMPLETE, which
+    // is exactly when unrar's own table answers a field this one cannot.
+    // Two ways in. Oversubscribed or all-zero length tables (old WinRAR
+    // 2.x encoders really emitted the first; the second is what a
+    // damaged stream degenerates into) have no strict form at all, so
+    // `symbols` and `lut` stay empty and the twin owns the whole code
+    // space - which also keeps the burst fast paths, gated on a
+    // non-empty LUT, off those tables. An UNDERsubscribed table does
+    // have a strict form and keeps it, LUT and all, because it decodes
+    // its reachable codes exactly like unrar; only the hole (fields no
+    // canonical code covers) is answered from the twin. That split
+    // matters: incomplete tables are common in real archives - the
+    // small length/offset alphabets routinely carry a single 1-bit code
+    // - and routing them all through the twin would cost the LUT for
+    // shapes that never decode a byte differently.
     tolerant: Option<Box<TolerantHuffman>>,
 }
 
 /// Bit-exact port of unrar's MakeDecodeTables/DecodeNumber pair, which
-/// tolerates oversubscribed tables instead of rejecting them: the
-/// left-aligned upper limits are 32-bit, so an oversubscribed length
-/// saturates past 0xffff and every wider code becomes unreachable
-/// (truncation, not an error). Out-of-range positions clamp to slot 0,
-/// as upstream does for damaged archives. Only built when strict
-/// canonical construction refuses the table; the member CRC still gates
-/// the output, so genuinely corrupt streams keep failing.
+/// never validates subscription at all - it builds a decode table from
+/// whatever lengths it is handed. Oversubscribed: the left-aligned upper
+/// limits are 32-bit, so an oversubscribed length saturates past 0xffff
+/// and every wider code becomes unreachable (truncation, not an error).
+/// Undersubscribed: the limits stop below 0xffff, so fields above the
+/// last one fall out of the length search at 15 bits, and the position
+/// they compute lands in the zero-filled tail of the alphabet list.
+/// All-zero: every limit is 0, so every field resolves the same way, to
+/// alphabet entry 0 with 15 bits consumed. Out-of-range positions clamp
+/// to slot 0 throughout, as upstream does for damaged archives. Built
+/// whenever the strict canonical form is not complete; the member CRC
+/// still gates the output, so genuinely corrupt streams keep failing.
 #[derive(Debug, Clone)]
 struct TolerantHuffman {
     // decode_len[len]: left-aligned (16-bit field space) upper limit for
@@ -2739,10 +2758,18 @@ impl Huffman {
                 count[len as usize] += 1;
             }
         }
-        if count.iter().all(|&value| value == 0) {
-            return Ok(Self::empty());
-        }
-        if validate_huffman_counts(&count).is_err() {
+        let shape = canonical_shape(&count);
+        if shape == CanonicalShape::Oversubscribed || count.iter().all(|&value| value == 0) {
+            // No strict table to build: the lengths either claim more code
+            // space than exists, or claim none at all. unrar builds a
+            // working table for both shapes and decodes every field from
+            // it, so hand the whole code space to the twin. The one shape
+            // with no unrar answer to copy is an empty alphabet - upstream
+            // reads its DecodeNum out of bounds there - so that one keeps
+            // erroring when a symbol is asked for.
+            if lengths.is_empty() {
+                return Ok(Self::empty());
+            }
             let mut table = Self::empty();
             table.tolerant = Some(Box::new(TolerantHuffman::from_lengths(lengths, &count)));
             return Ok(table);
@@ -2790,16 +2817,24 @@ impl Huffman {
             first_index,
             counts: count,
             lut,
-            tolerant: None,
+            // Complete: every field decodes strictly, so there is nothing
+            // for a twin to answer. Incomplete: the reachable codes decode
+            // strictly (and keep the LUT), the hole goes to the twin.
+            tolerant: match shape {
+                CanonicalShape::Complete => None,
+                _ => Some(Box::new(TolerantHuffman::from_lengths(lengths, &count))),
+            },
         })
     }
 
     fn decode(&self, bits: &mut BitReader) -> Result<usize> {
-        if let Some(tolerant) = &self.tolerant {
-            return tolerant.decode(bits);
-        }
         if self.symbols.is_empty() {
-            return Err(Error::InvalidData("RAR 2.9 empty Huffman table"));
+            // Oversubscribed or all-zero lengths: the twin owns the whole
+            // code space. Without one there is nothing to decode from.
+            return match &self.tolerant {
+                Some(tolerant) => tolerant.decode(bits),
+                None => Err(Error::InvalidData("RAR 2.9 empty Huffman table")),
+            };
         }
         if let Ok(peek) = bits.peek_bits(15) {
             let entry = self.lut[(peek >> (15 - HUFF29_LUT_BITS)) as usize];
@@ -2819,9 +2854,29 @@ impl Huffman {
                     }
                 }
             }
-            return Err(Error::InvalidData("RAR 2.9 invalid Huffman code"));
+            return self.decode_hole(bits);
         }
-        self.decode_slow(bits)
+        match &self.tolerant {
+            // Sub-15-bit tail of an incomplete table. The twin resolves the
+            // code length from buffered bits alone and consumes nothing
+            // when the answer needs bits that have not arrived, which the
+            // bit-by-bit walk below cannot do - and it agrees with the walk
+            // on every code the walk can complete.
+            Some(tolerant) => tolerant.decode(bits),
+            None => self.decode_slow(bits),
+        }
+    }
+
+    // A field no canonical code covers. A complete table has none; an
+    // incomplete one has a hole, and unrar reads the hole as a 15-bit code
+    // whose position lands in the zero-filled tail of the alphabet list (or
+    // clamps to slot 0 past its end) rather than failing. Nothing has been
+    // consumed at this point, so the twin sees the same bits.
+    fn decode_hole(&self, bits: &mut BitReader) -> Result<usize> {
+        match &self.tolerant {
+            Some(tolerant) => tolerant.decode(bits),
+            None => Err(Error::InvalidData("RAR 2.9 invalid Huffman code")),
+        }
     }
 
     // Bit-by-bit canonical walk for the input tail, where fewer than 15
@@ -2910,15 +2965,35 @@ impl TolerantHuffman {
     }
 }
 
-fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
+/// Shape of the strict canonical table a set of code lengths implies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanonicalShape {
+    /// The lengths use the code space exactly: every 15-bit field decodes.
+    Complete,
+    /// The lengths leave code space unused, so the strict table has a hole
+    /// that unrar's table still answers.
+    Incomplete,
+    /// The lengths claim more code space than exists, so no strict table
+    /// can be built.
+    Oversubscribed,
+}
+
+/// Walk the Kraft budget: one code of length 1 costs half the space, and
+/// each extra bit halves the cost again. `available` is the number of
+/// length-`len` slots still free after placing every shorter code.
+fn canonical_shape(count: &[u16; 16]) -> CanonicalShape {
     let mut available = 1i32;
     for &len_count in count.iter().skip(1) {
         available = (available << 1) - i32::from(len_count);
         if available < 0 {
-            return Err(Error::InvalidData("RAR 2.9 oversubscribed Huffman table"));
+            return CanonicalShape::Oversubscribed;
         }
     }
-    Ok(())
+    if available == 0 {
+        CanonicalShape::Complete
+    } else {
+        CanonicalShape::Incomplete
+    }
 }
 
 /// MSB-first bit reader over an owned, appendable buffer, with a 64-bit
@@ -3506,6 +3581,118 @@ mod tests {
                 tolerant_bits.position(),
                 "pattern {pattern:#06x}"
             );
+        }
+    }
+
+    // Decode one 16-bit field from a fresh reader: (symbol, bits consumed).
+    // unrar always has 16 bits in hand at this point, so two bytes is the
+    // whole field it would see.
+    fn decode_field(table: &Huffman, pattern: u16) -> (usize, usize) {
+        let input = pattern.to_be_bytes();
+        let mut bits = BitReader::from_bytes(&input);
+        let symbol = table.decode(&mut bits).unwrap();
+        (symbol, bits.position())
+    }
+
+    #[test]
+    fn undersubscribed_rar29_huffman_tables_answer_the_hole_as_unrar() {
+        // Lengths that leave code space unused. Strict construction is
+        // happy with these (nothing is oversubscribed) but has no code for
+        // fields at or above 0xa000, where unrar still answers: its length
+        // search falls out at 15 bits and the position it computes lands in
+        // the zero-filled tail of the alphabet list, or clamps to slot 0
+        // past its end. Expectations transcribed from unrar 7.20's
+        // MakeDecodeTables/DecodeNumber run over this exact table.
+        let lengths: [u8; 8] = [0, 2, 2, 3, 0, 0, 0, 0];
+        let table = Huffman::from_lengths(&lengths).unwrap();
+
+        // The strict table survives - this shape keeps the LUT and the
+        // burst path, and only borrows the twin for the hole.
+        assert!(!table.symbols.is_empty());
+        assert!(!table.lut.is_empty());
+        assert!(table.tolerant.is_some());
+
+        for pattern in 0u16..=0xffff {
+            let field = pattern & 0xfffe;
+            let expected = match field {
+                0x0000..=0x3fff => (1, 2),
+                0x4000..=0x7fff => (2, 2),
+                0x8000..=0x9fff => (3, 3),
+                // The hole. Position 3 + (field - 0xa000) / 2 reads the
+                // zero-filled tail while it stays inside the 8-entry
+                // alphabet, then clamps to slot 0 - which holds symbol 1,
+                // the first 2-bit code, not symbol 0.
+                0xa000..=0xa009 => (0, 15),
+                _ => (1, 15),
+            };
+            assert_eq!(
+                decode_field(&table, pattern),
+                expected,
+                "field {field:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_one_bit_code_rar29_table_decodes_as_unrar() {
+        // The commonest incomplete shape in real archives: one used symbol
+        // in a small alphabet, so half the code space is a hole.
+        let table = Huffman::from_lengths(&[0, 1, 0, 0]).unwrap();
+        assert!(table.tolerant.is_some());
+
+        for pattern in 0u16..=0xffff {
+            let field = pattern & 0xfffe;
+            let expected = match field {
+                0x0000..=0x7fff => (1, 1),
+                0x8000..=0x8005 => (0, 15),
+                _ => (1, 15),
+            };
+            assert_eq!(
+                decode_field(&table, pattern),
+                expected,
+                "field {field:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_zero_rar29_huffman_table_decodes_as_unrar() {
+        // What a damaged stream degenerates into. unrar builds a table here
+        // too: every limit is zero, so every field falls out of the length
+        // search at 15 bits and reads alphabet entry 0. rars used to return
+        // an empty table and then hard-error the first time a symbol was
+        // asked for.
+        let table = Huffman::from_lengths(&[0u8; 20]).unwrap();
+        assert!(table.symbols.is_empty());
+        assert!(table.tolerant.is_some());
+
+        for pattern in 0u16..=0xffff {
+            assert_eq!(
+                decode_field(&table, pattern),
+                (0, 15),
+                "pattern {pattern:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_alphabet_still_refuses_to_decode() {
+        // The one shape with no unrar answer to copy: upstream reads its
+        // decode table out of bounds. No table, no symbols.
+        let table = Huffman::from_lengths(&[]).unwrap();
+        assert!(table.tolerant.is_none());
+        let mut bits = BitReader::from_bytes(&[0xff, 0xff]);
+        assert!(table.decode(&mut bits).is_err());
+    }
+
+    #[test]
+    fn complete_rar29_tables_keep_the_strict_path_alone() {
+        // No hole, so no twin: the gate must not drag complete tables onto
+        // the tolerant path.
+        for lengths in [&[1u8, 1][..], &[2, 2, 2, 2][..], &[1, 2, 3, 3][..]] {
+            let table = Huffman::from_lengths(lengths).unwrap();
+            assert!(table.tolerant.is_none(), "lengths {lengths:?}");
+            assert!(!table.lut.is_empty(), "lengths {lengths:?}");
         }
     }
 

@@ -746,6 +746,48 @@ fn a_sized_fast_pair_suggests_then_auto_applies() {
     teardown(&d, ix);
 }
 
+/// The confirm lane's pick: STRONG suggestions only, best first, and
+/// a stamp retires a row from the pick forever - one suggestion never
+/// costs the user's indexer quota twice.
+#[test]
+fn the_confirm_pick_takes_strong_unchecked_suggestions_best_first() {
+    let d = dir("confirm-pick");
+    let ix = Index::open(&d.join("index.db")).unwrap();
+    ix.db
+        .execute(
+            "INSERT INTO predb(title, fnstem, fnkey, pt, seen_at)
+             VALUES('A.Strong.One-GRP','','',1000,1000),
+                   ('A.Stronger.One-GRP','','',1000,1000),
+                   ('A.Weak.One-GRP','','',1000,1000)",
+            [],
+        )
+        .unwrap();
+    for (rid, pid, score) in [(11, 1, 85), (12, 2, 95), (13, 3, 79)] {
+        ix.db
+            .execute(
+                "INSERT INTO pre_corr(release_id, predb_id, score, delta, status, at)
+                 VALUES(?1, ?2, ?3, 0, 'suggested', 1000)",
+                rusqlite::params![rid, pid, score],
+            )
+            .unwrap();
+    }
+    let picks = ix.corr_confirm_pick(10).unwrap();
+    assert_eq!(
+        picks
+            .iter()
+            .map(|(rid, _, s, _)| (*rid, *s))
+            .collect::<Vec<_>>(),
+        vec![(12, 95), (11, 85)],
+        "STRONG floor holds and the best spends first"
+    );
+    assert_eq!(picks[0].1, "A.Stronger.One-GRP");
+    ix.corr_confirm_stamp(12, 2, 2000).unwrap();
+    let picks = ix.corr_confirm_pick(10).unwrap();
+    assert_eq!(picks.len(), 1, "a stamped suggestion never re-picks");
+    assert_eq!(picks[0].0, 11);
+    teardown(&d, ix);
+}
+
 /// 2 Aug Opus sweep: the applied status update did not re-assert
 /// WHICH pre it applied. A stored suggestion pointing at an earlier,
 /// higher-scoring pre survives the refresh upsert (score gate), and
@@ -1517,6 +1559,218 @@ fn split_fragments_merge_and_then_correlate() {
     assert_eq!(a2, 1, "and tightly enough to auto-apply");
     let r = &ix.search("Whole.Set", 10).unwrap()[0];
     assert_eq!(r.pre_title, "Whole.Set.2026.1080p.WEB.H264-GRP");
+    teardown(&d, ix);
+}
+
+/// The shatter fold, end to end through REAL ingest: one file posted
+/// under a stable blob name with a randomized poster per article and
+/// the group rotated per article (the shape that holds 97% of the
+/// live dark band, 13 Aug 2026 census) collapses into one release
+/// with the unioned segment list, true size and honest completeness.
+/// A duplicate part under yet another poster folds in without
+/// double-counting.
+#[test]
+fn a_shattered_posting_folds_across_posters_and_groups() {
+    let d = dir("shatter-fold");
+    let mut ix = Index::open(&d.join("index.db")).unwrap();
+    // The wire truth this reproduces, seen live:
+    //   [037/209] - "3f2acf....par2" yEnc (2/2745) 1967195216
+    let subj = |p: u32| {
+        format!(r#"[001/003] - "e3b0c44298fc1c149afbf4c8996fb924.par2" yEnc ({p}/6) 4200000"#)
+    };
+    let groups = [
+        "alt.binaries.movies",
+        "alt.binaries.tv",
+        "alt.binaries.x264",
+    ];
+    for p in 1u32..=6 {
+        let grp = groups[(p as usize - 1) % 3];
+        ix.ingest(
+            grp,
+            &[over(
+                &subj(p),
+                &format!("r{p}@h{p}.tld"),
+                &format!("m{p}"),
+                700_000,
+            )],
+            5_000 + p as i64,
+        )
+        .unwrap();
+    }
+    // A repost of part 3 under a seventh poster: same stem, same
+    // total, duplicate part number.
+    ix.ingest(
+        "alt.binaries.tv",
+        &[over(&subj(3), "r7@h7.tld", "m3dup", 700_000)],
+        5_010,
+    )
+    .unwrap();
+    let rows: i64 = ix
+        .db
+        .query_row("SELECT COUNT(*) FROM releases", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 7, "the shattered shape really was built");
+
+    let (groups_folded, folded, done) = ix.shatter_fold(6_000, WALK).unwrap();
+    assert_eq!((groups_folded, folded), (1, 6));
+    assert!(done, "one stride covers a small table");
+    let (rows, nsegs, need, complete, total, fp): (i64, i64, i64, bool, i64, i64) = ix
+        .db
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM releases), f.nsegs, r.need_parts,
+                    r.complete, r.total_bytes, r.first_posted
+               FROM releases r JOIN files f ON f.release_id=r.id",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(rows, 1, "one posting now");
+    assert_eq!(
+        nsegs, 6,
+        "six distinct parts, the duplicate not double-counted"
+    );
+    assert_eq!(need, 6);
+    assert!(complete, "6/6 parts is complete");
+    assert_eq!(total, 6 * 700_000, "size is the union, not one article");
+    assert!(fp > 0);
+    // Idempotent and parked: the next call re-clamps to the surviving
+    // top and finds nothing.
+    assert_eq!(ix.shatter_fold(6_100, WALK).unwrap(), (0, 0, true));
+    // The session tag rode ingest ("[001/003]") and survived the fold.
+    let (si, st): (i64, i64) = ix
+        .db
+        .query_row("SELECT sess_idx, sess_total FROM releases", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((si, st), (1, 3), "file 1 of a 3-file posting session");
+    teardown(&d, ix);
+}
+
+/// The session tag parses only the real thing: a leading digit-only
+/// pair, in either bracket style, never a hex repost tag, a bare year,
+/// an inverted pair, or the trailing yEnc part counter.
+#[test]
+fn the_session_tag_parses_narrowly() {
+    use super::ingest::session_tag;
+    assert_eq!(
+        session_tag(r#"[037/209] - "x.par2" yEnc (2/2745) 196719"#),
+        Some((37, 209))
+    );
+    assert_eq!(session_tag(r#"(3/9) - "x.rar" yEnc (1/5)"#), Some((3, 9)));
+    assert_eq!(session_tag(r#"[a1911f7bca]_[newzNZB]_"x.rar""#), None);
+    assert_eq!(session_tag(r#"[2026] - "x.rar" yEnc (1/5)"#), None);
+    assert_eq!(session_tag(r#"[209/37] - "x.rar""#), None, "inverted");
+    assert_eq!(session_tag(r#""x.rar" yEnc (1/5)"#), None, "no leading tag");
+    assert_eq!(session_tag(r#"[0/5] - "x.rar""#), None, "zero index");
+}
+
+/// The two gates that keep the fold from ever bridging unrelated
+/// posts: a readable stem never folds even at junk>=70, and a short
+/// generic token ("1917") is excluded before the verdict is even
+/// asked. Both posters' rows survive untouched.
+#[test]
+fn readable_or_short_stems_never_shatter_fold() {
+    let d = dir("shatter-gates");
+    let mut ix = Index::open(&d.join("index.db")).unwrap();
+    for (i, name) in [
+        "Some.Movie.2026.1080p.WEB.H264-GRP.mkv",
+        "Some.Movie.2026.1080p.WEB.H264-GRP.mkv",
+        "1917",
+        "1917",
+    ]
+    .iter()
+    .enumerate()
+    {
+        ix.ingest(
+            "alt.binaries.movies",
+            &[over(
+                &format!(r#""{name}" yEnc ({}/2)"#, (i % 2) + 1),
+                &format!("p{i}@h.tld"),
+                &format!("g{i}"),
+                1_000,
+            )],
+            5_000,
+        )
+        .unwrap();
+    }
+    // Force the readable rows into the fold's junk band so ONLY the
+    // stem verdict stands between them and a wrong merge.
+    ix.db.execute("UPDATE releases SET junk=75", []).unwrap();
+    let before: i64 = ix
+        .db
+        .query_row("SELECT COUNT(*) FROM releases", [], |r| r.get(0))
+        .unwrap();
+    let (g, n, _) = ix.shatter_fold(6_000, WALK).unwrap();
+    assert_eq!((g, n), (0, 0), "nothing folded");
+    let after: i64 = ix
+        .db
+        .query_row("SELECT COUNT(*) FROM releases", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after);
+    teardown(&d, ix);
+}
+
+/// Disagreeing subject totals mean two postings reusing one stem: the
+/// fold takes the largest agreeing class and leaves the minority
+/// alone, so two part universes can never union into one "complete"
+/// download that extracts to garbage (the ingest D3 hazard, held at
+/// the fold too).
+#[test]
+fn disagreeing_part_totals_split_the_shatter_fold() {
+    let d = dir("shatter-classes");
+    let mut ix = Index::open(&d.join("index.db")).unwrap();
+    let subj =
+        |p: u32, of: u32| format!(r#""b5bb9d8014a0f9b1d61e21e796d78dcc.par2" yEnc ({p}/{of})"#);
+    for p in 1u32..=3 {
+        ix.ingest(
+            "alt.binaries.tv",
+            &[over(
+                &subj(p, 6),
+                &format!("a{p}@x.tld"),
+                &format!("s{p}"),
+                100,
+            )],
+            5_000,
+        )
+        .unwrap();
+    }
+    for p in 1u32..=2 {
+        ix.ingest(
+            "alt.binaries.tv",
+            &[over(
+                &subj(p, 4),
+                &format!("b{p}@y.tld"),
+                &format!("t{p}"),
+                100,
+            )],
+            5_001,
+        )
+        .unwrap();
+    }
+    let (g, n, _) = ix.shatter_fold(6_000, WALK).unwrap();
+    assert_eq!((g, n), (1, 2), "only the 3-member class folded");
+    let (rows, folded_need): (i64, i64) = ix
+        .db
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM releases),
+                    (SELECT need_parts FROM releases r JOIN files f
+                      ON f.release_id=r.id WHERE f.nsegs=3)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(rows, 3, "folded class + the untouched 2-row minority");
+    assert_eq!(folded_need, 6);
     teardown(&d, ix);
 }
 
@@ -2323,6 +2577,201 @@ fn a_quality_bump_rerun_keeps_names_applied_after_ingest() {
         snap(&ix),
         before,
         "a retro re-parse must reproduce the applied-name answer, not the stem's"
+    );
+    teardown(&d, ix);
+}
+
+/// Codex probe A: archive volumes share one release stem but remain
+/// distinct files, each with its own yEnc part-number universe.
+#[test]
+fn codex_probe_a_shatter_fold_keeps_distinct_archive_volume_filenames() {
+    let d = dir("codex-probe-a");
+    let mut ix = Index::open(&d.join("index.db")).unwrap();
+    const STEM: &str = "e3b0c44298fc1c149afbf4c8996fb924";
+    let groups = ["alt.binaries.movies", "alt.binaries.tv"];
+    for file in 1u32..=2 {
+        for part in 1u32..=2 {
+            let subject = format!(r#"[{file}/2] - "{STEM}.part{file:02}.rar" yEnc ({part}/2)"#);
+            ix.ingest(
+                groups[((file + part) as usize) % groups.len()],
+                &[over(
+                    &subject,
+                    &format!("p{file}{part}@test"),
+                    &format!("codex-a-{file}-{part}@test"),
+                    1_000,
+                )],
+                5_000,
+            )
+            .unwrap();
+        }
+    }
+    let before: i64 = ix
+        .db
+        .query_row("SELECT COUNT(*) FROM releases", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, 4, "real ingest built four one-article fragments");
+    ix.shatter_fold(6_000, WALK).unwrap();
+
+    let rows: Vec<(String, i64, bool)> = ix
+        .db
+        .prepare(
+            "SELECT f.filename, f.nsegs, r.complete
+               FROM releases r JOIN files f ON f.release_id=r.id
+              ORDER BY f.filename",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (format!("{STEM}.part01.rar"), 2, true),
+            (format!("{STEM}.part02.rar"), 2, true),
+        ],
+        "the fold must complete each filename without removing the other volume"
+    );
+    teardown(&d, ix);
+}
+
+/// Codex probe D: a posting bigger than the member cap must still
+/// reach one complete row. "It folds on a later lap" was never true -
+/// the cursor parks at the top id, so a posting that has stopped
+/// arriving is never revisited.
+#[test]
+fn a_posting_past_the_member_cap_still_folds_to_one_row() {
+    const MEMBERS: i64 = 20_001;
+    const STEM: &str = "d41d8cd98f00b204e9800998ecf8427e";
+    let d = dir("shatter-cap");
+    let mut ix = Index::open(&d.join("index.db")).unwrap();
+    {
+        let tx = ix.db.transaction().unwrap();
+        {
+            let mut rel = tx
+                .prepare(
+                    "INSERT INTO releases(id, stem, poster, grp, files, complete,
+                                          first_posted, first_seen, junk,
+                                          have_parts, need_parts)
+                     VALUES(?1,?2,?3,'alt.binaries.tv',1,0,4600,5000,70,1,?4)",
+                )
+                .unwrap();
+            let mut file = tx
+                .prepare(
+                    "INSERT INTO files(release_id, filename, total_parts, bytes,
+                                       segments, nsegs)
+                     VALUES(?1,?2,?3,100,?4,1)",
+                )
+                .unwrap();
+            for id in 1..=MEMBERS {
+                rel.execute(rusqlite::params![id, STEM, format!("p{id}@test"), MEMBERS])
+                    .unwrap();
+                let segments = format!(r#"[[{id},"<codex-d-{id}@test>",100]]"#);
+                file.execute(rusqlite::params![
+                    id,
+                    format!("{STEM}.bin"),
+                    MEMBERS,
+                    segments
+                ])
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+    let first = ix
+        .shatter_fold(6_000, std::time::Duration::from_secs(1))
+        .unwrap();
+    let state = |ix: &Index| -> (i64, i64, i64) {
+        ix.db
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(f.nsegs),0), COALESCE(SUM(r.complete),0)
+                   FROM releases r JOIN files f ON f.release_id=r.id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(first.1, (MEMBERS - 1) as usize, "every member folded away");
+    assert_eq!(
+        state(&ix),
+        (1, MEMBERS, 1),
+        "one row, every segment, and it is complete"
+    );
+    assert_eq!(ix.shatter_fold(6_100, WALK).unwrap(), (0, 0, true));
+    teardown(&d, ix);
+}
+
+/// Codex probe C: a checked marker belongs to ONE suggested pairing,
+/// not to every later pairing the same release acquires. A stronger
+/// pre replacing the stored one starts a fresh pairing, and the
+/// confirm lane has never spent a lookup on it.
+#[test]
+fn a_replacement_pairing_starts_unchecked() {
+    let d = dir("confirm-replace");
+    let mut ix = Index::open(&d.join("index.db")).unwrap();
+    const OLD: &str = "Older.Candidate.2026.1080p.WEB.H264-OLD";
+    const NEW: &str = "Newer.Candidate.2026.1080p.WEB.H264-NEW";
+
+    // Score 80: T(<=30m) + S(<=8%) + C. Eligible for the confirm pick
+    // but supersedable by a stronger later pre.
+    ix.predb_store(&[tpre(OLD, "X264-HD", 4_650_000_000, 3_000)], 5_000)
+        .unwrap();
+    ix.ingest(
+        "alt.binaries.x264",
+        &[overd(
+            r#""cD3xY7Bm2ZpK4L9q.part01.rar" yEnc (1/1)"#,
+            "codex-c1",
+            5_000_000_000,
+            4_600,
+        )],
+        5_000,
+    )
+    .unwrap();
+    let rid = ix.search("", 10).unwrap()[0].id;
+    assert_eq!(ix.predb_corr_backlog(100, 0, false, 5_000).unwrap().1, 1);
+    let picks = ix.corr_confirm_pick(10).unwrap();
+    assert_eq!(picks[0].1, OLD);
+    ix.corr_confirm_stamp(rid, picks[0].3, 5_010).unwrap();
+    assert!(ix.corr_confirm_pick(10).unwrap().is_empty(), "OLD retired");
+
+    // Score 90: T(<=30m) + S(top band) + C. The live pre sweep runs
+    // the production refresh upsert and replaces OLD with NEW.
+    ix.predb_store(&[tpre(NEW, "X264-HD", 4_900_000_000, 4_000)], 5_100)
+        .unwrap();
+    assert_eq!(ix.predb_corr_sweep(100, false, 5_200).unwrap().1, 1);
+    let (stored, checked): (String, i64) = ix
+        .db
+        .query_row(
+            "SELECT p.title, c.checked_at FROM pre_corr c
+               JOIN predb p ON p.id=c.predb_id WHERE c.release_id=?1",
+            [rid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, NEW, "the stronger pairing replaced the old one");
+    let picks = ix
+        .corr_confirm_pick(10)
+        .unwrap()
+        .into_iter()
+        .map(|(_, title, _, _)| title)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        (checked, picks),
+        (0, vec![NEW.to_string()]),
+        "the replacement pairing must start unchecked and enter the pick"
+    );
+
+    // And the stamp a lookup minted before the swap - the OLD pre id -
+    // cannot retire the successor when it finally lands.
+    let old_pid: i64 = ix
+        .db
+        .query_row("SELECT id FROM predb WHERE title=?1", [OLD], |r| r.get(0))
+        .unwrap();
+    ix.corr_confirm_stamp(rid, old_pid, 5_410).unwrap();
+    assert_eq!(
+        ix.corr_confirm_pick(10).unwrap().len(),
+        1,
+        "the in-flight stamp belonged to the replaced pairing"
     );
     teardown(&d, ix);
 }

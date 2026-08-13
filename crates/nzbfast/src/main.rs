@@ -113,9 +113,11 @@ struct Cli {
     config: PathBuf,
 
     /// Memory budget for the pipeline's cache tiers (e.g. 512M, 2G).
-    /// Default: a quarter of physical RAM, clamped to 256M..4G. Beyond
-    /// the budget the engine degrades to disk (materialized volumes,
-    /// settle read-back) instead of swapping the machine.
+    /// Default: a quarter of physical RAM, clamped to 256M..16G; in a
+    /// container, additionally capped at half the cgroup memory limit
+    /// (see MemBudget::auto). Beyond the budget the engine degrades to
+    /// disk (materialized volumes, settle read-back) instead of
+    /// swapping the machine.
     #[arg(long, global = true)]
     mem_limit: Option<String>,
 
@@ -485,6 +487,10 @@ enum Command {
     /// Run the download daemon: queue manager + watch folder + SABnzbd-
     /// compatible API (Sonarr/Radarr-ready).
     Serve {
+        /// Listening port. 0 asks the OS for a free one, which a
+        /// launcher that starts the daemon itself should prefer: the
+        /// chosen port is reported in the readiness banner and in
+        /// runtime.json beside the settings file.
         #[arg(long, default_value_t = 6789)]
         port: u16,
         /// Listen address. The default serves every interface, which is

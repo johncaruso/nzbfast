@@ -16,11 +16,27 @@ name: provenance-release
 # the container image, which this workflow assembles and pushes itself so
 # the attested digest is one a runner actually produced. The platform
 # installers (.dmg, setup.exe) are packaged and signed through separate
-# channels and are not covered here.
+# channels and are NOT covered here - which matters, because they are what
+# most people download. No copy anywhere may say nzbfast's downloads are
+# attested; the true claim is the narrower one, that the target-triple
+# tarballs are.
 #
-# DISPATCH-ONLY: run from Actions -> provenance-release -> Run workflow
-# with the tag of an existing release to attach the artifacts to, AND with
-# the workflow ref set to that same tag:
+# TWO WAYS IN, and they are not interchangeable:
+#
+# 1. AUTOMATIC, on `release: published` - the normal path. Provenance that
+#    exists only when somebody remembers to trigger it is provenance the
+#    README promises and some release quietly lacks, so the release itself
+#    is the trigger. Publishing a release creates (or already has) its tag
+#    and the event's GITHUB_SHA is that tag's commit, so the source guard
+#    below passes with nobody passing a ref. The `image` job stays opt-in
+#    and so never runs on this path - it moves :latest.
+#
+# 2. MANUAL, workflow_dispatch - the escape hatch, for the two cases the
+#    release event cannot cover: re-attesting a tag whose attestations
+#    died with a deleted release, and pushing the container image after an
+#    automatic run has already attached the tarballs
+#    (-f image=true -f binaries=false). Dispatch with the workflow ref set
+#    to the SAME tag:
 #
 #     gh workflow run provenance-release.yml --ref "$TAG" -f tag="$TAG" ...
 #
@@ -41,17 +57,49 @@ name: provenance-release
 # claim pointing at code that never produced the artifact. Checking out
 # the tag fixed which bytes get built; only binding the dispatch ref
 # fixes what the signature says about them.
+#
+# THE ATTESTATION ALSO SHIPS AS A RELEASE ASSET. The GitHub attestations
+# API is not a release asset, so provenance published only there is
+# invisible to anyone who does not already know to run `gh attestation
+# verify`, and invisible to anything that reads a release (OpenSSF
+# Scorecard's Signed-Releases check reads assets, and recognises
+# provenance by the case-sensitive suffix `.intoto.jsonl`, nothing else).
+# So each tarball ships its Sigstore bundle beside it as
+# nzbfast-<target-triple>.tar.gz.intoto.jsonl - byte for byte what the
+# attest action produced, one compact bundle per line, which is what the
+# .jsonl name asserts - and that also gives a verify needing no
+# attestations lookup:
+#
+#     gh attestation verify nzbfast-<triple>.tar.gz \
+#       --bundle nzbfast-<triple>.tar.gz.intoto.jsonl \
+#       --repo nzbfast/nzbfast
 
 on:
+  # Every published release, including prereleases and including one
+  # nobody thought to dispatch for.
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       tag:
         description: "Existing release tag to attach attested binaries to (e.g. v1.0.5)"
         required: true
+      binaries:
+        description: "Build, attest and attach the per-target tarballs (uncheck to only push and attest the image for a tag whose tarballs are already attached - re-uploading them fails, there is no --clobber)"
+        type: boolean
+        default: true
       image:
         description: "Also build, push and attest the container image (moves :latest - only at release time, never for an old tag)"
         type: boolean
         default: false
+
+# One name for "the tag being attested", whichever event named it. The
+# `inputs` context is empty outside a dispatch, so this falls through to
+# the release payload; on a dispatch there is no release payload to read.
+# Every job and step reads TAG and none interpolates it into a shell
+# line, so a crafted tag cannot inject a command.
+env:
+  TAG: ${{ inputs.tag || github.event.release.tag_name }}
 
 # Job-level permissions only (Scorecard TokenPermissionsID): a top-level
 # write grant leaks into every job added later; each job names what it
@@ -61,6 +109,12 @@ permissions:
 
 jobs:
   binaries:
+    # Automatic path: the public repo only (a fork, or the private repo,
+    # cannot write attestations - private ones need Enterprise). Dispatch
+    # path: whenever the `binaries` input is left on.
+    if: >-
+      ${{ (github.event_name == 'release' && github.repository == 'nzbfast/nzbfast')
+          || (github.event_name == 'workflow_dispatch' && inputs.binaries) }}
     permissions:
       id-token: write       # Sigstore keyless signing (OIDC identity token)
       attestations: write   # write the attestation to the GH attestations API
@@ -75,12 +129,22 @@ jobs:
           - { os: macos-latest,  target: x86_64-apple-darwin }
     runs-on: ${{ matrix.os }}
     steps:
+      # Neither path can proceed without a tag: stop here rather than let
+      # `refs/tags/` (empty) fail as a confusing checkout error.
+      - name: Require a tag
+        run: |
+          if [ -z "${TAG:-}" ]; then
+            echo "no tag to attest: inputs.tag and release.tag_name are both empty" >&2
+            exit 1
+          fi
+          echo "attesting $TAG"
+
       # Check out the TAG being attached to, so the binaries and the release
-      # they land on are the same source. `ref` is a tag name from the
-      # dispatch input, never interpolated into a shell line.
+      # they land on are the same source. `ref` is a tag name, never
+      # interpolated into a shell line.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: refs/tags/${{ env.TAG }}
 
       # Prove the checkout really is that tag before spending a build on it:
       # a missing tag, or a ref that resolved to something else, must fail
@@ -93,8 +157,6 @@ jobs:
       # way. See the header for why the signature reads the dispatch ref
       # rather than the checkout.
       - name: Verify the checkout and the attested source are both the tag
-        env:
-          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           want=$(git rev-parse "refs/tags/$TAG^{commit}")
@@ -185,28 +247,78 @@ jobs:
       # THE provenance step: signs a SLSA statement over the artifact,
       # publishes it to the repo's Attestations tab + the Rekor log.
       - name: Attest build provenance
+        id: attest
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: nzbfast-${{ matrix.target }}.tar.gz
+
+      # Make the attestation a thing you can DOWNLOAD. Copied verbatim -
+      # the signature covers the base64 statement inside the bundle, but
+      # re-serialising signed material to prettify it is a habit worth not
+      # having. `<artifact>.intoto.jsonl` is load-bearing twice: it pairs
+      # the bundle with the file it describes, and it is the exact
+      # case-sensitive suffix Scorecard's Signed-Releases check looks for.
+      #
+      # Then prove the pairing before it ships, because a bundle for the
+      # wrong subject is worse than no bundle: it verifies, against
+      # something else. The subject digest inside the signed statement
+      # must be this tarball's sha256.
+      - name: Stage the attestation bundle as a release asset
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          ART=nzbfast-${{ matrix.target }}.tar.gz
+          cp "$BUNDLE" "$ART.intoto.jsonl"
+          python3 - "$ART.intoto.jsonl" "$ART" <<'PY'
+          import base64, hashlib, json, sys
+
+          bundle_path, artifact = sys.argv[1], sys.argv[2]
+          want = hashlib.sha256(open(artifact, "rb").read()).hexdigest()
+          text = open(bundle_path, encoding="utf-8").read()
+
+          # The action writes each bundle as compact JSON plus a newline,
+          # appending, so this is genuinely JSON Lines - one line here,
+          # one subject. Accept a whole-file bundle too rather than let a
+          # formatting change on their side fail a release.
+          try:
+              bundles = [json.loads(text)]
+          except json.JSONDecodeError:
+              bundles = [json.loads(ln) for ln in text.splitlines() if ln.strip()]
+          if not bundles:
+              sys.exit(f"{bundle_path}: empty attestation bundle")
+
+          subjects = []
+          for b in bundles:
+              payload = b["dsseEnvelope"]["payload"]
+              stmt = json.loads(base64.b64decode(payload))
+              for subj in stmt.get("subject", []):
+                  subjects.append((subj.get("name"), subj.get("digest", {}).get("sha256")))
+          if want not in [d for _, d in subjects]:
+              sys.exit(f"{bundle_path} attests {subjects}, not {want} ({artifact})")
+          print(f"{bundle_path}: {len(bundles)} bundle(s), subject sha256 {want} confirmed")
+          PY
 
       # Attach to the existing release. Never touches the release notes.
       # Target-triple filenames can't collide with the human-download
       # assets (nzbfast-X.Y.Z-<platform>.*) on the same release.
       - name: Attach to release
-        # inputs.tag flows through an env var, never interpolated directly
+        # The tag flows through an env var, never interpolated directly
         # into the shell line, so a crafted tag can't inject a command.
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
           REPO: ${{ github.repository }}
           TARGET: ${{ matrix.target }}
         # No --clobber: re-running must not silently replace assets already
         # published under this tag. Delete the old asset deliberately if a
-        # genuine re-upload is intended.
+        # genuine re-upload is intended. (This is also what makes a second
+        # run for a tag the automatic path already covered fail loudly
+        # instead of quietly reshuffling a published release.)
         run: |
           gh release upload "$TAG" \
             "nzbfast-$TARGET.tar.gz" \
             "nzbfast-$TARGET.tar.gz.sha256" \
+            "nzbfast-$TARGET.tar.gz.intoto.jsonl" \
             --repo "$REPO"
 
   # Container image: assemble, push and attest IN THIS RUN, so the attested
@@ -240,15 +352,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: refs/tags/${{ env.TAG }}
 
       # Same guard as the binaries job: the Dockerfile + entrypoint used to
       # assemble the image must come from the tag being attested, and the
       # ref this run was dispatched at is what the image attestation will
       # name as its source.
       - name: Verify the checkout and the attested source are both the tag
-        env:
-          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           want=$(git rev-parse "refs/tags/$TAG^{commit}")
@@ -279,7 +389,6 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          TAG: ${{ inputs.tag }}
         run: packaging/docker/push-image.sh "${TAG#v}"
 
       # The digest of the manifest list just pushed. buildx pushed the same
@@ -287,8 +396,6 @@ jobs:
       # identifies the image on ghcr AND Docker Hub.
       - name: Resolve pushed digest
         id: digest
-        env:
-          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           d=$(docker buildx imagetools inspect \

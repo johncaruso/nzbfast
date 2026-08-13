@@ -103,6 +103,20 @@ pub struct Job {
     /// Jobs sharing a key are duplicates; later arrivals are held as
     /// ALTERNATIVEs and auto-promoted if the original fails.
     pub dupe_key: Option<String>,
+    /// The nzo_id of the row THIS job was held as an alternative of, or
+    /// empty for anything that was not held.
+    ///
+    /// The promotion in `park` used to find its alternatives by
+    /// `dupe_key` alone, which is the same-title identity, not the one
+    /// admission actually judged on. Under `dupe_scope = "exact"` a
+    /// different release of the same episode is admitted and runs, so
+    /// when IT fails it promoted a row that had been held against a
+    /// still-COMPLETED original - the user got a second copy of
+    /// something they already had (Codex sweep K, 13 Aug 2026). An
+    /// empty value (a queue written before this field existed) keeps
+    /// the old dupe_key-only behaviour, which is right for `smart`,
+    /// where the two identities agree.
+    pub held_for: String,
     /// M14i metadata-only mode: availability-check instead of downloading;
     /// the NZB in the spool is the library entry, a .strm file the pointer.
     pub library: bool,
@@ -308,6 +322,25 @@ pub struct Job {
     /// a mid-move kill never strands them elsewhere. Persisted so a
     /// restart re-queues the move instead of forgetting it.
     pub move_pending: bool,
+    /// How many times this record has crossed between the queue store
+    /// and the history store, counting from 0 for a job that has never
+    /// crossed. Bumped by [`stamp_move`](super::moveseq::stamp_move) on
+    /// the way OUT, before the destination store's durable write, so the
+    /// destination's copy always carries the higher number.
+    ///
+    /// This is what tells the two half-written moves apart at restore.
+    /// Both directions tear into the SAME shape - a nonterminal queue row
+    /// plus a terminal history row for one nzo_id - so precedence alone
+    /// cannot say whether it was a park that half-finished or a retry;
+    /// §158 resolved both as "history wins", which is right for the park
+    /// and silently reverts the retry. The counter makes the direction of
+    /// the last INTENDED move recoverable rather than inferred: whichever
+    /// store holds the higher `move_seq` is the one the move was heading
+    /// for. See `serve/moveseq.rs` for the whole protocol.
+    ///
+    /// Absent on every record written before this field existed, which
+    /// reads as 0 on both copies and falls back to the §158 rule.
+    pub move_seq: u64,
     /// What the extractor found this set to be: the space-separated
     /// `ArchiveShape` tokens (`rar5 store one-pass`, `rar4 compressed
     /// on-disk`, ...). Empty while nothing archive-shaped has parsed yet,
@@ -1146,7 +1179,7 @@ pub(super) async fn finalize_completed(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) {
         // The identity/cleanup stamps land on a record that may already
         // be parked (an unlock re-run) - keep its store line current.
         d.history_upsert_if_present(job);
-        d.save_queue();
+        d.save_queue_soon();
     }
 }
 
@@ -2050,16 +2083,44 @@ pub(super) fn dated_key(
     }
 }
 
+/// The "exact" duplicate identity: the whole release name, flattened the
+/// same way `dupe_key` flattens it. `Show.Name.S01E02.x264-Grp` and
+/// `Show Name S01E02 x264-Grp` still meet, but a different release of
+/// the same episode does not - which is the point of
+/// `dupe_scope = "exact"`: a quality upgrade an *arr chose is not a
+/// duplicate, a re-send of the same release is.
+pub(super) fn exact_dupe_key(name: &str) -> String {
+    flatten_name(name)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Reduce a release name to its bare letter/digit sequence, lowercased,
+/// with every separator and decoration collapsed to a single space.
+///
+/// Unicode-aware, and that is the whole point: an ASCII-only filter
+/// erased every non-Latin letter, so `電影甲.2024.1080p.WEB-DL.x264-GRP`
+/// and `電影乙.2024.1080p.WEB-DL.x264-GRP` reduced to the SAME key and
+/// collided as duplicates, while an all-CJK name reduced to the empty
+/// string - an identity so unspecific that the exact-duplicate check
+/// has to refuse it, so a genuine re-send of that release was admitted
+/// as new (Codex sweep J, 13 Aug 2026). ASCII names flatten exactly as
+/// they always did; `to_lowercase` differs from `to_ascii_lowercase`
+/// only on characters the old filter was deleting anyway.
+fn flatten_name(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect()
+}
+
 pub(super) fn dupe_key(name: &str) -> Option<String> {
     // Full non-alphanumeric flattening (not just ./_/-): friendly-named
     // posts write "Title (2026)" and the parenthesized year token never
     // matched the scene form's bare "2026", so the same film in two
     // naming styles didn't dedupe (and the wall's have-badge missed).
-    let flat: String = name
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
-        .collect();
+    let flat = flatten_name(name);
     let tokens: Vec<&str> = flat.split_whitespace().collect();
     // Episode marker wins over a year token (`Show.2026.S01E02` is an
     // episode, not a movie from 2026).

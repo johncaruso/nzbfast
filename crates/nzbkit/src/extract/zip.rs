@@ -358,8 +358,8 @@ impl Extractor {
         // resolves when its last part's decoded size registers - block
         // until then, exactly as reads block on unarrived bytes.
         let total = ctl.set.wait_resolved_total().map_err(|e| e.to_string())?;
-        let (cd, count, cd_size, multi_disk) =
-            zip::find_central_directory(&src).map_err(|e| e.to_string())?;
+        let dir = zip::find_central_directory(&src).map_err(|e| e.to_string())?;
+        let cd = dir.at;
         // The resolve promoted the last ZIP_TAIL_PREFETCH bytes. A
         // directory starting below that window is front-loaded too -
         // without this the parse would wait for the natural (front-to-
@@ -382,8 +382,7 @@ impl Extractor {
                 ex.promote_slot_spans(s, &[(ls, le)], true);
             }
         }
-        let entries = zip::parse_central_directory(&src, cd, count, cd_size, multi_disk)
-            .map_err(|e| e.to_string())?;
+        let entries = zip::parse_central_directory(&src, &dir).map_err(|e| e.to_string())?;
         if entries.is_empty() {
             return Err("the zip archive contains no entries".to_string());
         }
@@ -435,7 +434,14 @@ impl Extractor {
                 && !e.is_encrypted()
                 && e.compressed_size != e.uncompressed_size
             {
-                return Err("malformed zip (stored entry sizes disagree)".to_string());
+                // Named and quantified: the bare "stored entry sizes
+                // disagree" this carried sent a reader hunting for a
+                // desync in whichever entry they guessed at, and on a
+                // 40-archive job it did not even say which container.
+                return Err(format!(
+                    "malformed zip ({} is stored, but its packed size {} and unpacked size {} disagree)",
+                    e.name, e.compressed_size, e.uncompressed_size
+                ));
             }
         }
         let mut files: Vec<&zip::Entry> = entries.iter().filter(|e| !e.is_dir).collect();

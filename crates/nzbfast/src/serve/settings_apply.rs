@@ -113,6 +113,8 @@ pub(super) fn apply_setting_tail(
         "scoreboard_enabled" => set_scoreboard_enabled(d, name, v)?,
         "scoreboard_url" => set_scoreboard_url(d, name, v)?,
         "scoreboard_source" => set_scoreboard_source(d, name, v)?,
+        "corr_confirm_enabled" => set_corr_confirm_enabled(d, name, v)?,
+        "corr_confirm_source" => set_corr_confirm_source(d, name, v)?,
         "scoreboard_cats" => set_scoreboard_cats(d, name, v)?,
         "scoreboard_calibrate" => {
             let on = v == "1" || v.eq_ignore_ascii_case("true");
@@ -283,6 +285,14 @@ pub(super) fn apply_setting_tail(
                 return Err("dupe_action must be pause, discard or fail".into());
             }
             *d.dupe_action.lock_ok() = m.clone();
+            (true, json!(m))
+        }
+        "dupe_scope" => {
+            let m = v.trim().to_ascii_lowercase();
+            if !matches!(m.as_str(), "smart" | "exact") {
+                return Err("dupe_scope must be smart or exact".into());
+            }
+            *d.dupe_scope.lock_ok() = m.clone();
             (true, json!(m))
         }
         "watch_move_rejected" => {

@@ -37,9 +37,18 @@ const MARK_HEAD: u8 = 0x72;
 const MAIN_HEAD: u8 = 0x73;
 const FILE_HEAD: u8 = 0x74;
 const COMM_HEAD: u8 = 0x75;
+const SUB_HEAD: u8 = 0x77;
 const PROTECT_HEAD: u8 = 0x78;
 const NEWSUB_HEAD: u8 = 0x7a;
 const ENDARC_HEAD: u8 = 0x7b;
+
+/// Sub type of a RAR 2.x unix-owner sub-block (unrar's `UO_HEAD`), stored at
+/// `+11` of a `SUB_HEAD` block.
+const UO_HEAD: u16 = 0x0101;
+/// Fixed part of a unix-owner sub-block: the 7-byte short header, the 4-byte
+/// data size (`SUB_HEAD` always carries `LONG_BLOCK`), sub type, level, and
+/// the two name sizes (unrar's `SIZEOF_UOWNERHEAD`).
+const SIZEOF_UOWNERHEAD: usize = 18;
 
 const LONG_BLOCK: u16 = 0x8000;
 const MHD_VOLUME: u16 = 0x0001;
@@ -2346,11 +2355,24 @@ fn read_block_header_at(
     if absolute as u64 + head_size as u64 > file_len {
         return Err(Error::TooShort);
     }
-    let header = if head_size == 7 {
+    let mut header = if head_size == 7 {
         base
     } else {
         file.read_at(absolute, head_size)?
     };
+    // A unix-owner sub-block is checksummed over its trailing owner and group
+    // names, which live past `head_size` in the data area - read them in, or
+    // `parse_block_header` has to skip the check for want of the bytes.
+    let head_type = header[2];
+    let flags = read_u16(&header, 3)?;
+    if let Some(extra) = unix_owner_crc_extra(&header, 0, head_type, flags, head_size as u16)? {
+        let want = head_size
+            .checked_add(extra)
+            .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
+        if absolute as u64 + want as u64 <= file_len {
+            header = file.read_at(absolute, want)?;
+        }
+    }
     let mut block = parse_block_header(&header, 0)?;
     block.offset = offset;
     Ok(block)
@@ -2399,13 +2421,19 @@ fn parse_block_header(input: &[u8], offset: usize) -> Result<BlockHeader> {
         return Err(Error::TooShort);
     }
     if head_type != MARK_HEAD && should_validate_header_crc(head_type) {
-        let header_end = header_crc_end(input, offset, head_type, flags, head_size)?;
-        let actual = (crc32(&input[offset + 2..header_end]) & 0xffff) as u16;
-        if actual != head_crc {
-            return Err(Error::CrcMismatch {
-                expected: head_crc,
-                actual,
-            });
+        // `None` means the covered range runs past the bytes we were handed -
+        // only reachable for a unix-owner sub-block whose trailing names sit
+        // outside the buffer (a truncated archive, or the encrypted-header
+        // window, which is decrypted and cut to `head_size`). Skipping beats
+        // checksumming a range the writer never checksummed.
+        if let Some(header_end) = header_crc_end(input, offset, head_type, flags, head_size)? {
+            let actual = (crc32(&input[offset + 2..header_end]) & 0xffff) as u16;
+            if actual != head_crc {
+                return Err(Error::CrcMismatch {
+                    expected: head_crc,
+                    actual,
+                });
+            }
         }
     }
     validate_legacy_auth_block_size(head_type, head_size)?;
@@ -2420,21 +2448,68 @@ fn parse_block_header(input: &[u8], offset: usize) -> Result<BlockHeader> {
     })
 }
 
+/// End of the byte range the block's `HEAD_CRC` covers, or `None` when that
+/// range is not fully present in `input`.
 fn header_crc_end(
     input: &[u8],
     offset: usize,
     head_type: u8,
     flags: u16,
     head_size: u16,
-) -> Result<usize> {
+) -> Result<Option<usize>> {
     let full_end = offset + head_size as usize;
+    if let Some(extra) = unix_owner_crc_extra(input, offset, head_type, flags, head_size)? {
+        let end = full_end
+            .checked_add(extra)
+            .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
+        return Ok((end <= input.len()).then_some(end));
+    }
     let fixed_end = match head_type {
         MAIN_HEAD if flags & MHD_COMMENT != 0 => Some(offset + 13),
         COMM_HEAD => Some(offset + 13),
         FILE_HEAD if flags & FHD_COMMENT != 0 => Some(file_header_comment_crc_end(input, offset)?),
         _ => None,
     };
-    Ok(fixed_end.unwrap_or(full_end).min(full_end))
+    Ok(Some(fixed_end.unwrap_or(full_end).min(full_end)))
+}
+
+/// How many bytes PAST `head_size` the `HEAD_CRC` of a RAR 2.x unix-owner
+/// sub-block covers, or `None` when the block is not one.
+///
+/// `UO_HEAD` (`0x77` sub type `0x0101`) declares an owner and a group name
+/// size in its fixed part but stores the names themselves in the block's data
+/// area, past `head_size`. unrar reads both names into the same raw header
+/// buffer before checksumming it (`Raw.Read(OwnerNameSize)` /
+/// `Raw.Read(GroupNameSize)`, then `Raw.GetCRC15(false)` over the whole
+/// buffer), so the CRC WinRAR stamped covers them too. Checksumming only
+/// `head_size` rejects archives `rar`, `unrar` and `7z` all read - it is what
+/// made `rar2-unix-owner.rar` fail with `expected 0x1fc3, got 0x974d`.
+///
+/// The extension is deliberately keyed on the sub type, not on the block's
+/// data size: other sub-block flavours (`EA_HEAD`, `NTACL_HEAD`, `STREAM_HEAD`)
+/// carry a payload their header CRC does not cover, and this fixture cannot
+/// tell the two rules apart because its names happen to fill the data area
+/// exactly.
+fn unix_owner_crc_extra(
+    input: &[u8],
+    offset: usize,
+    head_type: u8,
+    flags: u16,
+    head_size: u16,
+) -> Result<Option<usize>> {
+    if head_type != SUB_HEAD
+        || flags & LONG_BLOCK == 0
+        || (head_size as usize) < SIZEOF_UOWNERHEAD
+        || input.len() < offset + SIZEOF_UOWNERHEAD
+    {
+        return Ok(None);
+    }
+    if read_u16(input, offset + 11)? != UO_HEAD {
+        return Ok(None);
+    }
+    let owner_name_size = read_u16(input, offset + 14)? as usize;
+    let group_name_size = read_u16(input, offset + 16)? as usize;
+    Ok(Some(owner_name_size + group_name_size))
 }
 
 fn file_header_comment_crc_end(input: &[u8], offset: usize) -> Result<usize> {

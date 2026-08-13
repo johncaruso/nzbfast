@@ -105,15 +105,18 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val saved = Store.load(this)
-        if (saved != null) {
-            if (saved.mode == Mode.DEVICE) {
+        when (Store.savedMode(this)) {
+            Mode.DEVICE -> {
                 // A saved ON-DEVICE connection must clear the same identity
                 // bar a fresh one does. Setting `connection` here and polling
                 // immediately is what sent the stored full key to whatever
                 // owned the port on every app start, not just the first (see
                 // EngineIdentity). The engine is asked to start, the screen
                 // goes to Home, and the credential waits for the proof.
+                //
+                // The mode is read here but the ENDPOINT is not: the engine
+                // takes an OS-chosen port, so where to send the key is not
+                // known until the proof comes back with it.
                 startForegroundService(Intent(this, EngineService::class.java))
                 screen = Screen.Home
                 busy = true
@@ -129,14 +132,19 @@ class MainActivity : ComponentActivity() {
                         return@launch
                     }
                     note = null
-                    connection = saved
+                    connection = Store.deviceConnection(this@MainActivity, proven)
                     startPolling()
                 }
-            } else {
-                connection = saved
-                screen = Screen.Home
-                startPolling()
             }
+            Mode.SERVER -> {
+                val saved = Store.load(this)
+                if (saved != null) {
+                    connection = saved
+                    screen = Screen.Home
+                    startPolling()
+                }
+            }
+            null -> {}
         }
         handleIntent(intent)
 
@@ -331,7 +339,10 @@ class MainActivity : ComponentActivity() {
                 return@launch
             }
             Store.saveDevice(this@MainActivity)
-            connection = Store.load(this@MainActivity)
+            // From the PROVEN record, not from a re-read: this is the
+            // listener that just answered the challenge, and the port it
+            // answered on is the only one the key may go to.
+            connection = Store.deviceConnection(this@MainActivity, proven)
             val configured = withContext(Dispatchers.IO) {
                 runCatching { client!!.serversConfigured() }.getOrDefault(false)
             }

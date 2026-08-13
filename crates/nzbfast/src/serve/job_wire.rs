@@ -23,6 +23,7 @@ pub(in crate::serve) fn job_json(j: &Job) -> Value {
         "paused": j.paused,
         "retries": j.retries,
         "dupe_key": j.dupe_key,
+        "held_for": j.held_for,
         "library": j.library,
         "fetched": j.fetched,
         "downloaded_bytes": j.downloaded_bytes,
@@ -69,6 +70,11 @@ pub(in crate::serve) fn job_json(j: &Job) -> Value {
         // daily is back to retrying an unreachable NAS forever.
         "move_attempts": j.move_attempts,
         "move_pending": j.move_pending,
+        // §158 item 1: which cross-store move this copy belongs to. The
+        // ONE field both stores write for the same nzo_id, and the only
+        // thing that tells a half-written park from a half-written retry
+        // at restore - see `serve/moveseq.rs`.
+        "move_seq": j.move_seq,
         "archive_shape": j.archive_shape,
         // The identity facts an oracle supplied. Persisted rather than
         // recomputed: every one of them cost a third-party request, and
@@ -166,6 +172,7 @@ pub(in crate::serve) fn job_from_json(v: &Value) -> Option<Job> {
         idle_at_add: false,
         retries: v.get("retries").and_then(Value::as_u64).unwrap_or(0) as u32,
         dupe_key: s("dupe_key"),
+        held_for: s("held_for").unwrap_or_default(),
         library: v.get("library").and_then(Value::as_bool).unwrap_or(false),
         fetched: v.get("fetched").and_then(Value::as_bool).unwrap_or(false),
         tombstone: false,
@@ -242,6 +249,12 @@ pub(in crate::serve) fn job_from_json(v: &Value) -> Option<Job> {
             .get("move_pending")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // Absent on every record written before §158 item 1. Zero is the
+        // right reading of that absence: BOTH copies of a pre-upgrade
+        // split-brain id read 0, the comparison ties, and the tie falls
+        // back to the §158 rule those records were written under -
+        // history wins. Nothing about an old store changes meaning.
+        move_seq: v.get("move_seq").and_then(Value::as_u64).unwrap_or(0),
         archive_shape: s("archive_shape").unwrap_or_default(),
         inner_crc: v.get("inner_crc").and_then(Value::as_u64).unwrap_or(0) as u32,
         identity_name: s("identity_name").unwrap_or_default(),

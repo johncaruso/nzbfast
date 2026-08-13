@@ -31,6 +31,15 @@ pub(crate) use stall::*;
 pub(super) use tuner::*;
 pub(crate) use watchfolder::*;
 
+/// Daily ceiling on indexer-confirm suggestion lookups. Each candidate
+/// costs one API hit and (on a listing match) one grab against the
+/// user's own account, so the ceiling is deliberately modest - the
+/// STRONG-first pick order means the budget spends itself on the
+/// likeliest pairs. It lives out here rather than in `indexer` because
+/// the settings setter quotes it in the switch-on line, and that setter
+/// is compiled with or without the `indexer` feature.
+pub(in crate::serve) const CONFIRM_PER_DAY: u32 = 24;
+
 /// M14g scheduler: JSON list of {days, time, action, value} entries,
 /// evaluated once per minute in the machine's LOCAL timezone. On
 /// startup the whole week is re-evaluated so a restart lands in the
@@ -167,6 +176,32 @@ pub(super) fn spawn_usage_flush(daemon: &Arc<Daemon>) {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             d.flush_run_usage();
+        }
+    });
+}
+
+/// Issue #38 follow-up: the debounced queue saver behind
+/// `save_queue_soon`. Waits for a dirty mark, sits out a short debounce
+/// window so a completion's burst of saves (postproc submit, park, the
+/// finalize tail) coalesces into one, then writes on the blocking pool -
+/// `save_queue` serializes every job and fsyncs twice, which is not
+/// tokio-worker work at 14,500 jobs.
+///
+/// A mark that lands mid-write is not lost: `notify_one` stores a permit,
+/// so the loop comes straight back around and writes again. Wind-down's
+/// own synchronous `save_queue` flushes whatever a kill would have caught
+/// pending.
+pub(super) fn spawn_queue_saver(daemon: &Arc<Daemon>) {
+    let d = daemon.clone();
+    d.saver_armed.store(true, Ordering::Relaxed);
+    tokio::spawn(async move {
+        loop {
+            d.save_wake.notified().await;
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            if d.save_soon.swap(false, Ordering::AcqRel) {
+                let d2 = d.clone();
+                let _ = tokio::task::spawn_blocking(move || d2.save_queue()).await;
+            }
         }
     });
 }
@@ -784,6 +819,10 @@ pub(super) fn spawn_index_scan(
             // both on their own clocks inside.
             if !groups.is_empty() && daemon2.index_maintenance_ok() {
                 retention_and_statistics(&daemon2, &index_db).await;
+                // One budgeted shatter-fold slice per pass, same
+                // stand-down gate: it takes the write lock, so it
+                // yields to anything the user is actually doing.
+                shatter_fold_pass(&daemon2);
             }
             evict_pass_and_republish(&daemon2, &index_db).await;
             drop(index_pass);
@@ -1600,6 +1639,27 @@ fn spawn_instant_recheck(daemon: &Arc<Daemon>) {
     });
 }
 
+/// TODO §154: what the runner's no-servers guard learned about the
+/// config this pass.
+///
+/// Three answers rather than two, because §156 item 7 found the guard
+/// publishing "no server is configured" for a config it had never
+/// managed to read. "Nothing to dial" and "no idea" both stand the guard
+/// down, but only one of them may take a live hold back down again - see
+/// `ServerProbe`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum ServerVerdict {
+    /// At least one enabled server: there is something to dial.
+    Dialable,
+    /// The config was read and parsed, and lists no enabled server.
+    /// The hold's condition, and the only one of the three.
+    NoneEnabled,
+    /// No answer: the config could not be read or parsed, or no probe
+    /// has come back yet.
+    #[default]
+    Unknown,
+}
+
 /// TODO §154: has this box nothing at all to dial right now?
 ///
 /// Strictly "zero ENABLED servers", which arrives in two shapes: a
@@ -1614,12 +1674,72 @@ fn spawn_instant_recheck(daemon: &Arc<Daemon>) {
 /// deliberately not folded together: an unreadable config leaves this
 /// guard standing down and the download reports the real error instead
 /// of a hold that blames a server list nobody could read.
-fn no_enabled_servers(config: &std::path::Path) -> bool {
-    match nzbkit::config::Config::load(config) {
-        Ok(c) => !c.servers.iter().any(|s| s.enabled),
-        Err(nzbkit::config::ConfigError::NoServers) => true,
-        Err(_) => false,
+///
+/// §156 item 7: keeping that promise needs `load_no_fallback`. Plain
+/// `Config::load` answers a missing file by going and finding the host's
+/// SABnzbd ini, so a typo'd `--config` path came back as that other
+/// application's server list - `NoServers` when SAB has none enabled,
+/// which is this guard's own condition wearing the wrong face. Reading
+/// only the operator's own file is also what keeps the guard off an
+/// unrelated application's file it was otherwise re-parsing twice a
+/// second, forever.
+///
+/// Blocking, and called only from the blocking pool - see `ServerProbe`.
+///
+/// Also returns the parsed config, because this is the one place the
+/// runner's config is read OFF the runner. `reset_hub_for_job` needs
+/// the server list for §96.5 block-account budgets and used to take it
+/// with a synchronous `Config::load` on the runner itself, immediately
+/// after this bounded probe had just protected the same read - so a
+/// config path that stopped answering held the runner in that read with
+/// a job already marked Downloading and no fetch task yet to cancel
+/// (Codex sweep H, 13 Aug 2026). The healthy path costs nothing extra:
+/// the parse this probe already did IS the snapshot, and only the
+/// operator-file-missing case (where the loader searches for a SABnzbd
+/// ini, which this probe deliberately does not) reads a second time.
+fn server_verdict(config: &std::path::Path) -> (ServerVerdict, Option<nzbkit::config::Config>) {
+    match nzbkit::config::Config::load_no_fallback(config) {
+        Ok(c) if c.servers.iter().any(|s| s.enabled) => (ServerVerdict::Dialable, Some(c)),
+        Ok(c) => (ServerVerdict::NoneEnabled, Some(c)),
+        Err(nzbkit::config::ConfigError::NoServers) => (ServerVerdict::NoneEnabled, None),
+        Err(_) => (
+            ServerVerdict::Unknown,
+            nzbkit::config::Config::load(config).ok(),
+        ),
     }
+}
+
+/// How long the download runner waits for `index_pass_gate` before
+/// starting the job anyway. The gate is a rendezvous, not a resource:
+/// every holder (scan legs, spot legs, gapfill, tip watcher, VACUUM)
+/// stands down on its own once the runner's `begin_index_job` guard is
+/// visible, so a wait past a few seconds means one of them is stuck in
+/// I/O against a peer that has gone mute. Waiting that out forever is
+/// issue #38's silent-wedge shape wearing the runner's face: the job
+/// sits in Downloading, HTTP answers, nothing is logged. Sixty seconds
+/// is an eternity next to the lanes' 100 ms preemption polls and their
+/// NNTP per-command bounds, so this only ever trips a wedged lane -
+/// and then the worst the fallback costs is brief SQLite/bandwidth
+/// contention with a lane that is already standing down.
+/// `NZBFAST_INDEX_GATE_WAIT_SECS` overrides for the tests.
+fn index_gate_bound() -> std::time::Duration {
+    static SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_secs(*SECS.get_or_init(|| {
+        std::env::var("NZBFAST_INDEX_GATE_WAIT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&s| s > 0)
+            .unwrap_or(60)
+    }))
+}
+
+/// Rendezvous on the index pass gate with [`index_gate_bound`] as the
+/// deadline. True = the gate was acquired (and released) cleanly;
+/// false = the bound expired and the caller proceeds without it. The
+/// guard is never held past this function either way - the acquisition
+/// itself is the proof that no index lane still runs.
+async fn index_gate_rendezvous(gate: &tokio::sync::Mutex<()>, bound: std::time::Duration) -> bool {
+    tokio::time::timeout(bound, gate.lock()).await.is_ok()
 }
 
 /// Download worker: one download at a time at full pipeline speed,
@@ -1645,6 +1765,9 @@ pub(super) fn spawn_download_worker(
         let lane = PostprocLane::new(d.clone());
         // In-flight statfs probe for the min-free guard (≤1 outstanding).
         let mut disk_probe: Option<tokio::task::JoinHandle<Option<u64>>> = None;
+        // §156 item 7: the no-servers guard's config read, on the
+        // blocking pool under the same one-outstanding rule.
+        let mut server_probe = ServerProbe::default();
         loop {
             let Some(only_force) = download_guards(
                 &d,
@@ -1653,6 +1776,7 @@ pub(super) fn spawn_download_worker(
                 &mut guard_reason,
                 &mut ledger,
                 &mut disk_probe,
+                &mut server_probe,
             )
             .await
             else {
@@ -1761,9 +1885,24 @@ pub(super) fn spawn_download_worker(
             // cancels, then rendezvous on the shared gate. Once this
             // lock is acquired no scan, tip ingest, eviction or
             // VACUUM can still be running beside the foreground job.
-            if d.index_pause_on_download.load(Ordering::Relaxed) {
-                let idle = index_pass_gate.lock().await;
-                drop(idle);
+            //
+            // Bounded (issue #38's second wedge shape): a lane wedged
+            // mid-I/O against a mute peer would otherwise park this
+            // runner forever with the job stuck in Downloading and
+            // nothing logged. Past the bound, say so and start - every
+            // lane also stands down on its own once the guard above is
+            // visible, so the gate is confirmation, not permission.
+            if d.index_pause_on_download.load(Ordering::Relaxed)
+                && !index_gate_rendezvous(&index_pass_gate, index_gate_bound()).await
+            {
+                let detail = format!(
+                    "{name} started without the index-pass rendezvous - an index \
+                     lane held the gate past {} s (stuck mid-I/O against an \
+                     unresponsive server); it stands down on its own",
+                    index_gate_bound().as_secs()
+                );
+                warn!(target: "queue", "{detail}");
+                d.note_event("indexer", detail);
             }
             // Claim the shared progress counters for THIS job, in one
             // lock section with the zeroing they describe. A queue
@@ -1897,6 +2036,11 @@ pub(super) fn spawn_download_worker(
                     info!(target: "health", "{nzo_id}: {}", j.fail_message);
                 }
                 *d.started_at.lock_ok() = None;
+                // The idle clock starts at every job exit, not only the
+                // completion path below - the idle memory trim arms on
+                // this stamp, and a give-up as the last pick of the day
+                // otherwise left it unarmed for good (§156 item 8a).
+                *d.last_download_end.lock_ok() = Instant::now();
                 d.run_post_job_hooks(&job);
                 d.park(job);
                 continue;
@@ -1932,6 +2076,10 @@ pub(super) fn spawn_download_worker(
                             j.finished_unix = Some(unix_now());
                         }
                         *d.started_at.lock_ok() = None;
+                        // Same idle-clock stamp as every other job
+                        // exit; the STAT sample above is the network
+                        // phase this job had (§156 item 8a).
+                        *d.last_download_end.lock_ok() = Instant::now();
                         d.run_post_job_hooks(&job);
                         d.park(job);
                         continue;
@@ -1941,7 +2089,7 @@ pub(super) fn spawn_download_worker(
                 }
             }
 
-            reset_hub_for_job(&d, &config, &nzo_id, failure_host);
+            reset_hub_for_job(&d, server_probe.config(), &nzo_id, failure_host);
             let (net_tx, net_rx) = tokio::sync::oneshot::channel::<()>();
             let fetch = {
                 let config = config.clone();
@@ -2211,7 +2359,21 @@ pub(super) fn spawn_media_prober(daemon: &Arc<Daemon>) {
             // not do: it is deliberately left pointing at the last job
             // that ran so post-completion streaming keeps working, so
             // the queue is what says whether that job is still fetching.
-            let live = d.active_stream.lock_ok().clone().filter(|id| {
+            //
+            // Two statements ON PURPOSE (issue #38): chained as
+            // `.lock_ok().clone().filter(..)` the guard is a statement
+            // temporary that stays held while the closure takes the
+            // queue lock - the exact reverse of queue_json's
+            // queue -> active_stream order. With a huge queue the
+            // completion path holds the queue lock for seconds, this
+            // task parked inside that convoy still holding
+            // active_stream, a mode=queue poll won the queue mutex and
+            // then blocked on active_stream: both sides frozen forever,
+            // and with them every HTTP worker and the runner. The clone
+            // must be bound (and the guard dropped) before any other
+            // lock is touched.
+            let cur = d.active_stream.lock_ok().clone();
+            let live = cur.filter(|id| {
                 d.queue_job(id)
                     .is_some_and(|job| job.lock_ok().state == JobState::Downloading)
             });
@@ -2507,3 +2669,11 @@ mod tasks_stall_tests;
 #[cfg(test)]
 #[path = "tasks_tests.rs"]
 mod tasks_tests;
+
+// TODO 161 items 2 and 3: the scoreboard and corr-confirm lanes driven
+// end to end against a loopback newznab fixture. Its own file, not an
+// extension of either lane's module, because it exercises BOTH and
+// because indexer.rs is already 2.4k lines against the 3k size gate.
+#[cfg(all(test, feature = "indexer"))]
+#[path = "tasks/lane_proof_tests.rs"]
+mod lane_proof_tests;

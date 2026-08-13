@@ -788,6 +788,9 @@ struct GrowingChainedReader<'a, P, C> {
     /// the decoder has read.
     frag_start: u64,
     frag_pos: u64,
+    /// The fragment's packed length - `frag_pos` reaching it means the
+    /// fragment is fully read even when no read ever drained the cursor.
+    frag_len: u64,
     /// Running CRC of the fragment's packed bytes, checked against
     /// [`FileHeader::split_fragment_packed_crc`] when the fragment reads
     /// out - the check that localizes damage to one volume.
@@ -829,6 +832,7 @@ where
             cursor: None,
             frag_start: 0,
             frag_pos: 0,
+            frag_len: 0,
             frag_crc: Crc32::new(),
             frag_expected_crc: None,
             last_seen: !first.is_split_after(),
@@ -850,6 +854,7 @@ where
     /// unpacked size short of what the fragments carry) still has to name
     /// the member's real end, so the walk resumes in the right volume.
     fn finish(mut self) -> Result<((usize, usize), Vec<Archive>)> {
+        self.check_boundary_fragment()?;
         while !self.last_seen {
             self.pull_fragment()?;
         }
@@ -948,9 +953,37 @@ where
         let range = file.packed_range.clone();
         self.frag_start = range.start as u64;
         self.frag_pos = 0;
+        self.frag_len = (range.end - range.start) as u64;
         self.frag_crc = Crc32::new();
         self.frag_expected_crc = file.split_fragment_packed_crc();
         self.cursor = Some(archive.owned_range_reader(range)?);
+        Ok(())
+    }
+
+    /// The packed CRC check fires when a read drains the cursor, so a
+    /// consumer that stops asking EXACTLY at a fragment's boundary (a
+    /// stored member whose final fragment is pure encryption padding, a
+    /// decoder that finishes at the byte) never issues the read that
+    /// would run it. Every one of the fragment's bytes is hashed by
+    /// then, so the check can run here without forcing a read the
+    /// consumer did not want. A cursor stopped MID-fragment stays
+    /// unchecked: its remaining bytes were never read, so there is
+    /// nothing sound to compare.
+    fn check_boundary_fragment(&mut self) -> Result<()> {
+        if self.cursor.is_some() && self.frag_pos == self.frag_len {
+            self.cursor = None;
+            if let Some(expected) = self.frag_expected_crc.take() {
+                let actual = self.frag_crc.finish();
+                if actual != expected {
+                    let (volume_index, _) = self.pending.fragments[self.at];
+                    return Err(Error::SplitFragmentCrc32Mismatch {
+                        volume: volume_index,
+                        expected,
+                        actual,
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -970,6 +1003,15 @@ where
     C: Fn(usize, u64),
 {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        // A recorded failure latches, matching FragmentCrcReader: a
+        // caller that swallowed the io error must keep failing here,
+        // because the error surfaces with `at` unadvanced and the
+        // cursor dropped - without the latch a retried read would
+        // re-open the failed fragment and deliver its bytes again as
+        // if nothing happened.
+        if let Some(error) = self.error.as_ref() {
+            return Err(std::io::Error::other(error.to_string()));
+        }
         if out.is_empty() {
             return Ok(0);
         }
@@ -1784,6 +1826,111 @@ mod tests {
             ),
             "the ordinary next-volume fragment must still be accepted"
         );
+    }
+
+    /// After a fragment CRC mismatch the incremental chain must keep
+    /// erroring on every later read, exactly as `FragmentCrcReader`
+    /// does: the mismatch surfaces with `at` unadvanced and the cursor
+    /// dropped, so without the latch a caller that swallowed the io
+    /// error would be handed the failed fragment's bytes all over
+    /// again.
+    #[test]
+    fn growing_chain_keeps_erroring_after_a_fragment_crc_mismatch() {
+        let data = *b"0123456";
+        let mut first = file(b"a.txt", FHD_SPLIT_AFTER);
+        first.pack_size = data.len() as u64;
+        first.packed_range = 0..data.len();
+        first.file_crc = !crate::crc32::crc32(&data);
+
+        let pending = PendingSplitRefs::new(&first, 0, 0);
+        let volumes = vec![archive_with_source(
+            vec![Block::File(first.clone())],
+            data.to_vec(),
+        )];
+        let mut next_volume = |_: usize| -> Result<Option<Archive>> {
+            panic!("the mismatch must surface before another volume is pulled");
+        };
+        let consumed = |_: usize, _: u64| {};
+        let mut chain =
+            GrowingChainedReader::new(volumes, pending, &first, &mut next_volume, None, &consumed);
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16];
+        loop {
+            match chain.read(&mut buf) {
+                Ok(count) => {
+                    assert_ne!(count, 0, "the mismatch must error, never read as clean EOF");
+                    got.extend_from_slice(&buf[..count]);
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(got, data);
+
+        // The latch: a retried read errors again, never delivers bytes.
+        chain.read(&mut buf).unwrap_err();
+        assert!(matches!(
+            chain.take_error(),
+            Some(Error::SplitFragmentCrc32Mismatch { volume: 0, .. })
+        ));
+    }
+
+    /// A consumer that stops asking exactly at a non-final fragment's
+    /// boundary never issues the read that drains the cursor, so the
+    /// packed CRC check used to be skipped entirely. `finish` runs it
+    /// over the fully-read fragment.
+    #[test]
+    fn finish_checks_a_fragment_left_exactly_at_its_boundary() {
+        let data = *b"0123456";
+        for (crc, expect_mismatch) in [
+            (crate::crc32::crc32(&data), false),
+            (!crate::crc32::crc32(&data), true),
+        ] {
+            let mut first = file(b"a.txt", FHD_SPLIT_AFTER);
+            first.pack_size = data.len() as u64;
+            first.packed_range = 0..data.len();
+            first.file_crc = crc;
+
+            let pending = PendingSplitRefs::new(&first, 0, 0);
+            let volumes = vec![archive_with_source(
+                vec![Block::File(first.clone())],
+                data.to_vec(),
+            )];
+            let mut next_volume = |_: usize| -> Result<Option<Archive>> {
+                Ok(Some(archive_with(vec![Block::File(file(
+                    b"a.txt",
+                    FHD_SPLIT_BEFORE,
+                ))])))
+            };
+            let consumed = |_: usize, _: u64| {};
+            let mut chain = GrowingChainedReader::new(
+                volumes,
+                pending,
+                &first,
+                &mut next_volume,
+                None,
+                &consumed,
+            );
+
+            // Read EXACTLY the fragment's bytes, then stop asking.
+            let mut buf = [0u8; 7];
+            let mut got = 0;
+            while got < buf.len() {
+                got += chain.read(&mut buf[got..]).unwrap();
+            }
+            assert_eq!(&buf, &data);
+
+            let result = chain.finish();
+            if expect_mismatch {
+                assert!(matches!(
+                    result,
+                    Err(Error::SplitFragmentCrc32Mismatch { volume: 0, .. })
+                ));
+            } else {
+                let ((finish_volume, finish_file), _) = result.unwrap();
+                assert_eq!((finish_volume, finish_file), (1, 0));
+            }
+        }
     }
 
     fn never_open(_meta: &ExtractedEntryMeta) -> Result<Box<dyn Write>> {

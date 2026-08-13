@@ -19,15 +19,12 @@ import java.security.SecureRandom
  * post-API-29-legal way to run a bundled binary. Same mechanism as the
  * proven packaging/android/app test APK.
  *
- * The daemon binds 127.0.0.1 only. Downloads land in filesDir/downloads
- * until the export story exists.
+ * The daemon binds 127.0.0.1 only, on a port the OS chooses. Downloads
+ * land in filesDir/downloads until the export story exists.
  */
 class EngineService : Service() {
 
     companion object {
-        // NOT 6789: the WebView test APK's engine binds that, and two
-        // installed nzbfast apps must not fight over one port.
-        const val PORT = 6791
         private const val CHANNEL = "engine"
 
         /** One API key per install, minted on first use. */
@@ -55,7 +52,7 @@ class EngineService : Service() {
         val n: Notification = Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentTitle("nzbfast")
-            .setContentText("engine running on 127.0.0.1:$PORT")
+            .setContentText("engine running on this device")
             .setOngoing(true)
             .build()
         if (Build.VERSION.SDK_INT >= 29) {
@@ -80,11 +77,28 @@ class EngineService : Service() {
                 "--config", File(cfg, "config.json").absolutePath,
                 "serve",
                 "--bind", "127.0.0.1",
-                "--port", PORT.toString(),
+                // 0 = let the OS pick. The engine used to bind a fixed
+                // 6791, and every app on a phone shares ONE loopback
+                // namespace, so a port a sibling app can predict is a
+                // port it can pre-bind before us (Codex sweep 12 Aug F4).
+                // Identity is still proved by the runtime.json token, not
+                // by the port - see EngineIdentity - but a port nobody can
+                // name in advance is one nobody can lie in wait on.
+                //
+                // Where the answer comes back: the daemon reports the port
+                // it actually bound in runtime.json, and Store.load reads
+                // it from there. Nothing in this app holds a port constant.
+                "--port", "0",
                 "--apikey", apiKey(this),
                 "--out", dl.absolutePath,
                 "--watch", watch.absolutePath,
             )
+            // The launcher owns the port, so a `port` in settings.json must
+            // not overrule the `--port 0` above. Without this a value saved
+            // from the daemon's own embedded dashboard would pin the
+            // listener back to one fixed port, and the randomisation would
+            // stop happening with nothing to show it had.
+            pb.environment()["NZBFAST_PORT_LOCKED"] = "1"
             pb.environment()["HOME"] = base.absolutePath
             pb.environment()["TMPDIR"] = cacheDir.absolutePath
             pb.redirectErrorStream(true)

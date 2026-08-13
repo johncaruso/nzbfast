@@ -3,7 +3,9 @@
 > The native Jetpack Compose app now lives in `compose-app/` (screens,
 > ExoPlayer test preview, remote mode - see its README and
 > CONTRACT.md). The WebView APK below stays as the fallback shell; its
-> on-device engine owns port 6789, the compose app's owns 6791.
+> on-device engine owns port 6789, while the compose app's takes an
+> OS-chosen port and publishes it in `runtime.json`, so the two can
+> never collide however many are installed.
 
 Proof-of-life kit for the Android port: build the slim engine for
 aarch64, push it to a phone or emulator with adb, run the daemon on

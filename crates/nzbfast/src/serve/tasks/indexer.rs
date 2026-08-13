@@ -545,133 +545,169 @@ pub(in crate::serve) fn spawn_tip_watcher(
             // tracks whatever the group actually does and still
             // guarantees the loop keeps to its own interval.
             let deadline = Instant::now() + std::time::Duration::from_secs(every.min(30));
-            'groups: for offset in 0..groups.len() {
-                let g = &groups[(group_cursor + offset) % groups.len()];
-                // A8: follow the group's chosen primary - the full
-                // pass persists its marks key. Absent = the group was
-                // never scanned; seeding needs the backfill count and
-                // max-age bisection only the full pass knows, so
-                // leave it alone.
-                let Some(pkey) = daemon2.with_index(|ix| ix.kv_get(&format!("scan_primary:{g}")))
-                else {
-                    continue;
-                };
-                let mark = daemon2
-                    .with_index(|ix| Some(ix.high_water(g, &pkey)))
-                    .unwrap_or(0);
-                if mark == 0 {
-                    continue;
-                }
-                if !conns.contains_key(&pkey) {
-                    // TODO 110: still cooling down from a slots-full
-                    // refusal - skip quietly, the full pass covers it.
-                    if cooldown.get(&pkey).is_some_and(|&t| Instant::now() < t) {
-                        continue;
-                    }
-                    // The key names a server the config may have
-                    // dropped since the pass; skip until the next
-                    // pass re-chooses.
-                    let Some(server) = crate::find_scan_server(&config, &pkey) else {
+            // The walk below runs under the pass gate a starting
+            // download rendezvouses on, and its NNTP awaits answer to
+            // a REMOTE peer's clock: each connect/GROUP/OVER carries
+            // its own wire bound, but a tick over many groups against
+            // a mute provider stacks those bounds into minutes - all
+            // of them spent holding the gate while a job the user just
+            // added sits in Downloading doing nothing. So the walk
+            // gets the same 100 ms preemption select as the scan and
+            // spot legs: dropping the future cancels whatever await is
+            // stuck, however wedged its peer is.
+            let walk = async {
+                for offset in 0..groups.len() {
+                    let g = &groups[(group_cursor + offset) % groups.len()];
+                    // A8: follow the group's chosen primary - the full
+                    // pass persists its marks key. Absent = the group was
+                    // never scanned; seeding needs the backfill count and
+                    // max-age bisection only the full pass knows, so
+                    // leave it alone.
+                    let Some(pkey) =
+                        daemon2.with_index(|ix| ix.kv_get(&format!("scan_primary:{g}")))
+                    else {
                         continue;
                     };
-                    match nzbkit::nntp::Connection::connect(&server).await {
-                        Ok((c, _)) => {
-                            cooldown.remove(&pkey);
-                            conns.insert(pkey.clone(), c);
-                        }
-                        Err(e) => match sampler_cap_cooldown(&e, &server) {
-                            Some(cd) => {
-                                cooldown.insert(pkey.clone(), Instant::now() + cd);
-                                warn!(
-                                    target: "tip",
-                                    "{}: {e} - the account's slots are in use \
-                                     elsewhere; tip watch resumes in {} min \
-                                     (full scan passes still cover the group)",
-                                    server.host,
-                                    cd.as_secs() / 60
-                                );
-                                continue;
-                            }
-                            None => {
-                                warn!(target: "tip", "{}: connect: {e}", server.host);
-                                continue;
-                            }
-                        },
-                    }
-                }
-                let c = conns.get_mut(&pkey).expect("connected above");
-                let high = match c.group(g).await {
-                    Ok(info) => info.high,
-                    // A dropped idle connection looks exactly like
-                    // this; reconnect on the next tick.
-                    Err(_) => {
-                        conns.remove(&pkey);
+                    let mark = daemon2
+                        .with_index(|ix| Some(ix.high_water(g, &pkey)))
+                        .unwrap_or(0);
+                    if mark == 0 {
                         continue;
                     }
-                };
-                if high <= mark || high - mark > TIP_HANDOFF {
-                    continue;
-                }
-                let mut lo = mark.saturating_add(1);
-                while lo <= high && Instant::now() < deadline {
-                    if daemon2.indexing_pause_reason().is_some() {
-                        for (_, c) in conns.drain() {
-                            c.quit().await;
+                    if !conns.contains_key(&pkey) {
+                        // TODO 110: still cooling down from a slots-full
+                        // refusal - skip quietly, the full pass covers it.
+                        if cooldown.get(&pkey).is_some_and(|&t| Instant::now() < t) {
+                            continue;
                         }
-                        break 'groups;
+                        // The key names a server the config may have
+                        // dropped since the pass; skip until the next
+                        // pass re-chooses.
+                        let Some(server) = crate::find_scan_server(&config, &pkey) else {
+                            continue;
+                        };
+                        match nzbkit::nntp::Connection::connect(&server).await {
+                            Ok((c, _)) => {
+                                cooldown.remove(&pkey);
+                                conns.insert(pkey.clone(), c);
+                            }
+                            Err(e) => match sampler_cap_cooldown(&e, &server) {
+                                Some(cd) => {
+                                    cooldown.insert(pkey.clone(), Instant::now() + cd);
+                                    warn!(
+                                        target: "tip",
+                                        "{}: {e} - the account's slots are in use \
+                                         elsewhere; tip watch resumes in {} min \
+                                         (full scan passes still cover the group)",
+                                        server.host,
+                                        cd.as_secs() / 60
+                                    );
+                                    continue;
+                                }
+                                None => {
+                                    warn!(target: "tip", "{}: connect: {e}", server.host);
+                                    continue;
+                                }
+                            },
+                        }
                     }
-                    let hi = lo.saturating_add(TIP_CHUNK - 1).min(high);
-                    let Some(c) = conns.get_mut(&pkey) else { break };
-                    let entries = match c.over(lo, hi).await {
-                        Ok(es) => es,
+                    let c = conns.get_mut(&pkey).expect("connected above");
+                    let high = match c.group(g).await {
+                        Ok(info) => info.high,
+                        // A dropped idle connection looks exactly like
+                        // this; reconnect on the next tick.
                         Err(_) => {
                             conns.remove(&pkey);
-                            break;
+                            continue;
                         }
                     };
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    let gates = gates.clone();
-                    let cats = cats.clone();
-                    let matcher = matcher.clone();
-                    let done = daemon2.with_index_mut(|ix| {
-                        // Gates are a live setting, so they are
-                        // re-installed each time rather than once at
-                        // startup. No gates configured = a closure
-                        // that admits everything, which is what the
-                        // absence of a gate means anyway.
-                        install_live_ingest_policy(ix, gates, cats);
-                        // §74: same re-install discipline for the
-                        // arrival watch, and for the same reason - the
-                        // handle is republished after every full pass.
-                        install_instant_watch(ix, matcher);
-                        let n = ix.ingest(g, &entries, now).ok()?;
-                        // The mark moves only with the rows: an
-                        // ingest that failed must not claim the
-                        // range.
-                        ix.set_high_water(g, &pkey, hi).ok()?;
-                        // Drained inside the same lock hold: these are
-                        // this batch's arrivals, and leaving them for
-                        // later would mix them with the next one's.
-                        Some((n, ix.take_watch_hits()))
-                    });
-                    let Some((_, (hits, dropped))) = done else {
-                        break;
-                    };
-                    instant_arrivals(&daemon2, hits, dropped, now);
-                    fresh += (hi - lo + 1) as u32;
-                    lo = hi.saturating_add(1);
+                    if high <= mark || high - mark > TIP_HANDOFF {
+                        continue;
+                    }
+                    let mut lo = mark.saturating_add(1);
+                    // No inline pause check here: the preemption select
+                    // wrapping this walk stands the whole tick down within
+                    // 100 ms of any reason, mid-await included.
+                    while lo <= high && Instant::now() < deadline {
+                        let hi = lo.saturating_add(TIP_CHUNK - 1).min(high);
+                        let Some(c) = conns.get_mut(&pkey) else { break };
+                        let entries = match c.over(lo, hi).await {
+                            Ok(es) => es,
+                            Err(_) => {
+                                conns.remove(&pkey);
+                                break;
+                            }
+                        };
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let gates = gates.clone();
+                        let cats = cats.clone();
+                        let matcher = matcher.clone();
+                        let done = daemon2.with_index_mut(|ix| {
+                            // Gates are a live setting, so they are
+                            // re-installed each time rather than once at
+                            // startup. No gates configured = a closure
+                            // that admits everything, which is what the
+                            // absence of a gate means anyway.
+                            install_live_ingest_policy(ix, gates, cats);
+                            // §74: same re-install discipline for the
+                            // arrival watch, and for the same reason - the
+                            // handle is republished after every full pass.
+                            install_instant_watch(ix, matcher);
+                            let n = ix.ingest(g, &entries, now).ok()?;
+                            // The mark moves only with the rows: an
+                            // ingest that failed must not claim the
+                            // range.
+                            ix.set_high_water(g, &pkey, hi).ok()?;
+                            // Drained inside the same lock hold: these are
+                            // this batch's arrivals, and leaving them for
+                            // later would mix them with the next one's.
+                            Some((n, ix.take_watch_hits()))
+                        });
+                        let Some((_, (hits, dropped))) = done else {
+                            break;
+                        };
+                        instant_arrivals(&daemon2, hits, dropped, now);
+                        fresh += (hi - lo + 1) as u32;
+                        lo = hi.saturating_add(1);
+                    }
+                    if lo <= high {
+                        behind = true;
+                    }
                 }
-                if lo <= high {
-                    behind = true;
+            };
+            let pause = async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if let Some(reason) = daemon2.indexing_pause_reason() {
+                        break reason;
+                    }
                 }
-            }
+            };
+            let stood_down = tokio::select! {
+                _ = walk => None,
+                reason = pause => Some(reason),
+            };
             // Every group leads one tick in turn. A sustained backlog
             // in groups[0] can consume the global deadline, but it can
             // no longer starve every quiet group behind it forever.
             group_cursor = (group_cursor + 1) % groups.len();
+            if let Some(reason) = stood_down {
+                // A cancelled OVER leaves unread bytes on the sockets,
+                // so the sessions can be neither reused nor politely
+                // QUIT - dropping them is the hang-up.
+                conns.clear();
+                drop(index_pass);
+                info!(
+                    target: "tip",
+                    "tip watch stood down: {}",
+                    Daemon::pause_phrase(reason)
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
             if fresh > 0 && daemon2.index_maintenance_ok() {
                 // Fresh posts need `titles` rows before the enricher
                 // will look at them, and the wall sorts newest-first
@@ -900,587 +936,15 @@ pub(in crate::serve) fn spawn_oracle_sampler(daemon: &Arc<Daemon>, config: &std:
 }
 
 // ---- TODO 131 B3: the byte-probe naming lane -------------------------
-
-/// Ceiling of articles one probe may spend (head + the two extra head
-/// tries for the ~1/29 scrambled case + a bounded trailing fetch). The
-/// token bucket refuses to start a release it cannot finish.
+//
+// The whole lane lives in indexer/probe7z.rs now (TODO 106): 582 lines
+// of one subject, and this file had crossed the size-gate ceiling.
 #[cfg(feature = "indexer")]
-const PROBE7Z_ARTICLES_MAX: u64 = 8;
-
-/// Trailing segments fetched at most while hunting the end header (the
-/// confirmation run found it inside the last two for every readable
-/// target; two more are slack for packed headers, not a search).
+mod probe7z;
 #[cfg(feature = "indexer")]
-const PROBE7Z_TAIL_MAX: usize = 4;
-
-/// What one probed release produced. `articles`/`bytes` are the wire
-/// spend the tallies track against the budget.
+use probe7z::probe_fetch;
 #[cfg(feature = "indexer")]
-struct ProbeRun {
-    outcome: &'static str,
-    /// A structural verdict: retrying cannot change the bytes, so the
-    /// row leaves the lane for good (the post-grab path still gets its
-    /// chance if the release is ever downloaded).
-    give_up: bool,
-    /// The recovered inner filename, on "named" only.
-    name: Option<String>,
-    articles: u64,
-    bytes: u64,
-}
-
-#[cfg(feature = "indexer")]
-impl ProbeRun {
-    fn new(outcome: &'static str, give_up: bool, articles: u64, bytes: u64) -> Self {
-        Self {
-            outcome,
-            give_up,
-            name: None,
-            articles,
-            bytes,
-        }
-    }
-}
-
-/// The uploader-recipe registry: which bounded byte-peek names this
-/// release's shape. One entry today; Pesto's tiny-PAR2 grammar and any
-/// future RAR continuation recipe slot in as further variants, each
-/// with its own matcher, so the lane is a registry of poster-tool
-/// shapes rather than a hardcoded special case.
-#[cfg(feature = "indexer")]
-enum ProbeRecipe {
-    /// A single logical 7z (one `.7z`, or an ordered `.7z.NNN` split
-    /// set): real name in the end header, reachable from the offset-0
-    /// article plus a bounded trailing fetch.
-    SevenzTail(Vec<nzbkit::index::ProbeFile>),
-}
-
-/// Match a candidate's file rows against the registry. None = no
-/// recipe fits (the pick's SQL shape-gate and this can disagree when a
-/// release mixes shapes; those rows are marked off, not chased).
-#[cfg(feature = "indexer")]
-fn probe_recipe(files: &[nzbkit::index::ProbeFile]) -> Option<ProbeRecipe> {
-    let data: Vec<&nzbkit::index::ProbeFile> = files
-        .iter()
-        .filter(|f| !f.segments.is_empty() && !f.filename.to_lowercase().ends_with(".par2"))
-        .collect();
-    // Ordered split set: every data file a `.7z.NNN` part of one base,
-    // numbered contiguously from 001.
-    let mut parts: Vec<(u32, &nzbkit::index::ProbeFile)> = Vec::new();
-    let mut bases: std::collections::BTreeSet<String> = Default::default();
-    for f in &data {
-        if let Some((base, idx)) = crate::rarfix::split_7z_part(&f.filename) {
-            bases.insert(base);
-            parts.push((idx, f));
-        }
-    }
-    if !parts.is_empty() && parts.len() == data.len() && bases.len() == 1 {
-        parts.sort_by_key(|(idx, _)| *idx);
-        if parts
-            .iter()
-            .enumerate()
-            .all(|(i, (idx, _))| *idx == i as u32 + 1)
-        {
-            return Some(ProbeRecipe::SevenzTail(
-                parts.into_iter().map(|(_, f)| f.clone()).collect(),
-            ));
-        }
-        return None;
-    }
-    // Single container: exactly one `.7z` among the data files.
-    let singles: Vec<&&nzbkit::index::ProbeFile> = data
-        .iter()
-        .filter(|f| f.filename.to_lowercase().ends_with(".7z"))
-        .collect();
-    if singles.len() == 1 {
-        return Some(ProbeRecipe::SevenzTail(vec![(*singles[0]).clone()]));
-    }
-    None
-}
-
-/// One bounded BODY fetch, decoded. `Ok(None)` = the article is gone
-/// (430) or does not decode as yEnc - both "this bytes path is closed",
-/// distinct from a connection error which aborts the whole probe run.
-#[cfg(feature = "indexer")]
-async fn probe_fetch(
-    conn: &mut nzbkit::nntp::Connection,
-    msgid: &str,
-    spent: &mut (u64, u64),
-) -> Result<Option<nzbkit::yenc::Decoded>, nzbkit::nntp::NntpError> {
-    let fetch = conn.body(msgid);
-    let body = match tokio::time::timeout(std::time::Duration::from_secs(20), fetch).await {
-        Ok(r) => r?,
-        Err(_) => {
-            return Err(nzbkit::nntp::NntpError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "probe article timeout",
-            )));
-        }
-    };
-    spent.0 += 1;
-    let Some(raw) = body else { return Ok(None) };
-    spent.1 += raw.len() as u64;
-    Ok(nzbkit::yenc_simd::decode(&raw).ok())
-}
-
-/// Run the single-7z recipe against one release: find the offset-0
-/// article (segments[0] almost always; two more tries cover the
-/// pilot's ~1/29 scrambled case), read the start header, fetch the
-/// LAST volume's trailing segments until the end header - and, when it
-/// is a packed header, its pack stream - fit inside, then parse and
-/// name. Every article is budgeted; nothing here retries beyond the
-/// caps, because the alternative is the known fetch livelock.
-#[cfg(feature = "indexer")]
-async fn run_sevenz_probe(
-    conn: &mut nzbkit::nntp::Connection,
-    vols: &[nzbkit::index::ProbeFile],
-) -> Result<ProbeRun, nzbkit::nntp::NntpError> {
-    use nzbkit::nameprobe;
-    let mut spent = (0u64, 0u64);
-    // Head: the archive's first bytes, wherever the poster put them.
-    let first = &vols[0];
-    let mut head: Option<Vec<u8>> = None;
-    for (_, msgid, _) in first.segments.iter().take(3) {
-        if let Some(dec) = probe_fetch(conn, msgid, &mut spent).await?
-            && dec.offset() == 0
-            && dec.data.len() >= 32
-        {
-            head = Some(dec.data);
-            break;
-        }
-    }
-    let Some(head) = head else {
-        return Ok(ProbeRun::new("nohead", false, spent.0, spent.1));
-    };
-    let Some(start) = nameprobe::sevenz_start(&head) else {
-        return Ok(ProbeRun::new("parsefail", true, spent.0, spent.1));
-    };
-    if start.header_size == 0 || start.header_size > nameprobe::SEVENZ_END_MAX {
-        return Ok(ProbeRun::new("parsefail", true, spent.0, spent.1));
-    }
-    // Tail of the LAST volume, walked backwards. Chunks must chain
-    // contiguously up to the file's end; a break in the chain is the
-    // scrambled-offsets shape the pilot proved unprobeable.
-    let last = vols.last().expect("recipe never matches empty");
-    let mut chunks: Vec<nzbkit::yenc::Decoded> = Vec::new();
-    let mut have: u64 = 0;
-    let mut verdict: Option<Result<Vec<nzbkit::nameprobe::SevenzEntryInfo>, ()>> = None;
-    for (_, msgid, _) in last.segments.iter().rev().take(PROBE7Z_TAIL_MAX) {
-        let Some(dec) = probe_fetch(conn, msgid, &mut spent).await? else {
-            return Ok(ProbeRun::new("fetchfail", false, spent.0, spent.1));
-        };
-        have += dec.data.len() as u64;
-        chunks.push(dec);
-        // The chain grows tail-first; verify contiguity before parsing.
-        // checked_add: `end` comes off the wire (a =ybegin size with no
-        // =ypart passes through ungeometry-checked), and u64::MAX + 1
-        // must read as "not contiguous", not panic a debug daemon's
-        // probe task.
-        chunks.sort_by_key(|c| c.begin);
-        let contiguous = chunks
-            .windows(2)
-            .all(|w| w[0].end.checked_add(1) == Some(w[1].begin));
-        if !contiguous {
-            return Ok(ProbeRun::new("tailmiss", true, spent.0, spent.1));
-        }
-        if have < start.header_size {
-            continue;
-        }
-        let tail: Vec<u8> = chunks.iter().flat_map(|c| c.data.iter().copied()).collect();
-        match nameprobe::sevenz_tail_names(&head, &tail) {
-            Ok(entries) => {
-                verdict = Some(Ok(entries));
-                break;
-            }
-            // A packed header wanting bytes just before our chunks:
-            // extend the chain if the cap allows, otherwise report it.
-            Err(nameprobe::ProbeError::HeaderUnreachable) => {
-                verdict = Some(Err(()));
-                continue;
-            }
-            Err(nameprobe::ProbeError::EncryptedHeader) => {
-                return Ok(ProbeRun::new("encrypted", true, spent.0, spent.1));
-            }
-            Err(nameprobe::ProbeError::TailCrcMismatch) => {
-                return Ok(ProbeRun::new("tailmiss", true, spent.0, spent.1));
-            }
-            Err(_) => {
-                return Ok(ProbeRun::new("parsefail", true, spent.0, spent.1));
-            }
-        }
-    }
-    match verdict {
-        Some(Ok(entries)) => match nzbkit::nameprobe::pick_media_name(&entries) {
-            Some(name) => Ok(ProbeRun {
-                outcome: "named",
-                give_up: true,
-                name: Some(name),
-                articles: spent.0,
-                bytes: spent.1,
-            }),
-            None => Ok(ProbeRun::new("junkname", true, spent.0, spent.1)),
-        },
-        Some(Err(())) => Ok(ProbeRun::new("unreachable", true, spent.0, spent.1)),
-        None => Ok(ProbeRun::new("tailmiss", true, spent.0, spent.1)),
-    }
-}
-
-// ---- TODO 131 rung 5: the ON-DEMAND RAR namer ------------------------
-
-/// Volumes a RAR probe would look at, in the order the pilot proved
-/// pays: MIDDLE first, then the physical first, then the last.
-///
-/// The middle-first order is the pilot's actual finding, not a style
-/// choice. A multi-volume RAR's CONTINUATION volumes repeat the inner
-/// file header, and the earlier bundle's "779-fetch dead end" measured
-/// the wrong search: it looked for physical volume 1 by FILENAME, which
-/// in this band is not where the archive starts (`part01.rar` carrying
-/// payload at offset ~288 MB, global segment 1 decoding to `part44`).
-/// Selecting by the stored part-1 TUPLE of any file row lands on that
-/// row's own leading bytes instead - 44 of 44 sampled targets decoded
-/// at yEnc `begin=1`, and a header parsed in a mean of 1.1 articles.
-///
-/// Capped at three because that is the measured ceiling: only 4 of 40
-/// targets needed a second look and none needed a fourth. Chasing
-/// further is the fetch livelock every lane here is built to avoid.
-#[cfg(feature = "indexer")]
-fn rar_probe_volumes(files: &[nzbkit::index::ProbeFile]) -> Vec<nzbkit::index::ProbeFile> {
-    let mut vols: Vec<&nzbkit::index::ProbeFile> = files
-        .iter()
-        .filter(|f| {
-            let n = f.filename.to_lowercase();
-            // `.partNN.rar` ends in `.rar` like any other; `.rNN` is the
-            // old-style continuation naming (29 sets on the measured
-            // index - negligible, but free to accept).
-            !f.segments.is_empty()
-                && (n.ends_with(".rar")
-                    || n.rsplit_once(".r").is_some_and(|(head, ext)| {
-                        !head.is_empty()
-                            && ext.len() == 2
-                            && ext.chars().all(|c| c.is_ascii_digit())
-                    }))
-        })
-        .collect();
-    if vols.is_empty() {
-        return Vec::new();
-    }
-    vols.sort_by(|a, b| a.filename.cmp(&b.filename));
-    let mut order = vec![vols.len() / 2, 0, vols.len() - 1];
-    order.dedup();
-    let mut seen = std::collections::BTreeSet::new();
-    order
-        .into_iter()
-        .filter(|i| seen.insert(*i))
-        .map(|i| vols[i].clone())
-        .collect()
-}
-
-/// What one on-demand RAR probe concluded.
-#[cfg(feature = "indexer")]
-pub(in crate::serve) struct RarNameRun {
-    /// One of: named, junkname, encrypted, nohead, parsefail, noshape.
-    pub outcome: &'static str,
-    pub name: Option<String>,
-    /// `{unpacked_size}:{crc32}` from the header, when it carried one.
-    pub key: Option<String>,
-    /// Which dialect earned an `encrypted` outcome, for the terminal
-    /// classification's evidence field.
-    pub enc_kind: Option<nzbkit::index::EncKind>,
-    pub articles: u64,
-    pub bytes: u64,
-}
-
-/// Read one release's RAR volume headers for the inner filename.
-///
-/// **On demand only.** The pilot's verdict on a scan-time RAR lane is
-/// NO-GO and stands: 24 of 26 sampled RAR5 sets are `-hp`, 98% of the
-/// band by bytes, and half the readable remainder carries an inner
-/// filename as obfuscated as the outer post - ~1.2% real-name yield by
-/// bytes, the worst evidence-per-byte in the build order. What survives
-/// is this: one to three articles, on a row a human or a grab is
-/// already looking at, reusing `rar::VolumeMapper` verbatim.
-#[cfg(feature = "indexer")]
-pub(in crate::serve) async fn run_rar_probe(
-    conn: &mut nzbkit::nntp::Connection,
-    files: &[nzbkit::index::ProbeFile],
-) -> Result<RarNameRun, nzbkit::nntp::NntpError> {
-    use nzbkit::nameprobe;
-    let mut spent = (0u64, 0u64);
-    let vols = rar_probe_volumes(files);
-    if vols.is_empty() {
-        return Ok(RarNameRun {
-            outcome: "noshape",
-            name: None,
-            key: None,
-            enc_kind: None,
-            articles: 0,
-            bytes: 0,
-        });
-    }
-    let mut last: &'static str = "nohead";
-    for vol in &vols {
-        // The part-1 TUPLE, not segments[0] and not the filename: this
-        // band's segment order is scrambled against volume order, and
-        // the tuple ordinal is the key that survives it.
-        let Some((_, msgid, _)) = vol
-            .segments
-            .iter()
-            .find(|(part, _, _)| *part == 1)
-            .or_else(|| vol.segments.first())
-        else {
-            continue;
-        };
-        let Some(dec) = probe_fetch(conn, msgid, &mut spent).await? else {
-            continue;
-        };
-        if dec.offset() != 0 {
-            continue;
-        }
-        match nameprobe::rar_head(&dec.data, vol.bytes.max(0) as u64) {
-            Ok(head) => {
-                let Some((name, key)) = nameprobe::pick_rar_media_name(&head) else {
-                    last = "junkname";
-                    continue;
-                };
-                return Ok(RarNameRun {
-                    outcome: "named",
-                    name: Some(name),
-                    key,
-                    enc_kind: None,
-                    articles: spent.0,
-                    bytes: spent.1,
-                });
-            }
-            // The wall. A property of the SET, not of this volume, so
-            // there is nothing to gain from the other candidates - and
-            // the classification that follows means nothing ever pays
-            // these articles again.
-            Err(nameprobe::ProbeError::EncryptedHeader) => {
-                return Ok(RarNameRun {
-                    outcome: "encrypted",
-                    name: None,
-                    key: None,
-                    enc_kind: Some(if head_is_rar5(&dec.data) {
-                        nzbkit::index::EncKind::Rar5HeadCrypt
-                    } else {
-                        nzbkit::index::EncKind::Rar4MhdPassword
-                    }),
-                    articles: spent.0,
-                    bytes: spent.1,
-                });
-            }
-            Err(nameprobe::ProbeError::BadStart) => last = "nohead",
-            Err(_) => last = "parsefail",
-        }
-    }
-    Ok(RarNameRun {
-        outcome: last,
-        name: None,
-        key: None,
-        enc_kind: None,
-        articles: spent.0,
-        bytes: spent.1,
-    })
-}
-
-/// Which RAR dialect these leading bytes are, for the classification's
-/// evidence field only. The signatures share their first five bytes;
-/// RAR5's is two longer and ends `\x01\x00`.
-#[cfg(feature = "indexer")]
-fn head_is_rar5(head: &[u8]) -> bool {
-    head.starts_with(b"Rar!\x1a\x07\x01\x00")
-}
-
-/// The byte-probe naming worker (TODO 131 B3): a 60 s loop that spends
-/// a small article budget reading real names out of obfuscated
-/// single-7z posts. Modelled on the oracle sampler: stamp-first
-/// rotation, one held connection, cooldowns, and a hard stand-down
-/// while anything downloads.
-///
-/// Honest scope, so nobody reads more into this lane than the
-/// measurements support: the shape it names is ~29% of currently-dark
-/// bytes on the measured index and is effectively ONE automated
-/// reposter's TV output in alt.binaries.tv. The daily tallies
-/// (`mode=probe7z_stats`) exist precisely because that poster can stop,
-/// scramble, or start encrypting headers at any moment - the lane's
-/// yield is watched, never assumed.
-#[cfg(feature = "indexer")]
-pub(in crate::serve) fn spawn_probe7z(daemon: &Arc<Daemon>, config: &std::path::Path) {
-    let config = config.to_path_buf();
-    let d = daemon.clone();
-    tokio::spawn(async move {
-        let mut conn: Option<(nzbkit::config::ServerConfig, nzbkit::nntp::Connection)> = None;
-        let mut cooldown: std::collections::HashMap<String, Instant> = Default::default();
-        // Token bucket over articles: refills at the hourly budget,
-        // caps at ten minutes' worth so an idle stretch cannot bank an
-        // afternoon of burst.
-        let mut tokens: f64 = 0.0;
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            let rate = d.index_probe7z_budget.load(Ordering::Relaxed);
-            if !d.index_probe7z.load(Ordering::Relaxed)
-                || rate == 0
-                || d.offline.load(Ordering::Relaxed)
-                || d.indexer_off()
-                || d.started_at.lock_ok().is_some()
-            {
-                // Same stand-down shape as the sampler: dropping the
-                // connection is the hang-up, and an idle session held
-                // against a provider is the account's slot, not ours.
-                if let Some((_, c)) = conn.take() {
-                    c.quit().await;
-                }
-                tokens = 0.0;
-                continue;
-            }
-            // The bucket must be allowed to hold at least one probe's
-            // worth: the cap is ten minutes of budget (rate/6), and the
-            // work gate below needs PROBE7Z_ARTICLES_MAX tokens, so any
-            // budget under 48/hr capped below 8 and the lane sat
-            // enabled, eligible counting up, probing NOTHING - the
-            // silent-zero-yield shape again, this time by configuration.
-            // The refill rate still honors the hourly budget; a tiny
-            // budget just fires one probe less often.
-            tokens = (tokens + rate as f64 / 60.0)
-                .min((rate as f64 / 6.0).max(PROBE7Z_ARTICLES_MAX as f64));
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|t| t.as_secs() as i64)
-                .unwrap_or(0);
-            while tokens >= PROBE7Z_ARTICLES_MAX as f64 {
-                let Some(cand) =
-                    d.with_index(|ix| ix.probe7z_pick(now, 1).ok()?.into_iter().next())
-                else {
-                    break;
-                };
-                // Stamp first: even a probe that dies mid-fetch
-                // rotates the pick, so one broken release cannot pin
-                // the lane (the sampler's rule, same reason).
-                d.with_index(|ix| ix.probe7z_mark(cand.id, now).ok());
-                let files = d
-                    .with_index(|ix| ix.probe7z_files(cand.id).ok())
-                    .unwrap_or_default();
-                let Some(ProbeRecipe::SevenzTail(vols)) = probe_recipe(&files) else {
-                    d.with_index(|ix| {
-                        ix.probe7z_give_up(cand.id, now).ok();
-                        ix.probe7z_note(now, "noshape", 0, 0).ok()
-                    });
-                    continue;
-                };
-                // A connection, made or kept. Servers come from the
-                // scan policy (enabled, never metered or per-byte
-                // billed, one per backbone).
-                if conn.is_none() {
-                    let servers = match nzbkit::config::Config::load(&config) {
-                        Ok(c) => crate::nettools::scan_servers(&c),
-                        Err(_) => break,
-                    };
-                    for s in servers {
-                        if cooldown.get(&s.host).is_some_and(|&t| Instant::now() < t) {
-                            continue;
-                        }
-                        match nzbkit::nntp::Connection::connect(&s).await {
-                            Ok((c, _)) => {
-                                cooldown.remove(&s.host);
-                                conn = Some((s, c));
-                                break;
-                            }
-                            Err(e) => {
-                                let cd = sampler_cap_cooldown(&e, &s)
-                                    .unwrap_or(std::time::Duration::from_secs(600));
-                                cooldown.insert(s.host.clone(), Instant::now() + cd);
-                                warn!(target: "probe7z", "{}: connect: {e}", s.host);
-                            }
-                        }
-                    }
-                }
-                let Some((_, c)) = conn.as_mut() else { break };
-                match run_sevenz_probe(c, &vols).await {
-                    Ok(run) => {
-                        tokens -= (run.articles.max(1)) as f64;
-                        if run.outcome == "encrypted" {
-                            // A fact about the bytes, recorded as the
-                            // terminal classification rather than as a
-                            // saturated try counter: the fact stays
-                            // revisable by a bump of ENC_CLASS, the
-                            // counter never would. See index/encrypted.rs.
-                            d.with_index(|ix| {
-                                ix.probe7z_retire_encrypted(
-                                    cand.id,
-                                    nzbkit::index::EncKind::SevenzAesHeader,
-                                    now,
-                                )
-                                .ok()
-                            });
-                        } else if run.give_up {
-                            d.with_index(|ix| ix.probe7z_give_up(cand.id, now).ok());
-                        }
-                        let mut outcome = run.outcome;
-                        if let Some(name) = &run.name {
-                            // The claims layer is the write path: a
-                            // BodyProbe claim at the top tier, applied
-                            // now unless a strictly stronger proof
-                            // already named the row.
-                            use nzbkit::index::ProvenOutcome;
-                            let verdict = d
-                                .with_index_mut(|ix| ix.apply_probed_name(cand.id, name, now).ok())
-                                .flatten();
-                            match verdict {
-                                Some(ProvenOutcome::Applied | ProvenOutcome::Replaced) => {
-                                    info!(
-                                        target: "probe7z",
-                                        "release {} named from its own archive: {name}",
-                                        cand.id
-                                    );
-                                }
-                                Some(ProvenOutcome::Confirmed) => {}
-                                // The byte-probe read a name that
-                                // DISAGREES with an equal-or-stronger
-                                // name already on the row (an exact-leg
-                                // relay name). For this near-ground-truth
-                                // band that is a real signal, not noise -
-                                // give it its own count. The claims layer
-                                // has already logged the specifics.
-                                Some(ProvenOutcome::Conflict) => outcome = "conflict",
-                                // Read bytes fine, but the name did not
-                                // land: a blob title the gate refused, an
-                                // association-only record, or a path-like
-                                // name the sanitiser rejected.
-                                _ => outcome = "junkname",
-                            }
-                        }
-                        d.with_index(|ix| {
-                            ix.probe7z_note(now, outcome, run.articles, run.bytes).ok()
-                        });
-                    }
-                    Err(e) => {
-                        // Connection trouble: log, cool the host off,
-                        // reconnect on a later tick. The stamped row
-                        // retries on its own rotation.
-                        d.with_index(|ix| ix.probe7z_note(now, "fetchfail", 0, 0).ok());
-                        if let Some((s, c)) = conn.take() {
-                            warn!(target: "probe7z", "{}: {e}", s.host);
-                            cooldown.insert(
-                                s.host.clone(),
-                                Instant::now() + std::time::Duration::from_secs(600),
-                            );
-                            c.quit().await;
-                        }
-                        break;
-                    }
-                }
-            }
-            // Give the slot back between ticks once downloads are
-            // idle past the server's release timeout - same reasoning
-            // as the sampler, same per-server gate.
-            if let Some((s, _)) = &conn
-                && !d.sampler_may_hold(s)
-                && let Some((_, c)) = conn.take()
-            {
-                c.quit().await;
-            }
-        }
-    });
-}
+pub(in crate::serve) use probe7z::{run_rar_probe, spawn_probe7z};
 
 // ---- TODO 131 #6: the posted-NZB ingestion rung ----------------------
 
@@ -1888,6 +1352,231 @@ fn import_join_apply(
     }
 }
 
+// ---- Indexer-confirm lane: correlation suggestions -> proven names ----
+
+/// One confirm attempt: pick the best unchecked STRONG suggestion,
+/// search the user's chosen indexer for its pre title, fetch the
+/// matching NZB and message-id-join it against the index. A quorum
+/// join applies the title through `apply_proven_name` at msgid-set
+/// tier (source `nzb-indexer`), which also settles the pre_corr row
+/// confirmed/rejected and back-feeds the predb filename - the same
+/// seam every other proof uses. Returns whether budget was spent.
+///
+/// Blocking (ureq + index writes) - call from `spawn_blocking`. The
+/// suggestion is stamped `checked_at` after the search attempt, hit
+/// or miss, so one suggestion can never cost quota twice.
+#[cfg(feature = "indexer")]
+pub(in crate::serve) fn corr_confirm_once(d: &Arc<Daemon>) -> bool {
+    use nzbkit::index::msgid_set_key;
+    use nzbkit::nzbimport::MIN_MSGID_QUORUM;
+    if !d.corr_confirm_enabled.load(Ordering::Relaxed) {
+        return false;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|t| t.as_secs() as i64)
+        .unwrap_or(0);
+    let today = now.div_euclid(86_400);
+    let spent: u32 = d
+        .with_index(|ix| {
+            let day: i64 = ix
+                .kv_get("corr_confirm_day")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if day != today {
+                let _ = ix.kv_set("corr_confirm_day", &today.to_string());
+                let _ = ix.kv_set("corr_confirm_spent", "0");
+                Some(0)
+            } else {
+                ix.kv_get("corr_confirm_spent").and_then(|v| v.parse().ok())
+            }
+        })
+        .unwrap_or(0);
+    if spent >= CONFIRM_PER_DAY {
+        return false;
+    }
+    let Some((rid, title, score, pid)) = d.with_index(|ix| {
+        ix.corr_confirm_pick(1)
+            .ok()
+            .and_then(|v| v.into_iter().next())
+    }) else {
+        return false;
+    };
+    let cfg = match d.corr_confirm_reference() {
+        Ok(c) => c,
+        Err(e) => {
+            // Once per daemon run, not per tick: the setting is wrong,
+            // and 1,440 identical lines a day would bury the one that
+            // matters.
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                warn!(target: "confirm", "{e}");
+            }
+            return false;
+        }
+    };
+    // The user's own per-account quotas gate BOTH halves up front: a
+    // search whose grab could never follow is quota spent on nothing.
+    {
+        let mut rt = d.indexer_rt.lock_ok();
+        rt.usage.roll(now);
+        if !rt.usage.hit_allowed(&cfg) || !rt.usage.grab_allowed(&cfg) {
+            return false;
+        }
+        rt.usage.count_hit(&cfg.name);
+    }
+    crate::serve::save_indexer_usage(d);
+    let spend = |n: u32| {
+        d.with_index(|ix| {
+            ix.kv_set("corr_confirm_spent", &(spent + n).to_string())
+                .ok()
+        });
+    };
+    let q = crate::newznab::SearchQuery {
+        q: title.clone(),
+        limit: 50,
+        ..Default::default()
+    };
+    // The origin is kept, not dropped: the NZB link below comes out of
+    // THIS response, so the fetch that follows it is bound to where
+    // this search actually answered from (M12 / TODO 135).
+    let (results, origin) = match crate::serve::indexer_search_one(&cfg, &q) {
+        Ok(pair) => pair,
+        Err(e) => {
+            // Budget is spent on the failure too, so a broken account
+            // warns at most CONFIRM_PER_DAY times a day, not every
+            // tick forever. The candidate is NOT stamped - it gets its
+            // lookup once the account answers again.
+            warn!(target: "confirm", "search against {} failed: {e}", cfg.name);
+            spend(1);
+            return true;
+        }
+    };
+    // The listing must BE the suggested release, not merely contain
+    // its words - match_key is the same normalization the predb exact
+    // legs join on.
+    let want = nzbkit::predb::match_key(&title);
+    let hit = results
+        .iter()
+        .find(|r| nzbkit::predb::match_key(&r.title) == want);
+    d.with_index(|ix| ix.corr_confirm_stamp(rid, pid, now).ok());
+    spend(1);
+    let Some(hit) = hit else {
+        info!(
+            target: "confirm",
+            "\"{title}\" (suggestion score {score}): {} listings, none exact - unresolved",
+            results.len()
+        );
+        return true;
+    };
+    {
+        let mut rt = d.indexer_rt.lock_ok();
+        rt.usage.count_grab(&cfg.name);
+    }
+    crate::serve::save_indexer_usage(d);
+    // fetch_url_from, not the plain indexer fetch: hit.link is an
+    // `<enclosure url>` the far end CHOSE, and the plain SSRF guard
+    // deliberately permits loopback and the LAN so a self-hosted
+    // indexer stays reachable. Unbound, a hostile or compromised
+    // account could point this lane's grab at any other service on the
+    // user's own box - the same pivot every other link-following lane
+    // here closed (indexer grabs, the RSS poller, the watchlist, the
+    // scoreboard's calibration). One line, same fix, same reason.
+    let xml = match crate::serve::fetch_url_from(&hit.link, &origin) {
+        Ok(f) => String::from_utf8_lossy(&f.bytes).into_owned(),
+        Err(e) => {
+            warn!(target: "confirm", "NZB fetch from {} failed: {e}", cfg.name);
+            return true;
+        }
+    };
+    let ident = match nzbkit::nzbimport::nzb_identity(xml.as_bytes()) {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(target: "confirm", "\"{title}\": fetched NZB did not parse: {e:?}");
+            return true;
+        }
+    };
+    if ident.lead_ids.is_empty() {
+        return true;
+    }
+    let applied = d.with_index_mut(|ix| {
+        // One id per probe so each release's MATCHED set is known -
+        // the canonical msgid-set key digests exactly what joined
+        // (same discipline as the posted-NZB lane).
+        let mut per: std::collections::HashMap<i64, Vec<&str>> = Default::default();
+        for id in &ident.lead_ids {
+            for (jrid, _) in ix
+                .find_releases_by_msgids(std::iter::once(id.as_str()))
+                .unwrap_or_default()
+            {
+                per.entry(jrid).or_default().push(id);
+            }
+        }
+        let mut out = Vec::new();
+        for (jrid, mids) in per {
+            if mids.len() < MIN_MSGID_QUORUM {
+                continue;
+            }
+            let claim = nzbkit::index::NameClaim {
+                name: title.clone(),
+                evidence: nzbkit::index::NameEvidence::MsgidSet,
+                key: msgid_set_key(&mids),
+                source: "nzb-indexer".into(),
+            };
+            if let Ok(o) = ix.apply_proven_name(jrid, &claim, now) {
+                out.push((jrid, mids.len(), o));
+            }
+        }
+        Some(out)
+    });
+    let mut named_any = false;
+    for (jrid, matched, outcome) in applied.into_iter().flatten() {
+        use nzbkit::index::ProvenOutcome;
+        if matches!(outcome, ProvenOutcome::Applied | ProvenOutcome::Replaced) {
+            named_any = true;
+            let aimed = if jrid == rid {
+                "the suggested row"
+            } else {
+                "a sibling row"
+            };
+            info!(
+                target: "confirm",
+                "release {jrid}: indexer NZB joined ({matched} ids, {aimed}) - named \"{title}\""
+            );
+        }
+    }
+    if !named_any {
+        info!(
+            target: "confirm",
+            "\"{title}\": listing found but its NZB joined no release at quorum - unresolved"
+        );
+    }
+    true
+}
+
+/// The confirm lane's clock: one budgeted attempt per tick, standing
+/// down whenever index maintenance would (offline, an active job).
+#[cfg(feature = "indexer")]
+pub(in crate::serve) fn spawn_corr_confirm(daemon: &Arc<Daemon>) {
+    // Checked once - the env cannot change under a running process,
+    // and the tests drive `corr_confirm_once` directly.
+    if std::env::var("NZBFAST_NO_ENRICH").is_ok_and(|v| v == "1") {
+        return;
+    }
+    let d = daemon.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            if !d.corr_confirm_enabled.load(Ordering::Relaxed) || !d.index_maintenance_ok() {
+                continue;
+            }
+            let d2 = d.clone();
+            let _ = tokio::task::spawn_blocking(move || corr_confirm_once(&d2)).await;
+        }
+    });
+}
+
 // ---- TODO 131 red-team 5a: the pesto tiny-PAR2 naming rung -----------
 
 /// Payload candidates one set may hash-check per hunt. The census's
@@ -2234,6 +1923,8 @@ pub(in crate::serve) fn spawn_pesto(daemon: &Arc<Daemon>, config: &std::path::Pa
 #[cfg(all(test, feature = "indexer"))]
 mod tests {
     use super::*;
+    // Only the tests still reach into the byte-probe lane for this one.
+    use super::probe7z::rar_probe_volumes;
 
     fn pf(filename: &str, parts: &[u32]) -> nzbkit::index::ProbeFile {
         nzbkit::index::ProbeFile {
@@ -2543,6 +2234,38 @@ pub(in crate::serve) async fn reclassify_pending_rows(
 /// The caller owns the "indexing is on and maintenance is allowed"
 /// guard.
 #[cfg(feature = "indexer")]
+/// One budgeted slice of the shatter fold per scan pass: merge dark
+/// rows shattered by per-article poster randomization (and group
+/// rotation) back into whole per-file releases. See
+/// `Index::shatter_fold` for the census that sized this (97% of dark
+/// rows) and the gates that keep it narrow. Runs whenever indexing
+/// does - the artifact hurts every consumer (correlation, probes,
+/// msgid joins, completeness), not just predb installs.
+pub(in crate::serve) fn shatter_fold_pass(daemon2: &Arc<Daemon>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|t| t.as_secs() as i64)
+        .unwrap_or(0);
+    const FOLD_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+    if let Some((g, n, _)) = daemon2.with_index_mut(|ix| {
+        // An error here must be SAID: a silent Err loops forever
+        // looking exactly like "nothing to do".
+        match ix.shatter_fold(now, FOLD_BUDGET) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                warn!(target: "index", "shatter fold error: {e}");
+                None
+            }
+        }
+    }) && g > 0
+    {
+        info!(
+            target: "index",
+            "shatter fold: {n} scattered row(s) folded into {g} posting(s)"
+        );
+    }
+}
+
 pub(in crate::serve) async fn retention_and_statistics(
     daemon2: &Arc<Daemon>,
     index_db: &std::path::Path,

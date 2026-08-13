@@ -128,6 +128,14 @@ pub(super) struct HoldsScratch {
     pub(super) state: Mutex<ScratchState>,
     /// Bytes ever paged (diagnostics/tests; monotonic).
     pub(super) paged_total: AtomicU64,
+    /// Reads served through [`Self::read`] - the route that preads
+    /// while its caller still holds a lock (monotonic). A deferred
+    /// `Plan::S` goes straight to the handle and never bumps this,
+    /// which is the difference the chase-arm test stands on. Test-only:
+    /// nothing in production reads it, so it costs a release build
+    /// neither the field nor the increment.
+    #[cfg(test)]
+    pub(super) locked_reads: AtomicU64,
     /// Hard ceiling on the append cursor. 0 = auto (4x the holds RAM cap,
     /// resolved at page time so a later `set_holds_cap` is respected).
     pub(super) cap: AtomicU64,
@@ -165,6 +173,8 @@ impl HoldsScratch {
                 pins: 0,
             }),
             paged_total: AtomicU64::new(0),
+            #[cfg(test)]
+            locked_reads: AtomicU64::new(0),
             cap: AtomicU64::new(0),
             dead: AtomicBool::new(false),
             announced: AtomicBool::new(false),
@@ -261,6 +271,8 @@ impl HoldsScratch {
 
     /// Read a paged region back (drain paths, under some routing lock).
     pub(super) fn read(&self, off: u64, buf: &mut [u8]) -> io::Result<()> {
+        #[cfg(test)]
+        self.locked_reads.fetch_add(1, Ordering::Relaxed);
         let f = self
             .handle()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "holds scratch file missing"))?;

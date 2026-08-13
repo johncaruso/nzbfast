@@ -23,6 +23,108 @@ pub(super) struct JobTail {
     pub(super) shaper: Option<Arc<nzbkit::extract::Extractor>>,
 }
 
+/// TODO §156 item 7: the no-servers guard's config read, kept off the
+/// runner.
+///
+/// `Config::load` is a `std::fs::read`, and this loop IS the runner, so
+/// reading it inline made the guard the very hazard the disk probe below
+/// documents and defends against, about twice a second forever: a config
+/// on a dropped SMB or NFS mount blocked every pick with no hold
+/// published, which is the worst shape there is - stalled and silent.
+///
+/// Three fixes were on the table; this is the disk probe's, for the
+/// disk probe's reasons. Caching against mtime does not fix it (`stat`
+/// hangs on a dead mount exactly as `read` does, so the runner still
+/// blocks), and having the config layer publish its own changes is a
+/// watcher on every config reader in the daemon, which is a different
+/// piece of work with a much wider blast radius than one guard. Reading
+/// on the blocking pool under a timeout is what the neighbour already
+/// does, is local to this guard, and turns the hang into the answer the
+/// ladder already knows how to handle.
+#[derive(Default)]
+pub(super) struct ServerProbe {
+    /// At most one outstanding read, re-awaited next pass rather than
+    /// stacking a fresh blocked thread per pass - the disk probe's rule,
+    /// for the disk probe's reason.
+    inflight: Option<tokio::task::JoinHandle<(ServerVerdict, Option<nzbkit::config::Config>)>>,
+    /// The last answer that actually came back.
+    last: ServerVerdict,
+    /// …and the config that answer was read from, kept so the pick that
+    /// follows never takes a SECOND, unbounded read on the runner. See
+    /// `server_verdict` for what that read cost.
+    cfg: Option<Arc<nzbkit::config::Config>>,
+}
+
+impl ServerProbe {
+    /// The freshest verdict there is, without ever blocking the runner.
+    ///
+    /// A probe that does not answer within the timeout leaves `last`
+    /// ALONE rather than reporting `Unknown`: "we did not hear back" is
+    /// not news about the config, and treating it as news would take a
+    /// live hold down and announce a server that nobody has added. The
+    /// hold therefore survives a config mount dying under it, which is
+    /// the honest reading - the queue is still not going anywhere.
+    ///
+    /// Before any probe has answered `last` is `Unknown`, so a daemon
+    /// whose config hangs from the first pass stands the guard down and
+    /// lets the download report the real error, rather than holding the
+    /// queue on a guess. On a healthy filesystem the read lands in
+    /// microseconds and the first pass has its answer, so the hold's
+    /// timing is what it always was.
+    pub(super) async fn verdict(&mut self, config: &std::path::Path) -> ServerVerdict {
+        let mut probe = self.inflight.take().unwrap_or_else(|| {
+            let path = config.to_path_buf();
+            tokio::task::spawn_blocking(move || server_verdict(&path))
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(2), &mut probe).await {
+            Ok(Ok((v, cfg))) => {
+                self.last = v;
+                // A read that came back but could not be parsed leaves
+                // the last GOOD snapshot alone, exactly as it leaves the
+                // last good verdict alone: "we could not read it" is not
+                // news about the server list.
+                if let Some(cfg) = cfg {
+                    self.cfg = Some(Arc::new(cfg));
+                }
+            }
+            // A panicked probe is no answer either; drop the handle and
+            // start a fresh read next pass.
+            Ok(Err(_)) => {}
+            Err(_) => self.inflight = Some(probe),
+        }
+        self.last
+    }
+
+    /// The config behind the freshest verdict, for the pick that
+    /// follows. `None` until a probe has answered once.
+    pub(super) fn config(&self) -> Option<Arc<nzbkit::config::Config>> {
+        self.cfg.clone()
+    }
+}
+
+/// Publish a queue hold - the store first, the revision second.
+///
+/// §156 item 6: under a hold nothing is transferring, so the revision
+/// is the ONLY thing that can move the §129 1b poll's payload, and
+/// without a bump an open dashboard never draws the banner. On the
+/// TRANSITION only (`fresh`): the hold row refreshes every pass and
+/// bumping there would put the whole queue back on the wire every few
+/// seconds.
+///
+/// The ORDER is the load-bearing part (Codex sweep I, 13 Aug 2026). A
+/// poll landing between a bump and the store sees the new revision with
+/// the old hold, adopts that revision, and - because the later store
+/// carries no second bump - every matching poll after it omits the
+/// queue payload until some other state change moves the revision. The
+/// banner the bump exists to draw is then never drawn at all. Storing
+/// first makes the revision a promise the state has already kept.
+fn publish_hold(d: &Arc<Daemon>, kind: &str, a: f64, b: f64, fresh: bool) {
+    *d.queue_hold.lock_ok() = Some((kind.into(), a, b));
+    if fresh {
+        d.queue_rev.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// The M14g guard ladder, run once per pass before anything is picked.
 ///
 /// `None` means the runner must not pick this pass - the hold has already
@@ -37,6 +139,7 @@ pub(super) async fn download_guards(
     guard_reason: &mut Option<String>,
     ledger: &mut Option<QuotaLedger>,
     disk_probe: &mut Option<tokio::task::JoinHandle<Option<u64>>>,
+    server_probe: &mut ServerProbe,
 ) -> Option<bool> {
     // §129 2g: a scheduled quota_reset zeroes the window here,
     // where the ledger lives - checked before every guard so a
@@ -85,7 +188,8 @@ pub(super) async fn download_guards(
         && let Some(free) = free_now
         && free < min
     {
-        if guard_reason.as_deref() != Some("disk") {
+        let fresh = guard_reason.as_deref() != Some("disk");
+        if fresh {
             info!(
                 target: "guard",
                 "pausing: {:.1} GB free < {:.1} GB min",
@@ -116,8 +220,9 @@ pub(super) async fn download_guards(
         }
         // Refreshed every pass, not just on entry: the free
         // figure moves while the user clears space, and the row
-        // strip shows it live.
-        *d.queue_hold.lock_ok() = Some(("disk".into(), free as f64 / 1e9, min as f64 / 1e9));
+        // strip shows it live. See `publish_hold` for why the
+        // revision bump rides WITH the store rather than above it.
+        publish_hold(d, "disk", free as f64 / 1e9, min as f64 / 1e9, fresh);
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         return None;
     }
@@ -135,8 +240,16 @@ pub(super) async fn download_guards(
                  download starts when a finishing job completes",
             );
         }
-        *d.queue_hold.lock_ok() =
-            Some(("postproc".into(), lane.backlog() as f64, lane.cap() as f64));
+        // No bump, on either edge: this hold's jobs are Finishing, so
+        // `any_active` already carries the payload (see the clear edge
+        // at the bottom of this function).
+        publish_hold(
+            d,
+            "postproc",
+            lane.backlog() as f64,
+            lane.cap() as f64,
+            false,
+        );
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         return None;
     }
@@ -170,9 +283,12 @@ pub(super) async fn download_guards(
     // `continue` gate rather than a term in `only_force`.
     //
     // The condition itself, and why it is narrower than "the
-    // config did not load", is `no_enabled_servers` above.
-    if no_enabled_servers(config) {
-        if guard_reason.as_deref() != Some("noservers") {
+    // config did not load", is `server_verdict` above; why the read
+    // is not on this thread is `ServerProbe`.
+    let servers = server_probe.verdict(config).await;
+    if servers == ServerVerdict::NoneEnabled {
+        let fresh = guard_reason.as_deref() != Some("noservers");
+        if fresh {
             info!(
                 target: "guard",
                 "holding the queue: no enabled server is configured"
@@ -182,24 +298,31 @@ pub(super) async fn download_guards(
                 "servers",
                 "no servers configured - downloads wait until one is added",
             );
-            // The §129 1b poll answers `"queue": null` for a
-            // client whose revision matches unless something is
-            // actively transferring, and under this hold every
-            // job sits Queued - so the revision is the ONLY
-            // thing that can move the payload, exactly as
-            // `slowstore::bump` documents for the storage pause.
-            // Without it an open dashboard never draws the
-            // banner this hold exists to draw.
-            d.queue_rev.fetch_add(1, Ordering::Relaxed);
         }
-        *d.queue_hold.lock_ok() = Some(("noservers".into(), 0.0, 0.0));
+        // The §129 1b poll answers `"queue": null` for a client whose
+        // revision matches unless something is actively transferring,
+        // and under this hold every job sits Queued - so the revision
+        // is the ONLY thing that can move the payload, exactly as
+        // `slowstore::bump` documents for the storage pause.
+        publish_hold(d, "noservers", 0.0, 0.0, fresh);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         return None;
     }
     if guard_reason.as_deref() == Some("noservers") {
         *guard_reason = None;
         *d.queue_hold.lock_ok() = None;
-        d.note_event("clear", "a server is configured - downloads resume");
+        d.note_event(
+            "clear",
+            match servers {
+                ServerVerdict::Dialable => "a server is configured - downloads resume",
+                // The other way off this hold: the config stopped
+                // being readable, so the guard stands down and the
+                // download it releases is what reports the real
+                // error. Saying "a server is configured" here would
+                // be a plain untruth on the event list.
+                _ => "the config cannot be read - downloads resume so the error is reported",
+            },
+        );
         // The clear edge needs the bump for the same reason the
         // set edge does: nothing is transferring yet, so a
         // matching revision would leave the banner on screen.
@@ -250,7 +373,8 @@ pub(super) async fn download_guards(
     if let (Some(led), true) = (ledger.as_mut(), quota > 0)
         && led.spent() >= quota
     {
-        if guard_reason.as_deref() != Some("quota") {
+        let fresh = guard_reason.as_deref() != Some("quota");
+        if fresh {
             info!(
                 target: "guard",
                 "quota spent ({:.1} of {:.1} GB) - only Force jobs until the period rolls over",
@@ -277,8 +401,13 @@ pub(super) async fn download_guards(
             );
             d.note_event("quota", msg);
         }
-        *d.queue_hold.lock_ok() =
-            Some(("quota".into(), led.spent() as f64 / 1e9, quota as f64 / 1e9));
+        publish_hold(
+            d,
+            "quota",
+            led.spent() as f64 / 1e9,
+            quota as f64 / 1e9,
+            fresh,
+        );
         only_force = true;
     }
     if guard_reason.is_some() && !only_force {
@@ -293,6 +422,14 @@ pub(super) async fn download_guards(
         let mut h = d.queue_hold.lock_ok();
         if h.is_some() {
             *h = None;
+            // The clear edge of the disk and quota holds. It needs the
+            // bump for the same reason their set edges do: nothing is
+            // transferring yet, so a matching revision would leave the
+            // banner on screen after the hold lifted. (The postproc
+            // hold clears on its own path above and stays bump-free:
+            // its jobs are Finishing, so `any_active` already carries
+            // the payload.)
+            d.queue_rev.fetch_add(1, Ordering::Relaxed);
         }
     }
     Some(only_force)
@@ -312,7 +449,7 @@ pub(super) async fn download_guards(
 /// below carries the specific hazard it closes.
 pub(super) fn reset_hub_for_job(
     d: &Arc<Daemon>,
-    config: &std::path::Path,
+    cfg_now: Option<Arc<nzbkit::config::Config>>,
     nzo_id: &str,
     failure_host: String,
 ) {
@@ -321,8 +458,13 @@ pub(super) fn reset_hub_for_job(
     // every host with bytes LEFT its remaining budget, so the
     // pool releases it mid-run if this job spends the rest
     // (§96.5 - the exclusion alone only helps the next job).
+    //
+    // The snapshot comes from the bounded no-servers probe rather than
+    // from a fresh `Config::load` here: this function runs ON the
+    // runner with the job already marked Downloading and no fetch task
+    // to cancel yet, so a config path that stopped answering wedged the
+    // queue silently (Codex sweep H).
     {
-        let cfg_now = nzbkit::config::Config::load(config).ok();
         let mut excluded: Vec<String> = Vec::new();
         let mut budgets: std::collections::HashMap<String, u64> = Default::default();
         for s in cfg_now

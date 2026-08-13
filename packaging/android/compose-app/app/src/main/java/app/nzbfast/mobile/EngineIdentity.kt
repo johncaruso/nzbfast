@@ -13,8 +13,8 @@ import org.json.JSONObject
  * a single byte of the API key is sent to it.
  *
  * The app used to treat "ProcessBuilder.start() did not throw" as proof
- * that the daemon owned 127.0.0.1:6791, then send the persistent
- * per-install full key in `X-Api-Key` to whoever held the port and accept
+ * that the daemon owned 127.0.0.1 on a fixed port, then send the persistent
+ * per-install full key in `X-Api-Key` to whoever held it and accept
  * any non-empty version reply. Android apps share one loopback namespace,
  * so another INTERNET-capable app could pre-bind the port, record the key
  * and answer `{"version":"x"}`; the real daemon exited on EADDRINUSE while
@@ -118,12 +118,23 @@ object EngineIdentity {
     suspend fun awaitVerified(ctx: Context, tries: Int = 60, gapMs: Long = 500): Runtime? {
         repeat(tries) {
             val rt = readRuntime(ctx)
-            // The record has to describe the listener the UI will actually
-            // talk to (see Store.load), or we would prove one endpoint and
-            // then hand the key to another. Both values are ours - we pass
-            // `--port` and no TLS flag - so a mismatch means the file is
-            // stale or from a different install, and waiting is right.
-            if (rt != null && rt.port == EngineService.PORT && !rt.tls && challenge(rt)) {
+            // There is no expected port to compare against any more, and
+            // that is the point: the engine is started with `--port 0` so
+            // the OS picks, and this file is the only thing that knows the
+            // answer (EngineService). What `rt.port == PORT` used to guard
+            // was "the record describes the listener the UI will actually
+            // talk to" - and that still holds, more tightly than before,
+            // because the caller now takes its endpoint from the Runtime
+            // RETURNED here instead of deriving one separately (Store).
+            //
+            // A stale record is still rejected, by the challenge instead of
+            // by the port: the token is minted per daemon start, so an old
+            // file names a port with nothing of ours behind it, and whatever
+            // does answer there cannot produce the proof.
+            //
+            // `tls` is still checked - we pass no TLS flag, so a record
+            // claiming https is not describing our engine.
+            if (rt != null && !rt.tls && challenge(rt)) {
                 return rt
             }
             delay(gapMs)

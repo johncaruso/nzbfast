@@ -23,6 +23,9 @@
 //!   X <file-name>                          the journal's claim over this
 //!                                          file is retired (see
 //!                                          [`Journal::invalidate`])
+//!   M <slot>                               the slot demoted to a
+//!                                          materialized volume (see
+//!                                          [`Journal::record_materialized`])
 //!   ```
 //!
 //! - Crypto lines - `E`/`K`/`T`/`D` - the plaintext-once records: an
@@ -348,6 +351,42 @@ impl Journal {
             }
         }
         let _ = writeln!(out, "{letter} {slot} {list} {id}");
+        let _ = st.file.write_all(out.as_bytes());
+    }
+
+    /// Record that a slot demoted to a materialized volume, with its
+    /// reconstruction fully on disk (the extractor fires its
+    /// `MaterializedHook` only after the header stash, inner-file
+    /// read-back, and held-span drain all landed). From this line back,
+    /// every placement recorded for the slot - fragments naming inner
+    /// files the fallback deletes right after - ALSO sits at its final
+    /// offsets in the slot's own volume file, so [`parse_lines`]
+    /// rewrites them to identity form and a retry restores those
+    /// articles instead of refetching the whole post. Positional like
+    /// `X`: records appended after this line already describe the
+    /// materialized file and need no rewrite.
+    ///
+    /// `name`/`size` describe the file the demote actually created. A
+    /// PAR2 report can rename a WRITERLESS slot after its `S` line was
+    /// written, and the volume then materializes under the verified
+    /// name; recording the demote against the stale posted name pointed
+    /// every rewritten placement at a file that does not exist, so the
+    /// retry refetched a post it was already holding on disk. The demote
+    /// therefore re-states the slot's metadata first and lets the
+    /// grammar's "last S wins" rule carry it. Both lines land in ONE
+    /// write - the rewrite is only correct if the fresh `S` precedes the
+    /// `M`.
+    pub fn record_materialized(&self, slot: usize, name: &str, size: u64) {
+        use std::fmt::Write as _;
+        let dest = sanitize_filename(name);
+        let mut st = self.state.lock_ok();
+        let mut out = String::new();
+        if !dest.is_empty() {
+            st.used_names.insert(dest.clone());
+            st.slots_emitted.insert(slot);
+            let _ = writeln!(out, "S {slot} {size} {dest}");
+        }
+        let _ = writeln!(out, "M {slot}");
         let _ = st.file.write_all(out.as_bytes());
     }
 
@@ -722,6 +761,34 @@ fn parse_lines(lines: impl Iterator<Item = String>, resume: &mut ResumeState) {
             }
             let name = sanitize_filename(name);
             placed.retain(|_, (_, frags, _, _)| !frags.iter().any(|f| f.file == name));
+        } else if let Some(rest) = line.strip_prefix("M ") {
+            // Slot demoted to a materialized volume: everything recorded
+            // for it SO FAR also sits at final offsets in the slot's own
+            // file (the volume was reconstructed from those very
+            // sources, which the fallback then deleted), so rewrite the
+            // fragments to identity form. `D` records lose their crypto
+            // marking too - the reconstruction wrote POSTED bytes.
+            // Positional on purpose, mirroring `X`: a record appended
+            // after this line already describes the materialized file,
+            // and a later `X` over the volume file must still drop the
+            // rewritten placements, which now name it.
+            let Ok(mslot) = rest.trim().parse::<usize>() else {
+                continue;
+            };
+            let Some((name, _)) = slot_meta.get(&mslot) else {
+                continue; // no S yet: nothing recorded, nothing to rewrite
+            };
+            for (slot, frags, crypto_frag, crypto) in placed.values_mut() {
+                if *slot != mslot {
+                    continue;
+                }
+                for f in frags.iter_mut() {
+                    f.file = name.clone();
+                    f.file_off = f.vol_off;
+                }
+                crypto_frag.iter_mut().for_each(|c| *c = false);
+                *crypto = false;
+            }
         } else {
             resume.completed.insert(line);
         }
@@ -982,26 +1049,47 @@ pub const PARTIAL_SUFFIX: &str = ".nzbfast-partial";
 /// of the next attempt, before [`restore`] reads it, so the rename costs
 /// a resume nothing.
 ///
-/// Scope is deliberately the direct-extracted payload alone. Volume
-/// files (`.rar`, `.par2`) left by a fallback or a resumed run stay
-/// exactly as they are: they are the classic resume target, and nothing
-/// mistakes a holed `.part03.rar` for a finished download.
+/// This function's scope is payload NAMES the extraction reported; the
+/// failing finish holds the downloaded volume files the same way
+/// through [`quarantine_paths`] (TODO 159 item 1c - a failed job's
+/// partial download must not keep wearing real volume names in the
+/// output directory either). The discrimination over which downloaded
+/// files are held lives with the caller, which can tell a volume from
+/// a plain file the job proved whole.
 ///
-/// Returns `(quarantined, failed)` by name. A failure is reported, never
-/// swallowed - the caller is already failing the job, but a payload that
-/// could not be renamed is still sitting there looking real.
+/// Returns `(quarantined, failed)` by on-disk name. A failure is
+/// reported, never swallowed - the caller is already failing the job,
+/// but a payload that could not be renamed is still sitting there
+/// looking real.
 pub fn quarantine_partials(out_dir: &Path, payload: &[String]) -> (Vec<String>, Vec<String>) {
+    let paths: Vec<PathBuf> = payload
+        .iter()
+        .map(|n| out_dir.join(sanitize_filename(n)))
+        .collect();
+    quarantine_paths(&paths)
+}
+
+/// Path-level half of [`quarantine_partials`]: rename each existing
+/// file aside to `<name>.nzbfast-partial`, returning `(renamed,
+/// failed)` by file name. Callers hand it the on-disk paths a failing
+/// job must take out of circulation - the get tail's downloaded volume
+/// files - where [`quarantine_partials`] builds paths from payload
+/// names. A path already wearing the suffix is left alone, so a
+/// second pass over the same directory cannot stack suffixes.
+pub fn quarantine_paths(paths: &[PathBuf]) -> (Vec<String>, Vec<String>) {
     let (mut done, mut failed) = (Vec::new(), Vec::new());
-    for name in payload {
-        let from = out_dir.join(sanitize_filename(name));
-        if !from.exists() {
+    for from in paths {
+        let Some(name) = from.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if name.ends_with(PARTIAL_SUFFIX) || !from.exists() {
             continue;
         }
         let mut to = from.clone().into_os_string();
         to.push(PARTIAL_SUFFIX);
-        match std::fs::rename(&from, PathBuf::from(to)) {
-            Ok(()) => done.push(name.clone()),
-            Err(_) => failed.push(name.clone()),
+        match std::fs::rename(from, PathBuf::from(to)) {
+            Ok(()) => done.push(name),
+            Err(_) => failed.push(name),
         }
     }
     (done, failed)
@@ -1472,6 +1560,238 @@ mod tests {
         // Identity slot seeds too (its spans are trusted in place).
         assert!(restored.seeds.iter().any(|s| s.slot == 1));
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The materialized-volume gap, measured 13 Aug 2026: a job whose
+    /// direct extraction fell back to volumes-on-disk left complete
+    /// volume files in the output directory, but its R records named the
+    /// inner files the fallback had just deleted - so a retry refetched
+    /// the ENTIRE post. The `M` line records that the fallback put those
+    /// bytes at final offsets in the volume file, and parse rewrites the
+    /// slot's placements to identity form.
+    #[test]
+    fn materialized_slot_restores_placements_as_identity() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-journal-m-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let nzb = b"<nzb>mat</nzb>";
+
+        let (j, _) = Journal::open(&dir, nzb).unwrap();
+        // Two direct-extracted articles whose fragments name an inner
+        // file; a third on a slot that never demotes.
+        j.record_placed(
+            0,
+            "<a@x>",
+            None,
+            "vol.part01.rar",
+            20_000,
+            &[frag("inner.bin", 7_000, 3_000, 5_000)],
+        );
+        j.record_placed(
+            0,
+            "<b@x>",
+            None,
+            "vol.part01.rar",
+            20_000,
+            &[frag("inner.bin", 12_000, 8_000, 5_000)],
+        );
+        j.record_placed(
+            1,
+            "<c@x>",
+            None,
+            "vol.part02.rar",
+            20_000,
+            &[frag("inner.bin", 0, 0, 100)],
+        );
+        // The demote: slot 0's bytes reconstructed into the volume file,
+        // inner.bin deleted right after (so it does NOT exist here).
+        j.record_materialized(0, "vol.part01.rar", 20_000);
+        std::fs::write(dir.join("vol.part01.rar"), vec![0xAAu8; 20_000]).unwrap();
+        drop(j);
+
+        let (_j2, resume) = Journal::open(&dir, nzb).unwrap();
+        let restored = restore(&dir, &resume, None);
+        assert!(
+            restored.ids.contains("<a@x>") && restored.ids.contains("<b@x>"),
+            "materialized slot's articles restore as identity, no inner file needed"
+        );
+        assert!(
+            !restored.ids.contains("<c@x>"),
+            "a slot that never demoted still needs its copy source"
+        );
+        let seed = restored.seeds.iter().find(|s| s.slot == 0).unwrap();
+        assert_eq!(seed.name, "vol.part01.rar");
+        let mut spans = seed.spans.clone();
+        spans.sort();
+        assert_eq!(spans, vec![(3_000, 5_000), (8_000, 5_000)]);
+        // Identity means trusted in place: the volume's bytes are untouched.
+        assert_eq!(
+            std::fs::read(dir.join("vol.part01.rar")).unwrap(),
+            vec![0xAAu8; 20_000]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The rewrite is positional, mirroring `X`: a record appended after
+    /// the `M` line describes the file as it is now and is NOT rewritten,
+    /// and an `X` retiring the volume file after the `M` drops the
+    /// rewritten placements (which now name it).
+    /// Codex sweep D, 13 Aug 2026: a PAR2 report renames a writerless
+    /// slot after its `S` line landed, and the volume materializes
+    /// under the VERIFIED name. Replay must rewrite the slot's
+    /// placements onto the file that exists - the stale posted name
+    /// restored nothing and the retry refetched the whole post.
+    #[test]
+    fn a_materialized_slot_renamed_after_its_s_line_restores_under_the_new_name() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-journal-mren-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let nzb = b"<nzb>matren</nzb>";
+
+        let (j, _) = Journal::open(&dir, nzb).unwrap();
+        // Recorded under the obfuscated posted name…
+        j.record_placed(
+            0,
+            "<a@x>",
+            None,
+            "0Bf3qZlM8kTn4dWx",
+            20_000,
+            &[frag("inner.bin", 7_000, 3_000, 5_000)],
+        );
+        // …renamed from a PAR2 report while still writerless, then
+        // materialized under that verified name.
+        j.record_materialized(0, "verified.part01.rar", 20_000);
+        std::fs::write(dir.join("verified.part01.rar"), vec![0xAAu8; 20_000]).unwrap();
+        drop(j);
+
+        let (_j2, resume) = Journal::open(&dir, nzb).unwrap();
+        let restored = restore(&dir, &resume, None);
+        assert!(
+            restored.ids.contains("<a@x>"),
+            "the article is on disk under the verified name"
+        );
+        let seed = restored.seeds.iter().find(|s| s.slot == 0).unwrap();
+        assert_eq!(seed.name, "verified.part01.rar");
+        assert_eq!(seed.spans, vec![(3_000, 5_000)]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn materialized_rewrite_is_positional_and_x_still_retires() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-journal-mx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let nzb = b"<nzb>matx</nzb>";
+
+        // Before-M and after-M articles on the demoting slot.
+        let (j, _) = Journal::open(&dir, nzb).unwrap();
+        j.record_placed(
+            0,
+            "<pre@x>",
+            None,
+            "vol.rar",
+            10_000,
+            &[frag("gone.bin", 500, 100, 400)],
+        );
+        j.record_materialized(0, "vol.rar", 10_000);
+        j.record_placed(
+            0,
+            "<post@x>",
+            None,
+            "vol.rar",
+            10_000,
+            &[frag("gone.bin", 500, 4_000, 400)],
+        );
+        std::fs::write(dir.join("vol.rar"), vec![0u8; 10_000]).unwrap();
+        {
+            let (_j2, resume) = Journal::open(&dir, nzb).unwrap();
+            let r = restore(&dir, &resume, None);
+            assert!(r.ids.contains("<pre@x>"), "pre-M record rewrites");
+            assert!(
+                !r.ids.contains("<post@x>"),
+                "post-M record keeps its own fragment sources"
+            );
+        }
+        // Retire the volume file itself: the rewritten placements name it
+        // now, so they must drop with it.
+        j.invalidate(&["vol.rar".to_string()]).unwrap();
+        drop(j);
+        let (_j3, resume) = Journal::open(&dir, nzb).unwrap();
+        let r = restore(&dir, &resume, None);
+        assert!(
+            !r.ids.contains("<pre@x>"),
+            "X after M retires the rewritten identity placements"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A `D` (plaintext-once) record on a materialized slot rewrites to
+    /// PLAIN identity: the fallback reconstruction wrote POSTED bytes
+    /// into the volume, so no crypt facts or password are needed.
+    #[test]
+    fn materialized_slot_restores_crypto_placements_as_plain_identity() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-journal-md-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let nzb = b"<nzb>matd</nzb>";
+
+        let (j, _) = Journal::open(&dir, nzb).unwrap();
+        j.record_placed_crypto(
+            0,
+            "<d@x>",
+            None,
+            "vol.rar",
+            10_000,
+            &[frag("secret.mkv", 2_000, 1_000, 3_000)],
+            &[true],
+        );
+        j.record_materialized(0, "vol.rar", 10_000);
+        std::fs::write(dir.join("vol.rar"), vec![0u8; 10_000]).unwrap();
+        drop(j);
+
+        let (_j2, resume) = Journal::open(&dir, nzb).unwrap();
+        // No password, no E facts on disk - identity needs neither.
+        let r = restore(&dir, &resume, None);
+        assert!(
+            r.ids.contains("<d@x>"),
+            "D record restores as plain identity after materialization"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An `M` line for a slot with no records (or a truncated volume
+    /// file) must not fabricate restores: identity is still gated on the
+    /// pre-restore file length.
+    #[test]
+    fn materialized_identity_still_respects_the_length_ceiling() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-journal-ml-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let nzb = b"<nzb>matl</nzb>";
+
+        let (j, _) = Journal::open(&dir, nzb).unwrap();
+        j.record_materialized(9, "", 0); // no S line for slot 9: harmless no-op
+        j.record_placed(
+            0,
+            "<t@x>",
+            None,
+            "vol.rar",
+            10_000,
+            &[frag("gone.bin", 0, 6_000, 4_000)],
+        );
+        j.record_materialized(0, "vol.rar", 10_000);
+        // The volume survived only truncated: the identity span [6000,
+        // 10000) is past the end, so the bytes cannot be there.
+        std::fs::write(dir.join("vol.rar"), vec![0u8; 5_000]).unwrap();
+        drop(j);
+
+        let (_j2, resume) = Journal::open(&dir, nzb).unwrap();
+        let r = restore(&dir, &resume, None);
+        assert!(
+            !r.ids.contains("<t@x>"),
+            "identity past the pre-restore length must refetch"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

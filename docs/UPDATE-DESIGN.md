@@ -116,9 +116,20 @@ gh attestation verify nzbfast-<target>.tar.gz --repo nzbfast/nzbfast
 ```
 
 The attestation names the repository, the workflow file, and the commit
-digest of the tag. Work to make builds bit-for-bit repeatable is in
-progress and documented separately; we do not claim it until a released
-tag has been independently rebuilt to the same digest.
+digest of the tag. The same attestation is attached to the release as
+`nzbfast-<target>.tar.gz.intoto.jsonl`, so it can be verified from the
+downloaded files alone (`--bundle <that file>`) and archived alongside
+them.
+
+Scope, stated plainly: this covers the `nzbfast-<target>.tar.gz`
+binaries. The convenience packages - the macOS disk image and the
+Windows installer, which is what most people download - are built and
+signed through separate channels and carry no build-provenance
+attestation.
+
+Work to make builds bit-for-bit repeatable is in progress and documented
+separately; we do not claim it until a released tag has been
+independently rebuilt to the same digest.
 
 ## Verifying a download by hand
 

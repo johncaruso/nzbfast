@@ -26,6 +26,12 @@ impl Daemon {
     /// poller is not: it deletes the user's original .nzb once the job is
     /// accepted, so it needs to know the acceptance survived a restart.
     pub(in crate::serve) fn save_queue(&self) -> bool {
+        // §158 item 7: the harness's kill-here seam. Before the lock, so a
+        // dropped write holds nothing up.
+        #[cfg(test)]
+        if super::storecut::cut_here() {
+            return false;
+        }
         // API requests run on a worker pool - serialize the writes so two
         // mutations can't interleave bytes in the file. Take the IO lock
         // BEFORE snapshotting: if the snapshot were built first, a slow
@@ -35,12 +41,18 @@ impl Daemon {
         // lock makes the last writer also the one holding the newest state.
         static IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = IO.lock_ok();
-        let jobs: Vec<Value> = self
-            .queue
-            .lock_ok()
-            .iter()
-            .map(|j| job_json(&j.lock_ok()))
-            .collect();
+        // Snapshot the queue's MEMBERSHIP under the queue lock (Arc
+        // clones, O(N) pointer bumps), then serialize each job after it
+        // is released. Serializing under the queue lock held it across
+        // 14,500 job locks and JSON builds - seconds at issue #38's
+        // queue size, and every API request queues behind it. The
+        // ordering argument above still holds: both steps happen under
+        // the IO lock, so the last writer snapshots the newest state. A
+        // job that leaves the queue between the two steps is written one
+        // extra time; its own mutation site calls save_queue after the
+        // change and rewrites the file behind us.
+        let snapshot: Vec<Arc<Mutex<Job>>> = self.queue.lock_ok().iter().cloned().collect();
+        let jobs: Vec<Value> = snapshot.iter().map(|j| job_json(&j.lock_ok())).collect();
         // §129 1a: history is NOT here any more. It lives in its own
         // append-only store (`histstore.rs`), written by the sites that
         // actually change it - park, delete, retry, recategorize, the
@@ -68,6 +80,32 @@ impl Daemon {
                 false
             }
         }
+    }
+
+    /// Coalesced [`save_queue`](Self::save_queue) for the per-completion
+    /// hot path (issue #38 follow-up). Marks the queue dirty and wakes
+    /// the saver task, which debounces the burst into one write - a
+    /// completion used to rewrite a 14,500-job file four times over.
+    ///
+    /// Only for callers that never needed the write's verdict and whose
+    /// crash window was already covered: the queue restores Downloading
+    /// as Queued and replays the journal, and park's history move is
+    /// durable in history.jsonl first with load_queue deduplicating in
+    /// history's favour. Anything that needs durable-before-return (the
+    /// finalize marker, the watch poller's delete) stays on the
+    /// synchronous call.
+    ///
+    /// The revision bump is immediate so the dashboard's change handle
+    /// does not inherit the debounce delay; save_queue bumps it again
+    /// with the write, which is harmless (clients just refetch).
+    pub(in crate::serve) fn save_queue_soon(&self) {
+        if !self.saver_armed.load(Ordering::Relaxed) {
+            self.save_queue();
+            return;
+        }
+        self.queue_rev.fetch_add(1, Ordering::Relaxed);
+        self.save_soon.store(true, Ordering::Release);
+        self.save_wake.notify_one();
     }
 
     /// Reload `.spool/queue.json` at startup, re-creating the Job records.
@@ -160,33 +198,20 @@ impl Daemon {
         // job then showed as Queued AND Failed, and the queued copy
         // downloaded the whole release again (Codex sweep 12 Aug F1).
         //
-        // History wins. It is the store that was written FIRST on that path
-        // and it holds the terminal verdict, so its record is the newer
-        // fact; the queue row is a snapshot the rewrite never got to
-        // replace. The two history -> queue paths (retry, library-stream
-        // activation) are ordered to agree with this rule: they save the
-        // queue BEFORE tombstoning, so their torn state is "still in
-        // history", which this resolves the same way - back in history,
-        // retryable, never lost and never running twice.
+        // §158 resolved every such pair in history's favour, which is
+        // right for the park and quietly reverts a retry - both directions
+        // tear into the same shape, so precedence cannot tell them apart.
+        // `moveseq` can: each move stamps the copy it is moving TO with a
+        // higher `move_seq` before writing it, so the counter names the
+        // direction the last intended move was heading. See
+        // `serve/moveseq.rs`; a pair that is unstamped on both sides -
+        // every record written by 1.1.0 and earlier - ties, and a tie
+        // keeps the §158 answer.
         //
         // `routed` above is the same rule applied to records restore_records
         // moved out of the queue array; this covers the ones it leaves in
         // it, which is the case that could still run.
-        let hist_ids: std::collections::HashSet<&str> =
-            history.iter().map(|j| j.nzo_id.as_str()).collect();
-        let before = queued.len();
-        let queued: Vec<Job> = queued
-            .into_iter()
-            .filter(|j| !hist_ids.contains(j.nzo_id.as_str()))
-            .collect();
-        if queued.len() != before {
-            warn!(
-                target: "queue",
-                "{} queued record(s) were also in history - a restart caught a \
-                 queue/history move half-written; keeping the history copy",
-                before - queued.len()
-            );
-        }
+        let (queued, history, split) = moveseq::reconcile_moves(queued, history);
         let (nq, nh) = (queued.len(), history.len());
         for job in queued {
             self.register_cat(&job.category);
@@ -195,6 +220,25 @@ impl Daemon {
         for job in history {
             self.register_cat(&job.category);
             self.history.lock_ok().push(Arc::new(Mutex::new(job)));
+        }
+        // Make the resolution DURABLE rather than re-deriving it every
+        // boot. The loser is still sitting in its own store, waiting to
+        // resurrect the job the moment its winner is removed: a retry
+        // resolved in the queue's favour and then deleted from the queue
+        // would come back as a parked failure from the stale history line
+        // nothing ever tombstoned. Each store's winner is already durable
+        // in it - that is why it won - so removing the loser cannot lose
+        // anything, whichever of the two writes below is interrupted.
+        //
+        // The queue half rides on the `save_queue` further down, AFTER the
+        // id allocator has been restored: writing queue.json here would
+        // publish a fresh daemon's `next_id` of 1 over the snapshot's and
+        // hand a later job an id that already carries a stream token. The
+        // `v == None` early return below cannot have a queue half at all -
+        // no queue.json means no queue array and no legacy history array,
+        // so `queued` is empty and nothing could have lost to history.
+        if !split.reverted.is_empty() {
+            self.history_tombstone(&split.reverted);
         }
         let v = match v {
             Some(v) => v,
@@ -232,8 +276,12 @@ impl Daemon {
         if migrating || routed_any || wants_compaction {
             self.history_compact();
         }
-        if migrating {
+        // ...and the queue half of the resolution above, here because the
+        // id allocator is restored by now.
+        if migrating || !split.parked.is_empty() {
             self.save_queue();
+        }
+        if migrating {
             info!(
                 target: "queue",
                 "history moved out of queue.json into its own store ({} records)",

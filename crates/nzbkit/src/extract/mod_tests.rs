@@ -1584,6 +1584,44 @@ fn protect_sources_paged_holds_reextract_one_pass() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// GitHub issue #40: a `.cbr` comic is a RAR container whose FILE is the
+/// deliverable. The offset-0 sniff must route it Plain - materialize the
+/// comic byte-identical - never map it as a volume and explode it into
+/// loose pages. The zip twin (`comic.cbz` never attaches) is pinned in
+/// `zip.rs`; this is the RAR-family mirror.
+#[test]
+fn a_named_cbr_is_payload_and_never_extracts() {
+    let dir = tmpdir("cbr-payload");
+    let page = payload(200_000, 15);
+    let vol = fixtures::rar5_volume(&[("page01.jpg", 200_000, &page, false, false)]);
+    let ex = Extractor::new(&dir, 1, true);
+    feed(&ex, 0, "Event Leviathan 01 (2019).cbr", &vol, 8000, 44);
+    let rep = ex.finish().unwrap();
+    assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+    assert_eq!(
+        std::fs::read(dir.join("Event Leviathan 01 (2019).cbr")).unwrap(),
+        vol,
+        "the comic must materialize byte-identical"
+    );
+    assert!(
+        !dir.join("page01.jpg").exists(),
+        "no page may be extracted from a payload file"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The guard keys on the NAMED extension alone (the zip side's standing
+/// trade-off): an obfuscated post keeps the magic sniff.
+#[test]
+fn payload_names_are_final_and_archive_names_are_not() {
+    for n in ["comic.cbr", "COMIC.CBR", "book.cb7", "a b (2019).cbr"] {
+        assert!(is_final_name(n), "{n} is payload");
+    }
+    for n in ["x.rar", "x.r00", "x.7z", "x.cbr.rar", "cbr", "deadbeef"] {
+        assert!(!is_final_name(n), "{n} is not payload");
+    }
+}
+
 #[test]
 fn protect_sources_non_rar_sniff_discards() {
     let dir = tmpdir("protect-plain");
@@ -1870,4 +1908,55 @@ fn shape_tag_round_trips_through_the_wire_form() {
     );
     // An unknown token from a newer daemon still reads as itself.
     assert_eq!(shape_word("rar9"), "rar9");
+}
+
+/// TODO 159 item 1: the failed-job quarantine has to withhold ONE
+/// archive's payload without withholding its neighbours', which means
+/// asking which source volumes fed each output file. Two independent
+/// single-volume archives in one post - the advYB shape - must answer
+/// with two disjoint slot sets.
+#[test]
+fn payload_sources_name_each_archives_own_volumes() {
+    let dir = tmpdir("provenance");
+    let a = payload(120_000, 11);
+    let b = payload(90_000, 22);
+    let va = fixtures::rar5_volume(&[("one.bin", 120_000, &a, false, false)]);
+    let vb = fixtures::rar5_volume(&[("two.bin", 90_000, &b, false, false)]);
+    let ex = Extractor::new(&dir, 2, true);
+    feed(&ex, 0, "a.rar", &va, 7000, 3);
+    feed(&ex, 1, "b.rar", &vb, 7000, 5);
+    let rep = ex.finish().unwrap();
+    let names: Vec<&str> = rep.extracted.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["one.bin", "two.bin"], "{rep:?}", rep = names);
+    let src = ex.payload_sources().expect("both slots are grouped");
+    assert_eq!(src.get("one.bin"), Some(&vec![0usize]));
+    assert_eq!(src.get("two.bin"), Some(&vec![1usize]));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The multi-volume half of the same question, and the reason the map
+/// answers at GROUP granularity: an inner file split across two volumes
+/// must name BOTH, so damage to either one withholds it.
+#[test]
+fn payload_sources_name_every_volume_of_a_split_file() {
+    let dir = tmpdir("provenance-split");
+    let data = payload(300_000, 7);
+    let v1 = fixtures::rar5_volume_n(&[("big.bin", 300_000, &data[..150_000], false, true)], 0);
+    let v2 = fixtures::rar5_volume_n(&[("big.bin", 300_000, &data[150_000..], true, false)], 1);
+    let ex = Extractor::new(&dir, 2, true);
+    feed(&ex, 0, "s.part1.rar", &v1, 7000, 3);
+    feed(&ex, 1, "s.part2.rar", &v2, 7000, 4);
+    let rep = ex.finish().unwrap();
+    assert!(
+        rep.extracted.iter().any(|(n, _)| n == "big.bin"),
+        "{:?}",
+        rep.extracted
+    );
+    let src = ex.payload_sources().expect("every slot is grouped");
+    assert_eq!(
+        src.get("big.bin"),
+        Some(&vec![0usize, 1]),
+        "a split file is only whole if every volume carrying it is"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

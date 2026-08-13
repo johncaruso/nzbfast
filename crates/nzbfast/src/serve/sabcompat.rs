@@ -1334,62 +1334,31 @@ fn slot_json(
     })
 }
 
+// The pre-queue-lock reads, a child module: see sabcompat/prelock.rs.
+mod prelock;
+use prelock::{PreLock, prelock_reads};
+
 pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, String>) -> Value {
-    // The running job's live archive shape, straight off its extractor -
-    // the badge updates the moment the first volume's headers parse, long
-    // before anything is latched onto the Job at completion. Taken before
-    // the queue lock so the hub's lock is never nested inside it, and read
-    // once for the whole payload (it is matched to its owning slot below).
-    let live_shape = d
-        .hub
-        .extractor
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|(owner, ex)| ex.archive_shape().map(|sh| (owner.clone(), sh.tag())));
-    // The live "this download wants a password" owner tag (raised by the
-    // in-stream probe when an encrypted set blocked with no working
-    // candidate). Read once, matched per slot below - same pattern as
-    // live_shape, and taken before the queue lock for the same reason.
-    let pw_wanted = d.hub.password_wanted.lock_ok().clone();
-    // §77: is the health sink switched on at all? Read once for the
-    // whole payload rather than per slot.
-    let health_defer = d.post_health_defer.load(Ordering::Relaxed);
-    // Free space on the output disk, read once per payload: feeds the
-    // per-slot unpack-space check below. This is per-job arithmetic,
-    // deliberately separate from the min_free floor (which holds the
-    // whole queue and knows nothing about shapes).
-    //
-    // §91 again, and the reason this is the (free, total) walk rather
-    // than a bare `free_bytes`: SAB's header carries both numbers for
-    // the same disk, and a second statvfs of its own could report a
-    // total that its own free exceeds. `free_bytes` IS this walk with
-    // the total dropped, so nothing changes for the callers below.
-    let disk_now = disk_stat_walk(&d.out_dir());
-    let free_now = disk_now.map(|(free, _)| free);
-    // Wall-clock now, once per payload: the slots' `time_added` is
-    // derived from each job's monotonic `queued_at` against it (issue
-    // #34 - SAB carries an absolute add time and we kept only an
-    // Instant).
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Why nothing is starting, if the scheduler is holding the queue -
-    // the dashboard renders this instead of an unexplained "idle".
-    // One read of the hold, two answers off it: the dashboard's own
-    // {kind, a, b} card, and - when the kind is "quota" - the GB
-    // already spent, which is the only live view this payload has of
-    // SAB's `left_quota`.
-    let (hold, hold_quota_spent) = {
-        let h = d.queue_hold.lock_ok();
-        (
-            h.as_ref().map(|(k, a, b)| hold_json(k, *a, *b)),
-            h.as_ref()
-                .filter(|(k, _, _)| k == "quota")
-                .map(|(_, spent, _)| *spent),
-        )
-    };
+    // Everything read BEFORE the queue lock: see prelock_reads. The
+    // destructure keeps every downstream read on the inline names. This
+    // call must stay ABOVE `let q` - that ordering is the issue #38
+    // deadlock, not a style note.
+    let PreLock {
+        live_shape,
+        pw_wanted,
+        health_defer,
+        disk_now,
+        free_now,
+        now_unix,
+        hold,
+        hold_quota_spent,
+        sc,
+        activity_map,
+        active_id,
+        stall,
+        pool_view,
+        outages,
+    } = prelock_reads(d);
     let q = d.queue.lock_ok();
     // §91: the active job's progress is read fresh at every pairing with
     // a slot's state (see `active_left` below), never snapshotted up
@@ -1443,43 +1412,6 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
     // never `bytes / ~zero elapsed`.
     let speed_bps = d.current_speed_bps();
     let (peak_bps, peak_src, line_hint) = d.link_peak.chart(d.line_speed.load(Ordering::Relaxed));
-    // Prefetch sidecar state, matched by nzo_id per slot below.
-    let sc = d
-        .sidecar
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|s| (s.nzo_id.clone(), s.progress.load(Ordering::Relaxed)));
-    // Queue-row activity: the pipeline's own token per job, the hub
-    // owner, an open stall episode, and a per-server pool view - all
-    // read before the queue lock like live_shape above. The fetch
-    // refinement below (connecting/reconnecting/waiting) only ever
-    // applies to the job that owns the hub.
-    let activity_map = d.hub.activity.lock_ok().clone();
-    let active_id = d.active_stream.lock_ok().clone();
-    let stall = d.stall_since.lock_ok().clone();
-    let pool_view: Vec<(String, usize, u64)> = d
-        .hub
-        .pool_live
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|l| {
-            l.servers
-                .iter()
-                .map(|s| {
-                    (
-                        s.host.clone(),
-                        s.connected.load(Ordering::Relaxed),
-                        s.bytes.load(Ordering::Relaxed),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    // Same instant as the pool view above, and read the same way: once,
-    // before the queue lock.
-    let outages = server_outages(d);
     // SAB's queue call takes the same category filter as history (the
     // *arrs pass category=<their cat> when one is configured).
     let cat_filter = params

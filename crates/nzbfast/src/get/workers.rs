@@ -94,14 +94,23 @@ pub(super) fn flush_pending_r(
         if p.par2_main {
             journal.record(&p.id);
         } else {
-            journal.record_placed(
-                p.sidx,
-                &p.id,
-                extractor.slot_file_info(p.sidx),
-                &p.name,
-                p.size,
-                &frags,
-            );
+            let slot_file = extractor.slot_file_info(p.sidx);
+            let mut frags = frags;
+            // A parked article completing AFTER its slot demoted may mix
+            // identity fragments (the reconstruction's own writes) with
+            // fragments naming inner files the fallback just deleted -
+            // and its record lands after the slot's `M` line, past the
+            // positional rewrite. Same fact, applied at record time: the
+            // materialized volume holds every one of these bytes at its
+            // final offset.
+            if extractor.slot_materialized(p.sidx)
+                && let Some((name, _)) = slot_file.as_ref()
+            {
+                for f in frags.iter_mut() {
+                    f.rebase_identity(name);
+                }
+            }
+            journal.record_placed(p.sidx, &p.id, slot_file, &p.name, p.size, &frags);
         }
         done.push((p.sidx, p.off, end));
         false
@@ -216,14 +225,18 @@ impl Par2Race<'_> {
         let Some(&(sidx, nbytes)) = id_to_slot.get(id) else {
             return;
         };
-        // A terminal verdict arms the extractor's stalled-chase spill: a
-        // compressed set wedged behind this article's gap pages its cold
-        // frontier bytes to scratch instead of sitting fully resident to
-        // the holds cap. Idempotent past the first call.
-        self.extractor.note_article_lost();
         let sidx = sidx as usize;
         done.fetch_add(nbytes, Ordering::Relaxed);
-        self.slots[sidx].missing.fetch_add(1, Ordering::Relaxed);
+        // A terminal verdict arms the extractor's stalled-chase spill: a
+        // compressed set WEDGED behind this article's gap pages its cold
+        // frontier bytes to scratch instead of sitting fully resident to
+        // the holds cap. Once per slot, not per article (§156.3a): the
+        // marks are sticky and per-volume, so the first verdict says
+        // everything - without this gate a pool teardown sealing ~10k
+        // outstanding ids as Failed re-ran the paging pass 10k times.
+        if self.slots[sidx].missing.fetch_add(1, Ordering::Relaxed) == 0 {
+            self.extractor.note_article_lost(sidx);
+        }
         if self.slots[sidx].remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.slot_drained(sidx);
         }
@@ -687,11 +700,24 @@ pub(super) fn spawn_rate_ticker(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut last = 0u64;
+        // Divide by the REAL elapsed time, and skip missed ticks. The
+        // default interval behavior is Burst: a ticker starved of the
+        // runtime for N seconds fires every missed tick back-to-back on
+        // recovery, and the /2e6 math then printed one impossible rate
+        // (the whole gap's bytes over "2 s") followed by a page of
+        // 0.0 MB/s lines, all stamped the same microsecond (issue #38
+        // saw 24 of them, 1236.4 MB/s on a 0.44 Gbps run). One honest
+        // line per wakeup; a gap in the timestamps still shows the
+        // starvation to anyone reading the log.
+        let mut last_t = Instant::now();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await;
         loop {
             tick.tick().await;
             let now = ticker_bytes.load(Ordering::Relaxed);
+            let dt = last_t.elapsed().as_secs_f64().max(0.1);
+            last_t = Instant::now();
             let missing: usize = ticker_slots
                 .iter()
                 .map(|s| s.missing.load(Ordering::Relaxed))
@@ -703,8 +729,8 @@ pub(super) fn spawn_rate_ticker(
             };
             println!(
                 "  … {:>7.1} MB/s ({:.2} Gbps)  written {:.2} GB{miss}",
-                (now - last) as f64 / 2e6,
-                (now - last) as f64 * 8.0 / 2e9,
+                (now - last) as f64 / dt / 1e6,
+                (now - last) as f64 * 8.0 / dt / 1e9,
                 now as f64 / 1e9
             );
             last = now;

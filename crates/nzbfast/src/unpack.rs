@@ -600,386 +600,21 @@ impl Drop for ExtractStaging {
     }
 }
 
-/// Ceiling on password candidates tested per level. Each candidate costs
-/// one PBKDF2-HMAC-SHA256 derivation (2^lg2 rounds - intentionally slow),
-/// so the cap bounds the KDF work a crafted post can force: fifty
-/// candidates at the common 2^15 count run well under a second, and a real
-/// password sidecar carries one line, not fifty.
-pub(crate) const MAX_PW_CANDIDATES: usize = 50;
-
-/// Largest text sidecar scanned for passwords. A real password note
-/// (.txt/.nfo/.diz) is tiny; a multi-megabyte "nfo" is a payload file, not
-/// a hint, and re-reading it at every level would be unbounded work.
-pub(crate) const PW_SIDECAR_MAX: u64 = 64 * 1024;
-
-/// KDF-depth ceiling for UNSTRUCTURED candidates (sidecar lines, file
-/// stems - anything a crafted post can mass-produce). The iteration
-/// count comes from the archive header, so a hostile archive can demand
-/// 2^24 rounds (~10 s of PBKDF2 per candidate) and turn the candidate
-/// sweep into minutes of CPU. Above this depth only the job's own
-/// password is tried; the archive keeps today's park/unrar path on a
-/// miss. 2^19 keeps the full 50-candidate sweep in low single-digit
-/// seconds while covering every count real archivers emit by default.
-pub(crate) const PW_KDF_MAX_LG2: u8 = 19;
-
-/// Wall-clock ceiling for one level's whole candidate sweep - the
-/// total-work backstop for costs the header does not advertise (the 7z
-/// probe decodes up to 64 MB per candidate).
-pub(crate) const PW_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// May this candidate pay for a KDF this deep? Structured candidates
-/// (the operator-supplied job password) always may; harvested ones only
-/// up to [`PW_KDF_MAX_LG2`].
-pub(crate) fn kdf_candidate_allowed(lg2_count: u8, structured: bool) -> bool {
-    structured || lg2_count <= PW_KDF_MAX_LG2
+/// The named-RAR arm of [`extract_one_level`], with its two recovery
+/// rungs: destroyed or missing volumes may be rebuildable from `.rev`
+/// recovery volumes, byte-damaged ones from embedded recovery records.
+fn unpack_named_rar(dir: &std::path::Path, password: Option<&str>) -> NestOutcome {
+    if try_unrar(dir, password) {
+        return NestOutcome::Produced;
+    }
+    if try_rev_reconstruct(dir) && try_unrar(dir, password) {
+        return NestOutcome::Produced;
+    }
+    println!("extraction failed - trying recovery-record self-repair…");
+    NestOutcome::from_produced(try_rar_rr_repair(dir, password))
 }
 
-/// A harvested password candidate and where it came from (for the unlock
-/// log line: knowing the source file is the whole point of the chain).
-/// `structured` marks the operator-supplied job password - the one
-/// source a crafted post cannot mass-produce - which alone is exempt
-/// from the KDF-depth gate.
-pub(crate) struct PwCandidate {
-    pub(crate) value: String,
-    pub(crate) source: String,
-    pub(crate) structured: bool,
-}
-
-/// Harvest bounded password candidates from a level's on-disk siblings -
-/// the nested password-chain unlock, where level k's extraction drops
-/// level k+1's password in a text file beside it. Sources, most-likely
-/// first: the job's own password (M24 ordering, resolved upstream), then
-/// trimmed lines of small .txt/.nfo/.diz sidecars, then the release stem
-/// and sibling file stems. Deduped and capped at [`MAX_PW_CANDIDATES`].
-pub(crate) fn harvest_password_candidates(
-    dir: &std::path::Path,
-    provided: Option<&str>,
-) -> Vec<PwCandidate> {
-    use nzbkit::extract::release_stem;
-    let mut out: Vec<PwCandidate> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut push = |value: &str, source: &str, structured: bool, out: &mut Vec<PwCandidate>| {
-        let v = value.trim();
-        // A password line, not a paragraph of prose or a binary blob.
-        if v.is_empty() || v.chars().count() > 128 || v.contains(['\r', '\n', '\0']) {
-            return;
-        }
-        if out.len() < MAX_PW_CANDIDATES && seen.insert(v.to_string()) {
-            out.push(PwCandidate {
-                value: v.to_string(),
-                source: source.to_string(),
-                structured,
-            });
-        }
-    };
-
-    if let Some(p) = provided {
-        push(p, "job password", true, &mut out);
-    }
-
-    // The operator's own passwords file (SAB/NZBGet parity), ABOVE the
-    // scraped sidecars: curated beats harvested, the same ranking the
-    // in-stream probe applies to the same file. Structured, because the
-    // operator typed these - so the KDF-depth gate never refuses one, and
-    // a hostile post cannot price the operator's answer out of the sweep.
-    //
-    // Without this the file was reachable only from the RAR check-value
-    // probe and the post-completion unlock, so the two shapes that reach
-    // the disk ladder with no check to probe - a header-encrypted 7z, an
-    // encrypted zip - failed the job (or left it packed) with the right
-    // password sitting in a file we had already read (advQ/advP, the four-
-    // way correctness round, 12 Aug).
-    for pw in crate::smart::operator_passwords() {
-        push(&pw, "passwords file", true, &mut out);
-    }
-
-    // Small text sidecars: each line is a candidate, and a "password: xxx"
-    // / "pass = xxx" line also yields its tail (poster notes vary).
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .collect();
-    entries.sort();
-    for path in &entries {
-        let is_sidecar = path.extension().is_some_and(|x| {
-            let x = x.to_string_lossy().to_lowercase();
-            x == "txt" || x == "nfo" || x == "diz"
-        });
-        if !is_sidecar {
-            continue;
-        }
-        // symlink_metadata: a planted link must not pull text from
-        // outside the job dir (or size-check a different file than the
-        // one read below).
-        let readable = std::fs::symlink_metadata(path)
-            .map(|m| m.is_file() && m.len() <= PW_SIDECAR_MAX)
-            .unwrap_or(false);
-        if !readable {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
-        };
-        let text = String::from_utf8_lossy(&bytes);
-        let fname = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        for line in text.lines() {
-            push(line, &fname, false, &mut out);
-            if let Some(tail) = strip_password_label(line) {
-                push(tail, &fname, false, &mut out);
-            }
-            if out.len() >= MAX_PW_CANDIDATES {
-                break;
-            }
-        }
-    }
-
-    // Release stem and sibling file stems: some posters use the release
-    // name (or a same-named marker file) as the password.
-    for path in &entries {
-        if let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) {
-            let stem = release_stem(&name);
-            push(&stem, "release/sibling stem", false, &mut out);
-        }
-        if out.len() >= MAX_PW_CANDIDATES {
-            break;
-        }
-    }
-
-    out
-}
-
-/// If `line` reads like `password: xxx` / `pass = xxx` / `pw - xxx`,
-/// return the trimmed value after the label; else None.
-pub(crate) fn strip_password_label(line: &str) -> Option<&str> {
-    let t = line.trim();
-    let lower = t.to_ascii_lowercase();
-    for label in ["password", "passwort", "pass", "pwd", "pw"] {
-        if let Some(rest) = lower.strip_prefix(label) {
-            let rest = rest.trim_start();
-            if let Some(after) = rest.strip_prefix([':', '=', '-']) {
-                // Map the offset in `lower` back onto `t` (same length -
-                // ASCII lowercasing preserves byte positions).
-                let cut = t.len() - after.len();
-                let val = t[cut..].trim();
-                if !val.is_empty() {
-                    return Some(val);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// The first RAR volume in `dir` that needs a password (named or
-/// magic-bearing). Any volume of an encrypted set carries the crypt
-/// record - a multi-volume set repeats it in every volume's header - so
-/// the first match is enough to probe candidates.
-pub(crate) fn first_encrypted_rar(dir: &std::path::Path) -> Option<PathBuf> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-        .map(|e| e.path())
-        .collect();
-    paths.sort();
-    paths
-        .into_iter()
-        .find(|p| (looks_like_named_rar(p) || rar_magic(p)) && nzbkit::rar::needs_password(p))
-}
-
-/// Does this 7z container open AND decode its first file entry with
-/// `password`? Header-encrypted archives fail to open on a wrong
-/// password; data-encrypted ones open with plaintext headers and only
-/// fail on decode, so the first real entry's bytes are pulled (bounded,
-/// to a sink) to force the AES/decompress failure before we trust it.
-pub(crate) fn sevenz_password_opens(container: &std::path::Path, password: Option<&str>) -> bool {
-    use sevenz_rust2::{ArchiveReader, Password};
-    let pw = match password {
-        Some(p) if !p.is_empty() => Password::from(p),
-        _ => Password::empty(),
-    };
-    let Ok(mut reader) = ArchiveReader::open(container, pw) else {
-        return false;
-    };
-    let res = reader.for_each_entries(|entry, rd| {
-        if entry.is_directory || !entry.has_stream {
-            return Ok(true); // need a real data stream to verify the key
-        }
-        let mut sink = std::io::sink();
-        // Reading the (verification-only) first entry to end trips CRC as
-        // well as decode errors; bound it so a huge first member can't
-        // stall the probe.
-        let mut limited = std::io::Read::take(rd, 64 << 20);
-        std::io::copy(&mut limited, &mut sink)?;
-        Ok(false) // stop after the first data entry
-    });
-    res.is_ok()
-}
-
-/// Resolve the working password for this level's encrypted archive by
-/// harvesting candidates from the level's own outputs. Returns `Some(pw)`
-/// once a candidate is proven correct - RAR via the stored check value (no
-/// data decrypted), 7z via a real open+decode attempt - or `None` to keep
-/// the provided password (it already works, the set is check-less, or
-/// nothing matched: today's park behavior is preserved).
-pub(crate) fn resolve_level_password(
-    dir: &std::path::Path,
-    provided: Option<&str>,
-) -> Option<String> {
-    if let Some(rar) = first_encrypted_rar(dir) {
-        return resolve_rar_password(&rar, dir, provided);
-    }
-    // Single-container 7z only: a multi-part encrypted .7z.001 set would
-    // need joining to probe, out of scope for v1 - it keeps today's path.
-    if let Ok(jobs) = collect_sevenz_archives(dir)
-        && let Some(z) = jobs.iter().find(|p| p.len() == 1).map(|p| p[0].clone())
-        && !sevenz_password_opens(&z, None)
-    {
-        return resolve_sevenz_password(&z, dir, provided);
-    }
-    // Encrypted zip. Both schemes carry a verifier in the entry framing,
-    // so a candidate is settled without decoding a byte - which makes
-    // this the cheapest of the three probes, not the most expensive.
-    if let Some(zip) = first_encrypted_zip(dir) {
-        return resolve_zip_password(&zip, dir, provided);
-    }
-    None
-}
-
-/// The first password-protected zip container in `dir`, if any - parts
-/// in read order, so a spanned or byte-split set probes as one archive.
-pub(crate) fn first_encrypted_zip(dir: &std::path::Path) -> Option<Vec<PathBuf>> {
-    nzbkit::zip::scan(dir)
-        .into_iter()
-        .map(|f| f.parts)
-        .find(|parts| nzbkit::zip::needs_password(parts))
-}
-
-/// Candidate sweep for an encrypted zip.
-///
-/// Unlike the RAR and 7z twins this needs no wall-clock budget of its
-/// own: `password_opens` reads a salt and a two-byte verifier (AE) or a
-/// twelve-byte header (ZipCrypto) and derives one key, so a candidate
-/// costs microseconds rather than a decode - there is no cost for a
-/// hostile post to inflate. The budget stays anyway, because the
-/// candidate LIST is attacker-influenced (harvested sidecars) even when
-/// each try is cheap, and one bound is easier to reason about than a
-/// special case.
-///
-/// A ZipCrypto check byte accepts a wrong password once in 256 tries, so
-/// the winner returned here is a candidate, not a verdict: the
-/// extraction's CRC32 is what proves it, and a false accept costs one
-/// failed unpack, exactly as it did before this probe existed.
-pub(crate) fn resolve_zip_password(
-    parts: &[PathBuf],
-    dir: &std::path::Path,
-    provided: Option<&str>,
-) -> Option<String> {
-    if let Some(p) = provided
-        && nzbkit::zip::password_opens(parts, Some(p))
-    {
-        return None; // provided password already works
-    }
-    let t0 = std::time::Instant::now();
-    for cand in harvest_password_candidates(dir, provided) {
-        if t0.elapsed() > PW_PROBE_BUDGET {
-            println!("⚠ password probe budget exhausted - keeping the park path");
-            break;
-        }
-        if nzbkit::zip::password_opens(parts, Some(&cand.value)) {
-            println!(
-                "🔑 auto-unlocked {} with password from {}",
-                parts
-                    .first()
-                    .and_then(|p| p.file_name())
-                    .unwrap_or_default()
-                    .to_string_lossy(),
-                cand.source
-            );
-            return Some(cand.value);
-        }
-    }
-    None
-}
-
-pub(crate) fn resolve_rar_password(
-    rar: &std::path::Path,
-    dir: &std::path::Path,
-    provided: Option<&str>,
-) -> Option<String> {
-    use nzbkit::rar::PwVerdict;
-    let probe = nzbkit::rar::crypt_probe(rar)?;
-    // Check-less set: a wrong password can't be vetoed before it writes
-    // garbage, so we never guess - hand it to today's path (unrar, or a
-    // manual 🔑).
-    probe.check?;
-    if let Some(p) = provided
-        && matches!(probe.verify(p), PwVerdict::Verified)
-    {
-        return None; // provided password already works
-    }
-    let t0 = std::time::Instant::now();
-    for cand in harvest_password_candidates(dir, provided) {
-        // KDF cost gates: the header's iteration depth is attacker-
-        // controlled, so harvested candidates never pay for a deep
-        // derivation, and the sweep as a whole is wall-time bounded.
-        if !kdf_candidate_allowed(probe.lg2_count, cand.structured) {
-            continue;
-        }
-        if t0.elapsed() > PW_PROBE_BUDGET {
-            println!("⚠ password probe budget exhausted - keeping the park path");
-            break;
-        }
-        if matches!(probe.verify(&cand.value), PwVerdict::Verified) {
-            println!(
-                "🔑 auto-unlocked {} with password from {}",
-                rar.file_name().unwrap_or_default().to_string_lossy(),
-                cand.source
-            );
-            return Some(cand.value);
-        }
-    }
-    None
-}
-
-pub(crate) fn resolve_sevenz_password(
-    z: &std::path::Path,
-    dir: &std::path::Path,
-    provided: Option<&str>,
-) -> Option<String> {
-    if let Some(p) = provided
-        && sevenz_password_opens(z, Some(p))
-    {
-        return None; // provided password already works
-    }
-    // The 7z header does not advertise its KDF depth up front and each
-    // probe may decode up to 64 MB, so the wall-clock budget is the
-    // whole defense here.
-    let t0 = std::time::Instant::now();
-    for cand in harvest_password_candidates(dir, provided) {
-        if t0.elapsed() > PW_PROBE_BUDGET {
-            println!("⚠ password probe budget exhausted - keeping the park path");
-            break;
-        }
-        if sevenz_password_opens(z, Some(&cand.value)) {
-            println!(
-                "🔑 auto-unlocked {} with password from {}",
-                z.file_name().unwrap_or_default().to_string_lossy(),
-                cand.source
-            );
-            return Some(cand.value);
-        }
-    }
-    None
-}
-
-/// One extraction pass over `dir`, trying each format we support in turn.
+/// One extraction pass over `dir`, unpacking EVERY archive family present.
 /// `Ok(None)` = no archive present; otherwise the pass's [`NestOutcome`],
 /// which names WHICH format stopped it so only the zip gap gets forgiven.
 pub(crate) fn extract_one_level(
@@ -1003,30 +638,47 @@ pub(crate) fn extract_one_level(
     {
         nzbkit::extract::note_nested_level(depth, kind, nzbkit::extract::NestedDisposition::Disk);
     }
+    // EVERY family present is unpacked, not just the first one to match.
+    // The ladder used to return at its first claiming arm, so a directory
+    // holding a RAR set and a zip extracted the RAR and left the zip
+    // packed, unopened by any reader - which is exactly what cost the
+    // torture round's advMA two oracle leaves, and what SABnzbd and
+    // NZBGet do differently (TODO 159 item 5). The ARMS and their order
+    // are unchanged; only "return" became "record and carry on".
+    //
+    // Every family's input set is collected BEFORE anything unpacks. A
+    // collector run after an earlier arm would sweep up archives that arm
+    // just PRODUCED, extracting a nested layer at this level: that would
+    // bypass the `.nzbfast-nest` scratch dance, the depth cap and the
+    // spent-intermediate sweep, all of which exist to handle produced
+    // archives one level down. `entries_left` then drops anything an
+    // earlier arm consumed on its way through (the RAR arms delete the
+    // volumes they spend).
+    let named_rar = dir_has_named_rar(dir)?;
+    let obf = collect_obfuscated_rar_volumes(dir)?;
+    let sevenz = collect_sevenz_archives(dir)?;
+    let zips = nzbkit::zip::scan(dir);
+    let entries_left =
+        |ps: &[PathBuf]| -> Vec<PathBuf> { ps.iter().filter(|p| p.exists()).cloned().collect() };
+    let mut out: Option<NestOutcome> = None;
+    let claim = |o: NestOutcome, out: &mut Option<NestOutcome>| {
+        *out = Some(out.map_or(o, |prev| prev.and(o)));
+    };
+
     // 1. Normally-named RAR set (.rar/.rNN by name; rollover/numeric with
-    //    the Rar! magic). Native rars first (bundled unrar fallback); on
-    //    failure, missing/destroyed volumes may be rebuildable from .rev
-    //    recovery volumes, and byte-damaged ones from embedded recovery
-    //    records.
-    if dir_has_named_rar(dir)? {
-        if try_unrar(dir, password) {
-            return Ok(Some(NestOutcome::Produced));
-        }
-        if try_rev_reconstruct(dir) && try_unrar(dir, password) {
-            return Ok(Some(NestOutcome::Produced));
-        }
-        println!("extraction failed - trying recovery-record self-repair…");
-        return Ok(Some(NestOutcome::from_produced(try_rar_rr_repair(
-            dir, password,
-        ))));
+    //    the Rar! magic). Native rars first (bundled unrar fallback), then
+    //    the two recovery rungs - see `unpack_named_rar`.
+    if named_rar {
+        claim(unpack_named_rar(dir, password), &mut out);
     }
     // 2. Obfuscated RAR: extensionless files carrying the Rar! magic, with
     //    no filename order - ordered by the RAR header volume number.
-    let obf = collect_obfuscated_rar_volumes(dir)?;
+    let obf = entries_left(&obf);
     if !obf.is_empty() {
-        return Ok(Some(NestOutcome::from_produced(extract_obfuscated_rar(
-            dir, &obf, password, depth,
-        ))));
+        claim(
+            NestOutcome::from_produced(extract_obfuscated_rar(dir, &obf, password, depth)),
+            &mut out,
+        );
     }
     // 3. SFX self-extractors: an .exe/.bin/.sfx whose head embeds the RAR
     //    signature past a stub. rars scans for the offset itself; only the
@@ -1034,20 +686,32 @@ pub(crate) fn extract_one_level(
     //    an SFX): a payload's setup.exe is often a legitimate WinRAR SFX
     //    installer and must never be auto-exploded by the nested pass or
     //    the daemon's post-extraction pass.
-    if depth == 0 {
+    //
+    //    This is the ONE arm that keeps first-match precedence, and
+    //    deliberately: it runs only when neither RAR arm claimed the
+    //    directory, exactly as before. Letting it fire beside a downloaded
+    //    RAR set would widen "the post IS an SFX" to "the post also
+    //    contains one", and auto-explode an .exe posted alongside a
+    //    release - a gate the SFX work narrowed on purpose.
+    if depth == 0 && out.is_none() {
         let sfx = collect_sfx_archives(dir)?;
         if !sfx.is_empty() {
-            return Ok(Some(NestOutcome::from_produced(extract_sfx(
-                dir, &sfx, password,
-            ))));
+            claim(
+                NestOutcome::from_produced(extract_sfx(dir, &sfx, password)),
+                &mut out,
+            );
         }
     }
     // 4. 7-Zip (native, incl. split .7z.001 multipart).
-    let sevenz = collect_sevenz_archives(dir)?;
+    let sevenz: Vec<Vec<PathBuf>> = sevenz
+        .into_iter()
+        .filter(|set| set.iter().all(|p| p.exists()))
+        .collect();
     if !sevenz.is_empty() {
-        return Ok(Some(NestOutcome::from_produced(extract_sevenz(
-            dir, &sevenz, password,
-        ))));
+        claim(
+            NestOutcome::from_produced(extract_sevenz(dir, &sevenz, password)),
+            &mut out,
+        );
     }
     // 5. Zip is a KNOWN, documented gap: we cannot produce the payload, so
     //    say so instead of exiting 0 with the archive still packed.
@@ -1061,16 +725,23 @@ pub(crate) fn extract_one_level(
     //    beside a landed feature is not the same problem as a post whose
     //    entire payload is still packed - so it reports uniformly and the
     //    top-level caller decides (`unsupported_archive_present`).
-    let zips = nzbkit::zip::scan(dir);
+    let zips: Vec<_> = zips
+        .into_iter()
+        .filter(|f| f.parts.iter().all(|p| p.exists()))
+        .collect();
     if !zips.is_empty() {
         // Store and deflate cover ~99% of real zips and are built in.
         // Anything else - an exotic codec, an encrypted entry - still
         // reports as a gap rather than a failure to open, so the message
         // names what was hit and the caller can still forgive a sidecar.
         if extract_zip(dir, &zips, password) {
-            return Ok(Some(NestOutcome::Produced));
+            claim(NestOutcome::Produced, &mut out);
+        } else {
+            claim(NestOutcome::ZipGap, &mut out);
         }
-        return Ok(Some(NestOutcome::ZipGap));
+    }
+    if let Some(out) = out {
+        return Ok(Some(out));
     }
     // Nothing above claimed it, but something here still has an archive's
     // head. `Ok(None)` means "there was nothing to unpack", and the
@@ -1086,9 +757,15 @@ pub(crate) fn extract_one_level(
     // can judge that). Both sniffs here read a head signature, so a
     // legitimate SFX installer - whose RAR marker sits past its stub - is
     // not caught by this.
+    // Named payload files (`.cbr`, `.cb7`) carry an archive head by
+    // design and are exactly what this door is FOR letting out: the file
+    // is the deliverable, so "no extractor claimed it" is the job done
+    // right, not a routing failure.
     let stray = std::fs::read_dir(dir)?.flatten().find(|e| {
         let p = e.path();
-        e.file_type().is_ok_and(|t| t.is_file()) && (rar_magic(&p) || sevenz_magic(&p))
+        e.file_type().is_ok_and(|t| t.is_file())
+            && !nzbkit::extract::is_final_file(&p)
+            && (rar_magic(&p) || sevenz_magic(&p))
     });
     if let Some(e) = stray {
         println!(
@@ -1228,6 +905,11 @@ pub(crate) fn dir_has_par2(dir: &std::path::Path) -> Result<bool> {
             || file_starts_with_par2_magic(&path)
     }))
 }
+
+/// Password candidate harvesting and the per-container key probes
+/// (TODO 106 size-gate split out of this file).
+mod passwords;
+pub(crate) use passwords::*;
 
 #[cfg(test)]
 mod uncovered_hole_tests {
@@ -1455,7 +1137,12 @@ pub(crate) fn nested_archive_beside_leftovers(
                     stack.push(p);
                 }
             } else if ft.is_file() {
-                let hit = if d == dir {
+                // A payload file (`.cbr`/`.cb7`) is never a nested
+                // archive - counting one would spin up a nested pass
+                // with nothing to do.
+                let hit = if nzbkit::extract::is_final_file(&p) {
+                    false
+                } else if d == dir {
                     if looks_like_named_rar(&p) {
                         p.file_name().is_some_and(|n| {
                             !outer_stems.contains(&release_stem(&n.to_string_lossy()))
@@ -1579,13 +1266,16 @@ pub(crate) fn dir_has_named_rar(dir: &std::path::Path) -> Result<bool> {
 /// RAR volumes whose names carry NO recognized RAR extension but which
 /// start with the Rar! magic (obfuscated usenet posts strip extensions and
 /// rename volumes to hex). Only consulted when no normally-named set was
-/// found, so this never shadows the fast name-based path.
+/// found, so this never shadows the fast name-based path. A named payload
+/// file (`.cbr`) is excluded: its bytes are a RAR, but the file IS the
+/// deliverable, and this collector's caller deletes what it spends.
 pub(crate) fn collect_obfuscated_rar_volumes(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for e in std::fs::read_dir(dir)?.flatten() {
         let path = e.path();
         if e.file_type().is_ok_and(|t| t.is_file())
             && !looks_like_named_rar(&path)
+            && !nzbkit::extract::is_final_file(&path)
             && rar_magic(&path)
         {
             out.push(path);
@@ -1903,9 +1593,12 @@ pub(crate) fn sweep_spent_obfuscated(
 /// the level in front of the reporting path, and a zip that nothing ever
 /// descends into is a zip nobody ever hears about (a `Release/x.zip`
 /// produced by an outer RAR used to vanish from every log). `nzbkit::zip`
-/// keeps `.cbz`/`.epub` payloads out of that on its own.
+/// keeps `.cbz`/`.epub` payloads out of that on its own; the RAR/7z arms
+/// need the same guard here, or a `.cbr`/`.cb7` an outer archive produced
+/// becomes a nested layer and then a spent intermediate - deleted.
 pub(crate) fn is_extractable_archive(path: &std::path::Path) -> bool {
-    rar_magic(path) || sevenz_magic(path) || nzbkit::zip::is_container(path)
+    (!nzbkit::extract::is_final_file(path) && (rar_magic(path) || sevenz_magic(path)))
+        || nzbkit::zip::is_container(path)
 }
 
 /// Phase 0(b): classify the nested inner archive the disk post-pass is
@@ -1918,7 +1611,10 @@ pub(crate) fn nested_inner_kind(dir: &std::path::Path) -> Option<&'static str> {
     // or by magic (obfuscated, extensionless) - sub-classify from its head.
     for e in std::fs::read_dir(dir).ok()?.flatten() {
         let p = e.path();
-        if e.file_type().is_ok_and(|t| t.is_file()) && (looks_like_named_rar(&p) || rar_magic(&p)) {
+        if e.file_type().is_ok_and(|t| t.is_file())
+            && !nzbkit::extract::is_final_file(&p)
+            && (looks_like_named_rar(&p) || rar_magic(&p))
+        {
             return Some(classify_rar_head(&p));
         }
     }
@@ -2843,3 +2539,11 @@ pub(crate) fn nzb_age_days(date: i64) -> u32 {
 #[cfg(test)]
 #[path = "unpack/pwfile_tests.rs"]
 mod pwfile_tests;
+
+/// GitHub issue #40: a named `.cbr` comic is a RAR container whose file
+/// IS the deliverable. The ladder used to sniff it into the obfuscated
+/// arm, unpack it and delete it as a spent volume, leaving loose pages.
+/// Mirrors `nzbkit::zip`'s `comic.cbz` pins for the RAR/7z families.
+#[cfg(test)]
+#[path = "unpack/named_payload_tests.rs"]
+mod named_payload_tests;

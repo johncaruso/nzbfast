@@ -223,3 +223,98 @@ async fn a_late_head_on_a_damaged_volume_still_repairs_one_pass() {
         "small-budget output differs"
     );
 }
+
+/// TODO 160: the damage is in a PLAIN member of the recovery set, and
+/// every archive volume beside it arrived perfectly. The plain file's
+/// bad blocks must patch in place through its own writer, leaving the
+/// store set exactly where it was - one-pass, no volume on disk.
+///
+/// Before the fix the mapped-repair gate refused any damaged slot that
+/// was not `is_mapped`, so a single lost article in `notes.bin` declined
+/// the WHOLE call: every volume materialized under its PAR2 name for a
+/// disk-fed `repair_dir` and was then re-extracted from disk. That is
+/// the §156.1 A/B's leg A2 shape (one fault in a plain file, a fully
+/// intact 12-volume chase demoted with it), reduced to a store set so it
+/// runs in seconds.
+///
+/// The teeth are the two output assertions TOGETHER with the absent
+/// materialize line: `notes.bin` byte-correct proves the repair really
+/// happened rather than the damage being waved through, and the volumes
+/// missing from disk prove it happened on the mapped lane.
+#[tokio::test(flavor = "multi_thread")]
+async fn damage_in_a_plain_set_member_leaves_the_volumes_one_pass() {
+    if !have_par2() {
+        eprintln!("skipping: par2 not installed");
+        return;
+    }
+    let mut fx = Fixture::new("plain-damage-onepass");
+    let inner = payload(900_000, 7);
+    let vols = [
+        fixtures::rar5_volume_n(&[("movie.mkv", 900_000, &inner[..350_001], false, true)], 0),
+        fixtures::rar5_volume_n(
+            &[("movie.mkv", 900_000, &inner[350_001..700_001], true, true)],
+            1,
+        ),
+        fixtures::rar5_volume_n(&[("movie.mkv", 900_000, &inner[700_001..], true, false)], 2),
+    ];
+    let vol_names = ["r.part1.rar", "r.part2.rar", "r.part3.rar"];
+    for (name, vol) in vol_names.iter().zip(&vols) {
+        fx.add_file(name, vol, 60_000);
+    }
+    // The plain member: ordinary bytes, no archive shape, so it sniffs
+    // to a Plain slot and its output file IS the thing par2 covers.
+    let notes = payload(600_000, 11);
+    fx.add_file("notes.bin", &notes, 60_000);
+    let covered = ["r.part1.rar", "r.part2.rar", "r.part3.rar", "notes.bin"];
+    assert!(fx.add_par2(30, &covered, 60_000), "par2 create failed");
+
+    // One article of the PLAIN file never arrives. Every volume is clean.
+    let victim = fx
+        .articles
+        .keys()
+        .find(|k| k.contains("notes_bin") && k.ends_with("-3@mock>"))
+        .expect("victim article exists")
+        .clone();
+    let chaos = Chaos {
+        missing: [victim].into(),
+        ..Default::default()
+    };
+    let srv = MockServer::start(fx.articles.clone(), chaos).await;
+    let cfg = fx.write_config(&[&srv]);
+    let nzb = fx.write_nzb();
+    let out = fx.dir.join("out");
+
+    let (log, ok) = tokio::task::spawn_blocking(move || run_get(&cfg, &nzb, &out, &[]))
+        .await
+        .unwrap();
+    assert!(ok, "job failed:\n{log}");
+    assert!(
+        log.contains("repair complete") && log.contains("(native, mapped"),
+        "the plain file's damage did not repair through the mapping:\n{log}"
+    );
+    assert!(
+        !log.contains("mapped repair declined"),
+        "mapped repair declined:\n{log}"
+    );
+    assert!(
+        !log.contains("materializing volumes for repair"),
+        "damage in a plain member still demoted the archive set to \
+         disk:\n{log}"
+    );
+    assert_eq!(
+        std::fs::read(fx.dir.join("out").join("notes.bin")).unwrap(),
+        notes,
+        "the repaired plain file differs"
+    );
+    assert_eq!(
+        std::fs::read(fx.dir.join("out").join("movie.mkv")).unwrap(),
+        inner,
+        "extracted bytes differ"
+    );
+    for v in &vol_names {
+        assert!(
+            !fx.dir.join("out").join(v).exists(),
+            "volume {v} must not touch disk"
+        );
+    }
+}

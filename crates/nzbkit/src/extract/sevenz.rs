@@ -173,7 +173,9 @@ impl Extractor {
             inner.verify_gate.clone().map(|g| (g, slot)),
             // No scratch: the 7z reader peeks at arbitrary offsets, so
             // "beyond the gap" is not provably cold - the stalled-chase
-            // spill stays a RAR-only bargain.
+            // spill stays a RAR-only bargain. No pager for the same
+            // reason.
+            None,
             None,
         ));
         if !ctl.set.register(
@@ -338,12 +340,31 @@ impl Extractor {
         password: Option<std::sync::Arc<str>>,
     ) -> Result<(), sevenz_rust2::Error> {
         let total = ctl.set.total();
-        let src = ChainedSeekReader {
+        let mut src = ChainedSeekReader {
             set: ctl.set.clone(),
             pos: 0,
             total,
             low_water: ctl.low_water.clone(),
         };
+        // Decompression-bomb gate, the extract half of the verdict the
+        // nameprobe entry points already share (TODO 156 item 5):
+        // ArchiveReader::new buffers the declared end header whole and
+        // decodes a packed (kEncodedHeader) one with the DECLARED sizes
+        // as its only bounds, so the declaration is read through the
+        // same blocking set view and judged first. These reads block
+        // exactly where the parse itself would block (the promoted
+        // tail), so no new wait is introduced, and on any malformed
+        // shape the gate stands aside for the library's own cheap
+        // error. A refusal errors the worker out, which demotes the
+        // set: the parts materialize for the disk post-pass, whose
+        // entry points hold the same shared gate and refuse with a
+        // diagnosable reason instead of an allocation.
+        if crate::nameprobe::sevenz_disk_header_bomb(&mut src) {
+            return Err(sevenz_rust2::Error::Other(
+                "end header declares an oversized decode".into(),
+            ));
+        }
+        io::Seek::seek(&mut src, io::SeekFrom::Start(0))?;
         let pw = match &password {
             Some(p) => sevenz_rust2::Password::from(&**p),
             None => sevenz_rust2::Password::empty(),
@@ -1303,6 +1324,41 @@ mod tests {
         }
         assert_eq!(std::fs::read(dir.join("inner.7z")).unwrap(), arch);
         assert!(!dir.join("F.bin").exists(), "no half-decoded output");
+        assert_eq!(dir_files(&dir), vec!["inner.7z".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// TODO 156 item 5's extract half: a chased 7z whose packed end
+    /// header declares 512 MiB of decoded header out of 16 pack bytes
+    /// dies at the shared gate BEFORE ArchiveReader::new decodes on the
+    /// declaration's say-so, and the refusal is a demote, not a silent
+    /// no - the .7z materializes byte-exact for the (equally gated)
+    /// disk post-pass, with the refusal named in the fallback reason.
+    /// The fixture is the checked-in bomb seed, whose meaning
+    /// nameprobe's checked_in_fuzz_seeds_keep_their_meaning pins; with
+    /// the gate neutered the library errors on the garbage pack bytes
+    /// instead, so the reason assertion is what discriminates.
+    #[test]
+    fn sevenz_bomb_header_demotes_at_the_gate() {
+        let arch = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sevenz/bomb-container.7z"
+        ))
+        .unwrap();
+        let outer = store_outer("inner.7z", &arch);
+        let dir = tmpdir("7z-bomb-gate");
+        let ex = Extractor::new(&dir, 1, true);
+        feed(&ex, 0, "v.rar", &outer, 7000, 48);
+        let rep = ex.finish().unwrap();
+        assert!(
+            rep.fallbacks
+                .iter()
+                .any(|(_, w)| w.contains("oversized decode")),
+            "the gate's refusal must be the named demote reason: {:?}",
+            rep.fallbacks
+        );
+        assert!(!dir.join("F.bin").exists(), "no decoded output");
+        assert_eq!(std::fs::read(dir.join("inner.7z")).unwrap(), arch);
         assert_eq!(dir_files(&dir), vec!["inner.7z".to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }

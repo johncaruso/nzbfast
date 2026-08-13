@@ -384,37 +384,21 @@ impl Daemon {
             // its next idle tick, which is the answer worth having here.
             j.health = None;
         }
+        // §158 item 1: claim the history -> queue move BEFORE the queue
+        // write below, so the copy that write makes durable carries the
+        // higher `move_seq` and a kill before the tombstone resolves in
+        // the QUEUE's favour. Until this existed the reconciliation had
+        // only precedence to go on, and precedence quietly undid the
+        // retry - the record was still there and still retryable, but the
+        // button the user pressed had done nothing.
+        moveseq::stamp_move(&job);
         self.queue.lock_ok().push_back(job);
         drop(publish);
-        // ORDER MATTERS, and it used to be the other way round. The
-        // tombstone was appended and fsync'd first, then queue.json was
-        // rewritten independently - so a kill, an ENOSPC or an EIO between
-        // the two left the record deleted from replayed history and absent
-        // from the old queue snapshot: it existed in NEITHER store, and no
-        // amount of startup reconciliation can recover a record nothing
-        // wrote down (Codex sweep 12 Aug F1).
-        //
-        // Queue first. The torn state is now "in both stores", which
-        // `load_queue` resolves in history's favour - the retry is simply
-        // not taken and the user can press it again.
-        //
-        // And a queue write that FAILED must not be followed by the
-        // tombstone at all, or the same loss happens with no crash needed.
-        // The retry itself stands: the job is live in memory and will run,
-        // exactly as `enqueue` runs a job whose persist failed. What is
-        // given up is only its survival across a restart, and the record it
-        // reverts to is the failed one it came from.
-        if self.save_queue() {
-            // The record has LEFT history: stop it replaying there.
-            self.history_tombstone(&[nzo_id.to_string()]);
-        } else {
-            error!(
-                target: "retry",
-                "{nzo_id}: retrying now, but the queue could not be written - its \
-                 history record was left in place rather than deleted, so a restart \
-                 before the next successful save shows it failed again"
-            );
-        }
+        // Queue first, tombstone second, and never the tombstone on its
+        // own - `commit_to_queue` holds the ordering and the reasons for
+        // it, shared with the library-stream activation that moves a
+        // record the same way.
+        self.commit_to_queue(nzo_id, "retrying");
         true
     }
 }

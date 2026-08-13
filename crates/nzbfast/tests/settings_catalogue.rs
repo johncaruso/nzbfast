@@ -699,6 +699,121 @@ fn the_daemon_proves_its_identity_to_a_launcher() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--port 0` binds an OS-chosen port, and the daemon reports which one.
+///
+/// The caller that needs this cannot name a port in advance and must not
+/// guess one: the Android app's on-device engine bound a hardcoded 6791,
+/// and every app on a phone shares one loopback namespace, so a
+/// predictable port is a port a sibling app can pre-bind (TODO 158 item
+/// 4). The app passes 0 and reads the answer back out of runtime.json,
+/// which is exactly what this asserts.
+///
+/// The two ends have to agree, so both are checked against the SAME
+/// listener: runtime.json names a real port, the banner names that port,
+/// and a request to it is answered by the daemon that wrote the file.
+/// Asking for 0 and reporting 0 would satisfy any one of those alone.
+#[test]
+fn port_zero_binds_an_os_chosen_port_and_says_which() {
+    let dir = scratch("portzero");
+    let logfile = dir.join("daemon-portzero.log");
+    let out = std::fs::File::create(&logfile).unwrap();
+    let err = out.try_clone().unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_nzbfast"))
+        .env("NZBFAST_NO_ENRICH", "1")
+        .env_remove("NZBFAST_OPEN")
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(dir.join("config.json"))
+        .arg("serve")
+        .arg("--bind")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg("0")
+        .arg("--out")
+        .arg(dir.join("complete"))
+        .arg("--index-db")
+        .arg(dir.join("index.db"))
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .unwrap();
+    let mut child = KillOnDrop(child);
+
+    // No port to poll, so wait on the file that is supposed to tell us -
+    // written only once the listener exists, which is the whole contract.
+    let mut port = 0u16;
+    for _ in 0..600 {
+        let named = std::fs::read_to_string(dir.join("runtime.json"))
+            .ok()
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+            .and_then(|rt| rt["port"].as_u64())
+            .filter(|p| *p > 0);
+        if let Some(p) = named {
+            port = p as u16;
+            break;
+        }
+        assert!(
+            child.0.try_wait().ok().flatten().is_none(),
+            "the daemon exited instead of binding an OS-chosen port\n{}",
+            log(&logfile)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_ne!(
+        port,
+        0,
+        "runtime.json never named a bound port\n{}",
+        log(&logfile)
+    );
+
+    // The banner is what every launcher and harness treats as readiness,
+    // so it must name the same listener the file does - a banner reading
+    // ":0" would send a user to a port nothing serves.
+    let banner = format!("open the dashboard at  http://localhost:{port}/");
+    for _ in 0..600 {
+        if log(&logfile).contains(&banner) && TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        log(&logfile).contains(&banner),
+        "the banner does not name the bound port {port}\n{}",
+        log(&logfile)
+    );
+
+    // ...and the listener there really is this daemon: same token.
+    let rt: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("runtime.json")).unwrap()).unwrap();
+    let token = rt["token"].as_str().unwrap_or_default().to_string();
+    assert!(
+        token.len() >= 32,
+        "the token is not a credential: {token:?}"
+    );
+    let nonce = "0123456789abcdef0123456789abcdef";
+    let answer = api(port, &format!("mode=version&hs={nonce}"));
+    let want = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(token.as_bytes());
+        h.update(b":");
+        h.update(nonce.as_bytes());
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    assert_eq!(
+        answer["hs_proof"].as_str(),
+        Some(want.as_str()),
+        "the listener on the reported port is not the daemon that wrote \
+         runtime.json: {answer}"
+    );
+
+    drop(child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The recoverable-delete default follows the platform.
 ///
 /// On macOS and Windows the Trash and the Recycle Bin are places the user

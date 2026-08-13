@@ -18,6 +18,17 @@ struct SplitMember {
     pre_named: bool,
 }
 
+/// One member row of a shattered posting, as `shatter_fold_group`
+/// reads it.
+#[derive(Clone)]
+struct ShatterMember {
+    id: i64,
+    has_par2: bool,
+    first_posted: i64,
+    first_seen: i64,
+    need_parts: i64,
+}
+
 /// Escape for XML - and DROP what XML 1.0 cannot carry at all.
 ///
 /// The emitted NZB's `poster=` is the raw OVER `From:` header and
@@ -816,6 +827,372 @@ impl Index {
         )?;
         tx.commit()?;
         Ok(tfiles as usize)
+    }
+
+    /// Fold releases SHATTERED by per-article poster randomization.
+    ///
+    /// The dominant obfuscated-poster family posts one file under a
+    /// stable blob subject name while randomizing the From on every
+    /// article (and rotating the group per article on top). The
+    /// cluster key is (stem, poster, grp), so a 562-part file lands as
+    /// up to 562 one-segment release rows, each holding one article
+    /// and the true `need_parts`. Measured on a 20.5M-row live index,
+    /// 13 Aug 2026: ~19.9M dark rows are ~1.08M such postings - 97% of
+    /// all dark rows. The fold key is therefore the STEM ALONE, across
+    /// posters AND groups.
+    ///
+    /// The gates keep it narrow: every member must be dark
+    /// (`junk>=70`, unnamed, and the stem fails
+    /// `release::stem_is_a_name` - the ONE shared verdict), a
+    /// single-file row, carry a real subject part total, and agree on
+    /// that total; the stem must be at least [`SHATTER_MIN_STEM`]
+    /// chars so a generic readable-ish token ("1917", "Subs") can
+    /// never bridge two posters' unrelated files. Members' one-file
+    /// segment lists are UNIONED by part number (all rows share the
+    /// filename, so repointing rows would silently drop segments).
+    ///
+    /// Like `par2_sidecar_fold` this can never finish for good -
+    /// ingest keeps shattering new postings - so the cursor parks at
+    /// the top id and follows it. Bounded per call in time and id
+    /// space; the caller holds the index write mutex throughout.
+    /// Returns (postings folded, rows folded away, caught up).
+    pub fn shatter_fold(
+        &mut self,
+        now: i64,
+        budget: std::time::Duration,
+    ) -> rusqlite::Result<(usize, usize, bool)> {
+        const STRIDE: i64 = 100_000;
+        const SUB_STRIDE: i64 = 1_000;
+        let started = std::time::Instant::now();
+        let top: i64 = self
+            .db
+            .query_row("SELECT COALESCE(MAX(id),0) FROM releases", [], |r| r.get(0))?;
+        let mut cursor: i64 = self
+            .kv_get("shatter_fold_cursor")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        // Same id-reuse hazard as `par2_sidecar_fold`: the fold deletes
+        // rows, releases.id has no AUTOINCREMENT, and a cursor parked
+        // above the surviving maximum would never visit a recreated id.
+        if cursor > top {
+            cursor = top;
+            self.kv_set("shatter_fold_cursor", &cursor.to_string())?;
+        }
+        if cursor >= top {
+            return Ok((0, 0, true));
+        }
+        let call_top = cursor.saturating_add(STRIDE).min(top);
+        let (mut groups, mut folded) = (0usize, 0usize);
+        let mut reached_top = false;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            let hi = cursor.saturating_add(SUB_STRIDE).min(call_top);
+            // Cheap SQL prefilter; `stem_is_a_name` is the real test
+            // and runs on the Rust side. files=1 is the shattered
+            // shape (one file row holding one segment).
+            let cands: Vec<String> = {
+                let mut stmt = self.db.prepare_cached(
+                    "SELECT DISTINCT stem FROM releases
+                      WHERE id>?1 AND id<=?2 AND junk>=70 AND pre_title=''
+                        AND files=1 AND need_parts>0
+                        AND LENGTH(stem) >= 16",
+                )?;
+                stmt.query_map([cursor, hi], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for stem in cands {
+                if crate::release::stem_is_a_name(&stem) || !seen.insert(stem.clone()) {
+                    continue;
+                }
+                let (g, n) = self.shatter_fold_stem(&stem, now)?;
+                groups += g;
+                folded += n;
+            }
+            // Clamp to the surviving maximum for the same
+            // delete-and-recreate interleaving `par2_sidecar_fold`
+            // guards against.
+            let survived: i64 =
+                self.db
+                    .query_row("SELECT COALESCE(MAX(id),0) FROM releases", [], |r| r.get(0))?;
+            cursor = hi.min(survived);
+            self.kv_set("shatter_fold_cursor", &cursor.to_string())?;
+            if hi >= top {
+                reached_top = true;
+                break;
+            }
+            if hi >= call_top || started.elapsed() >= budget {
+                break;
+            }
+        }
+        let done = reached_top;
+        if done && self.kv_get("shatter_fold_lap_v1").is_none() {
+            self.kv_set("shatter_fold_lap_v1", "1")?;
+            // The folded rows are the first time this band has real
+            // sizes and times - exactly what the correlation walks
+            // score on. Re-open them once.
+            let g: u64 = self
+                .kv_get("predb_seed_gen")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            self.kv_set("predb_seed_gen", &(g + 1).to_string())?;
+        }
+        Ok((groups, folded, done))
+    }
+
+    /// Fold every posting sharing `stem`, ONE FILENAME AT A TIME.
+    ///
+    /// `release_stem` deliberately reduces `x.part01.rar`,
+    /// `x.part02.rar`, `x.vol000+01.par2` … to the same `x`: that is
+    /// what makes a set one release. The shattered dark band posts a
+    /// single file per stem, but an obfuscated multi-volume set does
+    /// not, and those volumes are DISTINCT files with their own
+    /// part-number universes. Folding them together would union two
+    /// unrelated `(1/2)`/`(2/2)` pairs under whichever filename sorted
+    /// first and delete the rest of the set - the same garbage-union
+    /// hazard the part-total class gate exists to stop, one level up.
+    /// So the filename is part of the fold key.
+    ///
+    /// Returns (postings folded, rows folded away).
+    fn shatter_fold_stem(&mut self, stem: &str, now: i64) -> rusqlite::Result<(usize, usize)> {
+        let names: Vec<String> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT DISTINCT f.filename
+                   FROM releases r JOIN files f ON f.release_id=r.id
+                  WHERE r.stem=?1 AND r.junk>=70 AND r.pre_title=''
+                    AND r.files=1 AND r.need_parts>0",
+            )?;
+            stmt.query_map([stem], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let (mut groups, mut folded) = (0usize, 0usize);
+        for name in names {
+            let n = self.shatter_fold_group(stem, &name, now)?;
+            if n > 0 {
+                groups += 1;
+                folded += n;
+            }
+        }
+        Ok((groups, folded))
+    }
+
+    /// Fold every dark single-file row wearing `stem` and holding
+    /// `fname` - across posters and groups - into the lowest-id
+    /// member, unioning their segment lists by part number. Returns
+    /// rows folded away (0 = nothing to do or the group failed a
+    /// gate).
+    fn shatter_fold_group(&mut self, stem: &str, fname: &str, now: i64) -> rusqlite::Result<usize> {
+        // Hard cap keeps the id list bounded. A posting bigger than
+        // the cap folds over successive PASSES of this same call (see
+        // the loop below): the cursor parks at the top id once the lap
+        // completes, so "it folds on a later lap" was never true for a
+        // posting that has stopped arriving.
+        const MEMBER_CAP: usize = 20_000;
+        let mut folded = 0usize;
+        loop {
+            let members: Vec<ShatterMember> = {
+                let mut stmt = self.db.prepare_cached(
+                    "SELECT r.id, r.has_par2, r.first_posted, r.first_seen, r.need_parts
+                       FROM releases r JOIN files f ON f.release_id=r.id
+                      WHERE r.stem=?1 AND r.junk>=70 AND r.pre_title=''
+                        AND r.files=1 AND r.need_parts>0 AND f.filename=?2
+                      ORDER BY r.id LIMIT ?3",
+                )?;
+                stmt.query_map(rusqlite::params![stem, fname, MEMBER_CAP as i64], |r| {
+                    Ok(ShatterMember {
+                        id: r.get(0)?,
+                        has_par2: r.get(1)?,
+                        first_posted: r.get(2)?,
+                        first_seen: r.get(3)?,
+                        need_parts: r.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?
+            };
+            let capped = members.len() >= MEMBER_CAP;
+            let n = self.shatter_fold_members(stem, fname, members, now)?;
+            folded += n;
+            // Another cap's worth may be waiting behind this one. Stop
+            // when the batch came in under the cap, or when a capped
+            // batch made no progress (a gate refused it - looping
+            // would spin).
+            if !capped || n == 0 {
+                return Ok(folded);
+            }
+        }
+    }
+
+    /// One capped batch of `shatter_fold_group`'s members.
+    fn shatter_fold_members(
+        &mut self,
+        stem: &str,
+        fname: &str,
+        members: Vec<ShatterMember>,
+        now: i64,
+    ) -> rusqlite::Result<usize> {
+        type Member = ShatterMember;
+        // The subject's "(x/y)" total is per-posting truth: members of
+        // one posting agree on it. Fold only the largest agreeing
+        // class - a disagreeing minority is a different posting that
+        // happens to reuse the stem, and unioning two part universes
+        // is the exact garbage-download hazard the ingest D3 backstop
+        // exists to stop.
+        let mut by_total: std::collections::HashMap<i64, Vec<Member>> = Default::default();
+        for m in members {
+            by_total.entry(m.need_parts).or_default().push(m);
+        }
+        let Some(class) = by_total
+            .into_values()
+            .max_by_key(|v| (v.len(), v.first().map(|m| -m.id).unwrap_or(0)))
+        else {
+            return Ok(0);
+        };
+        if class.len() < 2 {
+            return Ok(0);
+        }
+        let need = class[0].need_parts;
+        let keep = class.iter().map(|m| m.id).min().unwrap_or(0);
+        let others: Vec<i64> = class
+            .iter()
+            .map(|m| m.id)
+            .filter(|id| *id != keep)
+            .collect();
+        // Union the one-file segment lists, keep's copy winning per
+        // part, then ascending id order - deterministic under replay.
+        let mut merged: std::collections::BTreeMap<u32, (String, u64)> = Default::default();
+        let mut total_parts: i64 = 0;
+        {
+            // Every member holds `fname` - that is the fold key - so
+            // the union needs no filename reconciliation.
+            let mut stmt = self.db.prepare_cached(
+                "SELECT total_parts, segments FROM files
+                  WHERE release_id=?1 AND filename=?2",
+            )?;
+            let mut ids = vec![keep];
+            ids.extend(&others);
+            for id in ids {
+                let Some((tp, segs)) = stmt
+                    .query_row(rusqlite::params![id, fname], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .optional()?
+                else {
+                    continue;
+                };
+                total_parts = total_parts.max(tp);
+                if let Ok(v) = serde_json::from_str::<Vec<(u32, String, u64)>>(&segs) {
+                    for (n, id, b) in v {
+                        merged.entry(n).or_insert((id, b));
+                    }
+                }
+            }
+        }
+        if merged.is_empty() {
+            return Ok(0);
+        }
+        let bytes: u64 = merged.values().map(|v| v.1).sum();
+        let seg_json = serde_json::to_string(
+            &merged
+                .iter()
+                .map(|(n, (id, b))| (*n, id.clone(), *b))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let nsegs = merged.len() as i64;
+        let list = others
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let tx = self.db.unchecked_transaction()?;
+        // Merge the pesto counter range BEFORE the source rows die -
+        // aggregate MIN/MAX ignore NULLs, matching ingest's monotonic
+        // merge rule.
+        #[allow(clippy::type_complexity)]
+        let (pmin, pmax, pck, sidx, stot): (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = tx.query_row(
+            &format!(
+                "SELECT MIN(pesto_ctr_min), MAX(pesto_ctr_max), MIN(pesto_clock),
+                        MAX(sess_idx), MAX(sess_total)
+                   FROM releases WHERE id IN ({list}) OR id=?1"
+            ),
+            [keep],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
+        // All members share the filename, so the source files rows are
+        // consumed by the in-memory union above, not repointed.
+        tx.execute(
+            &format!("DELETE FROM files WHERE release_id IN ({list})"),
+            [],
+        )?;
+        tx.execute(
+            "UPDATE files SET total_parts=?2, bytes=?3, segments=?4, nsegs=?5
+              WHERE release_id=?1 AND filename=?6",
+            rusqlite::params![
+                keep,
+                total_parts.max(need),
+                bytes as i64,
+                seg_json,
+                nsegs,
+                fname
+            ],
+        )?;
+        // Stale audit rows: fragment suggestions die with the rows,
+        // and the kept row's were scored against one article's size.
+        tx.execute(
+            &format!("DELETE FROM pre_corr WHERE release_id IN ({list}) OR release_id=?1"),
+            [keep],
+        )?;
+        // The message-id keys move WITH the articles (see
+        // `split_merge_group` for why losing them would erase the
+        // strongest naming evidence the index holds).
+        tx.execute(
+            &format!("UPDATE OR IGNORE msgid_map SET release_id=?1 WHERE release_id IN ({list})"),
+            [keep],
+        )?;
+        tx.execute(&format!("DELETE FROM releases WHERE id IN ({list})"), [])?;
+        let fp = class
+            .iter()
+            .map(|m| m.first_posted)
+            .filter(|v| *v > 0)
+            .min()
+            .unwrap_or(0);
+        let fs = class.iter().map(|m| m.first_seen).min().unwrap_or(now);
+        let has_par2 = class.iter().any(|m| m.has_par2);
+        let p = crate::categories::classify(stem, &self.custom);
+        tx.execute(
+            "UPDATE releases
+                SET total_bytes=?2, files=1, complete=?3, has_par2=?4,
+                    first_posted=?5, first_seen=?6, have_parts=?7, need_parts=?8,
+                    junk=?9,
+                    pesto_ctr_min=?10, pesto_ctr_max=?11, pesto_clock=?12,
+                    sess_idx=?13, sess_total=?14
+              WHERE id=?1",
+            rusqlite::params![
+                keep,
+                bytes as i64,
+                nsegs >= need,
+                has_par2,
+                fp,
+                fs,
+                nsegs,
+                need,
+                junk_score(stem, &p, bytes, false),
+                pmin,
+                pmax,
+                pck,
+                sidx,
+                stot,
+            ],
+        )?;
+        // The stem is unchanged, so rel_fts needs no manual write; the
+        // row deletions above are covered by rel_fts_ad.
+        tx.commit()?;
+        Ok(others.len())
     }
 
     /// M31a: age-based retention. Deletes releases older than the window,

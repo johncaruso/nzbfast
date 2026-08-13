@@ -488,6 +488,78 @@ const MAX_ENTRIES: usize = 100_000;
 const SIG5: &[u8; 8] = b"Rar!\x1a\x07\x01\x00";
 const SIG4: &[u8; 7] = b"Rar!\x1a\x07\x00";
 
+/// RAR4 block type of the main archive header, and RAR5's. An archive
+/// opens with one; nothing else may stand in for it here.
+const V4_TYPE_MAIN: u8 = 0x73;
+const V5_TYPE_MAIN: u64 = 1;
+
+/// Cap on a RAR5 main header's declared size before its bytes are hashed.
+/// A real one is tens of bytes - the block intro, the archive flags, and
+/// at most a locator record - so 64 KiB is generous slack, and it bounds
+/// what one crafted size vint can make a caller checksum.
+const V5_MAIN_HEADER_MAX: u64 = 64 << 10;
+
+/// Does a real RAR archive begin at byte 0 of `bytes` - the signature AND
+/// a CRC-valid main header behind it?
+///
+/// Written for callers that found the signature by SEARCHING rather than
+/// by opening a file at offset 0, where "these seven bytes appear here" is
+/// not evidence: `Rar!\x1a\x07\x00` and the 7z magic occur as constants
+/// inside ordinary programs, so a self-extractor gate built on a substring
+/// match claims them. Measured over 1,105 real binaries on one Mac (128 of
+/// them Windows executables), a bare substring search claims 25, including
+/// binaries this project itself ships - every one of them a magic constant
+/// in the program's own code, with no archive behind it (TODO 159 item 7).
+///
+/// The header CRC is what makes the answer evidence rather than a guess:
+/// 16 bits of it in RAR4, 32 in RAR5, on top of a block type that has to
+/// be MAIN and a declared size that has to be plausible. Both dialects
+/// checksum their own headers and this reuses those checks unchanged.
+///
+/// Deliberately NOT a "can this be extracted" test - it reads one header
+/// and stops. A truncated buffer answers false, so a caller scanning a
+/// bounded window must keep enough bytes past its candidates for a whole
+/// main header to fit.
+pub fn archive_starts_here(bytes: &[u8]) -> bool {
+    if let Some(a) = bytes.strip_prefix(SIG5) {
+        // crc32 u32, header-size vint, then that many bytes of header
+        // whose FIRST vint is the block type. The CRC covers the size
+        // vint and the header data both - `parse_block_v5`'s rule.
+        if a.len() < 5 {
+            return false;
+        }
+        let stored = rd_u32(a);
+        let Some((hsize, hs_len)) = vint(&a[4..]) else {
+            return false;
+        };
+        if hsize == 0 || hsize > V5_MAIN_HEADER_MAX {
+            return false;
+        }
+        let hend = 4 + hs_len + hsize as usize;
+        if a.len() < hend {
+            return false;
+        }
+        if crc32fast::hash(&a[4..hend]) != stored {
+            return false;
+        }
+        return matches!(vint(&a[4 + hs_len..hend]), Some((V5_TYPE_MAIN, _)));
+    }
+    if let Some(a) = bytes.strip_prefix(SIG4) {
+        // Fixed intro: head_crc u16, head_type u8, flags u16, size u16.
+        if a.len() < 7 || a[2] != V4_TYPE_MAIN {
+            return false;
+        }
+        let hsize = rd_u16(&a[5..]) as usize;
+        // 13 is the main header's own fixed length; `head_size` is a u16,
+        // so it needs no upper cap.
+        if hsize < 13 || a.len() < hsize {
+            return false;
+        }
+        return matches!(v4_header_crc(a), V4HeaderCrc::Ok);
+    }
+    false
+}
+
 impl VolumeMapper {
     pub fn new(volume_size: u64) -> VolumeMapper {
         Self::with_password(volume_size, None)
@@ -1459,8 +1531,15 @@ fn parse_block_v4_at(h: &[u8], base: u64, hdr_span: Option<u64>) -> BlockResult 
     // Only on the plaintext entry: an encrypted block arrives here with
     // `hdr_span` set, and `parse_block_v4_enc_with` has already checked
     // the same CRC over the same bytes.
-    if hdr_span.is_none() && !v4_header_crc_ok(a) {
-        return BlockResult::Corrupt("v4 header CRC mismatch");
+    if hdr_span.is_none() {
+        match v4_header_crc(a) {
+            V4HeaderCrc::Ok => {}
+            V4HeaderCrc::Mismatch => return BlockResult::Corrupt("v4 header CRC mismatch"),
+            // A unix-owner sub-block is checksummed over the names in its
+            // data area, so the check waits for them like any other header
+            // field that has not arrived yet.
+            V4HeaderCrc::NeedMore => return BlockResult::NeedMore,
+        }
     }
     let span = hdr_span.unwrap_or(hsize as u64);
     // Every `next` below is arithmetic over attacker-declared fields, so
@@ -1636,13 +1715,24 @@ fn parse_block_v4_at(h: &[u8], base: u64, hdr_span: Option<u64>) -> BlockResult 
 /// 1 - 2^-16 per block.
 ///
 /// The covered range stops short of the full header for the two legacy
-/// comment shapes, where WinRAR CRCs only the fixed part - mirrored from
-/// the vendored rars fork's `header_crc_end`, which is what real archives
-/// are known to match.
-fn v4_header_crc_ok(h: &[u8]) -> bool {
+/// comment shapes, where WinRAR CRCs only the fixed part, and runs PAST it
+/// for a RAR 2.x unix-owner sub-block - mirrored from the vendored rars
+/// fork's `header_crc_end`, which is what real archives are known to match.
+enum V4HeaderCrc {
+    /// The covered range checksums to the value the header stores.
+    Ok,
+    /// It does not, so nothing the header declares is authoritative.
+    Mismatch,
+    /// The covered range runs past the bytes buffered so far. Only a
+    /// unix-owner sub-block can do this: its range extends into the data
+    /// area, which the caller has not been asked to buffer.
+    NeedMore,
+}
+
+fn v4_header_crc(h: &[u8]) -> V4HeaderCrc {
     let hsize = rd_u16(&h[5..]) as usize;
     if h.len() < hsize {
-        return false;
+        return V4HeaderCrc::Mismatch;
     }
     let btype = h[2];
     let flags = rd_u16(&h[3..]);
@@ -1652,15 +1742,38 @@ fn v4_header_crc_ok(h: &[u8]) -> bool {
     let end = match btype {
         // Main header with an old-style archive comment, and the standalone
         // comment block: fixed 13-byte coverage.
-        0x73 if flags & MHD_COMMENT != 0 => 13,
-        0x75 => 13,
+        //
+        // 13 is also these blocks' own fixed length, so a `head_size`
+        // under it declares a block too small to hold the range its CRC
+        // covers. Taking the range anyway read PAST the header: off the
+        // end of the buffer when only a short read had arrived (a panic,
+        // found 13 Aug by `rar_name_probe` fuzzing on a 10-byte 0x73
+        // header declaring `head_size` 8), or silently into the NEXT
+        // block's bytes when more had. Neither is a real archive - WinRAR
+        // never writes one, and `looks_like_v4_main` has always refused
+        // `hsize < 13` outright - so a header claiming this is not
+        // authoritative about anything.
+        0x73 if flags & MHD_COMMENT != 0 => {
+            if hsize < 13 {
+                return V4HeaderCrc::Mismatch;
+            }
+            13
+        }
+        0x75 => {
+            if hsize < 13 {
+                return V4HeaderCrc::Mismatch;
+            }
+            13
+        }
         // File header with an old-style comment: coverage stops after the
-        // salt, before the comment area.
+        // salt, before the comment area. `name_size` sits at +26 (+28 is the
+        // attribute word) - reading the wrong field here made every
+        // commented file header miss its CRC.
         0x74 | 0x7a if flags & FHD_COMMENT != 0 => {
             if h.len() < 32 {
-                return false;
+                return V4HeaderCrc::Mismatch;
             }
-            let name_size = rd_u16(&h[28..]) as usize;
+            let name_size = rd_u16(&h[26..]) as usize;
             let mut e = 32;
             if flags & FHD_LARGE != 0 {
                 e += 8;
@@ -1669,15 +1782,66 @@ fn v4_header_crc_ok(h: &[u8]) -> bool {
             if flags & FHD_SALT != 0 {
                 e += 8;
             }
-            e
+            e.min(hsize)
         }
-        _ => hsize,
+        // Unix-owner sub-block: the owner and group names live past
+        // `head_size`, and the CRC covers them. See `v4_uo_crc_extra`.
+        _ => match v4_uo_crc_extra(h, btype, flags, hsize) {
+            Some(extra) => {
+                let end = hsize + extra;
+                if end > h.len() {
+                    return V4HeaderCrc::NeedMore;
+                }
+                end
+            }
+            None => hsize,
+        },
+    };
+    // The fixed-coverage arms (13 for the comment shapes) trust nothing
+    // about the buffer: a crafted block declaring `hsize` under its own
+    // coverage passes the caller's `len >= hsize` guard and would slice
+    // past the end here (fuzz find, 13 Aug 2026 - rar_name_probe). A
+    // real comment block is never shorter than its covered range, so a
+    // range the buffer cannot contain is a header lying about its own
+    // size: Mismatch, not NeedMore (the unix-owner arm, the one shape
+    // whose coverage legitimately outruns the buffer, returned NeedMore
+    // above before this point).
+    if end < 2 || end > h.len() {
+        return V4HeaderCrc::Mismatch;
     }
-    .min(hsize);
-    if end < 2 {
-        return false;
+    if (crc32fast::hash(&h[2..end]) & 0xffff) as u16 == rd_u16(h) {
+        V4HeaderCrc::Ok
+    } else {
+        V4HeaderCrc::Mismatch
     }
-    (crc32fast::hash(&h[2..end]) & 0xffff) as u16 == rd_u16(h)
+}
+
+/// How many bytes PAST `head_size` the CRC of a RAR 2.x unix-owner
+/// sub-block (`0x77`, sub type `UO_HEAD` = `0x0101`) covers, or `None` when
+/// the block is not one.
+///
+/// The block declares an owner and a group name size but stores the names
+/// themselves in its data area. unrar reads both into the same raw header
+/// buffer before checksumming it, so the CRC WinRAR stamped covers them -
+/// checksumming only `head_size` rejects archives `rar` and `unrar` read.
+/// Keyed on the sub type, not on the data size: other sub-block flavours
+/// carry a payload their CRC does not cover. Same rule, same reasoning as
+/// the vendored fork's `unix_owner_crc_extra`.
+fn v4_uo_crc_extra(h: &[u8], btype: u8, flags: u16, hsize: usize) -> Option<usize> {
+    /// The fixed part: short header, data size (`0x77` always carries
+    /// `LONG_BLOCK`), sub type, level, and the two name sizes.
+    const SIZEOF_UOWNERHEAD: usize = 18;
+    if btype != 0x77
+        || flags & 0x8000 == 0
+        || hsize < SIZEOF_UOWNERHEAD
+        || h.len() < SIZEOF_UOWNERHEAD
+    {
+        return None;
+    }
+    if rd_u16(&h[11..]) != 0x0101 {
+        return None;
+    }
+    Some(rd_u16(&h[14..]) as usize + rd_u16(&h[16..]) as usize)
 }
 
 /// Parse one AES-128-CBC encrypted RAR4 block (`-hp`) at volume offset
@@ -1747,7 +1911,13 @@ fn parse_block_v4_enc_with(
     let chain: [u8; 16] = a[8..24].try_into().unwrap();
     rarcrypt::cbc_decrypt(&aes, &chain, &mut hdr[16..]);
     hdr.truncate(hsize);
-    if !v4_header_crc_ok(&hdr) {
+    // `NeedMore` here means a unix-owner sub-block whose trailing names were
+    // cut off by the truncate above: they are ciphertext in the data area,
+    // outside this decrypt window. It is not a password verdict, so the
+    // oracle stands down for that one block rather than calling a correct
+    // password wrong. RAR 2.x sub-blocks predate this AES schedule by two
+    // major versions, so a real archive cannot reach it.
+    if matches!(v4_header_crc(&hdr), V4HeaderCrc::Mismatch) {
         return BlockResult::BadPassword;
     }
     match parse_block_v4_at(&hdr, base, Some(8 + enc_len as u64)) {
@@ -2342,1827 +2512,13 @@ pub enum ArithGate {
 // ---------------------------------------------------------------------------
 
 #[doc(hidden)]
-pub mod fixtures {
-    use crate::rarcrypt;
-
-    /// Encode a RAR5 vint.
-    fn vint(mut v: u64, out: &mut Vec<u8>) {
-        loop {
-            let b = (v & 0x7f) as u8;
-            v >>= 7;
-            if v == 0 {
-                out.push(b);
-                break;
-            }
-            out.push(b | 0x80);
-        }
-    }
-
-    /// Header bytes (crc + size vint + header data) for one v5 block.
-    /// `extra` is appended as the header's extra area (flag 0x01).
-    fn hdr_v5(btype: u64, mut hflags: u64, body: &[u8], extra: &[u8], data_len: u64) -> Vec<u8> {
-        let mut hdr = Vec::new();
-        if !extra.is_empty() {
-            hflags |= 0x01;
-        }
-        vint(btype, &mut hdr);
-        vint(hflags, &mut hdr);
-        if !extra.is_empty() {
-            vint(extra.len() as u64, &mut hdr);
-        }
-        if hflags & 0x02 != 0 {
-            vint(data_len, &mut hdr);
-        }
-        hdr.extend_from_slice(body);
-        hdr.extend_from_slice(extra);
-        let mut sized = Vec::new();
-        vint(hdr.len() as u64, &mut sized);
-        // CRC covers the header-size vint + header data (spec).
-        let mut crc = crc32fast::Hasher::new();
-        crc.update(&sized);
-        crc.update(&hdr);
-        let mut out = Vec::new();
-        out.extend_from_slice(&crc.finalize().to_le_bytes());
-        out.extend_from_slice(&sized);
-        out.extend_from_slice(&hdr);
-        out
-    }
-
-    fn block_v5(btype: u64, hflags: u64, body: &[u8], data: &[u8], out: &mut Vec<u8>) {
-        out.extend_from_slice(&hdr_v5(btype, hflags, body, &[], data.len() as u64));
-        out.extend_from_slice(data);
-    }
-
-    /// A RAR4 volume whose MAIN HEADER carries MHD_PASSWORD (0x0080),
-    /// padded with `pad` bytes of junk standing in for encrypted blocks.
-    /// The "a password is required" shape, for probes that ask exactly
-    /// that - the junk is not real ciphertext, so a mapper GIVEN a
-    /// password rejects it; use [`rar4_volume_enc_headers`] for a set that
-    /// actually decrypts.
-    pub fn rar4_encrypted_headers(pad: usize) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(super::SIG4);
-        // The main header stays PLAINTEXT even under MHD_PASSWORD, so it
-        // carries a real CRC like any other plaintext block.
-        out.extend_from_slice(&rar4_main_header(true));
-        out.extend(std::iter::repeat_n(0xA5, pad));
-        out
-    }
-
-    /// One store-mode RAR5 volume holding the given (name, total_size,
-    /// piece, split_before, split_after) pieces. No volume-number field
-    /// (like a standalone .rar) - use [`rar5_volume_n`] for numbered sets.
-    pub fn rar5_volume(pieces: &[(&str, u64, &[u8], bool, bool)]) -> Vec<u8> {
-        let with_crc: Vec<_> = pieces
-            .iter()
-            .map(|&(n, t, p, b, a)| (n, t, p, b, a, None))
-            .collect();
-        rar5_volume_inner(&with_crc, None)
-    }
-
-    /// Numbered multi-volume member (RAR5 volume_number, 0-based).
-    pub fn rar5_volume_n(pieces: &[(&str, u64, &[u8], bool, bool)], vol_no: u64) -> Vec<u8> {
-        let with_crc: Vec<_> = pieces
-            .iter()
-            .map(|&(n, t, p, b, a)| (n, t, p, b, a, None))
-            .collect();
-        rar5_volume_inner(&with_crc, Some(vol_no))
-    }
-
-    /// Like [`rar5_volume_n`], with a stored data CRC32 per piece (file
-    /// flag 0x04) the way real archivers always write it. Per the RAR5
-    /// spec the value is the CRC32 of the whole unpacked file on an
-    /// unsplit entry and on the LAST split piece (the one unrar checks),
-    /// and of the current volume's packed piece bytes on earlier pieces
-    /// (store mode packs 1:1).
-    pub fn rar5_volume_n_crc(
-        pieces: &[(&str, u64, &[u8], bool, bool, Option<u32>)],
-        vol_no: u64,
-    ) -> Vec<u8> {
-        rar5_volume_inner(pieces, Some(vol_no))
-    }
-
-    fn rar5_volume_inner(
-        pieces: &[(&str, u64, &[u8], bool, bool, Option<u32>)],
-        vol_no: Option<u64>,
-    ) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(super::SIG5);
-        // Main archive header (type 1): archive flags vint; volume sets
-        // carry 0x01 (volume) and, past the first volume, 0x02 + number.
-        let mut main_body = Vec::new();
-        match vol_no {
-            Some(0) => vint(0x01, &mut main_body),
-            Some(n) => {
-                vint(0x03, &mut main_body);
-                vint(n, &mut main_body);
-            }
-            None => vint(0x00, &mut main_body),
-        }
-        block_v5(1, 0, &main_body, &[], &mut out);
-        for &(name, total, piece, before, after, crc) in pieces {
-            let mut body = Vec::new();
-            // File flags: no mtime, not dir; 0x04 when a data CRC rides.
-            vint(if crc.is_some() { 0x04 } else { 0 }, &mut body);
-            vint(total, &mut body); // unpacked size
-            vint(0, &mut body); // attributes
-            if let Some(c) = crc {
-                body.extend_from_slice(&c.to_le_bytes());
-            }
-            vint(0, &mut body); // compression info: method 0 = store
-            vint(0, &mut body); // host os
-            vint(name.len() as u64, &mut body);
-            body.extend_from_slice(name.as_bytes());
-            let mut hflags = 0x02; // data area present
-            if before {
-                hflags |= 0x08;
-            }
-            if after {
-                hflags |= 0x10;
-            }
-            block_v5(2, hflags, &body, piece, &mut out);
-        }
-        // End of archive (type 5) with end-flags body (0 = last volume).
-        let mut end_body = Vec::new();
-        vint(0, &mut end_body);
-        block_v5(5, 0, &end_body, &[], &mut out);
-        out
-    }
-
-    /// HOSTILE fixture: a single-file store RAR5 volume whose file block
-    /// DECLARES `declared_data` bytes of data area while only `data` is
-    /// really there, and which ends immediately after those real bytes (no
-    /// end-of-archive block - the parser would never reach it anyway).
-    /// This is the "declared size exceeds what was posted" shape: without
-    /// the volume-bounds check the cursor jumps past the volume end, the
-    /// EOF rule calls the volume complete, and a mostly-sparse
-    /// `unpacked_size`-long file ships as a successful extraction.
-    pub fn rar5_volume_oversized(
-        name: &str,
-        unpacked_size: u64,
-        data: &[u8],
-        declared_data: u64,
-    ) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(super::SIG5);
-        let mut main_body = Vec::new();
-        vint(0x00, &mut main_body);
-        block_v5(1, 0, &main_body, &[], &mut out);
-        let mut body = Vec::new();
-        vint(0, &mut body); // file flags: no CRC
-        vint(unpacked_size, &mut body);
-        vint(0, &mut body); // attributes
-        vint(0, &mut body); // compression info: store
-        vint(0, &mut body); // host os
-        vint(name.len() as u64, &mut body);
-        body.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(&hdr_v5(2, 0x02, &body, &[], declared_data));
-        out.extend_from_slice(data);
-        out
-    }
-
-    /// Stamp a RAR4 block's header CRC16 over `h[2..]` - what a real
-    /// writer does, and since the M5 fix what the plaintext parser
-    /// insists on. Every RAR4 fixture here goes through it, so a fixture
-    /// can no longer accidentally stand in for a corrupt header.
-    pub fn stamp_v4_head_crc(h: &mut [u8]) {
-        let hc = (crc32fast::hash(&h[2..]) & 0xffff) as u16;
-        h[..2].copy_from_slice(&hc.to_le_bytes());
-    }
-
-    /// Restamp the RAR4 block header starting at `off` after a test has
-    /// poked one of its fields. Since the M5 fix the plaintext parser
-    /// checks the header CRC16, so a poke left unrestamped would test
-    /// the CRC gate instead of the field the test is about.
-    pub fn restamp_v4_block(vol: &mut [u8], off: usize) {
-        let hsize = u16::from_le_bytes(vol[off + 5..off + 7].try_into().unwrap()) as usize;
-        stamp_v4_head_crc(&mut vol[off..off + hsize]);
-    }
-
-    /// Where the first block after a RAR4 volume's signature + main
-    /// header starts: 7-byte marker, 13-byte main header.
-    pub const V4_FIRST_BLOCK: usize = 20;
-
-    /// One store-mode RAR4 volume.
-    pub fn rar4_volume(pieces: &[(&str, u64, &[u8], bool, bool)]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(super::SIG4);
-        out.extend_from_slice(&rar4_main_header(false));
-        for &(name, total, piece, before, after) in pieces {
-            let mut flags: u16 = 0x8000; // add size present
-            if before {
-                flags |= 0x0001;
-            }
-            if after {
-                flags |= 0x0002;
-            }
-            let name_b = name.as_bytes();
-            let hsize = (7 + 4 + 4 + 1 + 4 + 4 + 1 + 1 + 2 + 4 + name_b.len()) as u16;
-            let mut h = Vec::with_capacity(hsize as usize);
-            h.extend_from_slice(&0u16.to_le_bytes()); // head crc, stamped below
-            h.push(0x74);
-            h.extend_from_slice(&flags.to_le_bytes());
-            h.extend_from_slice(&hsize.to_le_bytes());
-            h.extend_from_slice(&(piece.len() as u32).to_le_bytes()); // add size
-            h.extend_from_slice(&(total as u32).to_le_bytes()); // unp size
-            h.push(0); // host
-            // Whole-file CRC32 (RAR4 header field). Only a complete, single
-            // piece can carry it here - a split piece's real whole-file CRC
-            // spans data this call doesn't hold, so leave those 0. The parser
-            // reads a 0 field as "not computed" (see `file_crc`), so a split
-            // fixture exercises mapping without tripping the output-CRC gate.
-            // Real writers put the whole-file CRC on the FINAL fragment
-            // (vendor/rars/src/rar15_40/write.rs); a multi-volume test of the
-            // gate itself therefore needs a fixture that can set it.
-            let crc = if !before && !after {
-                crc32fast::hash(piece)
-            } else {
-                0
-            };
-            h.extend_from_slice(&crc.to_le_bytes()); // crc
-            h.extend_from_slice(&0u32.to_le_bytes()); // time
-            h.push(29); // unp_ver
-            h.push(0x30); // method: store
-            h.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
-            h.extend_from_slice(&0u32.to_le_bytes()); // attr
-            h.extend_from_slice(name_b);
-            stamp_v4_head_crc(&mut h);
-            out.extend_from_slice(&h);
-            out.extend_from_slice(piece);
-        }
-        out.extend_from_slice(&rar4_end_block());
-        out
-    }
-
-    // -- encrypted RAR4 fixtures (mirror what the vendored rars writer
-    //    emits for `-m0 -p`/`-hp`, which testdata/rar4/ pins against
-    //    `unrar t`) --
-
-    /// One inner file encrypted the way RAR4 does it: ONE AES-128-CBC
-    /// stream over the whole file from the key schedule's own IV,
-    /// zero-padded to 16 at the very end. Volumes carve arbitrary byte
-    /// ranges out of `cipher` and repeat the same salt in every header.
-    pub struct EncFile4 {
-        pub(crate) plain_len: u64,
-        pub cipher: Vec<u8>,
-        pub(crate) salt: [u8; 8],
-        /// CRC32 of the PLAINTEXT - what a RAR4 header stores, and the
-        /// only thing that can adjudicate the password at finish.
-        pub(crate) crc: u32,
-    }
-
-    /// Encrypt `plain` as one RAR4 file stream.
-    pub fn encrypt_file_v4(password: &str, plain: &[u8], seed: u8) -> EncFile4 {
-        let salt: [u8; 8] = seed16(seed, 7)[..8].try_into().unwrap();
-        let keys = rarcrypt::derive_keys_v4(password, Some(salt));
-        let mut cipher = plain.to_vec();
-        cipher.resize(rarcrypt::align16(plain.len() as u64) as usize, 0);
-        rarcrypt::CbcEncStream::new(&rarcrypt::AesKey::Aes128(keys.key), &keys.iv)
-            .encrypt(&mut cipher);
-        EncFile4 {
-            plain_len: plain.len() as u64,
-            cipher,
-            salt,
-            crc: crc32fast::hash(plain),
-        }
-    }
-
-    type EncPiece4<'a> = (&'a str, &'a EncFile4, std::ops::Range<usize>, bool, bool);
-
-    /// A RAR4 file-header block for one encrypted piece, WITHOUT the data
-    /// area. `head_crc` is filled in for real: the `-hp` reader checks it,
-    /// and it is what tells a wrong password from a real header.
-    fn rar4_enc_file_header(piece: &EncPiece4<'_>) -> Vec<u8> {
-        let (name, f, range, before, after) = piece;
-        let mut flags: u16 = 0x8000 | 0x0004 | super::FHD_SALT; // add size, encrypted, salt
-        if *before {
-            flags |= 0x0001;
-        }
-        if *after {
-            flags |= 0x0002;
-        }
-        let name_b = name.as_bytes();
-        let hsize = (32 + name_b.len() + 8) as u16;
-        let mut h = Vec::with_capacity(hsize as usize);
-        h.extend_from_slice(&0u16.to_le_bytes()); // head crc, patched below
-        h.push(0x74);
-        h.extend_from_slice(&flags.to_le_bytes());
-        h.extend_from_slice(&hsize.to_le_bytes());
-        h.extend_from_slice(&(range.len() as u32).to_le_bytes()); // packed
-        h.extend_from_slice(&(f.plain_len as u32).to_le_bytes()); // unpacked
-        h.push(3); // host os
-        // Real writers stamp the WHOLE-FILE plaintext CRC on the final
-        // fragment only; earlier fragments describe their own volume's
-        // packed bytes (vendor/rars/src/rar15_40/write.rs).
-        let crc = if *after {
-            crc32fast::hash(&f.cipher[range.clone()])
-        } else {
-            f.crc
-        };
-        h.extend_from_slice(&crc.to_le_bytes());
-        h.extend_from_slice(&0u32.to_le_bytes()); // time
-        h.push(29); // unp_ver: RAR 2.9 = the AES-128 schedule
-        h.push(0x30); // method: store
-        h.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
-        h.extend_from_slice(&0u32.to_le_bytes()); // attr
-        h.extend_from_slice(name_b);
-        h.extend_from_slice(&f.salt);
-        let hc = (crc32fast::hash(&h[2..]) & 0xffff) as u16;
-        h[..2].copy_from_slice(&hc.to_le_bytes());
-        h
-    }
-
-    fn rar4_end_block() -> Vec<u8> {
-        let mut h = vec![0u8, 0];
-        h.push(0x7b);
-        h.extend_from_slice(&0u16.to_le_bytes());
-        h.extend_from_slice(&7u16.to_le_bytes());
-        let hc = (crc32fast::hash(&h[2..]) & 0xffff) as u16;
-        h[..2].copy_from_slice(&hc.to_le_bytes());
-        h
-    }
-
-    fn rar4_main_header(password_flag: bool) -> Vec<u8> {
-        let mut h = vec![0u8, 0];
-        h.push(0x73);
-        h.extend_from_slice(&(if password_flag { 0x0080u16 } else { 0 }).to_le_bytes());
-        h.extend_from_slice(&13u16.to_le_bytes());
-        h.extend_from_slice(&[0u8; 6]); // reserved
-        let hc = (crc32fast::hash(&h[2..]) & 0xffff) as u16;
-        h[..2].copy_from_slice(&hc.to_le_bytes());
-        h
-    }
-
-    /// Encrypted-DATA RAR4 volume (`rar -m0 -p…` shape): plaintext
-    /// headers, AES-128-CBC file data.
-    pub fn rar4_volume_enc(pieces: &[EncPiece4<'_>]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(super::SIG4);
-        out.extend_from_slice(&rar4_main_header(false));
-        for p in pieces {
-            out.extend_from_slice(&rar4_enc_file_header(p));
-            out.extend_from_slice(&p.1.cipher[p.2.clone()]);
-        }
-        out.extend_from_slice(&rar4_end_block());
-        out
-    }
-
-    /// Encrypted-HEADER RAR4 volume (`rar -m0 -hp…` shape): the marker and
-    /// main header stay plaintext (that is how the MHD_PASSWORD flag is
-    /// readable at all), and every block after them is an 8-byte salt
-    /// followed by its own AES-128-CBC stream padded to 16.
-    pub fn rar4_volume_enc_headers(pieces: &[EncPiece4<'_>], password: &str, seed: u8) -> Vec<u8> {
-        let salt: [u8; 8] = seed16(seed, 8)[..8].try_into().unwrap();
-        let keys = rarcrypt::derive_keys_v4(password, Some(salt));
-        let aes = rarcrypt::AesKey::Aes128(keys.key);
-        let mut out = Vec::new();
-        out.extend_from_slice(super::SIG4);
-        out.extend_from_slice(&rar4_main_header(true));
-        let wrap = |hdr: Vec<u8>, out: &mut Vec<u8>| {
-            let mut cipher = hdr;
-            cipher.resize(rarcrypt::align16(cipher.len() as u64) as usize, 0);
-            rarcrypt::CbcEncStream::new(&aes, &keys.iv).encrypt(&mut cipher);
-            out.extend_from_slice(&salt);
-            out.extend_from_slice(&cipher);
-        };
-        for p in pieces {
-            wrap(rar4_enc_file_header(p), &mut out);
-            out.extend_from_slice(&p.1.cipher[p.2.clone()]);
-        }
-        wrap(rar4_end_block(), &mut out);
-        out
-    }
-
-    // -- encrypted RAR5 fixtures (mirror what real `rar -m0 -p/-hp`
-    //    emits; the format facts are pinned by the testdata KATs) --
-
-    /// One inner file encrypted the way RAR5 does it: ONE AES-256-CBC
-    /// stream over the whole file, zero-padded to 16 at the very end.
-    /// Volumes carve arbitrary byte ranges out of `cipher` and repeat the
-    /// same (salt, iv, check) in every piece's header.
-    pub struct EncFile {
-        pub(crate) plain_len: u64,
-        pub cipher: Vec<u8>,
-        pub(crate) lg2_count: u8,
-        pub(crate) salt: [u8; 16],
-        pub(crate) iv: [u8; 16],
-        pub(crate) check: [u8; 12],
-        /// Plaintext CRC32 written into the file header (flag 0x04) when
-        /// `with_crc` is set - exercises the post-decrypt verify path.
-        pub(crate) crc: u32,
-        pub(crate) with_crc: bool,
-        /// Set the crypt record's tweaked-checksum flag (0x02): the stored
-        /// CRC is then treated as untrustworthy for a plain comparison.
-        pub(crate) tweaked: bool,
-        /// Omit the password-check value (crypt flag 0x01 cleared) - the
-        /// rare WinRAR "don't store password check" case.
-        pub(crate) no_check: bool,
-        /// Write an FHEXTRA_HASH record (type 0x02) carrying a BLAKE2sp
-        /// digest - `rar a -htb`. Set WITHOUT `with_crc` this is the
-        /// hash-only shape: a plaintext check nzbkit cannot compute, so no
-        /// in-stream path may publish the output. The digest bytes are
-        /// arbitrary here: nothing in nzbkit hashes plaintext, so what the
-        /// tests exercise is the ROUTING, not a comparison.
-        pub(crate) with_hash: bool,
-        /// The password these parameters were derived from - needed to
-        /// re-derive `hash_key` when `tweaked` folds the stored CRC.
-        pub password: String,
-    }
-
-    /// Deterministic 16 bytes from a seed (fixtures must be reproducible).
-    fn seed16(seed: u8, tweak: u8) -> [u8; 16] {
-        let mut b = [0u8; 16];
-        for (i, x) in b.iter_mut().enumerate() {
-            *x = (i as u8)
-                .wrapping_mul(37)
-                .wrapping_add(seed)
-                .wrapping_mul(59)
-                .wrapping_add(tweak);
-        }
-        b
-    }
-
-    /// Encrypt `plain` as one RAR5 file stream. `lg2_count` 12 keeps test
-    /// KDFs fast; real archives use 15.
-    pub fn encrypt_file(password: &str, plain: &[u8], seed: u8) -> EncFile {
-        let lg2_count = 12u8;
-        let salt = seed16(seed, 1);
-        let iv = seed16(seed, 2);
-        let keys = rarcrypt::derive_keys(password, &salt, lg2_count).unwrap();
-        let mut cipher = plain.to_vec();
-        cipher.resize(rarcrypt::align16(plain.len() as u64) as usize, 0);
-        rarcrypt::CbcEncStream::new(&keys.aes(), &iv).encrypt(&mut cipher);
-        EncFile {
-            plain_len: plain.len() as u64,
-            cipher,
-            lg2_count,
-            salt,
-            iv,
-            check: rarcrypt::make_check(&keys),
-            crc: crc32fast::hash(plain),
-            with_crc: false,
-            tweaked: false,
-            no_check: false,
-            with_hash: false,
-            password: password.to_string(),
-        }
-    }
-
-    /// The file-encryption extra record (type 0x01) for `f`, plus the
-    /// file-hash record (type 0x02) when `f.with_hash` and this is the
-    /// TAIL piece.
-    ///
-    /// Tail-only for the same reason the CRC32 is: a whole-file check
-    /// describes the whole file, and real RAR5 writes it on the unsplit
-    /// entry or the last fragment. A fixture that stamped it on every
-    /// piece would be testing a shape no archive has - and here it is
-    /// worse than cosmetic, because `instream_decrypt_allowed` reads the
-    /// check fields PER PIECE, so a head that disagrees with its tail
-    /// routes half of one output through a different path.
-    fn crypt_extra(f: &EncFile, tail: bool) -> Vec<u8> {
-        let mut body = Vec::new();
-        vint(0x01, &mut body); // record type: encryption
-        vint(0, &mut body); // version
-        let cflags = if f.no_check { 0 } else { 0x01 } | if f.tweaked { 0x02 } else { 0 };
-        vint(cflags, &mut body); // flags: [check value present] [+ tweaked]
-        body.push(f.lg2_count);
-        body.extend_from_slice(&f.salt);
-        body.extend_from_slice(&f.iv);
-        if !f.no_check {
-            body.extend_from_slice(&f.check);
-        }
-        let mut out = Vec::new();
-        vint(body.len() as u64, &mut out);
-        out.extend_from_slice(&body);
-        if f.with_hash && tail {
-            let mut h = Vec::new();
-            vint(0x02, &mut h); // record type: file hash
-            vint(0, &mut h); // hash type: BLAKE2sp
-            h.extend_from_slice(&[0xAB; 32]);
-            vint(h.len() as u64, &mut out);
-            out.extend_from_slice(&h);
-        }
-        out
-    }
-
-    /// (header bytes, data bytes) for every block of an encrypted-data
-    /// volume. `pieces` = (name, file, cipher range, split_before,
-    /// split_after).
-    type EncPiece<'a> = (&'a str, &'a EncFile, std::ops::Range<usize>, bool, bool);
-
-    fn enc_volume_blocks(pieces: &[EncPiece<'_>], vol_no: Option<u64>) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut blocks = Vec::new();
-        let mut main_body = Vec::new();
-        match vol_no {
-            Some(0) => vint(0x01, &mut main_body),
-            Some(n) => {
-                vint(0x03, &mut main_body);
-                vint(n, &mut main_body);
-            }
-            None => vint(0x00, &mut main_body),
-        }
-        blocks.push((hdr_v5(1, 0, &main_body, &[], 0), Vec::new()));
-        for (name, f, range, before, after) in pieces {
-            let mut body = Vec::new();
-            // Real RAR5 writes the WHOLE-FILE checksum on the unsplit
-            // entry and on the LAST split piece only; earlier pieces
-            // describe their own volume's bytes. Fixtures that stamped
-            // the whole-file value on every piece let a head-only
-            // lookup pass a test the tail lookup is what actually makes
-            // work in the field, so only the tail carries it here.
-            let tail = !*after;
-            vint(if f.with_crc && tail { 0x04 } else { 0 }, &mut body); // file flags
-            vint(f.plain_len, &mut body); // unpacked size
-            vint(0, &mut body); // attributes
-            if f.with_crc && tail {
-                // A tweaked-checksum archive stores the KEYED FOLD of the
-                // plaintext CRC32, not the CRC itself (WinRAR's
-                // ConvertHashToMAC) - a fixture that stored the bare CRC
-                // under a set tweaked flag would be testing a shape no
-                // real archive has.
-                let stored = if f.tweaked {
-                    let keys = rarcrypt::derive_keys(&f.password, &f.salt, f.lg2_count)
-                        .expect("fixture KDF count is sane");
-                    rarcrypt::mac_crc32(&keys, f.crc)
-                } else {
-                    f.crc
-                };
-                body.extend_from_slice(&stored.to_le_bytes());
-            }
-            vint(0, &mut body); // compression info: store
-            vint(0, &mut body); // host os
-            vint(name.len() as u64, &mut body);
-            body.extend_from_slice(name.as_bytes());
-            let mut hflags = 0x02;
-            if *before {
-                hflags |= 0x08;
-            }
-            if *after {
-                hflags |= 0x10;
-            }
-            let piece = &f.cipher[range.clone()];
-            blocks.push((
-                hdr_v5(2, hflags, &body, &crypt_extra(f, tail), piece.len() as u64),
-                piece.to_vec(),
-            ));
-        }
-        let mut end_body = Vec::new();
-        vint(0, &mut end_body);
-        blocks.push((hdr_v5(5, 0, &end_body, &[], 0), Vec::new()));
-        blocks
-    }
-
-    /// Encrypted-DATA volume (`rar -m0 -p…` shape): plaintext headers,
-    /// AES-256-CBC file data.
-    pub fn rar5_volume_enc(pieces: &[EncPiece<'_>], vol_no: Option<u64>) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(super::SIG5);
-        for (hdr, data) in enc_volume_blocks(pieces, vol_no) {
-            out.extend_from_slice(&hdr);
-            out.extend_from_slice(&data);
-        }
-        out
-    }
-
-    /// Encrypted-HEADER volume (`rar -m0 -hp…` shape): a plaintext type-4
-    /// crypt block, then every header wrapped as 16-byte IV + ciphertext
-    /// (padded to 16); file data encrypted as in [`rar5_volume_enc`].
-    pub fn rar5_volume_enc_headers(
-        pieces: &[EncPiece<'_>],
-        vol_no: Option<u64>,
-        password: &str,
-        seed: u8,
-    ) -> Vec<u8> {
-        let lg2_count = 12u8;
-        let salt = seed16(seed, 3);
-        let keys = rarcrypt::derive_keys(password, &salt, lg2_count).unwrap();
-        let mut out = Vec::new();
-        out.extend_from_slice(super::SIG5);
-        let mut crypt_body = Vec::new();
-        vint(0, &mut crypt_body); // version: AES-256
-        vint(0x01, &mut crypt_body); // flags: check present
-        crypt_body.push(lg2_count);
-        crypt_body.extend_from_slice(&salt);
-        crypt_body.extend_from_slice(&rarcrypt::make_check(&keys));
-        out.extend_from_slice(&hdr_v5(4, 0, &crypt_body, &[], 0));
-        for (bi, (hdr, data)) in enc_volume_blocks(pieces, vol_no).into_iter().enumerate() {
-            let iv = seed16(seed.wrapping_add(bi as u8), 4);
-            let mut cipher = hdr;
-            cipher.resize(rarcrypt::align16(cipher.len() as u64) as usize, 0);
-            rarcrypt::CbcEncStream::new(&keys.aes(), &iv).encrypt(&mut cipher);
-            out.extend_from_slice(&iv);
-            out.extend_from_slice(&cipher);
-            out.extend_from_slice(&data);
-        }
-        out
-    }
-}
+pub mod fixtures;
 
 // The RAR4 header-framing tests - a child module (the par2repair.rs
-// pattern) so rar.rs stays inside its size-gate entry while `super::*`
+// pattern) so rar.rs stays under the size-gate ceiling while `super::*`
 // keeps the private parser reachable.
 #[cfg(test)]
 mod v4_header_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    use fixtures::{V4_FIRST_BLOCK, restamp_v4_block};
-
-    fn payload(n: usize, seed: u8) -> Vec<u8> {
-        (0..n)
-            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
-            .collect()
-    }
-
-    #[test]
-    fn needs_password_on_disk_detection() {
-        let dir = std::env::temp_dir().join(format!("nzbkit-rar-pw-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let write = |name: &str, bytes: &[u8]| {
-            let p = dir.join(name);
-            std::fs::write(&p, bytes).unwrap();
-            p
-        };
-        // Encrypted headers (RAR4 MHD_PASSWORD) → password required.
-        assert!(needs_password(&write(
-            "enc.rar",
-            &fixtures::rar4_encrypted_headers(64)
-        )));
-        // Plain store volume → no.
-        let store = fixtures::rar4_volume(&[("a.bin", 4, b"data", false, false)]);
-        assert!(!needs_password(&write("plain.rar", &store)));
-        // Readable headers but the file's data is encrypted: LHD_PASSWORD
-        // (0x0004) in the file-header flags (sig 7 + main 13 = block base
-        // 20; flags at +3) → password required.
-        let mut pwfile = store.clone();
-        pwfile[23] |= 0x04;
-        restamp_v4_block(&mut pwfile, V4_FIRST_BLOCK);
-        assert!(needs_password(&write("pwfile.rar", &pwfile)));
-        // Compressed-but-not-encrypted (method byte at block base + 25)
-        // must NOT ask for a password - unrar unpacks it alone.
-        let mut comp = store.clone();
-        comp[45] = 0x33;
-        restamp_v4_block(&mut comp, V4_FIRST_BLOCK);
-        assert!(!needs_password(&write("comp.rar", &comp)));
-        // Not a RAR / unreadable → no (nothing to unlock).
-        assert!(!needs_password(&write("junk.rar", b"not a rar at all")));
-        assert!(!needs_password(&dir.join("missing.rar")));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The discriminator the extraction ladder's `-hp` shortcut rests on:
-    /// "is the password we hold any use to the STREAMING path". Both
-    /// formats now answer the same way - opaque with no password, and
-    /// parseable with the right one - so neither is diverted to a disk
-    /// read it no longer needs. (RAR4 `-hp` used to answer yes-opaque
-    /// whatever it was passed, because header decryption was unimplemented.)
-    #[test]
-    fn headers_encrypted_to_separates_hp_from_a_usable_password() {
-        let dir = std::env::temp_dir().join(format!("nzbkit-hdrenc-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let write = |name: &str, bytes: &[u8]| {
-            let p = dir.join(name);
-            std::fs::write(&p, bytes).unwrap();
-            p
-        };
-        let rar4 = write("hp4.rar", V4_ENC_HDRS);
-        assert!(headers_encrypted_to(&rar4, None));
-        assert!(
-            !headers_encrypted_to(&rar4, Some(PW)),
-            "RAR4 -hp decrypts in-stream now - it must not be diverted to disk"
-        );
-        // Same rule as RAR5 below: a wrong password is a BadPassword
-        // blocker, not an opaque one.
-        assert!(!headers_encrypted_to(&rar4, Some("nope")));
-
-        let rar5 = write("hp5.rar", ENC_HDRS);
-        assert!(headers_encrypted_to(&rar5, None));
-        assert!(
-            !headers_encrypted_to(&rar5, Some(PW)),
-            "RAR5 -hp decrypts in-stream - it must not be diverted to disk"
-        );
-        // A wrong password is a BadPassword blocker, not an opaque one:
-        // reading the volumes off disk would not help either, so the
-        // streaming path keeps it and reports the real reason.
-        assert!(!headers_encrypted_to(&rar5, Some("nope")));
-
-        // Nothing encrypted, and a non-archive: never divert.
-        let store = fixtures::rar4_volume(&[("a.bin", 4, b"data", false, false)]);
-        assert!(!headers_encrypted_to(&write("plain.rar", &store), Some(PW)));
-        assert!(!headers_encrypted_to(
-            &write("junk.rar", b"not a rar"),
-            Some(PW)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Feed a volume to a mapper in shuffled article-sized chunks.
-    fn feed_shuffled(m: &mut VolumeMapper, vol: &[u8], art: usize, seed: u64) {
-        let mut idx: Vec<usize> = (0..vol.len().div_ceil(art)).collect();
-        // Tiny LCG shuffle.
-        let mut state = seed;
-        for i in (1..idx.len()).rev() {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            idx.swap(i, (state >> 33) as usize % (i + 1));
-        }
-        for i in idx {
-            let s = i * art;
-            let e = (s + art).min(vol.len());
-            m.feed(s as u64, &vol[s..e]);
-        }
-    }
-
-    #[test]
-    fn v5_single_file_maps_fully() {
-        let data = payload(100_000, 7);
-        let vol = fixtures::rar5_volume(&[("movie.mkv", 100_000, &data, false, false)]);
-        let mut m = VolumeMapper::new(vol.len() as u64);
-        assert!(m.feed(0, &vol));
-        assert_eq!(m.version, Some(RarVersion::V5));
-        assert!(m.complete);
-        assert_eq!(m.blocker, None);
-        assert_eq!(m.entries.len(), 1);
-        let e = &m.entries[0];
-        assert_eq!(e.name, "movie.mkv");
-        assert_eq!(e.method, Method::Store);
-        assert_eq!(e.data_len, 100_000);
-        // The data area must be exactly the payload.
-        let off = e.data_off as usize;
-        assert_eq!(&vol[off..off + 100_000], &data[..]);
-        // map_span round-trip.
-        let hits = m.map_span(e.data_off + 10, 50);
-        assert_eq!(hits, vec![(0, 10, 0, 50)]);
-    }
-
-    #[test]
-    fn v5_out_of_order_articles() {
-        let data = payload(300_000, 3);
-        let vol = fixtures::rar5_volume(&[("big.bin", 300_000, &data, false, false)]);
-        for seed in 1..6u64 {
-            let mut m = VolumeMapper::new(vol.len() as u64);
-            feed_shuffled(&mut m, &vol, 7000, seed);
-            assert!(m.complete, "seed {seed}");
-            assert_eq!(m.entries.len(), 1);
-            assert_eq!(m.entries[0].data_len, 300_000);
-        }
-    }
-
-    #[test]
-    fn v5_multi_file_volume() {
-        let a = payload(50_000, 1);
-        let b = payload(80_000, 2);
-        let vol = fixtures::rar5_volume(&[
-            ("a.bin", 50_000, &a, false, false),
-            ("b.bin", 80_000, &b, false, false),
-        ]);
-        let mut m = VolumeMapper::new(vol.len() as u64);
-        // Feed only the first 4 KB: should parse main + file a's header.
-        m.feed(0, &vol[..4096]);
-        assert_eq!(m.entries.len(), 1);
-        assert!(!m.complete);
-        // b's header sits after a's 50 KB data area - feed that region.
-        let need = m.mapped_through() as usize;
-        m.feed(need as u64, &vol[need..(need + 4096).min(vol.len())]);
-        assert_eq!(m.entries.len(), 2);
-        assert_eq!(m.entries[1].name, "b.bin");
-        let off = m.entries[1].data_off as usize;
-        assert_eq!(&vol[off..off + 80_000], &b[..]);
-    }
-
-    #[test]
-    fn v5_split_series_resolves_bases() {
-        let total = payload(250_000, 9);
-        let p1 = &total[..100_000];
-        let p2 = &total[100_000..200_000];
-        let p3 = &total[200_000..];
-        let v1 = fixtures::rar5_volume(&[("film.mkv", 250_000, p1, false, true)]);
-        let v2 = fixtures::rar5_volume(&[("film.mkv", 250_000, p2, true, true)]);
-        let v3 = fixtures::rar5_volume(&[("film.mkv", 250_000, p3, true, false)]);
-        let mut m1 = VolumeMapper::new(v1.len() as u64);
-        let mut m2 = VolumeMapper::new(v2.len() as u64);
-        let mut m3 = VolumeMapper::new(v3.len() as u64);
-        m1.feed(0, &v1);
-        m2.feed(0, &v2);
-        m3.feed(0, &v3);
-        let map = ArchiveMap::resolve(&[&m1, &m2, &m3]);
-        assert_eq!(map.bases[&(0, 0)], 0);
-        assert_eq!(map.bases[&(1, 0)], 100_000);
-        assert_eq!(map.bases[&(2, 0)], 200_000);
-    }
-
-    #[test]
-    fn bases_resolve_from_headers_alone_not_completeness() {
-        // Volume 1: only its HEADER bytes fed (end block still in flight -
-        // the 35 GB regression: waiting on completeness stalls resolution
-        // behind every volume's last article). Volume 2's base must still
-        // resolve from vol 1's parsed piece length.
-        let total = payload(200_000, 6);
-        let v1 = fixtures::rar5_volume_n(&[("m.mkv", 200_000, &total[..120_000], false, true)], 0);
-        let v2 = fixtures::rar5_volume_n(&[("m.mkv", 200_000, &total[120_000..], true, false)], 1);
-        let mut m1 = VolumeMapper::new(v1.len() as u64);
-        m1.feed(0, &v1[..4096]); // header only
-        assert!(!m1.complete && m1.entries.len() == 1);
-        let mut m2 = VolumeMapper::new(v2.len() as u64);
-        m2.feed(0, &v2[..4096]);
-        let map = ArchiveMap::resolve(&[&m1, &m2]);
-        assert_eq!(map.bases[&(1, 0)], 120_000, "vol2 base from vol1 header");
-    }
-
-    #[test]
-    fn v5_bases_wait_for_missing_volume() {
-        // Three volumes, only the LAST parsed. Its piece ends the file,
-        // so its base is `unpacked_size - data_len` from its own header
-        // alone - no chain, no neighbours. (This used to assert the
-        // opposite: forward-only resolution could place nothing until
-        // volume 1 arrived, which is what stalled obfuscated season
-        // packs.)
-        let total = payload(300_000, 4);
-        let v1 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[..100_000], false, true)]);
-        let v2 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[100_000..200_000], true, true)]);
-        let v3 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[200_000..], true, false)]);
-        let m1 = VolumeMapper::new(v1.len() as u64); // never fed!
-        let m2 = VolumeMapper::new(v2.len() as u64); // never fed!
-        let mut m3 = VolumeMapper::new(v3.len() as u64);
-        m3.feed(0, &v3);
-        let map = ArchiveMap::resolve(&[&m1, &m2, &m3]);
-        assert_eq!(map.bases.get(&(2, 0)).copied(), Some(200_000));
-        assert!(!map.contradiction);
-        // The MIDDLE piece is still unplaceable on its own - it is
-        // neither the file's head nor its tail, so it genuinely needs a
-        // neighbour. That is the limit the tail seed does not remove.
-        let mut m2 = VolumeMapper::new(v2.len() as u64);
-        m2.feed(0, &v2);
-        let m3_empty = VolumeMapper::new(v3.len() as u64); // never fed!
-        let map = ArchiveMap::resolve(&[&m1, &m2, &m3_empty]);
-        assert!(map.bases.is_empty(), "{:?}", map.bases);
-    }
-
-    /// The tail seed walks BACKWARD: once the final piece is anchored,
-    /// each earlier piece of the same file follows from it, so a set
-    /// resolves from its end even with volume 0 still missing.
-    #[test]
-    fn v5_bases_walk_backward_from_the_final_piece() {
-        let total = payload(300_000, 6);
-        let v1 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[..100_000], false, true)]);
-        let v2 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[100_000..200_000], true, true)]);
-        let v3 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[200_000..], true, false)]);
-        let m1 = VolumeMapper::new(v1.len() as u64); // never fed!
-        let mut m2 = VolumeMapper::new(v2.len() as u64);
-        let mut m3 = VolumeMapper::new(v3.len() as u64);
-        m2.feed(0, &v2);
-        m3.feed(0, &v3);
-        let map = ArchiveMap::resolve(&[&m1, &m2, &m3]);
-        assert_eq!(map.bases.get(&(2, 0)).copied(), Some(200_000));
-        assert_eq!(
-            map.bases.get(&(1, 0)).copied(),
-            Some(100_000),
-            "backward step"
-        );
-        assert!(!map.contradiction);
-    }
-
-    /// Headers that disagree with themselves: the piece in volume 2 is
-    /// reachable forward from volume 1 and backward from volume 3, and
-    /// the two answers differ. Nothing may be placed on a guess, so the
-    /// map reports the contradiction and the caller demotes.
-    #[test]
-    fn v5_bases_flag_a_self_contradictory_chain() {
-        let total = payload(300_000, 8);
-        // Volume 2 claims a piece longer than the gap the other two
-        // leave for it.
-        let v1 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[..100_000], false, true)]);
-        let v2 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[..150_000], true, true)]);
-        let v3 = fixtures::rar5_volume(&[("x.bin", 300_000, &total[200_000..], true, false)]);
-        let mut ms = Vec::new();
-        for v in [&v1, &v2, &v3] {
-            let mut m = VolumeMapper::new(v.len() as u64);
-            m.feed(0, v);
-            ms.push(m);
-        }
-        let refs: Vec<&VolumeMapper> = ms.iter().collect();
-        let map = ArchiveMap::resolve(&refs);
-        assert!(map.contradiction, "disagreeing neighbours must be reported");
-    }
-
-    #[test]
-    fn v4_single_and_split() {
-        let data = payload(120_000, 5);
-        let vol = fixtures::rar4_volume(&[("old.avi", 120_000, &data, false, false)]);
-        let mut m = VolumeMapper::new(vol.len() as u64);
-        m.feed(0, &vol);
-        assert_eq!(m.version, Some(RarVersion::V4));
-        assert!(m.complete);
-        assert_eq!(m.entries.len(), 1);
-        assert_eq!(m.entries[0].method, Method::Store);
-        let off = m.entries[0].data_off as usize;
-        assert_eq!(&vol[off..off + 120_000], &data[..]);
-
-        // Split pair.
-        let p1 = &data[..60_000];
-        let p2 = &data[60_000..];
-        let v1 = fixtures::rar4_volume(&[("old.avi", 120_000, p1, false, true)]);
-        let v2 = fixtures::rar4_volume(&[("old.avi", 120_000, p2, true, false)]);
-        let mut m1 = VolumeMapper::new(v1.len() as u64);
-        let mut m2 = VolumeMapper::new(v2.len() as u64);
-        m1.feed(0, &v1);
-        m2.feed(0, &v2);
-        assert!(m1.entries[0].split_after && !m1.entries[0].split_before);
-        assert!(m2.entries[0].split_before && !m2.entries[0].split_after);
-        let map = ArchiveMap::resolve(&[&m1, &m2]);
-        assert_eq!(map.bases[&(1, 0)], 60_000);
-    }
-
-    #[test]
-    fn compressed_flagged_not_store() {
-        // Method bits nonzero → Compressed → blocker NotStore.
-        let data = payload(10_000, 8);
-        let mut vol = fixtures::rar5_volume(&[("c.bin", 10_000, &data, false, false)]);
-        // Patch compression_info in the file header: find the name and walk
-        // back… simpler: rebuild via a tweaked writer is overkill - craft by
-        // scanning for method vint is brittle. Instead test v4 (fixed
-        // layout): method byte 0x33 = compressed.
-        let mut v4 = fixtures::rar4_volume(&[("c.bin", 10_000, &data, false, false)]);
-        // method byte offset: sig 7 + main 13 + 11 (intro+add) + 4+1+4+4+1 = 49
-        let m_off = 7 + 13 + 11 + 14;
-        assert_eq!(v4[m_off], 0x30);
-        v4[m_off] = 0x33;
-        restamp_v4_block(&mut v4, V4_FIRST_BLOCK);
-        let mut m = VolumeMapper::new(v4.len() as u64);
-        m.feed(0, &v4);
-        assert_eq!(m.blocker, Some(MapBlocker::NotStore));
-
-        // And RAR5 header corruption is caught by the CRC.
-        vol[10] ^= 0xff;
-        let mut m5 = VolumeMapper::new(vol.len() as u64);
-        m5.feed(0, &vol);
-        assert!(matches!(m5.blocker, Some(MapBlocker::Corrupt(_))));
-    }
-
-    /// A RAR4 file header carrying `field` verbatim as its name area and
-    /// no data area, so headers pack back to back. `extra_flags` is OR'd
-    /// into the block flags (FHD_UNICODE for the packed-name tests).
-    fn v4_file_header(field: &[u8], extra_flags: u16) -> Vec<u8> {
-        let hsize = (32 + field.len()) as u16;
-        let mut blk = Vec::new();
-        blk.extend_from_slice(&0u16.to_le_bytes()); // head crc (unchecked)
-        blk.push(0x74);
-        blk.extend_from_slice(&(0x8000u16 | extra_flags).to_le_bytes()); // add size present
-        blk.extend_from_slice(&hsize.to_le_bytes());
-        blk.extend_from_slice(&0u32.to_le_bytes()); // add size: no data area
-        blk.extend_from_slice(&0u32.to_le_bytes()); // unp size
-        blk.push(0); // host
-        blk.extend_from_slice(&0u32.to_le_bytes()); // crc
-        blk.extend_from_slice(&0u32.to_le_bytes()); // time
-        blk.push(29); // unp_ver
-        blk.push(0x30); // store
-        blk.extend_from_slice(&(field.len() as u16).to_le_bytes());
-        blk.extend_from_slice(&0u32.to_le_bytes()); // attr
-        blk.extend_from_slice(field);
-        fixtures::stamp_v4_head_crc(&mut blk);
-        blk
-    }
-
-    /// Wrap raw blocks in a RAR4 signature + main header + ENDARC.
-    fn v4_volume_of(blocks: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(SIG4);
-        let mut main = Vec::new();
-        main.extend_from_slice(&0u16.to_le_bytes()); // main head crc
-        main.push(0x73);
-        main.extend_from_slice(&0u16.to_le_bytes()); // flags
-        main.extend_from_slice(&13u16.to_le_bytes());
-        main.extend_from_slice(&[0u8; 6]); // reserved
-        fixtures::stamp_v4_head_crc(&mut main);
-        out.extend_from_slice(&main);
-        out.extend_from_slice(blocks);
-        let mut end = Vec::new();
-        end.extend_from_slice(&0u16.to_le_bytes()); // ENDARC
-        end.push(0x7b);
-        end.extend_from_slice(&0u16.to_le_bytes());
-        end.extend_from_slice(&7u16.to_le_bytes());
-        fixtures::stamp_v4_head_crc(&mut end);
-        out.extend_from_slice(&end);
-        out
-    }
-
-    /// A downloaded RAR4 volume must not turn into many times its own size
-    /// in resident memory through its FILE NAMES. The packed-unicode
-    /// decoder's ceiling used to be counted per HEADER, which a 70-byte
-    /// header reaches on its own: 200 of them decoded to ~88x the volume,
-    /// so a ~100 MB volume in any NZB meant ~9 GB resident. Legitimate
-    /// FHD_UNICODE names must still decode exactly.
-    #[test]
-    fn v4_unicode_names_cannot_amplify_the_volume() {
-        // Hostile: empty ASCII fallback, high byte 0x08, then 36 bytes of
-        // 0xFF - every 2-bit mode is 3 (a run), every run is the maximum
-        // 129 units, and every unit is a 3-byte UTF-8 character.
-        let mut field = vec![0u8, 0x08];
-        field.extend_from_slice(&[0xFFu8; 36]);
-        let hdr = v4_file_header(&field, FHD_UNICODE);
-        assert_eq!(hdr.len(), 70);
-        let mut blocks = Vec::new();
-        for _ in 0..200 {
-            blocks.extend_from_slice(&hdr);
-        }
-        let vol = v4_volume_of(&blocks);
-        let mut m = VolumeMapper::new(vol.len() as u64);
-        m.feed(0, &vol);
-        assert_eq!(m.entries.len(), 200);
-        let decoded: usize = m.entries.iter().map(|e| e.name.len()).sum();
-        assert!(
-            decoded <= 3 * vol.len(),
-            "names decoded to {decoded} bytes from a {}-byte volume",
-            vol.len()
-        );
-
-        // Good case: a real FHD_UNICODE name, through every mode a writer
-        // uses - a mode-3 run copied from the ASCII fallback, a mode-2
-        // literal for the non-ASCII character, then a second run.
-        let mut good = b"My.Long.Show.S01E01.e.mkv".to_vec();
-        good.push(0); // separator
-        good.push(0); // high byte
-        good.extend_from_slice(&[0xEC, 18, 0xE9, 0x00, 2]);
-        let vol = v4_volume_of(&v4_file_header(&good, FHD_UNICODE));
-        let mut m = VolumeMapper::new(vol.len() as u64);
-        m.feed(0, &vol);
-        assert_eq!(m.entries.len(), 1);
-        assert_eq!(m.entries[0].name, "My.Long.Show.S01E01.é.mkv");
-    }
-
-    /// A stream of back-to-back file headers must stop being mapped rather
-    /// than growing the retained entry list at line rate - and it must stop
-    /// with NotStore, so the job still materializes its volumes and hands
-    /// them to unrar instead of failing outright.
-    #[test]
-    fn v4_entry_flood_stops_mapping_without_failing_the_job() {
-        let hdr = v4_file_header(b"", 0);
-        assert_eq!(hdr.len(), 32);
-        let mut blocks = Vec::with_capacity(hdr.len() * (MAX_ENTRIES + 50));
-        for _ in 0..MAX_ENTRIES + 50 {
-            blocks.extend_from_slice(&hdr);
-        }
-        let vol = v4_volume_of(&blocks);
-        let mut m = VolumeMapper::new(vol.len() as u64);
-        // Article-sized feeds, so the parse window stays small.
-        for s in (0..vol.len()).step_by(4096) {
-            let e = (s + 4096).min(vol.len());
-            m.feed(s as u64, &vol[s..e]);
-        }
-        assert_eq!(m.blocker, Some(MapBlocker::NotStore));
-        assert!(!m.complete);
-        assert!(
-            m.entries.len() <= MAX_ENTRIES,
-            "{} entries retained",
-            m.entries.len()
-        );
-        // Both mapper preconditions of the extractor's chase attach still
-        // say no (RAR5 only, exactly one entry), so this routes to
-        // materialize + unrar rather than to a chase worker.
-        assert_eq!(m.version, Some(RarVersion::V4));
-        assert_ne!(m.entries.len(), 1);
-
-        // A real multi-file store volume is untouched by the cap.
-        let a = payload(1_000, 1);
-        let b = payload(2_000, 2);
-        let c = payload(3_000, 3);
-        let ok = fixtures::rar4_volume(&[
-            ("a.bin", 1_000, &a, false, false),
-            ("b.bin", 2_000, &b, false, false),
-            ("c.bin", 3_000, &c, false, false),
-        ]);
-        let mut m = VolumeMapper::new(ok.len() as u64);
-        m.feed(0, &ok);
-        assert_eq!(m.blocker, None);
-        assert!(m.complete);
-        assert_eq!(m.entries.len(), 3);
-        assert_eq!(m.entries[2].name, "c.bin");
-        let off = m.entries[2].data_off as usize;
-        assert_eq!(&ok[off..off + 3_000], &c[..]);
-    }
-
-    /// RAR5 extra-area record with a hostile size near 2^64: the record
-    /// walk must terminate (the wrapping add mapped the cursor onto
-    /// itself - an infinite loop holding the extractor's global lock).
-    #[test]
-    fn v5_hostile_extra_record_size_terminates() {
-        // File header with an extra area whose record size vint is huge.
-        let mut extra = vec![0xFF; 9];
-        extra.push(0x7F); // vint ≈ 2^63+ - record "size"
-        extra.push(0x01); // record type: file encryption
-        let mut body = Vec::new();
-        let mut hdr = Vec::new();
-        // type 2 (file), flags 0x03 (extra + data), extra size, data size
-        fn vint_enc(mut v: u64, out: &mut Vec<u8>) {
-            loop {
-                let b = (v & 0x7f) as u8;
-                v >>= 7;
-                if v == 0 {
-                    out.push(b);
-                    break;
-                }
-                out.push(b | 0x80);
-            }
-        }
-        vint_enc(2, &mut hdr);
-        vint_enc(0x03, &mut hdr);
-        vint_enc(extra.len() as u64, &mut hdr); // extra size
-        vint_enc(4, &mut hdr); // data size
-        vint_enc(0, &mut body); // file flags
-        vint_enc(100, &mut body); // unpacked
-        vint_enc(0, &mut body); // attrs
-        vint_enc(0, &mut body); // comp info: store
-        vint_enc(0, &mut body); // host
-        vint_enc(4, &mut body); // name len
-        body.extend_from_slice(b"x.mk");
-        hdr.extend_from_slice(&body);
-        hdr.extend_from_slice(&extra);
-        let mut sized = Vec::new();
-        vint_enc(hdr.len() as u64, &mut sized);
-        let mut blk = Vec::new();
-        let mut crc = crc32fast::Hasher::new();
-        crc.update(&sized);
-        crc.update(&hdr);
-        blk.extend_from_slice(&crc.finalize().to_le_bytes());
-        blk.extend_from_slice(&sized);
-        blk.extend_from_slice(&hdr);
-        blk.extend_from_slice(b"data");
-        // Must return (not spin) - and the hostile record still counts as
-        // its declared type (encryption) before the walk stops.
-        match parse_block_v5(&blk, 0) {
-            BlockResult::File { entry, .. } => assert!(entry.encrypted),
-            other => panic!(
-                "expected file block, got {}",
-                match other {
-                    BlockResult::NeedMore => "NeedMore",
-                    BlockResult::Corrupt(w) => w,
-                    BlockResult::EncryptedHeaders => "EncryptedHeaders",
-                    BlockResult::BadPassword => "BadPassword",
-                    BlockResult::V4EncryptedHeaders { .. } => "V4EncryptedHeaders",
-                    BlockResult::Crypt { .. } => "Crypt",
-                    BlockResult::End => "End",
-                    BlockResult::Skip { .. } => "Skip",
-                    BlockResult::File { .. } => unreachable!(),
-                }
-            ),
-        }
-    }
-
-    /// RAR5 extra-area encryption record whose declared size is SMALLER
-    /// than the type vint (rec_size=0). The old guard only checked the
-    /// upper bound, so `&hdr[rec_start+tn .. rec_start+rec_size]` had
-    /// start > end and panicked. Must parse without panicking.
-    #[test]
-    fn v5_encryption_record_size_below_type_vint_no_panic() {
-        fn vint_enc(mut v: u64, out: &mut Vec<u8>) {
-            loop {
-                let b = (v & 0x7f) as u8;
-                v >>= 7;
-                if v == 0 {
-                    out.push(b);
-                    break;
-                }
-                out.push(b | 0x80);
-            }
-        }
-        // Extra record: size vint = 0, then type vint = 0x01 (encryption).
-        // rec_size (0) < tn (1) is the panic trigger.
-        let mut extra = Vec::new();
-        vint_enc(0, &mut extra); // rec_size = 0
-        vint_enc(0x01, &mut extra); // rec_type = file encryption
-        let mut hdr = Vec::new();
-        vint_enc(2, &mut hdr); // type 2 = file
-        vint_enc(0x03, &mut hdr); // flags: extra + data
-        vint_enc(extra.len() as u64, &mut hdr); // extra size
-        vint_enc(4, &mut hdr); // data size
-        let mut body = Vec::new();
-        vint_enc(0, &mut body); // file flags
-        vint_enc(100, &mut body); // unpacked
-        vint_enc(0, &mut body); // attrs
-        vint_enc(0, &mut body); // comp info: store
-        vint_enc(0, &mut body); // host
-        vint_enc(4, &mut body); // name len
-        body.extend_from_slice(b"x.mk");
-        hdr.extend_from_slice(&body);
-        hdr.extend_from_slice(&extra);
-        let mut sized = Vec::new();
-        vint_enc(hdr.len() as u64, &mut sized);
-        let mut blk = Vec::new();
-        let mut crc = crc32fast::Hasher::new();
-        crc.update(&sized);
-        crc.update(&hdr);
-        blk.extend_from_slice(&crc.finalize().to_le_bytes());
-        blk.extend_from_slice(&sized);
-        blk.extend_from_slice(&hdr);
-        blk.extend_from_slice(b"data");
-        // The record is malformed, so crypt params stay None, but the flag
-        // is set from the record type before the (now guarded) slice.
-        match parse_block_v5(&blk, 0) {
-            BlockResult::File { entry, .. } => {
-                assert!(entry.encrypted);
-                assert!(
-                    entry.crypt.is_none(),
-                    "malformed record must not yield crypt params"
-                );
-            }
-            other => panic!(
-                "expected file block, got {}",
-                match other {
-                    BlockResult::NeedMore => "NeedMore",
-                    BlockResult::Corrupt(w) => w,
-                    BlockResult::EncryptedHeaders => "EncryptedHeaders",
-                    BlockResult::BadPassword => "BadPassword",
-                    BlockResult::V4EncryptedHeaders { .. } => "V4EncryptedHeaders",
-                    BlockResult::Crypt { .. } => "Crypt",
-                    BlockResult::End => "End",
-                    BlockResult::Skip { .. } => "Skip",
-                    BlockResult::File { .. } => unreachable!(),
-                }
-            ),
-        }
-    }
-
-    #[test]
-    fn real_world_encrypted_headers_detected() {
-        // Prefix of the real obfuscated release (encrypted headers):
-        // signature + block crc 8eb85a8b + hsize 0x21 + type 4.
-        let mut prefix = Vec::new();
-        prefix.extend_from_slice(SIG5);
-        prefix.extend_from_slice(&[0x8e, 0xb8, 0x5a, 0x8b, 0x21, 0x04]);
-        prefix.extend_from_slice(&[0u8; 64]);
-        let mut m = VolumeMapper::new(4096);
-        m.feed(0, &prefix);
-        // CRC of our zero-padded fake body won't match, so we accept either
-        // blocker - the point is it must NOT parse as mappable store data.
-        assert!(m.blocker.is_some());
-        assert!(m.entries.is_empty());
-    }
-
-    /// A data area declared past the end of the volume must blocker the
-    /// mapper, not sail through as a COMPLETE volume. Without the bound
-    /// the cursor lands beyond `volume_size`, the next parse sees an
-    /// empty window, and the EOF rule declares the volume complete - the
-    /// mapper then vouches for bytes that were never posted.
-    #[test]
-    fn data_area_past_the_volume_end_is_corrupt() {
-        let data = payload(4_000, 3);
-        let vol = fixtures::rar5_volume_oversized("movie.mkv", 8 << 20, &data, 8 << 20);
-        let mut m = VolumeMapper::new(vol.len() as u64);
-        feed_shuffled(&mut m, &vol, 700, 5);
-        assert!(
-            matches!(m.blocker, Some(MapBlocker::Corrupt(_))),
-            "expected a Corrupt blocker, got {:?}",
-            m.blocker
-        );
-        assert!(
-            !m.complete,
-            "an overrunning volume must never read complete"
-        );
-        assert_eq!(m.mapped_through(), m.cursor);
-    }
-
-    /// The bound must not fire on a legitimate split set, where every
-    /// piece's `data_len` is the PER-VOLUME portion and lands exactly on
-    /// the volume end - the same invariant the EOF rule already assumes.
-    #[test]
-    fn volume_bound_leaves_real_split_sets_alone() {
-        let total = payload(300_000, 4);
-        let vols = [
-            fixtures::rar5_volume_n(&[("f.mkv", 300_000, &total[..100_000], false, true)], 0),
-            fixtures::rar5_volume_n(
-                &[("f.mkv", 300_000, &total[100_000..200_000], true, true)],
-                1,
-            ),
-            fixtures::rar5_volume_n(&[("f.mkv", 300_000, &total[200_000..], true, false)], 2),
-        ];
-        let mappers: Vec<VolumeMapper> = vols
-            .iter()
-            .map(|v| {
-                let mut m = VolumeMapper::new(v.len() as u64);
-                feed_shuffled(&mut m, v, 7000, 6);
-                assert!(m.blocker.is_none(), "{:?}", m.blocker);
-                assert!(m.complete);
-                m
-            })
-            .collect();
-        let refs: Vec<&VolumeMapper> = mappers.iter().collect();
-        let am = ArchiveMap::resolve(&refs);
-        assert_eq!(am.bases.get(&(0, 0)), Some(&0));
-        assert_eq!(am.bases.get(&(1, 0)), Some(&100_000));
-        assert_eq!(am.bases.get(&(2, 0)), Some(&200_000));
-    }
-
-    #[test]
-    fn not_rar_rejected() {
-        let mut m = VolumeMapper::new(1000);
-        m.feed(0, b"PK\x03\x04 definitely a zip file padding padding");
-        assert_eq!(m.blocker, Some(MapBlocker::NotRar));
-    }
-
-    // -- encrypted RAR5, validated against REAL `rar 7.23` archives
-    //    (testdata/rar5/, password testpw123, payload secret.bin) --
-
-    const PW: &str = "testpw123";
-    const ENC_STORE: &[u8] = include_bytes!("../testdata/rar5/enc-store.rar");
-    const ENC_HDRS: &[u8] = include_bytes!("../testdata/rar5/enc-hdrs.rar");
-    const ENC_V1: &[u8] = include_bytes!("../testdata/rar5/enc-vols.part1.rar");
-    const ENC_V2: &[u8] = include_bytes!("../testdata/rar5/enc-vols.part2.rar");
-    const ENC_V3: &[u8] = include_bytes!("../testdata/rar5/enc-vols.part3.rar");
-    const SECRET: &[u8] = include_bytes!("../testdata/rar5/secret.bin");
-
-    // -- encrypted RAR4, from the vendored rars writer and validated with
-    //    the reference decoder (`unrar t -ptestpw123`) before committing;
-    //    see testdata/rar4/README.md. Same password, its own payload --
-
-    const V4_ENC_STORE: &[u8] = include_bytes!("../testdata/rar4/enc-store.rar");
-    const V4_ENC_HDRS: &[u8] = include_bytes!("../testdata/rar4/enc-hdrs.rar");
-    const V4_ENC_V1: &[u8] = include_bytes!("../testdata/rar4/enc-vols.part1.rar");
-    const V4_ENC_V2: &[u8] = include_bytes!("../testdata/rar4/enc-vols.part2.rar");
-    const V4_ENC_V3: &[u8] = include_bytes!("../testdata/rar4/enc-vols.part3.rar");
-    const V4_ENC_HV1: &[u8] = include_bytes!("../testdata/rar4/enc-hdr-vols.part1.rar");
-    const V4_ENC_HV2: &[u8] = include_bytes!("../testdata/rar4/enc-hdr-vols.part2.rar");
-    const V4_ENC_HV3: &[u8] = include_bytes!("../testdata/rar4/enc-hdr-vols.part3.rar");
-    const V4_SECRET: &[u8] = include_bytes!("../testdata/rar4/secret.bin");
-
-    fn mapper_with(pw: Option<&str>, vol: &[u8]) -> VolumeMapper {
-        let mut m = VolumeMapper::with_password(vol.len() as u64, pw.map(std::sync::Arc::from));
-        m.feed(0, vol);
-        m
-    }
-
-    #[test]
-    fn real_encrypted_data_archive_maps_with_password() {
-        let m = mapper_with(Some(PW), ENC_STORE);
-        assert_eq!(m.blocker, None, "encrypted store must stay mappable");
-        assert!(m.complete);
-        assert_eq!(m.entries.len(), 1);
-        let e = &m.entries[0];
-        assert_eq!(e.name, "secret.bin");
-        assert_eq!(e.method, Method::Store);
-        assert!(e.encrypted);
-        assert_eq!(e.unpacked_size, SECRET.len() as u64);
-        // Ciphertext data area = align16(plaintext).
-        assert_eq!(e.data_len, (SECRET.len() as u64 + 15) & !15);
-        let c = e
-            .crypt
-            .as_ref()
-            .and_then(EntryCrypt::rar5)
-            .expect("crypt params parsed");
-        assert_eq!(c.lg2_count, 15);
-        assert!(c.check.is_some(), "real rar writes a check value");
-    }
-
-    #[test]
-    fn real_encrypted_data_archive_without_password_blocks() {
-        let m = mapper_with(None, ENC_STORE);
-        assert_eq!(m.blocker, Some(MapBlocker::EncryptedNoPassword));
-        // The entry is still recorded (needs_password relies on it).
-        assert!(m.entries.iter().any(|e| e.encrypted));
-    }
-
-    #[test]
-    fn real_encrypted_data_archive_wrong_password_rejected() {
-        let m = mapper_with(Some("nottherightpw"), ENC_STORE);
-        assert_eq!(m.blocker, Some(MapBlocker::BadPassword));
-    }
-
-    #[test]
-    fn real_encrypted_headers_archive_parses_with_password() {
-        let m = mapper_with(Some(PW), ENC_HDRS);
-        assert_eq!(m.blocker, None, "headers must decrypt");
-        assert!(m.complete);
-        assert_eq!(m.entries.len(), 1);
-        let e = &m.entries[0];
-        assert_eq!(e.name, "secret.bin");
-        assert!(e.encrypted && e.crypt.is_some());
-        // Data must decrypt to the payload: one CBC stream from the
-        // entry's IV over its data area.
-        let keys = e.crypt.as_ref().unwrap().derive(PW).unwrap();
-        let mut data = ENC_HDRS[e.data_off as usize..(e.data_off + e.data_len) as usize].to_vec();
-        crate::rarcrypt::cbc_decrypt(&keys.aes, &keys.iv, &mut data);
-        assert_eq!(&data[..SECRET.len()], SECRET);
-    }
-
-    #[test]
-    fn real_encrypted_headers_wrong_or_missing_password() {
-        let m = mapper_with(None, ENC_HDRS);
-        assert_eq!(m.blocker, Some(MapBlocker::EncryptedHeaders));
-        assert!(m.entries.is_empty());
-        let m = mapper_with(Some("nope"), ENC_HDRS);
-        assert_eq!(m.blocker, Some(MapBlocker::BadPassword));
-    }
-
-    /// Multi-volume: the crypt record (salt AND iv) repeats verbatim in
-    /// every volume - one continuous CBC stream, arbitrary split points,
-    /// total ciphertext = align16(unpacked). Everything the extractor's
-    /// decrypt-at-finish design rests on, proven against real output.
-    #[test]
-    fn real_encrypted_volumes_are_one_cbc_stream() {
-        let vols = [ENC_V1, ENC_V2, ENC_V3];
-        let mut mappers = Vec::new();
-        for v in vols {
-            let m = mapper_with(Some(PW), v);
-            assert_eq!(m.blocker, None);
-            assert_eq!(m.entries.len(), 1);
-            mappers.push(m);
-        }
-        let c0 = mappers[0].entries[0].crypt.clone().unwrap();
-        let r0 = c0.rar5().unwrap();
-        let mut cipher = Vec::new();
-        for m in &mappers {
-            let e = &m.entries[0];
-            // The KEY MATERIAL repeats verbatim - that is what makes the
-            // volumes one stream. The tweaked-checksum flag does NOT: real
-            // rar sets it only on the piece that carries a checksum, so
-            // comparing whole records here would false-fail.
-            let c = e.crypt.as_ref().and_then(EntryCrypt::rar5).unwrap();
-            assert_eq!((c.salt, c.iv), (r0.salt, r0.iv), "params repeat per volume");
-            cipher.push((e.data_off, e.data_len));
-        }
-        // Split flags chain head → middle → tail.
-        assert!(!mappers[0].entries[0].split_before && mappers[0].entries[0].split_after);
-        assert!(mappers[1].entries[0].split_before && mappers[1].entries[0].split_after);
-        assert!(mappers[2].entries[0].split_before && !mappers[2].entries[0].split_after);
-        let mut stream = Vec::new();
-        for (i, (off, len)) in cipher.iter().enumerate() {
-            stream.extend_from_slice(&vols[i][*off as usize..(*off + *len) as usize]);
-        }
-        assert_eq!(stream.len() as u64, (SECRET.len() as u64 + 15) & !15);
-        let keys = c0.derive(PW).unwrap();
-        crate::rarcrypt::cbc_decrypt(&keys.aes, &keys.iv, &mut stream);
-        assert_eq!(
-            &stream[..SECRET.len()],
-            SECRET,
-            "reassembled stream decrypts"
-        );
-    }
-
-    // -- the same ladder for RAR4, against unrar-validated archives --
-
-    /// `rar -m0 -p` RAR4: plaintext headers, AES-128 data. The entry must
-    /// stay MAPPABLE (store-shaped, so the one-pass path owns it) and
-    /// carry the salt the key schedule needs.
-    #[test]
-    fn real_v4_encrypted_data_archive_maps_with_password() {
-        let m = mapper_with(Some(PW), V4_ENC_STORE);
-        assert_eq!(m.blocker, None, "RAR4 encrypted store must stay mappable");
-        assert!(m.complete);
-        assert_eq!(m.entries.len(), 1);
-        let e = &m.entries[0];
-        assert_eq!(e.name, "inner.bin");
-        assert_eq!(e.method, Method::Store);
-        assert!(e.encrypted);
-        assert_eq!(e.unpacked_size, V4_SECRET.len() as u64);
-        // Ciphertext data area = align16(plaintext), same as RAR5.
-        assert_eq!(e.data_len, (V4_SECRET.len() as u64 + 15) & !15);
-        assert!(
-            matches!(e.crypt, Some(EntryCrypt::Rar4(Rar4Crypt { salt: Some(_) }))),
-            "RAR4 crypt params with the header salt, got {:?}",
-            e.crypt
-        );
-        // The stored CRC is the PLAINTEXT's - the only thing that can
-        // adjudicate the password once the finish pass has decrypted.
-        assert_eq!(e.file_crc, Some(crc32fast::hash(V4_SECRET)));
-        // …and the data really is one CBC stream from the derived IV.
-        let keys = e.crypt.as_ref().unwrap().derive(PW).unwrap();
-        let mut data =
-            V4_ENC_STORE[e.data_off as usize..(e.data_off + e.data_len) as usize].to_vec();
-        crate::rarcrypt::cbc_decrypt(&keys.aes, &keys.iv, &mut data);
-        assert_eq!(&data[..V4_SECRET.len()], V4_SECRET);
-    }
-
-    /// No password: the same "keep the volumes, prompt for a key" verdict
-    /// RAR5 gets, NOT the unrar-fallback NotStore this used to give.
-    #[test]
-    fn real_v4_encrypted_data_archive_without_password_blocks() {
-        let m = mapper_with(None, V4_ENC_STORE);
-        assert_eq!(m.blocker, Some(MapBlocker::EncryptedNoPassword));
-        assert!(m.entries.iter().any(|e| e.encrypted));
-    }
-
-    /// RAR4 stores no password check, so a wrong password CANNOT be
-    /// rejected here - the entry maps and the finish pass adjudicates it
-    /// against the plaintext CRC. Mapping it is what keeps the assembled
-    /// bytes identical to the posted volumes, so the demote costs nothing.
-    #[test]
-    fn real_v4_wrong_password_is_not_detectable_before_decrypting() {
-        let m = mapper_with(Some("nottherightpw"), V4_ENC_STORE);
-        assert_eq!(m.blocker, None);
-        let e = &m.entries[0];
-        let keys = e.crypt.as_ref().unwrap().derive("nottherightpw").unwrap();
-        assert!(
-            !e.crypt.as_ref().unwrap().check_verifies(&keys),
-            "nothing in RAR4 may report a password as verified"
-        );
-        // Which is exactly why the CRC gate has to exist: the wrong key
-        // produces plausible-looking bytes with a CRC that misses.
-        let mut data =
-            V4_ENC_STORE[e.data_off as usize..(e.data_off + e.data_len) as usize].to_vec();
-        crate::rarcrypt::cbc_decrypt(&keys.aes, &keys.iv, &mut data);
-        assert_ne!(
-            crc32fast::hash(&data[..V4_SECRET.len()]),
-            e.file_crc.unwrap()
-        );
-    }
-
-    /// `rar -m0 -hp` RAR4: every block past the plaintext main header is
-    /// `8-byte salt + AES-128-CBC`, and the file DATA carries its own salt
-    /// under the same password.
-    #[test]
-    fn real_v4_encrypted_headers_archive_parses_with_password() {
-        let m = mapper_with(Some(PW), V4_ENC_HDRS);
-        assert_eq!(m.blocker, None, "RAR4 headers must decrypt");
-        assert!(m.complete);
-        assert_eq!(m.entries.len(), 1);
-        let e = &m.entries[0];
-        assert_eq!(e.name, "inner.bin");
-        assert!(e.encrypted && e.crypt.is_some());
-        assert_eq!(e.method, Method::Store);
-        let keys = e.crypt.as_ref().unwrap().derive(PW).unwrap();
-        let mut data =
-            V4_ENC_HDRS[e.data_off as usize..(e.data_off + e.data_len) as usize].to_vec();
-        crate::rarcrypt::cbc_decrypt(&keys.aes, &keys.iv, &mut data);
-        assert_eq!(&data[..V4_SECRET.len()], V4_SECRET);
-    }
-
-    /// Unlike `-p`, a RAR4 `-hp` set DOES catch a wrong password: the
-    /// decrypted header's CRC16 misses. No password at all stays opaque.
-    #[test]
-    fn real_v4_encrypted_headers_wrong_or_missing_password() {
-        let m = mapper_with(None, V4_ENC_HDRS);
-        assert_eq!(m.blocker, Some(MapBlocker::EncryptedHeaders));
-        assert!(m.entries.is_empty());
-        let m = mapper_with(Some("nope"), V4_ENC_HDRS);
-        assert_eq!(m.blocker, Some(MapBlocker::BadPassword));
-        assert!(m.entries.is_empty(), "no garbage entry may survive");
-    }
-
-    /// The multi-volume fact the whole one-pass design rests on, for RAR4:
-    /// the salt repeats verbatim in every volume, the pieces concatenate
-    /// into ONE AES-128-CBC stream of align16(unpacked) bytes, and the
-    /// WHOLE-FILE plaintext CRC rides the LAST piece only.
-    #[test]
-    fn real_v4_encrypted_volumes_are_one_cbc_stream() {
-        for vols in [
-            [V4_ENC_V1, V4_ENC_V2, V4_ENC_V3],
-            [V4_ENC_HV1, V4_ENC_HV2, V4_ENC_HV3],
-        ] {
-            let mappers: Vec<VolumeMapper> = vols
-                .iter()
-                .map(|v| {
-                    let m = mapper_with(Some(PW), v);
-                    assert_eq!(m.blocker, None);
-                    assert_eq!(m.entries.len(), 1);
-                    m
-                })
-                .collect();
-            let c0 = mappers[0].entries[0].crypt.clone().unwrap();
-            let mut cipher = Vec::new();
-            for m in &mappers {
-                let e = &m.entries[0];
-                assert_eq!(e.crypt.as_ref(), Some(&c0), "one salt for the whole set");
-                assert_eq!(e.unpacked_size, V4_SECRET.len() as u64);
-                cipher.push((e.data_off, e.data_len));
-            }
-            assert!(!mappers[0].entries[0].split_before && mappers[0].entries[0].split_after);
-            assert!(mappers[1].entries[0].split_before && mappers[1].entries[0].split_after);
-            assert!(mappers[2].entries[0].split_before && !mappers[2].entries[0].split_after);
-            // Only the tail's CRC describes the plaintext; the earlier
-            // pieces' fields cover their own volume's packed bytes, which
-            // is why the finish pass reads the tail's and not the head's.
-            assert_eq!(
-                mappers[2].entries[0].file_crc,
-                Some(crc32fast::hash(V4_SECRET))
-            );
-            assert_ne!(
-                mappers[0].entries[0].file_crc,
-                Some(crc32fast::hash(V4_SECRET))
-            );
-            let mut stream = Vec::new();
-            for (i, (off, len)) in cipher.iter().enumerate() {
-                stream.extend_from_slice(&vols[i][*off as usize..(*off + *len) as usize]);
-            }
-            assert_eq!(stream.len() as u64, (V4_SECRET.len() as u64 + 15) & !15);
-            let keys = c0.derive(PW).unwrap();
-            crate::rarcrypt::cbc_decrypt(&keys.aes, &keys.iv, &mut stream);
-            assert_eq!(
-                &stream[..V4_SECRET.len()],
-                V4_SECRET,
-                "reassembled stream decrypts"
-            );
-        }
-    }
-
-    /// Pre-3.0 RAR ciphers have no key schedule here, so those entries
-    /// must keep routing to unrar rather than mapping with no `crypt`.
-    #[test]
-    fn v4_pre_30_encryption_still_falls_back() {
-        let mut vol = V4_ENC_STORE.to_vec();
-        // unp_ver lives at header start + 25 (7 sig + 20-byte prologue is
-        // the main header; the file header starts at 20).
-        let unp_ver = 20 + 24;
-        assert_eq!(vol[unp_ver], 29, "fixture layout moved");
-        vol[unp_ver] = 20; // RAR 2.0
-        restamp_v4_block(&mut vol, V4_FIRST_BLOCK);
-        let m = mapper_with(Some(PW), &vol);
-        assert_eq!(m.blocker, Some(MapBlocker::NotStore));
-        let e = &m.entries[0];
-        assert!(e.encrypted && e.crypt.is_none());
-        assert!(
-            e.file_crc.is_none(),
-            "an undecryptable entry vouches for nothing"
-        );
-    }
-
-    /// The RAR4 encrypted fixture writer must produce what the real
-    /// archives above do: mappable store entries, one CBC stream across
-    /// the split, the plaintext CRC on the tail, and `-hp` headers this
-    /// parser reads with the password and rejects without it. The e2e
-    /// suite posts these, so a drift here would test a shape no archiver
-    /// emits.
-    #[test]
-    fn fixture_writer_v4_encrypted_matches_parser() {
-        let plain = payload(40_001, 11);
-        let f = fixtures::encrypt_file_v4("pw4!", &plain, 21);
-        assert_eq!(f.cipher.len() as u64, (plain.len() as u64 + 15) & !15);
-        let (a, n) = (17_003, f.cipher.len());
-        let split: [(&str, _, std::ops::Range<usize>, bool, bool); 2] = [
-            ("a.bin", &f, 0..a, false, true),
-            ("a.bin", &f, a..n, true, false),
-        ];
-        for headers_encrypted in [false, true] {
-            let vols: Vec<Vec<u8>> = split
-                .iter()
-                .map(|p| {
-                    let one = [p.clone()];
-                    if headers_encrypted {
-                        fixtures::rar4_volume_enc_headers(&one, "pw4!", 3)
-                    } else {
-                        fixtures::rar4_volume_enc(&one)
-                    }
-                })
-                .collect();
-            let mut stream = Vec::new();
-            let mut crypt = None;
-            for (i, v) in vols.iter().enumerate() {
-                let m = mapper_with(Some("pw4!"), v);
-                assert_eq!(m.blocker, None, "hp={headers_encrypted} vol={i}");
-                assert!(m.complete);
-                let e = &m.entries[0];
-                assert_eq!(e.method, Method::Store);
-                assert!(e.encrypted);
-                assert_eq!(e.unpacked_size, plain.len() as u64);
-                assert_eq!(e.split_before, i == 1);
-                assert_eq!(e.split_after, i == 0);
-                let c = e.crypt.clone().unwrap();
-                assert_eq!(crypt.get_or_insert(c.clone()), &c, "one salt per set");
-                stream
-                    .extend_from_slice(&v[e.data_off as usize..(e.data_off + e.data_len) as usize]);
-                // Only the tail vouches for the plaintext.
-                assert_eq!(e.file_crc == Some(f.crc), i == 1);
-            }
-            let keys = crypt.unwrap().derive("pw4!").unwrap();
-            crate::rarcrypt::cbc_decrypt(&keys.aes, &keys.iv, &mut stream);
-            assert_eq!(&stream[..plain.len()], &plain[..]);
-            if headers_encrypted {
-                assert_eq!(
-                    mapper_with(None, &vols[0]).blocker,
-                    Some(MapBlocker::EncryptedHeaders)
-                );
-                assert_eq!(
-                    mapper_with(Some("wrong"), &vols[0]).blocker,
-                    Some(MapBlocker::BadPassword)
-                );
-            }
-        }
-    }
-
-    /// Our encrypted fixture writer must round-trip through the parser
-    /// exactly like real rar output does (the e2e suite leans on it).
-    #[test]
-    fn fixture_writer_encrypted_matches_parser() {
-        let plain = payload(50_001, 3);
-        let f = fixtures::encrypt_file("pw!", &plain, 9);
-        assert_eq!(f.cipher.len() as u64, (plain.len() as u64 + 15) & !15);
-        let vol =
-            fixtures::rar5_volume_enc(&[("a.bin", &f, 0..f.cipher.len(), false, false)], None);
-        let m = mapper_with(Some("pw!"), &vol);
-        assert_eq!(m.blocker, None);
-        let e = &m.entries[0];
-        assert_eq!(
-            e.crypt.as_ref().and_then(EntryCrypt::rar5).unwrap().salt,
-            f.salt
-        );
-        // And header-encrypted wrapping parses too.
-        let hv = fixtures::rar5_volume_enc_headers(
-            &[("a.bin", &f, 0..f.cipher.len(), false, false)],
-            None,
-            "pw!",
-            7,
-        );
-        let m = mapper_with(Some("pw!"), &hv);
-        assert_eq!(m.blocker, None, "encrypted headers from fixture writer");
-        assert_eq!(m.entries.len(), 1);
-        assert!(m.complete);
-        let m = mapper_with(Some("wrong"), &hv);
-        assert_eq!(m.blocker, Some(MapBlocker::BadPassword));
-    }
-
-    /// The no-password check-value probe: harvest crypt params off an
-    /// on-disk archive and rule a candidate in or out without decrypting.
-    /// Volume 0's main header carries no volume-number field, so the SAME
-    /// pieces produce a file exactly one byte shorter at `vol_no` 0 than at
-    /// 1. Pinned here, where the asymmetry originates, because every
-    /// multi-volume fixture in the workspace has to compensate for it and
-    /// each one was re-deriving it by hand - or, more often, not.
-    ///
-    /// A store set is "uniform" when the volume FILES are the same size, so
-    /// a fixture that splits its payload into equal pieces is NOT uniform:
-    /// volume 0 comes out a byte short. That matters because the extractor's
-    /// arithmetic gate speculates bases under a uniform premise and demotes
-    /// the group when headers contradict it - which made
-    /// `nested_inner_par2_repairs_data_damaged_store_layer` a race between
-    /// two correct demotion reasons, passing under load and failing on a
-    /// slower runner (it reproduced 8 times in 30 on macOS). A fixture that
-    /// wants a uniform set gives volume 0 one byte MORE data; one that wants
-    /// a non-uniform set can keep equal pieces, which is a legitimate shape
-    /// real posters produce.
-    ///
-    /// If this test fails, the helper's header layout moved and every
-    /// multi-volume fixture's geometry needs re-checking.
-    #[test]
-    fn volume_zero_header_is_one_byte_shorter_than_the_rest() {
-        let body = vec![b'x'; 4096];
-        let piece = |crc: Option<u32>| vec![("v.bin", 8192u64, &body[..], false, true, crc)];
-        let v0 = fixtures::rar5_volume_n_crc(&piece(Some(1)), 0);
-        let v1 = fixtures::rar5_volume_n_crc(&piece(Some(1)), 1);
-        assert_eq!(
-            v1.len(),
-            v0.len() + 1,
-            "vol 0 must be exactly one byte shorter for the same pieces \
-             (got {} at vol 0, {} at vol 1) - every multi-volume fixture's \
-             uniformity depends on this",
-            v0.len(),
-            v1.len()
-        );
-        // ...so equal pieces are NOT a uniform set, and one extra byte in
-        // volume 0 IS - the two facts fixtures actually need.
-        let mut long = body.clone();
-        long.push(b'x');
-        let v0_plus =
-            fixtures::rar5_volume_n_crc(&[("v.bin", 8192, &long[..], false, true, Some(1))], 0);
-        assert_eq!(
-            v0_plus.len(),
-            v1.len(),
-            "one extra data byte in vol 0 evens the files up"
-        );
-    }
-
-    #[test]
-    fn crypt_probe_verifies_without_decrypt() {
-        let dir = std::env::temp_dir().join(format!("nzbkit-cryptprobe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let write = |name: &str, bytes: &[u8]| {
-            let p = dir.join(name);
-            std::fs::write(&p, bytes).unwrap();
-            p
-        };
-
-        // Data-encrypted set: probe reads the first entry's crypt record.
-        let f = fixtures::encrypt_file("open-sesame", b"secret payload bytes", 9);
-        let vol =
-            fixtures::rar5_volume_enc(&[("s.bin", &f, 0..f.cipher.len(), false, false)], None);
-        let probe = crypt_probe(&write("data.rar", &vol)).expect("encrypted set yields a probe");
-        assert_eq!(probe.verify("open-sesame"), PwVerdict::Verified);
-        assert_eq!(probe.verify("wrong-one"), PwVerdict::Rejected);
-
-        // Header-encrypted set: probe reads the type-4 block before it
-        // blocks (no password given to the probe).
-        let hv = fixtures::rar5_volume_enc_headers(
-            &[("s.bin", &f, 0..f.cipher.len(), false, false)],
-            None,
-            "hp-secret",
-            7,
-        );
-        let hprobe = crypt_probe(&write("hdr.rar", &hv)).expect("header-crypt yields a probe");
-        assert_eq!(hprobe.verify("hp-secret"), PwVerdict::Verified);
-        assert_eq!(hprobe.verify("nope"), PwVerdict::Rejected);
-
-        // Check-less set: no stored check to veto with -> Indeterminate,
-        // and the auto-unlock path leaves it to a real extraction attempt.
-        let mut g = fixtures::encrypt_file("k", b"data here", 4);
-        g.no_check = true;
-        let g2 = fixtures::rar5_volume_enc(&[("x", &g, 0..g.cipher.len(), false, false)], None);
-        let cl = crypt_probe(&write("nocheck.rar", &g2)).expect("still a probe");
-        assert_eq!(cl.check, None);
-        assert_eq!(cl.verify("k"), PwVerdict::Indeterminate);
-
-        // A plaintext store archive is not probeable at all.
-        let plain = fixtures::rar5_volume_n(&[("a.bin", 4, b"data", false, false)], 0);
-        assert!(crypt_probe(&write("plain.rar", &plain)).is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
+mod tests;

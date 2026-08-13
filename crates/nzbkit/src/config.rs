@@ -509,7 +509,6 @@ impl Config {
     /// per-platform location - a machine already running SAB needs no
     /// configuration at all.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
-        let is_ini = |p: &Path| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("ini"));
         let (bytes, ini) = match std::fs::read(path) {
             Ok(b) => (b, is_ini(path)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -533,14 +532,45 @@ impl Config {
             }
             Err(e) => return Err(e.into()),
         };
+        Self::parse(&bytes, ini)
+    }
+
+    /// The file the operator pointed us at, and nothing else: no search
+    /// for a SABnzbd install, so a missing or unreadable `path` comes
+    /// back as the `Io` error it is rather than as some other
+    /// application's server list.
+    ///
+    /// TODO §156 item 7: the runner's no-servers guard reads through
+    /// this, because `load`'s fallback makes the two conditions that
+    /// guard exists to tell apart indistinguishable. A typo'd `--config`
+    /// on a box with SABnzbd installed and a genuinely empty server list
+    /// both arrive as `NoServers`, so the guard would hold the queue
+    /// saying "no server is configured" about a config nobody could
+    /// read, which is the one case its own doc comment promises to stand
+    /// down for. It also keeps that guard off an unrelated application's
+    /// file, which `load` would otherwise re-read and re-parse at the
+    /// runner's tick rate forever.
+    ///
+    /// The trade, deliberately: on a machine that runs SABnzbd and has
+    /// no nzbfast config at all, a SAB ini with no enabled server no
+    /// longer raises the hold (the download reports "config has no
+    /// servers" as it did before §154). Every other SAB-fallback shape
+    /// is untouched - `load` still resolves the servers the download
+    /// actually dials.
+    pub fn load_no_fallback(path: &Path) -> Result<Config, ConfigError> {
+        Self::parse(&std::fs::read(path)?, is_ini(path))
+    }
+
+    /// The half both loaders share, once the bytes are in hand.
+    fn parse(bytes: &[u8], ini: bool) -> Result<Config, ConfigError> {
         let cfg = if ini {
-            let text = String::from_utf8_lossy(&bytes);
+            let text = String::from_utf8_lossy(bytes);
             Config {
                 servers: parse_sabnzbd_ini(&text)?,
                 tmdb_key: None,
             }
         } else {
-            serde_json::from_slice(&bytes)?
+            serde_json::from_slice(bytes)?
         };
         if cfg.servers.is_empty() {
             return Err(ConfigError::NoServers);
@@ -553,6 +583,11 @@ impl Config {
         }
         Ok(cfg)
     }
+}
+
+/// A `.ini` extension means SABnzbd's format; anything else is our JSON.
+fn is_ini(p: &Path) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("ini"))
 }
 
 /// Standard sabnzbd.ini locations, most likely first. `extra_dirs` are
@@ -1113,6 +1148,41 @@ x = y
         assert_eq!(found, dir.join("sabnzbd.ini"));
         let cfg = Config::load(&dir.join("config.local.json")).unwrap();
         assert_eq!(cfg.servers.len(), 2);
+    }
+
+    /// TODO §156 item 7: the strict loader reads the file it was given
+    /// and nothing else. The runner's no-servers guard needs "this
+    /// config could not be read" to stay distinguishable from "this
+    /// config lists no server", and the fallback above erases that
+    /// difference: a typo'd path on a SAB box comes back as SAB's list,
+    /// or as `NoServers` when SAB has none enabled, which is the guard's
+    /// own hold condition. It also kept the guard re-parsing another
+    /// application's file twice a second.
+    ///
+    /// Same fixture as the test above, so the fallback it pins and the
+    /// refusal pinned here are the same situation read two ways.
+    #[test]
+    fn load_no_fallback_does_not_search_for_sabnzbd_ini() {
+        let dir = std::env::temp_dir().join("nzbfast-cfg-test-strict");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sabnzbd.ini"), SAB_INI).unwrap();
+        let missing = dir.join("config.local.json");
+        // The fallback is intact for everyone else...
+        assert_eq!(Config::load(&missing).unwrap().servers.len(), 2);
+        // ...and invisible here: a missing file is a missing file.
+        let err = Config::load_no_fallback(&missing).expect_err("must not fall back");
+        assert!(
+            matches!(&err, ConfigError::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "a missing config must stay an Io error, got {err:?}"
+        );
+        // And the file it WAS given still parses by extension.
+        assert_eq!(
+            Config::load_no_fallback(&dir.join("sabnzbd.ini"))
+                .unwrap()
+                .servers
+                .len(),
+            2
+        );
     }
 }
 

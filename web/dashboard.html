@@ -2192,6 +2192,10 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
       <option value="pause" data-i18n="set.rss.dupe.pause">hold it paused as a backup</option>
       <option value="discard" data-i18n="set.rss.dupe.discard">refuse it</option>
       <option value="fail" data-i18n="set.rss.dupe.fail">fail it into History</option></select></div>
+  <div class="row"><label data-i18n="set.rss.dupescope">What counts as a duplicate<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.rss.dupescope.hint">"same show or film" treats any release with the same identity (show, season and episode, or title and year) as a duplicate, even under a different name. "same release only" matches only the same release name again, so a quality upgrade chosen by Sonarr or Radarr downloads normally while the same NZB added twice is still caught</span></label>
+    <select class="sel" id="s_dupe_scope" style="max-width:280px" onchange="setCfg('dupe_scope',this.value)">
+      <option value="smart" data-i18n="set.rss.dupescope.smart">same show or film</option>
+      <option value="exact" data-i18n="set.rss.dupescope.exact">same release only</option></select></div>
 </div>
 
 <div class="card set" data-sg="organise" data-sk="pullsearch">
@@ -4737,7 +4741,7 @@ async function tick(){
         : pwhen? ` · ${t('status.paused.sched','by your schedule until {t}',{t:pwhen})}`
         : psched? ` · ${t('status.paused.sched.open','by your schedule')}`
         : pmin? ` · ${t('status.minleft','{n}m left',{n:pmin})}` : '')
-      : (q.hold && !busy ? t('status.held','held')
+      : (visibleHold(q) && !busy ? t('status.held','held')
       : tailNow ? tStatus(tailNow.status)
       : tStatus(downloading?'Downloading':'Idle'));
     // Work in progress gets the pulsing dot - a still one beside
@@ -6900,6 +6904,24 @@ function whyslowBlock(s){
         {s:num(w.storage_probe_ms/1000,1)}))}`:''}</div>
   </div>`;
 }
+// §156 8(d): which scheduler hold is worth drawing. The banner answers
+// "why is nothing MOVING right now", a question the user only has when
+// there is something to move - and the daemon publishes the no-servers
+// hold whenever zero servers are enabled, queue or no queue. On a fresh
+// install that meant "Queue held" over an EMPTY queue, shouting past
+// the first-run checklist whose "Add a server" points at the very same
+// card. So noservers is suppressed while the queue is empty, and ONLY
+// noservers: disk and quota exist only once the user has set a limit
+// (never a fresh install) and carry live figures worth seeing before
+// the next job is queued, and a postproc hold with an empty visible
+// queue is a real state - jobs are finishing. Shared by the banner and
+// the header pill, so "held" never shows without the sentence that
+// explains it.
+function visibleHold(q){
+  const h=q&&q.hold;
+  if(h&&h.kind==='noservers'&&!((q.slots||[]).length)) return null;
+  return h||null;
+}
 // Queue table renderer (runs each tick AND on drawer toggles). The
 // re-render is suppressed while a row is mid-drag or a drawer control has
 // focus - same guard idea as the schedule editor's :focus check.
@@ -6933,7 +6955,7 @@ function renderQueue(){
   }
   const qs=document.getElementById('qspace');
   if(qs){
-    const hold=lastQ&&lastQ.hold;
+    const hold=visibleHold(lastQ);
     // A scheduler hold outranks the forecast: it is why nothing is
     // MOVING right now, with the live numbers, where the user is
     // already looking. The daemon composed only the facts; the sentence
@@ -11479,6 +11501,7 @@ async function loadSettings(){
   initMovePace(c.move_pace||'yield'); renderCatFiles(c.categories||'', c.move_completed_cats||'', c.cat_meta||{}); put('s_out_umask', c.out_umask||''); put('s_min_free', sizeStr(c.min_free)); put('s_quota', sizeStr(c.quota));
   put('s_quota_period', c.quota_period||'d');
   put('s_dupe_action', c.dupe_action||'pause');
+  put('s_dupe_scope', c.dupe_scope||'smart');
   put('s_nested_max_depth', c.nested_max_depth??5);
   put('s_watch', c.watch); put('s_script', c.script);
   put('s_watch_interval_secs', c.watch_interval_secs??5);

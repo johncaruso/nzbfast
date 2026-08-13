@@ -702,6 +702,30 @@ impl Extractor {
             self.discard_slot(inner, slot);
             return Ok(());
         }
+        // The whole reconstruction runs with `refeed_active` raised
+        // (saved/restored like drain_holds, which nests inside): every
+        // plain write it performs - header stash, extracted read-back,
+        // chase buffer - surfaces an identity placement, so an article
+        // parked on a Held return (header articles above all) completes
+        // its journal record at the caller's next flush instead of
+        // refetching on resume. Sound for the same reason the `M`
+        // record is: these bytes are durably at their final offsets in
+        // the volume file the moment the write lands, and the record
+        // only ever surfaces AFTER that write.
+        let prev = inner.refeed_active;
+        inner.refeed_active = true;
+        let r = self.fallback_slot_reconstruct(inner, slot);
+        inner.refeed_active = prev;
+        r?;
+        self.note_slot_materialized(inner, slot);
+        Ok(())
+    }
+
+    /// The body of [`Self::fallback_slot`]: everything from chase/7z
+    /// teardown through the held-span drain, split out so the caller
+    /// can bracket it with the refeed flag and fire the materialized
+    /// notification only on full success.
+    fn fallback_slot_reconstruct(&self, inner: &mut Inner, slot: usize) -> io::Result<()> {
         // A demoting 7z chase abandons its worker's partial outputs
         // first; the worker itself unblocks on the buffer abort below.
         // The ctl stays IN the slot: sevenz_finish / Drop discover
@@ -861,6 +885,33 @@ impl Extractor {
 
         // 3. Held spans flush through the plain path.
         self.drain_holds(inner, slot)
+    }
+
+    /// Tell the journal this ROOT slot's volume file now holds every
+    /// byte its recorded placements describe (see [`MaterializedHook`]).
+    /// Fired only after the reconstruction fully landed - a kill before
+    /// this point leaves no `M` line and the articles refetch, which is
+    /// the safe direction. Depth-gated as a second belt beside the
+    /// root-only hook install: a nested slot index must never reach the
+    /// journal's root slot space.
+    fn note_slot_materialized(&self, inner: &Inner, slot: usize) {
+        if self.depth == 0
+            && let Some(h) = inner.materialized.as_ref()
+        {
+            // The file that actually exists, not the one the slot was
+            // first recorded under: `Extractor::rename` retargets a
+            // writerless slot from a PAR2 report, and the writer this
+            // demote just created carries the renamed path.
+            let s = &inner.slots[slot];
+            let name = s
+                .writer
+                .as_ref()
+                .map(|w| w.current_path())
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| s.name.clone());
+            let size = s.writer.as_ref().map(|w| w.size).unwrap_or(s.size);
+            h(slot, &name, size);
+        }
     }
 
     /// Download over: no more articles can arrive, so a slot still waiting
@@ -1343,6 +1394,64 @@ mod tests {
         ex.finish().unwrap();
         assert_eq!(std::fs::read(dir.join("v.rar")).unwrap(), vol);
         assert!(!dir.join("f.bin").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The demote must tell the journal (see [`MaterializedHook`]): the
+    /// fallback deletes the inner files the slot's R records name as
+    /// copy sources, and without the `M` line a retry over intact
+    /// volumes refetched the whole post (measured 13 Aug 2026).
+    #[test]
+    fn fallback_fires_the_materialized_hook_per_slot() {
+        let dir = tmpdir("fbhook");
+        let data = payload(200_000, 23);
+        let vol = fixtures::rar5_volume(&[("g.bin", 200_000, &data, false, false)]);
+        let ex = Extractor::new(&dir, 1, true);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(usize, String, u64)>::new()));
+        let s2 = seen.clone();
+        ex.set_materialized_hook(Arc::new(move |slot, name: &str, size| {
+            s2.lock().unwrap().push((slot, name.to_string(), size))
+        }));
+        ex.write(0, "v.rar", vol.len() as u64, 0, &vol).unwrap();
+        assert!(seen.lock().unwrap().is_empty(), "no demote, no hook");
+        ex.materialize(0).unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(0, "v.rar".to_string(), vol.len() as u64)],
+            "hook fires once, after the reconstruction landed"
+        );
+        // A second demote of an already-fallen slot is a no-op.
+        ex.materialize(0).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        ex.finish().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A PAR2 report renames a still-WRITERLESS slot, then the repair
+    /// path materializes it. The hook must name the file that now
+    /// exists - the journal rewrites every placement of the slot onto
+    /// that name, and the stale posted name pointed them at nothing.
+    #[test]
+    fn the_materialized_hook_names_the_renamed_volume() {
+        let dir = tmpdir("fbrename");
+        let data = payload(200_000, 24);
+        let vol = fixtures::rar5_volume(&[("g.bin", 200_000, &data, false, false)]);
+        let ex = Extractor::new(&dir, 1, true);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(usize, String, u64)>::new()));
+        let s2 = seen.clone();
+        ex.set_materialized_hook(Arc::new(move |slot, name: &str, size| {
+            s2.lock().unwrap().push((slot, name.to_string(), size))
+        }));
+        ex.write(0, "0Bf3qZ.bin", vol.len() as u64, 0, &vol)
+            .unwrap();
+        ex.rename(0, "verified.part01.rar");
+        ex.materialize(0).unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(0, "verified.part01.rar".to_string(), vol.len() as u64)]
+        );
+        assert!(dir.join("verified.part01.rar").exists());
+        ex.finish().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

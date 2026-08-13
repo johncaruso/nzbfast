@@ -379,7 +379,20 @@ pub(super) fn spawn_sidecar(
                 Err(e) => {
                     // A restricted attempt, not a verdict - the job stays
                     // queued and its journal keeps everything landed.
-                    info!(target: "prefetch", "{nzo_id} stopped: {e} (progress kept in the journal)");
+                    //
+                    // Our own wind-down surfaces from the pipeline as the
+                    // user-cancel bail ("stopped by user"), and printing
+                    // that verbatim reads as a cancel nobody made (issue
+                    // #38). The runner set `cancelled` before firing the
+                    // abort, so the flag says which story is true.
+                    if cancelled.load(Ordering::Relaxed) {
+                        info!(
+                            target: "prefetch",
+                            "{nzo_id} wound down - the main queue takes over (progress kept in the journal)"
+                        );
+                    } else {
+                        info!(target: "prefetch", "{nzo_id} stopped: {e} (progress kept in the journal)");
+                    }
                 }
             }
             let mut g = d.sidecar.lock_ok();

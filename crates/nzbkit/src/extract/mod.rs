@@ -72,6 +72,7 @@ mod holds;
 mod reader;
 mod settle;
 mod sevenz;
+mod shape;
 #[cfg(test)]
 mod testutil;
 mod zip;
@@ -87,6 +88,11 @@ use frontier::*;
 use holds::*;
 use settle::*;
 use sevenz::*;
+use shape::*;
+pub use shape::{
+    ArchiveShape, NestedDisposition, NestedPrevalence, nested_prevalence, note_nested_level,
+    reset_nested_prevalence, shape_word,
+};
 
 /// Reason prefix for a demote of a TOP-LEVEL 7z chase. The archive
 /// materializes into the output directory, which is precisely the disk
@@ -139,6 +145,26 @@ pub type DecryptBarrier = Arc<dyn Fn(&[String]) -> io::Result<()> + Send + Sync>
 /// retirement simply stands and the retry refetches - the pre-existing,
 /// always-correct behaviour.
 pub type DecryptPublish = Arc<dyn Fn(&str, &[CryptoJournalEvent]) + Send + Sync>;
+
+/// Slot demoted to a materialized volume: its reconstruction (header
+/// stash + inner-file read-back + held-span drain) has fully landed, so
+/// every placement the journal recorded for this ROOT slot - fragments
+/// naming inner files the fallback is about to delete - now also sits at
+/// its final offsets in the slot's own volume file. The daemon wires
+/// this to `Journal::record_materialized`, whose `M` line lets a resume
+/// restore those articles as identity instead of refetching the whole
+/// post (the measured 13 Aug 2026 gap: a retry over volumes-on-disk
+/// pulled every article again). Root level only, deliberately not
+/// inherited by children: the journal's slot space is the root's, and a
+/// nested demote materializes an inner file, not a volume.
+///
+/// Called with (slot, the slot's CURRENT filename, its size). The name
+/// matters: a PAR2 report can rename a writerless slot between the `S`
+/// line that first recorded it and this demote, and the volume is then
+/// materialized under the verified name. Recording the demote against
+/// the stale posted name pointed every rewritten placement at a file
+/// that does not exist, so the retry refetched the post it was holding.
+pub type MaterializedHook = Arc<dyn Fn(usize, &str, u64) + Send + Sync>;
 
 /// Strip release-file suffixes down to the shared stem:
 /// `x.part01.rar`/`x.r00`/`x.vol000+01.par2`/`x.par2`/`x.rar` → `x`,
@@ -201,6 +227,31 @@ pub fn release_stem(name: &str) -> String {
         .then_some(p)
     });
     name[..end].to_string()
+}
+
+/// Extensions whose bytes ARE a RAR or 7z container but whose file is
+/// the deliverable: `.cbr` is a comic wearing a RAR wrapper, `.cb7` its
+/// 7-Zip twin. Unpacking one is data loss, not extraction - the user
+/// asked for the comic, not a folder of loose pages (GitHub issue #40).
+/// The zip family's counterpart list (`.cbz`, `.epub`, office files)
+/// lives in `zip::FINAL_FILE_EXTS`; the same standing rule applies here:
+/// the guard keys on the NAMED extension only, so an obfuscated post
+/// (hash names, no meaningful extension) still earns the magic sniff.
+const FINAL_FILE_EXTS: &[&str] = &["cbr", "cb7"];
+
+/// A RAR/7z-container file whose extension marks it as the payload
+/// itself. Never unpack one - and never let a sweep count it as a spent
+/// volume or nested layer.
+pub fn is_final_file(path: &std::path::Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| is_final_name(&n.to_string_lossy()))
+}
+
+/// [`is_final_file`] over a bare file name (any case).
+pub fn is_final_name(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .is_some_and(|e| FINAL_FILE_EXTS.contains(&&*e.to_string_lossy().to_ascii_lowercase()))
 }
 
 /// Natural volume order key: `.rar` < `.r00` < `.r01`; `.part1` < `.part2`.
@@ -288,6 +339,19 @@ struct Slot {
     /// a wrong guess never re-arms; `spill_unclassified_slot` stays the
     /// backstop for posts whose offset 0 genuinely never comes early.
     probe0_sent: bool,
+    /// This slot is Plain because the offset-0 sniff LOOKED and found no
+    /// archive shape worth mapping or chasing - an ordinary payload file
+    /// (or an archive bound for a post-pass, which reads the same file
+    /// off disk either way). False for the other road to Plain: the
+    /// spill/overflow give-up, where classification never ran and the
+    /// bytes may be a RAR volume whose header article was lost.
+    ///
+    /// The distinction exists for exactly one caller,
+    /// [`Extractor::is_plain_patchable`] (TODO 160): a sniffed-plain
+    /// slot's file IS its own output, so mapped repair may patch damage
+    /// straight into it, while a given-up volume keeps declining to the
+    /// materialize + `repair_dir` path that has always owned it.
+    plain_by_sniff: bool,
     /// Plain-file or materialized-volume writer.
     writer: Option<Arc<FileWriter>>,
     mapper: Option<VolumeMapper>,
@@ -322,6 +386,11 @@ struct Slot {
     /// exact path this state deferred - the stored reason keeps the
     /// finish ladder's remediation keyed the same either way.
     pw_await: Option<&'static str>,
+    /// §156.1: an article of this slot got a terminal verdict. Sticky;
+    /// what lets a chase attaching (or a member routing) AFTER the
+    /// verdict still learn its volume is doomed - see
+    /// `Extractor::mark_slot_lost`.
+    article_lost: bool,
 }
 
 struct Group {
@@ -401,6 +470,18 @@ pub struct Frag {
     pub len: u64,
 }
 
+impl Frag {
+    /// Rebase this fragment to identity form in `file`: the bytes sit at
+    /// their volume offset in the named file itself. The journal writer
+    /// uses it for articles that complete after their slot demoted to a
+    /// materialized volume, whose original fragments may name inner
+    /// files the fallback deleted.
+    pub fn rebase_identity(&mut self, file: &str) {
+        self.file = file.to_string();
+        self.file_off = self.vol_off;
+    }
+}
+
 /// What [`Extractor::write`] did with a span, for the crash-resume
 /// journal. `Placed` means EVERY byte of the article is durably on disk
 /// at the recorded fragments - the only state a plain `R` record may
@@ -427,320 +508,6 @@ pub enum Persist {
     Placed(Vec<Frag>),
     PlacedCrypto(Vec<Frag>),
     Held(Vec<Frag>),
-}
-
-// ---- Phase 0(b): nested-archive prevalence instrumentation ----
-//
-// Learn real-world nesting prevalence from live daemons and testers.
-// Every nested level processed (an archive INSIDE another archive - depth
-// > 0) emits one concise, greppable log line and bumps a process-global
-// tally the daemon stats API can surface. A single-layer job (depth 0)
-// never reaches this path, so the common case pays nothing. Two paths
-// feed the ONE counter set: the in-stream child extractor here (store /
-// chase / 7z inners that stream in RAM) and the disk post-pass in nzbfast
-// (materialized inners the stream demoted, plus never-streamed shapes
-// like RAR4 and resumed jobs).
-//
-// Counting model (kept consistent across both call sites so a demoted
-// inner is never double-counted):
-//   * an inner that STAYS in-stream          -> `in_stream` (this crate)
-//   * an inner handled by the disk post-pass -> `disk`      (nzbfast)
-//   * an in-stream attempt that DEMOTES      -> `demoted` only
-// A demoted inner materializes and is then re-extracted by the disk
-// post-pass, where it is tallied once under `disk`; the `demoted` bump is
-// a diagnostic that records WHY a `disk` line exists. Hence the invariant
-// `levels == in_stream + disk`, with `demoted <= disk`.
-
-static NESTED_LEVELS: AtomicU64 = AtomicU64::new(0);
-static NESTED_IN_STREAM: AtomicU64 = AtomicU64::new(0);
-static NESTED_DEMOTED: AtomicU64 = AtomicU64::new(0);
-static NESTED_DISK: AtomicU64 = AtomicU64::new(0);
-static NESTED_RAR_STORE: AtomicU64 = AtomicU64::new(0);
-static NESTED_RAR_COMPRESSED: AtomicU64 = AtomicU64::new(0);
-static NESTED_RAR_ENCRYPTED: AtomicU64 = AtomicU64::new(0);
-static NESTED_SEVENZ: AtomicU64 = AtomicU64::new(0);
-static NESTED_OTHER: AtomicU64 = AtomicU64::new(0);
-
-// ---------------------------------------------------------------------------
-// Archive shape: what the set turned out to BE, published live.
-//
-// The mappers already learn every fact here the moment a volume's headers
-// parse - RAR version, per-entry method, encryption - and the routing
-// decisions know whether the bytes are being extracted as they arrive or
-// materialized for a disk unpack. None of it used to leave the extractor
-// before finish(). The latch below collects it into a small token list
-// the daemon can poll mid-download and the dashboard can translate.
-//
-// Bits are LATCHED, never cleared: a set that starts on the fast path and
-// later demotes reads as "partly on disk", which is what actually
-// happened. One latch is shared by a whole extractor chain, with nested
-// levels writing a separate word, so an inner 7z inside a RAR5 store set
-// shows up as "7z inside" rather than overwriting the outer format.
-// ---------------------------------------------------------------------------
-
-const SH_RAR4: u32 = 1 << 0;
-const SH_RAR5: u32 = 1 << 1;
-const SH_7Z: u32 = 1 << 2;
-const SH_STORE: u32 = 1 << 3;
-const SH_COMPRESSED: u32 = 1 << 4;
-const SH_ENCRYPTED: u32 = 1 << 5;
-/// Encrypted content that decrypts at write time (plaintext-once) rather
-/// than being assembled as ciphertext for the finish pass.
-const SH_ENC_INSTREAM: u32 = 1 << 6;
-/// At least one inner file was routed to direct extraction.
-const SH_ONE_PASS: u32 = 1 << 7;
-/// At least one group/slot fell back to volumes on disk.
-const SH_MATERIALIZED: u32 = 1 << 8;
-/// The outer container is a zip (one-pass zip, phase 2).
-const SH_ZIP: u32 = 1 << 9;
-
-/// Shared observations for one extractor chain (see the section note).
-#[derive(Default)]
-struct ShapeLatch {
-    outer: AtomicU32,
-    nested: AtomicU32,
-    /// The first whole-file CRC32 an inner entry's header stated, with
-    /// the entry's name. Latched from the same parse the shape bits come
-    /// from, because it is the same fact: what the archive says it
-    /// contains.
-    ///
-    /// It rides here rather than in a field of its own so a nested level
-    /// contributes to it without a second Arc through `build` - and
-    /// because a naming oracle wants the OUTERMOST content it can get, a
-    /// first-writer-wins latch is the right shape as well as the cheap
-    /// one.
-    crc: Mutex<Option<(String, u32)>>,
-}
-
-impl ShapeLatch {
-    fn note(&self, depth: usize, bits: u32) {
-        let w = if depth == 0 {
-            &self.outer
-        } else {
-            &self.nested
-        };
-        w.fetch_or(bits, Ordering::Relaxed);
-    }
-
-    /// First writer wins: the volumes of one set repeat their entries in
-    /// every header, and re-latching would just churn the lock at line
-    /// rate for the same answer.
-    fn note_crc(&self, name: &str, crc: u32) {
-        let mut g = self.crc.lock_ok();
-        if g.is_none() {
-            *g = Some((name.to_string(), crc));
-        }
-    }
-
-    fn snapshot(&self) -> (u32, u32) {
-        (
-            self.outer.load(Ordering::Relaxed),
-            self.nested.load(Ordering::Relaxed),
-        )
-    }
-}
-
-/// What an archive set turned out to be, as an ordered list of stable
-/// tokens: format, then how the content is packed, then how it is being
-/// unpacked, then what was found inside.
-///
-/// The tokens are the wire format - the daemon persists them and the
-/// dashboard translates them - so they must stay stable. [`Self::display`]
-/// renders the English the CLI prints.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArchiveShape {
-    tokens: Vec<&'static str>,
-}
-
-impl ArchiveShape {
-    fn from_bits(outer: u32, nested: u32) -> Option<ArchiveShape> {
-        let mut t: Vec<&'static str> = Vec::new();
-        if outer & SH_RAR5 != 0 {
-            t.push("rar5");
-        } else if outer & SH_RAR4 != 0 {
-            t.push("rar4");
-        } else if outer & SH_7Z != 0 {
-            t.push("7z");
-        } else if outer & SH_ZIP != 0 {
-            t.push("zip");
-        } else {
-            // Nothing archive-shaped has been recognized yet (or the job
-            // is loose files) - no badge rather than a guess.
-            return None;
-        }
-        match (outer & SH_STORE != 0, outer & SH_COMPRESSED != 0) {
-            (true, true) => t.push("mixed"),
-            (true, false) => t.push("store"),
-            (false, true) => t.push("compressed"),
-            (false, false) => {}
-        }
-        if outer & SH_ENCRYPTED != 0 {
-            t.push("encrypted");
-        }
-        let one_pass = outer & SH_ONE_PASS != 0;
-        let on_disk = outer & SH_MATERIALIZED != 0;
-        if one_pass && on_disk {
-            t.push("mixed-pass");
-        } else if on_disk {
-            t.push("on-disk");
-        } else if one_pass {
-            // Legacy encrypted sets assemble ciphertext and unlock in the
-            // finish pass; plaintext-once unlocks as the bytes arrive, so
-            // it is a plain one-pass set like any other.
-            if outer & SH_ENCRYPTED != 0 && outer & SH_ENC_INSTREAM == 0 {
-                t.push("unlock-at-end");
-            } else {
-                t.push("one-pass");
-            }
-        }
-        if nested & SH_7Z != 0 {
-            t.push("inner-7z");
-        } else if nested & (SH_RAR4 | SH_RAR5) != 0 {
-            t.push("inner-rar");
-        }
-        Some(ArchiveShape { tokens: t })
-    }
-
-    pub fn tokens(&self) -> &[&'static str] {
-        &self.tokens
-    }
-
-    /// The space-separated form carried by the API and the history file.
-    pub fn tag(&self) -> String {
-        self.tokens.join(" ")
-    }
-
-    /// English, for the CLI and as the dashboard's fallback.
-    pub fn display(&self) -> String {
-        self.tokens
-            .iter()
-            .map(|t| shape_word(t))
-            .collect::<Vec<_>>()
-            .join(" · ")
-    }
-}
-
-/// English for one [`ArchiveShape`] token. Unknown tokens pass through so
-/// an older daemon's persisted tag still reads sensibly.
-pub fn shape_word(token: &str) -> &str {
-    match token {
-        "rar5" => "RAR5",
-        "rar4" => "RAR4",
-        "7z" => "7z",
-        "zip" => "zip",
-        "store" => "stored",
-        "compressed" => "compressed",
-        "mixed" => "mixed",
-        "encrypted" => "encrypted",
-        "one-pass" => "one-pass",
-        "unlock-at-end" => "unlocked at the end",
-        "on-disk" => "unpacked after download",
-        "mixed-pass" => "partly on disk",
-        "inner-7z" => "7z inside",
-        "inner-rar" => "RAR inside",
-        other => other,
-    }
-}
-
-/// How a nested inner archive was handled, for [`note_nested_level`].
-pub enum NestedDisposition<'a> {
-    /// Extracted entirely in-stream - its volumes never touched disk.
-    InStream,
-    /// An in-stream attempt fell back to materialized volumes; the reason
-    /// is the demote cause (a mixed set, a budget breach, a bad CRC, ...).
-    Demoted(&'a str),
-    /// Handled by the disk post-pass (a demoted inner, or one never
-    /// eligible for streaming - RAR4, multipart 7z, a resumed job).
-    Disk,
-}
-
-/// A snapshot of the nested-prevalence tally, for the stats API.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct NestedPrevalence {
-    /// Distinct nested inner archives processed (`in_stream + disk`).
-    pub levels: u64,
-    pub in_stream: u64,
-    pub demoted: u64,
-    pub disk: u64,
-    pub rar_store: u64,
-    pub rar_compressed: u64,
-    pub rar_encrypted: u64,
-    pub sevenz: u64,
-    pub other: u64,
-}
-
-/// Record one processed nested level: log a line and bump the tally. Cheap
-/// and non-spammy - called once per nested archive at a terminal seam, not
-/// per span. `kind` is one of `rar-store` / `rar-compressed` /
-/// `rar-encrypted` / `7z` / `other`.
-pub fn note_nested_level(depth: usize, kind: &str, disposition: NestedDisposition) {
-    let bump_kind = || {
-        match kind {
-            "rar-store" => &NESTED_RAR_STORE,
-            "rar-compressed" => &NESTED_RAR_COMPRESSED,
-            "rar-encrypted" => &NESTED_RAR_ENCRYPTED,
-            "7z" => &NESTED_SEVENZ,
-            _ => &NESTED_OTHER,
-        }
-        .fetch_add(1, Ordering::Relaxed)
-    };
-    match disposition {
-        NestedDisposition::InStream => {
-            NESTED_LEVELS.fetch_add(1, Ordering::Relaxed);
-            NESTED_IN_STREAM.fetch_add(1, Ordering::Relaxed);
-            bump_kind();
-            println!("nested-prevalence: depth={depth} type={kind} stream=in-stream");
-        }
-        NestedDisposition::Disk => {
-            NESTED_LEVELS.fetch_add(1, Ordering::Relaxed);
-            NESTED_DISK.fetch_add(1, Ordering::Relaxed);
-            bump_kind();
-            println!("nested-prevalence: depth={depth} type={kind} stream=disk");
-        }
-        NestedDisposition::Demoted(reason) => {
-            // Diagnostic only - the archive is tallied under `disk` when
-            // the post-pass re-extracts the volumes this demote produced.
-            NESTED_DEMOTED.fetch_add(1, Ordering::Relaxed);
-            println!(
-                "nested-prevalence: depth={depth} type={kind} stream=demoted reason=\"{reason}\""
-            );
-        }
-    }
-}
-
-/// Current nested-prevalence tally (process lifetime). Surfaced by the
-/// daemon stats API and asserted by the prevalence tests.
-pub fn nested_prevalence() -> NestedPrevalence {
-    NestedPrevalence {
-        levels: NESTED_LEVELS.load(Ordering::Relaxed),
-        in_stream: NESTED_IN_STREAM.load(Ordering::Relaxed),
-        demoted: NESTED_DEMOTED.load(Ordering::Relaxed),
-        disk: NESTED_DISK.load(Ordering::Relaxed),
-        rar_store: NESTED_RAR_STORE.load(Ordering::Relaxed),
-        rar_compressed: NESTED_RAR_COMPRESSED.load(Ordering::Relaxed),
-        rar_encrypted: NESTED_RAR_ENCRYPTED.load(Ordering::Relaxed),
-        sevenz: NESTED_SEVENZ.load(Ordering::Relaxed),
-        other: NESTED_OTHER.load(Ordering::Relaxed),
-    }
-}
-
-/// Reset the tally to zero. Test-only: the counters are process-global, so
-/// a test that asserts exact counts must isolate itself first.
-#[doc(hidden)]
-pub fn reset_nested_prevalence() {
-    for c in [
-        &NESTED_LEVELS,
-        &NESTED_IN_STREAM,
-        &NESTED_DEMOTED,
-        &NESTED_DISK,
-        &NESTED_RAR_STORE,
-        &NESTED_RAR_COMPRESSED,
-        &NESTED_RAR_ENCRYPTED,
-        &NESTED_SEVENZ,
-        &NESTED_OTHER,
-    ] {
-        c.store(0, Ordering::Relaxed);
-    }
 }
 
 /// One deferred pwrite: performed after the routing lock drops.
@@ -907,6 +674,12 @@ pub struct Extractor {
     /// Deliberately outside `inner`: the daemon polls it once a second
     /// while the routing lock is the hot path.
     shape: Arc<ShapeLatch>,
+    /// §156.3b stalled-chase pager: coalesced wake flags for the
+    /// detached paging thread (`Extractor::wake_pager`). Outside `inner`
+    /// on purpose - the arrival path and the blocking readers touch
+    /// them without the routing lock.
+    pager_armed: AtomicBool,
+    pager_active: AtomicBool,
     inner: Mutex<Inner>,
 }
 
@@ -1076,6 +849,9 @@ struct Inner {
     /// Post-rename decrypt publish notification, inherited like the
     /// barrier. See [`DecryptPublish`].
     decrypt_publish: Option<DecryptPublish>,
+    /// Materialized-volume journal notification, root only (never
+    /// inherited). See [`MaterializedHook`].
+    materialized: Option<MaterializedHook>,
     /// Plaintext-once gate (see [`CryptoState`]): encrypted store
     /// entries decrypt at write time instead of assembling ciphertext
     /// for the finish pass. `NZBFAST_NO_INSTREAM_DECRYPT=1` restores
@@ -1243,6 +1019,8 @@ impl Extractor {
             depth,
             parent,
             shape,
+            pager_armed: AtomicBool::new(false),
+            pager_active: AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 slots: (0..n_slots).map(|_| Self::new_slot()).collect(),
                 groups: HashMap::new(),
@@ -1290,6 +1068,7 @@ impl Extractor {
                 stream_states: HashMap::new(),
                 decrypt_barrier: None,
                 decrypt_publish: None,
+                materialized: None,
                 verify_gate: None,
                 // Plaintext-once gate: on for a live (enabled, fresh)
                 // extractor unless the env kill-switch restores the
@@ -1397,6 +1176,7 @@ impl Extractor {
             holds: Vec::new(),
             pre_bytes: 0,
             probe0_sent: false,
+            plain_by_sniff: false,
             writer: None,
             mapper: None,
             header_spans: Vec::new(),
@@ -1406,6 +1186,7 @@ impl Extractor {
             container_fmt: ChaseFormat::SevenZ,
             piece_crcs: HashMap::new(),
             pw_await: None,
+            article_lost: false,
         }
     }
 
@@ -1693,8 +1474,16 @@ impl Extractor {
                         // establishes a mode and the drain writes it.
                         return Ok(Persist::Held(Vec::new()));
                     } else {
-                        let is_rar = data.starts_with(b"Rar!\x1a\x07\x01\x00")
-                            || data.starts_with(b"Rar!\x1a\x07\x00");
+                        // A NAMED payload file (`.cbr`, `.cb7`) is the
+                        // deliverable even though its bytes carry an
+                        // archive magic - it must never map, chase, or
+                        // attach. Named extension only: an obfuscated
+                        // post keeps the sniff (the zip side's standing
+                        // trade-off, see `zip::chase_eligible_name`).
+                        let payload_name = is_final_name(&inner.slots[slot].name);
+                        let is_rar = !payload_name
+                            && (data.starts_with(b"Rar!\x1a\x07\x01\x00")
+                                || data.starts_with(b"Rar!\x1a\x07\x00"));
                         if is_rar {
                             inner.slots[slot].mode = SlotMode::Rar;
                             routed_rar = true;
@@ -1710,7 +1499,7 @@ impl Extractor {
                                 repair,
                                 article_crc,
                             )?;
-                        } else if self.try_attach_sevenz(inner, slot, data)? {
+                        } else if !payload_name && self.try_attach_sevenz(inner, slot, data)? {
                             // Phase 3: a .7z gets the tail-prefetch chase -
                             // this span (and everything held) feeds its
                             // frontier buffer. Only the FORMAT is known
@@ -1738,7 +1527,10 @@ impl Extractor {
                             self.discard_slot(inner, slot);
                             return Ok(Persist::No);
                         } else {
-                            if data.starts_with(b"7z\xbc\xaf\x27\x1c") {
+                            // No badge for a payload name: a `.cb7` is
+                            // not a 7z the post-pass will (or should)
+                            // open.
+                            if !payload_name && data.starts_with(b"7z\xbc\xaf\x27\x1c") {
                                 // A .7z the chase can't take (top level, a
                                 // multipart .001, gate off): it lands on
                                 // disk for the post-pass, and the badge
@@ -1763,6 +1555,9 @@ impl Extractor {
                                 self.shape.note(self.depth, SH_ZIP | SH_MATERIALIZED);
                             }
                             inner.slots[slot].mode = SlotMode::Plain;
+                            // The sniff LOOKED at offset 0 and found no
+                            // shape to map or chase - see `plain_by_sniff`.
+                            inner.slots[slot].plain_by_sniff = true;
                             self.plain_job(inner, slot, offset, data, &mut *jobs)?;
                         }
                         self.drain_holds(inner, slot)?;
@@ -2616,7 +2411,7 @@ impl Extractor {
                         existing
                     } else if encrypted
                         && inner.instream_decrypt
-                        && Self::instream_decrypt_allowed(inner, slot, ei)
+                        && Self::instream_decrypt_allowed(inner, slot, ei, &w)
                     {
                         match Self::crypto_for(inner, slot, ei, &w) {
                             Some(cs) => {
@@ -2833,6 +2628,16 @@ impl Extractor {
             let child = self.ensure_child(inner);
             let cs = child.alloc_slot();
             inner.groups.get_mut(&gk).unwrap().routed.insert(key, cs);
+            // §156.1: a member routed AFTER a terminal verdict on one of
+            // its group's volumes still inherits the loss mark - the
+            // hole lives inside this archive, wherever it routes.
+            if inner.groups[&gk]
+                .slots
+                .iter()
+                .any(|&s| inner.slots[s].article_lost)
+            {
+                child.mark_child_slot_lost(cs);
+            }
             return Ok(Dest::Child(child, cs));
         }
         Ok(Dest::Writer(self.inner_writer(inner, slot, ei, total)?))

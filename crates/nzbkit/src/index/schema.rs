@@ -480,6 +480,22 @@ fn additive_migrations(db: &Connection) {
         "ALTER TABLE releases ADD COLUMN pesto_ctr_min INTEGER",
         "ALTER TABLE releases ADD COLUMN pesto_ctr_max INTEGER",
         "ALTER TABLE releases ADD COLUMN pesto_clock INTEGER",
+        // Indexer-confirm lane: when this suggestion was last spent an
+        // external lookup on (0 = never). Stamped after the search
+        // attempt whether or not it found anything, so one suggestion
+        // can never cost the user's indexer quota twice.
+        "ALTER TABLE pre_corr ADD COLUMN checked_at INTEGER NOT NULL DEFAULT 0",
+        // Posting-session tag (13 Aug 2026 census): the leading
+        // "[037/209]" many posting tools put on every subject - THIS
+        // file is number 37 of a 209-file posting session. The
+        // shattered-poster family carries it even while randomizing
+        // From per article, so it is the cheapest session-assembly
+        // evidence the wire offers (a future pass can stitch the 209
+        // per-file rows into one release). Persisted at ingest, first
+        // writer wins. NULL = subject carried no digit-only tag; 0 is
+        // never written.
+        "ALTER TABLE releases ADD COLUMN sess_idx INTEGER",
+        "ALTER TABLE releases ADD COLUMN sess_total INTEGER",
         // Spot-born adult marker (TODO 131): the person who posted this
         // release filed it under the Spotnet adult subcategory. 0 = no
         // such claim, which is every scanner-born row and every spot

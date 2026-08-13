@@ -188,6 +188,59 @@ pub(super) fn set_scoreboard_source(
     })
 }
 
+pub(super) fn set_corr_confirm_enabled(
+    d: &Arc<Daemon>,
+    _name: &str,
+    v: &str,
+) -> std::result::Result<(bool, Value), String> {
+    Ok({
+        let on = v == "1" || v.eq_ignore_ascii_case("true");
+        let was = d.corr_confirm_enabled.swap(on, Ordering::Relaxed);
+        if on != was {
+            // Same courtesy as the scoreboard: this switch spends the
+            // user's own indexer quota, so say so, naming the account.
+            if on {
+                let src = d.corr_confirm_source.lock_ok().clone();
+                let from = if src.is_empty() {
+                    "NO account picked - inert until corr_confirm_source names one".to_string()
+                } else {
+                    src
+                };
+                info!(
+                    target: "confirm",
+                    "indexer-confirm ON - up to {} suggestion lookup(s)/day from {from}",
+                    crate::serve::tasks::CONFIRM_PER_DAY,
+                );
+            } else {
+                info!(target: "confirm", "indexer-confirm off - nothing is looked up");
+            }
+        }
+        (true, json!(on))
+    })
+}
+
+pub(super) fn set_corr_confirm_source(
+    d: &Arc<Daemon>,
+    _name: &str,
+    v: &str,
+) -> std::result::Result<(bool, Value), String> {
+    Ok({
+        // The name of one of the user's own indexer accounts, same
+        // contract as scoreboard_source: a typo through the raw API
+        // fails loudly here. There is no manual URL+key fallback - the
+        // lane fetches NZBs, which indexers meter as grabs, so it only
+        // runs against an account whose quotas live in the editor.
+        let s = v.trim().to_string();
+        if !s.is_empty() && !d.indexers.lock_ok().iter().any(|i| i.name == s) {
+            return Err(format!(
+                "corr_confirm_source: no indexer account named \"{s}\" - add it under indexer accounts first"
+            ));
+        }
+        *d.corr_confirm_source.lock_ok() = s.clone();
+        (true, json!(s))
+    })
+}
+
 pub(super) fn set_scoreboard_cats(
     d: &Arc<Daemon>,
     _name: &str,

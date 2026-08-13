@@ -36,6 +36,22 @@ mod daemon_usage;
 // the top (TODO 106). Same child-module shape.
 #[path = "daemon_idle.rs"]
 mod daemon_idle;
+// How a job stops running - failure report, sidecar abort, delete
+// quarantine, park into history, idle and give-up: one subject, moved
+// whole (TODO 106).
+#[path = "daemon_park.rs"]
+mod daemon_park;
+
+// How the daemon stops - the graceful wind-down under mode=shutdown and
+// SIGTERM/SIGINT - and the pause timer that stops it temporarily, with
+// the pause state carried across a restart (TODO 106). Same
+// child-module shape. These are free functions rather than a second
+// `impl Daemon`, so unlike its siblings this one is re-exported: every
+// call site names them unqualified through serve/mod.rs's
+// `use daemon::*`.
+#[path = "daemon_shutdown.rs"]
+mod daemon_shutdown;
+pub(in crate::serve) use daemon_shutdown::*;
 
 #[path = "searchlog.rs"]
 mod searchlog;
@@ -279,6 +295,19 @@ pub struct Daemon {
     /// pick so it can be said again. Without the latch every park of a
     /// quiet queue would repeat it.
     pub queue_idle_latch: AtomicBool,
+    /// Issue #38 follow-up: the coalesced-save dirty flag. A completion
+    /// used to call `save_queue` four times (postproc submit, finalize
+    /// marker, finalize end, park), and at 14,500 jobs each rewrite
+    /// serializes the whole queue - multi-second stalls. The hot sites
+    /// call `save_queue_soon` instead, which sets this and wakes the
+    /// saver task; one debounced write covers the burst.
+    pub(super) save_soon: AtomicBool,
+    /// Wakes `spawn_queue_saver` when `save_soon` is set.
+    pub(super) save_wake: tokio::sync::Notify,
+    /// Whether the saver task is running. Until it is (unit tests, and
+    /// the window before `spawn_core_tasks`), `save_queue_soon` degrades
+    /// to the synchronous `save_queue` so nothing is ever left unsaved.
+    pub(super) saver_armed: AtomicBool,
     /// §129 4a: the lifecycle webhook dispatcher's inbox. None until
     /// the dispatcher is spawned (boot does it; unit tests that want
     /// deliveries call `hooks::spawn_dispatcher`). Offers are try-sends:
@@ -1144,6 +1173,17 @@ pub struct Daemon {
     /// resolved at run time, so a key rotated in the indexer editor
     /// carries over. Empty = use `scoreboard_url`/`scoreboard_key`.
     pub(super) scoreboard_source: Mutex<String>,
+    /// Indexer-confirm lane: spend a small daily budget of the user's
+    /// own indexer quota turning STRONG correlation suggestions into
+    /// PROVEN names - search the suggested pre title, fetch the NZB,
+    /// message-id-join it against our rows. OFF by default for the
+    /// same reason as the scoreboard: it is outbound traffic on the
+    /// user's own account, so it is the user's decision.
+    pub(super) corr_confirm_enabled: std::sync::atomic::AtomicBool,
+    /// Name of the `indexers` entry the confirm lane searches. Stored
+    /// by NAME, resolved at run time like `scoreboard_source`. Empty =
+    /// the lane is inert even when switched on.
+    pub(super) corr_confirm_source: Mutex<String>,
     /// Which of [`SCOREBOARD_CATEGORIES`] the daily sample asks for -
     /// one request each, so this is the requests-per-day dial. Indexers
     /// meter every call, so the user gets to spend fewer than the full
@@ -1379,6 +1419,14 @@ pub struct Daemon {
     /// Live - read per add. `allow_dupe` (the wall's asked-and-said-yes)
     /// bypasses all three.
     pub(super) dupe_action: Mutex<String>,
+    /// What counts as a duplicate in the first place. "smart" (the
+    /// default): same identity - show, season and episode, or title and
+    /// year - so a different release of an owned episode collides.
+    /// "exact": only a re-add of the same release name collides, so a
+    /// quality upgrade Sonarr or Radarr chose sails through while the
+    /// same NZB sent twice is still caught (issue #41). Live - read per
+    /// add, through `dupe_collision`.
+    pub(super) dupe_scope: Mutex<String>,
     /// §129 2b (decision 5): real per-category behavior, keyed by the
     /// category name. Everything defaults to "as before": empty dir =
     /// the category's own subfolder, priority None = no default,
@@ -2492,6 +2540,33 @@ impl Daemon {
         Ok((url, key))
     }
 
+    /// The indexer account the confirm lane searches, resolved by name
+    /// at call time (a rotated key carries over). Unlike the
+    /// scoreboard there is no manual URL+key fallback: this lane
+    /// FETCHES NZBs, which most indexers meter as grabs, so it only
+    /// ever runs against an account the user manages in the indexer
+    /// editor where those quotas are visible.
+    pub(super) fn corr_confirm_reference(&self) -> Result<crate::newznab::IndexerConfig, String> {
+        let source = self.corr_confirm_source.lock_ok().trim().to_string();
+        if source.is_empty() {
+            return Err(
+                "no confirm indexer configured - pick one of your indexer accounts".to_string(),
+            );
+        }
+        let list = self.indexers.lock_ok();
+        let Some(i) = list.iter().find(|i| i.name == source) else {
+            return Err(format!(
+                "the confirm indexer \"{source}\" is no longer in your indexer list - pick another"
+            ));
+        };
+        if !i.enabled {
+            return Err(format!(
+                "the confirm indexer \"{source}\" is turned off in your indexer list"
+            ));
+        }
+        Ok(i.clone())
+    }
+
     /// The categories today's sample will actually ask for, in
     /// [`SCOREBOARD_CATEGORIES`] order. One request each, so the length
     /// of this IS the scoreboard's requests-per-day figure.
@@ -2761,425 +2836,6 @@ impl Daemon {
     }
 }
 
-/// How long the wind-down below is allowed to take before it exits
-/// anyway.
-///
-/// Sized against `docker stop`, which sends SIGTERM and then SIGKILLs 10
-/// seconds later. Being killed halfway through the wind-down is the
-/// ungraceful exit we are fixing, so the whole sequence has to finish
-/// well inside that with room for a loaded host - and every step it
-/// waits on is separately bounded (`Connection::quit` at 500 ms, the
-/// pool's own EXIT_GRACE at 5 s).
-pub(super) const WIND_DOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
-
-/// How long going offline waits for the wound-down fleet to park before
-/// it clears the warm pool regardless.
-///
-/// Longer than [`WIND_DOWN_BUDGET`] because nothing is about to SIGKILL
-/// us: this one is racing the operator's patience, not a container
-/// runtime. A graceful pause escalates to a hard abort at ~10 s
-/// (`suspend_matching`), and the abort's own QUITs are bounded, so the
-/// gauge reaches zero well inside this on any provider that answers at
-/// all. It exists for the one that does not.
-pub(super) const OFFLINE_PARK_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Stop cleanly and exit: park the transfer, persist the queue, and
-/// hand every open NNTP session back to the provider with a QUIT.
-///
-/// Shared by `mode=shutdown` and by SIGTERM/SIGINT (issue #13). A
-/// container stop has exactly the same work to do as the tray's Quit
-/// item, and used to do none of it - nothing was wired to signals, so
-/// `docker restart` killed the process outright and left the provider
-/// counting ~100 orphaned sessions until its own idle timeout. The
-/// restart then asked for a full pool the account could not give it and
-/// sat at 0 MB/s.
-///
-/// Bounded by [`WIND_DOWN_BUDGET`] as a whole: if a step overruns we
-/// carry on regardless, because a slow clean exit that gets SIGKILLed is
-/// worth no more than the abrupt one.
-pub(super) fn wind_down(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, reason: &str) {
-    let started = Instant::now();
-    info!(target: "shutdown", "{reason} - persisting queue and closing connections");
-    // Order matters. Pause first so nothing new is admitted while we are
-    // tearing down, THEN wind the transfer down GRACEFULLY.
-    //
-    // Graceful, not the immediate abort, and the difference is the whole
-    // point of this function: the hard abort drops the pool future, and
-    // a dropped worker never reaches the `conn.quit()` its exit path is
-    // built around. Measured against a mock provider that logs commands
-    // - eight busy connections, SIGTERM, eight sockets closed and not one
-    // QUIT logged. The graceful path admits no new articles, lets the
-    // in-flight window land, and lets each worker say goodbye, which is
-    // what actually returns the session slot to the account. It also
-    // costs less on resume: what landed is journalled instead of being
-    // re-fetched.
-    d.paused.store(true, Ordering::Relaxed);
-    d.suspend_active(true);
-    d.save_queue();
-    // Now wait for the sessions themselves to go, because THAT is what
-    // the provider is counting - not the job's state.
-    //
-    // Aborted workers QUIT on their way out, but only at their next
-    // response boundary: the abort flag is checked at the top of the
-    // worker loop, not inside the read it is parked on. So the job
-    // leaves `Downloading` well before the fleet has said goodbye, and
-    // waiting on the job (which is what this loop did first) exited
-    // after 0.3 s with eight connections still open and not one QUIT
-    // sent - measured against a mock provider that logs its commands.
-    // The live gauge is the honest signal.
-    let connected = || -> usize {
-        d.hub
-            .pool_live
-            .lock_ok()
-            .as_ref()
-            .map(|l| {
-                l.servers
-                    .iter()
-                    .map(|s| s.connected.load(Ordering::Relaxed))
-                    .sum()
-            })
-            .unwrap_or(0)
-    };
-    let open_at_signal = connected();
-    while started.elapsed() < WIND_DOWN_BUDGET && connected() > 0 {
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    if open_at_signal > 0 {
-        let left = connected();
-        info!(
-            target: "shutdown",
-            "{} of {open_at_signal} provider connection(s) closed{}",
-            open_at_signal - left,
-            if left > 0 {
-                format!(" - {left} still busy, dropping them")
-            } else {
-                String::new()
-            }
-        );
-    }
-    // The connections nobody is using are the ones a restart trips over:
-    // an idle daemon holds no pool at all, but it does hold parked warm
-    // sessions, and those are pure occupancy on the account's cap.
-    // `clear()` QUITs each one.
-    //
-    // `.get()`, NOT `hub.warm()`: the accessor CONSTRUCTS the pool on
-    // first call, and construction spawns a keepalive tick, which needs
-    // a reactor this thread does not have. On a daemon that had never
-    // pooled anything, asking for the pool in order to empty it panicked
-    // the wind-down thread - and with SIGTERM's default disposition
-    // already replaced, that left a process no `docker stop` could end.
-    if let Some(warm) = d.hub.warm.get() {
-        let left = WIND_DOWN_BUDGET.saturating_sub(started.elapsed());
-        let _ = rt.block_on(async {
-            tokio::time::timeout(
-                left.max(std::time::Duration::from_millis(200)),
-                warm.clear(),
-            )
-            .await
-        });
-    }
-    info!(
-        target: "shutdown",
-        "wound down in {:.1}s",
-        started.elapsed().as_secs_f64()
-    );
-    // Flush the log tee's buffer along with stdout before the exit.
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-}
-
-/// [`wind_down`], then go - and go whatever happens.
-///
-/// Installing a signal handler replaces SIGTERM's default disposition,
-/// so from here on NOTHING else will end this process for us: a panic or
-/// a wedge inside the wind-down does not degrade to the old abrupt exit,
-/// it degrades to a daemon that ignores `docker stop` entirely and waits
-/// out the 10 s until SIGKILL. Both are covered - the wind-down cannot
-/// unwind past `catch_unwind`, and the watchdog exits on time even if it
-/// blocks forever.
-pub(super) fn wind_down_and_exit(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, reason: &str) -> ! {
-    {
-        let reason = reason.to_string();
-        std::thread::spawn(move || {
-            std::thread::sleep(WIND_DOWN_BUDGET + std::time::Duration::from_secs(2));
-            info!(target: "shutdown", "{reason}: wind-down overran its budget - exiting now");
-            std::process::exit(0);
-        });
-    }
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wind_down(d, rt, reason)));
-    if r.is_err() {
-        info!(target: "shutdown", "wind-down failed - exiting anyway");
-    }
-    std::process::exit(0);
-}
-
-/// Wire SIGTERM/SIGINT to [`wind_down_and_exit`].
-///
-/// Unix only for the terminate signal; Ctrl-C is handled on every
-/// platform. A second signal while the first wind-down is still running
-/// is ignored on purpose - the budget already bounds it, and re-entering
-/// the sequence would abort the QUITs it exists to send.
-///
-/// The wait runs on a DEDICATED thread with its own single-thread
-/// runtime, never as a task on the shared runtime. A spawned signal
-/// task is only as responsive as the runtime's free workers, and the
-/// index loops park workers in synchronous SQLite work behind one
-/// mutex: with every worker blocked that way, a spawned handler is not
-/// polled AT ALL - measured on a saturated 4-worker runtime, SIGTERM
-/// went unhandled for five minutes, and the live daemon sat ~30 s on
-/// SIGTERM mid-deepening (2 Aug, TODO §98.2). On its own thread the
-/// same handler answered in under a millisecond under the same
-/// saturation. `docker stop` SIGKILLs at 10 s, so those 30 s are the
-/// difference between a graceful exit and an abrupt one.
-pub(super) fn install_shutdown_signals(daemon: &Arc<Daemon>) {
-    // Not when a host app owns the process. Two reasons, either alone
-    // sufficient: this path ends in `std::process::exit(0)`, which from
-    // an iOS staticlib kills the HOST, not a daemon; and the thread
-    // parks forever by design, so installing it once per start/stop
-    // cycle leaked a thread plus a whole `Arc<Daemon>` graph per
-    // generation. An embedded host's stop is `nzbfast_stop`, which the
-    // serve loop already answers.
-    if super::is_embedded() {
-        return;
-    }
-    let rt = tokio::runtime::Handle::current();
-    let d = daemon.clone();
-    let spawned = std::thread::Builder::new()
-        .name("signal-wait".into())
-        .spawn(move || {
-            let srt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    info!(target: "shutdown", "cannot build the signal runtime ({e}) - stop will be abrupt");
-                    return;
-                }
-            };
-            let reason = srt.block_on(wait_for_shutdown_signal());
-            // Off this thread too: the wind-down blocks on locks and on
-            // `Handle::block_on`, and this thread must stay free to keep
-            // ignoring further signals (see above).
-            std::thread::spawn(move || wind_down_and_exit(&d, &rt, reason));
-            // Park forever rather than return: dropping the runtime
-            // would unregister the signal handlers and restore the
-            // default disposition, so a second SIGTERM mid-wind-down
-            // would kill the process abruptly - the exact exit the
-            // wind-down exists to avoid.
-            loop {
-                std::thread::park();
-            }
-        })
-        .is_ok();
-    if !spawned {
-        info!(target: "shutdown", "cannot spawn the signal thread - stop will be abrupt");
-    }
-}
-
-/// Resolve to the name of whichever shutdown signal arrives first.
-pub(super) async fn wait_for_shutdown_signal() -> &'static str {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        // A failure to register is not fatal: it costs the graceful exit,
-        // not the daemon. Say so rather than dying at startup.
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                info!(target: "shutdown", "cannot listen for SIGTERM ({e}) - stop will be abrupt");
-                let _ = tokio::signal::ctrl_c().await;
-                return "SIGINT";
-            }
-        };
-        tokio::select! {
-            _ = term.recv() => "SIGTERM",
-            _ = tokio::signal::ctrl_c() => "SIGINT",
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        "Ctrl-C"
-    }
-}
-
-/// Pause now; with `mins > 0` also arm an auto-resume ("pause for N
-/// minutes", SAB's set_pause). The timer only fires if no manual
-/// pause/resume happened in between (generation check).
-pub(super) fn timed_pause(d: &Arc<Daemon>, mins: u64, graceful: bool) {
-    let was_paused = d.paused.swap(true, Ordering::Relaxed);
-    // Every caller of this is a person or a client acting for one - the
-    // scheduler pauses through `apply_action`, which claims the pause
-    // for itself.
-    *d.pause_source.lock_ok() = "user";
-    // M23e: also stop the transfer that's in flight, not just new jobs.
-    d.suspend_active(graceful);
-    // Marker on the transition only; a re-sent pause of a paused queue
-    // is not a new moment.
-    if !was_paused {
-        d.note_event(
-            "pause",
-            if mins == 0 {
-                "downloads paused".to_string()
-            } else {
-                format!("downloads paused for {mins} minutes")
-            },
-        );
-    }
-    if mins == 0 {
-        // Still bump the generation: a plain pause has to cancel any
-        // auto-resume a previous timed pause left pending.
-        d.pause_gen.fetch_add(1, Ordering::Relaxed);
-        *d.pause_until.lock_ok() = None;
-    } else {
-        arm_pause_timer(d, std::time::Duration::from_secs(mins * 60));
-    }
-    persist_pause(d);
-}
-
-/// Arm the auto-resume timer for a pause that is ALREADY in effect.
-///
-/// Split out of `timed_pause` so a pause restored at startup can run out
-/// the time it has left rather than a fresh full interval, and so it can
-/// take a Duration - a pause with 90 seconds to go does not round to a
-/// whole number of minutes.
-pub(super) fn arm_pause_timer(d: &Arc<Daemon>, dur: std::time::Duration) {
-    let my_gen = d.pause_gen.fetch_add(1, Ordering::Relaxed) + 1;
-    *d.pause_until.lock_ok() = Some(Instant::now() + dur);
-    let d = d.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(dur);
-        if d.pause_gen.load(Ordering::Relaxed) == my_gen {
-            d.paused.store(false, Ordering::Relaxed);
-            *d.pause_until.lock_ok() = None;
-            persist_pause(&d);
-            info!(target: "pause", "timed pause over - resumed");
-            d.note_event("resume", "timed pause over - downloads resumed");
-        }
-    });
-}
-
-/// Record the queue's pause state so it survives a restart.
-///
-/// A pause is a deliberate act - a metered week, a call in progress, a
-/// benchmark running - and an update or a crash-restart used to undo it
-/// silently, with the queue back at full speed and nothing on screen
-/// saying the user's choice had been dropped.
-///
-/// A timed pause is stored as an ABSOLUTE deadline, not "N minutes left".
-/// "Pause for 30 minutes" is a statement about when downloading may start
-/// again, so a daemon that is down for an hour must come back running,
-/// not sit out another half hour. `restore_pause` handles the deadline
-/// that passed while we were gone.
-///
-/// Called only from the paths that carry the user's intent. Notably NOT
-/// from `shutdown`/`restart_daemon`, which pause the queue as part of
-/// winding down - persisting that would mean every clean quit came back
-/// paused.
-pub(super) fn persist_pause(d: &Daemon) {
-    // The dashboard's change handle, bumped WITH the write, exactly as
-    // `save_queue` does for the job rows - because paused / offline /
-    // pause_source / resume_at ride the same revisioned queue payload.
-    // Without this the §129 1b poll answers `"queue": null` for an idle
-    // daemon whose only change was this one, the page keeps the queue
-    // object it last applied, and the second after the header flips to
-    // "Offline" the poll repaints "Online" over a daemon that really is
-    // offline. Pause hid the same staleness because it is normally
-    // pressed mid-download, where `any_active` makes the queue ride
-    // regardless.
-    d.queue_rev.fetch_add(1, Ordering::Relaxed);
-    let paused = d.paused.load(Ordering::Relaxed);
-    let until = d.pause_until.lock_ok().map(|deadline| {
-        // Instant is monotonic and process-local, so convert through the
-        // time REMAINING to get a wall-clock deadline we can write down.
-        unix_now() + deadline.saturating_duration_since(Instant::now()).as_secs() as i64
-    });
-    // Null removes the key: a running queue leaves nothing behind, so
-    // settings.json keeps holding only what the user actually changed.
-    save_settings(
-        &d.settings_path,
-        &[
-            ("paused", if paused { json!(true) } else { Value::Null }),
-            (
-                "pause_until_unix",
-                match until.filter(|_| paused) {
-                    Some(u) => json!(u),
-                    None => Value::Null,
-                },
-            ),
-            // Offline must survive a restart, or a daemon that was
-            // deliberately kept off the account would silently reconnect
-            // the moment it came back - reoccupying the address slot the
-            // operator went offline to free, with nothing on screen
-            // saying so.
-            (
-                "offline",
-                match d.offline.load(Ordering::Relaxed) {
-                    true => json!(true),
-                    false => Value::Null,
-                },
-            ),
-            (
-                "paused_by_offline",
-                match d.paused_by_offline.load(Ordering::Relaxed) {
-                    true => json!(true),
-                    false => Value::Null,
-                },
-            ),
-        ],
-    );
-}
-
-/// Put back the pause the last run was in, at startup.
-///
-/// Runs BEFORE the scheduler's own startup evaluation, which is allowed
-/// to overrule it: a schedule is a standing rule about what should be
-/// true at this hour, and it already re-evaluates the whole week on boot
-/// for exactly that reason.
-pub(super) fn restore_pause(d: &Arc<Daemon>, saved: &serde_json::Map<String, Value>) {
-    // Offline first, and independently of the pause below: it is the
-    // stronger state and the one with a promise attached (this machine
-    // is not on the account). Restored by setting the flags directly
-    // rather than through `set_offline`, because the queue pause it
-    // would apply is already recorded alongside it - re-deriving it here
-    // would forget whether the operator had ALSO paused by hand.
-    if saved.get("offline").and_then(Value::as_bool) == Some(true) {
-        d.offline.store(true, Ordering::Relaxed);
-        d.paused_by_offline.store(
-            saved.get("paused_by_offline").and_then(Value::as_bool) == Some(true),
-            Ordering::Relaxed,
-        );
-        info!(target: "offline", "restored: offline, touching no provider");
-    }
-    if saved.get("paused").and_then(Value::as_bool) != Some(true) {
-        return;
-    }
-    let Some(deadline) = saved.get("pause_until_unix").and_then(Value::as_i64) else {
-        d.paused.store(true, Ordering::Relaxed);
-        info!(target: "pause", "restored: queue paused");
-        return;
-    };
-    let left = deadline - unix_now();
-    if left <= 0 {
-        // The auto-resume fell due while the daemon was down. Honour it:
-        // start running, and clear the keys so we don't re-read them.
-        info!(target: "pause", "timed pause expired while stopped - resumed");
-        persist_pause(d);
-        return;
-    }
-    d.paused.store(true, Ordering::Relaxed);
-    arm_pause_timer(d, std::time::Duration::from_secs(left as u64));
-    info!(target: "pause", "restored: paused, {} min left", (left + 59) / 60);
-}
-
-/// M14g3: one 1 Hz auto-speed control step (LEDBAT-flavoured AIMD).
-/// `delay_ms` is smoothed RTT minus the base (uncongested) RTT - the
-/// queueing delay OUR traffic is inflicting on the household. Above
-/// target: multiplicative backoff (yield fast when someone starts a call
-/// or a game). Well below target: additive-ish climb to soak spare
-/// capacity. Never below the floor (downloads always trickle), never
-/// above the user/schedule ceiling.
 /// How many failure-link replacements deep an automatic re-grab will go
 /// before it stops asking and only reports. An indexer with a run of
 /// dead posts for one title would otherwise walk the entire run
@@ -3202,6 +2858,13 @@ pub(super) const AUTO_SPEED_FLOOR: u64 = 512_000;
 pub(super) const AUTO_SPEED_START: u64 = 8_000_000;
 pub(super) const AUTO_SPEED_MAX: u64 = 10_000_000_000;
 
+/// M14g3: one 1 Hz auto-speed control step (LEDBAT-flavoured AIMD).
+/// `delay_ms` is smoothed RTT minus the base (uncongested) RTT - the
+/// queueing delay OUR traffic is inflicting on the household. Above
+/// target: multiplicative backoff (yield fast when someone starts a call
+/// or a game). Well below target: additive-ish climb to soak spare
+/// capacity. Never below the floor (downloads always trickle), never
+/// above the user/schedule ceiling.
 pub(super) fn auto_speed_step(delay_ms: u64, target_ms: u64, cap: u64, ceiling: u64) -> u64 {
     let max = if ceiling == 0 {
         AUTO_SPEED_MAX
@@ -3486,10 +3149,31 @@ impl Daemon {
         if is_proper(stem) {
             return None;
         }
-        let k = dupe_key(stem)?;
+        // dupe_scope = "exact" (#41): only a re-add of the same release
+        // name is a duplicate, compared through `exact_dupe_key` so
+        // separator styles still meet. The smart key stays on the job
+        // either way - held alternatives keep auto-promoting by
+        // identity, this only narrows what collides at add time.
+        let exact = self.dupe_scope.lock_ok().as_str() == "exact";
+        let smart_k = dupe_key(stem);
+        let exact_k = exact_dupe_key(stem);
+        if exact {
+            if exact_k.is_empty() {
+                return None;
+            }
+        } else {
+            smart_k.as_ref()?;
+        }
+        let hit = |g: &Job| {
+            if exact {
+                exact_dupe_key(&g.name) == exact_k
+            } else {
+                g.dupe_key == smart_k
+            }
+        };
         let queued = self.queue.lock_ok().iter().find_map(|j| {
             let g = j.lock_ok();
-            (g.dupe_key.as_ref() == Some(&k)).then(|| DupeCollision {
+            hit(&g).then(|| DupeCollision {
                 where_: "queue",
                 name: g.name.clone(),
                 nzo_id: g.nzo_id.clone(),
@@ -3500,12 +3184,10 @@ impl Daemon {
         }
         self.history.lock_ok().iter().find_map(|j| {
             let g = j.lock_ok();
-            (g.dupe_key.as_ref() == Some(&k) && g.state == JobState::Completed).then(|| {
-                DupeCollision {
-                    where_: "history",
-                    name: g.name.clone(),
-                    nzo_id: g.nzo_id.clone(),
-                }
+            (hit(&g) && g.state == JobState::Completed).then(|| DupeCollision {
+                where_: "history",
+                name: g.name.clone(),
+                nzo_id: g.nzo_id.clone(),
             })
         })
     }
@@ -3853,536 +3535,6 @@ impl Daemon {
             let _ = self.history_upsert(std::slice::from_ref(&job));
         } else {
             self.save_queue();
-        }
-    }
-
-    /// Will [`park`](Daemon::park) arm an M32 automatic retry for this
-    /// job? See [`auto_retry_eligible`], which both this and the hook
-    /// planner share so they cannot drift (they already did once - see
-    /// [`fail_kind`]).
-    pub(super) fn will_auto_retry(&self, job: &Arc<Mutex<Job>>) -> bool {
-        let secs = self.auto_retry_secs.load(Ordering::Relaxed);
-        auto_retry_eligible(&job.lock_ok(), secs)
-    }
-
-    /// Tell the indexer this download failed, and queue the replacement
-    /// it offers - NZBGet's FailureLink, natively.
-    ///
-    /// An indexer that sends `X-DNZB-Failure` is offering two things at
-    /// one URL: a failure report (which is how it learns a post is dead,
-    /// and how the next person is spared it) and, in the response body,
-    /// another NZB for the same title. `failure_link` chooses how far to
-    /// go: "report" sends the report and stops, "regrab" also queues what
-    /// comes back. Off by default - it tells a third party what failed
-    /// for you, which is a reasonable thing to want and not a reasonable
-    /// default.
-    ///
-    /// A 404, an empty body, or anything that isn't XML means the
-    /// indexer has nothing else, which is the ordinary outcome and not an
-    /// error. Blocking: call from the blocking pool.
-    pub(super) fn report_failure(&self, job: &Arc<Mutex<Job>>) {
-        let mode = self.failure_link.lock_ok().clone();
-        if mode == "off" {
-            return;
-        }
-        let (link, depth, name, cat, priority, pp, password) = {
-            let j = job.lock_ok();
-            // A job the user DELETED owes the outside world nothing, and
-            // least of all a dead-post report for a post that is not dead.
-            if j.state != JobState::Failed || j.tombstone || j.failure_link.is_empty() {
-                return;
-            }
-            // Only a post-unavailability failure is news the indexer can
-            // act on. A full disk, a permission error or an unpack that
-            // fell over says nothing about the post - reporting it marks
-            // a healthy release dead for every other user of that indexer
-            // and, under `regrab`, spends bandwidth replacing it.
-            if !fail_kind(&j.fail_message).post_unavailable() {
-                info!(
-                    target: "failurelink",
-                    "{}: not reported - {} is a local fault, not a dead post",
-                    j.name, j.fail_message
-                );
-                return;
-            }
-            if !failure_link_allowed(&j.failure_link, &j.failure_host, j.failure_https) {
-                warn!(
-                    target: "failurelink",
-                    "{}: refusing {} - it does not point back at {} (the indexer that supplied it)",
-                    j.name,
-                    // The X-DNZB-Failure endpoint is the indexer's own URL and
-                    // carries its key - and this line fires exactly on a host
-                    // mismatch, which in practice is an indexer serving the
-                    // link from a CDN alias with ?apikey= attached. stdout is
-                    // not private (logtee mirrors it into mode=log, the
-                    // JSON-RPC log methods and `docker logs`), so redact here
-                    // like the accept path below already does.
-                    redact_url_creds(&j.failure_link),
-                    if j.failure_host.is_empty() {
-                        "the origin"
-                    } else {
-                        &j.failure_host
-                    }
-                );
-                return;
-            }
-            let (cat, priority, password) = replacement_inherits(&j);
-            (
-                j.failure_link.clone(),
-                j.failure_depth,
-                j.name.clone(),
-                cat,
-                priority,
-                // The pp the failed job's add asked for: the replacement
-                // is the same request re-made, so the pre-queue hook
-                // sees the same mode.
-                j.sab_pp,
-                password,
-            )
-        };
-        let regrab = may_regrab(&mode, depth);
-        if mode == "regrab" && !regrab {
-            info!(target: "failurelink", "{name}: {depth} replacements already tried - reporting only");
-        }
-        // In `report` mode the report IS the GET: nothing reads the
-        // response, a 404 counts as success, and there is no reason to
-        // pull a body down (let alone a large one) only to drop it.
-        let fetched = match if regrab {
-            fetch_url(&link).map(Some)
-        } else {
-            ping_url(&link)
-        } {
-            Ok(f) => f,
-            // 404 is the indexer saying "nothing else for that title".
-            Err(e) => {
-                let s = e.to_string();
-                if s.contains("404") {
-                    info!(target: "failurelink", "{name}: reported, no other release available");
-                } else {
-                    // Same reason as the watch leg above: the X-DNZB-Failure
-                    // endpoint is the indexer's own URL and carries the key.
-                    warn!(target: "failurelink", "{name}: {}", redact_url_creds(&s));
-                }
-                return;
-            }
-        };
-        let Some(fetched) = fetched else {
-            info!(target: "failurelink", "{name}: failure reported to the indexer");
-            return;
-        };
-        if !is_nzb_body(&fetched.bytes) {
-            info!(target: "failurelink", "{name}: reported, no other release available");
-            return;
-        }
-        // Our category, always: it selects the output subfolder, the
-        // library flag and the move-completed destination, so taking the
-        // one out of the (untrusted) response would let the indexer pick
-        // which of the user's destinations the payload lands in.
-        match self.enqueue_fetched(
-            &fetched,
-            &format!("{name}.nzb"),
-            &cat,
-            priority,
-            pp,
-            password.as_deref(),
-            depth + 1,
-            // A failure-link replacement inherits nothing useful from the
-            // failed job, but "we picked this for you" is worth saying.
-            "failure-link",
-            false,
-        ) {
-            Ok(id) => info!(target: "failurelink", "{name}: queued a replacement ({id})"),
-            Err(e) => warn!(target: "failurelink", "{name}: replacement was not usable: {e}"),
-        }
-    }
-
-    /// Abort of the prefetch sidecar when a user op removes or pauses the
-    /// job it holds (sync handler contexts - the task winds down on its
-    /// own; the runner's stop_sidecar await covers pipeline handover).
-    ///
-    /// Fires inline and then RE-FIRES until the sidecar is actually gone,
-    /// for the same reason suspend_matching does: `get_with_progress`
-    /// installs the hub's abort and queue-ctl handles asynchronously after
-    /// launch, so a single signal that lands in the gap finds both slots
-    /// empty and no-ops. `cancelled` is not a safety net there either - the
-    /// task reads it once, before the transfer starts, and is then parked
-    /// inside the pipeline with nothing left to re-check it.
-    ///
-    /// That gap was reachable and it lost data-plane work: deleting a job
-    /// mid-prefetch removed it from the queue and kept it out of history
-    /// (both correct) while the transfer ran to completion, spending
-    /// provider quota on a job the user had explicitly deleted and leaving
-    /// the finished files in the output directory. Caught by
-    /// `jsonrpc_delete_stops_a_prefetching_job`, which failed on
-    /// "the delete did not stop the prefetch" roughly 1 run in 40 in
-    /// release - the whole reason that assertion exists.
-    pub(super) fn poke_sidecar(self: &Arc<Self>, hit: impl Fn(&str) -> bool) {
-        // Inline first, so the transfer is already stopping by the time the
-        // delete/pause API call returns.
-        let Some(id) = self.fire_sidecar_abort(&hit) else {
-            return;
-        };
-        let d = self.clone();
-        std::thread::spawn(move || {
-            // Bounded like the pause re-fire: 60 s is far longer than the
-            // handles take to attach, and the loop exits the moment the
-            // sidecar slot is empty or holds a different job.
-            for _ in 0..240 {
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                if d.fire_sidecar_abort(&|s: &str| s == id).is_none() {
-                    return;
-                }
-            }
-        });
-    }
-
-    /// One abort signal at the current sidecar, if `hit` accepts it.
-    /// Returns the nzo_id it fired at, or None when there is nothing to
-    /// fire at - which is how the re-fire loop above knows to stop.
-    fn fire_sidecar_abort(&self, hit: &impl Fn(&str) -> bool) -> Option<String> {
-        let sc = self.sidecar.lock_ok();
-        let sc = sc.as_ref().filter(|s| hit(&s.nzo_id))?;
-        sc.cancelled.store(true, Ordering::Relaxed);
-        if let Some(f) = sc.hub.abort.lock_ok().as_ref() {
-            f.store(true, Ordering::Relaxed);
-        }
-        if let Some(c) = sc.hub.queue_ctl.lock_ok().as_ref() {
-            c.abort();
-        }
-        Some(sc.nzo_id.clone())
-    }
-
-    /// Record a delete that removed the RECORD but not the FILES, for the
-    /// dashboard's kept-files notice.
-    ///
-    /// Every delete-with-files path ends here on a [`FilesGone::Kept`],
-    /// and the reason is the same one each time: the user asked for
-    /// recoverable deletes, no Trash would take the path, and we now
-    /// leave the download alone rather than destroying it (70990f19).
-    /// That was the right call and it opened this hole - the queue row or
-    /// history row goes regardless, so the only handle the user had on a
-    /// folder that is still sitting there is the thing the delete removed,
-    /// and a `warn!` in a log they will never open is not telling them.
-    ///
-    /// The path is the replacement handle, which is why it is stored
-    /// rather than the id: they cannot open a record that no longer
-    /// exists, but they can go and look at the folder.
-    pub(super) fn note_delete_kept(&self, name: &str, path: &std::path::Path, why: &str) {
-        {
-            let mut k = self.delete_kept.lock_ok();
-            let path = path.display().to_string();
-            // One entry per path. A bulk history sweep over a shared season
-            // folder refuses once per record, and a dozen identical rows
-            // would bury the one thing the notice has to say.
-            if k.iter().any(|(_, p, _, _)| *p == path) {
-                return;
-            }
-            k.push_back((name.to_string(), path, why.to_string(), unix_now()));
-            while k.len() > 12 {
-                k.pop_front();
-            }
-        }
-        self.save_delete_kept();
-    }
-
-    /// Persist the kept-files notices to `.spool/delete-kept.json`.
-    ///
-    /// This ring is not a moment that scrolls past like the ones beside
-    /// it - it is the REPLACEMENT handle on a folder whose history row
-    /// was just deleted, and it stays on screen until dismissed. Held
-    /// only in memory it did not survive a restart, which includes the
-    /// auto-updater's own restart and `restart_daemon` from the settings
-    /// UI: the row was already gone, so the user was left with the exact
-    /// state the notice exists to prevent - a folder still eating disk,
-    /// named by nothing anywhere. The deferred `park()` refusal has no
-    /// response to ride back on at all, so for that path this is the
-    /// only channel there is.
-    pub(super) fn save_delete_kept(&self) {
-        let path = self.spool.join("delete-kept.json");
-        // The lock is held ACROSS the write, not just around a snapshot.
-        // Snapshotting and then writing lets two writers land in the
-        // opposite order to the states they carry: a refusal snapshots
-        // [X, Y] and is preempted, the user dismisses X and its write of
-        // [Y] completes, then the first write lands [X, Y] - and the next
-        // restart resurrects the notice the user just cleared, which is
-        // the one thing persisting the dismissal exists to prevent.
-        // Safe to hold: `write_atomic` takes no other lock of ours, and
-        // this mutex is a leaf (never acquired while queue/history are
-        // held - both delete arms record after dropping them).
-        let kept = self.delete_kept.lock_ok();
-        if let Ok(text) = serde_json::to_string_pretty(&*kept) {
-            let _ = crate::persist::write_atomic(&path, text.as_bytes());
-        }
-    }
-
-    /// Park a finished job in history (NZBGet-style: failures are parked,
-    /// not lost - mode=retry sends them back through the queue and the
-    /// journal resumes from what already landed).
-    pub(super) fn park(&self, job: Arc<Mutex<Job>>) {
-        let (id, failed, key, demote) = {
-            let g = job.lock_ok();
-            (
-                g.nzo_id.clone(),
-                g.state == JobState::Failed,
-                g.dupe_key.clone(),
-                g.demote,
-            )
-        };
-        // The active-download delete deferred its file removal to here: by
-        // now the fetch has drained and no writer can recreate the dir. A
-        // tombstoned job is dropped (not filed to history), so its spooled
-        // .nzb is dead weight too - remove it (history retry keeps its own).
-        {
-            let g = job.lock_ok();
-            if g.del_on_drop {
-                let tail = delete_tail(&g, || self.job_suffix(filed_stem(&g)));
-                // The user pressed delete-with-files on a LIVE download
-                // and this is where it finally happens, long after the
-                // request answered - so a refusal here has no response
-                // left to ride back on, and the notice is the only way it
-                // reaches them at all.
-                if let FilesGone::Kept(why) =
-                    remove_job_files(&g.out_dir, filed_stem(&g), g.filed, &tail)
-                {
-                    self.note_delete_kept(filed_stem(&g), &g.out_dir, &why);
-                }
-                // The other end of the reservation the delete took when
-                // it set this flag: the directory is only safe to hand
-                // out once its files are actually gone.
-                self.reserved.lock_ok().remove(&g.out_dir);
-            }
-            if g.tombstone {
-                let _ = std::fs::remove_file(&g.nzb_path);
-            }
-        }
-        self.queue.lock_ok().retain(|j| j.lock_ok().nzo_id != id);
-        // The job's queue-row activity dies with the row.
-        self.hub.activity.lock_ok().remove(&id);
-        // §129: so does its recovery-fetch cancel handle. Same key, same
-        // place, same reason - the tail is over, and neither map may
-        // outgrow the queue.
-        self.hub.tail_cancel.lock_ok().remove(&id);
-        // Read LIVE, not from the snapshot above: everything between the two
-        // is unlocked, and file removal is slow. A queue or JSON-RPC delete
-        // landing in that window used to be decided against a stale
-        // `tombstone == false`, so the deleted job was requeued (demote arm),
-        // filed into history, or had an alternative promoted for a cancel the
-        // user had just made. Every terminal branch below re-reads it.
-        let tombstone = job.lock_ok().tombstone;
-        // Watchdog demotion: back into the queue (deferred, at the end)
-        // instead of history - the abort was ours, not a failure. The
-        // journal keeps everything already landed, so the eventual rerun
-        // fetches only what's still missing.
-        // `!tombstone`: a deleted job stays deleted. Both flags together is
-        // an ordinary race - the slow-job watchdog demotes at T, the user (or
-        // an *arr) deletes at T+ε - and the demote arm used to win, pushing
-        // the just-deleted job back onto the queue with its payload removed
-        // and its spooled .nzb already unlinked above. It then reappeared in
-        // the *arr, ran, and failed.
-        // `failed`: the demotion only counts if its abort actually took the
-        // download down. The watchdog's abort can lose the race with the
-        // finish line - it once fired at a job whose network had already
-        // drained (see the runner's stand-down at net-drain) - and a stale
-        // flag on a job that went on to COMPLETE must not send it back
-        // through the queue: post-processing has renamed its directory by
-        // now, so the "rerun" was a full second download of a finished
-        // release into the renamed folder (the 31 Jul queue soak).
-        if demote_requeues(demote, tombstone, failed) {
-            {
-                let mut g = job.lock_ok();
-                g.state = JobState::Queued;
-                g.fail_message.clear();
-                // The evidence goes with the verdict it explained - a
-                // re-queued job that fails again captures its own.
-                g.fail_detail.clear();
-                g.finished_at = None;
-                g.finished_unix = None;
-                g.demote = false;
-                g.deferred = true;
-                g.defer_count += 1;
-            }
-            self.queue.lock_ok().push_back(job);
-            self.save_queue();
-            return;
-        }
-        if demote {
-            // The flag outlived a download that finished anyway (or a
-            // tombstone). Scrub it before the record reaches history, or a
-            // later retry of this job carries it back here and the arm
-            // above requeues that retry's park unconditionally.
-            job.lock_ok().demote = false;
-        }
-        // M32: a FIRST failure with missing articles gets ONE
-        // automatic retry after a cooldown - propagation lag is a real
-        // cause of missing articles that clears on its own, and the
-        // journal makes the rerun fetch only what's still missing. Only
-        // transient shapes qualify: password and takedown verdicts don't.
-        //
-        // The predicate itself is `will_auto_retry`, shared with
-        // `run_post_job_hooks` so the report/re-grab side and the
-        // duplicate promotion below agree with what actually happens here.
-        let armed_auto_retry = self.will_auto_retry(&job);
-        if armed_auto_retry {
-            let secs = self.auto_retry_secs.load(Ordering::Relaxed);
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            // What we are waiting FOR decides both the delay and what
-            // to call it. Propagation filling in missing articles takes
-            // real time; a pool that stalled on this machine has nothing
-            // to wait for at all, and the old copy told the user to sit
-            // out 20 minutes for a propagation that was never the
-            // problem.
-            let kind = fail_kind(&job.lock_ok().fail_message);
-            let (secs, why, token) = match kind {
-                FailKind::Transport => (
-                    secs.min(SHORT_RETRY_SECS),
-                    "connection trouble, not missing articles - retrying shortly",
-                    RETRY_WHY_TRANSPORT,
-                ),
-                _ => (
-                    secs,
-                    "articles missing - propagation may fill them",
-                    RETRY_WHY_PROPAGATION,
-                ),
-            };
-            {
-                let mut g = job.lock_ok();
-                g.auto_retry_at = Some(now + secs);
-                // Beside the stamp, because the delay above was chosen
-                // from it: the drawer says "2 minutes, because this was
-                // the link and not the post" in the user's own language,
-                // which needs the reason as a token and not as this
-                // English log line.
-                g.auto_retry_why = Some(token.to_string());
-            }
-            info!(
-                target: "retry",
-                "{id}: {why}; automatic retry in {} min \
-                 (resumes from the journal; only the gaps will be refetched)",
-                secs.div_ceil(60)
-            );
-        }
-        // Re-read once more: the demote arm above returns, so this is the
-        // first point the history/promotion decisions are actually taken.
-        let tombstone = job.lock_ok().tombstone;
-        // §96.3: feed the per-target give-up breaker. Here because this
-        // is where a failure becomes FINAL - a tombstone owes nobody
-        // anything and an armed auto-retry means the story continues.
-        if !tombstone {
-            self.giveup_note_outcome(&job, armed_auto_retry);
-        }
-        if !tombstone {
-            // C: hand the owed move over only once the record is IN
-            // history - the mover looks the job up there, and it runs
-            // on its own worker so this park (and the runner tail
-            // behind it) never waits on a NAS copy.
-            let owes_move = job.lock_ok().move_pending;
-            self.history.lock_ok().push(job.clone());
-            // §129 1a/1b: the record reaches its own store the moment it
-            // reaches history, and the lifecycle event replaces the
-            // dashboard's snapshot-diff toast inference. Then retention,
-            // which is a no-op unless the optional knobs are set.
-            let _ = self.history_upsert(std::slice::from_ref(&job));
-            self.life_emit_parked(&job);
-            self.history_enforce_retention();
-            if owes_move {
-                self.mover_enqueue(&job);
-            }
-        }
-        // The original failed → promote its best held ALTERNATIVE (M14f).
-        // Not while an automatic retry is armed: the original is coming
-        // back through the queue in minutes, and starting the alternative
-        // now downloads the same title twice. And not for a tombstone: the
-        // "failure" there is the abort the user's own delete fired, so
-        // promoting would start downloading the very title they cancelled.
-        if failed
-            && !tombstone
-            && !armed_auto_retry
-            && let Some(key) = key
-        {
-            // BEST, not first. Breaking at the first match promoted
-            // whichever alternative happened to be added earliest, so
-            // a 720p held before a 2160p won and the 2160p stayed
-            // parked for good - the user ended up with the worst copy
-            // of the three while two better ones sat in the queue.
-            // Rank them the way the watchlist ranks candidates, so
-            // "best" means the same thing in both places.
-            let q = self.queue.lock_ok();
-            let mut best: Option<(u32, usize)> = None;
-            for (i, j) in q.iter().enumerate() {
-                let g = j.lock_ok();
-                if g.priority == -3 && g.dupe_key.as_ref() == Some(&key) && g.paused {
-                    let rank = crate::watchlist::quality_rank(&crate::wall::parse_release(&g.name));
-                    // Ties keep the earlier-added one, which is the
-                    // old behaviour and is as good a tiebreak as any.
-                    if best.is_none_or(|(r, _)| rank > r) {
-                        best = Some((rank, i));
-                    }
-                }
-            }
-            if let Some((rank, i)) = best {
-                let mut g = q[i].lock_ok();
-                g.paused = false;
-                g.priority = 0;
-                info!(
-                    target: "queue",
-                    "{} promoted (best held duplicate of failed {id}, rank {rank})",
-                    g.nzo_id
-                );
-            }
-        }
-        self.save_queue();
-        self.note_queue_idle();
-    }
-
-    /// §129 4a: `queue.idle`, if the queue has just become idle. Idle =
-    /// nothing downloading or finishing and nothing unpaused waiting; a
-    /// held ALTERNATIVE (paused by design) does not keep the queue
-    /// "busy". The latch makes it a transition, said once until the next
-    /// add or pick re-arms it.
-    ///
-    /// Every way the last runnable job can leave calls this, not just
-    /// `park`. Deleting the last queued job and pausing the last
-    /// runnable one both make the queue idle without a park, and until
-    /// the 10 Aug sweep (M3) neither said so - the subscriber that
-    /// starts a media scan or spins a disk down when the queue empties
-    /// simply never heard about those two.
-    pub(super) fn note_queue_idle(&self) {
-        let idle = !self.queue.lock_ok().iter().any(|j| {
-            let g = j.lock_ok();
-            matches!(g.state, JobState::Downloading | JobState::Finishing)
-                || (g.state == JobState::Queued && !g.paused)
-        });
-        if idle
-            && self
-                .queue_idle_latch
-                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            self.life_emit("queue.idle", json!({}));
-        }
-    }
-
-    /// Persist the give-up counters (small, changes rarely - every
-    /// terminal outcome of an automated grab at most).
-    /// Persist the give-up counters (small, changes rarely - every
-    /// terminal outcome of an automated grab at most).
-    ///
-    /// Snapshot AND write under one hold of the state lock. `write_atomic`
-    /// publishes through a uniquely named temp file, so two savers that
-    /// snapshot in one order can rename in the other: a tripped snapshot
-    /// that stalled behind a "Try again" reset could land last and
-    /// restore the trip at the next restart, with the UI still saying
-    /// reset (M14, 10 Aug sweep). Holding the lock across the write
-    /// costs nothing here - this file is a few hundred bytes and is
-    /// written at most once per terminal grab.
-    pub(super) fn save_giveup(&self) {
-        let path = self.spool.join("giveup-state.json");
-        let st = self.giveup.lock_ok();
-        if let Ok(text) = serde_json::to_string_pretty(&*st) {
-            let _ = crate::persist::write_atomic(&path, text.as_bytes());
         }
     }
 

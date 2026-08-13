@@ -110,6 +110,7 @@ with any value.
 | `NZBFAST_HEALTH_RECHECK_SECS` | How long a job must sit queued before its one post-health re-probe | 3600 | Debug-only |
 | `NZBFAST_NESTED_MAX_DEPTH` | Overrides the nested-extraction depth cap (test override; beats the daemon setting) | daemon setting, else built-in default | Debug-only |
 | `NZBFAST_SCAN_IDLE_SECS` | Indexer header-scan idle deadline before a pass is abandoned | 300 | Debug-only |
+| `NZBFAST_INDEX_GATE_WAIT_SECS` | How long the download runner waits for the index pass gate before starting the job anyway with a logged warning (tests compress it) | 60 | Debug-only |
 | `NZBFAST_DROP_CACHE` | `1`/`0` force page-cache drop-behind of written data on Linux (benching; the CLI defaults on, the daemon off because a stream reader can attach) | path default | Debug-only |
 | `NZBFAST_WRITE_PACE_MB` | macOS write pacing: fsync every N MB of new bytes per output file so dirty pages never pile up into one line-stalling flush burst; `0` off | 32 (macOS) | Debug-only |
 | `NZBFAST_WIN_SPARSE` | Windows: mark output files sparse (FSCTL_SET_SPARSE) so NTFS stops zero-filling below valid-data-length on out-of-order writes (~1.6x write amplification without it); `0` off | on (Windows) | Debug-only |

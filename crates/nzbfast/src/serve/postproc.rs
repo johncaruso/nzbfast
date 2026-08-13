@@ -121,10 +121,12 @@ impl PostprocLane {
                 }),
             );
         }
-        // Durable before visible-anywhere-else: a crash right here
-        // restores the job as Queued (the wildcard state arm) and the
-        // journal replays the network phase for free.
-        self.d.save_queue();
+        // Coalesced: a crash before the debounced write lands restores
+        // the job from an OLDER snapshot, which the wildcard state arm
+        // reads as Queued either way, and the journal replays the
+        // network phase for free. What the deferral buys is not writing
+        // a 14,500-job file four times per completion (issue #38).
+        self.d.save_queue_soon();
         self.backlog.fetch_add(1, Ordering::Relaxed);
         let d = self.d.clone();
         let slots = self.slots.clone();

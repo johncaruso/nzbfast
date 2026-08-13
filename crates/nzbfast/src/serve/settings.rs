@@ -268,6 +268,7 @@ pub(super) const PATHS: &[Setting] = &[
         json!(c.d.watch_interval_secs.load(Ordering::Relaxed))
     }),
     rw("dupe_action", |c| json!(c.d.dupe_action.lock_ok().clone())),
+    rw("dupe_scope", |c| json!(c.d.dupe_scope.lock_ok().clone())),
     rw("cat_meta", |c| json!(c.d.cat_meta.lock_ok().clone())),
     rw("watch_recursive", |c| {
         json!(c.d.watch_recursive.load(Ordering::Relaxed))
@@ -672,6 +673,17 @@ pub(super) const INDEXING: &[Setting] = &[
     // take categories away.
     rw("scoreboard_cats", |c| {
         json!(c.d.scoreboard_cats.lock_ok().clone())
+    }),
+    // Indexer-confirm lane. Off by default; spends a small daily
+    // budget of the named indexer account's quota turning STRONG
+    // correlation suggestions into proven msgid-set names.
+    rw("corr_confirm_enabled", |c| {
+        json!(c.d.corr_confirm_enabled.load(Ordering::Relaxed))
+    }),
+    // A NAME from the user's indexer accounts, resolved at run time
+    // like scoreboard_source; empty = the lane is inert.
+    rw("corr_confirm_source", |c| {
+        json!(c.d.corr_confirm_source.lock_ok().clone())
     }),
     rw("scoreboard_calibrate", |c| {
         json!(c.d.scoreboard_calibrate.load(Ordering::Relaxed))

@@ -378,6 +378,25 @@ fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
     })
 }
 
+/// The decompression-bomb verdict on a located end-header window,
+/// shared by BOTH 7z entry points (the in-stream tail probe and the
+/// on-disk password probe): true when a packed (`kEncodedHeader`)
+/// window declares a decoded size above [`SEVENZ_END_MAX`] or a PPMd
+/// memSize above [`SEVENZ_PPMD_MEM_MAX`]. sevenz-rust2 decodes the
+/// window with the DECLARED sizes as its only bounds - LZMA ratios
+/// would turn a couple MB of hostile pack bytes into hundreds of MB of
+/// RAM, synchronously - so the declaration must be read out of the
+/// window and judged before the library is allowed to decode it. Real
+/// posters' packed headers decode to a few hundred bytes; 2 MiB of
+/// decoded header metadata is generous. A PPMd coder's memSize is a
+/// second declared allocation the output cap never touches, so it gets
+/// its own cap.
+fn encoded_header_bomb(window: &[u8]) -> bool {
+    window.first() == Some(&K_ENCODED_HEADER)
+        && encoded_header_declared_cost(window)
+            .is_some_and(|d| d.unpack > SEVENZ_END_MAX || d.ppmd_mem > SEVENZ_PPMD_MEM_MAX)
+}
+
 /// A sparse Read+Seek view over the two byte ranges a probe actually
 /// holds (the head article and the located end header). Reads inside a
 /// gap fail rather than fabricate zeros, so the parser can never be fed
@@ -447,19 +466,10 @@ pub fn sevenz_tail_names(head: &[u8], tail: &[u8]) -> Result<Vec<SevenzEntryInfo
     let start = sevenz_start(head).ok_or(ProbeError::BadStart)?;
     let window = locate_end_header(&start, tail)?;
     // Decompression-bomb gate: a packed header's pack stream sits in
-    // the fetched tail, and sevenz-rust2 decodes it with the DECLARED
-    // unpack size as the only output bound - LZMA ratios would turn a
-    // couple MB of hostile pack bytes into hundreds of MB of RAM,
-    // synchronously on the probe lane. Read the declaration out of the
-    // (already CRC-verified) window first and hold it to the same cap
-    // as the stored header. Real posters' packed headers decode to a
-    // few hundred bytes; 2 MiB of decoded header metadata is generous.
-    // A PPMd coder's memSize is a second declared allocation the output
-    // cap never touches, so it gets its own cap.
-    if window.first() == Some(&K_ENCODED_HEADER)
-        && let Some(declared) = encoded_header_declared_cost(window)
-        && (declared.unpack > SEVENZ_END_MAX || declared.ppmd_mem > SEVENZ_PPMD_MEM_MAX)
-    {
+    // the fetched tail, and decoding it on the probe lane would cost
+    // whatever the (already CRC-verified) window declares - so hold the
+    // declaration to the same cap as the stored header first.
+    if encoded_header_bomb(window) {
         return Err(ProbeError::HeaderTooBig);
     }
     let total = 32u64
@@ -676,19 +686,90 @@ pub fn pick_rar_media_name(head: &RarHead) -> Option<(String, Option<String>)> {
 /// False for anything that is not a readable 7z: a caller asking "does
 /// this need a password" about a missing or malformed file wants "no",
 /// and the malformed case is somebody else's error to report.
+///
+/// Bomb-gated like the in-stream twin: the end-header window is read
+/// and held to [`encoded_header_bomb`]'s caps BEFORE `Archive::read` is
+/// allowed to decode it, and a declared `header_size` past
+/// [`SEVENZ_END_MAX`] is refused before this function buffers it. A
+/// refused file lands in the same "not a readable 7z" bucket as any
+/// other malformed input.
 pub fn sevenz_needs_password(path: &std::path::Path) -> bool {
     let Ok(mut f) = std::fs::File::open(path) else {
         return false;
     };
+    if sevenz_disk_header_bomb(&mut f) || f.seek(io::SeekFrom::Start(0)).is_err() {
+        return false;
+    }
     matches!(
         sevenz_rust2::Archive::read(&mut f, &sevenz_rust2::Password::default()),
         Err(sevenz_rust2::Error::PasswordRequired) | Err(sevenz_rust2::Error::MaybeBadPassword(_))
     )
 }
 
+/// The Read+Seek half of the bomb gate: read the declared end-header
+/// geometry out of `f` and answer whether the caller must refuse the
+/// container before the library allocates on the declaration's say-so.
+/// Shared by every entry point that hands sevenz-rust2 a whole
+/// container: [`sevenz_needs_password`] here, the chase worker's
+/// blocking set view (`extract::sevenz`), and the daemon's disk-side
+/// 7z probes and extractor - which is why it is `pub`. True means
+/// refuse: the start header declares an end header past
+/// [`SEVENZ_END_MAX`] (which `Archive::read` buffers whole), or the
+/// window is a `kEncodedHeader` whose declared decode cost
+/// [`encoded_header_bomb`] rejects. False means the geometry gave no
+/// reason to refuse - including every malformed shape (short file, bad
+/// start CRC, unreadable window), where the library's own parse fails
+/// cheaply and its error keeps the verdict honest. Leaves the cursor
+/// wherever the reads ended; the caller rewinds.
+pub fn sevenz_disk_header_bomb(f: &mut (impl Read + Seek)) -> bool {
+    let mut head = [0u8; 32];
+    if f.read_exact(&mut head).is_err() {
+        return false;
+    }
+    let Some(start) = sevenz_start(&head) else {
+        return false;
+    };
+    if start.header_size > SEVENZ_END_MAX {
+        return true;
+    }
+    let Some(off) = 32u64.checked_add(start.header_off) else {
+        return true;
+    };
+    let mut window = vec![0u8; start.header_size as usize];
+    if f.seek(io::SeekFrom::Start(off)).is_err() || f.read_exact(&mut window).is_err() {
+        return false;
+    }
+    encoded_header_bomb(&window)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fuzz find, 13 Aug 2026 (rar_name_probe, CI): a RAR4 block whose
+    /// declared header size sits UNDER the comment shapes' fixed
+    /// 13-byte CRC coverage passed the length-vs-hsize guards and the
+    /// checksum then sliced past the buffer. The exact crashing bytes,
+    /// verbatim from the artifact; the only legal answers are parse
+    /// errors, never a panic.
+    #[test]
+    fn a_comment_block_shorter_than_its_crc_coverage_is_a_parse_error() {
+        const CRASH: &[u8] = &[
+            0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00, 0x6f, 0x97, 0x73, 0x40, 0x00, 0x0d, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x8c, 0xc2, 0x75, 0x00, 0x20, 0x0a, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x2e, 0x3a, 0x20, 0x54, 0x68, 0xde, 0x96, 0x8c, 0xdf, 0x9e, 0x74,
+            0x00, 0x80, 0x28, 0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        for head in [CRASH, &CRASH[..CRASH.len() / 2]] {
+            for declared in [head.len() as u64, 0] {
+                assert!(
+                    rar_head(head, declared).is_err(),
+                    "crafted bytes must decline, not parse"
+                );
+            }
+        }
+    }
 
     /// A real single-entry 7z built by sevenz-rust2 itself (dev-dep has
     /// the `compress` feature), so the parse path is tested against
@@ -982,6 +1063,66 @@ mod tests {
         );
     }
 
+    /// The disk-side probe must share the in-stream twin's bomb gate:
+    /// a file whose packed end header declares hundreds of MB of
+    /// decoded header (or a ~4 GiB PPMd model) must be refused BEFORE
+    /// `Archive::read` allocates on the declaration's say-so, and a
+    /// declared `header_size` past the cap must be refused before it is
+    /// even buffered. The gate verdict is asserted directly because the
+    /// end-to-end boolean cannot see it: on the garbage pack bytes the
+    /// fixtures carry, the library's decode happens to error out with
+    /// the same "no" the gate gives, just after requesting the
+    /// allocations the gate exists to prevent.
+    #[test]
+    fn disk_probe_refuses_bomb_declarations_before_decoding() {
+        // seal() places the window at 32 + header_off, so head ++ tail
+        // IS the on-disk container the start header describes.
+        let refused = |head: &[u8], tail: &[u8]| {
+            let mut f = std::io::Cursor::new([head, tail].concat());
+            sevenz_disk_header_bomb(&mut f)
+        };
+        let (head, tail) = seal(&encoded_window(512 << 20));
+        assert!(
+            refused(&head, &tail),
+            "an LZMA header bomb must die at the gate, not in the decoder"
+        );
+        let (head, tail) = seal(&ppmd_window(0xF923_EF0F));
+        assert!(
+            refused(&head, &tail),
+            "a PPMd memSize bomb must die at the gate, not in the decoder"
+        );
+        // Stored-header size bomb: a start header declaring a 2 GiB end
+        // header, which Archive::read would buffer whole.
+        let arch = fixture(NAME, b"y");
+        let mut head = arch[..32].to_vec();
+        head[20..28].copy_from_slice(&(2u64 << 30).to_le_bytes());
+        let reseal = crc32fast::hash(&head[12..32]);
+        head[8..12].copy_from_slice(&reseal.to_le_bytes());
+        assert!(
+            refused(&head, &arch[32..]),
+            "an oversize declared header_size must be refused unbuffered"
+        );
+        // The gate must not eat the honest answers: benign containers
+        // (the writer packs headers, so this IS a kEncodedHeader) and
+        // the -mhe fixture must pass through to the real parser. The
+        // encrypted one still answering "yes" end to end is pinned by
+        // a_header_encrypted_sevenz_is_known_to_need_a_password_on_disk.
+        assert!(!refused(&arch, &[]), "a benign packed header must pass");
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sevenz");
+        let enc = std::fs::read(format!("{dir}/header-encrypted.7z")).unwrap();
+        assert!(!refused(&enc, &[]), "-mhe must stay a password question");
+        // End to end: a refused file is not a readable 7z, so the
+        // password answer is "no" - via the gate, not the decoder.
+        let tmp = std::env::temp_dir().join(format!("nzbkit-np-bomb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let (head, tail) = seal(&encoded_window(512 << 20));
+        let p = tmp.join("lzma-bomb.7z");
+        std::fs::write(&p, [head, tail].concat()).unwrap();
+        assert!(!sevenz_needs_password(&p));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn checked_in_fuzz_seeds_keep_their_meaning() {
         // tests/fixtures/sevenz/* seed the sevenz_name_probe fuzz
@@ -1170,6 +1311,35 @@ mod tests {
             rar_head(&vol[..7], vol.len() as u64),
             Err(ProbeError::BadStart)
         );
+    }
+
+    /// CI's own `rar_name_probe` artifact, byte for byte: a RAR4 main
+    /// header declaring `head_size` 7 while carrying `MHD_COMMENT`,
+    /// whose header CRC covers a fixed 13 bytes. The target's truncated
+    /// half left 12 bytes of it, and the CRC helper sliced `h[2..13]`
+    /// out of them - "range end index 13 out of range for slice of
+    /// length 12". A probe holds ONE article, so a torn header is the
+    /// ordinary case and must be an answer, never a panic.
+    ///
+    /// `868b2603` fixed this against a hand-reduced input; this is the
+    /// input the fuzzer actually found, kept in the tree (as
+    /// `fuzz/seeds/rar_name_probe/`, replayed into the corpus by
+    /// fuzz-smoke.yml) rather than left to expire with the CI artifact.
+    #[test]
+    fn the_torn_comment_header_repro_answers_rather_than_panicking() {
+        const REPRO: &[u8] = include_bytes!(
+            "../fuzz/seeds/rar_name_probe/crash-f064a660a000d079ef552779894d5aa9ba76d15c"
+        );
+        // Both feed shapes the target drives, and both volume-size
+        // configurations: the 19-byte half is the one that panicked.
+        for head in [REPRO, &REPRO[..REPRO.len() / 2]] {
+            for declared in [head.len() as u64, 0] {
+                assert!(
+                    rar_head(head, declared).is_err(),
+                    "a header too short for its own CRC range named something"
+                );
+            }
+        }
     }
 
     /// The uploader's string is untrusted exactly like the 7z lane's:

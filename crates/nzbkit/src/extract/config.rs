@@ -450,6 +450,15 @@ impl Extractor {
         }
     }
 
+    /// Install the materialized-volume notification (see
+    /// [`MaterializedHook`]). Root level ONLY, deliberately not
+    /// inherited by children - the journal records placements in the
+    /// ROOT's slot space, and a nested slot index fired through this
+    /// hook would rewrite some unrelated root slot's records.
+    pub fn set_materialized_hook(&self, hook: MaterializedHook) {
+        self.inner.lock_ok().materialized = Some(hook);
+    }
+
     /// Install the post-rename decrypt publish notification (see
     /// [`DecryptPublish`]). Same inheritance contract as the barrier.
     pub fn set_decrypt_publish(&self, publish: DecryptPublish) {

@@ -43,6 +43,7 @@ use daemon::*;
 
 mod giveup;
 mod histstore;
+mod moveseq;
 #[cfg(feature = "indexer")]
 pub(crate) mod predb_seed;
 mod tasks;
@@ -58,6 +59,10 @@ mod api;
 
 #[cfg(test)]
 mod testutil;
+
+/// §158 item 7: fault injection at the two durable store writes.
+#[cfg(test)]
+mod storecut;
 
 pub struct ServeOpts {
     pub port: u16,

@@ -272,6 +272,21 @@ pub(super) fn build_rig(
             None => Ok(()),
         }));
     }
+    // Materialized-volume demote (advG follow-up, 13 Aug 2026): when a
+    // slot falls back to volumes-on-disk, its reconstruction puts every
+    // journaled byte at final offsets in the volume file - and then
+    // deletes the inner files the R records name as copy sources, so
+    // without this line a retry over intact, complete volumes refetched
+    // the ENTIRE post. The M record lets parse rewrite those placements
+    // to identity form. Weak for the same try_unwrap reason as above.
+    {
+        let j = Arc::downgrade(journal);
+        extractor.set_materialized_hook(Arc::new(move |slot: usize, name: &str, size: u64| {
+            if let Some(j) = j.upgrade() {
+                j.record_materialized(slot, name, size);
+            }
+        }));
+    }
     // TODO 100: the publish half of the handshake. Once a file's verified
     // plaintext is RENAMED into place, its crypt facts land as E/K/T
     // records and the retired placements republish as D records - the

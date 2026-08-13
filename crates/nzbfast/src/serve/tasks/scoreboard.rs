@@ -149,8 +149,10 @@ struct CalPick {
     link: String,
 }
 
+/// `pub(super)` so the lane-proof test (tasks/lane_proof_tests.rs) can
+/// drive one whole run without the daily poll loop in front of it.
 #[cfg(feature = "indexer")]
-fn run(d: &Arc<Daemon>) -> Result<String, String> {
+pub(super) fn run(d: &Arc<Daemon>) -> Result<String, String> {
     let say = |what: &str| *d.scoreboard_status.lock_ok() = what.to_string();
     // Resolved again here (the gate checked minutes ago): the run must
     // use whatever the chosen account says NOW, and a reference that

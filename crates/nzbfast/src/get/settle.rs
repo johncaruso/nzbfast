@@ -20,12 +20,39 @@ pub(super) struct SettleVerdict {
     pub(super) repair_shortfall: Option<(usize, usize)>,
     pub(super) deferred_renames: Vec<(usize, String)>,
     pub(super) sniff_covered: Option<std::collections::HashSet<String>>,
+    /// TODO 159 item 1: the slots - BY INDEX - that are the whole reason
+    /// this job failed, when that is a claim the pass can honestly make.
+    /// `Some` means "the repair itself succeeded and every OTHER slot is
+    /// verified or rebuilt; these are the ones still holed", which is
+    /// exactly what the failed-job quarantine needs to withhold one
+    /// archive's payload without withholding the rest.
+    ///
+    /// `None` is the answer for every pass that cannot say that, and the
+    /// quarantine reads it as "withhold everything" - today's behaviour.
+    /// Deliberately not "the slots that took damage": a covered volume
+    /// whose corrupt article PAR2 rebuilt has damage counters set and is
+    /// perfectly healthy, so a damage-counter test would withhold the
+    /// whole job again.
+    pub(super) unhealed_slots: Option<Vec<usize>>,
 }
 
 struct RepairOutcome {
     all_good: bool,
     reextract_failed: Option<String>,
     repair_shortfall: Option<(usize, usize)>,
+    unhealed_slots: Option<Vec<usize>>,
+}
+
+/// The slot a failure hint names, when exactly one slot answers to it.
+///
+/// Ambiguity is a refusal, not a guess: two slots posted under the same
+/// subject would make a wrong pick attribute one archive's damage to
+/// another's payload, and the caller turns `None` into "quarantine the
+/// whole job" - the safe direction.
+fn slot_by_hint(slots: &[Arc<FileSlot>], hint: &str) -> Option<usize> {
+    let mut hits = slots.iter().enumerate().filter(|(_, s)| s.hint == hint);
+    let (i, _) = hits.next()?;
+    hits.next().is_none().then_some(i)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -60,6 +87,17 @@ pub(super) async fn settle_verify_repair(
     // to stop them. `crate::repair::SideCancel`; None on the CLI.
     cancel: Option<&crate::repair::SideCancel>,
 ) -> Result<SettleVerdict> {
+    // Phase marker: the network phase is over, the checks begin. On the
+    // chart this is where throughput sits at zero on purpose - without
+    // the marker a long repair reads as a download that died. The ring
+    // lives on the fleet's shared LiveStats (build_fleet gave every
+    // server's cfg the same Arc), so borrow it from the first server.
+    if let Some(live) = servers.iter().find_map(|(_, c)| c.live.clone()) {
+        live.note_run(
+            "settle",
+            "download finished - checking the files and repairing if needed",
+        );
+    }
     // Slots whose offset-0 article never landed are still unclassified,
     // their spans held in memory - flush them to plain files so settle
     // read-back and PAR2 repair see the bytes on disk.
@@ -165,6 +203,11 @@ async fn settle_with_set(
     // (needed, have) when repair died on recovery-block arithmetic - the
     // counts belong in the fail message, not just the console log.
     let mut repair_shortfall: Option<(usize, usize)> = None;
+    // TODO 159 item 1 - see `SettleVerdict::unhealed_slots`. Only the
+    // repair pass ever gets to claim this: the clean-download arm below
+    // fails on `incomplete`/`derrs` alone, which name no slot and prove
+    // nothing about the rest of the job.
+    let mut unhealed_slots: Option<Vec<usize>> = None;
     // Deobfuscated names a CHASED slot could not take while its writer was
     // live (see the rename below). Applied after `extractor.finish()`,
     // when nothing holds an fd on the partial file any more - otherwise
@@ -492,6 +535,7 @@ async fn settle_with_set(
         all_good = o.all_good;
         reextract_failed = o.reextract_failed;
         repair_shortfall = o.repair_shortfall;
+        unhealed_slots = o.unhealed_slots;
     } else {
         println!("clean download - no repair, no post-verify pass ✔");
         // PAR2 verifying clean is NOT the same as the download being
@@ -523,6 +567,7 @@ async fn settle_with_set(
         repair_shortfall,
         deferred_renames,
         sniff_covered,
+        unhealed_slots,
     })
 }
 
@@ -810,6 +855,14 @@ async fn run_set_repair(
             false
         });
     }
+    // TODO 159 item 1: WHETHER the repair worked is what licenses a
+    // per-file quarantine, so latch it before the three checks below
+    // start subtracting from it. True here means the pass proved the
+    // recovery set - `repair_mapped` re-reads every covered file back
+    // through the view it wrote through, the disk repair re-reads the
+    // whole set off disk - so anything still wrong is named by one of
+    // those checks and nothing else is.
+    let repair_ok = all_good;
     let mut uncovered_bad: Vec<String> =
         uncovered_pairs.iter().map(|(_, h)| h.to_string()).collect();
     // The census's own findings belong here too. A slot whose
@@ -884,10 +937,45 @@ async fn run_set_repair(
             in_set_bad.join(", ")
         );
     }
+    // TODO 159 item 1: name the slots the two ✘ checks just failed on,
+    // by INDEX, so the failed-job quarantine can withhold their payload
+    // alone. Licensed only by `repair_ok`: without a proved repair the
+    // rest of the output has no certificate either, and the quarantine
+    // must stay whole-job.
+    //
+    // `uncovered_pairs` carries its own indices; the census's
+    // `sparse_slots` and the unproven in-set names arrive as hints and
+    // have to be looked back up. A hint that resolves to no slot, or to
+    // two, abandons the whole claim rather than dropping one file from
+    // it - an unnamed damaged slot would otherwise look like a healthy
+    // one and its payload would ship.
+    let unhealed_slots = repair_ok
+        .then(|| {
+            let named: std::collections::HashSet<&str> =
+                uncovered_pairs.iter().map(|(_, h)| *h).collect();
+            let mut idx: Vec<usize> = uncovered_pairs.iter().map(|(i, _)| *i).collect();
+            for hint in uncovered_bad
+                .iter()
+                .map(|h| h.as_str())
+                .filter(|h| !named.contains(h))
+                .chain(unproven_bad.iter().copied())
+            {
+                idx.push(slot_by_hint(slots, hint)?);
+            }
+            idx.sort_unstable();
+            idx.dedup();
+            Some(idx)
+        })
+        .flatten()
+        // A job that is still good has nothing to quarantine, and an
+        // empty list would read as "withhold nothing" on a path that
+        // never reached the question.
+        .filter(|_| !all_good);
     Ok(RepairOutcome {
         all_good,
         reextract_failed,
         repair_shortfall,
+        unhealed_slots,
     })
 }
 
@@ -1325,6 +1413,13 @@ async fn settle_without_set(
         repair_shortfall,
         deferred_renames: Vec::new(),
         sniff_covered: None,
+        // No per-file claim from the disk-side fallback. It is reached
+        // only where no set activated, and its repair works on volume
+        // FILES - so any group that was direct-extracting has already
+        // materialized and abandoned its output names, leaving the
+        // quarantine nothing to discriminate between. Whole-job stays
+        // right here, and it stays honest.
+        unhealed_slots: None,
     })
 }
 

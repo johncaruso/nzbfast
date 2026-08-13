@@ -1211,6 +1211,27 @@ pub(super) fn decrypt_shard(
     Ok(hasher.map_or(0, |h| h.finalize()))
 }
 
+/// Every check field the plaintext-once route decision reads, resolved
+/// across a whole inner FILE.
+///
+/// The route is latched per OUTPUT name (`crypto_files`) by whichever
+/// fragment asks first, so a decision that reads its check fields off the
+/// fragment in front of the writer can latch on a head and disagree with
+/// its own tail. See [`Extractor::instream_decrypt_allowed`].
+struct FileChecks {
+    /// Some piece of the file refuses the plaintext-once route: it is
+    /// unencrypted, or its crypt record is RAR4 or check-less (nothing
+    /// proves the password before a byte is decrypted), or it states a
+    /// plaintext digest this build cannot compute with no CRC32 beside
+    /// it (`rar a -htb`, whose output nothing here could adjudicate).
+    vetoed: bool,
+    /// (slot, entry) of the head piece - `split_before` clear, the record
+    /// whose IV starts the stream and which [`Extractor::crypto_for`]
+    /// keys the whole file with. `None` while the head volume's headers
+    /// are still in flight.
+    head: Option<(usize, usize)>,
+}
+
 impl Extractor {
     /// Drain the chain's pending resume-journal crypto events (`E`/`K`/
     /// `T` facts - see [`CryptoJournalEvent`]). The caller writes them to
@@ -1467,7 +1488,7 @@ impl Extractor {
     /// May this encrypted entry decrypt at WRITE time (plaintext-once),
     /// or must it assemble ciphertext for the finish pass?
     ///
-    /// Only when the entry's stored check verifies the password. Without
+    /// Only when the file's stored check verifies the password. Without
     /// that proof (a check-less set, or one whose check is malformed and
     /// so vetoes nothing) a wrong password would write plaintext-shaped
     /// garbage straight into the output file, and the group could no
@@ -1476,7 +1497,52 @@ impl Extractor {
     /// noise instead. Assembling ciphertext keeps the bytes identical to
     /// the posted volumes, so `decrypt_finished` can adjudicate against
     /// the whole-file checksum and, on a miss, demote with nothing lost.
-    pub(super) fn instream_decrypt_allowed(inner: &Inner, slot: usize, ei: usize) -> bool {
+    ///
+    /// ONE ANSWER PER FILE, and never veto-then-allow. `crypto_files`
+    /// caches the route by OUTPUT name and the first fragment to ask
+    /// latches it for the whole file, so fragments that disagree would
+    /// route half an output each way - and a half-plaintext file cannot
+    /// be turned back into byte-exact volumes by the fallback shim. Two
+    /// rules keep that unreachable:
+    ///
+    /// 1. Every check field consulted here is resolved across the whole
+    ///    file by [`FileChecks`], which walks every mapped piece in the
+    ///    group. None is read off the fragment in front of the writer.
+    ///    Only the tail piece carries the whole-file checks, so reading
+    ///    them off a head answered "allowed" for a split hash-only set
+    ///    (Codex sweep 12 Aug F2) - and the same trap waits for any
+    ///    per-file check field added later.
+    /// 2. An output that already holds bytes with no `CryptoState`
+    ///    behind it holds CIPHERTEXT, and may never latch plaintext-once
+    ///    afterwards. Rule 1 makes the fields agree; rule 2 is what makes
+    ///    a MIXED output impossible even where they cannot. It covers
+    ///    what rule 1 does not: the live password cell, which a
+    ///    mid-download re-key can flip from veto to allow under a file
+    ///    already assembling ciphertext, and whatever the next field
+    ///    turns out to be.
+    ///
+    /// What the two rules do NOT buy is the same ROUTE in every arrival
+    /// order: a fact that has not arrived cannot veto, so a head mapped
+    /// alone may latch plaintext-once for a file whose tail would have
+    /// refused, and the same set fed tail-first assembles ciphertext.
+    /// Both routes are whole-file, both are adjudicated by
+    /// `decrypt_finished`, and both reach the same published bytes.
+    /// Route identity would mean holding every encrypted span until the
+    /// last volume mapped, which is not a trade this path can make
+    /// (TODO 158 item 2).
+    pub(super) fn instream_decrypt_allowed(
+        inner: &Inner,
+        slot: usize,
+        ei: usize,
+        w: &FileWriter,
+    ) -> bool {
+        // Rule 2, and first because it is the cheapest test here and the
+        // only one that still holds for a check field this function does
+        // not know about yet. Bytes under an output with no crypto state
+        // are ciphertext: the plaintext-once writes all go through one.
+        if w.written() > 0 {
+            return false;
+        }
         let Some(pw) = inner.password.as_ref() else {
             return false;
         };
@@ -1486,62 +1552,86 @@ impl Extractor {
         let Some(e) = m.entries.get(ei) else {
             return false;
         };
-        // An entry carrying only an FHEXTRA_HASH digest (BLAKE2sp, i.e.
-        // `rar a -htb`) and no CRC32 has nothing the finish pass can
-        // adjudicate: `crc_gate` returns None, so `crc_verdict` is None
-        // rather than Some(false), and the plaintext is published with NO
-        // integrity check at all. `verify_inner_crcs` already refuses the
-        // unencrypted twin of this shape for the same reason - its gate
-        // is `Store && !encrypted`, so an encrypted entry never reached
-        // it. Assembling ciphertext instead costs nothing: the volumes
-        // stay byte-exact and can still materialize, and the disk path
-        // verifies the BLAKE2sp properly (`verify_integrity_with_keys`).
-        // nzbkit has no BLAKE2sp of its own, so verifying in place is not
-        // an option here.
-        //
-        // Asked of the whole FILE across the group, not of the fragment in
-        // front of us: only the tail fragment carries the whole-file
-        // checks, so reading them off a head answered "allowed" for a
-        // split hash-only set. That alone would be caught at finish, but
-        // the two fragments then disagreed - one route each for one output
-        // - and a half-plaintext file cannot be turned back into byte-exact
-        // volumes by the fallback shim. One answer per file keeps the route
-        // consistent whichever volume is mapped first (Codex sweep 12 Aug
-        // F2, extended).
-        if Self::hash_only_file(inner, slot, &e.name) {
+        let f = Self::file_checks(inner, slot, &e.name);
+        if f.vetoed {
             return false;
         }
-        let Some(c) = e.crypt.as_ref() else {
+        // The head piece's record is what `crypto_for` keys the whole
+        // stream with, so the head's check is the one that has to verify.
+        // While the head volume's headers are still in flight there is
+        // nothing to latch onto at all: `crypto_for` returns None and the
+        // span holds, which is what stops a continuation piece from
+        // committing the file to a route its head never answered for.
+        let Some((si, hi)) = f.head else {
+            return true;
+        };
+        let Some(c) = inner.slots[si]
+            .mapper
+            .as_ref()
+            .and_then(|m| m.entries.get(hi))
+            .and_then(|e| e.crypt.as_ref())
+        else {
             return false;
         };
-        // Always false for RAR4: the format stores no check value, so
-        // nothing can prove the password before a byte is decrypted. Such a
-        // set assembles ciphertext and is adjudicated by `decrypt_finished`
-        // against the header's plaintext CRC32 - the recoverable route a
-        // check-less RAR5 set takes for exactly the same reason.
-        //
-        // Answered without deriving, because this runs per SPAN: RAR4's
-        // schedule is 0x40000 SHA-1 rounds, and while the cache makes a
-        // repeat cheap, an archive with a fresh salt per entry would pay it
-        // again and again under the routing lock.
-        let Some(r5) = c.rar5() else { return false };
-        r5.check.is_some() && c.derive(pw).is_some_and(|keys| c.check_verifies(&keys))
+        // One derive, for the head alone, because this runs per SPAN:
+        // RAR4's schedule is 0x40000 SHA-1 rounds, and while the cache
+        // makes a repeat cheap, an archive with a fresh salt per piece
+        // would pay it again and again under the routing lock. RAR4 never
+        // reaches this line - the format stores no check value, so
+        // `file_checks` vetoes it and `decrypt_finished` adjudicates the
+        // set against the header's plaintext CRC32, the recoverable route
+        // a check-less RAR5 set takes for exactly the same reason.
+        c.derive(pw).is_some_and(|keys| c.check_verifies(&keys))
     }
 
-    /// Does this inner FILE state a plaintext digest and no CRC32?
+    /// Resolve [`FileChecks`] for inner file `name` over `slot`'s group.
     ///
-    /// Every fragment of `name` in this slot's group is consulted, because
-    /// the whole-file checks live on the tail fragment alone and the answer
-    /// has to be the same for all of them - see the caller. Fragments that
-    /// have not arrived yet cannot contribute, which is why
-    /// `decrypt_finished` re-asks once the set is complete.
-    fn hash_only_file(inner: &Inner, slot: usize, name: &str) -> bool {
-        let mut any_hash = false;
-        let mut any_crc = false;
-        let mut scan = |m: &VolumeMapper| {
-            for e in m.entries.iter().filter(|e| e.name == name) {
-                any_hash |= e.hash.is_some();
-                any_crc |= e.file_crc.is_some();
+    /// Every mapped piece is consulted, because the whole-file checks
+    /// live on the tail piece alone and the answer has to be the same for
+    /// every fragment of the file - see the caller. Pieces that have not
+    /// arrived yet cannot contribute, which is why `decrypt_finished`
+    /// re-asks once the set is complete.
+    ///
+    /// The digest veto is per PIECE (a piece stating a digest and no
+    /// CRC32 of its own), not `any digest && no CRC32 anywhere`: the
+    /// group-wide form let a head's CRC32 excuse a tail that says
+    /// "BLAKE2sp, no CRC32", which is the disagreement this whole walk
+    /// exists to refuse. A piece carrying both - the `rar a -htb` set
+    /// that also stores a CRC32 - is fully adjudicable and still routes
+    /// one-pass.
+    fn file_checks(inner: &Inner, slot: usize, name: &str) -> FileChecks {
+        let mut out = FileChecks {
+            vetoed: false,
+            head: None,
+        };
+        let mut scan = |si: usize, m: &VolumeMapper| {
+            for (ei, e) in m.entries.iter().enumerate() {
+                if e.name != name || e.is_dir {
+                    continue;
+                }
+                let checked = e.encrypted
+                    && e.crypt
+                        .as_ref()
+                        .and_then(|c| c.rar5())
+                        .is_some_and(|r5| r5.check.is_some());
+                // An FHEXTRA_HASH digest (BLAKE2sp, `rar a -htb`) with no
+                // CRC32 beside it has nothing the finish pass can
+                // adjudicate: `crc_gate` returns None, so `crc_verdict` is
+                // None rather than Some(false), and the plaintext is
+                // published with NO integrity check at all.
+                // `verify_inner_crcs` already refuses the unencrypted twin
+                // of this shape for the same reason - its gate is `Store
+                // && !encrypted`, so an encrypted entry never reached it.
+                // Assembling ciphertext instead costs nothing: the volumes
+                // stay byte-exact and can still materialize, and the disk
+                // path verifies the BLAKE2sp properly
+                // (`verify_integrity_with_keys`). nzbkit has no BLAKE2sp of
+                // its own, so verifying in place is not an option here.
+                let uncheckable = e.hash.is_some() && e.file_crc.is_none();
+                out.vetoed |= !checked || uncheckable;
+                if !e.split_before && out.head.is_none() {
+                    out.head = Some((si, ei));
+                }
             }
         };
         match inner.slots[slot]
@@ -1552,17 +1642,17 @@ impl Extractor {
             Some(g) => {
                 for &si in &g.slots {
                     if let Some(m) = inner.slots[si].mapper.as_ref() {
-                        scan(m);
+                        scan(si, m);
                     }
                 }
             }
             None => {
                 if let Some(m) = inner.slots[slot].mapper.as_ref() {
-                    scan(m);
+                    scan(slot, m);
                 }
             }
         }
-        any_hash && !any_crc
+        out
     }
 
     pub(super) fn crypto_for(
@@ -1579,34 +1669,19 @@ impl Extractor {
         }
         let key = key.into_owned();
         let name = Self::entry_name(inner, slot, ei);
-        // Find the head piece (split_before == false) of this file - it
-        // may live in another volume's mapper within the same group.
-        let head_of = |m: &VolumeMapper| {
-            m.entries
-                .iter()
-                .find(|e| e.name == name && !e.split_before && e.crypt.is_some())
-                .map(|e| {
-                    (
-                        e.crypt.clone().unwrap(),
-                        e.unpacked_size,
-                        e.file_crc,
-                        e.split_after,
-                    )
-                })
-        };
-        let mut head = inner.slots[slot].mapper.as_ref().and_then(head_of);
-        if head.is_none()
-            && let Some(gk) = inner.slots[slot].group.clone()
-            && let Some(g) = inner.groups.get(&gk)
-        {
-            for &si in &g.slots {
-                if let Some(h) = inner.slots[si].mapper.as_ref().and_then(head_of) {
-                    head = Some(h);
-                    break;
-                }
-            }
-        }
-        let (c, unp, file_crc, split_after) = head?;
+        // The head piece (split_before == false) of this file - it may
+        // live in another volume's mapper within the same group. Found by
+        // the SAME walk the route gate uses, so the record that keys the
+        // stream is the record whose check the gate verified; a slot-first
+        // preference here and a group-order one there could pick two
+        // different heads for one output.
+        let (c, unp, file_crc, split_after) =
+            Self::file_checks(inner, slot, name)
+                .head
+                .and_then(|(si, hi)| {
+                    let e = inner.slots[si].mapper.as_ref()?.entries.get(hi)?;
+                    Some((e.crypt.clone()?, e.unpacked_size, e.file_crc, e.split_after))
+                })?;
         let pw = inner.password.as_ref()?;
         let keys = c.derive(pw)?;
         // Plaintext-once requires a pre-decrypt password proof, which only
@@ -1901,21 +1976,24 @@ impl Extractor {
                         }
                         // The hash-only backstop, and the only ORDER-
                         // INDEPENDENT place to put it.
-                        // `instream_decrypt_allowed` vetoes this shape from
-                        // the entry in front of it, which is right for an
-                        // unsplit file and blind for a split one: only the
-                        // TAIL fragment carries the whole-file checks, so a
-                        // head reading `hash: None, file_crc: None`
-                        // answered "allowed" and latched the plaintext-once
-                        // route for the whole file (`crypto_files` caches by
+                        // `instream_decrypt_allowed` resolves its check
+                        // fields across the whole file, but a fact that has
+                        // not arrived cannot veto: only the TAIL fragment
+                        // carries the whole-file checks, so a head mapped
+                        // alone reads `hash: None, file_crc: None`, answers
+                        // "allowed" and latches the plaintext-once route
+                        // for the whole file (`crypto_files` caches by
                         // output name, first decision wins). Whether that
-                        // happened therefore depended on which volume was
-                        // mapped first - and when it did, plaintext was
-                        // published with no integrity verdict at all. By
-                        // finish every volume is mapped, so `hash_only` is
-                        // the truth: demote exactly as an incomplete cipher
-                        // record does, and the shim reproduces the posted
-                        // bytes for the fallback (Codex sweep 12 Aug F2).
+                        // happens therefore depends on which volume is
+                        // mapped first, and without this the head-first
+                        // order published plaintext with no integrity
+                        // verdict at all. By finish every volume is mapped,
+                        // so `hash_only` is the truth: demote exactly as an
+                        // incomplete cipher record does, and the shim
+                        // reproduces the posted bytes for the fallback
+                        // (Codex sweep 12 Aug F2). The route may still
+                        // differ by arrival order; what it may never be is
+                        // MIXED, which is the gate's own contract.
                         if unp > 0 && hash_only {
                             instream_failed.insert(key.clone());
                         } else if unp == 0 || cs.complete() {

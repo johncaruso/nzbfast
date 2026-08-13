@@ -4519,6 +4519,54 @@ mod tests {
         assert_eq!(crc32::crc32(&entries[0].data), 0x4974_dc39);
     }
 
+    /// A RAR 2.x unix-owner sub-block (`0x77`, sub type `UO_HEAD`) declares
+    /// an owner and a group name size but stores the names themselves in the
+    /// block's DATA area, past `head_size` - and the `HEAD_CRC` WinRAR
+    /// stamped covers them, because unrar reads both into the same raw
+    /// header buffer before checksumming it. Checksumming only `head_size`
+    /// refused the whole archive at parse time with "checksum mismatch:
+    /// expected 0x1fc3, got 0x974d" (torture round 4 finding 4), where `rar`
+    /// 7.23 extracts it.
+    #[test]
+    fn rar2_unix_owner_subblock_crc_covers_the_names_in_its_data_area() {
+        let bytes = std::fs::read(rar15_40_fixture("external/rar2_unix_owner.rar")).unwrap();
+        let archive = ArchiveReader::read(&bytes).unwrap();
+        let entries = collect_extract(&archive, None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, b"file.txt");
+        assert_eq!(entries[0].data, b"foo\n");
+
+        // The seekable walk reads one block header at a time, sized by
+        // `head_size`, so it has to reach past it for the names on its own.
+        let walked = ArchiveReader::read_path(rar15_40_fixture("external/rar2_unix_owner.rar"))
+            .and_then(|archive| collect_extract(&archive, None))
+            .unwrap();
+        assert_eq!(walked[0].data, b"foo\n");
+
+        // The range was extended, not dropped. Byte 0x5f is the first byte
+        // of the owner name, which lives OUTSIDE `head_size`: damaging it
+        // has to be caught, or the sub-block would have been quietly exempt
+        // from its own checksum.
+        let mut damaged = bytes.clone();
+        damaged[0x5f] ^= 0x20;
+        assert!(matches!(
+            ArchiveReader::read(&damaged),
+            Err(Error::CrcMismatch {
+                expected: 0x1fc3,
+                ..
+            })
+        ));
+
+        // Truncating the archive so the names are gone leaves nothing to
+        // checksum against. The header check stands down (a CRC over a range
+        // the writer never covered would be a libel), and the block is
+        // refused for what it actually is: short of its own data area.
+        assert!(matches!(
+            ArchiveReader::read(&bytes[..0x5f]),
+            Err(Error::TooShort)
+        ));
+    }
+
     #[test]
     fn archive_facade_repairs_rar15_40_recovery_as_full_archive_bytes() {
         let bytes = std::fs::read(rar15_40_fixture("rar250_protect_head_rr5.rar")).unwrap();

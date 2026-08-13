@@ -117,8 +117,13 @@ BASELINE_FILES = {
     # 6,192, then 6,480 after the 8 Aug burst. Its 3,018-line inline
     # `mod tests` moved out and split at its own nested-one-pass banner
     # (mod_tests.rs + nested_tests.rs, neither big enough to want an
-    # entry of its own): 3,467.
-    "crates/nzbkit/src/extract/mod.rs": 3467,
+    # entry of its own): 3,467. Regrown to 3,550 on 13 Aug by the §160
+    # plain-member repair and §156.1 chase-spill appends, past the slack.
+    # Its instrumentation is one subject and left whole: the latched
+    # shape bits with their token/English rendering and the nested
+    # prevalence tally are extract/shape.rs now (326 lines, no entry of
+    # its own): 3,242.
+    "crates/nzbkit/src/extract/mod.rs": 3242,
     # serve/tasks.rs was here at 6,400 (6,056 when first measured, then
     # 6,213 from pre-gate concurrent work) and the 8 Aug merges took it to
     # 6,723 - past the slack, the only file-level offender left on main.
@@ -156,7 +161,23 @@ BASELINE_FILES = {
     # daemon_usage.rs, and what the daemon does with connections when
     # nothing is downloading (the warm pool, the idle-release policy,
     # and the offline switch over the top) to daemon_idle.rs: 4,630.
-    "crates/nzbfast/src/serve/daemon.rs": 4630,
+    # Regrown to 4,748 - past the slack this time, and caught at a merge
+    # rather than in the commit that spent the margin. TWO sessions then
+    # split it in parallel; the lanes turned out to be disjoint (no
+    # function moved twice, and daemon.rs auto-merged), so both are kept
+    # rather than one backed out. How a JOB stops running is one subject
+    # end to end (will_auto_retry, the failure report, the sidecar abort,
+    # the delete quarantine, park into history, note_queue_idle,
+    # save_giveup) and moved whole to daemon_park.rs, a seventh child on
+    # the daemon_index shape. How the DAEMON stops is the other - the
+    # graceful wind-down shared by mode=shutdown and SIGTERM/SIGINT, the
+    # signal handlers over it, and the pause timer that stops the queue
+    # only for a while (armed, persisted, restored across a restart) -
+    # and moved whole to daemon_shutdown.rs, an eighth. Those are free
+    # functions rather than a second `impl Daemon`, so that one is
+    # re-exported from daemon.rs and every call site still names it
+    # unqualified. 3,783 with both, still over the ceiling: entry stays.
+    "crates/nzbfast/src/serve/daemon.rs": 3783,
     # 5,150, then 5,397 after the 8 Aug burst. The inline `mod tests`
     # (the repair math and the mapped driver) moved to
     # par2repair/inline_tests.rs, beside unit_tests.rs: 4,206. Regrown
@@ -165,7 +186,11 @@ BASELINE_FILES = {
     # (a child of the defining module, so the private fields stay in
     # scope): 3,791.
     "crates/nzbkit/src/par2repair.rs": 3791,
-    "crates/nzbkit/src/rar.rs": 4088,
+    # rar.rs was here at 4,088 and reached 4,363 as the shatter-fold and
+    # fuzz-crash rounds landed. Its inline `mod tests` (1,255 lines) moved
+    # to rar/tests.rs beside v4_header_tests.rs, and the fixture writers
+    # (a public module, its `nzbkit::rar::fixtures` path unchanged) to
+    # rar/fixtures.rs. 2,494, under the ceiling, so its entry is GONE.
     "crates/nzbfast/src/wall.rs": 3911,
     "crates/nzbkit/src/nntp.rs": 3688,
     # release.rs was here at 3,505 and reached 3,586 as the dark-verdict

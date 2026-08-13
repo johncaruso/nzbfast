@@ -13,11 +13,10 @@ use fleet::{Fleet, build_fleet};
 mod plan;
 use plan::{FetchPlan, Intake, build_fetch_plan, build_intake, clamp_concurrency};
 mod census;
-use census::{Census, take_census};
 mod tail;
-use tail::{UnpackVerdict, finish_job, report_extraction, sweep_sniffed_leftovers, unpack_tail};
+use tail::finish_run;
 mod settle;
-use settle::{SettleVerdict, fetch_matched_deferred, settle_verify_repair};
+use settle::fetch_matched_deferred;
 mod rig;
 mod workers;
 use workers::{
@@ -101,6 +100,32 @@ fn announce_plan(nzb_path: &Path, files: usize, eager: u64, total: u64, out_dir:
         total as f64 / 1e6,
         out_dir.display()
     );
+}
+
+/// The network fetch itself: D1 (big-link) shards the fleet across
+/// independent I/O runtimes when `shard_count` says it is worth it,
+/// small fleets stay on the single-runtime path. Lifted out of
+/// `get_with_progress` for the size gate.
+async fn run_fetch(
+    servers: &[(ServerConfig, nzbkit::pool::PoolConfig)],
+    ids: Vec<nzbkit::pool::ArticleReq>,
+    tx: tokio::sync::mpsc::Sender<nzbkit::pool::FetchOutcome>,
+    queue_ctl: &Arc<nzbkit::pool::QueueControl>,
+) -> Vec<nzbkit::pool::PoolStats> {
+    let total_conns: usize = servers.iter().map(|(_, c)| c.connections).sum();
+    let shards = shard_count(total_conns);
+    if shards > 1 {
+        println!("  sharding {total_conns} connections across {shards} I/O runtimes");
+        let servers_owned = servers.to_vec();
+        let qc = queue_ctl.clone();
+        tokio::task::spawn_blocking(move || {
+            nzbkit::pool::fetch_all_sharded(servers_owned, ids, tx, shards, Some(&qc))
+        })
+        .await
+        .expect("sharded fetch panicked")
+    } else {
+        fetch_all_multi_ctl(servers, ids, tx, Some(queue_ctl.as_ref())).await
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -376,22 +401,9 @@ pub(crate) async fn get_with_progress(
         &decoded_bytes,
         &slot_file,
     );
-    // D1 (big-link): how many I/O runtimes this fleet is worth - see
-    // `shard_count`.
-    let total_conns: usize = servers.iter().map(|(_, c)| c.connections).sum();
-    let shards = shard_count(total_conns);
-    let stats = if shards > 1 {
-        println!("  sharding {total_conns} connections across {shards} I/O runtimes");
-        let servers_owned = servers.clone();
-        let qc = queue_ctl.clone();
-        tokio::task::spawn_blocking(move || {
-            nzbkit::pool::fetch_all_sharded(servers_owned, ids, tx, shards, Some(&qc))
-        })
-        .await
-        .expect("sharded fetch panicked")
-    } else {
-        fetch_all_multi_ctl(&servers, ids, tx, Some(&queue_ctl)).await
-    };
+    // The network fetch itself - sharded across I/O runtimes when the
+    // fleet is big enough (D1), single-runtime otherwise: see run_fetch.
+    let stats = run_fetch(&servers, ids, tx, &queue_ctl).await;
     // Network phase over: stop the side tasks, join the decode
     // consumers, flush the last D records, honor abort/pause, signal
     // net_done and re-read the late password: see drain_network in
@@ -434,176 +446,47 @@ pub(crate) async fn get_with_progress(
     )
     .await;
 
-    // Post-drain accounting: see take_census. The destructure keeps every
-    // downstream read on the same names the inline code used.
-    let Census {
-        total,
-        dead_servers,
-        backbones,
-        post_age_days,
-        sniff_bootstrap,
-        incomplete,
-        incomplete_spared,
-        missing_segments,
-        total_segments,
-        sparse_slots,
-        recovery_errs,
-        derrs,
-        retention_skipped,
-        recovery_missing,
-    } = take_census(
+    // Everything after the network drain - accounting, settle/repair,
+    // extraction, the unpack tail and the journal's retirement: see
+    // finish_run in get/tail.rs.
+    finish_run(
         &servers,
         &stats,
         &nzb,
         &slots,
+        &slot_file,
         &sniff,
         &verifier,
         &extractor,
+        journal,
+        out_dir,
+        &buf_pool,
         &decode_errors,
         &retention_excluded,
         &decoded_bytes,
-        elapsed,
-    );
-
-    // Phase marker: the network phase is over, the checks begin. On the
-    // chart this is where throughput sits at zero on purpose - without
-    // the marker a long repair reads as a download that died. The ring
-    // lives on the fleet's shared LiveStats (build_fleet gave every
-    // server's cfg the same Arc), so borrow it from the first server.
-    if let Some(live) = servers.iter().find_map(|(_, c)| c.live.clone()) {
-        live.note_run(
-            "settle",
-            "download finished - checking the files and repairing if needed",
-        );
-    }
-
-    // Settle verification and the repair ladder: see get/settle.rs. The
-    // destructure keeps every downstream read on the inline names.
-    let SettleVerdict {
-        all_good,
-        reextract_failed,
-        repair_shortfall,
-        deferred_renames,
-        sniff_covered,
-    } = settle_verify_repair(
-        &verifier,
-        &extractor,
-        &journal,
-        &slots,
-        &slot_file,
-        &servers,
-        &nzb,
-        out_dir,
-        &buf_pool,
-        &sniff,
-        sniff_bootstrap,
-        bootstrap_vol,
-        &resume_vols,
-        &prefetched,
-        fast_verify,
-        par_cleanup,
-        password.as_deref(),
-        incomplete,
-        derrs,
-        &sparse_slots,
-        recovery_errs,
-        recovery_missing,
-        &note_activity,
-        cancel,
-    )
-    .await?;
-
-    // Extraction summary: see report_extraction in get/tail.rs.
-    let (ex_report, outer_vol_stems, final_shape) =
-        report_extraction(&extractor, &deferred_renames, out_dir)?;
-
-    // Second late-attach read (C1): the settle/repair phase between the
-    // network drain and this ladder runs for minutes on a big damaged
-    // set, and a password typed during it must not miss this job too.
-    let password: Option<String> = hub
-        .as_ref()
-        .and_then(|h| h.late_password_for(stream_owner))
-        .or(password);
-    // Everything from here to the end of the run is unpack work (the
-    // disk-side ladders below, or the nested second pass) - close
-    // enough for the queue row even on jobs that skip them all, since
-    // those reach the finish within moments.
-    // The disk-unpack tail (eat-arm, unrar ladder, nested pass): see
-    // get/tail.rs. Off the scheduler core (Codex sweep 8 Aug H11): the
-    // tail is minutes of synchronous unrar work plus parked waits for
-    // the heavy-CPU permit and the §129 disk admission, and all of it
-    // used to run directly on this task's runtime worker - freezing
-    // sockets, timers and the API for the duration, and deadlocking
-    // outright when the permit holder needed the same worker to
-    // finish. `off_worker` (block_in_place, not spawn_blocking) keeps
-    // the tail on THIS thread, which the eat-arm's and the need
-    // ledger's thread-locals both rely on.
-    let UnpackVerdict {
-        all_good,
-        reextract_failed,
-    } = crate::lanegate::off_worker(|| {
-        unpack_tail(
-            &extractor,
-            &slots,
-            &restored,
-            &ex_report,
-            &final_shape,
-            &outer_vol_stems,
-            out_dir,
-            password.as_deref(),
-            resuming,
-            no_extract,
-            resume_map,
-            eat_consent,
-            &note_activity,
-            all_good,
-            reextract_failed,
-        )
-    })?;
-    // M15 memory summary - the line benchmarks quote and budgets tune.
-    let (pp_peak, pp_spilled) = verifier.partials_stats();
-    println!(
-        "mem: peak RSS {:.2} GB · holds peak {:.0} MB · verify partials peak {:.0} MB ({pp_spilled} blocks to read-back) · budget {:.2} GB",
-        nzbkit::mem::peak_rss().unwrap_or(0) as f64 / 1e9,
-        extractor.holds_peak() as f64 / 1e6,
-        pp_peak as f64 / 1e6,
-        budget.total as f64 / 1e9,
-    );
-
-    // Issue #14 tail - the sniffed-leftover sweep: see get/tail.rs.
-    sweep_sniffed_leftovers(all_good, par_cleanup, &sniff, sniff_covered, out_dir);
-
-    // Retire the journal on a good finish; otherwise print the
-    // diagnostics block and fail with the closest cause: see
-    // finish_job in get/tail.rs.
-    finish_job(
-        all_good,
-        out_dir,
-        &incomplete_spared,
-        journal,
-        &servers,
-        &stats,
-        reextract_failed,
-        incomplete,
-        derrs,
         &missing_430,
-        retention_skipped,
         &transport_failed,
         &transport_sample,
         &decode_error_sample,
-        &dead_servers,
-        &slots,
         &stalled,
-        missing_segments,
-        total_segments,
-        total,
-        &backbones,
-        post_age_days,
-        repair_shortfall,
-        &ex_report
-            .extracted
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect::<Vec<_>>(),
+        &pending_r,
+        elapsed,
+        bootstrap_vol,
+        &resume_vols,
+        &prefetched,
+        &restored,
+        fast_verify,
+        par_cleanup,
+        password,
+        resuming,
+        no_extract,
+        resume_map,
+        eat_consent,
+        &note_activity,
+        cancel,
+        &hub,
+        stream_owner,
+        &budget,
     )
+    .await
 }

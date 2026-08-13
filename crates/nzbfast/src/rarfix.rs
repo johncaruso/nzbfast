@@ -1264,9 +1264,9 @@ pub(crate) fn split_7z_part(name: &str) -> Option<(String, u32)> {
 /// `.7z.NNN` split sets grouped and ordered by part index. Each job is
 /// the ordered list of on-disk parts that form one container.
 ///
-/// The magic sniff ignores the extension entirely, the way the RAR
-/// detection beside it always has (`nested_inner_kind` takes any file
-/// with a RAR head). It used to require an EMPTY extension, so an
+/// The magic sniff accepts any extension except a named payload one
+/// (`nzbkit::extract::is_final_name` - a `.cb7` comic is the
+/// deliverable). It used to require an EMPTY extension, so an
 /// obfuscated container posted as `hash.bin` was invisible here: the
 /// disk post-pass walked past it, nothing extracted, and the job
 /// reported Completed holding one unopened archive. Obfuscation strips
@@ -1287,8 +1287,12 @@ pub(crate) fn collect_sevenz_archives(dir: &std::path::Path) -> Result<Vec<Vec<P
             .to_lowercase();
         if let Some((base, num)) = split_7z_part(&name) {
             splits.entry(base).or_default().insert(num, path);
-        } else if name.ends_with(".7z") || sevenz_magic(&path) {
-            // Named, or obfuscated under any name at all.
+        } else if name.ends_with(".7z")
+            || (!nzbkit::extract::is_final_name(&name) && sevenz_magic(&path))
+        {
+            // Named, or obfuscated under any name at all - except a
+            // named payload file (`.cb7`), whose 7z bytes ARE the
+            // deliverable and must never be unpacked.
             singles.push(path);
         }
     }
@@ -1327,13 +1331,49 @@ pub(crate) fn extract_sevenz(
             }
         };
         println!("unpacking 7z archive natively…");
-        let unpacked = extract_one_sevenz(out.path(), &container, password);
-        match unpacked.and_then(|()| out.publish_into(dir)) {
-            Ok(()) => println!("7z unpack complete ✔"),
-            Err(e) => {
-                println!("⚠ 7z unpack failed ({e})");
-                all_ok = false;
+        // Per CONTAINER, like the zip arm: one resolved value per level
+        // handed every 7z job the first job's password (Codex sweep G).
+        // A shortlist rather than a pick, because a probe that hit the
+        // 64 MB cap never reached the entry's checksum and cannot settle
+        // anything (sweep M) - the extraction does.
+        let cands = crate::unpack::sevenz_password_candidates(&container, dir, password);
+        let mut last: Option<String> = None;
+        let mut done = false;
+        // `publish_into` consumes its staging dir, so a retry needs a
+        // fresh one; the prepared dir is the first attempt's.
+        let mut prepared = Some(out);
+        for (pw, source) in &cands {
+            let out = match prepared
+                .take()
+                .map(Ok)
+                .unwrap_or_else(|| ExtractStaging::new(dir))
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    last = Some(e.to_string());
+                    break;
+                }
+            };
+            match extract_one_sevenz(out.path(), &container, pw.as_deref())
+                .and_then(|()| out.publish_into(dir))
+            {
+                Ok(()) => {
+                    if pw.is_some() && source != "job password" {
+                        println!("🔑 auto-unlocked with password from {source}");
+                    }
+                    println!("7z unpack complete ✔");
+                    done = true;
+                    break;
+                }
+                Err(e) => last = Some(e.to_string()),
             }
+        }
+        if !done {
+            println!(
+                "⚠ 7z unpack failed ({})",
+                last.unwrap_or_else(|| "no candidate password opened it".into())
+            );
+            all_ok = false;
         }
         drop(join);
     }
@@ -1383,6 +1423,18 @@ pub(crate) fn extract_one_sevenz(
         Some(p) if !p.is_empty() => Password::from(p),
         _ => Password::empty(),
     };
+    // The shared declared-size gate (nzbkit's nameprobe, TODO 156 item
+    // 5): ArchiveReader::open buffers the declared end header whole and
+    // decodes a packed one with the declared sizes as its only bounds,
+    // and a chased container that refused at the in-stream gate demotes
+    // to exactly this path - so the refusal here must be a named error,
+    // not an allocation. Malformed shapes fall through to the library's
+    // own cheap error, same as the probe halves of the gate.
+    if let Ok(mut probe) = std::fs::File::open(container)
+        && nzbkit::nameprobe::sevenz_disk_header_bomb(&mut probe)
+    {
+        anyhow::bail!("7z end header declares an oversized decode");
+    }
     let mut reader =
         ArchiveReader::open(container, pw).map_err(|e| anyhow::anyhow!("opening 7z: {e}"))?;
     // Staging sits on the same filesystem as the job directory, so this
@@ -1434,33 +1486,55 @@ pub(crate) fn extract_zip(
 ) -> bool {
     let mut all_ok = true;
     for job in jobs {
-        let out = match ExtractStaging::new(dir) {
-            Ok(v) => v,
-            Err(e) => {
-                println!("⚠ {e}");
-                all_ok = false;
-                continue;
-            }
-        };
+        // Per CONTAINER, not per level: two encrypted zips in one post
+        // need not share a password, and resolving once for the level
+        // handed the second one the first one's value and left it
+        // packed while reporting success (Codex sweep G, 13 Aug 2026).
+        // The list is also a shortlist rather than a pick - a ZipCrypto
+        // check byte accepts a wrong value once in 256 tries, so the
+        // extraction below is what settles it (sweep F).
+        let cands = crate::unpack::zip_password_candidates(dir, &job.parts, password);
         println!("unpacking {} natively…", job.shape.label());
-        match extract_one_zip(out.path(), &job.parts, password)
-            .and_then(|()| {
-                if out.produced_anything() {
-                    Ok(())
-                } else {
-                    // "Succeeded" having written nothing is the silent
-                    // success this codebase refuses everywhere else: the
-                    // user would get a green job and an empty folder.
-                    anyhow::bail!("the archive produced no files")
+        let mut last: Option<String> = None;
+        let mut done = false;
+        for (pw, source) in &cands {
+            let out = match ExtractStaging::new(dir) {
+                Ok(v) => v,
+                Err(e) => {
+                    last = Some(e.to_string());
+                    break;
                 }
-            })
-            .and_then(|()| out.publish_into(dir))
-        {
-            Ok(()) => println!("zip unpack complete ✔"),
-            Err(e) => {
-                println!("⚠ zip unpack failed ({e})");
-                all_ok = false;
+            };
+            match extract_one_zip(out.path(), &job.parts, pw.as_deref())
+                .and_then(|()| {
+                    if out.produced_anything() {
+                        Ok(())
+                    } else {
+                        // "Succeeded" having written nothing is the silent
+                        // success this codebase refuses everywhere else: the
+                        // user would get a green job and an empty folder.
+                        anyhow::bail!("the archive produced no files")
+                    }
+                })
+                .and_then(|()| out.publish_into(dir))
+            {
+                Ok(()) => {
+                    if pw.is_some() && source != "job password" {
+                        println!("🔑 auto-unlocked with password from {source}");
+                    }
+                    println!("zip unpack complete ✔");
+                    done = true;
+                    break;
+                }
+                Err(e) => last = Some(e.to_string()),
             }
+        }
+        if !done {
+            println!(
+                "⚠ zip unpack failed ({})",
+                last.unwrap_or_else(|| "no candidate password opened it".into())
+            );
+            all_ok = false;
         }
     }
     all_ok
@@ -2280,6 +2354,49 @@ mod native_unrar_tests {
 /// in `nzbkit::zip`; these cover the WIRING - what lands in the output
 /// directory, and the refusals that keep a hostile archive out of it.
 #[cfg(test)]
+mod sevenz_extract_tests {
+    use std::path::PathBuf;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("nzbfast-7zx-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The disk half of TODO 156 item 5's extract gate: a container
+    /// whose packed end header declares 512 MiB of decoded header (the
+    /// checked-in nzbkit bomb seed) is refused by name BEFORE
+    /// ArchiveReader::open decodes on the declaration's say-so. The
+    /// message assertion is what discriminates: with the gate neutered
+    /// the library errors on the garbage pack bytes as "opening 7z: …"
+    /// instead - after requesting the allocations the gate exists to
+    /// prevent. It matters here because a chased container that refused
+    /// at the in-stream gate demotes to exactly this path.
+    #[test]
+    fn a_bomb_declaring_sevenz_is_refused_by_name() {
+        let dir = tmp("bomb");
+        let container = dir.join("bomb.7z");
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../nzbkit/tests/fixtures/sevenz/bomb-container.7z"
+            ),
+            &container,
+        )
+        .unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let err = super::extract_one_sevenz(&out, &container, None).unwrap_err();
+        assert!(
+            err.to_string().contains("oversized decode"),
+            "must die at the gate, not in the decoder: {err}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod zip_extract_tests {
     use nzbkit::zip::fixtures::Spec;
     use std::path::PathBuf;
@@ -2319,6 +2436,35 @@ mod zip_extract_tests {
             movie
         );
         assert_eq!(std::fs::read(dir.join("Some.Movie/info.nfo")).unwrap(), nfo);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A self-extracting zip - a stub concatenated in front of a
+    /// container - reaches the disk pass by NAME (`zip::scan` never
+    /// magic-sniffs a named file), and the reader now follows the
+    /// archive's own offsets from where the archive actually starts.
+    /// The whole path has to hold, not just the parser: this is the
+    /// shape `unzip` reports as "extra bytes at beginning" and 7-Zip as
+    /// "the archive is open with offset". TODO 159 item 2.
+    #[test]
+    fn a_zip_behind_a_prepended_stub_unpacks_from_disk() {
+        let dir = tmp("stubzip");
+        let data = payload(80_000, 17);
+        let mut z = b"MZ stub bytes, not a zip".to_vec();
+        z.resize(511, 0);
+        z.extend_from_slice(&nzbkit::zip::fixtures::zip_of(&[Spec::deflated(
+            "Some.Movie/movie.mkv",
+            &data,
+        )]));
+        std::fs::write(dir.join("selfextract.zip"), &z).unwrap();
+
+        let found = nzbkit::zip::scan(&dir);
+        assert_eq!(found.len(), 1, "a named .zip is found whatever its head");
+        assert!(super::extract_zip(&dir, &found, None), "zip should unpack");
+        assert_eq!(
+            std::fs::read(dir.join("Some.Movie/movie.mkv")).unwrap(),
+            data
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

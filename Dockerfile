@@ -10,6 +10,16 @@
 # ecosystem entry too, or the pin silently rots.
 FROM rust:1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS build
 WORKDIR /src
+# Issue #38: a wedged daemon in the official image could not be given a
+# usable backtrace - the release profile strips symbols and the strip
+# below strips again, so `gdb -p` resolved 1010 frames of `?? ()`.
+# Build with symbols + line tables instead (env overrides the profile's
+# `strip = "symbols"`), then split them into a debuglink sidecar the
+# runtime stage ships at gdb's standard search path. The binary on PATH
+# stays stripped. Set BEFORE the cache-warming stub build too, or the
+# profile hash changes and the dependency cache is thrown away.
+ENV CARGO_PROFILE_RELEASE_STRIP=none \
+    CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 # Cache dependency compilation: copy manifests, build a stub, then the source.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/nzbkit/Cargo.toml crates/nzbkit/
@@ -29,7 +39,9 @@ COPY docs/ docs/
 COPY crates/ crates/
 RUN touch crates/nzbkit/src/lib.rs crates/nzbfast/src/main.rs \
     && cargo build --release -p nzbfast \
-    && strip target/release/nzbfast
+    && objcopy --only-keep-debug target/release/nzbfast target/release/nzbfast.debug \
+    && objcopy --strip-all --add-gnu-debuglink=target/release/nzbfast.debug \
+         target/release/nzbfast
 
 FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 # unrar (non-free) matches the real unrar the desktop bundles embed -
@@ -41,6 +53,11 @@ RUN sed -i 's/Components: main/Components: main non-free non-free-firmware/' \
         unrar p7zip-full ca-certificates tini curl gosu \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/nzbfast /usr/local/bin/nzbfast
+# The symbol sidecar, where gdb's debuglink search looks for it
+# (/usr/lib/debug + the binary's directory). `apt-get install gdb` in a
+# wedged container then gives named, line-numbered frames from
+# `gdb -p $(pidof nzbfast) -batch -ex 'thread apply all bt'`.
+COPY --from=build /src/target/release/nzbfast.debug /usr/lib/debug/usr/local/bin/nzbfast.debug
 
 LABEL org.opencontainers.image.title="nzbfast" \
       org.opencontainers.image.source="https://github.com/nzbfast/nzbfast" \

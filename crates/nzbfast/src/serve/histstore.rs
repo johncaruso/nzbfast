@@ -79,6 +79,11 @@ impl Daemon {
     /// present-check in `history_upsert_if_present`) can do so without
     /// dropping it between the decision and the write.
     fn history_write_locked(&self, lines: &[String]) -> bool {
+        // §158 item 7: the harness's kill-here seam, matching save_queue's.
+        #[cfg(test)]
+        if super::storecut::cut_here() {
+            return false;
+        }
         let path = self.history_store_path();
         // 0600 on unix, for the same reason `persist::write_atomic`
         // does it: these rows are daemon-private and carry credentials.
@@ -151,6 +156,32 @@ impl Daemon {
         }
         let line = job_json(&job.lock_ok()).to_string();
         self.history_write_locked(&[line]);
+    }
+
+    /// §158 item 7: a park's history row, written BEFORE the row leaves
+    /// the live queue. Returns whether it landed.
+    ///
+    /// Dropping the queue row publishes a queue.json without it the moment
+    /// any other thread saves - every queue mutation in the daemon calls
+    /// `save_queue` - and until `park` reached its `history_upsert`, past
+    /// the give-up bookkeeping and that bookkeeping's own file write, the
+    /// record was in NEITHER store. A kill or an ENOSPC in that window
+    /// lost it outright: gone from the queue, absent from history, its
+    /// payload on disk named by no record anywhere. Written first, the
+    /// torn state is "in both", which `load_queue` already reconciles in
+    /// history's favour.
+    ///
+    /// `tombstone` is not a convenience: a record that is NOT bound for
+    /// history must not be written here. `park`'s demote arm returns the
+    /// job to the queue, and a history line for it would make that same
+    /// reconciliation drop the requeued row.
+    ///
+    /// Not the final word on the record either. The auto-retry stamps and
+    /// the demote scrub settle it afterwards and the upsert beside the
+    /// history push writes it again; last line wins on replay, so this one
+    /// only has to EXIST.
+    pub(super) fn park_prewrite(&self, job: &Arc<Mutex<Job>>, tombstone: bool) -> bool {
+        !tombstone && self.history_upsert(std::slice::from_ref(job))
     }
 
     /// Persist removals: tombstone lines. For a record leaving history

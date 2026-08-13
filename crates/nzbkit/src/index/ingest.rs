@@ -219,6 +219,29 @@ pub fn split_subject(subject: &str) -> Option<(String, u32, u32)> {
     None
 }
 
+/// The posting-session tag: a subject that OPENS with `[37/209]` (or
+/// `(37/209)`) is announcing "this file is number 37 of a 209-file
+/// posting session" - a different pair from the trailing `(n/m)` part
+/// counter `split_subject` extracts. The shattered-poster family keeps
+/// it even while randomizing From per article (13 Aug 2026 census), so
+/// it is session-assembly evidence. Digits only on both sides, both
+/// nonzero, idx <= total - a leading hex repost tag (`[a1911f7bca]`)
+/// or a bare year never parses.
+pub fn session_tag(subject: &str) -> Option<(i64, i64)> {
+    let s = subject.trim_start();
+    let (open, close) = match s.chars().next()? {
+        '[' => ('[', ']'),
+        '(' => ('(', ')'),
+        _ => return None,
+    };
+    let inner = &s[open.len_utf8()..s.find(close)?];
+    let (a, b) = inner.split_once('/')?;
+    let (Ok(idx), Ok(total)) = (a.trim().parse::<i64>(), b.trim().parse::<i64>()) else {
+        return None;
+    };
+    (idx > 0 && total > 0 && idx <= total).then_some((idx, total))
+}
+
 /// Filename from a counter-stripped subject: the quoted name, else - for
 /// the unquoted convention `Release.Name.part01.rar yEnc` - the first
 /// whitespace token with a plausible extension (all-digit `.001`-style,
@@ -757,6 +780,10 @@ impl Index {
         // can link a sidecar backward to its payload by counter. The
         // randomized Date header is NEVER used for this.
         let mut pesto: HashMap<(String, String), (i64, i64, i64)> = HashMap::new();
+        // Posting-session tag: the leading "[037/209]" file-of-session
+        // marker (13 Aug 2026 census). First parsed value per cluster
+        // wins - a file has exactly one position in its session.
+        let mut sess: HashMap<(String, String), (i64, i64)> = HashMap::new();
         // Articles this pass refuses to place - see the note at the
         // clash test below. Empty on every ordinary batch.
         let mut deferred: Vec<OverEntry> = Vec::new();
@@ -820,6 +847,9 @@ impl Index {
                         *ck = (*ck).min(clock);
                     })
                     .or_insert((ctr, ctr, clock));
+            }
+            if let Some(t) = session_tag(&e.subject) {
+                sess.entry(key.clone()).or_insert(t);
             }
             clusters
                 .entry(key)
@@ -904,6 +934,18 @@ impl Index {
                      WHERE id=?1",
                 )?
                 .execute(rusqlite::params![rid, lo, hi, ck])?;
+            }
+            if let Some((si, st)) = sess.get(&(poster.clone(), stem.clone())) {
+                // First writer wins: a file has one position in its
+                // posting session, and a later disagreeing tag is a
+                // different posting the generation split handles.
+                tx.prepare_cached(
+                    "UPDATE releases SET
+                       sess_idx   = COALESCE(sess_idx, ?2),
+                       sess_total = COALESCE(sess_total, ?3)
+                     WHERE id=?1",
+                )?
+                .execute(rusqlite::params![rid, si, st])?;
             }
             for (fname, (total, parts)) in files {
                 // Merge with existing segments (batches split arbitrarily).

@@ -127,6 +127,17 @@ run. Attestations are also browsable under this repository's
 **Attestations** tab, and every release ships `SHA256SUMS.txt` for a
 plain checksum check (`shasum -a 256 -c SHA256SUMS.txt`).
 
+Newer releases also attach the attestation beside each tarball, so the
+proof is a file you can download and keep rather than a lookup (older
+releases publish it only through the attestations API, where the plain
+`verify` above still finds it):
+
+```sh
+gh attestation verify nzbfast-x86_64-unknown-linux-gnu.tar.gz \
+  --bundle nzbfast-x86_64-unknown-linux-gnu.tar.gz.intoto.jsonl \
+  --repo nzbfast/nzbfast
+```
+
 The attested files are the `nzbfast-<target-triple>.tar.gz` assets. The
 convenience packages (DMG, Windows installer, platform zips) are built
 and signed through separate channels; grab a target-triple tarball when

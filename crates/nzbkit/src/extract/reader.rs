@@ -236,11 +236,18 @@ impl Extractor {
                         return Err(nofile());
                     }
                 }
-                // Chased slot: byte-exact view straight from the
-                // frontier buffer (RAM memcpy - fine under the lock).
-                // A drop-behind trim splits the request: the prefix it
-                // spilled is served from the slot's archive file, on the
-                // deferred plan like any other pread.
+                // Chased slot: byte-exact view from the frontier
+                // buffer. Its RAM bytes (frontier + parked spans)
+                // memcpy under the lock; the spans a stalled chase
+                // paged to the holds scratch defer to preads like every
+                // other paged read, because a drop-behind trim made
+                // this arm's "RAM memcpy" claim untrue - a request
+                // straddling the trim point does real disk I/O, and
+                // every other extractor thread is waiting on this lock.
+                // A drop-behind trim splits the request the same way:
+                // the prefix it spilled is served from the slot's
+                // archive file, on the deferred plan like any other
+                // pread.
                 SlotMode::RarChase | SlotMode::SevenZ => {
                     let ch = s.chase.as_ref().ok_or_else(nofile)?;
                     let base = ch.buf.base();
@@ -252,7 +259,19 @@ impl Extractor {
                     }
                     if end > base {
                         let from = base.max(off);
-                        ch.buf.peek(from, &mut buf[(from - off) as usize..])?;
+                        let rel = (from - off) as usize;
+                        let plans = ch.buf.plan_peek(from, &mut buf[rel..])?;
+                        if !plans.is_empty() {
+                            // The buffer's own scratch, not the level's:
+                            // the plan offsets are regions of that file
+                            // and of no other.
+                            let sc = ch.buf.scratch().ok_or_else(nofile)?;
+                            pin.pin(sc);
+                            let f = sc.handle().ok_or_else(nofile)?;
+                            for (bo, n, po) in plans {
+                                reads.push(Plan::S(f.clone(), rel + bo, n, po));
+                            }
+                        }
                     }
                 }
                 // Unclassified slot: serve from pre-sniff holds when they
@@ -425,6 +444,19 @@ impl Extractor {
     /// stale value - demoting, at finish, a job whose output healed
     /// cleanly (see [`CrcRuns::overwrite`]).
     ///
+    /// A PLAIN slot takes the same patch, and needs none of that
+    /// machinery: its volume view IS its output file, so the span lands
+    /// as an ordinary positioned write through `plain_job` (which marks
+    /// writer coverage like any arrival) and there is no mapper, no
+    /// entry, and therefore no `piece_crcs` composition to overwrite -
+    /// the repair marker rides along inert. Admitting it is what keeps a
+    /// set whose only damage is in a plain member on the mapped lane
+    /// instead of demoting every chased volume beside it to disk (TODO
+    /// 160). `RarFallback` is deliberately NOT admitted though `read_at`
+    /// treats it identically: that slot already materialized, so the set
+    /// is paying for volumes on disk regardless, and its re-extract
+    /// accounting is the fallback path's business.
+    ///
     /// [`write`]: Extractor::write
     /// [`finish`]: Extractor::finish
     /// [`read_at`]: Extractor::read_at
@@ -432,7 +464,7 @@ impl Extractor {
         let (name, size) = {
             let inner = self.inner.lock_ok();
             let s = &inner.slots[slot];
-            if !matches!(s.mode, SlotMode::Rar) {
+            if !matches!(s.mode, SlotMode::Rar | SlotMode::Plain) {
                 return Err(nofile());
             }
             (s.name.clone(), s.size)
@@ -696,6 +728,17 @@ impl Extractor {
         Some(w.size.saturating_sub(covered))
     }
 
+    /// Has this slot demoted to a materialized volume? A parked article
+    /// completing after the demote may still carry fragments naming the
+    /// inner files the fallback deleted - but the reconstruction put
+    /// those same bytes at their final offsets in the volume file, so
+    /// the journal writer rewrites them to identity form (the record
+    /// lands after the slot's `M` line, whose positional rewrite
+    /// deliberately does not reach forward).
+    pub fn slot_materialized(&self, slot: usize) -> bool {
+        matches!(self.inner.lock_ok().slots[slot].mode, SlotMode::RarFallback)
+    }
+
     /// (file name, size) of the slot's on-disk file - what the journal
     /// records as the slot's restore destination.
     pub fn slot_file_info(&self, slot: usize) -> Option<(String, u64)> {
@@ -786,6 +829,43 @@ impl Extractor {
     /// mapped slot onto the no-writer path (worse than a few bad blocks).
     pub fn is_mapped(&self, slot: usize) -> bool {
         matches!(self.inner.lock_ok().slots[slot].mode, SlotMode::Rar)
+    }
+
+    /// TODO 160 - may a mapped repair patch this slot's DAMAGED blocks in
+    /// place, instead of declining the whole call to the materialize +
+    /// `repair_dir` path? True for a plain slot that owns a writer and
+    /// reads back as exactly the bytes it was posted as. Reads already
+    /// work ([`Self::read_at`] serves a plain slot from its writer) and
+    /// so do writes ([`Self::patch_volume_span`]); this is the admission
+    /// test the repair gate asks before believing either.
+    ///
+    /// `plain_by_sniff` is the load-bearing half. A slot that reached
+    /// Plain by GIVING UP - the spill/overflow backstop, which flips
+    /// mode without ever seeing offset 0 - may well be a RAR volume
+    /// whose header article was lost, and those keep declining to the
+    /// path that has always owned them. Without that test this admits
+    /// every spilled volume too, quietly moving the small-budget
+    /// degradation shape off the disk lane it is pinned to.
+    ///
+    /// The crypto exclusion is the whole reason this is not a bare mode
+    /// check. A plaintext-once output holds CIPHERTEXT on disk with its
+    /// seams and tail padding in the crypto stashes, and the plain
+    /// read/write pair goes straight at the writer - `read_at`'s plain
+    /// arm never consults `crypto_of` and `plain_job` sets no `crypto`
+    /// on the job. Repair bytes are posted-domain, so patching one
+    /// through here would write plaintext into a ciphertext file and
+    /// then "verify" it by reading the same wrong bytes back. Those
+    /// slots decline and take the fallback, exactly as before.
+    pub fn is_plain_patchable(&self, slot: usize) -> bool {
+        let inner = self.inner_read();
+        let s = &inner.slots[slot];
+        if !matches!(s.mode, SlotMode::Plain) || !s.plain_by_sniff {
+            return false;
+        }
+        let Some(w) = s.writer.as_ref() else {
+            return false;
+        };
+        Self::crypto_of(&inner, w).is_none()
     }
 
     /// Is this slot being CHASED - its bytes retained in a frontier
@@ -916,6 +996,100 @@ impl Extractor {
         if let Some(w) = w {
             w.note_renamed(new_path);
         }
+    }
+
+    /// Which SOURCE VOLUME SLOTS fed each direct-extracted output file.
+    ///
+    /// The failed-job quarantine asks this so it can withhold only the
+    /// payload a still-holed volume touched, instead of every file the
+    /// job produced (TODO 159 item 1: a post whose PAR2 set covers two
+    /// of three archives had both repaired files withheld along with the
+    /// unrecoverable one). Deliberately answers at GROUP granularity,
+    /// not per piece: a solid or multi-volume set's members can draw
+    /// bytes from any volume in the group, and `bases` only records the
+    /// pieces resolution has reached - so every volume of the group is
+    /// named as a source of every file that group wrote.
+    ///
+    /// Being ABSENT from the map is the answer for anything this level
+    /// cannot speak for, and every caller must read it that way: a
+    /// nested (`routed`) or chased member is written by the child chain
+    /// under a name this level never sees, and a group-less slot writes
+    /// through a bare `inner_writers` key that no group owns. The map is
+    /// therefore a positive claim about the names it lists and says
+    /// nothing at all about the rest.
+    ///
+    /// `None` - no claim about ANY file - when a mapped slot has no
+    /// group. Such a slot writes through the group-less branch of
+    /// `inner_writer`, which reuses an existing writer by sanitized
+    /// name, so it could be feeding a file some group's `out_names`
+    /// also claims, and every entry below would then be understating
+    /// its sources.
+    pub fn payload_sources(&self) -> Option<HashMap<String, Vec<usize>>> {
+        let inner = self.inner.lock_ok();
+        if inner
+            .slots
+            .iter()
+            .any(|s| matches!(s.mode, SlotMode::Rar) && s.group.is_none())
+        {
+            return None;
+        }
+        // Parent lock held across the child lookups, the same order
+        // `map_output_range` takes (and for the same reason: the route
+        // being read lives in the parent). `direct_slot_out_name` is
+        // poison-tolerant so a panicking child cannot cascade upward.
+        let child = inner.child.clone();
+        let mut out: HashMap<String, Vec<usize>> = HashMap::new();
+        for g in inner.groups.values() {
+            let mut srcs = g.slots.clone();
+            srcs.sort_unstable();
+            srcs.dedup();
+            // Members this level wrote to its own file: nesting off,
+            // or an encrypted store set, which never routes.
+            let names = g.out_names.values().cloned().chain(
+                // Routed members: with nesting on - the default - an
+                // inner file is a CHILD slot, and it is that slot's
+                // own file that gets delivered. Only a slot that IS an
+                // output answers; a routed member that turned out to be
+                // another archive is extracted one level further down,
+                // and those outputs stay unattributed here.
+                g.routed
+                    .values()
+                    .filter_map(|&cs| child.as_ref().and_then(|c| c.direct_slot_out_name(cs))),
+            );
+            for name in names {
+                out.entry(name).or_default().extend(srcs.iter().copied());
+            }
+        }
+        for srcs in out.values_mut() {
+            srcs.sort_unstable();
+            srcs.dedup();
+        }
+        Some(out)
+    }
+
+    /// Output filename of a slot that IS a delivered file - a Plain
+    /// slot, or an archive a nested demote materialized. Exactly the
+    /// filter [`slot_output_files`](Self::slot_output_files) folds into
+    /// the parent's report, so the name matches the one the report
+    /// carries. `None` for a slot still being extracted THROUGH, whose
+    /// outputs belong to the level below.
+    ///
+    /// Poison-tolerant for the same reason as
+    /// [`plain_slot_out_name`](Self::plain_slot_out_name): the caller
+    /// holds the PARENT lock while calling this on the child.
+    pub(super) fn direct_slot_out_name(&self, slot: usize) -> Option<String> {
+        let inner = self.inner_read();
+        let s = inner.slots.get(slot)?;
+        if !matches!(s.mode, SlotMode::Plain | SlotMode::RarFallback) {
+            return None;
+        }
+        s.writer.as_ref().map(|w| {
+            w.path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
     }
 
     /// Force materialization of a slot's group (e.g. PAR2 repair needs the
