@@ -1656,6 +1656,96 @@ fn a_shattered_posting_folds_across_posters_and_groups() {
     teardown(&d, ix);
 }
 
+/// The lifetime counters postdate the fold itself (they arrived after
+/// v1.1.1, which already shipped the fold and its lap marker), so a
+/// database upgraded across that release holds merged rows nothing
+/// ever counted. Its census must read as partial instead of a
+/// confident zero - and must KEEP reading partial once new folds start
+/// writing the counters, because the pre-upgrade total is gone for
+/// good. A fresh database, by contrast, really is at zero.
+#[test]
+fn a_pre_counter_database_census_reads_partial_never_zero() {
+    let d = dir("shatter-fold-census");
+    let mut ix = Index::open(&d.join("index.db")).unwrap();
+    // Fresh database: no lap marker, no counters - zero is the truth.
+    let s = ix.shatter_fold_stats();
+    assert_eq!(s["lifetime_known"], true, "a fresh database's zero is real");
+    assert_eq!(s["rows_folded"], 0);
+    // The v1.1.1 shape: a completed lap, no counter keys.
+    ix.kv_set("shatter_fold_lap_v1", "1").unwrap();
+    let s = ix.shatter_fold_stats();
+    assert_eq!(
+        s["lifetime_known"], false,
+        "a lap without counters is a pre-counter database"
+    );
+    assert_eq!(
+        s["rows_folded"], 0,
+        "the count itself stays honestly at what was counted"
+    );
+    // The first counted fold writes the counter keys; the partial fact
+    // must survive that, or the since-upgrade total would promote
+    // itself to a lifetime number.
+    let subj = |p: u32| {
+        format!(r#"[001/003] - "e3b0c44298fc1c149afbf4c8996fb924.par2" yEnc ({p}/6) 4200000"#)
+    };
+    for p in 1u32..=6 {
+        ix.ingest(
+            "alt.binaries.movies",
+            &[over(
+                &subj(p),
+                &format!("r{p}@h{p}.tld"),
+                &format!("m{p}"),
+                700_000,
+            )],
+            5_000 + p as i64,
+        )
+        .unwrap();
+    }
+    let (_groups, folded, _done) = ix.shatter_fold(6_000, WALK).unwrap();
+    assert!(folded > 0, "the fixture really folded");
+    let s = ix.shatter_fold_stats();
+    assert_eq!(s["rows_folded"], folded as u64);
+    assert_eq!(
+        s["lifetime_known"], false,
+        "counters exist now, but the census stays since-upgrade"
+    );
+    teardown(&d, ix);
+}
+
+/// A first lap completed by counter-aware code has counted every merge
+/// it made, so its zero is materialized as real counter keys: a new
+/// database that swept and found nothing to fold reads as a true zero,
+/// never as "lifetime unknown".
+#[test]
+fn an_empty_first_lap_reads_as_a_real_zero() {
+    let d = dir("shatter-fold-empty-lap");
+    let mut ix = Index::open(&d.join("index.db")).unwrap();
+    // One perfectly ordinary named post: nothing shattered, nothing to
+    // fold, but the lap has real rows to walk.
+    ix.ingest(
+        "alt.binaries.movies",
+        &[over(
+            r#"[001/001] - "Whole.Set.2026.1080p.WEB.H264-GRP.par2" yEnc (1/1) 4200"#,
+            "p@h.tld",
+            "mid1",
+            4_200,
+        )],
+        5_000,
+    )
+    .unwrap();
+    let (groups, folded, done) = ix.shatter_fold(6_000, WALK).unwrap();
+    assert_eq!((groups, folded), (0, 0));
+    assert!(done);
+    let s = ix.shatter_fold_stats();
+    assert_eq!(s["first_lap_done"], true);
+    assert_eq!(
+        s["lifetime_known"], true,
+        "a lap completed under counting code proves its own zero"
+    );
+    assert_eq!(s["rows_folded"], 0);
+    teardown(&d, ix);
+}
+
 /// The session tag parses only the real thing: a leading digit-only
 /// pair, in either bracket style, never a hex repost tag, a bare year,
 /// an inverted pair, or the trailing yEnc part counter.
@@ -2678,9 +2768,13 @@ fn a_posting_past_the_member_cap_still_folds_to_one_row() {
         }
         tx.commit().unwrap();
     }
-    let first = ix
-        .shatter_fold(6_000, std::time::Duration::from_secs(1))
-        .unwrap();
+    // WALK, not a one-second budget: this test is about the member CAP,
+    // not the clock. A second was enough on the machine it was written
+    // on and not on the CI runners, which folded 19,999 of 20,000 and
+    // failed by one on Linux and on Windows (14 Aug). It costs nothing
+    // now that the pass stops when it catches up instead of spinning
+    // out its whole budget.
+    let first = ix.shatter_fold(6_000, WALK).unwrap();
     let state = |ix: &Index| -> (i64, i64, i64) {
         ix.db
             .query_row(
@@ -2692,6 +2786,15 @@ fn a_posting_past_the_member_cap_still_folds_to_one_row() {
             .unwrap()
     };
     assert_eq!(first.1, (MEMBERS - 1) as usize, "every member folded away");
+    // And it KNOWS it is caught up. The fold deletes the rows it folded,
+    // so the surviving maximum id collapses far below the `top` the call
+    // read at entry; a pass that only tests against that stale top can
+    // never reach it, and spins on an empty id range until its budget
+    // runs out.
+    assert!(
+        first.2,
+        "the fold folded everything and still reported itself behind"
+    );
     assert_eq!(
         state(&ix),
         (1, MEMBERS, 1),

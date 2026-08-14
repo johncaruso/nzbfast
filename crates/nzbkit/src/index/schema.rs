@@ -9,6 +9,51 @@
 
 use super::*;
 
+/// Bytes of write-ahead log the writer keeps when a checkpoint resets
+/// it. Past this, the WAL file is truncated back to here.
+///
+/// SQLite's default is no limit, and the WAL then keeps its all-time
+/// high-water mark FOREVER: it is reused from the front after every
+/// checkpoint but never shrinks. Measured on the live index on 14 Aug
+/// 2026 - a 28.1 GiB `index.db-wal` alongside a 39 GiB `index.db`,
+/// holding exactly ONE live frame (`mxFrame=1`). Nothing was wrong with
+/// checkpointing and no reader was pinning anything; the file was a
+/// fossil of the one-pass `compact` VACUUM, which is a single
+/// transaction over the whole database and so pushed all 7,331,058
+/// pages through the WAL at once. Thousands of checkpoint resets since
+/// then reused the front of the file and left the other 28 GiB
+/// allocated.
+///
+/// 64 MiB because routine work must never reach it - a truncate the
+/// daemon pays on every commit is churn, and churn in a multi-gigabyte
+/// file is what makes Time Machine snapshots expensive, which is the
+/// bill this whole investigation started from.
+///
+/// Sized from the live daemon, not from taste. Sampling `mxFrame` out
+/// of the wal-index once a second for three minutes while it indexed:
+/// peak 4,036 frames (15.9 MiB), typical 94-902 (0.4-3.5 MiB), floor 1.
+/// The autocheckpoint threshold is 1000 pages (4 MiB) and the largest
+/// routine write transaction in the tree is `COMPACT_CHUNK_PAGES` at
+/// 2048 pages (8 MiB), both consistent with that. 64 MiB is 4x the
+/// measured live peak, so only a one-shot whole-database rewrite ever
+/// crosses it.
+///
+/// It bounds, it does not block: a transaction bigger than this still
+/// grows the WAL as far as it needs. The limit applies when the WAL is
+/// next reset, which is what hands the space back.
+///
+/// So DO NOT be alarmed by a WAL over the limit during startup. Watched
+/// across the 14 Aug restart, the boot burst (backfills and the spot
+/// history scan) drove it to 1.12 GiB of genuinely LIVE frames, drained
+/// in about 40 seconds, and the file went straight back to exactly this
+/// limit and stayed there - live content 0.5-3.6 MiB across the next
+/// five minutes. That is one truncate per daemon start, which is the
+/// churn we are happy to pay; the steady-state figure above is what the
+/// limit is sized against. Tell the two apart with `mxFrame` from the
+/// wal-index rather than the file size: live frames say whether the
+/// bytes are in use or are the dead space this constant exists to stop.
+pub const WAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
+
 /// The base tables, pragmas aside: everything `CREATE TABLE IF NOT
 /// EXISTS` so it is a no-op on an existing database.
 fn create_base_schema(db: &Connection) -> rusqlite::Result<()> {
@@ -36,13 +81,18 @@ fn create_base_schema(db: &Connection) -> rusqlite::Result<()> {
         // ~0.1% of the file, plus a ptrmap write when a page is
         // allocated or freed. Cheap against a multi-GB index that
         // otherwise blocks a download for minutes.
-        "PRAGMA auto_vacuum=INCREMENTAL;
-         PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
-         PRAGMA temp_store=MEMORY;
-         PRAGMA cache_size=-262144;
-         PRAGMA mmap_size=1073741824;
-         CREATE TABLE IF NOT EXISTS releases(
+        &format!(
+            "PRAGMA auto_vacuum=INCREMENTAL;
+             PRAGMA journal_mode=WAL;
+             PRAGMA journal_size_limit={WAL_SIZE_LIMIT};
+             PRAGMA synchronous=NORMAL;
+             PRAGMA temp_store=MEMORY;
+             PRAGMA cache_size=-262144;
+             PRAGMA mmap_size=1073741824;"
+        ),
+    )?;
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS releases(
             id INTEGER PRIMARY KEY,
             stem TEXT NOT NULL,
             poster TEXT NOT NULL,
@@ -1306,7 +1356,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::testutil::entry;
+    use crate::index::testutil::{entry, teardown};
 
     /// The read-only connection behind the daemon's interactive query
     /// endpoints: it reads what the writer commits WITHOUT being
@@ -1354,5 +1404,219 @@ mod tests {
         assert!(ro.kv_set("k", "v").is_err());
         // And it must never be the open that CREATES a database.
         assert!(Index::open_read_only(&dir.join("absent.db")).is_err());
+    }
+
+    fn wal_len(db: &Path) -> u64 {
+        let mut s = db.as_os_str().to_os_string();
+        s.push("-wal");
+        std::fs::metadata(std::path::PathBuf::from(s))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// The writer must declare a bound on how much WAL it keeps.
+    ///
+    /// SQLite's default is no limit at all, and the consequence is not
+    /// that checkpointing stops - it is that the WAL file never SHRINKS.
+    /// It is reused from the front after every checkpoint and stays at
+    /// its all-time high-water mark forever, so one whole-database
+    /// rewrite pins its own size in dead space permanently. The live
+    /// index was found on 14 Aug 2026 carrying 28.1 GiB of exactly that
+    /// while holding one live frame.
+    ///
+    /// Delete the pragma and this reads back -1.
+    #[test]
+    fn the_writer_bounds_how_much_wal_it_keeps() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-wal-lim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+        let ix = Index::open(&db).unwrap();
+
+        let limit: i64 = ix
+            .db
+            .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            limit, WAL_SIZE_LIMIT,
+            "the writer is not carrying the WAL size limit; -1 means SQLite's \
+             unbounded default and a WAL that keeps its high-water mark forever"
+        );
+        // The bound has to be a bound. Sanity in both directions: below
+        // the 15.9 MiB peak measured on the live daemon it would truncate
+        // during ordinary indexing, which is churn in a file big enough
+        // to make snapshots expensive; unbounded is the bug itself.
+        assert!(
+            (32 * 1024 * 1024..=256 * 1024 * 1024).contains(&limit),
+            "WAL_SIZE_LIMIT {limit} is outside the range the live measurement supports"
+        );
+        teardown(&dir, ix);
+    }
+
+    /// `compact` is a single VACUUM over the whole database, so it
+    /// leaves behind a WAL as large as the database - this is what put
+    /// 28.1 GiB beside the live index. It must hand that back before it
+    /// returns, while it still holds the idle moment the compaction loop
+    /// waited for, rather than leaving it for whatever checkpoint
+    /// happens next.
+    #[test]
+    fn compact_hands_back_the_wal_its_vacuum_inflated() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-wal-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+        let mut ix = Index::open(&db).unwrap();
+
+        // Enough bulk that the VACUUM has something real to push
+        // through the WAL - the assertion below is about megabytes
+        // coming back, not about an empty file staying empty.
+        for r in 0..4_000u32 {
+            ix.ingest(
+                "alt.binaries.test",
+                &[entry(
+                    &format!(r#""Ballast.Release.{r:06}.1080p.WEB-DL.x264-GRP.rar" yEnc (1/1)"#),
+                    "p@x",
+                    &format!("wal{r:06}"),
+                    900_000,
+                )],
+                1_000,
+            )
+            .unwrap();
+        }
+        assert!(
+            wal_len(&db) > 0,
+            "nothing in the WAL to reclaim - the fixture wrote too little to test anything"
+        );
+
+        ix.compact().unwrap();
+
+        assert_eq!(
+            wal_len(&db),
+            0,
+            "compact left its VACUUM's write-ahead log on disk; on the live \
+             index that log was 28.1 GiB and it stayed there"
+        );
+        teardown(&dir, ix);
+    }
+
+    /// End to end: a WAL driven far past the limit comes back down.
+    ///
+    /// The sequence is load-bearing and is why the pragma alone is worth
+    /// a behavioural test. SQLite does not truncate at the checkpoint -
+    /// a restart only sets `truncateOnCommit`, and the file is cut on
+    /// the first COMMIT after it. So a bound that is never followed by a
+    /// write is a bound that has not been applied yet.
+    #[test]
+    fn a_runaway_wal_comes_back_down_to_the_limit() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-wal-runaway-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+        let ix = Index::open(&db).unwrap();
+
+        // One transaction bigger than the limit, which is exactly the
+        // shape of the one-pass compact that did this for real.
+        ix.db
+            .execute_batch("CREATE TABLE _wal_ballast(b BLOB)")
+            .unwrap();
+        let blob = vec![7u8; 256 * 1024];
+        let over = WAL_SIZE_LIMIT as usize + 24 * 1024 * 1024;
+        {
+            let tx = ix.db.unchecked_transaction().unwrap();
+            {
+                let mut st = tx
+                    .prepare("INSERT INTO _wal_ballast(b) VALUES(?1)")
+                    .unwrap();
+                for _ in 0..over.div_ceil(blob.len()) {
+                    st.execute(rusqlite::params![blob.as_slice()]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let peak = wal_len(&db);
+        assert!(
+            peak > WAL_SIZE_LIMIT as u64,
+            "fixture never drove the WAL past the limit (peak {peak}) - the \
+             assertion below would pass without proving anything"
+        );
+
+        // Backfill everything and restart the log, then commit once.
+        // Both halves are required; see the doc comment.
+        let _ = ix
+            .db
+            .query_row("PRAGMA wal_checkpoint(RESTART)", [], |_| Ok(()));
+        ix.kv_set("wal_probe", "1").unwrap();
+
+        let after = wal_len(&db);
+        assert!(
+            after <= WAL_SIZE_LIMIT as u64 + 1024 * 1024,
+            "WAL stayed at {after} bytes after a checkpoint and a commit; it \
+             peaked at {peak} and the limit is {WAL_SIZE_LIMIT}. An unbounded \
+             WAL keeps its high-water mark for the life of the database."
+        );
+        teardown(&dir, ix);
+    }
+
+    /// The live reclaim path: a database whose WAL is ALREADY over the
+    /// limit before this build ever opened it.
+    ///
+    /// This is the shape the fix has to handle for real - 28.1 GiB was
+    /// on disk long before the pragma existed, and it comes back when
+    /// the daemon restarts onto a binary that carries the limit. A
+    /// second connection stays open throughout so that dropping the
+    /// first does not delete the WAL: SQLite removes it only when the
+    /// LAST connection closes, and a daemon restart on a live index is
+    /// not that.
+    #[test]
+    fn a_reopen_reclaims_a_wal_that_was_already_oversized() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-wal-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+
+        let keepalive = {
+            let first = Index::open(&db).unwrap();
+            first
+                .db
+                .execute_batch("CREATE TABLE _wal_ballast(b BLOB)")
+                .unwrap();
+            // Held across the drop below, so the WAL outlives `first`.
+            let keepalive = Index::open_read_only(&db).unwrap();
+            let blob = vec![7u8; 256 * 1024];
+            let over = WAL_SIZE_LIMIT as usize + 24 * 1024 * 1024;
+            let tx = first.db.unchecked_transaction().unwrap();
+            {
+                let mut st = tx
+                    .prepare("INSERT INTO _wal_ballast(b) VALUES(?1)")
+                    .unwrap();
+                for _ in 0..over.div_ceil(blob.len()) {
+                    st.execute(rusqlite::params![blob.as_slice()]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+            drop(first);
+            keepalive
+        };
+        let inherited = wal_len(&db);
+        assert!(
+            inherited > WAL_SIZE_LIMIT as u64,
+            "fixture did not leave an oversized WAL behind ({inherited} bytes)"
+        );
+
+        // What the daemon does on restart: open, and get on with it.
+        let ix = Index::open(&db).unwrap();
+        let _ = ix
+            .db
+            .query_row("PRAGMA wal_checkpoint(RESTART)", [], |_| Ok(()));
+        ix.kv_set("wal_probe", "1").unwrap();
+
+        let after = wal_len(&db);
+        assert!(
+            after <= WAL_SIZE_LIMIT as u64 + 1024 * 1024,
+            "reopening an index with a {inherited}-byte WAL left {after} bytes \
+             behind - the 28.1 GiB on the live index would never come back"
+        );
+        drop(keepalive);
+        teardown(&dir, ix);
     }
 }

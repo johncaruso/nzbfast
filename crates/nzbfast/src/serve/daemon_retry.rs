@@ -270,6 +270,13 @@ impl Daemon {
             info!(target: "retry", "{nzo_id}: refused - an unlock is finalizing it right now");
             return false;
         }
+        // Q2's other direction: from this removal until `commit_to_queue`'s
+        // save lands, the record's only durable copy is its history.jsonl
+        // row - and a concurrent "Save queue" compaction snapshots
+        // `self.history`, which no longer holds it. Register the id so the
+        // compaction carries the disk row, exactly as park does around its
+        // prewrite window. Guard drops on every exit below.
+        let _inflight = self.hist_inflight_begin(nzo_id);
         let job = h.remove(pos);
         drop(h);
         // A TV-filed job's out_dir is the SHARED `Show/Season NN` library
@@ -364,6 +371,14 @@ impl Daemon {
             j.paused = false;
             j.fail_message.clear();
             j.fail_detail.clear();
+            // M5: a row an NZBGet delete verb filed here carries the
+            // delete's mark, and the queued-prefetch shape keeps its
+            // tombstone too (the sidecar tail may still land an Ok).
+            // A retry is an instruction to RUN the job: left set, the
+            // mark would refile the next park as "deleted", and the
+            // tombstone would make pick_job skip the row forever.
+            j.delete_status.clear();
+            j.tombstone = false;
             j.finished_at = None;
             j.finished_unix = None;
             j.retries += 1;

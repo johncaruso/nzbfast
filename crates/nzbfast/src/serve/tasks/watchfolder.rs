@@ -221,12 +221,12 @@ fn consume_source_file(d: &Arc<Daemon>, p: &std::path::Path, sig: (u64, u64), na
              the next pass",
             p.display()
         );
-        d.watch_failed.lock_ok().remove(p);
+        d.watch_failed_remove(p);
         return true;
     }
     match crate::smart::remove_user_file(p, crate::smart::delete_to_trash()) {
         Ok(_) => {
-            d.watch_failed.lock_ok().remove(p);
+            d.watch_failed_remove(p);
             true
         }
         Err(err) => {
@@ -236,7 +236,7 @@ fn consume_source_file(d: &Arc<Daemon>, p: &std::path::Path, sig: (u64, u64), na
                  yourself or it stays listed",
                 p.display()
             );
-            d.watch_failed.lock_ok().insert(
+            d.watch_failed_insert(
                 p.to_path_buf(),
                 (
                     sig.0,
@@ -433,26 +433,19 @@ pub(in crate::serve) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                 .ok()
                                 .is_some_and(|b| nzb_looks_complete(&b));
                             if !complete {
-                                if settled {
-                                    let mut failed = d.watch_failed.lock_ok();
-                                    if !failed.contains_key(&p) {
-                                        info!(
-                                            target: "watch",
-                                            "{} looks truncated - no closing </nzb> tag, \
-                                             and it has stopped changing. Left alone; re-save it \
-                                             to retry.",
-                                            p.display()
-                                        );
-                                        failed.insert(
-                                            p.clone(),
-                                            (
-                                                sig.0,
-                                                sig.1,
-                                                watchfail::TRUNCATED.into(),
-                                                String::new(),
-                                            ),
-                                        );
-                                    }
+                                if settled
+                                    && d.watch_failed_insert(
+                                        p.clone(),
+                                        (sig.0, sig.1, watchfail::TRUNCATED.into(), String::new()),
+                                    )
+                                {
+                                    info!(
+                                        target: "watch",
+                                        "{} looks truncated - no closing </nzb> tag, \
+                                         and it has stopped changing. Left alone; re-save it \
+                                         to retry.",
+                                        p.display()
+                                    );
                                 }
                                 continue;
                             }
@@ -514,7 +507,7 @@ pub(in crate::serve) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                          alone rather than downloading it twice",
                                         p.display()
                                     );
-                                    d.watch_failed.lock_ok().insert(
+                                    d.watch_failed_insert(
                                         p.clone(),
                                         (sig.0, sig.1, watchfail::ALREADY_QUEUED.into(), queued_id),
                                     );
@@ -550,7 +543,7 @@ pub(in crate::serve) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                          or add the NZB from the dashboard",
                                         p.display()
                                     );
-                                    d.watch_failed.lock_ok().insert(
+                                    d.watch_failed_insert(
                                         p.clone(),
                                         (sig.0, sig.1, watchfail::ALREADY_DONE.into(), done_id),
                                     );
@@ -618,7 +611,7 @@ pub(in crate::serve) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                             watch_seen
                                                 .insert(p.clone(), (sig.0, sig.1, sha.clone()));
                                             save_watch_seen(&seen_path, &watch_seen);
-                                            d.watch_failed.lock_ok().remove(&p);
+                                            d.watch_failed_remove(&p);
                                             continue;
                                         }
                                         if consume_source_file(&d, &p, sig, &name) {
@@ -636,7 +629,7 @@ pub(in crate::serve) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                              saved - keeping your file at {}",
                                             p.display()
                                         );
-                                        d.watch_failed.lock_ok().insert(
+                                        d.watch_failed_insert(
                                             p,
                                             (
                                                 sig.0,
@@ -677,7 +670,7 @@ pub(in crate::serve) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                                                 ),
                                             }
                                         }
-                                        d.watch_failed.lock_ok().insert(
+                                        d.watch_failed_insert(
                                             fp,
                                             (sig.0, sig.1, err.to_string(), String::new()),
                                         );
@@ -690,7 +683,12 @@ pub(in crate::serve) fn spawn_watch_folder(daemon: &Arc<Daemon>) {
                         prev_pass = this_pass;
                     }
                     // Files the user deleted or moved drop off the list.
-                    d.watch_failed.lock_ok().retain(|p, _| p.exists());
+                    // Through the bumping helper: this retain is exactly
+                    // where a ghost row was born - the entry left the map
+                    // here while every idle dashboard kept rendering it,
+                    // and its delete button answered "no such rejected
+                    // file" from then on.
+                    d.watch_failed_prune_missing();
                     // ...and off the keep-mode seen-set, so it never grows
                     // past what the folder actually holds. Persisted only
                     // when something actually left.

@@ -2059,10 +2059,10 @@ async fn one_dead_server_does_not_seal_work_the_live_one_can_still_do() {
     assert_exactly_one_outcome_each(&ids, &seen);
 }
 
-/// Codex sweep 2, 3 Aug M6. A budget trained down to the 2 s floor
+/// Codex sweep 2, 3 Aug M6. A budget trained down to the floor
 /// by pipelined ~0 ms samples has to be able to climb back out
 /// WITHIN the article retry allowance (four charged attempts by
-/// default), or a provider that settles at a stable 2.5 s fails
+/// default), or a provider that settles just above the floor fails
 /// every article on a link the flat path would have served.
 ///
 /// Deterministic and pool-free on purpose: with a live fleet the
@@ -2072,7 +2072,7 @@ async fn one_dead_server_does_not_seal_work_the_live_one_can_still_do() {
 #[test]
 fn a_pre_byte_timeout_widens_past_the_budget_that_expired() {
     // The shape the bug needed: pipelining collapsed the EWMA to
-    // 1 ms, so every budget is the 2 s floor and doubling the raw
+    // 1 ms, so every budget is the floor and doubling the raw
     // value (1, 2, 4, 8, 16 ms) never moves it.
     let mut ewma = 1u64;
     let mut ladder = Vec::new();
@@ -2089,10 +2089,16 @@ fn a_pre_byte_timeout_widens_past_the_budget_that_expired() {
             ttfb_budget_ms(ewma)
         );
     }
-    assert_eq!(ladder, vec![2_000, 4_000, 8_000, 10_000]);
-    // A 2.5 s server is served by the SECOND attempt, well inside
-    // the default four - that is the whole point.
-    assert!(ladder[1] >= 2_500);
+    // Floor-derived, so this moved with the 2 s -> 4 s floor
+    // (14 Aug 2026): it starts a rung higher and tops out a step
+    // sooner. What the test is actually about - that four charged
+    // attempts cannot all be spent at the same floor - is unchanged.
+    assert_eq!(ladder, vec![4_000, 8_000, 10_000, 10_000]);
+    // A 2.5 s server is now served by the FIRST attempt, and a 5 s one
+    // by the second - still well inside the default four, which is the
+    // whole point.
+    assert!(ladder[0] >= 2_500);
+    assert!(ladder[1] >= 5_000);
 
     // The ceiling still holds however many timeouts arrive, and an
     // unmeasured server (which already budgets at the ceiling) has
@@ -2106,8 +2112,8 @@ fn a_pre_byte_timeout_widens_past_the_budget_that_expired() {
         ADAPTIVE_FIRST_BYTE_MAX.as_millis() as u64
     );
 
-    // And the ordinary path is untouched: a genuinely slow server
-    // whose EWMA is already above the floor still doubles.
+    // And the ordinary path is untouched: a server whose 4x EWMA has
+    // reached the floor still doubles from there on the escalation.
     assert_eq!(ttfb_budget_ms(1_000), 4_000);
     assert_eq!(ttfb_budget_ms(escalated_ttfb_ms(1_000)), 8_000);
 }

@@ -216,12 +216,32 @@ pub(super) fn check_update(d: &Arc<Daemon>) -> std::result::Result<Option<Value>
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    if !remote.is_empty() && version_newer(&remote, env!("CARGO_PKG_VERSION")) {
-        *d.update_manifest.lock_ok() = Some(m.clone());
-        Ok(Some(m))
-    } else {
-        *d.update_manifest.lock_ok() = None;
-        Ok(None)
+    let newer = !remote.is_empty() && version_newer(&remote, env!("CARGO_PKG_VERSION"));
+    latch_update_manifest(d, if newer { Some(m.clone()) } else { None });
+    Ok(if newer { Some(m) } else { None })
+}
+
+/// Latch the manifest the banner reads, and let open dashboards see it.
+///
+/// The banner rides the REVISIONED queue payload, which an idle
+/// dashboard skips while its revision matches. Latching a change
+/// without bumping the revision left every open page blind to it until
+/// an unrelated queue mutation moved the number - a manual Settings ->
+/// Check said "see the banner up top" and the banner stayed empty
+/// (Gary, 14 Aug). Bump only on a CHANGE of the visible version: the
+/// 6 h steady-state re-check must not invalidate the queue for nothing.
+pub(super) fn latch_update_manifest(d: &Arc<Daemon>, latched: Option<Value>) {
+    let ver = |v: &Option<Value>| {
+        v.as_ref()
+            .and_then(|m| m.get("version").and_then(Value::as_str).map(str::to_string))
+    };
+    let mut g = d.update_manifest.lock_ok();
+    let changed = ver(&g) != ver(&latched);
+    *g = latched;
+    drop(g);
+    if changed {
+        d.queue_rev
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -280,4 +300,51 @@ pub(super) fn container_install() -> bool {
 pub(super) fn port_locked() -> bool {
     static LOCKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LOCKED.get_or_init(|| std::env::var("NZBFAST_PORT_LOCKED").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn with_daemon(name: &str, f: impl FnOnce(&Arc<Daemon>)) {
+        let dir = std::env::temp_dir().join(format!("nzbfast-upd-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let d = super::super::testutil::test_daemon(&dir);
+        f(&d);
+        drop(d);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The banner rides the revisioned queue payload: a manifest change
+    /// must bump the queue revision or an idle open dashboard never
+    /// hears about it, and a steady-state re-check must NOT bump it.
+    #[test]
+    fn a_manifest_change_bumps_the_queue_revision_and_steady_state_does_not() {
+        with_daemon("latch", |d| {
+            let m = serde_json::json!({"version": "9.9.9"});
+            let rev = d.queue_rev.load(Ordering::Relaxed);
+            latch_update_manifest(d, Some(m.clone()));
+            let rev = {
+                let now = d.queue_rev.load(Ordering::Relaxed);
+                assert_ne!(now, rev, "a new version must invalidate the queue payload");
+                now
+            };
+            // Same version again: the 6 h re-check steady state.
+            latch_update_manifest(d, Some(m));
+            assert_eq!(
+                d.queue_rev.load(Ordering::Relaxed),
+                rev,
+                "an unchanged manifest must not churn the revision"
+            );
+            // The release caught up with us: banner comes down, rev moves.
+            latch_update_manifest(d, None);
+            assert_ne!(d.queue_rev.load(Ordering::Relaxed), rev);
+            // And staying up to date is quiet too.
+            let rev = d.queue_rev.load(Ordering::Relaxed);
+            latch_update_manifest(d, None);
+            assert_eq!(d.queue_rev.load(Ordering::Relaxed), rev);
+        });
+    }
 }

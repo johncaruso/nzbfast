@@ -45,6 +45,8 @@ mod logging;
 mod nettools;
 mod newznab;
 mod notify;
+#[cfg(feature = "indexer")]
+mod oracle_backtest;
 mod persist;
 // TODO 151 (issue #36): the first list source's own wire formats.
 mod plex;
@@ -337,6 +339,59 @@ enum Command {
     // clap prints doc comments as help text.
     #[command(hide = true)]
     ChaosServe(chaos_serve::Cli),
+    /// Score the M29 availability oracle against reality: sample
+    /// indexed releases per (family, age bucket) cell, STAT them on
+    /// every configured server, and print what the ledger predicted
+    /// beside what the network answered.
+    ///
+    /// The oracle's routing skip acts on counted ARTICLES, and articles
+    /// of one posting are not independent samples - one doomed release
+    /// can pin a whole cell red. This is how that is caught: it reports
+    /// precision, recall and the false-skip rate (the share of skipped
+    /// provider attempts that would have served the release).
+    ///
+    /// The index is opened read-only and nothing is written back, so it
+    /// is safe against a live daemon's database. No change to
+    /// MIN_SAMPLES, GREEN_LOW or RED_HIGH ships without a run of this.
+    #[cfg(feature = "indexer")]
+    OracleBacktest {
+        #[arg(long, default_value = "index.db")]
+        db: PathBuf,
+        /// Releases sampled per (family, age bucket) cell.
+        #[arg(long, default_value_t = 12)]
+        releases: usize,
+        /// Message-ids STATted per release, spread evenly across its
+        /// files (head-only sampling misses tail takedowns).
+        #[arg(long, default_value_t = 3)]
+        msgids: usize,
+        /// Only score this group family (repeatable; default = the
+        /// families the ledger has evidence in).
+        #[arg(long = "family")]
+        families: Vec<String>,
+        /// Only score this age bucket 0-6 (repeatable).
+        #[arg(long = "bucket")]
+        buckets: Vec<u8>,
+        /// Cells to score, most ledger evidence first.
+        #[arg(long, default_value_t = 6)]
+        cells: usize,
+        /// Seed for the release sample. The same seed replays the same
+        /// draw order, but the age window it draws from moves with the
+        /// clock, so a run tomorrow scores different releases.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// A release counts as carried by a backbone when at least this
+        /// fraction of its probed articles answered 223.
+        #[arg(long, default_value_t = 0.5)]
+        truth: f64,
+        /// Seconds spent drawing one cell's sample out of the index
+        /// before settling for a short one. A family with nothing
+        /// indexed in the bucket's age window costs a full window scan
+        /// per attempt, so the draw is bounded by the clock.
+        #[arg(long, default_value_t = 15)]
+        sample_secs: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Scan group headers into the local release index (M12).
     #[cfg(feature = "indexer")]
     Index {
@@ -1066,6 +1121,36 @@ async fn run() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("{msg}");
             Ok(())
+        }
+        #[cfg(feature = "indexer")]
+        Command::OracleBacktest {
+            db,
+            releases,
+            msgids,
+            families,
+            buckets,
+            cells,
+            seed,
+            truth,
+            sample_secs,
+            json,
+        } => {
+            oracle_backtest::run(
+                &cli.config,
+                oracle_backtest::Opts {
+                    db,
+                    releases,
+                    msgids,
+                    families,
+                    buckets,
+                    cells,
+                    seed,
+                    truth,
+                    sample_secs,
+                    json,
+                },
+            )
+            .await
         }
         #[cfg(feature = "indexer")]
         Command::Search { query, db, nzb } => search_index(&query, &db, nzb.as_deref()),

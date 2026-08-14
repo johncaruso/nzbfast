@@ -2478,6 +2478,182 @@ async fn nzbget_jsonrpc_facade_cycle() {
     let _ = std::fs::remove_dir_all(&dir2);
 }
 
+/// The NZBGet JSON-RPC facade announces the idle edge (Codex sweep
+/// 14 Aug M4). GroupPause on the sole runnable job and a non-active
+/// GroupDelete each idle the queue with no park, and the REST arms have
+/// said `queue.idle` for both since the 10 Aug sweep - this facade
+/// answered true and said nothing, so which client type the user
+/// configured decided whether lifecycle hooks heard about it. Global
+/// pause keeps the jobs Queued (and Queued-unpaused is NOT idle), so
+/// each edge here is exactly the job-level transition under test.
+#[tokio::test(flavor = "multi_thread")]
+async fn jsonrpc_pause_and_delete_announce_the_idle_edge() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-jridle-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let data = payload(80_000, 3);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("idle.bin", &data, 40_000, "jri", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+    let nzb_for = |name: &str| {
+        let mut xml = format!(
+            "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;{name}&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+            segs.len()
+        );
+        for (id, bytes, num) in &segs {
+            xml.push_str(&format!(
+                "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+            ));
+        }
+        xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+        xml
+    };
+    let xml_a = nzb_for("Alpha.Idle.Test");
+    let xml_b = nzb_for("Beta.Idle.Test");
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    let dir2 = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        fn b64(data: &[u8]) -> String {
+            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            for c in data.chunks(3) {
+                let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+                let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+                out.push(A[(n >> 18) as usize & 63] as char);
+                out.push(A[(n >> 12) as usize & 63] as char);
+                out.push(if c.len() > 1 {
+                    A[(n >> 6) as usize & 63] as char
+                } else {
+                    '='
+                });
+                out.push(if c.len() > 2 {
+                    A[n as usize & 63] as char
+                } else {
+                    '='
+                });
+            }
+            out
+        }
+        let rpc = |method: &str, params: String| -> String {
+            let body = format!("{{\"method\":\"{method}\",\"params\":{params},\"id\":9}}");
+            http(
+                port,
+                "/jsonrpc",
+                Some(("application/json", body.as_bytes())),
+            )
+        };
+        let append = |name: &str, xml: &str| -> i64 {
+            let ap = rpc(
+                "append",
+                format!(
+                    "[\"{name}\",\"{}\",\"\",0,false,false,\"\",0,\"SCORE\"]",
+                    b64(xml.as_bytes())
+                ),
+            );
+            let id = serde_json::from_str::<serde_json::Value>(&ap)
+                .ok()
+                .and_then(|v| v.get("result").and_then(|r| r.as_i64()))
+                .unwrap_or(0);
+            assert!(id > 0, "append failed: {ap}");
+            id
+        };
+        // Idle events since the cursor, in ring order.
+        let idles = |since: u64| -> Vec<u64> {
+            let body = http(
+                port,
+                &format!("/api?mode=dashboard&events={since}&output=json"),
+                None,
+            );
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            v["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| e["kind"] == "queue.idle")
+                .filter_map(|e| e["seq"].as_u64())
+                .collect()
+        };
+        let wait_idles = |since: u64, want: usize| -> Vec<u64> {
+            for _ in 0..50 {
+                let got = idles(since);
+                if got.len() >= want {
+                    return got;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            panic!("never saw {want} queue.idle event(s) past seq {since}");
+        };
+        let seq0 = {
+            let body = http(port, "/api?mode=dashboard&output=json", None);
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            v["events_seq"].as_u64().expect("events_seq")
+        };
+        // Global pause first, so the appended jobs stay Queued and
+        // unpaused - runnable, hence NOT idle - instead of downloading.
+        rpc("pausedownload", "[]".into());
+
+        // Edge 1: GroupPause on the sole runnable job.
+        let a = append("alpha-idle.nzb", &xml_a);
+        let r = rpc("editqueue", format!("[\"GroupPause\",\"\",[{a}]]"));
+        assert!(r.contains("true"), "{r}");
+        let after_pause = wait_idles(seq0, 1);
+        assert_eq!(
+            after_pause.len(),
+            1,
+            "GroupPause must announce exactly one idle edge: {after_pause:?}"
+        );
+
+        // Edge 2: a non-active delete. The add of B re-arms the latch;
+        // deleting B (A still paused) idles the queue again.
+        let b = append("beta-idle.nzb", &xml_b);
+        let r = rpc("editqueue", format!("[\"GroupDelete\",\"\",[{b}]]"));
+        assert!(r.contains("true"), "{r}");
+        let after_delete = wait_idles(seq0, 2);
+        assert_eq!(
+            after_delete.len(),
+            2,
+            "GroupDelete must announce exactly one more idle edge: {after_delete:?}"
+        );
+
+        // Still a transition: a paused queue poked again stays silent.
+        let r = rpc("editqueue", format!("[\"GroupPause\",\"\",[{a}]]"));
+        assert!(r.contains("true"), "{r}");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert_eq!(idles(seq0).len(), 2, "the latch must keep repeats silent");
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
 /// M23 Smart Folders + cleanup rules, end to end: rules set live via the
 /// config API route an UNcategorized upload to its category, junk files
 /// are deleted after completion, and the finished job is filed as
@@ -3439,6 +3615,181 @@ async fn slow_single_server_job_deferred() {
         std::fs::read(dir.join("complete/slowjob/slowjob.bin")).unwrap(),
         payload(3_000_000, 11),
         "deferred job payload differs after journal resume"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A taken-down post must not hold the queue. Every article of the
+/// "gone" job 430s, so not a byte arrives and the byte-share defer
+/// verdict never applies (it bails at `total == 0`, treating a refusal
+/// ladder as progress). The refusal counter is what separates this from
+/// a wedged server - answers arrived, every one of them "no such
+/// article" - and the watchdog defers on it so the healthy job behind it
+/// runs.
+///
+/// Regression for 14 Aug 2026: two 21-day-old releases whose articles
+/// were all taken down each held the queue 10+ minutes at 0.0 MB/s.
+#[tokio::test(flavor = "multi_thread")]
+async fn gone_post_defers_so_the_queue_moves_on() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-gonedefer-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    // The server holds ONLY the good job's articles. The gone job's ids
+    // are never inserted, so the mock 430s every one of them.
+    let mut articles = HashMap::new();
+    let good_segs = make_file_articles(
+        "goodjob.bin",
+        &payload(1_600_000, 31),
+        40_000,
+        "gd",
+        &mut articles,
+    );
+    let mut absent = HashMap::new();
+    let gone_segs = make_file_articles(
+        "gonejob.bin",
+        &payload(4_000_000, 33),
+        20_000,
+        "gn",
+        &mut absent,
+    );
+    // Enough segments that one window clears the refusal floor set below
+    // several times over, with retries on top.
+    assert!(gone_segs.len() >= 100, "{} segments", gone_segs.len());
+    // `missing_delay_ms` is what makes this a queue-holding job rather
+    // than a fast failure: refused instantly, 200 segments are gone in
+    // well under the warmup and the watchdog never gets to judge. Real
+    // refusals cost a round trip, and the releases this regression comes
+    // from carried ~15k segments - so pace the 430s and let the job sit
+    // there being useless, which is the situation under test.
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            delay_ms: 10,
+            missing_delay_ms: 120,
+            ..Chaos::default()
+        },
+    )
+    .await;
+
+    let nzb_for = |name: &str, segs: &[(String, u64, u32)]| {
+        let mut xml = String::from(
+            "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+        );
+        xml.push_str(&format!(
+            "  <file poster=\"x\" date=\"0\" subject=\"&quot;{name}&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+            segs.len()
+        ));
+        for (id, bytes, num) in segs {
+            xml.push_str(&format!(
+                "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+            ));
+        }
+        xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+        xml
+    };
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .env("NZBFAST_DEFER_WARMUP_SECS", "2")
+            .env("NZBFAST_DEFER_WINDOW_SECS", "3")
+            .env("NZBFAST_DEFER_GONE_MIN_MISSES", "8")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    let (gone_xml, good_xml) = (
+        nzb_for("gonejob.bin", &gone_segs),
+        nzb_for("goodjob.bin", &good_segs),
+    );
+    tokio::task::spawn_blocking(move || {
+        let upload = |xml: &str, fname: &str| -> String {
+            let boundary = "----goneb";
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{fname}\"\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(xml.as_bytes());
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            let r = http(
+                port,
+                "/api?mode=addfile&apikey=sekrit&output=json",
+                Some((&format!("multipart/form-data; boundary={boundary}"), &body)),
+            );
+            assert!(r.contains("\"status\":true"), "{r}");
+            r.split("SABnzbd_nzo_").nth(1).unwrap().split('"').next()
+                .map(|s| format!("SABnzbd_nzo_{s}")).unwrap()
+        };
+        let poll = |pred: &dyn Fn(&str, &str) -> bool, what: &str| -> (String, String) {
+            for _ in 0..300 {
+                let q = http(port, "/api?mode=queue&apikey=sekrit&output=json", None);
+                let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+                if pred(&q, &h) {
+                    return (q, h);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            panic!("timed out waiting for {what}");
+        };
+
+        // The gone job starts first (only candidate); the good one
+        // queues behind it and would wait forever without the defer.
+        let gone_id = upload(&gone_xml, "gonejob.nzb");
+        poll(&|q, _h| q.contains(&gone_id) && q.contains("Downloading"), "gone job start");
+        let good_id = upload(&good_xml, "goodjob.nzb");
+
+        let (q, _) = poll(
+            &|q, _h| q.contains("\"deferred\":true"),
+            "watchdog deferral of the gone job",
+        );
+        assert!(q.contains(&gone_id), "the GONE job is the one to defer: {q}");
+        assert!(
+            q.contains("came back missing"),
+            "defer must be attributed to refusals, not to a slow/dead server: {q}"
+        );
+
+        // The point of the whole arm: the healthy job behind it runs and
+        // finishes while the gone one is still parked.
+        let (_, h) = poll(
+            &|_h, h| h.contains(&good_id) && h.contains("Completed"),
+            "good job completion while the gone job is deferred",
+        );
+        assert!(
+            !h.contains("gonejob"),
+            "the gone job must not have completed: {h}"
+        );
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(dir.join("complete/goodjob/goodjob.bin")).unwrap(),
+        payload(1_600_000, 31),
+        "the job that overtook the gone post should be byte-exact"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5892,6 +6243,7 @@ async fn jsonrpc_delete_stops_a_prefetching_job() {
     .await;
     let port = d.port;
 
+    let out_root = dir.join("complete");
     let deleted = tokio::task::spawn_blocking(move || {
         let upload = |xml: &str, fname: &str| -> String {
             let boundary = "----rpcdb";
@@ -5965,11 +6317,87 @@ async fn jsonrpc_delete_stops_a_prefetching_job() {
             "A should still be running - the rig proves nothing otherwise: {q}"
         );
 
-        // The deleted job is gone from both views, and it never published.
+        // M5: GroupDelete is delete-and-file, not delete-and-forget. The
+        // job leaves the queue, never publishes as a finished download,
+        // and history gets a row that says the user removed it.
         assert!(qslot(&q, &b_id).is_null(), "the deleted job is still queued: {q}");
+        let hslot = |h: &str, id: &str| -> serde_json::Value {
+            let v: serde_json::Value = serde_json::from_str(h)
+                .unwrap_or_else(|e| panic!("bad history JSON: {e}\n{h}"));
+            v["history"]["slots"]
+                .as_array()
+                .and_then(|a| a.iter().find(|s| s["nzo_id"] == id).cloned())
+                .unwrap_or(serde_json::Value::Null)
+        };
+        let b_row = hslot(&h, &b_id);
         assert!(
-            !h.contains(&b_id),
-            "a job deleted mid-prefetch came back as a finished download: {h}"
+            !b_row.is_null(),
+            "GroupDelete must file a history row for the job it removed: {h}"
+        );
+        assert_eq!(
+            b_row["status"], "Failed",
+            "a deleted row must not read as a finished download: {b_row}"
+        );
+        assert_eq!(b_row["fail_message"], "deleted from the queue", "{b_row}");
+        // The NZBGet view spells the same row in NZBGet's own vocabulary.
+        let jr = http(
+            port,
+            "/jsonrpc",
+            Some((
+                "application/json",
+                br#"{"method":"history","id":9}"#.as_slice(),
+            )),
+        );
+        assert!(
+            jr.contains("\"DELETED/MANUAL\""),
+            "the JSON-RPC history must mark the deleted row DELETED/MANUAL: {jr}"
+        );
+
+        // M5's active leg: GroupDelete on the DOWNLOADING job. The
+        // pipeline aborts, park() finishes the cleanup - removes the
+        // files GroupDelete asked for - and files the history row.
+        let a_nzbid: i64 = a_id
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+            .parse()
+            .unwrap();
+        let body = format!(
+            "{{\"method\":\"editqueue\",\"params\":[\"GroupDelete\",\"\",[{a_nzbid}]],\"id\":8}}"
+        );
+        let r = http(port, "/jsonrpc", Some(("application/json", body.as_bytes())));
+        assert!(r.contains("true"), "GroupDelete of the active job refused: {r}");
+        let (_, h) = poll(
+            &|_, h| {
+                let v: serde_json::Value = match serde_json::from_str(h) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                v["history"]["slots"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|s| s["nzo_id"] == a_id.as_str()))
+            },
+            "the active delete to park into history",
+        );
+        let a_row = hslot(&h, &a_id);
+        assert_eq!(a_row["fail_message"], "deleted from the queue", "{a_row}");
+        // The files half is deferred to park, so it is allowed to lag
+        // the history row by the drain - poll rather than assert.
+        let a_out = out_root.join("grinder");
+        for _ in 0..300 {
+            if !a_out.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(
+            !a_out.exists(),
+            "an active GroupDelete must remove the payload once the fetch drains: {}",
+            a_out.display()
         );
         b_id
     })
@@ -5984,6 +6412,203 @@ async fn jsonrpc_delete_stops_a_prefetching_job() {
         !log.contains(&format!("[prefetch] {deleted} completed")),
         "the delete did not stop the prefetch:\n{log}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M5 (14 Aug sweep): the four NZBGet delete verbs carry four distinct
+/// contracts, and one collapsed arm served them all - no file removal,
+/// no history row, every variant identical. Per NZBGet's editqueue
+/// documentation and the nzbgetcom ChangeLog:
+///
+///   GroupDelete      files deleted, history row DELETED/MANUAL
+///   GroupDupeDelete  files deleted, history row DELETED/DUPE
+///   GroupFinalDelete files deleted, NO history row (what Sonarr and
+///                    Radarr send to cancel - the orphaned-payload bug)
+///   GroupParkDelete  files RETAINED, history row DELETED/MANUAL
+///
+/// Queued fixtures against a dead server, paused, so every job sits
+/// still while its verb lands. The retry at the end proves the filed
+/// rows are live records (spooled NZB kept, tombstone scrubbed), not
+/// just rendered corpses.
+#[tokio::test(flavor = "multi_thread")]
+async fn nzbget_delete_variants_keep_their_own_contracts() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-rpcvariants-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{dead_port},\"tls\":false}}]}}"),
+    )
+    .unwrap();
+    let out = dir.join("complete");
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(dir.join("complete"));
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let upload = |stem: &str| -> String {
+            let xml = format!(
+                "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"{stem}.bin (1/1)\">\n    <groups><group>g</group></groups>\n    <segments>\n      <segment bytes=\"10000\" number=\"1\">{stem}seg1@test</segment>\n    </segments>\n  </file>\n</nzb>\n"
+            );
+            let boundary = "----nzbfastboundary";
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{stem}.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(xml.as_bytes());
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            let ctype = format!("multipart/form-data; boundary={boundary}");
+            let r = http(port, "/api?mode=addfile&output=json", Some((&ctype, &body)));
+            assert!(r.contains("\"status\":true"), "{r}");
+            r.split("SABnzbd_nzo_").nth(1).unwrap().split('"').next()
+                .map(|s| format!("SABnzbd_nzo_{s}")).unwrap()
+        };
+        let nzbid = |nzo: &str| -> i64 {
+            nzo.chars()
+                .rev()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+                .parse()
+                .unwrap()
+        };
+        let editqueue = |cmd: &str, id: i64| -> String {
+            let body = format!(
+                "{{\"method\":\"editqueue\",\"params\":[\"{cmd}\",\"\",[{id}]],\"id\":3}}"
+            );
+            http(port, "/jsonrpc", Some(("application/json", body.as_bytes())))
+        };
+        let hslot = |h: &str, id: &str| -> serde_json::Value {
+            let v: serde_json::Value = serde_json::from_str(h)
+                .unwrap_or_else(|e| panic!("bad history JSON: {e}\n{h}"));
+            v["history"]["slots"]
+                .as_array()
+                .and_then(|a| a.iter().find(|s| s["nzo_id"] == id).cloned())
+                .unwrap_or(serde_json::Value::Null)
+        };
+
+        let r = http(port, "/api?mode=pause&output=json", None);
+        assert!(r.contains("\"status\":true"), "{r}");
+        let ids: Vec<String> = ["alpha", "bravo", "charlie", "delta"]
+            .iter()
+            .map(|s| upload(s))
+            .collect();
+        // Every job gets a payload directory the verb must judge: three
+        // verbs delete it, one retains it.
+        for stem in ["alpha", "bravo", "charlie", "delta"] {
+            let p = out.join(stem);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("part.bin"), b"partial payload").unwrap();
+        }
+
+        for (cmd, nzo) in [
+            ("GroupDelete", &ids[0]),
+            ("GroupDupeDelete", &ids[1]),
+            ("GroupFinalDelete", &ids[2]),
+            ("GroupParkDelete", &ids[3]),
+        ] {
+            let r = editqueue(cmd, nzbid(nzo));
+            assert!(r.contains("true"), "{cmd} refused: {r}");
+        }
+
+        let q = http(port, "/api?mode=queue&output=json", None);
+        let v: serde_json::Value = serde_json::from_str(&q).unwrap();
+        assert_eq!(v["queue"]["slots"].as_array().map(Vec::len), Some(0), "{q}");
+
+        // File retention per verb.
+        assert!(!out.join("alpha").exists(), "GroupDelete must remove the files");
+        assert!(!out.join("bravo").exists(), "GroupDupeDelete must remove the files");
+        assert!(!out.join("charlie").exists(), "GroupFinalDelete must remove the files");
+        assert!(
+            out.join("delta").join("part.bin").exists(),
+            "GroupParkDelete must retain the downloaded files"
+        );
+
+        // History per verb, SAB view: three rows filed, FinalDelete none.
+        let h = http(port, "/api?mode=history&output=json", None);
+        assert_eq!(hslot(&h, &ids[0])["fail_message"], "deleted from the queue", "{h}");
+        assert_eq!(
+            hslot(&h, &ids[1])["fail_message"],
+            "deleted from the queue as a duplicate",
+            "{h}"
+        );
+        assert!(
+            hslot(&h, &ids[2]).is_null(),
+            "GroupFinalDelete must not file a history row: {h}"
+        );
+        assert_eq!(hslot(&h, &ids[3])["fail_message"], "deleted from the queue", "{h}");
+
+        // The same rows in NZBGet's own vocabulary.
+        let jr = http(
+            port,
+            "/jsonrpc",
+            Some(("application/json", br#"{"method":"history","id":4}"#.as_slice())),
+        );
+        let v: serde_json::Value = serde_json::from_str(&jr).unwrap();
+        let jr_status = |id: i64| -> String {
+            v["result"]
+                .as_array()
+                .and_then(|a| a.iter().find(|e| e["NZBID"] == id))
+                .map(|e| {
+                    format!(
+                        "{} {}",
+                        e["Status"].as_str().unwrap_or(""),
+                        e["DeleteStatus"].as_str().unwrap_or("")
+                    )
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(jr_status(nzbid(&ids[0])), "DELETED/MANUAL MANUAL", "{jr}");
+        assert_eq!(jr_status(nzbid(&ids[1])), "DELETED/DUPE DUPE", "{jr}");
+        assert_eq!(jr_status(nzbid(&ids[2])), "", "{jr}");
+        assert_eq!(jr_status(nzbid(&ids[3])), "DELETED/MANUAL MANUAL", "{jr}");
+
+        // A filed row is a record, not a corpse: retry re-queues it from
+        // the spooled NZB, and the re-queued job is one pick_job will
+        // actually run (delete_status and tombstone both scrubbed).
+        let r = http(
+            port,
+            &format!("/api?mode=retry&value={}&output=json", ids[0]),
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "retrying a deleted row: {r}");
+        let q = http(port, "/api?mode=queue&output=json", None);
+        assert!(q.contains(&ids[0]), "the retried row must be back in the queue: {q}");
+        let h = http(port, "/api?mode=history&output=json", None);
+        assert!(
+            hslot(&h, &ids[0]).is_null(),
+            "the retried row must have left history: {h}"
+        );
+    })
+    .await
+    .unwrap();
+
+    drop(d);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

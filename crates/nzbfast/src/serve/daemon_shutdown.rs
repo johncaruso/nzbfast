@@ -44,6 +44,31 @@ pub(in crate::serve) const WIND_DOWN_BUDGET: std::time::Duration =
 pub(in crate::serve) const OFFLINE_PARK_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(60);
 
+/// How long the exit waits to get the index's write connection to
+/// itself before it gives up on closing the database.
+///
+/// Short on purpose. The index loops hold that mutex through whole
+/// synchronous SQLite passes - a catch-up ingest held it 62 s straight
+/// on 28 Jul - and the wind-down has four seconds for everything. A
+/// stop that arrives mid-ingest leaves the log for the next start,
+/// which is what every stop has always done; a stop that arrives at
+/// idle (the overwhelming majority: `docker stop`, the tray's Quit, a
+/// deploy) takes the mutex on the first try.
+#[cfg(feature = "indexer")]
+const INDEX_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long the truncating checkpoint waits for readers before it
+/// reports itself busy and leaves the log alone.
+///
+/// Same trade as above, one level down: TRUNCATE blocks until every
+/// reader has caught up to the latest snapshot, and a query handler
+/// that borrowed a read connection a moment before the signal is
+/// exactly such a reader. Whatever the checkpoint copied before giving
+/// up is copied - a busy answer costs the next start a shorter recovery,
+/// not a failed one.
+#[cfg(feature = "indexer")]
+const INDEX_CHECKPOINT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Stop cleanly and exit: park the transfer, persist the queue, and
 /// hand every open NNTP session back to the provider with a QUIT.
 ///
@@ -61,6 +86,11 @@ pub(in crate::serve) const OFFLINE_PARK_BUDGET: std::time::Duration =
 pub(in crate::serve) fn wind_down(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, reason: &str) {
     let started = Instant::now();
     info!(target: "shutdown", "{reason} - persisting queue and closing connections");
+    // Said first, because `index_db_wanted` reads it: from here on
+    // nothing lazily reopens the index database behind the close
+    // started below. Never cleared - every caller of this either exits
+    // or execs (`restart_in_place` exits if its exec fails).
+    d.exiting.store(true, Ordering::Relaxed);
     // Order matters. Pause first so nothing new is admitted while we are
     // tearing down, THEN wind the transfer down GRACEFULLY.
     //
@@ -77,6 +107,11 @@ pub(in crate::serve) fn wind_down(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, 
     d.paused.store(true, Ordering::Relaxed);
     d.suspend_active(true);
     d.save_queue();
+    // Off to its own thread NOW, to run alongside the connection drain
+    // below rather than after it: both are waits, and they share one
+    // budget. Nothing downstream depends on the index, and the index
+    // work touches nothing the fleet teardown touches.
+    let index_closed = close_index_in_background(d);
     // Now wait for the sessions themselves to go, because THAT is what
     // the provider is counting - not the job's state.
     //
@@ -139,6 +174,22 @@ pub(in crate::serve) fn wind_down(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, 
             .await
         });
     }
+    // Whatever is left of the budget, and never nothing: an idle
+    // daemon - the ordinary stop - reaches here with the drain already
+    // finished and the checkpoint already done or nearly so.
+    if let Some(done) = index_closed {
+        let left = WIND_DOWN_BUDGET.saturating_sub(started.elapsed());
+        if done
+            .recv_timeout(left.max(std::time::Duration::from_millis(250)))
+            .is_err()
+        {
+            info!(
+                target: "shutdown",
+                "the index did not close in time - its write-ahead log stays \
+                 for the next start to recover"
+            );
+        }
+    }
     info!(
         target: "shutdown",
         "wound down in {:.1}s",
@@ -147,6 +198,120 @@ pub(in crate::serve) fn wind_down(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, 
     // Flush the log tee's buffer along with stdout before the exit.
     use std::io::Write;
     let _ = std::io::stdout().flush();
+}
+
+/// Start closing the index database on a thread of its own, and hand
+/// back the channel that says it finished.
+///
+/// A thread rather than a step in the wind-down because the close is
+/// the one part of the exit that can block for an unbounded time: a
+/// truncating checkpoint copies whatever the log holds, and while the
+/// log is bounded now (`nzbkit::index::WAL_SIZE_LIMIT`), it was 28.1
+/// GiB on the live index a day before this was written. The caller
+/// waits for the budget it has and no longer; a checkpoint still
+/// running when the process goes is safe to lose - checkpointing is
+/// idempotent, and the frames stay in the log until they are durably in
+/// the database file, which is the same guarantee that makes a power
+/// cut survivable.
+///
+/// `None` in a build without the indexer: there is no database.
+#[cfg(feature = "indexer")]
+fn close_index_in_background(d: &Arc<Daemon>) -> Option<std::sync::mpsc::Receiver<()>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let d = d.clone();
+    let spawned = std::thread::Builder::new()
+        .name("index-close".into())
+        .spawn(move || {
+            close_index_for_exit(&d);
+            let _ = tx.send(());
+        })
+        .is_ok();
+    // A daemon that cannot spawn a thread still has to stop. The
+    // receiver would simply time out; say so once instead.
+    if !spawned {
+        info!(target: "shutdown", "cannot spawn the index-close thread - its write-ahead log stays");
+        return None;
+    }
+    Some(rx)
+}
+
+#[cfg(not(feature = "indexer"))]
+fn close_index_in_background(_d: &Arc<Daemon>) -> Option<std::sync::mpsc::Receiver<()>> {
+    None
+}
+
+/// Hand the index's write-ahead log back and close every connection to
+/// it that this daemon holds.
+///
+/// SQLite deletes the -wal and the -shm when the last connection to a
+/// WAL database closes, checkpointing on the way. The daemon never got
+/// that far: it exits through `std::process::exit` (SIGTERM, SIGINT,
+/// `mode=shutdown`) or through `exec` (`mode=restart`), and neither
+/// runs a destructor - so the connections were still open at exit,
+/// every time. Measured 14 Aug 2026 on the live daemon: SIGTERM, the
+/// process gone and the port free, and a 28.1 GiB `index.db-wal` and
+/// 6.9 MiB `index.db-shm` still on disk. The next start then paid a
+/// recovery pass over the whole log instead of opening a database that
+/// was already whole.
+///
+/// Every wait here is bounded and every failure is a shrug, because the
+/// thing being protected is the exit: leaving the log behind is the
+/// behaviour we have shipped since the beginning, and the next start
+/// recovers from it correctly. What must not happen is a stop that
+/// overruns - `docker stop` SIGKILLs at 10 s, and a `mode=restart`
+/// blocked here would never re-exec at all.
+#[cfg(feature = "indexer")]
+fn close_index_for_exit(d: &Arc<Daemon>) {
+    let started = Instant::now();
+    // The read-only pool first, and for two reasons: its idle
+    // connections close here, and a reader is exactly what makes a
+    // TRUNCATE checkpoint report busy. One lent out to a query running
+    // right now is retired by the generation stamp instead - this never
+    // waits on somebody's query.
+    d.drop_index_read();
+    // try_lock on a timer, never a blocking lock. See INDEX_LOCK_WAIT:
+    // this mutex is held for whole ingest passes, and the exit cannot
+    // afford to queue behind one. A POISONED mutex lands in the same
+    // place - try_lock reports it as an error, we run out the deadline
+    // and leave the database alone, which is the right answer for a
+    // connection whose last holder panicked mid-statement.
+    let deadline = Instant::now() + INDEX_LOCK_WAIT;
+    let taken = loop {
+        if let Ok(mut guard) = d.index.try_lock() {
+            // Out of the mutex, not merely borrowed: `exiting` already
+            // stops every path from reopening it, so the connection is
+            // ours to close.
+            break guard.take();
+        }
+        if Instant::now() >= deadline {
+            info!(
+                target: "shutdown",
+                "the index is busy - leaving its write-ahead log for the next start"
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // Never opened in this process (or already closed by a switch going
+    // off): there is nothing of ours to checkpoint.
+    let Some(ix) = taken else { return };
+    match ix.checkpoint_truncate(INDEX_CHECKPOINT_WAIT) {
+        Ok(true) => {}
+        Ok(false) => info!(
+            target: "shutdown",
+            "a reader still held the index - part of its write-ahead log stays"
+        ),
+        Err(e) => info!(target: "shutdown", "index checkpoint failed ({e}) - its log stays"),
+    }
+    // The close itself. With the pool retired above and no scan pass
+    // holding its own scratch connection, this is the LAST connection,
+    // and SQLite removes the -wal and the -shm as it goes.
+    drop(ix);
+    info!(
+        target: "shutdown",
+        "index closed in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
 }
 
 /// [`wind_down`], then go - and go whatever happens.
@@ -273,7 +438,10 @@ pub(in crate::serve) async fn wait_for_shutdown_signal() -> &'static str {
 /// minutes", SAB's set_pause). The timer only fires if no manual
 /// pause/resume happened in between (generation check).
 pub(in crate::serve) fn timed_pause(d: &Arc<Daemon>, mins: u64, graceful: bool) {
-    let was_paused = d.paused.swap(true, Ordering::Relaxed);
+    // Raise the flag and invalidate any pending auto-resume in one step
+    // (see `set_paused_cancel_timer`); `arm_pause_timer` below re-arms
+    // its own deadline under the same lock for the mins > 0 case.
+    let was_paused = set_paused_cancel_timer(d, true);
     // Every caller of this is a person or a client acting for one - the
     // scheduler pauses through `apply_action`, which claims the pause
     // for itself.
@@ -292,12 +460,7 @@ pub(in crate::serve) fn timed_pause(d: &Arc<Daemon>, mins: u64, graceful: bool) 
             },
         );
     }
-    if mins == 0 {
-        // Still bump the generation: a plain pause has to cancel any
-        // auto-resume a previous timed pause left pending.
-        d.pause_gen.fetch_add(1, Ordering::Relaxed);
-        *d.pause_until.lock_ok() = None;
-    } else {
+    if mins > 0 {
         arm_pause_timer(d, std::time::Duration::from_secs(mins * 60));
     }
     persist_pause(d);
@@ -310,19 +473,50 @@ pub(in crate::serve) fn timed_pause(d: &Arc<Daemon>, mins: u64, graceful: bool) 
 /// take a Duration - a pause with 90 seconds to go does not round to a
 /// whole number of minutes.
 pub(in crate::serve) fn arm_pause_timer(d: &Arc<Daemon>, dur: std::time::Duration) {
-    let my_gen = d.pause_gen.fetch_add(1, Ordering::Relaxed) + 1;
-    *d.pause_until.lock_ok() = Some(Instant::now() + dur);
+    let my_gen;
+    {
+        let mut until = d.pause_until.lock_ok();
+        my_gen = d.pause_gen.fetch_add(1, Ordering::Relaxed) + 1;
+        *until = Some(Instant::now() + dur);
+    }
     let d = d.clone();
     std::thread::spawn(move || {
         std::thread::sleep(dur);
-        if d.pause_gen.load(Ordering::Relaxed) == my_gen {
-            d.paused.store(false, Ordering::Relaxed);
-            *d.pause_until.lock_ok() = None;
+        // Check and clear under the SAME lock every pause/resume writer
+        // bumps the generation under (`set_paused_cancel_timer`). The
+        // bare check-then-store had a preemption-wide hole: a manual
+        // pause landing between the two bumped the generation too late
+        // and was immediately undone by this stale timer (14 Aug sweep).
+        let fired = {
+            let mut until = d.pause_until.lock_ok();
+            let live = d.pause_gen.load(Ordering::Relaxed) == my_gen;
+            if live {
+                d.paused.store(false, Ordering::Relaxed);
+                *until = None;
+            }
+            live
+        };
+        if fired {
             persist_pause(&d);
             info!(target: "pause", "timed pause over - resumed");
             d.note_event("resume", "timed pause over - downloads resumed");
         }
     });
+}
+
+/// Set or clear the pause flag, cancel any pending auto-resume deadline,
+/// and bump the timer generation - as ONE step with respect to the
+/// expiry thread, which makes its generation check and its store under
+/// this same `pause_until` lock. Writers that bumped the generation and
+/// wrote the flag as two bare atomics raced the thread's check-then-act
+/// window. Returns the previous flag value. Callers do their own
+/// `persist_pause` / events / wind-down outside the lock.
+pub(in crate::serve) fn set_paused_cancel_timer(d: &Daemon, paused: bool) -> bool {
+    let mut until = d.pause_until.lock_ok();
+    d.pause_gen.fetch_add(1, Ordering::Relaxed);
+    let was = d.paused.swap(paused, Ordering::Relaxed);
+    *until = None;
+    was
 }
 
 /// Record the queue's pause state so it survives a restart.

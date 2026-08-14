@@ -1000,7 +1000,7 @@ impl Extractor {
             let s = &inner.slots[slot];
             (
                 s.writer.clone(),
-                matches!(s.mode, SlotMode::RarFallback),
+                matches!(s.mode, SlotMode::RarFallback | SlotMode::Plain),
                 inner.materialized.clone(),
             )
         };
@@ -1018,6 +1018,16 @@ impl Extractor {
             // the positional M rewrites the already-identity fragments
             // to the new name. Root level only, like the hook install -
             // the journal records in the root's slot space.
+            //
+            // Plain slots need the same retarget (14 Aug sweep): their
+            // placements are identity-form by construction (file offset
+            // == volume offset, the slot's own file) but the S line and
+            // fragments carry the posted name, so after this rename a
+            // replay looked for the OLD file, found nothing, and
+            // refetched a complete verified payload. The M contract
+            // holds trivially for a plain write-through file; fragments
+            // placed after the rename still carry the creation-time name
+            // and refetch, which is the pre-existing post-M rule.
             if self.depth == 0
                 && materialized
                 && let Some(h) = hook

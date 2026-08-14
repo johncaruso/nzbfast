@@ -312,8 +312,13 @@ impl Daemon {
             self.history_compact();
         }
         // ...and the queue half of the resolution above, here because the
-        // id allocator is restored by now.
-        if migrating || !split.parked.is_empty() {
+        // id allocator is restored by now. `routed_any` belongs in this
+        // gate too: a routed terminal row that won under Q3 went to
+        // history above, and without a queue rewrite its stale copy
+        // stays in queue.json - where, after the user deletes the record
+        // from history and the daemon dies uncleanly, the next boot
+        // re-routes it and resurrects the deleted record (14 Aug sweep).
+        if migrating || routed_any || !split.parked.is_empty() {
             self.save_queue();
         }
         if migrating {

@@ -123,11 +123,13 @@ pub(crate) struct StreamHub {
     /// daemon drains it into the ledger at net-drain.
     pub oracle: std::sync::Mutex<Option<Arc<nzbkit::oracle::OracleSink>>>,
     /// M29 opt-in routing (`oracle_route`, OFF by default): when the
-    /// daemon installs a ledger snapshot here, get_with_progress drops
+    /// daemon installs a ledger snapshot here, get_with_progress DEMOTES
     /// any enabled server whose backbone is confidently GONE for this
-    /// release's (family, age-bucket) - saving the doomed primary
-    /// round-trips on takedown'd content. Never empties the pool, so a
-    /// wrong verdict costs only latency, never the last path.
+    /// release's (family, age-bucket) to the bottom of the level ladder,
+    /// so the doomed round-trips on takedown'd content are paid last
+    /// rather than first. Nothing leaves the pool, so a wrong verdict
+    /// costs only latency however many backbones it writes off. See
+    /// `get::plan::demote_predicted_gone` for why removal was wrong.
     pub route_gone: std::sync::Mutex<Option<nzbkit::oracle::Snapshot>>,
     /// "What is the pipeline doing right now", per owning nzo_id - the
     /// queue row's sub-line. Keyed rather than a single slot because job

@@ -2767,9 +2767,11 @@ async function openCard(k){
             <button class="act" ${r.complete?'':'disabled'} onclick="grab(${r.id},false)">${t('wall.download','Download')}</button>
           </td>
         </tr>`).join('')}
-      </tbody></table>${rels.length?'':`<div class="dim" style="padding:6px 2px 2px;font-size:12.5px">${t('wall.norel','No releases indexed for this title yet.')}</div>`}</div>`;
+      </tbody></table>${rels.length?'':`<div class="dim" style="padding:6px 2px 2px;font-size:12.5px">${t('wall.norel','No releases indexed for this title yet.')}</div>`}</div>
+    <div class="sesswrap" id="sesswrap"></div>`;
   sheetOpen();
   loadCredits(k);
+  loadSession(k);
 }
 function closeOvl(){
   // Retires any in-flight openCard so a late response cannot re-open the
@@ -2932,6 +2934,60 @@ async function loadCredits(k){
         <b>${esc(p.name)}</b>
         <span>${esc(p.character||roleLabel(p.role))}</span>
       </button>`).join('')}</div>`;
+}
+
+// Upload-session siblings (wall_session): posts that went up in the
+// same run as this title's newest releases - usually the rest of the
+// season under scrambled names. Same lazy pattern as loadCredits; the
+// rows are association evidence, so nothing here renames anything -
+// grabbing one lets the download pipeline prove the real name.
+let sessRows=[];
+function sessDt(s){
+  const a=Math.abs(s), v=a<5400?Math.max(1,Math.round(a/60))+'m':a<172800?Math.round(a/3600)+'h':Math.round(a/86400)+'d';
+  return (s<0?'-':'+')+v;
+}
+async function loadSession(k){
+  if(!document.getElementById('sesswrap')) return;
+  const j=await api('wall_session',`&key=${encodeURIComponent(k)}`);
+  if(openKey!==k) return;
+  const box=document.getElementById('sesswrap');
+  if(!box) return;
+  sessRows=(j.siblings||[]);
+  if(!sessRows.length){ box.innerHTML=''; return; }
+  const why={counter:t('wall.sess.link.counter','same counter sequence'),
+             poster:t('wall.sess.link.poster','same poster'),
+             tags:t('wall.sess.link.tags','same session tags'),
+             time:t('wall.sess.link.time','posted together')};
+  box.innerHTML=`<div class="rels"><h3>${t('wall.sess.title','From the same upload run')}</h3>
+    <div class="dim" style="font-size:12.5px;margin:2px 0 8px">${t('wall.sess.hint','These posts went up in the same run as this title\'s releases, so they are usually more of the same show under scrambled names. Nothing is renamed by this list; downloading one verifies its real name.')}</div>
+    <table><thead><tr><th>${t('wall.col.release','Release')}</th><th>${t('wall.col.size','Size')}</th><th>${t('wall.sess.why','Linked by')}</th><th></th><th style="text-align:end"></th></tr></thead>
+    <tbody>${sessRows.map(r=>`
+      <tr>
+        <td class="dim" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+            title="${esc(r.posted?r.posted:r.name)}">${esc(r.name)}</td>
+        <td class="mono">${gb(r.size||0)}</td>
+        <td class="dim" style="white-space:nowrap">${why[r.link]||esc(r.link)} <span class="mono">${sessDt(r.dt)}</span></td>
+        <td class="${r.complete?'ok':'warn'}">${r.complete?'✓ '+t('wall.complete','complete'):t('wall.partial','partial')}</td>
+        <td style="text-align:end"><button class="act" ${r.complete?'':'disabled'} onclick="grab(${r.id},false)">${t('wall.download','Download')}</button></td>
+      </tr>`).join('')}
+    </tbody></table>
+    <div style="margin-top:8px;text-align:end"><button class="act" onclick="sessGrabAll(this)">${t('wall.sess.graball','Grab everything complete')}</button></div></div>`;
+}
+async function sessGrabAll(btn){
+  const ids=sessRows.filter(r=>r.complete).map(r=>r.id);
+  if(!ids.length) return;
+  btn.disabled=true;
+  let ok=0, fail=0;
+  try{
+    for(const id of ids){
+      try{
+        const j=await api('index_get',`&id=${id}&priority=1`);
+        if(j.status) ok++; else fail++;
+      }catch(err){ fail++; }
+    }
+  } finally { btn.disabled=false; }
+  toast(tn('wall.sel.queued',ok,'{n} release queued','{n} releases queued')
+    +(fail?' · '+tn('wall.sel.fail',fail,'{n} failed','{n} failed'):''));
 }
 
 // The card to come back to when a person page was opened from one.

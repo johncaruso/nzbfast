@@ -4084,7 +4084,7 @@ async fn backfilled_spans_compose_crcs_under_a_tiny_budget() {
         "par2 create failed"
     );
     // Stall every par2-main article's first request: activation waits on
-    // the 2 s read-timeout + retry, by which time the payload has landed.
+    // the pre-byte floor + retry, by which time the payload has landed.
     let par2_ids: Vec<String> = fx
         .nzb_files
         .iter()
@@ -4146,7 +4146,7 @@ async fn pre_activation_spans_backfill_not_settle_readback() {
     fx.add_file("b.bin", &data, 60_000);
     assert!(fx.add_par2(10, &["b.bin"], 60_000), "par2 create failed");
     // Stall the FIRST request of every par2-main article: activation
-    // can't happen until the 2 s read-timeout fires and the retry lands -
+    // can't happen until the pre-byte floor fires and the retry lands -
     // by which time the whole 4 MB payload has arrived pre-activation.
     let par2_ids: Vec<String> = fx
         .nzb_files

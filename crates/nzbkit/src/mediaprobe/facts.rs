@@ -120,11 +120,25 @@ impl MediaFacts {
 /// by the format, not by the frame. A 2.39:1 film at 1920x800 is a
 /// "1080p" release and a 4:3 broadcast at 1024x576 is not a 720p one;
 /// only taking both dimensions gets those two right at once.
+///
+/// EXCEPT when the coded height already IS a standard height: a scope
+/// film scaled to a full 1080 rows keeps its width (2592x1080), and the
+/// width rule would promote it a bucket. A frame whose height sits on a
+/// standard is named by that height; the width rule exists only for
+/// crops, whose heights sit between standards.
 pub fn res_label(w: u32, h: u32) -> Option<String> {
     if w == 0 || h == 0 {
         return None;
     }
-    let eh = u64::from(h).max(u64::from(w) * 9 / 16);
+    // Codecs pad to macroblock multiples, so "is a standard height"
+    // tolerates the mod-16 spellings (1088 for 1080, 2176 for 2160).
+    const STANDARD: [u32; 8] = [2160, 1440, 1080, 720, 576, 480, 360, 240];
+    let standard = STANDARD.iter().any(|s| h.abs_diff(*s) <= 16);
+    let eh = if standard {
+        u64::from(h)
+    } else {
+        u64::from(h).max(u64::from(w) * 9 / 16)
+    };
     Some(
         match eh {
             1800.. => "2160p",
@@ -430,6 +444,13 @@ mod tests {
         assert_eq!(res_label(1440, 1080).as_deref(), Some("1080p"));
         assert_eq!(res_label(1280, 720).as_deref(), Some("720p"));
         assert_eq!(res_label(2560, 1440).as_deref(), Some("1440p"));
+        // Scope scaled by HEIGHT keeps a full 1080 rows and a width past
+        // 1920 - still a 1080p release, not a 1440p one (Gary's
+        // 2592x1080 SNW report, and every 21:9 "ultrawide 1080p").
+        assert_eq!(res_label(2592, 1080).as_deref(), Some("1080p"));
+        assert_eq!(res_label(2560, 1080).as_deref(), Some("1080p"));
+        // The mod-16 coded spelling of 1080 counts as 1080.
+        assert_eq!(res_label(2592, 1088).as_deref(), Some("1080p"));
         // A frame size the container did not state is not a resolution.
         assert_eq!(res_label(0, 1080), None);
         assert_eq!(res_label(1920, 0), None);

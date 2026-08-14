@@ -545,7 +545,19 @@ impl NzbFile {
             .filename_hint()
             .unwrap_or(&self.subject)
             .to_ascii_lowercase();
-        if !name.contains(".par2") {
+        // The name must END at ".par2" to be a PAR2 file at all - either
+        // there and then, or with the raw subject carrying on after
+        // whitespace (kind() falls back to the whole subject when
+        // nothing is quoted). A mere `contains` also caught payload
+        // whose name continues past the extension, so
+        // "extras.vol-10.par2-sample.mkv" was classified PAR2 rather
+        // than data. Same whitespace rule as `par2_vol_suffix`, for the
+        // same reason (14 Aug sweep).
+        let is_par2 = name.match_indices(".par2").any(|(i, _)| {
+            let rest = &name[i + ".par2".len()..];
+            rest.is_empty() || rest.starts_with(char::is_whitespace)
+        });
+        if !is_par2 {
             return FileKind::Data;
         }
         // Anything with .par2 that doesn't wear a recovery-volume
@@ -629,14 +641,19 @@ pub fn par2_vol_suffix(name: &str) -> Option<usize> {
     let tail = &after[end..];
     match tail.strip_prefix(".par2") {
         None if tail.is_empty() => Some(vol),
-        Some(t)
-            if !t
-                .as_bytes()
-                .first()
-                .is_some_and(|b| b.is_ascii_alphanumeric()) =>
-        {
-            Some(vol)
-        }
+        // WHITESPACE, not merely "not alphanumeric". The allowance
+        // exists because kind() falls back to the raw subject, where
+        // ".par2" is followed by " yEnc (1/2)" - and whitespace is
+        // exactly what ends a filename inside a subject. Accepting any
+        // non-alphanumeric byte also accepted a QUOTED filename that
+        // continues past .par2: "x.vol-10.par2.bak" and
+        // "extras.vol-10.par2-sample.mkv" classified as recovery
+        // volumes, and a volume never gets a download slot
+        // (get::plan.rs), so a real payload file listed in the NZB was
+        // silently never fetched and the job still reported complete
+        // (14 Aug sweep).
+        Some("") => Some(vol),
+        Some(t) if t.starts_with(char::is_whitespace) => Some(vol),
         _ => None,
     }
 }
@@ -1063,6 +1080,41 @@ POST]]></segment>
         assert_eq!(par2_vol_suffix("set.vol000+01.par2 yEnc (1/1)"), Some(3));
         assert_eq!(par2_vol_suffix("set.vol-01.par2 yEnc (1/1)"), Some(3));
         assert_eq!(par2_vol_suffix("set.par2 yEnc (1/1)"), None);
+        // ...but ONLY whitespace ends the name. A quoted filename that
+        // carries on past .par2 is a DATA file: classifying it as a
+        // volume costs it its download slot, and the job then completes
+        // without the payload it never fetched (14 Aug sweep).
+        assert_eq!(par2_vol_suffix("x.vol-10.par2.bak"), None);
+        assert_eq!(par2_vol_suffix("extras.vol-10.par2-sample.mkv"), None);
+        assert_eq!(par2_vol_suffix("set.vol000+01.par2.txt"), None);
+    }
+
+    /// The same rule where it actually decides a download: `kind()`.
+    #[test]
+    fn a_quoted_name_continuing_past_par2_stays_data() {
+        let file = |subject: &str| NzbFile {
+            subject: subject.to_string(),
+            ..Default::default()
+        };
+        // The genuine shapes still classify as they did.
+        assert_eq!(
+            file("Rel [2/3] - \"rel.vol-01.par2\" yEnc (1/1)").kind(),
+            FileKind::Par2Volume
+        );
+        assert_eq!(
+            file("Rel [1/3] - \"rel.par2\" yEnc (1/1)").kind(),
+            FileKind::Par2Main
+        );
+        // A quoted payload name that merely CONTAINS the pattern is data
+        // and must keep its slot.
+        assert_eq!(
+            file("Rel [3/3] - \"extras.vol-10.par2-sample.mkv\" yEnc (1/1)").kind(),
+            FileKind::Data
+        );
+        assert_eq!(
+            file("Rel [3/3] - \"rel.vol-10.par2.bak\" yEnc (1/1)").kind(),
+            FileKind::Data
+        );
     }
 
     #[test]

@@ -255,10 +255,8 @@ pub(super) fn apply_action(d: &Arc<Daemon>, a: SchedAction) {
             // Without the bump the older sleeper stayed authoritative:
             // "pause for 60 minutes" at 21:30 un-paused the queue at
             // 22:30, inside a 22:00 scheduled off window.
-            d.pause_gen.fetch_add(1, Ordering::Relaxed);
-            *d.pause_until.lock_ok() = None;
             let pause = a == SchedAction::Pause;
-            d.paused.store(pause, Ordering::Relaxed);
+            set_paused_cancel_timer(d, pause);
             // Claim it, so the header can say who decided and until when
             // instead of showing the same word a deliberate pause gets.
             *d.pause_source.lock_ok() = "schedule";

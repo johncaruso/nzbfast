@@ -1671,17 +1671,15 @@ pub(crate) fn release_stem(name: &str) -> String {
     };
     // .par2 first (may wrap .volNN+MM)
     end = cut(&lower, end, &|s| s.strip_suffix(".par2").map(|r| r.len()));
-    end = cut(&lower, end, &|s| {
-        // .volNNN+MM / range-style .volNNN-MMM
-        let vol = s.rfind(".vol")?;
-        let tail = &s[vol + 4..];
-        let (a, b) = tail.split_once(['+', '-'])?;
-        (!a.is_empty()
-            && a.bytes().all(|c| c.is_ascii_digit())
-            && !b.is_empty()
-            && b.bytes().all(|c| c.is_ascii_digit()))
-        .then_some(vol)
-    });
+    // .volNNN+MM, range-style .volNNN-MMM, and the bare ordinal
+    // .vol-NN - the SHARED rule, the same one kind() and
+    // extract::release_stem ask. This was a third private spelling that
+    // demanded digits before the separator, so a `.vol-NN.par2` post
+    // stemmed its volumes to `Rel.vol-01` while its main and data
+    // stemmed to `Rel`: make_release_nzb below then never saw main,
+    // volume and data in one release map and reported "no complete
+    // release with par2 found" on a complete post (14 Aug sweep).
+    end = cut(&lower, end, &nzbkit::nzb::par2_vol_suffix);
     end = cut(&lower, end, &|s| s.strip_suffix(".rar").map(|r| r.len()));
     end = cut(&lower, end, &|s| {
         // .partNNN
@@ -1933,6 +1931,37 @@ pub(crate) fn xml_escape(s: &str) -> String {
 mod scan_pass_tests {
     use super::*;
     use std::time::Duration;
+
+    /// 14 Aug sweep: this file kept a THIRD private spelling of the
+    /// "is it a recovery volume?" rule, demanding digits before the
+    /// separator. `make_release_nzb` groups by this stem, so on a
+    /// `.vol-NN.par2` post the volumes stemmed to `Rel.vol-01` while
+    /// main and data stemmed to `Rel` - no group ever held all three,
+    /// and a complete post finished "no complete release with par2
+    /// found". Every volume shape must reduce to the same stem.
+    #[test]
+    fn every_par2_volume_shape_shares_the_release_stem() {
+        for n in [
+            "Rel.par2",
+            "Rel.vol000+01.par2",
+            "Rel.vol127-199.par2",
+            // The bare ordinal - the shape that was missed.
+            "Rel.vol-01.par2",
+            "Rel.vol-09.par2",
+            "Rel.part01.rar",
+            "Rel.rar",
+            "Rel.r00",
+        ] {
+            assert_eq!(release_stem(n), "Rel", "{n} must stem to the release");
+        }
+        // The negatives the shared rule protects: a spelt-out "volume"
+        // and a compilation numbered Vol-3 name releases, not volumes.
+        assert_eq!(release_stem("Rel.volume-2.par2"), "Rel.volume-2");
+        assert_eq!(
+            release_stem("VA.Best.Hits.Vol-3.par2"),
+            "VA.Best.Hits.Vol-3"
+        );
+    }
 
     fn tmp_index(tag: &str) -> (PathBuf, nzbkit::index::Index) {
         let dir =

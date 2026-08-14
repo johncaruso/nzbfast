@@ -203,27 +203,44 @@ fn m_corr_confirm_stats(
     _api_body: &mut Option<Vec<u8>>,
 ) -> Option<Value> {
     let today = (epoch_secs() as i64).div_euclid(86_400);
+    // The picker deliberately keeps a vanished account listed so the
+    // box shows the truth, which means the card needs the daemon's live
+    // verdict alongside the string.
+    let source = d.corr_confirm_source.lock_ok().clone();
+    let source_state = d.corr_confirm_source_state();
+    // index_read_checked, not with_index_read: a saturated read pool
+    // must report busy, or known-nonzero fold totals and daily spend
+    // render as exact zeroes until the next poll.
+    let census = d.index_read_checked(|ix| {
+        // Read-only view of the day budget: a stale day reads as 0
+        // spent, the reset itself belongs to the lane.
+        let day: i64 = ix
+            .kv_get("corr_confirm_day")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let spent = if day == today {
+            ix.kv_get("corr_confirm_spent")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        Some((spent, ix.shatter_fold_stats()))
+    });
+    let (busy, spent_today, fold) = match census {
+        Ok(Some((spent, fold))) => (false, Some(spent), Some(fold)),
+        Ok(None) => (false, None, None),
+        Err(_) => (true, None, None),
+    };
     Some(json!({
         "index_enabled": d.index_enabled.load(Ordering::Relaxed),
         "enabled": d.corr_confirm_enabled.load(Ordering::Relaxed),
-        "source": d.corr_confirm_source.lock_ok().clone(),
+        "source": source,
+        "source_state": source_state,
         "per_day": crate::serve::tasks::CONFIRM_PER_DAY,
-        // Read-only view of the day budget: a stale day reads as 0
-        // spent, the reset itself belongs to the lane.
-        "spent_today": d.with_index_read(|ix| {
-            let day: i64 = ix
-                .kv_get("corr_confirm_day")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            Some(if day == today {
-                ix.kv_get("corr_confirm_spent")
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .unwrap_or(0)
-            } else {
-                0
-            })
-        }),
-        "fold": d.with_index_read(|ix| Some(ix.shatter_fold_stats())),
+        "busy": busy,
+        "spent_today": spent_today,
+        "fold": fold,
     }))
 }
 
@@ -2116,7 +2133,8 @@ fn m_rar_name(
                 let (mut conn, _) = nzbkit::nntp::Connection::connect(&server)
                     .await
                     .map_err(|e| e.to_string())?;
-                let r = super::super::tasks::run_rar_probe(&mut conn, &files)
+                let mut spent = (0u64, 0u64);
+                let r = super::super::tasks::run_rar_probe(&mut conn, &files, &mut spent)
                     .await
                     .map_err(|e| e.to_string());
                 conn.quit().await;
@@ -2220,7 +2238,17 @@ fn m_spot_grab(
                         // chunk ids in sx.nzb_segments are useless
                         // downstream: they never appear in any
                         // content group.
-                        d.with_index(|ix| {
+                        //
+                        // try_with_index, not with_index: this is a
+                        // best-effort cache line - the scan loop sets
+                        // the same column from its own spot fetch
+                        // (scan.rs) and the result is discarded here -
+                        // and it sits directly in front of `enqueue`
+                        // on the user's Grab click. Parking for a tip
+                        // ingest's whole transaction (~80 s measured
+                        // 14 Aug 2026) would delay the grab itself to
+                        // write a column nothing is waiting on.
+                        d.try_with_index(|ix| {
                             ix.set_spot_nzb(&spot.msgid, &nzbkit::spot::payload_msgids(&nzb))
                                 .ok()
                         });

@@ -194,9 +194,9 @@ impl OracleSink {
         c.entry((si, age_bucket(age_days))).or_insert((0, 0)).1 += 1;
     }
 
-    /// Empty the accumulator into ingest-ready samples. Counts recorded
-    /// for a server index the context never named are dropped (can't
-    /// attribute them).
+    /// Empty the accumulator into ingest-ready samples, each clamped to
+    /// [`JOB_SAMPLE_WEIGHT`]. Counts recorded for a server index the
+    /// context never named are dropped (can't attribute them).
     pub fn drain(&self) -> Vec<Sample> {
         let servers = self.servers.lock_ok().clone();
         let family = self.family.lock_ok().clone();
@@ -205,6 +205,15 @@ impl OracleSink {
             .into_iter()
             .filter_map(|((si, bucket), (hits, misses))| {
                 let host = servers.get(si)?.clone();
+                // ONE job contributes one bounded observation per cell,
+                // not one per article. A release's articles are not
+                // independent trials - they live or die together - so
+                // feeding 15,000 raw 430s into a Wilson interval that
+                // assumes independence is a category error, and it is
+                // what let two doomed postings drive (omicron, hdtv,
+                // 7-30d) to a 0.05 upper bound while 12 other releases
+                // in that same cell were 36/36 available.
+                let (hits, misses) = clamp_weight(hits, misses, JOB_SAMPLE_WEIGHT);
                 Some(Sample {
                     host,
                     family: family.clone(),
@@ -219,7 +228,37 @@ impl OracleSink {
     }
 }
 
-/// Create the ledger table (idempotent; called from `Index::open`).
+/// Evidence weight one download contributes to a single (server, age
+/// bucket) cell, whatever its article count.
+///
+/// 5 is exactly the idle STAT sampler's per-release budget -
+/// `ceil(oracle_sample / 60)` at the default 300/hour, see
+/// `spawn_oracle_sampler` in the daemon. That equality is the point.
+/// Article-counted, a single 15,000-segment download outweighed one
+/// sampler probe by roughly 3,000:1, so the sampler - the ONLY evidence
+/// source that can reach a server routing has stopped dialing - could
+/// never correct a cell the download path had poisoned. Weighted the
+/// same, the two sources are commensurable and [`MIN_SAMPLES`] means
+/// about a dozen distinct postings, which is what it reads like.
+pub const JOB_SAMPLE_WEIGHT: u64 = 5;
+
+/// Scale `(hits, misses)` down to `weight` total samples, preserving
+/// the ratio: hits round half-up, misses take the remainder. Totals
+/// already at or under `weight` pass through untouched, so an all-miss
+/// cell stays all-miss and an all-hit cell stays all-hit.
+fn clamp_weight(hits: u64, misses: u64, weight: u64) -> (u64, u64) {
+    let n = hits + misses;
+    if weight == 0 || n <= weight {
+        return (hits, misses);
+    }
+    // u128 so the product cannot wrap on an absurd count; the result is
+    // bounded by `weight`, so the cast back is lossless.
+    let h = ((hits as u128 * weight as u128 + (n as u128) / 2) / n as u128) as u64;
+    (h, weight - h)
+}
+
+/// Create the ledger table and run its one-shot rescale (idempotent;
+/// called from `Index::open`).
 #[cfg(feature = "indexer")]
 pub fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(
@@ -230,8 +269,64 @@ pub fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
             hits INTEGER NOT NULL DEFAULT 0,
             misses INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY(backbone, family, bucket));",
-    )
+            PRIMARY KEY(backbone, family, bucket));
+         -- The index's own schema creates this first on every real
+         -- open; repeated here (same definition, IF NOT EXISTS, so a
+         -- no-op there) only so the ledger's migration flag has a home
+         -- when this module is handed a bare connection.
+         CREATE TABLE IF NOT EXISTS kv(
+            k TEXT PRIMARY KEY,
+            v TEXT NOT NULL);",
+    )?;
+    rescale_article_counts(db);
+    Ok(())
+}
+
+/// One-shot migration off article-counted evidence.
+///
+/// Cells written before [`JOB_SAMPLE_WEIGHT`] counted ARTICLES, so a
+/// handful of doomed releases - re-counted on every retry - could bury
+/// a cell under tens of thousands of correlated misses and hold it
+/// confidently red forever. Those counts cannot be converted into
+/// release samples (the release identity was never recorded), but
+/// wiping the table would throw away real signal too.
+///
+/// So scale every cell proportionally down to [`MIN_SAMPLES`] - 1,
+/// ratio preserved. Every cell lands just under the evidence bar, which
+/// means `backbone_gone` and `carry_rate` stop consulting them the
+/// moment this runs, while the ledger keeps its lean for the wall's
+/// amber. A dozen fresh release-weighted samples then confirm or refute
+/// each cell - at the sampler's one release a minute, days for the
+/// cells that matter, not the 11 days of pure sampler budget it would
+/// have taken to out-vote 57,000 articles.
+///
+/// Non-fatal and self-healing like the index's other migrations: if the
+/// flag write is lost the UPDATE re-runs, and its `WHERE` skips every
+/// cell already at or under the target.
+#[cfg(feature = "indexer")]
+fn rescale_article_counts(db: &Connection) {
+    const FLAG: &str = "oracle_release_weight_v1";
+    let done = db
+        .query_row("SELECT 1 FROM kv WHERE k=?1", [FLAG], |_| Ok(()))
+        .is_ok();
+    if done {
+        return;
+    }
+    // `target` is at least 1 and the WHERE keeps the divisor above it,
+    // so neither division can be by zero. SQLite evaluates every SET
+    // expression against the row's ORIGINAL values, so `misses` reads
+    // the pre-update `hits`.
+    let target = (MIN_SAMPLES - 1) as i64;
+    let rescaled = db.execute(
+        "UPDATE oracle
+            SET hits   = (hits * ?1 + (hits + misses) / 2) / (hits + misses),
+                misses = ?1 - (hits * ?1 + (hits + misses) / 2) / (hits + misses)
+          WHERE hits + misses > ?1",
+        [target],
+    );
+    if rescaled.is_ok() {
+        let _ = db.execute("INSERT OR REPLACE INTO kv(k, v) VALUES(?1, '1')", [FLAG]);
+    }
 }
 
 /// Fold a batch of samples into the ledger (one transaction).
@@ -395,11 +490,11 @@ impl Snapshot {
     /// upper ≤ [`RED_HIGH`], ≥ [`MIN_SAMPLES`] samples).
     ///
     /// Deliberately NOT the cross-family aggregate fallback `verdict` may
-    /// use: routing must never skip a server for a family it might still
-    /// carry just because a *different* family is being reaped on that
-    /// backbone. A blind spot (thin exact cell) is never "gone" - it is
-    /// kept. Powers the daemon's `oracle_route` short-circuit of
-    /// known-doomed primary attempts.
+    /// use: routing must never write off a server for a family it might
+    /// still carry just because a *different* family is being reaped on
+    /// that backbone. A blind spot (thin exact cell) is never "gone" - it
+    /// is kept. Powers the daemon's `oracle_route` demotion of
+    /// known-doomed primary attempts to the end of the level ladder.
     pub fn backbone_gone(&self, backbone: &str, family: &str, age_days: u32) -> bool {
         let bucket = age_bucket(age_days);
         let fam = {
@@ -435,6 +530,25 @@ impl Snapshot {
             return None;
         }
         Some(h as f64 / n as f64)
+    }
+
+    /// Raw (hits, misses) of one EXACT cell, no thresholds applied.
+    /// Diagnostics only: the scoreboard prints the counts a verdict was
+    /// computed from, because the M29 failure mode is a cell whose
+    /// counts are enormous and correlated, which no rate can show.
+    pub fn cell(&self, backbone: &str, family: &str, bucket: u8) -> Option<(u64, u64)> {
+        self.cells
+            .get(&(backbone.to_string(), family.to_string(), bucket))
+            .copied()
+    }
+
+    /// Every cell as (backbone, family, bucket, hits, misses). The
+    /// ledger is tiny by construction, so the scoreboard enumerates it
+    /// to find the cells routing actually has evidence in.
+    pub fn iter_cells(&self) -> impl Iterator<Item = (&str, &str, u8, u64, u64)> {
+        self.cells
+            .iter()
+            .map(|((b, f, k), (h, m))| (b.as_str(), f.as_str(), *k, *h, *m))
     }
 
     /// Predicted verdict for a release in `family`, `age_days` old, given
@@ -480,16 +594,24 @@ impl Snapshot {
 }
 
 /// Minimum samples in a cell before it counts as evidence.
-const MIN_SAMPLES: u64 = 12;
+///
+/// Public so the backtest scoreboard (`nzbfast oracle-backtest`) can
+/// print the thresholds a run was measured against: these three numbers
+/// ARE the tuning surface, and none of them moves without a run of it.
+pub const MIN_SAMPLES: u64 = 12;
 /// Green requires the Wilson 95% lower bound of the best backbone's
 /// hit-rate at or above this (the M29 gate wants ≥95% green precision).
-const GREEN_LOW: f64 = 0.95;
+pub const GREEN_LOW: f64 = 0.95;
 /// Red requires the Wilson upper bound of the BEST backbone at or below
 /// this - confidently gone everywhere the user can reach.
-const RED_HIGH: f64 = 0.60;
+pub const RED_HIGH: f64 = 0.60;
 
 /// Wilson 95% score interval for `hits` successes in `n` trials.
-fn wilson(hits: u64, n: u64) -> (f64, f64) {
+///
+/// Public for the backtest scoreboard: a cell's verdict is the interval,
+/// not the point estimate, so a report that printed only hits/(hits+m)
+/// would not show why a cell was called red.
+pub fn wilson(hits: u64, n: u64) -> (f64, f64) {
     if n == 0 {
         return (0.0, 1.0);
     }
@@ -636,6 +758,168 @@ mod tests {
         );
         // Drain empties.
         assert!(sink.drain().is_empty());
+    }
+
+    /// A real download is thousands of correlated articles, not
+    /// thousands of independent trials: whatever its size, one job
+    /// contributes at most [`JOB_SAMPLE_WEIGHT`] to a cell, and the
+    /// hit/miss ratio it measured survives the clamp.
+    #[test]
+    fn drain_bounds_one_job_to_a_release_sized_sample() {
+        let sink = OracleSink::default();
+        sink.set_context(vec!["news.eweka.nl".into()], "hdtv".into());
+        // The shape that poisoned (omicron, hdtv, 7-30d): a 15,000
+        // segment posting that is simply gone from this backbone.
+        for _ in 0..15_000 {
+            sink.miss(0, 20);
+        }
+        let s = sink.drain();
+        assert_eq!(s.len(), 1);
+        assert_eq!(
+            (s[0].hits, s[0].misses),
+            (0, JOB_SAMPLE_WEIGHT),
+            "a wholly-missing release is one all-miss sample, not 15,000"
+        );
+
+        // A three-quarters-carried release keeps its ratio.
+        let sink = OracleSink::default();
+        sink.set_context(vec!["news.eweka.nl".into()], "hdtv".into());
+        for _ in 0..9_000 {
+            sink.hit(0, 20);
+        }
+        for _ in 0..3_000 {
+            sink.miss(0, 20);
+        }
+        let s = sink.drain();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].hits + s[0].misses, JOB_SAMPLE_WEIGHT);
+        assert_eq!(
+            (s[0].hits, s[0].misses),
+            (4, 1),
+            "0.75 of 5 rounds to 4 hits, not to a wiped-out miss"
+        );
+
+        // Ten thousand articles across two buckets are TWO cells, each
+        // separately bounded - the clamp is per cell, as ingest is.
+        let sink = OracleSink::default();
+        sink.set_context(vec!["news.eweka.nl".into()], "hdtv".into());
+        for _ in 0..5_000 {
+            sink.hit(0, 3); // bucket 1
+            sink.miss(0, 20); // bucket 2
+        }
+        let s = sink.drain();
+        assert_eq!(s.len(), 2);
+        assert!(s.iter().all(|x| x.hits + x.misses == JOB_SAMPLE_WEIGHT));
+
+        // A cell under the weight is untouched - the sampler's own
+        // 5-STAT probes must pass through exactly as measured.
+        let sink = OracleSink::default();
+        sink.set_context(vec!["news.eweka.nl".into()], "hdtv".into());
+        sink.hit(0, 20);
+        sink.miss(0, 20);
+        let s = sink.drain();
+        assert_eq!((s[0].hits, s[0].misses), (1, 1));
+    }
+
+    /// The clamp's edges: it never invents evidence in either
+    /// direction, and never exceeds the weight.
+    #[test]
+    fn clamp_weight_edges() {
+        assert_eq!(clamp_weight(0, 0, 5), (0, 0));
+        assert_eq!(clamp_weight(3, 1, 5), (3, 1)); // under weight, verbatim
+        assert_eq!(clamp_weight(0, 99_999, 5), (0, 5)); // all miss stays all miss
+        assert_eq!(clamp_weight(99_999, 0, 5), (5, 0)); // all hit stays all hit
+        assert_eq!(clamp_weight(50, 50, 5), (3, 2)); // half rounds up
+        // A vanishing minority rounds away, but only to the side it was
+        // already on - it can never flip the cell's lean.
+        assert_eq!(clamp_weight(1, 99_999, 5), (0, 5));
+        assert_eq!(clamp_weight(99_999, 1, 5), (5, 0));
+        // Absurd counts do not wrap, and weight 0 is a no-op guard.
+        assert_eq!(clamp_weight(u64::MAX / 2, u64::MAX / 2, 5), (3, 2));
+        assert_eq!(clamp_weight(7, 7, 0), (7, 7));
+    }
+
+    /// The migration off article-counted cells: every pre-existing cell
+    /// must land under the evidence bar (so routing stops consulting it
+    /// at once), keep the lean it was measured with, and run once.
+    #[cfg(feature = "indexer")]
+    #[test]
+    fn rescale_drops_legacy_cells_under_the_evidence_bar() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+        // Seed AROUND the migration flag ensure_schema just set, as an
+        // upgrade from the article-counted era would have on disk.
+        db.execute("DELETE FROM kv WHERE k='oracle_release_weight_v1'", [])
+            .unwrap();
+        let seed = |bb: &str, fam: &str, bucket: u8, h: i64, m: i64| {
+            db.execute(
+                "INSERT INTO oracle(backbone, family, bucket, hits, misses, updated_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, 1)",
+                rusqlite::params![bb, fam, bucket, h, m],
+            )
+            .unwrap();
+        };
+        // The measured live cell that started this: 2871/57071 on
+        // (omicron, hdtv, 7-30d), Wilson upper 0.0496 - two releases.
+        seed("omicron", "hdtv", 2, 2871, 57071);
+        // A wholly-missing cell, a healthy cell, and one already thin.
+        seed("giganews", "hdtv", 2, 0, 15_263);
+        seed("xsnews", "moovee", 0, 3205, 0);
+        seed("abavia", "teevee", 1, 2, 1);
+
+        ensure_schema(&db).unwrap();
+        let snap = Snapshot::load(&db).unwrap();
+        let cell = |bb: &str, fam: &str, b: u8| {
+            *snap
+                .cells
+                .get(&(bb.to_string(), fam.to_string(), b))
+                .expect("cell survives the migration")
+        };
+
+        // NOTHING is above the bar any more, so backbone_gone and
+        // carry_rate go quiet on every migrated cell.
+        for ((bb, fam, b), (h, m)) in &snap.cells {
+            assert!(
+                h + m < MIN_SAMPLES,
+                "({bb},{fam},{b}) = {h}/{m} still counts as evidence"
+            );
+        }
+        assert!(!snap.backbone_gone("omicron", "hdtv", 20));
+        assert!(!snap.backbone_gone("giganews", "hdtv", 20));
+        assert_eq!(snap.carry_rate("omicron", "hdtv", 2), None);
+
+        // The lean survives: a miss-dominated cell stays miss-leaning,
+        // a 100%-miss cell stays 100% miss, a clean cell stays clean.
+        let (h, m) = cell("omicron", "hdtv", 2);
+        assert!(m > h, "{h}/{m} lost the miss lean it was measured with");
+        assert_eq!(cell("giganews", "hdtv", 2), (0, 11));
+        assert_eq!(cell("xsnews", "moovee", 0), (11, 0));
+        // Already under the target - untouched, not inflated to 11.
+        assert_eq!(cell("abavia", "teevee", 1), (2, 1));
+
+        // One-shot: fresh post-migration evidence is NOT re-squashed by
+        // a later open.
+        let s = |host: &str, hits, misses| Sample {
+            host: host.into(),
+            family: "hdtv".into(),
+            bucket: 2,
+            hits,
+            misses,
+        };
+        for _ in 0..4 {
+            ingest(&db, &[s("news.eweka.nl", 4, 1)], 300).unwrap();
+        }
+        ensure_schema(&db).unwrap();
+        let snap = Snapshot::load(&db).unwrap();
+        let (h, m) = *snap
+            .cells
+            .get(&("omicron".into(), "hdtv".into(), 2))
+            .unwrap();
+        assert_eq!(
+            h + m,
+            11 + 20,
+            "the migration must not re-run over new release-weighted evidence"
+        );
     }
 
     #[cfg(feature = "indexer")]

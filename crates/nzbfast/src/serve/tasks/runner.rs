@@ -525,14 +525,32 @@ pub(super) fn reset_hub_for_job(
     *d.hub.oracle.lock_ok() = Some(Arc::new(nzbkit::oracle::OracleSink::default()));
     // M29 opt-in routing: install a ledger snapshot for this
     // job only when `oracle_route` is on, so get_with_progress
-    // can skip providers confidently gone for the release's
-    // (family, age-bucket). Off → cleared, so a plain job never
-    // consults it. A wrong verdict costs only latency (the
-    // engine never removes the last usable provider).
+    // can DEMOTE providers confidently gone for the release's
+    // (family, age-bucket) to the bottom of the level ladder.
+    // Off → cleared, so a plain job never consults it. A wrong
+    // verdict costs only latency, and that is now literally
+    // true: no server is removed, so however many backbones the
+    // ledger writes off (it wrote off 5 of 6 on 14 Aug 2026),
+    // each demoted one still gets every article once the
+    // undemoted servers have 430'd it.
+    //
+    // Read-only path, never `with_index`: this is the LAST thing
+    // between a queued job and its first byte, and the write
+    // mutex is held for a tip pass's whole ingest transaction.
+    // Measured 14 Aug 2026: an NZB dropped in the watch folder
+    // mid-pass sat 40 s here - queued and durable at 16:13:43,
+    // first byte at 16:14:23, the exact second the pass logged
+    // its headers - because the runner's 1 s poll had nothing to
+    // acquire. That is the same starvation the `with_index`
+    // comment records at 38 s on 5 Aug; demoting the call off
+    // the async workers never addressed the mutex wait itself.
+    // A saturated read pool answers None, which is precisely the
+    // `oracle_route` off case above: routing is an optimisation
+    // and skipping it costs latency, never correctness.
     #[cfg(feature = "indexer")]
     {
         *d.hub.route_gone.lock_ok() = if d.oracle_route.load(Ordering::Relaxed) {
-            d.with_index(|ix| ix.oracle_snapshot().ok())
+            d.with_index_read(|ix| ix.oracle_snapshot().ok())
         } else {
             None
         };

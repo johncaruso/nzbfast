@@ -1156,6 +1156,7 @@ impl SlotState {
         let files = &active.set.files;
         let mut claimed = active.claimed.lock_ok();
 
+        let mut name_ambiguous = false;
         if let Some(name) = &self.name {
             // EXACT first, across the whole set, before any approximate
             // tier is allowed to claim. One first-hit loop over the
@@ -1189,6 +1190,7 @@ impl SlotState {
                 if it.next().is_none() {
                     first.map(|(fi, _)| fi)
                 } else {
+                    name_ambiguous = true;
                     None
                 }
             });
@@ -1220,8 +1222,12 @@ impl SlotState {
                 }
             }
             // Head is complete and matched nothing: if the name also failed,
-            // this slot will never match (nfo/sfv/sample files).
-            if self.name.is_some() {
+            // this slot will never match (nfo/sfv/sample files). NOT when the
+            // name tier declined on ambiguity - those candidates are real, and
+            // a later claim by the twin slot makes the approximate match
+            // unique. Latching here froze the slot forever and downgraded a
+            // patchable file to wholly-missing (found by the 14 Aug sweep).
+            if self.name.is_some() && !name_ambiguous {
                 self.unmatchable = true;
             }
         }
@@ -1823,6 +1829,34 @@ mod tests {
             "content, not descriptor order, must decide the ambiguous claim"
         );
         assert!(r.all_ok(), "{r:?}");
+    }
+
+    /// 14 Aug sweep: an AMBIGUOUS name decline must not latch the slot
+    /// unmatchable. Slot 0's sanitized name matches two descriptors and
+    /// its head matches neither (damage inside the first 16k), so both
+    /// tiers decline - but the candidates are real, and once the twin
+    /// slot claims its descriptor by exact name the ambiguity resolves
+    /// to unique. The latch froze the slot forever and downgraded a
+    /// patchable file to wholly-missing.
+    #[test]
+    fn ambiguous_decline_stays_retryable_until_twin_resolves_it() {
+        let a = data_of(3000, 25);
+        let b = data_of(3000, 26);
+        let corrupt = data_of(3000, 27); // head matches neither descriptor
+        let (v, _set) = active_verifier(&[("a/b.txt", &a), ("a\\b.txt", &b)], 1024);
+        // Slot 0: ambiguous name, corrupt head - both tiers decline.
+        v.on_data(0, "a_b.txt", 3000, 0, &corrupt);
+        assert!(!v.slot_in_set(0), "nothing claimable yet");
+        // Slot 1 claims a/b.txt by exact name, making slot 0's
+        // approximate match unique.
+        v.on_data(1, "a/b.txt", 3000, 0, &a);
+        assert!(v.slot_in_set(1));
+        // Slot 0's next span retries the match and must now claim.
+        v.on_data(0, "a_b.txt", 3000, 0, &corrupt);
+        assert!(
+            v.slot_in_set(0),
+            "ambiguity resolved by the twin's claim - the slot must not stay latched unmatchable"
+        );
     }
 
     /// A slot whose name AND head both match nothing (nfo/sfv/sample)

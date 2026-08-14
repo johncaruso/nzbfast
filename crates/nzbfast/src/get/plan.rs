@@ -290,6 +290,61 @@ pub(super) struct Intake {
     pub(super) resume_vols: HashMap<usize, PathBuf>,
 }
 
+/// M29 routing: sink every predicted-gone server to one tier below the
+/// config's deepest level, so it is asked only after every server the
+/// ledger has NOT written off has already 430'd the article.
+///
+/// Demotion, not removal (14 Aug 2026). Removal made a wrong verdict cost
+/// the download: a Star Trek job lost 4 of its 6 providers and died with
+/// "5019 of 14986 segment(s) never arrived", while direct STAT showed 12
+/// other releases in the very same (hdtv, bucket 2) cell were 36/36
+/// available on five of those providers - a ~92% false-skip rate, because
+/// the ledger counts ARTICLES and one doomed release supplies ~15,000
+/// perfectly correlated ones. A level bump buys back two properties:
+///
+/// - A wrong verdict costs only latency again. `required_mask`
+///   (nzbkit::pool) hands a level-N server the article once every live
+///   lower-level server has missed it, so nothing becomes unreachable.
+/// - The red cell can heal. `OracleSink` binds to the POOL's servers
+///   (see fleet.rs), so a REMOVED server recorded neither hits nor
+///   misses: the only healer left was the idle STAT sampler at 5
+///   STAT/min/server, needing ~82,000 hits to clear one poisoned cell.
+///   A demoted server keeps recording, and real download traffic drains
+///   the absorbing state for free.
+///
+/// The accepted cost is the pipelined 430s the skip used to avoid on
+/// genuinely doomed content, now paid at the end of the ladder.
+///
+/// There is deliberately no "only if at least one server survives" guard.
+/// It counted SERVERS while verdicts are per BACKBONE - 3 omicron mirrors
+/// plus 1 xsnews passes it and drops 3 of 4 - and it is redundant here:
+/// if every server is predicted gone they all land on the SAME new level,
+/// every `required_mask` is empty, and the run is exactly what it would
+/// have been with no verdict at all.
+fn demote_predicted_gone(servers: &mut [ServerConfig], gone: &[String], family: &str, age: u32) {
+    if gone.is_empty() {
+        return;
+    }
+    // Computed over ALL servers before any mutation, so a config that
+    // already has fill tiers keeps them strictly ahead of the demoted set.
+    let Some(sunk) = servers
+        .iter()
+        .map(|s| s.level)
+        .max()
+        .map(|m| m.saturating_add(1))
+    else {
+        return;
+    };
+    for s in servers.iter_mut().filter(|s| gone.contains(&s.host)) {
+        info!(
+            target: "oracle",
+            "{} predicted gone for {family} (age {age}d) - demoted to level {sunk}, it is asked only after every other server has missed",
+            s.host
+        );
+        s.level = sunk;
+    }
+}
+
 pub(super) fn build_intake(
     config: &Path,
     nzb_path: &Path,
@@ -389,13 +444,12 @@ pub(super) fn build_intake(
         .max();
 
     // M29 opt-in routing (`oracle_route`, OFF unless the daemon installed
-    // a snapshot): drop enabled servers whose backbone the availability
+    // a snapshot): DEMOTE enabled servers whose backbone the availability
     // ledger is confident is GONE for this release's (family, age-bucket),
-    // saving the doomed primary round-trips on takedown'd content. Guarded
-    // three ways: needs an installed snapshot, needs a real post date to
-    // pick an age bucket, and NEVER empties the pool - so a wrong verdict
-    // only costs latency (a surviving server + the fill ladder still try),
-    // never the last path.
+    // so the doomed round-trips on takedown'd content are paid at the END
+    // of the ladder instead of the front. Guarded two ways: needs an
+    // installed snapshot, and needs a real post date to pick an age
+    // bucket.
     if let Some(snap) = hub.as_ref().and_then(|h| h.route_gone.lock_ok().clone())
         && let Some(date) = job_posted
     {
@@ -410,20 +464,7 @@ pub(super) fn build_intake(
             .filter(|s| snap.backbone_gone(&nzbkit::oracle::backbone_of(&s.host), &job_family, age))
             .map(|s| s.host.clone())
             .collect();
-        // Only skip if at least one server survives (never the last path).
-        if !gone.is_empty() && gone.len() < cfg_all.servers.len() {
-            cfg_all.servers.retain(|s| {
-                    let keep = !gone.contains(&s.host);
-                    if !keep {
-                        info!(
-                            target: "oracle",
-                            "{} predicted gone for {job_family} (age {age}d) - skipping it this download",
-                            s.host
-                        );
-                    }
-                    keep
-                });
-        }
+        demote_predicted_gone(&mut cfg_all.servers, &gone, &job_family, age);
     }
 
     // Archive password, in priority order: explicit > NZB meta > filename
@@ -847,5 +888,167 @@ mod tests {
 </nzb>"#);
         let p = plan(&n, &HashSet::new(), None, &HashMap::new());
         assert_eq!(p.slots[0].hint, "file000");
+    }
+
+    /// Build a ServerConfig through serde so the test survives new
+    /// `#[serde(default)]` fields being added to the struct.
+    fn srv(host: &str, level: u32) -> ServerConfig {
+        serde_json::from_value(serde_json::json!({
+            "host": host,
+            "port": 563,
+            "tls": true,
+            "connections": 10,
+            "level": level,
+            "enabled": true,
+        }))
+        .unwrap()
+    }
+
+    fn levels(servers: &[ServerConfig]) -> Vec<(&str, u32)> {
+        servers.iter().map(|s| (s.host.as_str(), s.level)).collect()
+    }
+
+    /// The 14 Aug 2026 shape: 4 of 6 backbones written off. They must all
+    /// still be in the pool, just last in line - a wrong verdict costs
+    /// round-trips, never the download.
+    #[test]
+    fn predicted_gone_servers_are_demoted_not_removed() {
+        let mut servers = vec![
+            srv("news.newshosting.com", 0),
+            srv("news.eweka.nl", 0),
+            srv("news.tweaknews.eu", 0),
+            srv("news.usenetexpress.com", 0),
+            srv("news.giganews.com", 0),
+            srv("news.xsnews.nl", 0),
+        ];
+        let gone: Vec<String> = [
+            "news.newshosting.com",
+            "news.eweka.nl",
+            "news.tweaknews.eu",
+            "news.usenetexpress.com",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        demote_predicted_gone(&mut servers, &gone, "hdtv", 20);
+        assert_eq!(servers.len(), 6, "no server may leave the pool");
+        assert_eq!(
+            levels(&servers),
+            vec![
+                ("news.newshosting.com", 1),
+                ("news.eweka.nl", 1),
+                ("news.tweaknews.eu", 1),
+                ("news.usenetexpress.com", 1),
+                ("news.giganews.com", 0),
+                ("news.xsnews.nl", 0),
+            ]
+        );
+    }
+
+    /// Every backbone written off: they all land on the SAME new level,
+    /// so every `required_mask` is empty and the run is identical to one
+    /// with no verdict at all. This is why the old "only skip if at least
+    /// one survives" guard is not needed.
+    #[test]
+    fn all_gone_is_a_no_op() {
+        let mut servers = vec![
+            srv("a.example", 0),
+            srv("b.example", 0),
+            srv("c.example", 0),
+        ];
+        let gone: Vec<String> = servers.iter().map(|s| s.host.clone()).collect();
+        demote_predicted_gone(&mut servers, &gone, "hdtv", 20);
+        assert_eq!(servers.len(), 3);
+        let ls: Vec<u32> = servers.iter().map(|s| s.level).collect();
+        assert!(ls.iter().all(|l| *l == ls[0]), "all on one level: {ls:?}");
+    }
+
+    /// The guard the old code had counted SERVERS while verdicts are per
+    /// BACKBONE: three mirrors of one backbone plus one other provider
+    /// passed it and lost 3 of 4. Demotion keeps all four.
+    #[test]
+    fn three_mirrors_plus_one_keeps_every_server() {
+        let mut servers = vec![
+            srv("news.omicron-a.example", 0),
+            srv("news.omicron-b.example", 0),
+            srv("news.omicron-c.example", 0),
+            srv("news.xsnews.nl", 0),
+        ];
+        let gone: Vec<String> = servers[..3].iter().map(|s| s.host.clone()).collect();
+        demote_predicted_gone(&mut servers, &gone, "hdtv", 20);
+        assert_eq!(servers.len(), 4);
+        assert_eq!(servers[3].level, 0, "the surviving backbone stays primary");
+        assert!(servers[..3].iter().all(|s| s.level == 1));
+    }
+
+    /// An existing level-1 fill server must stay AHEAD of a demoted
+    /// primary: the new tier is one below the config's deepest, not a
+    /// flat "level 1".
+    #[test]
+    fn existing_fill_servers_stay_above_the_demoted() {
+        let mut servers = vec![
+            srv("primary.example", 0),
+            srv("other-primary.example", 0),
+            srv("block-fill.example", 1),
+        ];
+        demote_predicted_gone(&mut servers, &["primary.example".to_string()], "hdtv", 20);
+        assert_eq!(
+            levels(&servers),
+            vec![
+                ("primary.example", 2),
+                ("other-primary.example", 0),
+                ("block-fill.example", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_verdict_changes_nothing() {
+        let mut servers = vec![srv("a.example", 0), srv("b.example", 1)];
+        demote_predicted_gone(&mut servers, &[], "hdtv", 20);
+        assert_eq!(levels(&servers), vec![("a.example", 0), ("b.example", 1)]);
+    }
+
+    /// CRC steering (fleet.rs) keys on a same-LEVEL peer, so demotion can
+    /// switch it off. The measured 4-of-6 and 5-of-6 splits both leave a
+    /// pair somewhere, but a two-primary config demoted 1 of 2 leaves each
+    /// server alone on its level - and turning the steer off there is
+    /// correct, because the lone peer's pickup gate would not let it take
+    /// the article anyway.
+    #[test]
+    fn demotion_can_leave_a_server_alone_on_its_level() {
+        // 4 of 6 gone: still a pair on each level, steer stays on.
+        let mut six = vec![
+            srv("a.example", 0),
+            srv("b.example", 0),
+            srv("c.example", 0),
+            srv("d.example", 0),
+            srv("e.example", 0),
+            srv("f.example", 0),
+        ];
+        let gone: Vec<String> = six[..4].iter().map(|s| s.host.clone()).collect();
+        demote_predicted_gone(&mut six, &gone, "hdtv", 20);
+        assert!(crate::get::fleet::has_steer_peer(&six));
+
+        // 5 of 6 gone: the survivor is alone on level 0, but the five
+        // demoted share level 1, so an elsewhere still exists.
+        let mut five = vec![
+            srv("a.example", 0),
+            srv("b.example", 0),
+            srv("c.example", 0),
+            srv("d.example", 0),
+            srv("e.example", 0),
+            srv("f.example", 0),
+        ];
+        let gone: Vec<String> = five[..5].iter().map(|s| s.host.clone()).collect();
+        demote_predicted_gone(&mut five, &gone, "hdtv", 20);
+        assert!(crate::get::fleet::has_steer_peer(&five));
+
+        // Two primaries, one demoted: nobody has a same-level peer.
+        let mut pair = vec![srv("a.example", 0), srv("b.example", 0)];
+        assert!(crate::get::fleet::has_steer_peer(&pair));
+        demote_predicted_gone(&mut pair, &["a.example".to_string()], "hdtv", 20);
+        assert_eq!(levels(&pair), vec![("a.example", 1), ("b.example", 0)]);
+        assert!(!crate::get::fleet::has_steer_peer(&pair));
     }
 }

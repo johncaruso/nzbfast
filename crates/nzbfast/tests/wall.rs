@@ -1108,6 +1108,138 @@ async fn a_grab_names_the_job_from_the_index_however_deep_the_row_is() {
     .unwrap();
 }
 
+/// The upload-session panel (mode=wall_session): an identified episode
+/// surfaces the obfuscated posts that went up in the same run, and a
+/// surfaced row grabs through the ordinary index_get path. Association
+/// only - the sibling keeps its scrambled name until a download proves
+/// better.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_siblings_surface_on_the_sheet_and_grab() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-sess-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let named = "Watched.Show.S01E01.1080p.WEB-DL-GRP";
+    let dark = "k9f2c7a1e5b8d3f6";
+    let t0 = 1_700_000_000i64;
+    let db = dir.join("index.db");
+    {
+        let mut ix = nzbkit::index::Index::open(&db).unwrap();
+        let post = |n: u64, subj: &str, from: &str, id: &str, date: i64| OverEntry {
+            number: n,
+            subject: subj.into(),
+            from: from.into(),
+            message_id: id.into(),
+            bytes: 50 << 20,
+            date,
+        };
+        ix.ingest(
+            "alt.binaries.teevee",
+            &[
+                post(
+                    1,
+                    &format!("\"{named}.rar\" yEnc (1/1)"),
+                    "a@x",
+                    "<s1@x>",
+                    t0,
+                ),
+                // Same run, five minutes later, rotated handle,
+                // scrambled name - the row the panel exists for.
+                post(
+                    2,
+                    &format!("\"{dark}.rar\" yEnc (1/1)"),
+                    "b@x",
+                    "<s2@x>",
+                    t0 + 300,
+                ),
+                // Nine hours out: outside the session window, must
+                // not surface.
+                post(
+                    3,
+                    "\"aa77zz9900ffee11.rar\" yEnc (1/1)",
+                    "c@x",
+                    "<s3@x>",
+                    t0 + 9 * 3600,
+                ),
+            ],
+            t0 + 9 * 3600,
+        )
+        .unwrap();
+    }
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
+    index_enabled(&cfg);
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--index-db")
+            .arg(&db);
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let json = |q: &str| -> serde_json::Value {
+            let (code, body) = http_get(port, q);
+            assert_eq!(code, 200, "{body}");
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("{q}: {e}\n{body}"))
+        };
+        // The named episode's card key, the way the sheet gets it.
+        let page = json("/api?mode=index_browse&all=1&q=Watched&apikey=sekrit");
+        let row = page["results"]
+            .as_array()
+            .and_then(|rs| rs.iter().find(|r| r["name"].as_str() == Some(named)))
+            .unwrap_or_else(|| panic!("seeded show not on the page: {page}"))
+            .clone();
+        let key = row["key"].as_str().expect("named row carries a key");
+
+        let sess = json(&format!(
+            "/api?mode=wall_session&key={}&apikey=sekrit",
+            urlencoding(key)
+        ));
+        let sibs = sess["siblings"].as_array().unwrap_or_else(|| {
+            panic!("no siblings array: {sess}");
+        });
+        let hit = sibs
+            .iter()
+            .find(|s| s["name"].as_str().is_some_and(|n| n.starts_with(dark)))
+            .unwrap_or_else(|| panic!("the same-run dark post is missing: {sess}"));
+        assert_eq!(hit["link"], "time", "{hit}");
+        assert_eq!(hit["dt"], 300, "{hit}");
+        assert!(
+            !sibs
+                .iter()
+                .any(|s| s["name"].as_str().is_some_and(|n| n.starts_with("aa77zz"))),
+            "a post nine hours out is not the same run: {sess}"
+        );
+
+        // A surfaced row rides the ordinary grab path and keeps its
+        // scrambled name - naming happens in the download, never here.
+        let sid = hit["id"].as_i64().unwrap();
+        let g = json(&format!("/api?mode=index_get&id={sid}&apikey=sekrit"));
+        assert_eq!(g["status"], true, "{g}");
+    })
+    .await
+    .unwrap();
+}
+
 /// Percent-encode a settings value for the GET config API.
 fn urlencoding(v: &str) -> String {
     v.bytes()

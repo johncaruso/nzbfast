@@ -425,23 +425,50 @@ pub(crate) fn try_rar_rr_repair(dir: &std::path::Path, password: Option<&str>) -
         "PAR2 exhausted - trying embedded RAR recovery records on {} volume(s)…",
         volumes.len()
     );
+    // Group by stem and resolve the password PER GROUP, as both try_unrar
+    // rungs do. This rung took the caller's raw value straight into
+    // rr_repair_volume, so a set whose password lives in a harvested
+    // sidecar (the nested password-chain shape) failed every
+    // header-encrypted volume parse and the repair reported "could not
+    // save the set" on a set it could have saved (14 Aug sweep; the
+    // per-group resolve moved out of extract_one_level in U2/b1c20eea and
+    // this rung never got one).
+    let mut by_stem: std::collections::BTreeMap<String, Vec<&PathBuf>> = Default::default();
+    {
+        use nzbkit::extract::release_stem;
+        for p in &volumes {
+            let stem = release_stem(
+                &p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase(),
+            )
+            .to_string();
+            by_stem.entry(stem).or_default().push(p);
+        }
+    }
     let mut rewritten = 0usize;
     let mut hard_failures = 0usize;
-    for path in &volumes {
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        match rr_repair_volume(path, password) {
-            Ok(true) => {
-                println!("  ✔ {name} - rewritten from recovery record");
-                rewritten += 1;
-            }
-            Ok(false) => println!("  – {name} - no recovery record"),
-            Err(e) => {
-                println!("  ✘ {name} - {e}");
-                hard_failures += 1;
+    for group in by_stem.values() {
+        let owned: Vec<PathBuf> = group.iter().map(|p| (*p).clone()).collect();
+        let group_pw = crate::unpack::resolve_rar_group_password(dir, &owned, password);
+        let pw = group_pw.as_deref().or(password);
+        for path in group {
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            match rr_repair_volume(path, pw) {
+                Ok(true) => {
+                    println!("  ✔ {name} - rewritten from recovery record");
+                    rewritten += 1;
+                }
+                Ok(false) => println!("  – {name} - no recovery record"),
+                Err(e) => {
+                    println!("  ✘ {name} - {e}");
+                    hard_failures += 1;
+                }
             }
         }
     }
@@ -1439,12 +1466,15 @@ pub(crate) fn extract_one_sevenz(
     // decodes a packed one with the declared sizes as its only bounds,
     // and a chased container that refused at the in-stream gate demotes
     // to exactly this path - so the refusal here must be a named error,
-    // not an allocation. Malformed shapes fall through to the library's
-    // own cheap error, same as the probe halves of the gate.
+    // not an allocation. The declared variant also judges the CONTENT
+    // blocks' dictionary and PPMd declarations, which the extraction
+    // below would otherwise allocate unbounded. Malformed shapes fall
+    // through to the library's own cheap error, same as the probe
+    // halves of the gate.
     if let Ok(mut probe) = std::fs::File::open(container)
-        && nzbkit::nameprobe::sevenz_disk_header_bomb(&mut probe)
+        && let Some(reason) = nzbkit::nameprobe::sevenz_disk_declared_bomb(&mut probe)
     {
-        anyhow::bail!("7z end header declares an oversized decode");
+        anyhow::bail!("{reason}");
     }
     let mut reader =
         ArchiveReader::open(container, pw).map_err(|e| anyhow::anyhow!("opening 7z: {e}"))?;
@@ -2402,6 +2432,39 @@ mod sevenz_extract_tests {
         assert!(
             err.to_string().contains("oversized decode"),
             "must die at the gate, not in the decoder: {err}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The content half of the same gate (bug-sweep H1, 14 Aug): a
+    /// container whose CONTENT block declares a 384 MiB LZMA2
+    /// dictionary out of 16 packed bytes is refused by name before the
+    /// entry decode allocates it, and the zeroed-start shape (H2) is
+    /// refused before the library's end-header recovery scan can
+    /// decode an unverified packed header with no limit. Both messages
+    /// land verbatim in the job's failure detail.
+    #[test]
+    fn content_and_recovery_bombs_are_refused_by_name() {
+        let fixtures = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../nzbkit/tests/fixtures/sevenz"
+        );
+        let dir = tmp("content-bomb");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let container = dir.join("content.7z");
+        std::fs::copy(format!("{fixtures}/bomb-content-dict.7z"), &container).unwrap();
+        let err = super::extract_one_sevenz(&out, &container, None).unwrap_err();
+        assert!(
+            err.to_string().contains("content declares decoder memory"),
+            "content bomb must die at the gate, not in the decoder: {err}"
+        );
+        let container = dir.join("zeroed.7z");
+        std::fs::copy(format!("{fixtures}/recovered-zero-start.bin"), &container).unwrap();
+        let err = super::extract_one_sevenz(&out, &container, None).unwrap_err();
+        assert!(
+            err.to_string().contains("start header geometry is zeroed"),
+            "zeroed start must refuse before the recovery scan: {err}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

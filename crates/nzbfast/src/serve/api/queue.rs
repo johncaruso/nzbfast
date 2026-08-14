@@ -42,6 +42,23 @@ pub(in crate::serve) fn apply_pause(d: &Arc<Daemon>, g: &mut Job, pause: bool) -
     true
 }
 
+/// The idle edge after a delete removed rows without a park. Deleting
+/// the last queued job empties the queue with no park, so park's
+/// queue.idle would never fire (M3, 10 Aug sweep). Not while an active
+/// download is draining: it has left the queue but its pipeline has not
+/// stopped, and its own park announces the real transition a moment
+/// later.
+///
+/// Shared so the SAB/API delete arm and the NZBGet JSON-RPC delete
+/// variants cannot drift (Codex sweep 14 Aug M4): the facade is a
+/// hand-copy of the REST path and this is the second REST fix it
+/// missed. Call after the rows are gone and no queue lock is held.
+pub(in crate::serve) fn note_queue_idle_unless_active(d: &Daemon, stopped_active: bool) {
+    if !stopped_active {
+        d.note_queue_idle();
+    }
+}
+
 /// Write one job's priority, releasing the states an explicit priority
 /// is an instruction to release. Returns whether the job took it.
 ///
@@ -187,11 +204,9 @@ fn m_resume(
         // Marker on the actual transition only - *arrs send resume
         // routinely, and a resume of a queue that was never paused
         // is not a moment worth marking.
-        if d.paused.swap(false, Ordering::Relaxed) {
+        if set_paused_cancel_timer(d, false) {
             d.note_event("resume", "downloads resumed");
         }
-        d.pause_gen.fetch_add(1, Ordering::Relaxed);
-        *d.pause_until.lock_ok() = None;
         persist_pause(d);
         json!({"status": true})
     })
@@ -1289,7 +1304,12 @@ fn m_watch_failed_delete(
             None => json!({"status": false, "error": "no such rejected file"}),
             Some(p) => match std::fs::remove_file(&p) {
                 Ok(()) => {
-                    d.watch_failed.lock_ok().remove(&p);
+                    // The bumping helper, not a bare map remove: without
+                    // the queue_rev bump the deleting tab itself kept
+                    // rendering the row it had just deleted (the payload
+                    // skip in m_dashboard), and the retry then answered
+                    // "no such rejected file".
+                    d.watch_failed_remove(&p);
                     // The full path, not the basename: whose
                     // `same.nzb` this was is exactly what a reader
                     // of this line needs to know.
@@ -1565,15 +1585,9 @@ fn m_queue(
                 }
                 if count > 0 {
                     d.save_queue();
-                    // Deleting the last queued job empties the queue
-                    // without a park, so park's queue.idle would never
-                    // fire (M3). Not while an active download is
-                    // draining: it has left the queue but its pipeline
-                    // has not stopped, and its own park announces the
-                    // real transition a moment later.
-                    if !stopped_active {
-                        d.note_queue_idle();
-                    }
+                    // The rationale lives on the helper, which the
+                    // JSON-RPC delete variants share.
+                    note_queue_idle_unless_active(d, stopped_active);
                 }
                 json!({"status": count > 0, "removed": count})
             }

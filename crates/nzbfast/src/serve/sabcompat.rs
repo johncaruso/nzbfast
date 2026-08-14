@@ -2060,7 +2060,15 @@ fn jr_history(d: &Arc<Daemon>) -> Value {
             .rev()
             .map(|j| {
                 let g = j.lock_ok();
-                let (status, par_status, unpack_status) = nzbget_status(&g);
+                // M5: a row a delete verb filed here is not a download
+                // verdict - NZBGet spells it DELETED/<why>, and the
+                // *arrs read that as "removed", not "failed".
+                let (status, par_status, unpack_status) = if g.delete_status.is_empty() {
+                    let (s, p, u) = nzbget_status(&g);
+                    (s.to_string(), p, u)
+                } else {
+                    (format!("DELETED/{}", g.delete_status), "NONE", "NONE")
+                };
                 // Prefer the wall clock: `finished_at` is monotonic
                 // and process-local, so after a restart it was None
                 // and every row reported an age of zero - a week of
@@ -2089,7 +2097,14 @@ fn jr_history(d: &Arc<Daemon>) -> Value {
                     // outside their {SUCCESS, NONE} success set → every
                     // finished item shows Warning. NONE = "no move ran".
                     ("MoveStatus".to_string(), json!("NONE")),
-                    ("DeleteStatus".to_string(), json!("NONE")),
+                    (
+                        "DeleteStatus".to_string(),
+                        json!(if g.delete_status.is_empty() {
+                            "NONE"
+                        } else {
+                            g.delete_status.as_str()
+                        }),
+                    ),
                     ("MarkStatus".to_string(), json!("NONE")),
                     ("UrlStatus".to_string(), json!("NONE")),
                     ("Category".to_string(), json!(g.category)),
@@ -2293,8 +2308,34 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                 if cmd == "GroupPause" {
                     d.suspend_matching(true, |g| ids.contains(&nzo_int(&g.nzo_id)));
                 }
+                // Pausing the last runnable job idles the queue with no
+                // park, and this facade answered true without saying so
+                // while the REST arm has announced it since the 10 Aug
+                // sweep (Codex sweep 14 Aug M4). Resume takes the same
+                // call as the REST arm does, deliberately: it re-arms
+                // nothing on its own, and the latch keeps a still-idle
+                // queue silent.
+                if ok {
+                    d.note_queue_idle();
+                }
             }
             "GroupDelete" | "GroupDupeDelete" | "GroupFinalDelete" | "GroupParkDelete" => {
+                // M5 (14 Aug sweep): one arm, four distinct NZBGet
+                // contracts. Per nzbget.com/documentation/api/editqueue
+                // and the nzbgetcom ChangeLog:
+                //   GroupDelete      files gone,  history row DELETED/MANUAL
+                //   GroupDupeDelete  files gone,  history row DELETED/DUPE
+                //   GroupFinalDelete files gone,  NO history row
+                //   GroupParkDelete  files KEPT,  history row DELETED/MANUAL
+                // Sonarr and Radarr cancel with GroupFinalDelete, so the
+                // files half is what stops a cancelled partial download
+                // leaving orphaned payload nothing names.
+                let del_files = cmd != "GroupParkDelete";
+                let hist_status = match cmd {
+                    "GroupDupeDelete" => "DUPE",
+                    "GroupFinalDelete" => "",
+                    _ => "MANUAL",
+                };
                 // A deleted job's prefetch sidecar must stop writing to
                 // its directory - the *arrs delete through here, so this
                 // is an ordinary path, not a corner of one.
@@ -2305,25 +2346,87 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                 // owner, and a job in the lane is not that.
                 d.cancel_tail_fetches(hit_id);
                 let mut stopped_active = false;
+                // Slow work is collected under the queue lock and done
+                // after it, exactly like the SAB delete arm and for the
+                // reasons written there: file removal can hold locks for
+                // a Trash call's timeout, and the notice lock is a leaf.
+                let mut kept: Vec<(String, std::path::PathBuf, String)> = Vec::new();
+                let mut doomed: Vec<(String, std::path::PathBuf, bool, crate::smart::FiledTail)> =
+                    Vec::new();
+                // Jobs owed a history row, filed after the queue lock
+                // drops - park() pushes to history without the queue
+                // lock held, and this path keeps that order.
+                let mut to_history: Vec<Arc<Mutex<Job>>> = Vec::new();
                 let mut q = d.queue.lock_ok();
                 let before = q.len();
                 q.retain(|j| {
                     let mut g = j.lock_ok();
                     if ids.contains(&nzo_int(&g.nzo_id)) {
-                        if g.state == JobState::Downloading {
-                            // park() drops the record and its spooled .nzb.
+                        let active = g.state == JobState::Downloading;
+                        let lane = g.state == JobState::Finishing;
+                        g.delete_status = hist_status.to_string();
+                        if active {
+                            // The pipeline is running - abort below,
+                            // park() finishes the job's cleanup once the
+                            // fetch drains: it removes the files if
+                            // del_on_drop asks, and files the record into
+                            // history when delete_status asks (or drops
+                            // it, the pre-M5 shape, when it is empty).
                             g.tombstone = true;
                             stopped_active = true;
                         } else {
-                            // Non-active record gone for good - drop its
-                            // spooled NZB (retry only applies to history).
-                            // Tombstoned too: a queued job can still be
+                            // Tombstoned even though it is leaving the
+                            // queue right here: a queued job can still be
                             // running in the prefetch sidecar, and an Ok
                             // that lands after this would otherwise run
                             // the whole completion tail and park the
-                            // deleted job into history.
+                            // deleted job a second time.
                             g.tombstone = true;
-                            let _ = std::fs::remove_file(&g.nzb_path);
+                            if hist_status.is_empty() {
+                                // FinalDelete: no history row, so the
+                                // spooled NZB is dead weight. The other
+                                // verbs keep it - their history row is
+                                // retryable, and retry reads the spool.
+                                let _ = std::fs::remove_file(&g.nzb_path);
+                            } else {
+                                // The record becomes a history row now.
+                                // Stamped here, not rendered on the fly:
+                                // both facades and the dashboard read
+                                // these fields.
+                                g.state = JobState::Failed;
+                                g.fail_message = if hist_status == "DUPE" {
+                                    "deleted from the queue as a duplicate".into()
+                                } else {
+                                    "deleted from the queue".into()
+                                };
+                                g.finished_at = Some(std::time::Instant::now());
+                                g.finished_unix = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|t| t.as_secs() as i64);
+                                to_history.push(j.clone());
+                            }
+                        }
+                        if del_files {
+                            if active || lane || g.finalizing {
+                                // Writers are still live; removing now
+                                // lets the next positioned write recreate
+                                // the files. Defer to park(), reserving
+                                // the directory so `dir_claim` cannot
+                                // hand it out in the gap - the SAB arm
+                                // documents both halves.
+                                g.del_on_drop = true;
+                                d.reserved.lock_ok().insert(g.out_dir.clone());
+                            } else {
+                                let tail = delete_tail(&g, || d.job_suffix(filed_stem(&g)));
+                                d.reserved.lock_ok().insert(g.out_dir.clone());
+                                doomed.push((
+                                    filed_stem(&g).to_string(),
+                                    g.out_dir.clone(),
+                                    g.filed,
+                                    tail,
+                                ));
+                            }
                         }
                         false
                     } else {
@@ -2332,6 +2435,34 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                 });
                 ok = q.len() < before;
                 drop(q);
+                // History first, so a poll that races the delete sees the
+                // row appear rather than the job vanish and return.
+                if !to_history.is_empty() {
+                    d.history.lock_ok().extend(to_history.iter().cloned());
+                    let _ = d.history_upsert(&to_history);
+                    d.history_enforce_retention();
+                }
+                // The slow half, with no global lock held. Reservations
+                // release after the WHOLE batch (`reserved` is a set; two
+                // entries naming one directory are one member).
+                let reserved_dirs: Vec<std::path::PathBuf> =
+                    doomed.iter().map(|(_, dir, _, _)| dir.clone()).collect();
+                for (name, dir, filed, tail) in doomed {
+                    if let FilesGone::Kept(why) = remove_job_files(&dir, &name, filed, &tail) {
+                        kept.push((name, dir, why));
+                    }
+                }
+                {
+                    let mut r = d.reserved.lock_ok();
+                    for dir in &reserved_dirs {
+                        r.remove(dir);
+                    }
+                }
+                // A refused removal with the queue row already gone is
+                // invisible unless the notice names it.
+                for (name, dir, why) in kept {
+                    d.note_delete_kept(&name, &dir, &why);
+                }
                 // `owns_hub`, exactly as the REST arm does it, and for
                 // the reason spelled out there: `state == Downloading`
                 // is NOT the owner test. A job whose network leg has
@@ -2356,6 +2487,12 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                     if let Some(c) = d.hub.queue_ctl.lock_ok().as_ref() {
                         c.abort();
                     }
+                }
+                // Shared with the REST delete rather than hand-copied a
+                // third time - the rationale (and the active-deletion
+                // exception) lives on the helper.
+                if ok {
+                    super::api::queue::note_queue_idle_unless_active(d, stopped_active);
                 }
             }
             "GroupMoveTop" | "GroupMoveBottom" => {
@@ -2726,9 +2863,7 @@ pub(super) fn handle_jsonrpc(
             json!(true)
         }
         "resumedownload" | "resumedownload2" => {
-            d.paused.store(false, Ordering::Relaxed);
-            d.pause_gen.fetch_add(1, Ordering::Relaxed);
-            *d.pause_until.lock_ok() = None;
+            set_paused_cancel_timer(d, false);
             persist_pause(d);
             json!(true)
         }

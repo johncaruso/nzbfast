@@ -24,6 +24,11 @@ pub(crate) enum Verdict {
     Repairable {
         est_missing: usize,
         recovery: usize,
+        /// At least one recovery volume declares an ordinal but no slice
+        /// count (`.vol-NN.par2`), so `recovery` is a FLOOR, not the
+        /// budget. Renders as an approximate answer rather than a
+        /// comparison the numbers do not support.
+        recovery_unknown: bool,
         dropped: Vec<String>,
     },
     Impossible {
@@ -83,13 +88,34 @@ pub(crate) fn is_droppable_metadata(name: &str) -> bool {
 /// file, never the fate of the job: if the set does not cover it the
 /// download completes and drops it, and if the set does cover it repair
 /// rebuilds it. The copy says both rather than picking one.
-pub(crate) fn verdict_of(est_missing: usize, recovery: usize, dropped: Vec<String>) -> Verdict {
+///
+/// `recovery_unknown` says the budget above is a FLOOR: some recovery
+/// volume names an ordinal without a slice count, the `.vol-NN.par2`
+/// shape playWEB/NORViNE/GRACE post. Those volumes carry real blocks we
+/// cannot count from the name, and pre-flight never downloads the PAR2
+/// packets that would say. Summing them as ZERO is what made this
+/// report IMPOSSIBLE - aborting the CLI, failing daemon and library
+/// jobs - on sets the downloader repairs, because the real repair path
+/// estimates the same volumes from their SIZE instead
+/// (`repair::recovery_candidates`). Pre-flight cannot borrow that
+/// estimate: it needs the set's block size, which only the PAR2 main
+/// packet carries. So it declines to claim impossibility it cannot
+/// support - the asymmetry is the point, since IMPOSSIBLE stops a
+/// download that would have worked while REPAIRABLE only lets the real
+/// verify decide (14 Aug sweep).
+pub(crate) fn verdict_of(
+    est_missing: usize,
+    recovery: usize,
+    recovery_unknown: bool,
+    dropped: Vec<String>,
+) -> Verdict {
     if est_missing == 0 {
         Verdict::Complete { dropped }
-    } else if est_missing <= recovery {
+    } else if est_missing <= recovery || recovery_unknown {
         Verdict::Repairable {
             est_missing,
             recovery,
+            recovery_unknown,
             dropped,
         }
     } else {
@@ -136,11 +162,21 @@ pub(crate) async fn check(
             file_of.push(fi);
         }
     }
-    let recovery: usize = nzb
+    // Known counts sum; an ordinal-only volume (`.vol-NN.par2`) has real
+    // blocks this name cannot size, so it is recorded as UNKNOWN rather
+    // than silently added as zero - see `verdict_of`.
+    let mut recovery: usize = 0;
+    let mut recovery_unknown = false;
+    for f in nzb
         .files
         .iter()
-        .filter_map(|f| vol_count_from_name(f.filename_hint().unwrap_or(&f.subject)))
-        .sum();
+        .filter(|f| f.kind() == FileKind::Par2Volume)
+    {
+        match vol_count_from_name(f.filename_hint().unwrap_or(&f.subject)) {
+            Some(n) => recovery += n,
+            None => recovery_unknown = true,
+        }
+    }
     println!(
         "pre-flight: STAT {} article(s) ({}% sample) × {} server(s), {} conns × window {}",
         ids.len(),
@@ -220,7 +256,7 @@ pub(crate) async fn check(
     // Verdict in article units (block ≈ article for typical posts; the
     // live ledger is exact once the par2 main packet is in hand), and in
     // PAYLOAD articles only - see verdict_of.
-    let verdict = verdict_of(est_missing, recovery, dropped);
+    let verdict = verdict_of(est_missing, recovery, recovery_unknown, dropped);
     let dropped_tail = |dropped: &[String]| {
         if dropped.is_empty() {
             String::new()
@@ -245,9 +281,20 @@ pub(crate) async fn check(
         Verdict::Repairable {
             est_missing,
             recovery,
+            recovery_unknown: false,
             dropped,
         } => println!(
             "verdict: REPAIRABLE - ≈{est_missing} payload article(s) missing everywhere ≤ {recovery} recovery block(s){} ({:.2?})",
+            dropped_tail(dropped),
+            sweep.elapsed
+        ),
+        Verdict::Repairable {
+            est_missing,
+            recovery,
+            recovery_unknown: true,
+            dropped,
+        } => println!(
+            "verdict: PROBABLY REPAIRABLE - ≈{est_missing} payload article(s) missing everywhere, against {recovery} counted recovery block(s) plus volumes whose names do not say how many they hold - the real block count is read during repair{} ({:.2?})",
             dropped_tail(dropped),
             sweep.elapsed
         ),
@@ -283,7 +330,7 @@ mod tests {
     /// repair promise.
     #[test]
     fn a_missing_nfo_is_not_a_repair_promise() {
-        let v = verdict_of(0, 51, names(&["release.nfo"]));
+        let v = verdict_of(0, 51, false, names(&["release.nfo"]));
         assert_eq!(
             v,
             Verdict::Complete {
@@ -293,7 +340,7 @@ mod tests {
         // And the reverse framing: nothing missing anywhere is still the
         // plain COMPLETE, with nothing to say about metadata.
         assert_eq!(
-            verdict_of(0, 51, vec![]),
+            verdict_of(0, 51, false, vec![]),
             Verdict::Complete { dropped: vec![] }
         );
     }
@@ -305,15 +352,16 @@ mod tests {
     #[test]
     fn furniture_does_not_spend_the_recovery_budget() {
         assert_eq!(
-            verdict_of(4, 51, names(&["release.sfv"])),
+            verdict_of(4, 51, false, names(&["release.sfv"])),
             Verdict::Repairable {
                 est_missing: 4,
                 recovery: 51,
+                recovery_unknown: false,
                 dropped: names(&["release.sfv"]),
             }
         );
         assert_eq!(
-            verdict_of(52, 51, names(&["release.sfv"])),
+            verdict_of(52, 51, false, names(&["release.sfv"])),
             Verdict::Impossible {
                 est_missing: 52,
                 recovery: 51,
@@ -323,12 +371,59 @@ mod tests {
         // The boundary the old code drew, undisturbed: exactly enough
         // blocks still repairs.
         assert_eq!(
-            verdict_of(51, 51, vec![]),
+            verdict_of(51, 51, false, vec![]),
             Verdict::Repairable {
                 est_missing: 51,
                 recovery: 51,
+                recovery_unknown: false,
                 dropped: vec![],
             }
+        );
+    }
+
+    /// 14 Aug sweep: recovery volumes whose names carry an ordinal but
+    /// no slice count (`.vol-01.par2` … `.vol-09.par2`, the playWEB
+    /// shape) summed to a ZERO budget, so one missing payload article
+    /// beside nine real recovery volumes reported IMPOSSIBLE and aborted
+    /// a job the downloader repairs. Unknown must not be spent as zero.
+    #[test]
+    fn unknown_recovery_counts_never_reach_impossible() {
+        // The old arithmetic: 5 missing against a budget counted as 0.
+        assert_eq!(
+            verdict_of(5, 0, true, vec![]),
+            Verdict::Repairable {
+                est_missing: 5,
+                recovery: 0,
+                recovery_unknown: true,
+                dropped: vec![],
+            },
+            "an uncountable recovery set cannot prove a job impossible"
+        );
+        // A PARTLY known budget is still a floor, not a ceiling: the
+        // known 2 blocks do not bound what the ordinal volumes hold.
+        assert_eq!(
+            verdict_of(40, 2, true, vec![]),
+            Verdict::Repairable {
+                est_missing: 40,
+                recovery: 2,
+                recovery_unknown: true,
+                dropped: vec![],
+            }
+        );
+        // And the flag changes nothing when the budget IS fully known -
+        // a genuinely short set still reports impossible.
+        assert_eq!(
+            verdict_of(52, 51, false, vec![]),
+            Verdict::Impossible {
+                est_missing: 52,
+                recovery: 51,
+                dropped: vec![],
+            }
+        );
+        // Nothing missing stays COMPLETE either way.
+        assert_eq!(
+            verdict_of(0, 0, true, vec![]),
+            Verdict::Complete { dropped: vec![] }
         );
     }
 

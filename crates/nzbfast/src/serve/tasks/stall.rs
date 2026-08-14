@@ -318,6 +318,13 @@ pub(in crate::serve) fn spawn_slow_job_watchdog(
         };
         let warmup = secs("NZBFAST_DEFER_WARMUP_SECS", 45);
         let window = secs("NZBFAST_DEFER_WINDOW_SECS", 30);
+        // Refusals in one window that make "this post is gone" a
+        // verdict rather than noise. A dead post answers 430 as fast as
+        // the pool can ask - the 14 Aug releases were accruing thousands
+        // per window - so the floor only has to clear a handful of
+        // stragglers 430ing at the tail of an otherwise healthy job,
+        // which the zero-byte test has almost always excluded already.
+        let gone_min_misses = secs("NZBFAST_DEFER_GONE_MIN_MISSES", 64);
         // Tail-prefetch experiment (dark): when the active job's article
         // queue runs dry (the pool's network tail), the flat byte window
         // below would skip the whole prefetch block - which is exactly
@@ -334,7 +341,10 @@ pub(in crate::serve) fn spawn_slow_job_watchdog(
         // already sidecar-tried during the current active job (so a
         // job whose articles the idle servers don't hold either
         // isn't retried every tick).
-        let mut win: VecDeque<(Instant, Vec<(String, u64)>)> = VecDeque::new();
+        // Per sample: (taken at, per-host raw bytes, articles tried,
+        // articles 430'd) - the last two summed across servers, because
+        // "is this post gone" is a job-wide question, not a per-host one.
+        let mut win: VecDeque<(Instant, Vec<(String, u64)>, u64, u64)> = VecDeque::new();
         let mut cur: Option<String> = None;
         let mut attempted: std::collections::HashSet<String> = Default::default();
         // Once per active job: "every idle server has refused auth".
@@ -405,33 +415,43 @@ pub(in crate::serve) fn spawn_slow_job_watchdog(
                 refusal_noted = false;
                 cur = Some(id.clone());
             }
-            let snap: Vec<(String, u64)> = d
+            let (snap, tried_now, missing_now) = d
                 .hub
                 .pool_live
                 .lock()
                 .unwrap()
                 .as_ref()
                 .map(|l| {
-                    l.servers
-                        .iter()
-                        .map(|s| (s.host.clone(), s.bytes.load(Ordering::Relaxed)))
-                        .collect()
+                    let mut hosts: Vec<(String, u64)> = Vec::with_capacity(l.servers.len());
+                    let (mut tried, mut missing) = (0u64, 0u64);
+                    for s in l.servers.iter() {
+                        hosts.push((s.host.clone(), s.bytes.load(Ordering::Relaxed)));
+                        tried += s.articles_tried.load(Ordering::Relaxed);
+                        missing += s.articles_missing.load(Ordering::Relaxed);
+                    }
+                    (hosts, tried, missing)
                 })
                 .unwrap_or_default();
             if snap.is_empty() {
                 continue;
             }
             let now = Instant::now();
-            win.push_back((now, snap));
+            win.push_back((now, snap, tried_now, missing_now));
             while win
                 .front()
-                .is_some_and(|(t, _)| now.duration_since(*t).as_secs() > window)
+                .is_some_and(|(t, ..)| now.duration_since(*t).as_secs() > window)
             {
                 win.pop_front();
             }
-            let Some((t_first, first)) = win.front().cloned() else {
+            let Some((t_first, first, tried_base, missing_base)) = win.front().cloned() else {
                 continue;
             };
+            // Answers this window, not this run: a job that fetched
+            // half a release and only then hit a dead patch still holds
+            // the queue, and cumulative totals would let its early
+            // successes mask that forever.
+            let tried_delta = tried_now.saturating_sub(tried_base);
+            let missing_delta = missing_now.saturating_sub(missing_base);
             let span = now.duration_since(t_first).as_secs_f64();
             if span < window as f64 * 0.8 {
                 continue;
@@ -502,6 +522,71 @@ pub(in crate::serve) fn spawn_slow_job_watchdog(
                          has arrived for {:.0}s - the articles this job still needs \
                          are only on that server",
                         o.host, o.secs, o.kind, span
+                    );
+                    {
+                        let mut g = job.lock_ok();
+                        g.demote = true;
+                        g.defer_reason = reason.clone();
+                    }
+                    info!(target: "defer", "{id}: {reason} - moving to the back of the queue");
+                    if let Some(f) = d.hub.abort.lock_ok().as_ref() {
+                        f.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(c) = d.hub.queue_ctl.lock_ok().as_ref() {
+                        c.abort();
+                    }
+                    win.clear();
+                    continue;
+                }
+            }
+            // ---- The post is gone: servers healthy, every answer a 430.
+            //
+            // The sibling arm above covers a server that grants no
+            // CONNECTION. This is the other shape of a zero-byte window,
+            // and the `total == 0` bail below sends it to the pool's
+            // retry logic on the reasoning that articles "430ing their
+            // way through a refusal ladder" are real progress. They are,
+            // right up until every one of them is a refusal - then the
+            // ladder has nothing left to climb and the queue sits behind
+            // a post no configured server carries.
+            //
+            // Measured 14 Aug 2026: two 21-day-old teevee releases whose
+            // articles are all taken down held the queue for 10+ minutes
+            // each, at 0.0 MB/s, while other jobs waited. The engine had
+            // already PROVED it - the prefetch lane logged "post is
+            // gone: not one of the 14087 article(s) is on any server" -
+            // but that verdict died with the sidecar and the main job
+            // started over from scratch.
+            //
+            // Separating the two shapes is the miss counter, not the
+            // clock: a wedged server answers nothing, so `missing_delta`
+            // stays 0 and this arm cannot fire on it. Zero bytes plus
+            // refusals means the answers arrived and every one was "no
+            // such article".
+            //
+            // Deferring, not failing: this says "unservable right now",
+            // which a provider outage or a still-propagating post also
+            // looks like. `pick_job` runs a deferred job when nothing
+            // else is available, the journal keeps every landed article,
+            // and the give-up breaker and post-download health verdict
+            // remain the things that decide a job is finally dead.
+            if total == 0
+                && missing_delta >= gone_min_misses
+                && tried_delta > 0
+                && d.auto_defer.load(Ordering::Relaxed)
+                && now.duration_since(t0).as_secs() >= warmup
+                && defer_count < 3
+                && d.sidecar.lock_ok().as_ref().is_none_or(|s| s.borrowed)
+            {
+                let others_waiting = d.queue.lock_ok().iter().any(|j| {
+                    let g = j.lock_ok();
+                    g.state == JobState::Queued && !g.paused && !g.deferred
+                });
+                if others_waiting {
+                    let reason = format!(
+                        "every one of the {missing_delta} article(s) answered in the \
+                         last {span:.0}s came back missing and not a byte arrived - \
+                         no configured server carries this post right now"
                     );
                     {
                         let mut g = job.lock_ok();

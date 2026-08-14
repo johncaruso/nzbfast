@@ -121,6 +121,7 @@ jobs:
         run: |
           mkdir -p corpus/rar_extract corpus/par2_parse corpus/mkv_parse corpus/zip_parse
           mkdir -p corpus/rar_map corpus/rar_recovery_scan corpus/sevenz_name_probe
+          mkdir -p corpus/sevenz_disk_gate
           # rar_name_probe takes a bare volume head - no selector byte,
           # unlike rar_map - so real .rar files seed it verbatim.
           mkdir -p corpus/rar_name_probe
@@ -132,6 +133,9 @@ jobs:
           # declared-size gate must keep rejecting it within the low rss
           # limit this target runs under.
           cp ../tests/fixtures/sevenz/* corpus/sevenz_name_probe/ 2>/dev/null || true
+          # The disk-gate target takes whole containers; the same seeds
+          # cover it (it also self-seals raw windows, like the probe).
+          cp ../tests/fixtures/sevenz/* corpus/sevenz_disk_gate/ 2>/dev/null || true
           cp ../../../vendor/rars/tests/fixtures/rar*/*.rar corpus/rar_extract/ 2>/dev/null || true
           cp ../tests/fixtures/par2/*.par2 corpus/par2_parse/ 2>/dev/null || true
           cp ../tests/fixtures/mkv/*.mkv corpus/mkv_parse/ 2>/dev/null || true
@@ -244,6 +248,16 @@ jobs:
           # more reason a green burst is weak evidence.
           echo "::group::fuzz sevenz_name_probe"
           cargo +nightly fuzz run sevenz_name_probe -- \
+            -max_total_time=60 -rss_limit_mb=4096 -malloc_limit_mb=128 -timeout=10
+          echo "::endgroup::"
+          # sevenz_disk_gate runs the whole-container declared-size gate
+          # (start geometry, packed-header decode, content dictionary
+          # accounting - bug-sweep H1+H2, 14 Aug). Same malloc ceiling
+          # and for the same reason: the gate's own legal allocations
+          # top out at a 2 MiB header window plus a 2 MiB packed-header
+          # decode, so any big single allocation is a finding.
+          echo "::group::fuzz sevenz_disk_gate"
+          cargo +nightly fuzz run sevenz_disk_gate -- \
             -max_total_time=60 -rss_limit_mb=4096 -malloc_limit_mb=128 -timeout=10
           echo "::endgroup::"
       # Report what the corpus is costing before saving it. A corpus that

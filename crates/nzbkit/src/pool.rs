@@ -396,7 +396,7 @@ pub struct PoolConfig {
     /// server's TTFB EWMA if that is larger), the article is marked
     /// suspect and any topping-up worker dup-races it IMMEDIATELY -
     /// same server included - instead of waiting out the full adaptive
-    /// pre-byte budget (floor 2 s) plus a requeue round-trip. First
+    /// pre-byte budget (floor 4 s) plus a requeue round-trip. First
     /// answer wins, the owner's read is never killed, and every
     /// suspect dup counts against the hedge issue-rate cap so jitter
     /// cannot turn suspicion into a duplicate storm. Only meaningful
@@ -2321,7 +2321,7 @@ impl Shared {
     /// leaving it where it was.
     ///
     /// Only SUCCESSFUL status reads feed the EWMA, so a budget trained
-    /// down to the 2 s floor by pipelined ~0 ms samples had no way back
+    /// down to the floor by pipelined ~0 ms samples had no way back
     /// up if the provider then settled at a stable latency above it:
     /// every read timed out, every timeout produced no sample, and
     /// healthy articles failed forever on a link the flat 30 s path
@@ -2334,13 +2334,14 @@ impl Shared {
     /// the raw EWMA, because the floor routinely hides the EWMA far
     /// below the budget it produced. Doubling the raw value took a
     /// 1 ms EWMA through 2, 4, 8, 16 ms - four charged attempts that
-    /// every one of them still spent at the flat 2 s floor, so a
-    /// provider that settled at 2.5 s failed every article before the
-    /// budget could widen a millisecond (Codex sweep 2, 3 Aug M6).
-    /// Escalating from the expired budget makes the next attempt's
-    /// budget strictly larger than the one that just failed - 2 s, 4 s,
-    /// 8 s, ceiling - so the retry allowance is spent probing upwards
-    /// instead of re-testing the same floor four times.
+    /// every one of them still spent at the flat floor (2 s when this
+    /// was found), so a provider that settled just above it failed
+    /// every article before the budget could widen a millisecond
+    /// (Codex sweep 2, 3 Aug M6). Escalating from the expired budget
+    /// makes the next attempt's budget strictly larger than the one
+    /// that just failed - 4 s, 8 s, ceiling at today's floor - so the
+    /// retry allowance is spent probing upwards instead of re-testing
+    /// the same floor four times.
     fn note_ttfb_timeout(&self, idx: usize) {
         let cell = &self.ttfb_ms[idx];
         let old = cell.load(Ordering::Relaxed);

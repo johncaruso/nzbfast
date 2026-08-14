@@ -1234,6 +1234,46 @@ mod app {
         }
     }
 
+    /// Append one tray-stamped line to daemon.log, in the daemon's own
+    /// timestamp format so the two interleave legibly. This exists for
+    /// the child-death paths: a native Windows crash (access violation,
+    /// heap corruption, a fail-fast) writes NOTHING to stderr, so
+    /// without this line an engine death is indistinguishable in the
+    /// log from a machine that went to sleep - which is exactly the
+    /// hole Gary's silent idle crash fell through (TODO 165).
+    fn log_note(data_dir: &Path, msg: &str) {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        // Civil-from-days (Hinnant): enough calendar for a log stamp
+        // without pulling a date crate into the tray.
+        let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(data_dir.join("daemon.log"))
+        {
+            let _ = writeln!(
+                f,
+                "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}Z WARN  [tray] {msg}",
+                rem / 3600,
+                (rem / 60) % 60,
+                rem % 60
+            );
+        }
+    }
+
     fn log_tail(data_dir: &Path, lines: usize) -> String {
         std::fs::read_to_string(data_dir.join("daemon.log"))
             .map(|s| {
@@ -1910,6 +1950,15 @@ mod app {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 if child.try_wait().ok().flatten().is_none() {
+                    // An engine that ignores an authenticated shutdown
+                    // for 5 s is wedged, not slow - record that before
+                    // the kill, or the log just stops mid-sentence and
+                    // the death reads like a crash (TODO 165).
+                    log_note(
+                        &app.data_dir,
+                        "engine did not answer the shutdown request within 5s - \
+                         killed by the tray while quitting (the API was unresponsive)",
+                    );
                     let _ = child.kill();
                     let _ = child.wait();
                 }
@@ -1963,7 +2012,7 @@ mod app {
                         let mut a = a.borrow_mut();
                         let app = a.as_mut().unwrap();
                         if app.child_dead {
-                            return false;
+                            return None;
                         }
                         match app.child.as_mut().map(|c| c.try_wait()) {
                             Some(Ok(Some(status))) => {
@@ -1972,9 +2021,23 @@ mod app {
                             }
                             _ => None,
                         }
-                        .is_some()
                     });
-                    if died {
+                    if let Some(status) = died {
+                        // Stamp the death and its exit status into the
+                        // log FIRST: a native crash said nothing to
+                        // stderr, so this line is the only record of
+                        // when and how the engine went (0xC0000005 is
+                        // an access violation, 0xC0000374 heap
+                        // corruption, 0xC00000FD stack overflow, 3 a
+                        // CRT abort).
+                        {
+                            let dir = APP.with(|a| a.borrow().as_ref().unwrap().data_dir.clone());
+                            let how = match status.code() {
+                                Some(c) => format!("exit status {c} (0x{:08X})", c as u32),
+                                None => "an unknown exit status".to_string(),
+                            };
+                            log_note(&dir, &format!("engine exited on its own with {how}"));
+                        }
                         // Some deaths are not "try again" deaths. A missing
                         // or unusable API key stops startup deliberately and
                         // will do so every time, so telling this user to hit

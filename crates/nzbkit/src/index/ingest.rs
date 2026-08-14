@@ -454,6 +454,21 @@ fn gen_candidates(
     Ok(out)
 }
 
+/// What [`pick_release_row`] decided for one cluster.
+enum RowPick {
+    /// Write into this row (plain or marked); the batch does not
+    /// contradict it. Carries the file rows the row already holds.
+    Adopt(String, ExistingFiles),
+    /// Every candidate is contradicted: write under this brand-new
+    /// marked poster value.
+    Mint(String),
+    /// Every candidate is contradicted AND the marked namespace is
+    /// already at [`MAX_GEN_SIBLINGS`]. Drop the cluster - the articles
+    /// re-arrive on the next scan of this window, exactly like the
+    /// [`MAX_GEN_PASSES`] overflow.
+    Saturated,
+}
+
 /// Pick the `releases.poster` value this batch should be written under,
 /// and hand back the file rows that row already holds so the caller's
 /// merge does not read them a second time.
@@ -466,21 +481,30 @@ fn gen_candidates(
 /// candidate is contradicted AND the plain row is among them, so a
 /// triple whose plain row is somehow free still lands there rather than
 /// starting life marked.
+///
+/// Minting stops at [`MAX_GEN_SIBLINGS`]: `gen_candidates` never looks
+/// past that many marked rows, so a seventeenth sibling could never be
+/// adopted by any later batch - every re-arrival of its articles would
+/// mint an eighteenth, and so on without bound. Measured on a live
+/// index (14 Aug 2026): 6.5M marked rows, 166k families past the cap,
+/// one family at 2,730 rows - flood bots reinject the same posting
+/// under fresh message-ids, which this key treats as a new generation
+/// every time. Past the cap the cluster is dropped instead.
 fn pick_release_row(
     db: &Connection,
     stem: &str,
     poster: &str,
     grp: &str,
     files: &ClusterFiles,
-) -> rusqlite::Result<(String, ExistingFiles)> {
+) -> rusqlite::Result<RowPick> {
     let candidates = gen_candidates(db, stem, poster, grp)?;
     if candidates.is_empty() {
-        return Ok((poster.to_string(), ExistingFiles::new()));
+        return Ok(RowPick::Adopt(poster.to_string(), ExistingFiles::new()));
     }
     for (rid, row_poster) in &candidates {
         let existing = fetch_existing(db, *rid, files)?;
         if !contradicts(&existing, files) {
-            return Ok((row_poster.clone(), existing));
+            return Ok(RowPick::Adopt(row_poster.clone(), existing));
         }
     }
     // Every candidate holds a different posting, so this batch needs a
@@ -489,7 +513,10 @@ fn pick_release_row(
     // triple is free and is the natural home; starting life marked would
     // leave the unmarked row permanently unclaimable.
     if !candidates.iter().any(|(_, p)| p == poster) {
-        return Ok((poster.to_string(), ExistingFiles::new()));
+        return Ok(RowPick::Adopt(poster.to_string(), ExistingFiles::new()));
+    }
+    if candidates.iter().filter(|(_, p)| p != poster).count() >= MAX_GEN_SIBLINGS as usize {
+        return Ok(RowPick::Saturated);
     }
     // Marked, keyed by the batch's own articles so the value is a
     // function of what it carries rather than an ordinal - the same
@@ -509,7 +536,12 @@ fn pick_release_row(
         "{poster}{POSTER_GEN_MARK}{}",
         &msgid_set_key(&lowest)[..GEN_HEX]
     );
-    warn!(
+    // debug, not warn: reinjection floods hit this thousands of times a
+    // tick, and the per-cluster storm wrote 90 MB of daemon.log in one
+    // day on a tester's box (which Windows never caps - the logtee's
+    // file cap is unix-only). The per-pass summary in `ingest_pass`
+    // carries the counts at warn level.
+    tracing::debug!(
         target: "index",
         "{stem} by {poster} in {grp} is already release {} with different articles - \
          indexing this posting separately",
@@ -517,7 +549,7 @@ fn pick_release_row(
     );
     // A brand-new row by construction: the marked value did not appear
     // among the candidates, all of which were contradicted.
-    Ok((marked, ExistingFiles::new()))
+    Ok(RowPick::Mint(marked))
 }
 
 /// How many times [`Index::ingest`] re-drives its own leftovers before
@@ -893,6 +925,11 @@ impl Index {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Generation-split traffic this pass, for the one-line summary
+        // below - the per-cluster lines are debug level (see the note in
+        // `pick_release_row`).
+        let mut gen_minted = 0u32;
+        let mut gen_dropped = 0u32;
         for ((poster, stem), files) in clusters {
             // Real upload time when the batch carried Dates; scan time
             // otherwise. MIN on conflict lets an older batch (backfill
@@ -910,7 +947,18 @@ impl Index {
             // file rows that row already holds - fetched once here and
             // reused by the merge below, so the common single-candidate
             // case costs no extra queries against `files`.
-            let (poster_key, mut existing) = pick_release_row(&tx, &stem, &poster, grp, &files)?;
+            let (poster_key, mut existing) =
+                match pick_release_row(&tx, &stem, &poster, grp, &files)? {
+                    RowPick::Adopt(key, existing) => (key, existing),
+                    RowPick::Mint(key) => {
+                        gen_minted += 1;
+                        (key, ExistingFiles::new())
+                    }
+                    RowPick::Saturated => {
+                        gen_dropped += 1;
+                        continue;
+                    }
+                };
             tx.prepare_cached(
                 "INSERT INTO releases(stem, poster, grp, first_seen, first_posted)
                  VALUES(?1, ?2, ?3, ?4, ?5)
@@ -1131,6 +1179,13 @@ impl Index {
             }
         }
         tx.commit()?;
+        if gen_minted > 0 || gen_dropped > 0 {
+            warn!(
+                target: "index",
+                "{grp}: {gen_minted} reposted posting(s) indexed as generation rows, \
+                 {gen_dropped} dropped at the {MAX_GEN_SIBLINGS}-sibling cap",
+            );
+        }
         Ok(deferred)
     }
 
@@ -1559,6 +1614,64 @@ mod tests {
         assert_eq!(ix.high_water("alt.test", "news.example.com"), 42);
         assert_eq!(ix.high_water("alt.test", "other.example.com"), 0);
         assert_eq!(ix.stats().unwrap(), (1, 1));
+        teardown(&dir, ix);
+    }
+
+    /// The generation namespace is bounded: a reinjection flood (same
+    /// subject and poster, fresh message-ids every repost - observed at
+    /// 536k mints in 40 hours on a tester's box) mints marked siblings
+    /// only up to MAX_GEN_SIBLINGS, then drops the batch. Without the
+    /// cap the seventeenth row is invisible to `gen_candidates` (LIMIT),
+    /// can never be adopted, and every further repost mints another row
+    /// without bound (live index: one family reached 2,730 rows).
+    #[test]
+    fn generation_minting_stops_at_the_sibling_cap() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-gencap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+
+        let rows = |ix: &Index| -> i64 {
+            ix.db
+                .query_row("SELECT COUNT(*) FROM releases", [], |r| r.get(0))
+                .unwrap()
+        };
+        // The same posting reinjected over and over: identical subject
+        // and poster, a fresh message-id each time. Every batch
+        // contradicts every row the previous ones created (same part
+        // number, different id), so each mints one marked sibling -
+        // until the cap.
+        for i in 0..(MAX_GEN_SIBLINGS as usize + 8) {
+            let b = vec![entry(
+                "\"Flood.S01E01.mkv\" yEnc (1/1)",
+                "bot@flood",
+                &format!("reinject-{i}"),
+                1000,
+            )];
+            ix.ingest("alt.test", &b, 1000 + i as i64).unwrap();
+        }
+        // One plain row plus exactly MAX_GEN_SIBLINGS marked rows; the
+        // eight batches past the cap minted nothing.
+        assert_eq!(rows(&ix), 1 + MAX_GEN_SIBLINGS);
+        let marked: i64 = ix
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM releases WHERE poster LIKE '%' || ? || '%'",
+                [POSTER_GEN_MARK],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marked, MAX_GEN_SIBLINGS);
+        // A batch that agrees with an existing sibling still adopts it
+        // rather than being dropped: re-send the very first reinjection.
+        let again = vec![entry(
+            "\"Flood.S01E01.mkv\" yEnc (1/1)",
+            "bot@flood",
+            "reinject-1",
+            1000,
+        )];
+        ix.ingest("alt.test", &again, 5000).unwrap();
+        assert_eq!(rows(&ix), 1 + MAX_GEN_SIBLINGS);
         teardown(&dir, ix);
     }
 

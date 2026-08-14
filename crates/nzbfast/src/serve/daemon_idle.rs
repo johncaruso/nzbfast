@@ -53,15 +53,21 @@ impl Daemon {
             self.paused.load(Ordering::Relaxed),
             self.paused_by_offline.load(Ordering::Relaxed),
         );
-        self.paused.store(paused, Ordering::Relaxed);
-        self.paused_by_offline.store(by_offline, Ordering::Relaxed);
-        if want_offline {
-            *self.pause_until.lock_ok() = None;
-        }
         // Bumped either way: an in-flight job has to wind down whether or
         // not this transition was the thing that paused the queue,
         // because staying connected is exactly what offline forbids.
-        self.pause_gen.fetch_add(1, Ordering::Relaxed);
+        // Flag, deadline, and generation move under the pause_until lock
+        // so the auto-resume timer's check-and-clear cannot interleave
+        // (see `set_paused_cancel_timer`).
+        {
+            let mut until = self.pause_until.lock_ok();
+            self.pause_gen.fetch_add(1, Ordering::Relaxed);
+            self.paused.store(paused, Ordering::Relaxed);
+            self.paused_by_offline.store(by_offline, Ordering::Relaxed);
+            if want_offline {
+                *until = None;
+            }
+        }
         match want_offline {
             true => {
                 // The pause flag above is a START-time gate (`pick_job`);

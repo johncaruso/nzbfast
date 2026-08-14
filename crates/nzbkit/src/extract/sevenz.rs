@@ -358,11 +358,12 @@ impl Extractor {
         // error. A refusal errors the worker out, which demotes the
         // set: the parts materialize for the disk post-pass, whose
         // entry points hold the same shared gate and refuse with a
-        // diagnosable reason instead of an allocation.
-        if crate::nameprobe::sevenz_disk_header_bomb(&mut src) {
-            return Err(sevenz_rust2::Error::Other(
-                "end header declares an oversized decode".into(),
-            ));
+        // diagnosable reason instead of an allocation. The declared
+        // variant also judges the CONTENT blocks' dictionary and PPMd
+        // declarations - this call path is about to decode them, and
+        // the library itself puts no bound on what they may allocate.
+        if let Some(reason) = crate::nameprobe::sevenz_disk_declared_bomb(&mut src) {
+            return Err(sevenz_rust2::Error::Other(reason.into()));
         }
         io::Seek::seek(&mut src, io::SeekFrom::Start(0))?;
         let pw = match &password {

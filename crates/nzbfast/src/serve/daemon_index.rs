@@ -624,6 +624,14 @@ impl Daemon {
     /// seeding) - the point of the read-only path is that those handlers
     /// never park behind an ingest, so their embedded writes must not
     /// park either.
+    ///
+    /// try_lock for the handle, `blocking_db` for the closure - the same
+    /// split [`Self::try_with_index_mut`] documents: the WAIT is what
+    /// this refuses, not the work. Winning the try_lock still buys a
+    /// synchronous SQLite run, and that belongs off the async workers
+    /// for the reason `with_index` records. Not a hypothetical closure
+    /// either: the wall's title seeding loops `title_seed` over a whole
+    /// page of cards.
     #[cfg(feature = "indexer")]
     pub(in crate::serve) fn try_with_index<T>(
         &self,
@@ -632,16 +640,54 @@ impl Daemon {
         if !self.index_db_wanted() {
             return None;
         }
-        let Ok(mut guard) = self.index.try_lock() else {
-            return None;
-        };
-        if guard.is_none() {
-            *guard = nzbkit::index::Index::open(&self.index_db).ok();
-            if guard.is_some() {
-                self.index_migrated.store(true, Ordering::Release);
+        crate::persist::blocking_db(|| {
+            let Ok(mut guard) = self.index.try_lock() else {
+                return None;
+            };
+            if guard.is_none() {
+                *guard = nzbkit::index::Index::open(&self.index_db).ok();
+                if guard.is_some() {
+                    self.index_migrated.store(true, Ordering::Release);
+                }
             }
+            guard.as_ref().and_then(f)
+        })
+    }
+
+    /// Mutable sibling of [`Self::try_with_index`]: run `f` on the
+    /// read-write connection if it is free RIGHT NOW, skip entirely if
+    /// anything holds it.
+    ///
+    /// For a best-effort write that sits on a latency-critical path and
+    /// has a later surface to fall back on. `with_index_mut` would park
+    /// the caller for the holder's whole transaction - a tip ingest runs
+    /// ~80 s - and the callers that describe themselves as best-effort
+    /// mean "skip when contended", not "wait for it".
+    ///
+    /// try_lock for the handle, `blocking_db` for the closure: the wait
+    /// is what we refuse, not the work. Winning the lock still buys a
+    /// synchronous SQLite run, which belongs off the async workers for
+    /// the reason `blocking_db` documents.
+    #[cfg(feature = "indexer")]
+    pub(in crate::serve) fn try_with_index_mut<T>(
+        &self,
+        f: impl FnOnce(&mut nzbkit::index::Index) -> Option<T>,
+    ) -> Option<T> {
+        if !self.index_db_wanted() {
+            return None;
         }
-        guard.as_ref().and_then(f)
+        crate::persist::blocking_db(|| {
+            let Ok(mut guard) = self.index.try_lock() else {
+                return None;
+            };
+            if guard.is_none() {
+                *guard = nzbkit::index::Index::open(&self.index_db).ok();
+                if guard.is_some() {
+                    self.index_migrated.store(true, Ordering::Release);
+                }
+            }
+            guard.as_mut().and_then(f)
+        })
     }
 
     /// Retire every read-only connection so the next `with_index_read`
@@ -884,10 +930,18 @@ impl Daemon {
     /// parts first and keeps them (append-only).
     ///
     /// Best-effort by design: it runs after the job is queued and
-    /// published, `with_index_mut` demotes off the async workers, and
-    /// a contended or closed index just means this pairing waits for a
-    /// future surface (the download tail names it again at PAR2/CRC
-    /// strength anyway).
+    /// published, and a contended or closed index just means this
+    /// pairing waits for a future surface (the download tail names it
+    /// again at PAR2/CRC strength anyway).
+    ///
+    /// `try_with_index_mut`, never the blocking form. This runs INSIDE
+    /// `enqueue`, so whatever it waits on, the caller waits on too - and
+    /// the watch folder's scan loop calls `enqueue` serially. Measured
+    /// 14 Aug 2026: four NZBs dropped in together, and because the first
+    /// `enqueue` parked here behind a tip ingest, the other three were
+    /// not even picked up for 40 s. "Waits for a future surface" is what
+    /// this comment always claimed; with the blocking form it waited for
+    /// THIS one instead, on the user's critical path.
     #[cfg(feature = "indexer")]
     pub(in crate::serve) fn record_nzb_pairing(
         &self,
@@ -923,7 +977,7 @@ impl Daemon {
             format!("nzb-{origin}")
         };
         let now = epoch_secs() as i64;
-        let applied = self.with_index_mut(|ix| {
+        let applied = self.try_with_index_mut(|ix| {
             // Probed one id at a time (same cost as the batch form,
             // which loops internally) so each release's MATCHED id set
             // is known: the canonical MsgidSet key digests the matched

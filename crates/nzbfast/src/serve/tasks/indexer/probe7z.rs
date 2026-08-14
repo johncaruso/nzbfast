@@ -146,14 +146,18 @@ pub(super) async fn probe_fetch(
 async fn run_sevenz_probe(
     conn: &mut nzbkit::nntp::Connection,
     vols: &[nzbkit::index::ProbeFile],
+    spent: &mut (u64, u64),
 ) -> Result<ProbeRun, nzbkit::nntp::NntpError> {
+    // `spent` is an out-param so a mid-run connection error does not drop
+    // the wire spend already paid: the caller's Err arm used to log
+    // fetchfail as 0/0 and skip the token debit, under-counting the lane
+    // (14 Aug sweep).
     use nzbkit::nameprobe;
-    let mut spent = (0u64, 0u64);
     // Head: the archive's first bytes, wherever the poster put them.
     let first = &vols[0];
     let mut head: Option<Vec<u8>> = None;
     for (_, msgid, _) in first.segments.iter().take(3) {
-        if let Some(dec) = probe_fetch(conn, msgid, &mut spent).await?
+        if let Some(dec) = probe_fetch(conn, msgid, spent).await?
             && dec.offset() == 0
             && dec.data.len() >= 32
         {
@@ -178,7 +182,7 @@ async fn run_sevenz_probe(
     let mut have: u64 = 0;
     let mut verdict: Option<Result<Vec<nzbkit::nameprobe::SevenzEntryInfo>, ()>> = None;
     for (_, msgid, _) in last.segments.iter().rev().take(PROBE7Z_TAIL_MAX) {
-        let Some(dec) = probe_fetch(conn, msgid, &mut spent).await? else {
+        let Some(dec) = probe_fetch(conn, msgid, spent).await? else {
             return Ok(ProbeRun::new("fetchfail", false, spent.0, spent.1));
         };
         have += dec.data.len() as u64;
@@ -317,9 +321,11 @@ pub(in crate::serve) struct RarNameRun {
 pub(in crate::serve) async fn run_rar_probe(
     conn: &mut nzbkit::nntp::Connection,
     files: &[nzbkit::index::ProbeFile],
+    spent: &mut (u64, u64),
 ) -> Result<RarNameRun, nzbkit::nntp::NntpError> {
+    // Out-param for the same reason as `run_sevenz_probe`: spend paid
+    // before a connection error must reach the caller's tallies.
     use nzbkit::nameprobe;
-    let mut spent = (0u64, 0u64);
     let vols = rar_probe_volumes(files);
     if vols.is_empty() {
         return Ok(RarNameRun {
@@ -344,7 +350,7 @@ pub(in crate::serve) async fn run_rar_probe(
         else {
             continue;
         };
-        let Some(dec) = probe_fetch(conn, msgid, &mut spent).await? else {
+        let Some(dec) = probe_fetch(conn, msgid, spent).await? else {
             continue;
         };
         if dec.offset() != 0 {
@@ -509,7 +515,8 @@ pub(in crate::serve) fn spawn_probe7z(daemon: &Arc<Daemon>, config: &std::path::
                     }
                 }
                 let Some((_, c)) = conn.as_mut() else { break };
-                match run_sevenz_probe(c, &vols).await {
+                let mut spent = (0u64, 0u64);
+                match run_sevenz_probe(c, &vols, &mut spent).await {
                     Ok(run) => {
                         tokens -= (run.articles.max(1)) as f64;
                         if run.outcome == "encrypted" {
@@ -570,8 +577,11 @@ pub(in crate::serve) fn spawn_probe7z(daemon: &Arc<Daemon>, config: &std::path::
                     Err(e) => {
                         // Connection trouble: log, cool the host off,
                         // reconnect on a later tick. The stamped row
-                        // retries on its own rotation.
-                        d.with_index(|ix| ix.probe7z_note(now, "fetchfail", 0, 0).ok());
+                        // retries on its own rotation. The spend paid
+                        // before the failure still counts - against the
+                        // tally AND the token bucket.
+                        tokens -= (spent.0.max(1)) as f64;
+                        d.with_index(|ix| ix.probe7z_note(now, "fetchfail", spent.0, spent.1).ok());
                         if let Some((s, c)) = conn.take() {
                             warn!(target: "probe7z", "{}: {e}", s.host);
                             cooldown.insert(

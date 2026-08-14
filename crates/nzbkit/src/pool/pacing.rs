@@ -8,10 +8,11 @@ use super::PoolConfig;
 use std::time::Duration;
 
 /// Adaptive timeout decomposition (TODO 96.1), all behind
-/// `PoolConfig::adaptive_timeout`. Budget clamps mirror nntppool's
-/// field-tested 2-10 s window; the stall bound is the rolling
-/// no-progress deadline once bytes flow.
-pub(super) const ADAPTIVE_FIRST_BYTE_MIN: Duration = Duration::from_secs(2);
+/// `PoolConfig::adaptive_timeout`. The budget window started as
+/// nntppool's field-tested 2-10 s; the floor was raised to 4 s on the
+/// 14 Aug 2026 A/B (see [`adaptive_first_byte_min_ms`]). The stall
+/// bound is the rolling no-progress deadline once bytes flow.
+pub(super) const ADAPTIVE_FIRST_BYTE_MIN: Duration = Duration::from_secs(4);
 pub(super) const ADAPTIVE_FIRST_BYTE_MAX: Duration = Duration::from_secs(10);
 pub(super) const ADAPTIVE_STALL: Duration = Duration::from_secs(8);
 /// TODO 121.1: hard ceiling of the PER-ARTICLE pre-byte escalation
@@ -104,7 +105,8 @@ pub(super) fn ttfb_budget_ms(ewma_ms: u64) -> u64 {
     (4 * ewma_ms).clamp(adaptive_first_byte_min_ms(), adaptive_first_byte_max_ms())
 }
 
-/// The pre-byte FLOOR, `NZBFAST_TTFB_FLOOR_MS` (default: unchanged).
+/// The pre-byte FLOOR, `NZBFAST_TTFB_FLOOR_MS` (default 4 s, raised
+/// from 2 s on 14 Aug 2026).
 ///
 /// Providers answer in tens of ms, so `4 x EWMA` lands far below the
 /// floor and every server budgets at exactly this value - which makes
@@ -116,9 +118,31 @@ pub(super) fn ttfb_budget_ms(ewma_ms: u64) -> u64 {
 /// provider lost 11 sessions in 53 s that way, every one of them our
 /// own budget (no peer ever closed). Raising
 /// NZBFAST_READ_TIMEOUT_SECS does not help: it lifts the CEILING,
-/// which never binds. Left at the shipped 2 s until the A/B says a
-/// wider floor keeps the dead-air payout (deadair 166 s -> 26 s) that
-/// the adaptive path exists for.
+/// which never binds.
+///
+/// THE A/B THIS COMMENT ASKED FOR, 14 Aug 2026, both phases on a
+/// 10 GbE box against a six-provider fleet. The dead-air payout
+/// survives, which is the only thing that was holding it at 2 s:
+///
+/// - Chaos rig `deadair`/`deadair-dial`, 300 MB: 26.5 s at the 2 s
+///   floor, 30.5 s at 4 s, against a 22-23 s clean floor - and 59 s
+///   with the adaptive path switched off, which is the number the
+///   payout is measured against (the rival field pays 66-260 s). Every
+///   leg hash-gated 3/3 and reported the SAME 12 reconnects, 12/12
+///   "our pre-byte budget", at both floors: the stalls are all still
+///   found, only later. They overlap across the pool instead of
+///   serialising, so doubling the floor costs about 4 s, not double.
+///   8 s costs 34.5 s, so the curve is ~4 s per doubling and the
+///   payout does not fall off a cliff there either.
+/// - What it buys, apollo13 across the 6-provider fleet: 22 and 12
+///   fleet reconnects at 2 s against 10 and 7 at 4 s, 100% of them our
+///   own budget at BOTH floors ("peer closed" never appeared once),
+///   with aggregate throughput unchanged - 5.70/6.62 Gbps against
+///   5.65/6.36, identical byte-for-byte output on all four legs.
+///
+/// So the floor buys back roughly half the fleet's self-inflicted
+/// session teardowns for ~4 s on the one profile that is pure dead
+/// air, and nothing on a clean one (23 s vs 22 s).
 pub(super) fn adaptive_first_byte_min_ms() -> u64 {
     static M: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *M.get_or_init(|| {
@@ -136,9 +160,10 @@ pub(super) fn adaptive_first_byte_min_ms() -> u64 {
 /// The per-server escalation (`note_ttfb_timeout`) is not enough on its
 /// own: fast pipelined samples decay the EWMA back toward the floor
 /// between a slow article's retries, so all `article_retries` attempts
-/// could run at the 2 s floor and a healthy cold-storage article
-/// (12-25 s first byte) died with no knob to save it (§121.1, measured
-/// in the 5 Aug sweep). The article's OWN expiry count escalates ITS
+/// could run at the floor (2 s when this was written, 4 s since
+/// 14 Aug 2026) and a healthy cold-storage article (12-25 s first
+/// byte) died with no knob to save it (§121.1, measured in the 5 Aug
+/// sweep). The article's OWN expiry count escalates ITS
 /// next attempt from the adaptive ceiling upward - 10 s, 20 s, 30 s -
 /// so the retry allowance probes upward for that article while the
 /// server's budget stays trained for everyone else. An env-lifted
@@ -171,8 +196,9 @@ pub(super) fn adaptive_first_byte_max_ms() -> u64 {
 
 /// TTFB-suspicion bound (TODO 115): pre-byte silence past this makes an
 /// article a hedge candidate. 2x the server's TTFB EWMA, floored at 1 s -
-/// half the adaptive budget's own floor, so on a healthy-history server
-/// suspicion always fires with a full second of budget left to win in.
+/// a quarter of the adaptive budget's own floor since that went to 4 s
+/// (it was half at the original 2 s), so on a healthy-history server
+/// suspicion always fires with whole seconds of budget left to win in.
 /// A server whose honest TTFB is near the second (high-RTT satellite)
 /// pushes the bound out with the EWMA instead of hedging every article.
 /// 0 ("unmeasured") keeps the floor: no history means no reason to wait.

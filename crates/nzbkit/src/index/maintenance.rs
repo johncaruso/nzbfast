@@ -668,7 +668,18 @@ impl Index {
                     .query_row("SELECT COALESCE(MAX(id),0) FROM releases", [], |r| r.get(0))?;
             cursor = hi.min(survived);
             self.kv_set("par2_fold_cursor", &cursor.to_string())?;
-            if hi >= top {
+            // Caught up two ways, and the second one matters: `hi`
+            // reached the top this call started from, OR the rows above
+            // `hi` are GONE because this fold deleted them, so
+            // `survived` has collapsed to at or below the cursor and
+            // the `top` read at entry can never be reached. Without
+            // that second test the loop re-queries an empty id range,
+            // advancing nothing, until its whole budget is spent -
+            // measured on the 20,001-member fixture in predb_tests: the
+            // fold itself finished in well under a second and the call
+            // then span for the remaining 4 s of a 5 s budget, and
+            // reported "not caught up" so the lap never completed.
+            if hi >= top || cursor >= survived {
                 reached_top = true;
                 break;
             }
@@ -882,52 +893,93 @@ impl Index {
             return Ok((0, 0, true));
         }
         let call_top = cursor.saturating_add(STRIDE).min(top);
+        let deadline = started + budget;
         let (mut groups, mut folded) = (0usize, 0usize);
         let mut reached_top = false;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        loop {
-            let hi = cursor.saturating_add(SUB_STRIDE).min(call_top);
-            // Cheap SQL prefilter; `stem_is_a_name` is the real test
-            // and runs on the Rust side. files=1 is the shattered
-            // shape (one file row holding one segment).
-            let cands: Vec<String> = {
-                let mut stmt = self.db.prepare_cached(
-                    "SELECT DISTINCT stem FROM releases
-                      WHERE id>?1 AND id<=?2 AND junk>=70 AND pre_title=''
-                        AND files=1 AND need_parts>0
-                        AND LENGTH(stem) >= 16",
-                )?;
-                stmt.query_map([cursor, hi], |r| r.get(0))?
-                    .collect::<rusqlite::Result<_>>()?
-            };
-            for stem in cands {
-                if crate::release::stem_is_a_name(&stem) || !seen.insert(stem.clone()) {
-                    continue;
+        // The loop runs inside a closure so EVERY exit - normal break, a
+        // mid-pass SQL error, a deadline bail - flows through the tally
+        // flush below. Each group's fold commits its own transaction, so
+        // work done before an error is real and must be counted; the old
+        // shape lost it to the `?` (14 Aug sweep).
+        let run: rusqlite::Result<()> = (|| {
+            'pass: loop {
+                let hi = cursor.saturating_add(SUB_STRIDE).min(call_top);
+                // Cheap SQL prefilter; `stem_is_a_name` is the real test
+                // and runs on the Rust side. files=1 is the shattered
+                // shape (one file row holding one segment).
+                let cands: Vec<String> = {
+                    let mut stmt = self.db.prepare_cached(
+                        "SELECT DISTINCT stem FROM releases
+                          WHERE id>?1 AND id<=?2 AND junk>=70 AND pre_title=''
+                            AND files=1 AND need_parts>0
+                            AND LENGTH(stem) >= 16",
+                    )?;
+                    stmt.query_map([cursor, hi], |r| r.get(0))?
+                        .collect::<rusqlite::Result<_>>()?
+                };
+                for stem in cands {
+                    if crate::release::stem_is_a_name(&stem) || !seen.insert(stem.clone()) {
+                        continue;
+                    }
+                    let (g, n, complete) = self.shatter_fold_stem(&stem, now, deadline)?;
+                    groups += g;
+                    folded += n;
+                    if !complete {
+                        // Time ran out inside this stem. Leave the
+                        // cursor at the substride START so the next call
+                        // revisits the remainder (already-folded groups
+                        // rescan to nothing) - advancing it would orphan
+                        // the unfolded rows forever, since the cursor
+                        // never returns below its park.
+                        break 'pass;
+                    }
                 }
-                let (g, n) = self.shatter_fold_stem(&stem, now)?;
-                groups += g;
-                folded += n;
+                // Clamp to the surviving maximum for the same
+                // delete-and-recreate interleaving `par2_sidecar_fold`
+                // guards against.
+                let survived: i64 =
+                    self.db
+                        .query_row("SELECT COALESCE(MAX(id),0) FROM releases", [], |r| r.get(0))?;
+                cursor = hi.min(survived);
+                self.kv_set("shatter_fold_cursor", &cursor.to_string())?;
+                // Caught up two ways, and the second one matters: `hi`
+                // reached the top this call started from, OR the rows above
+                // `hi` are GONE because this fold deleted them, so
+                // `survived` has collapsed to at or below the cursor and
+                // the `top` read at entry can never be reached. Without
+                // that second test the loop re-queries an empty id range,
+                // advancing nothing, until its whole budget is spent -
+                // measured on the 20,001-member fixture in predb_tests: the
+                // fold itself finished in well under a second and the call
+                // then span for the remaining 4 s of a 5 s budget, and
+                // reported "not caught up" so the lap never completed.
+                if hi >= top || cursor >= survived {
+                    reached_top = true;
+                    break;
+                }
+                if hi >= call_top || started.elapsed() >= budget {
+                    break;
+                }
             }
-            // Clamp to the surviving maximum for the same
-            // delete-and-recreate interleaving `par2_sidecar_fold`
-            // guards against.
-            let survived: i64 =
-                self.db
-                    .query_row("SELECT COALESCE(MAX(id),0) FROM releases", [], |r| r.get(0))?;
-            cursor = hi.min(survived);
-            self.kv_set("shatter_fold_cursor", &cursor.to_string())?;
-            if hi >= top {
-                reached_top = true;
-                break;
-            }
-            if hi >= call_top || started.elapsed() >= budget {
-                break;
-            }
-        }
+            Ok(())
+        })();
         // Lifetime tallies for the settings-card census: the per-pass
         // log line scrolls away, and "how much of the dark band has
         // been merged" needs running totals.
         if folded > 0 {
+            // The counters postdate the fold itself (v1.1.1 shipped the
+            // fold and the lap marker, the tallies came later), so a
+            // database whose first lap predates them has merged rows
+            // nothing ever counted. Stamp that fact now, before the
+            // counter keys exist: once they do, the absence that proved
+            // it is gone and the totals would read as lifetime numbers.
+            if self.kv_get("shatter_fold_lap_v1").is_some()
+                && self.kv_get("shatter_fold_rows").is_none()
+                && self.kv_get("shatter_fold_groups").is_none()
+            {
+                self.kv_set("shatter_fold_census_partial", "1")?;
+            }
             for (key, add) in [
                 ("shatter_fold_rows", folded),
                 ("shatter_fold_groups", groups),
@@ -936,9 +988,19 @@ impl Index {
                 self.kv_set(key, &(cur + add as u64).to_string())?;
             }
         }
+        run?;
         let done = reached_top;
         if done && self.kv_get("shatter_fold_lap_v1").is_none() {
             self.kv_set("shatter_fold_lap_v1", "1")?;
+            // A lap completed under counter-aware code has counted every
+            // merge it made, so materialize zeroes: without the keys this
+            // database would be indistinguishable from a pre-counter one
+            // and read as "lifetime unknown" forever.
+            for key in ["shatter_fold_rows", "shatter_fold_groups"] {
+                if self.kv_get(key).is_none() {
+                    self.kv_set(key, "0")?;
+                }
+            }
             // The folded rows are the first time this band has real
             // sizes and times - exactly what the correlation walks
             // score on. Re-open them once.
@@ -955,21 +1017,28 @@ impl Index {
     /// merged and postings made whole, plus how far the current sweep
     /// has got. Read-only; same readout contract as `probe7z_stats`.
     pub fn shatter_fold_stats(&self) -> serde_json::Value {
-        let kv_u64 = |k: &str| {
-            self.kv_get(k)
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0)
-        };
+        let kv_u64 = |k: &str| self.kv_get(k).and_then(|v| v.parse::<u64>().ok());
         let top: i64 = self
             .db
             .query_row("SELECT COALESCE(MAX(id),0) FROM releases", [], |r| r.get(0))
             .unwrap_or(0);
+        let rows = kv_u64("shatter_fold_rows");
+        let groups = kv_u64("shatter_fold_groups");
+        let first_lap = self.kv_get("shatter_fold_lap_v1").is_some();
+        // A pre-counter database: either stamped as such the moment the
+        // counters were first written, or still recognizable read-only
+        // by a completed lap with no counter keys. Its totals are
+        // since-upgrade, not lifetime, and the card must say so instead
+        // of quoting a confident zero.
+        let partial = self.kv_get("shatter_fold_census_partial").is_some()
+            || (first_lap && rows.is_none() && groups.is_none());
         serde_json::json!({
-            "rows_folded": kv_u64("shatter_fold_rows"),
-            "postings": kv_u64("shatter_fold_groups"),
-            "cursor": kv_u64("shatter_fold_cursor"),
+            "rows_folded": rows.unwrap_or(0),
+            "postings": groups.unwrap_or(0),
+            "lifetime_known": !partial,
+            "cursor": kv_u64("shatter_fold_cursor").unwrap_or(0),
             "top": top,
-            "first_lap_done": self.kv_get("shatter_fold_lap_v1").is_some(),
+            "first_lap_done": first_lap,
         })
     }
 
@@ -986,8 +1055,19 @@ impl Index {
     /// hazard the part-total class gate exists to stop, one level up.
     /// So the filename is part of the fold key.
     ///
-    /// Returns (postings folded, rows folded away).
-    fn shatter_fold_stem(&mut self, stem: &str, now: i64) -> rusqlite::Result<(usize, usize)> {
+    /// Returns (postings folded, rows folded away, complete). `complete`
+    /// is false when `deadline` passed mid-stem: the caller must NOT
+    /// advance its cursor past this stem's substride, so the remainder
+    /// is revisited on the next call. The per-group batch walk used to
+    /// ignore the pass budget entirely, and a single 200k-member posting
+    /// held the index write mutex for the whole multi-batch fold
+    /// (14 Aug sweep).
+    fn shatter_fold_stem(
+        &mut self,
+        stem: &str,
+        now: i64,
+        deadline: std::time::Instant,
+    ) -> rusqlite::Result<(usize, usize, bool)> {
         let names: Vec<String> = {
             let mut stmt = self.db.prepare_cached(
                 "SELECT DISTINCT f.filename
@@ -1000,13 +1080,16 @@ impl Index {
         };
         let (mut groups, mut folded) = (0usize, 0usize);
         for name in names {
-            let n = self.shatter_fold_group(stem, &name, now)?;
+            let (n, complete) = self.shatter_fold_group(stem, &name, now, deadline)?;
             if n > 0 {
                 groups += 1;
                 folded += n;
             }
+            if !complete || std::time::Instant::now() >= deadline {
+                return Ok((groups, folded, false));
+            }
         }
-        Ok((groups, folded))
+        Ok((groups, folded, true))
     }
 
     /// Fold every dark single-file row wearing `stem` and holding
@@ -1014,7 +1097,13 @@ impl Index {
     /// member, unioning their segment lists by part number. Returns
     /// rows folded away (0 = nothing to do or the group failed a
     /// gate).
-    fn shatter_fold_group(&mut self, stem: &str, fname: &str, now: i64) -> rusqlite::Result<usize> {
+    fn shatter_fold_group(
+        &mut self,
+        stem: &str,
+        fname: &str,
+        now: i64,
+        deadline: std::time::Instant,
+    ) -> rusqlite::Result<(usize, bool)> {
         // Hard cap keeps the id list bounded. A posting bigger than
         // the cap folds over successive PASSES of this same call (see
         // the loop below): the cursor parks at the top id once the lap
@@ -1050,7 +1139,13 @@ impl Index {
             // batch made no progress (a gate refused it - looping
             // would spin).
             if !capped || n == 0 {
-                return Ok(folded);
+                return Ok((folded, true));
+            }
+            // Each batch commits its own transaction, so stopping here
+            // is clean - but the remainder must be REVISITED, which is
+            // what the false `complete` makes the top-level cursor do.
+            if std::time::Instant::now() >= deadline {
+                return Ok((folded, false));
             }
         }
     }
@@ -1330,8 +1425,73 @@ impl Index {
     /// the behaviour we want - `compact_pending` is sticky, so the
     /// migration simply retries at the next idle moment.
     pub fn compact(&self) -> rusqlite::Result<()> {
-        self.db
-            .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM")
+        let vacuumed = self
+            .db
+            .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM");
+        // Hand the WAL spike back HERE rather than at whatever later
+        // checkpoint happens to reset it. VACUUM is one transaction over
+        // the whole database, so it leaves a write-ahead log the size of
+        // the database - 28.1 GiB of it on the live index, still sitting
+        // there weeks later (see `WAL_SIZE_LIMIT` for the measurement).
+        // `journal_size_limit` alone would cap that eventually, but only
+        // at the next reset, and this is the one moment we know both
+        // that the WAL is enormous and that nothing else wants the
+        // database: the compaction loop only runs at idle.
+        //
+        // Best-effort by design. If a reader does arrive first TRUNCATE
+        // reports busy in its result row rather than failing, and the
+        // size limit is still there to catch it. An interrupted VACUUM
+        // lands here with the interrupt flag still set and simply skips
+        // - same fallback. Neither outcome may mask the VACUUM's own
+        // result, which is what the caller acts on.
+        let _ = self
+            .db
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        vacuumed
+    }
+
+    /// Fold the write-ahead log back into the database file and cut the
+    /// -wal to nothing, waiting at most `wait` for whoever is in the
+    /// way. `Ok(false)` is "someone was still reading": the frames it
+    /// managed to copy are copied either way, the log is simply still
+    /// on disk.
+    ///
+    /// This exists for the way out. A WAL database that is CLOSED
+    /// checkpoints on the way and deletes its -wal and -shm, but the
+    /// daemon does not leave by dropping things - it leaves by
+    /// `std::process::exit`, and on `mode=restart` by `exec`, neither of
+    /// which runs a destructor. So every stop this daemon has ever made
+    /// left the whole log behind for the next start to recover.
+    /// Measured 14 Aug 2026: SIGTERM, process gone, port free, and a
+    /// 28.1 GiB `index.db-wal` plus a 6.9 MiB `-shm` still sitting
+    /// beside the database.
+    ///
+    /// `wait` replaces the connection's 10 s busy timeout for this call
+    /// and is put back after it. TRUNCATE waits for readers to catch up
+    /// to the latest snapshot, and the caller is an exit with a budget
+    /// it would rather keep than spend: a log left behind costs the next
+    /// start a recovery pass, which is exactly what happens today, while
+    /// an exit that overruns costs a SIGKILL.
+    pub fn checkpoint_truncate(&self, wait: std::time::Duration) -> rusqlite::Result<bool> {
+        // Read it back rather than assuming `open`'s figure: this is a
+        // public method on a connection whose timeout the caller may
+        // have set, and it has no business changing it permanently.
+        let previous: i64 = self
+            .db
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap_or(10_000);
+        self.db.busy_timeout(wait)?;
+        // The result row is (busy, log frames, checkpointed frames) and
+        // a checkpoint that could not finish reports itself in `busy`
+        // rather than failing the statement - so `?` here is a real
+        // error (the database went away), not contention.
+        let busy: i64 = self
+            .db
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        let _ = self
+            .db
+            .busy_timeout(std::time::Duration::from_millis(previous.max(0) as u64));
+        Ok(busy == 0)
     }
 
     /// Free pages this database is holding that `compact_chunk` could
@@ -1986,5 +2146,93 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exit path's checkpoint: fold the log into the database and
+    /// leave nothing behind.
+    ///
+    /// This is what a proper CLOSE does for free, and the daemon never
+    /// closes - it exits through `process::exit` or `exec`. So the whole
+    /// write-ahead log survived every stop, and the next start recovered
+    /// it instead of opening a database that was already whole.
+    #[test]
+    fn checkpoint_truncate_leaves_no_write_ahead_log() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-ckpt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+        let ix = Index::open(&db).unwrap();
+        ix.kv_set("probe", "before").unwrap();
+        let wal = dir.join("index.db-wal");
+        assert!(
+            wal.metadata().map(|m| m.len()).unwrap_or(0) > 0,
+            "fixture wrote nothing to the log - the assertion below would prove nothing"
+        );
+
+        assert!(
+            ix.checkpoint_truncate(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "nothing else holds this database, so the checkpoint had no reason to report busy"
+        );
+
+        assert_eq!(
+            wal.metadata().map(|m| m.len()).unwrap_or(0),
+            0,
+            "the log is still on disk after a truncating checkpoint"
+        );
+        // And the point of folding it in: the data is in the database
+        // file itself, so the next open has nothing to recover.
+        drop(ix);
+        let reopened = Index::open(&db).unwrap();
+        assert_eq!(reopened.kv_get("probe").as_deref(), Some("before"));
+        teardown(&dir, reopened);
+    }
+
+    /// A reader that has not caught up blocks a TRUNCATE checkpoint, and
+    /// the caller is an exit with a budget. It must come back with
+    /// `false` inside the wait it asked for rather than sitting on the
+    /// connection's own 10 s busy timeout.
+    #[test]
+    fn checkpoint_truncate_gives_up_on_a_reader_inside_its_wait() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-ckptb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+        let ix = Index::open(&db).unwrap();
+        ix.kv_set("probe", "one").unwrap();
+
+        // A read transaction left open on a second connection: the
+        // shape of a query handler holding a pooled read connection
+        // when the signal arrives.
+        let reader = Index::open_read_only(&db).unwrap();
+        reader.db.execute_batch("BEGIN").unwrap();
+        assert_eq!(reader.kv_get("probe").as_deref(), Some("one"));
+        // Written after the reader pinned its snapshot, so the log now
+        // holds frames that reader cannot see - which is precisely what
+        // a checkpoint may not overwrite.
+        ix.kv_set("probe", "two").unwrap();
+
+        let started = std::time::Instant::now();
+        let truncated = ix
+            .checkpoint_truncate(std::time::Duration::from_millis(300))
+            .unwrap();
+        let took = started.elapsed();
+
+        assert!(!truncated, "a pinned reader must be reported, not ignored");
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "waited {took:?} - the wait argument was ignored and this fell back \
+             to the connection's own 10 s busy timeout"
+        );
+        // The timeout it borrowed is put back, not left at 300 ms.
+        let restored: i64 = ix
+            .db
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(restored, 10_000, "the busy timeout was not put back");
+
+        reader.db.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        teardown(&dir, ix);
     }
 }

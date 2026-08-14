@@ -207,6 +207,39 @@ pub(crate) fn redact_url_creds(s: &str) -> String {
     out
 }
 
+/// Scrub an error that came out of an indexer's own RESPONSE BODY.
+///
+/// [`redact_apikey`] and [`redact_url_creds`] both guard errors we
+/// built, whose text we therefore know the shape of. This guards text
+/// the far end wrote. Newznab reports protocol errors with HTTP 200, so
+/// the body arrives AFTER every transport-level scrub has run, and its
+/// `<error description>` is echoed verbatim to Test results, search
+/// notes, the wall and the logs. Indexers routinely reflect the request
+/// back - `description="invalid apikey=SECRET"` - and some spell the key
+/// no particular way at all, so the `apikey=` pass alone is not enough:
+/// the configured value itself is blanked wherever it appears (14 Aug
+/// sweep). Keys shorter than 8 characters are left alone; blanking a
+/// 3-character string would redact ordinary prose.
+pub(super) fn scrub_indexer_body_error(
+    e: crate::newznab::NewznabError,
+    apikey: &str,
+) -> crate::newznab::NewznabError {
+    use crate::newznab::NewznabError as E;
+    let clean = |m: &str| {
+        let m = redact_apikey(m);
+        if apikey.len() >= 8 {
+            m.replace(apikey, "***")
+        } else {
+            m
+        }
+    };
+    match e {
+        E::Auth(c, m) => E::Auth(c, clean(&m)),
+        E::Limit(c, m) => E::Limit(c, clean(&m)),
+        E::Api(c, m) => E::Api(c, clean(&m)),
+    }
+}
+
 pub(super) fn indexer_fetch(
     url: &str,
 ) -> std::result::Result<String, crate::newznab::NewznabError> {
@@ -255,7 +288,7 @@ pub(super) fn indexer_search_one(
     let (body, addrs) = witness_resolution(&url_netloc(&cfg.url), || indexer_fetch(&url));
     let body = body?;
     if let Some(e) = crate::newznab::parse_error(&body) {
-        return Err(e);
+        return Err(scrub_indexer_body_error(e, &cfg.apikey));
     }
     Ok((
         crate::newznab::parse_results(&body),
@@ -304,7 +337,7 @@ pub(super) fn indexer_caps_one(
 ) -> std::result::Result<crate::newznab::Caps, crate::newznab::NewznabError> {
     let body = indexer_fetch(&crate::newznab::caps_url(cfg))?;
     if let Some(e) = crate::newznab::parse_error(&body) {
-        return Err(e);
+        return Err(scrub_indexer_body_error(e, &cfg.apikey));
     }
     let caps = crate::newznab::parse_caps(&body);
     if !caps.search && caps.server.is_empty() && caps.categories.is_empty() {

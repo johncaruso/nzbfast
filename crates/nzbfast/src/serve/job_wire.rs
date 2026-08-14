@@ -19,6 +19,7 @@ pub(in crate::serve) fn job_json(j: &Job) -> Value {
         "out_dir": j.out_dir.to_string_lossy(),
         "fail_message": j.fail_message,
         "fail_detail": j.fail_detail,
+        "delete_status": j.delete_status,
         "priority": j.priority,
         "paused": j.paused,
         "retries": j.retries,
@@ -177,6 +178,7 @@ pub(in crate::serve) fn job_from_json(v: &Value) -> Option<Job> {
         fetched: v.get("fetched").and_then(Value::as_bool).unwrap_or(false),
         tombstone: false,
         del_on_drop: false,
+        delete_status: s("delete_status").unwrap_or_default(),
         suspended: false,
         downloaded_bytes: v
             .get("downloaded_bytes")

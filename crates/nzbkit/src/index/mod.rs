@@ -38,6 +38,7 @@ mod query;
 mod schema;
 mod scoreboard;
 mod searchlog;
+mod session;
 mod spots;
 #[cfg(test)]
 mod testutil;
@@ -53,8 +54,10 @@ pub use maintenance::*;
 pub use nzbimport::*;
 pub use pesto::*;
 pub use probe::*;
+pub use schema::WAL_SIZE_LIMIT;
 pub use scoreboard::*;
 pub use searchlog::*;
+pub use session::{SessionLink, SessionSibling, TitleSibling};
 pub use spots::*;
 pub use titles::*;
 
@@ -376,6 +379,117 @@ impl Index {
             out.push(b);
             at += step;
         }
+        Ok(out)
+    }
+
+    /// Backtest sampler (M29 scoreboard): up to `want` releases posted
+    /// inside the half-open window `[lo, hi)`, junk-gated exactly like
+    /// [`Index::oracle_pick`] so the scoreboard scores the same
+    /// population routing decisions are made about.
+    ///
+    /// Draws by seeking to pseudo-random instants in the window rather
+    /// than sorting the table: `oracle_pick`'s `ORDER BY` is fine over
+    /// a fresh index and ruinous over a real one (a long-running
+    /// install reaches 32M rows / 42 GB, and this tool reads it while
+    /// the daemon is serving from it).
+    /// Each draw is one `idx_rel_posted` range seek, taking up to three
+    /// consecutive matches so twelve releases cost four seeks, not
+    /// twelve. Those three are neighbours in posting time, which is the
+    /// price of the cheap seek; they are still distinct postings, which
+    /// is what the scoreboard needs.
+    ///
+    /// The sample is uniform over POSTING TIME, not over rows: an hour
+    /// that carried 900 posts is as likely to be drawn from as an hour
+    /// that carried 9. That is the honest bias to have here - it
+    /// spreads the sample across the bucket's whole age range instead
+    /// of concentrating it in whichever hours the scanner ingested most
+    /// heavily - but it is a bias, and a caller comparing rates across
+    /// cells should know it exists.
+    ///
+    /// `grp_like` is an optional SQL LIKE narrowing on the group name
+    /// (`%hdtv%`); it is a prefilter only, callers still have to check
+    /// the exact family, because no index covers `grp` and a group
+    /// family is not a substring match. It is also why `budget` exists:
+    /// when the window holds no rows of that family at all, every seek
+    /// scans the window to its end before answering nothing (measured
+    /// at 2.8 s for one 23-day window), so the draw loop is bounded by
+    /// wall clock, not only by attempts. Returning a short sample is
+    /// correct here; the caller reports what it got.
+    ///
+    /// Returns (id, group, first_posted), ids distinct, oldest first.
+    pub fn oracle_backtest_pick(
+        &self,
+        lo: i64,
+        hi: i64,
+        grp_like: Option<&str>,
+        seed: u64,
+        want: usize,
+        budget: std::time::Duration,
+    ) -> rusqlite::Result<Vec<(i64, String, i64)>> {
+        if want == 0 || hi <= lo {
+            return Ok(Vec::new());
+        }
+        /// Matches taken per seek - see the clustering note above.
+        const PER_SEEK: usize = 3;
+        let like = grp_like.unwrap_or("%");
+        // Next releases at or after an instant, then (when the draw
+        // landed past the last match) the nearest ones before it, so
+        // instants near the top of the window are not wasted draws.
+        let mut fwd = self.db.prepare(
+            "SELECT id, grp, first_posted FROM releases
+             WHERE first_posted >= ?1 AND first_posted < ?2
+               AND junk < 50 AND grp LIKE ?3
+             ORDER BY first_posted LIMIT ?4",
+        )?;
+        let mut back = self.db.prepare(
+            "SELECT id, grp, first_posted FROM releases
+             WHERE first_posted >= ?1 AND first_posted < ?2
+               AND junk < 50 AND grp LIKE ?3
+             ORDER BY first_posted DESC LIMIT ?4",
+        )?;
+        let mut out: Vec<(i64, String, i64)> = Vec::new();
+        let mut seen: std::collections::HashSet<i64> = Default::default();
+        let span = (hi - lo) as u64;
+        let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+        let deadline = std::time::Instant::now() + budget;
+        let seeks = want.div_ceil(PER_SEEK).saturating_mul(3).clamp(4, 64);
+        for _ in 0..seeks {
+            if out.len() >= want || std::time::Instant::now() >= deadline {
+                break;
+            }
+            // SplitMix64 - a named, reproducible generator, so a
+            // scoreboard run can be replayed against the same releases.
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            let t = lo + (z % span.max(1)) as i64;
+            let rows = |st: &mut rusqlite::Statement<'_>, a: i64, b: i64| {
+                st.query_map(rusqlite::params![a, b, like, PER_SEEK as i64], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })
+                .and_then(|m| m.collect::<rusqlite::Result<Vec<_>>>())
+                .unwrap_or_default()
+            };
+            let mut hit = rows(&mut fwd, t, hi);
+            if hit.is_empty() {
+                hit = rows(&mut back, lo, t);
+            }
+            for row in hit {
+                if out.len() >= want {
+                    break;
+                }
+                if seen.insert(row.0) {
+                    out.push(row);
+                }
+            }
+        }
+        out.sort_by_key(|r| r.2);
         Ok(out)
     }
 

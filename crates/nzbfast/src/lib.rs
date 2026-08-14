@@ -48,6 +48,8 @@ pub mod logging;
 mod nettools;
 mod newznab;
 mod notify;
+#[cfg(feature = "indexer")]
+mod oracle_backtest;
 mod persist;
 // TODO 151 (issue #36): the first list source's own wire formats.
 mod plex;

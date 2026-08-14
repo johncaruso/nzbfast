@@ -170,7 +170,23 @@ fn m_wall_fix(
                 // Manual: keep id/rating/art/imdb/cast, take
                 // the typed text; absent fields keep their
                 // old values.
-                let old = d.with_index(|ix| ix.title_get(&key).ok().flatten());
+                //
+                // index_read_checked, not with_index_read: this
+                // read IS the "keep" half, and its `None` feeds
+                // `unwrap_or_default()` straight into title_fill -
+                // a zeroed row that blanks the poster, rating,
+                // imdb id and cast the user was not editing. A
+                // saturated read pool must stop the edit and say
+                // so, never strip it silently.
+                let old = match d.index_read_checked(|ix| ix.title_get(&key).ok().flatten()) {
+                    Ok(old) => old,
+                    Err(_) => {
+                        return Some(json!({
+                            "status": false,
+                            "error": "the index is busy - try again in a moment",
+                        }));
+                    }
+                };
                 let (oid, orating, opost, obd, oview, ogen, oimdb, oact, oair) = old
                     .map(|t| {
                         (
@@ -264,9 +280,19 @@ fn m_wall_art(
                 Some(b) if !looks_image(&b) => {
                     json!({"status": false, "error": "that isn't an image (JPEG/PNG/GIF/WebP)"})
                 }
-                Some(b) => match d.with_index(|ix| ix.title_get(&key).ok().flatten()) {
-                    None => json!({"status": false, "error": "unknown title key"}),
-                    Some(t) => {
+                // index_read_checked, not with_index_read: a busy
+                // read pool is not an unknown key. Flattening the
+                // two would tell the user their title does not
+                // exist because a scan batch happened to be
+                // running, and send them off to fix the wrong
+                // thing - after they already uploaded the file.
+                Some(b) => match d.index_read_checked(|ix| ix.title_get(&key).ok().flatten()) {
+                    Err(_) => json!({
+                        "status": false,
+                        "error": "the index is busy - try again in a moment",
+                    }),
+                    Ok(None) => json!({"status": false, "error": "unknown title key"}),
+                    Ok(Some(t)) => {
                         let art = d.spool.join("art");
                         let _ = std::fs::create_dir_all(&art);
                         let name = crate::wall::art_name(&key, false);
@@ -472,6 +498,35 @@ fn m_title_credits(
     })
 }
 
+fn m_wall_session(
+    d: &Arc<Daemon>,
+    _req: &mut tiny_http::Request,
+    params: &std::collections::HashMap<String, String>,
+    _ctx: &ApiCtx<'_>,
+    _api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    Some({
+        let key = params.get("key").cloned().unwrap_or_default();
+        let rows = d
+            .with_index_read(|ix| ix.title_session_siblings(&key, 40).ok())
+            .unwrap_or_default();
+        json!({"status": true, "siblings": rows.iter().map(|t| json!({
+                    "id": t.sib.rel.id,
+                    "name": t.sib.rel.display_name(),
+                    // The raw stem rides along only when a fed name is
+                    // shown, same contract as index_browse's "posted".
+                    "posted": if t.sib.rel.pre_title.is_empty() { Value::Null }
+                              else { Value::String(t.sib.rel.stem.clone()) },
+                    "group": t.sib.rel.grp,
+                    "size": t.sib.rel.total_bytes,
+                    "complete": t.sib.rel.complete,
+                    "link": t.sib.link.tag(),
+                    "dt": t.sib.dt,
+                    "anchor": t.anchor_id,
+                })).collect::<Vec<_>>()})
+    })
+}
+
 fn m_person(
     d: &Arc<Daemon>,
     _req: &mut tiny_http::Request,
@@ -668,8 +723,13 @@ fn m_wall_suggest(
     _api_body: &mut Option<Vec<u8>>,
 ) -> Option<Value> {
     Some({
+        // Pure read - the pooled read-only connection, so the
+        // suggestions panel never parks a worker behind an ingest.
+        // with_index_read, not the checked form: this is a nudge
+        // beside the hide list, and an empty panel for one poll is
+        // the right degradation for it.
         let sug = d
-            .with_index(|ix| ix.hide_suggestions().ok())
+            .with_index_read(|ix| ix.hide_suggestions().ok())
             .unwrap_or_default();
         json!({"suggestions": sug.iter().map(|s| json!({
                         "field": s.field, "value": s.value, "n": s.n,
@@ -800,6 +860,13 @@ pub(in crate::serve) fn dispatch(
         // against 60 joins per grid page for something nobody
         // sees until they open a card.
         "title_credits" => m_title_credits(d, req, params, ctx, api_body),
+        // Upload-session siblings for one title's newest releases -
+        // posts that went up in the same run as an identified episode
+        // and are very probably the rest of the season (research/
+        // FINGERPRINT-next-episode-2026-08-14.md). Detail-sheet only,
+        // one call per open, association evidence: rows are offered,
+        // never renamed.
+        "wall_session" => m_wall_session(d, req, params, ctx, api_body),
         // The person page's instant half: who they are, and every
         // title of theirs already in the index. No network.
         "person" => m_person(d, req, params, ctx, api_body),

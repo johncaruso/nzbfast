@@ -1201,6 +1201,54 @@ fn scoreboard_reference_prefers_the_named_account_and_never_falls_through() {
     });
 }
 
+/// The confirm lane's stats card mirrors `corr_confirm_reference`'s
+/// verdict as four DISTINCT states: the picker deliberately keeps a
+/// vanished account listed, so present-and-enabled, disabled, deleted
+/// and empty must each be tellable apart - a card that only knows
+/// "string present" says "0 of 24 checks used" while every tick is
+/// refused.
+#[test]
+fn corr_confirm_source_state_tells_the_four_states_apart() {
+    with_daemon("ccfstate", |d| {
+        let mk = |name: &str, enabled: bool| crate::newznab::IndexerConfig {
+            name: name.into(),
+            url: "https://geek.test".into(),
+            apikey: "k1".into(),
+            enabled,
+            priority: 0,
+            hits_per_day: 0,
+            grabs_per_day: 0,
+        };
+        // Empty pick.
+        assert_eq!(d.corr_confirm_source_state(), "none");
+        assert!(d.corr_confirm_reference().is_err());
+
+        // Present and enabled.
+        d.indexers.lock_ok().push(mk("geek", true));
+        *d.corr_confirm_source.lock_ok() = "geek".into();
+        assert_eq!(d.corr_confirm_source_state(), "ok");
+        assert!(d.corr_confirm_reference().is_ok());
+
+        // Turned off: the string is still there, the state is not ok.
+        d.indexers.lock_ok()[0].enabled = false;
+        assert_eq!(d.corr_confirm_source_state(), "disabled");
+        assert!(
+            d.corr_confirm_reference()
+                .unwrap_err()
+                .contains("turned off")
+        );
+
+        // Deleted: distinct from turned off.
+        d.indexers.lock_ok().clear();
+        assert_eq!(d.corr_confirm_source_state(), "missing");
+        assert!(
+            d.corr_confirm_reference()
+                .unwrap_err()
+                .contains("no longer in your indexer list")
+        );
+    });
+}
+
 // -- evict policy / predb config --------------------------------------------
 
 #[cfg(feature = "indexer")]
@@ -1870,6 +1918,10 @@ fn an_indexer_confirmed_suggestion_becomes_a_proven_name() {
             grabs_per_day: 0,
         });
         *d.corr_confirm_source.lock_ok() = "mock".into();
+        // Both switches: the confirm lane is a child of correlation
+        // and stands down whenever the parent is off.
+        d.predb_corr_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         d.corr_confirm_enabled
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -2477,5 +2529,228 @@ fn latched_note_queue_idle_never_takes_the_queue_lock() {
             "note_queue_idle with the latch set must answer from the \
              latch, not the queue walk",
         );
+    });
+}
+
+/// The arming edge's empty scan and its latch CAS share one hold of the
+/// queue lock, and an enqueue cannot publish between them (Codex sweep
+/// 14 Aug M3). The pre-fix shape dropped the queue guard after the scan:
+/// removal of a last job A leaves the queue empty, an add of B re-arms
+/// the latch and publishes job.added, and A's notifier - holding a scan
+/// from before B existed - then CASes and announces queue.idle over a
+/// runnable job, with the latch left set so B's own genuine idle edge
+/// could be swallowed too. The seam pins the notifier in exactly that
+/// window; a real enqueue must sit out the window, land after the emit,
+/// and leave the latch re-armed.
+#[test]
+fn an_enqueue_cannot_interleave_into_the_idle_scan_cas_window() {
+    with_daemon("idle-aba", |d| {
+        // The shape the removal of a last job leaves behind: latch
+        // re-armed (false), queue empty.
+        d.queue_idle_latch.store(false, Ordering::Relaxed);
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let released = Arc::new(std::sync::Barrier::new(2));
+        *super::daemon_park::IDLE_CAS_BARRIER.lock_ok() = Some((entered.clone(), released.clone()));
+        let notifier = {
+            let d = d.clone();
+            std::thread::spawn(move || d.note_queue_idle())
+        };
+        // The notifier has scanned the empty queue and is pinned before
+        // its CAS. Disarm the seam so nothing else trips it.
+        entered.wait();
+        *super::daemon_park::IDLE_CAS_BARRIER.lock_ok() = None;
+
+        // Now the add of B, on its own thread - the interleaving's
+        // other half.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let adder = {
+            let d = d.clone();
+            std::thread::spawn(move || {
+                let nzb = "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\
+                     <file poster=\"x\" date=\"0\" subject=\"&quot;b.bin&quot; yEnc (1/1)\">\
+                     <groups><group>g</group></groups><segments>\
+                     <segment bytes=\"1000\" number=\"1\">b1@x</segment>\
+                     </segments></file></nzb>";
+                d.enqueue(
+                    nzb.as_bytes(),
+                    "B.Release.nzb",
+                    "",
+                    -100,
+                    None,
+                    None,
+                    "test",
+                    false,
+                )
+                .expect("enqueue");
+                let _ = tx.send(());
+            })
+        };
+        // Route assertion, not a clock: the add must be waiting on the
+        // queue lock the notifier holds, so it cannot complete while
+        // the window is open. The timeout only bounds how long we watch
+        // for something that must never happen.
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "an enqueue published inside the scan-to-CAS window"
+        );
+        released.wait();
+        notifier.join().expect("notifier");
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the add completes once the notifier's hold ends");
+        adder.join().expect("adder");
+
+        // The serialized order is one the queue really passed through:
+        // idle (it WAS empty), then the add.
+        let (events, _, _) = d.life_since(0);
+        let pos = |k: &str| {
+            events
+                .iter()
+                .position(|e| e["kind"] == k)
+                .unwrap_or_else(|| panic!("no {k} event in {events:?}"))
+        };
+        assert!(
+            pos("queue.idle") < pos("job.added"),
+            "queue.idle announced over a runnable job: {events:?}"
+        );
+        assert!(
+            !d.queue_idle_latch.load(Ordering::Relaxed),
+            "the add must leave the latch re-armed"
+        );
+        // ...so B's own genuine departure still gets its edge.
+        d.queue.lock_ok().clear();
+        d.note_queue_idle();
+        let (events, _, _) = d.life_since(0);
+        let idles = events.iter().filter(|e| e["kind"] == "queue.idle").count();
+        assert_eq!(idles, 2, "exactly one idle edge per transition: {events:?}");
+    });
+}
+
+// -- the exit path closes the index -----------------------------------------
+
+/// The wind-down must hand the index's write-ahead log back and close
+/// the database.
+///
+/// SQLite deletes the -wal and -shm when the last connection closes, and
+/// checkpoints on the way. The daemon never reached that: it leaves by
+/// `process::exit` or `exec`, neither of which runs a destructor, so
+/// every stop it has ever made left the whole log on disk. Measured on
+/// the live daemon 14 Aug 2026 - SIGTERM, process gone, port free, and a
+/// 28.1 GiB `index.db-wal` plus a 6.9 MiB `-shm` still sitting beside a
+/// 39 GiB database, for the next start to recover.
+///
+/// The whole wind-down runs here, not just the index step, because the
+/// wiring is half the fix: this ran to completion for a year without
+/// touching the index at all.
+#[cfg(feature = "indexer")]
+#[test]
+fn the_wind_down_hands_back_the_index_write_ahead_log() {
+    with_daemon("windwal", |d| {
+        d.index_enabled.store(true, Ordering::Relaxed);
+        // Opened and written through the daemon's own accessor, so this
+        // is the connection the exit has to find and close. Before the
+        // runtime exists: `with_index` runs its SQLite work through
+        // `block_in_place` when there is one.
+        d.with_index(|ix| ix.kv_set("shutdown_probe", "written").ok())
+            .expect("the index must open");
+        let wal = d.index_db.with_extension("db-wal");
+        let shm = d.index_db.with_extension("db-shm");
+        assert!(
+            wal.metadata().map(|m| m.len()).unwrap_or(0) > 0,
+            "fixture left no write-ahead log - the assertions below would prove nothing"
+        );
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        wind_down(d, rt.handle(), "test wind-down");
+
+        assert!(
+            !wal.exists(),
+            "the wind-down left {} behind - the index was never closed, so \
+             the next start pays a recovery pass over the whole log",
+            wal.display()
+        );
+        assert!(!shm.exists(), "the wind-down left {} behind", shm.display());
+        // Closed, not merely emptied: what was in the log is in the
+        // database file.
+        let reopened = nzbkit::index::Index::open(&d.index_db).expect("reopen");
+        assert_eq!(
+            reopened.kv_get("shutdown_probe").as_deref(),
+            Some("written"),
+            "the checkpoint dropped the committed rows"
+        );
+        drop(reopened);
+    });
+}
+
+/// ...and nothing reopens it behind the close. A status poll or an *arr
+/// query arriving in the last moments of the wind-down would otherwise
+/// lazily open a fresh connection, and the daemon would exit with a new
+/// -wal and -shm on disk after all.
+#[cfg(feature = "indexer")]
+#[test]
+fn an_exiting_daemon_does_not_reopen_the_index() {
+    with_daemon("windreopen", |d| {
+        d.index_enabled.store(true, Ordering::Relaxed);
+        d.exiting.store(true, Ordering::Relaxed);
+
+        assert!(
+            d.with_index(|ix| ix.kv_get("anything")).is_none(),
+            "an exiting daemon answered from the index instead of declining"
+        );
+        assert!(
+            !d.index_db.exists(),
+            "an exiting daemon created {} on its way out",
+            d.index_db.display()
+        );
+    });
+}
+
+/// The watch-failed strip rides the revisioned queue payload, so every
+/// mutation of the map must move `queue_rev` - an idle dashboard skips
+/// the payload while `client_q == qrev`, and an entry removed without a
+/// bump renders forever: its delete button answers "no such rejected
+/// file" for a row the daemon dropped long ago (reported 14 Aug 2026;
+/// the third instance of the payload-rider trap after the update banner
+/// and set_limit). No-op mutations must NOT bump, or every 5 s watch
+/// pass would re-send the payload to every idle tab.
+#[test]
+fn watch_failed_mutations_move_the_queue_rev() {
+    with_daemon("wfrev", |d| {
+        let dir = std::env::temp_dir().join(format!("nzbfast-wfrev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("present.nzb");
+        std::fs::write(&present, b"x").unwrap();
+        let gone = dir.join("gone.nzb");
+        let rev = || d.queue_rev.load(Ordering::Relaxed);
+        let val = |s: &str| (1u64, 2u64, s.to_string(), String::new());
+
+        let r0 = rev();
+        assert!(d.watch_failed_insert(present.clone(), val("truncated")));
+        assert_eq!(rev(), r0 + 1, "a fresh insert must bump");
+        assert!(
+            !d.watch_failed_insert(present.clone(), val("truncated")),
+            "re-inserting the identical row is the every-pass no-op"
+        );
+        assert_eq!(rev(), r0 + 1, "the no-op re-insert must not bump");
+        assert!(d.watch_failed_insert(present.clone(), val("kept")));
+        assert_eq!(rev(), r0 + 2, "a changed value must bump");
+
+        d.watch_failed_remove(&gone);
+        assert_eq!(rev(), r0 + 2, "removing an absent row must not bump");
+        d.watch_failed_remove(&present);
+        assert_eq!(rev(), r0 + 3, "a real removal must bump");
+
+        d.watch_failed_insert(present.clone(), val("truncated"));
+        d.watch_failed_insert(gone.clone(), val("truncated"));
+        let r1 = rev();
+        d.watch_failed_prune_missing();
+        assert_eq!(rev(), r1 + 1, "pruning a vanished file must bump");
+        assert!(
+            d.watch_failed.lock_ok().contains_key(&present),
+            "pruning must keep entries whose file is still on disk"
+        );
+        d.watch_failed_prune_missing();
+        assert_eq!(rev(), r1 + 1, "an empty prune must not bump");
+        let _ = std::fs::remove_dir_all(&dir);
     });
 }

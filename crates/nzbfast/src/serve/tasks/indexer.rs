@@ -1369,7 +1369,7 @@ fn import_join_apply(
 pub(in crate::serve) fn corr_confirm_once(d: &Arc<Daemon>) -> bool {
     use nzbkit::index::msgid_set_key;
     use nzbkit::nzbimport::MIN_MSGID_QUORUM;
-    if !d.corr_confirm_enabled.load(Ordering::Relaxed) {
+    if !d.corr_confirm_on() {
         return false;
     }
     let now = std::time::SystemTime::now()
@@ -1486,7 +1486,21 @@ pub(in crate::serve) fn corr_confirm_once(d: &Arc<Daemon>) -> bool {
     let xml = match crate::serve::fetch_url_from(&hit.link, &origin) {
         Ok(f) => String::from_utf8_lossy(&f.bytes).into_owned(),
         Err(e) => {
-            warn!(target: "confirm", "NZB fetch from {} failed: {e}", cfg.name);
+            // redact_url_creds, for the reason every other grab lane
+            // already states: fetch_url names the URL it failed on, and
+            // hit.link is the indexer's own enclosure link, which
+            // carries the account credential - spelled `apikey`, `r`,
+            // `i`, or simply built into the path, so blanking one
+            // parameter name would be a guess. logtee mirrors this into
+            // the dashboard log and support bundles. The watchlist,
+            // scoreboard, nzblnk and manual-grab lanes all scrub here;
+            // this one was missed (14 Aug sweep).
+            warn!(
+                target: "confirm",
+                "NZB fetch from {} failed: {}",
+                cfg.name,
+                crate::serve::redact_url_creds(&e.to_string())
+            );
             return true;
         }
     };
@@ -1568,7 +1582,7 @@ pub(in crate::serve) fn spawn_corr_confirm(daemon: &Arc<Daemon>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            if !d.corr_confirm_enabled.load(Ordering::Relaxed) || !d.index_maintenance_ok() {
+            if !d.corr_confirm_on() || !d.index_maintenance_ok() {
                 continue;
             }
             let d2 = d.clone();

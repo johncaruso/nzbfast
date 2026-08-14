@@ -67,6 +67,9 @@ pub const SEVENZ_PPMD_MEM_MAX: u64 = 64 << 20;
 /// reference implementation spell them. Only the ones the declared-size
 /// pre-scan below needs.
 const K_END: u8 = 0x00;
+const K_HEADER: u8 = 0x01;
+const K_ARCHIVE_PROPERTIES: u8 = 0x02;
+const K_MAIN_STREAMS_INFO: u8 = 0x04;
 const K_PACK_INFO: u8 = 0x06;
 const K_UNPACK_INFO: u8 = 0x07;
 const K_SIZE: u8 = 0x09;
@@ -85,6 +88,36 @@ const SEVENZ_ID_PPMD: [u8; 3] = [0x03, 0x04, 0x01];
 /// is set by the props and NOT by the declared output size.
 const SEVENZ_ID_LZMA1: [u8; 3] = [0x03, 0x01, 0x01];
 const SEVENZ_ID_LZMA2: [u8; 1] = [0x21];
+
+/// 7z method ids the packed-header decode below needs to recognise:
+/// Copy (a stored header inside a kEncodedHeader wrapper) and
+/// AES-256-SHA256 (a `-mhe` encrypted header, which no gate can read
+/// without the password).
+const SEVENZ_ID_COPY: [u8; 1] = [0x00];
+const SEVENZ_ID_AES: [u8; 4] = [0x06, 0xF1, 0x07, 0x01];
+
+/// Floor under which a CONTENT block's declared decoder memory (LZMA
+/// dictionaries plus PPMd model sizes, summed per block) is always
+/// accepted. 64 MiB is the dictionary 7-Zip's Ultra preset declares
+/// regardless of how small the data is, so every preset-made archive
+/// passes on the floor alone. This is deliberately NOT
+/// [`SEVENZ_DICT_MAX`] reused: that cap is for metadata headers, whose
+/// decoded output is bounded at [`SEVENZ_END_MAX`] anyway - content has
+/// no such output bound, and users legitimately select dictionaries far
+/// past 64 MiB, so past the floor the declaration is judged against the
+/// packed bytes actually present instead of refused outright.
+pub const SEVENZ_CONTENT_COST_FLOOR: u64 = 64 << 20;
+
+/// Named refusals [`sevenz_disk_declared_bomb`] can return; callers put
+/// them verbatim into job failure detail. All four mean "the file's own
+/// declarations ask for work no honest archive needs", judged before
+/// sevenz-rust2 is allowed to allocate on those declarations' say-so.
+pub const SEVENZ_REFUSE_ZERO_START: &str =
+    "7z start header geometry is zeroed (header recovery scan refused)";
+pub const SEVENZ_REFUSE_HEADER: &str = "7z end header declares an oversized decode";
+pub const SEVENZ_REFUSE_HEADER_CHAIN: &str = "7z packed header uses an unexpected coder chain";
+pub const SEVENZ_REFUSE_CONTENT: &str =
+    "7z content declares decoder memory far beyond its packed bytes";
 
 /// The parsed 32-byte 7z start header. Offsets are relative to byte 32,
 /// so the end header (the archive map, kept at the TAIL of a 7z)
@@ -277,23 +310,68 @@ struct DeclaredCost {
     dict_size: u64,
 }
 
-/// The declared decode cost of a `kEncodedHeader` window. A byte-exact
-/// mirror of the library's parse up to `kCodersUnpackSize` (reader.rs:
+/// What one coder declaration was, as far as the packed-header decode
+/// below cares: enough to run the two chains real writers compress
+/// headers with (single LZMA1/LZMA2, or Copy), to recognise `-mhe`
+/// encryption, and to lump everything else into Other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScannedCoder {
+    Copy,
+    Lzma1 { props: u8, dict: u32 },
+    Lzma2 { dict: u32 },
+    Aes,
+    Other,
+}
+
+/// One block's declared shape out of a streams-info scan.
+struct BlockDecl {
+    /// Summed LZMA1/LZMA2 props-declared dictionary sizes.
+    dict_size: u64,
+    /// Summed PPMd props-declared memSizes.
+    ppmd_mem: u64,
+    /// How many pack streams this block consumes (blocks take them from
+    /// the kPackInfo list in order).
+    packed: u64,
+    /// Total coders declared, and the first one's classified shape -
+    /// the packed-header decode only acts when the count is exactly 1.
+    coder_count: u64,
+    first_coder: ScannedCoder,
+    /// Any AES coder anywhere on the chain (an encrypted header or an
+    /// encrypted content block).
+    has_aes: bool,
+}
+
+/// A scanned streams-info section: the shared grammar of a
+/// `kEncodedHeader` window and of a real header's kMainStreamsInfo.
+struct StreamsDecl {
+    pack_pos: u64,
+    pack_sizes: Vec<u64>,
+    blocks: Vec<BlockDecl>,
+    /// Sum of every declared unpack size across all blocks.
+    unpack_total: u64,
+}
+
+/// Scan a streams-info section starting at `s` (positioned just after
+/// the id byte that introduced it). A byte-exact mirror of the
+/// library's parse up to `kCodersUnpackSize` (reader.rs:
 /// `read_pack_info`, `read_unpack_info`, `read_block`), stopping right
 /// after the sizes.
 ///
-/// Returns None when the window does not scan - the library will then
+/// Returns None when the section does not scan - the library will then
 /// reject the same bytes itself BEFORE any decode (its parse is the
 /// same grammar, and it cannot reach the decoder without a parsed
 /// block), so None safely means "let the library produce its error".
 /// Overflow while summing saturates instead of failing: an astronomic
 /// declaration must land in the over-cap bucket, not the None one.
-fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
-    let limit = window.len() as u64;
-    let mut s = Scan { b: window, i: 1 }; // window[0] == K_ENCODED_HEADER
+/// Vec growth is paced by parsed bytes (every entry consumes at least
+/// one), so a hostile section can never balloon them past its own size.
+fn streams_info_declared(s: &mut Scan) -> Option<StreamsDecl> {
+    let limit = s.b.len() as u64;
+    let mut pack_pos = 0u64;
+    let mut pack_sizes = Vec::new();
     let mut nid = s.u8()?;
     if nid == K_PACK_INFO {
-        let _pack_pos = s.num()?;
+        pack_pos = s.num()?;
         let num_pack = s.num()?;
         if num_pack > limit {
             return None;
@@ -301,7 +379,7 @@ fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
         nid = s.u8()?;
         if nid == K_SIZE {
             for _ in 0..num_pack {
-                s.num()?;
+                pack_sizes.push(s.num()?);
             }
             nid = s.u8()?;
         }
@@ -322,12 +400,11 @@ fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
     if num_blocks > limit || s.u8()? != 0 {
         return None;
     }
-    // Out-stream count per block; pushes are paced by parsed bytes (a
-    // block consumes at least two), so a declared-huge `num_blocks`
-    // truncates out of the loop before it can balloon this vec.
+    // Per-block records; pushes are paced by parsed bytes (a block
+    // consumes at least two), so a declared-huge `num_blocks` truncates
+    // out of the loop before it can balloon this vec.
+    let mut blocks = Vec::new();
     let mut block_outs = Vec::new();
-    let mut ppmd_mem = 0u64;
-    let mut dict_size = 0u64;
     for _ in 0..num_blocks {
         let num_coders = s.num()?;
         if num_coders > limit {
@@ -335,7 +412,11 @@ fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
         }
         let mut total_in = 0u64;
         let mut total_out = 0u64;
-        for _ in 0..num_coders {
+        let mut ppmd_mem = 0u64;
+        let mut dict_size = 0u64;
+        let mut first_coder = ScannedCoder::Other;
+        let mut has_aes = false;
+        for coder_idx in 0..num_coders {
             let bits = s.u8()?;
             let id_at = s.i;
             s.skip((bits & 0xF) as usize)?;
@@ -343,6 +424,14 @@ fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
             let is_ppmd = id == SEVENZ_ID_PPMD;
             let is_lzma1 = id == SEVENZ_ID_LZMA1;
             let is_lzma2 = id == SEVENZ_ID_LZMA2;
+            has_aes |= id == SEVENZ_ID_AES;
+            let mut kind = if id == SEVENZ_ID_COPY {
+                ScannedCoder::Copy
+            } else if id == SEVENZ_ID_AES {
+                ScannedCoder::Aes
+            } else {
+                ScannedCoder::Other
+            };
             let (n_in, n_out) = if bits & 0x10 == 0 {
                 (1, 1)
             } else {
@@ -375,6 +464,7 @@ fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
                     let p = &s.b[props_at..];
                     let dict = u32::from_le_bytes([p[1], p[2], p[3], p[4]]);
                     dict_size = dict_size.saturating_add(dict as u64);
+                    kind = ScannedCoder::Lzma1 { props: p[0], dict };
                 }
                 // LZMA2 props: ONE byte, and the dictionary it names
                 // grows exponentially - `(2 | p & 1) << (p / 2 + 11)`,
@@ -387,16 +477,20 @@ fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
                         return None;
                     }
                     let dict = if p == 40 {
-                        u32::MAX as u64
+                        u32::MAX
                     } else {
-                        (2 | (p as u64 & 1)) << (p / 2 + 11)
+                        ((2 | (p as u64 & 1)) << (p / 2 + 11)) as u32
                     };
-                    dict_size = dict_size.saturating_add(dict);
+                    dict_size = dict_size.saturating_add(dict as u64);
+                    kind = ScannedCoder::Lzma2 { dict };
                 }
             }
             if bits & 0x80 != 0 {
                 // Alternative methods: the library refuses these too.
                 return None;
+            }
+            if coder_idx == 0 {
+                first_coder = kind;
             }
         }
         if total_out == 0 {
@@ -416,6 +510,14 @@ fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
                 s.num()?;
             }
         }
+        blocks.push(BlockDecl {
+            dict_size,
+            ppmd_mem,
+            packed,
+            coder_count: num_coders,
+            first_coder,
+            has_aes,
+        });
         block_outs.push(total_out);
     }
     if s.u8()? != K_CODERS_UNPACK_SIZE {
@@ -427,8 +529,28 @@ fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
             total = total.saturating_add(s.num()?);
         }
     }
+    Some(StreamsDecl {
+        pack_pos,
+        pack_sizes,
+        blocks,
+        unpack_total: total,
+    })
+}
+
+/// The declared decode cost of a `kEncodedHeader` window, summed the
+/// way the header caps judge it. See [`streams_info_declared`] for the
+/// scan itself and the meaning of None.
+fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
+    let mut s = Scan { b: window, i: 1 }; // window[0] == K_ENCODED_HEADER
+    let decl = streams_info_declared(&mut s)?;
+    let mut ppmd_mem = 0u64;
+    let mut dict_size = 0u64;
+    for b in &decl.blocks {
+        ppmd_mem = ppmd_mem.saturating_add(b.ppmd_mem);
+        dict_size = dict_size.saturating_add(b.dict_size);
+    }
     Some(DeclaredCost {
-        unpack: total,
+        unpack: decl.unpack_total,
         ppmd_mem,
         dict_size,
     })
@@ -779,30 +901,260 @@ pub fn sevenz_needs_password(path: &std::path::Path) -> bool {
 /// refuse: the start header declares an end header past
 /// [`SEVENZ_END_MAX`] (which `Archive::read` buffers whole), or the
 /// window is a `kEncodedHeader` whose declared decode cost
-/// [`encoded_header_bomb`] rejects. False means the geometry gave no
-/// reason to refuse - including every malformed shape (short file, bad
+/// [`encoded_header_bomb`] rejects, or the start header is the zeroed
+/// shape that would send `Archive::read` into its end-header recovery
+/// scan (see the body). False means the geometry gave no reason to
+/// refuse - including every OTHER malformed shape (short file, bad
 /// start CRC, unreadable window), where the library's own parse fails
 /// cheaply and its error keeps the verdict honest. Leaves the cursor
 /// wherever the reads ended; the caller rewinds.
 pub fn sevenz_disk_header_bomb(f: &mut (impl Read + Seek)) -> bool {
+    disk_declared_bomb(f, false).is_some()
+}
+
+/// The full declared-size verdict for an entry point about to DECODE
+/// CONTENT: everything [`sevenz_disk_header_bomb`] refuses, plus the
+/// content blocks' own declarations. Returns the named reason to
+/// refuse, or None when the declarations gave none - including every
+/// malformed shape, where the library's own parse fails cheaply.
+///
+/// The content half exists because sevenz-rust2 passes an unlimited
+/// memory budget into its content decoders, and lzma-rust2's
+/// `LzDecoder::ensure_capacity` sizes and ZERO-FILLS the whole
+/// props-declared match window before producing a byte - so an LZMA2
+/// props byte of 40 in a content block is a ~4 GiB committed
+/// allocation out of a file a few hundred bytes long. The parsed
+/// `Archive` does not expose coder props, so the declarations are read
+/// out of the raw end header here: directly for a stored (`kHeader`)
+/// one, and for a packed (`kEncodedHeader`) one by decoding the header
+/// in-process first - a decode the header caps above have already
+/// bounded to 2 MiB of output. The verdict itself is
+/// [`content_declared_bomb`]'s proportionality rule.
+///
+/// What this cannot see, it lets pass rather than guess: an
+/// AES-encrypted header (`-mhe`) hides its content declarations from
+/// everything but the passworded parse, and a scan/decode mismatch
+/// means the library will fail on the same bytes anyway. The one
+/// fail-closed case is an unencrypted packed header whose coder chain
+/// is none of the shapes any known writer emits (single LZMA1, LZMA2,
+/// or Copy): the only reason to compress a header with an exotic chain
+/// is to hide what it declares. Leaves the cursor wherever the reads
+/// ended; the caller rewinds.
+pub fn sevenz_disk_declared_bomb(f: &mut (impl Read + Seek)) -> Option<&'static str> {
+    disk_declared_bomb(f, true)
+}
+
+/// Shared body of the two disk gates above.
+fn disk_declared_bomb(f: &mut (impl Read + Seek), check_content: bool) -> Option<&'static str> {
     let mut head = [0u8; 32];
     if f.read_exact(&mut head).is_err() {
-        return false;
+        return None;
     }
-    let Some(start) = sevenz_start(&head) else {
-        return false;
-    };
+    // A zeroed start header (magic intact, CRC field AND all twenty
+    // geometry bytes zero) is the ONE malformed shape that does not
+    // fail cheaply in the library: Archive::read treats exactly it as
+    // "guess the end header", scans the last MiB for a header id, and
+    // decodes whatever kEncodedHeader it finds with no CRC check and no
+    // memory limit - so the caps above never see the declaration. A
+    // well-formed archive always has a nonzero start CRC, so refusing
+    // the shape outright costs nothing.
+    if head.starts_with(SEVENZ_MAGIC) && head[6] == 0 && head[8..32].iter().all(|&b| b == 0) {
+        return Some(SEVENZ_REFUSE_ZERO_START);
+    }
+    let start = sevenz_start(&head)?;
     if start.header_size > SEVENZ_END_MAX {
-        return true;
+        return Some(SEVENZ_REFUSE_HEADER);
     }
     let Some(off) = 32u64.checked_add(start.header_off) else {
-        return true;
+        return Some(SEVENZ_REFUSE_HEADER);
     };
     let mut window = vec![0u8; start.header_size as usize];
     if f.seek(io::SeekFrom::Start(off)).is_err() || f.read_exact(&mut window).is_err() {
-        return false;
+        return None;
     }
-    encoded_header_bomb(&window)
+    if encoded_header_bomb(&window) {
+        return Some(SEVENZ_REFUSE_HEADER);
+    }
+    if !check_content {
+        return None;
+    }
+    let decl = match window.first() {
+        Some(&K_HEADER) => header_content_decl(&window),
+        Some(&K_ENCODED_HEADER) => match decode_packed_header(f, &window) {
+            PackedHeader::Bytes(h) if h.first() == Some(&K_HEADER) => header_content_decl(&h),
+            PackedHeader::Bytes(_) | PackedHeader::Opaque => None,
+            PackedHeader::Refuse => return Some(SEVENZ_REFUSE_HEADER_CHAIN),
+        },
+        _ => None,
+    };
+    let decl = decl?;
+    let file_len = f.seek(io::SeekFrom::End(0)).ok()?;
+    content_declared_bomb(&decl, file_len).then_some(SEVENZ_REFUSE_CONTENT)
+}
+
+/// Scan a real (stored or already-decoded) header's kMainStreamsInfo.
+/// `header[0]` is `K_HEADER`; None when there is no streams info to
+/// judge or the bytes do not scan (the library errors on them too).
+fn header_content_decl(header: &[u8]) -> Option<StreamsDecl> {
+    let mut s = Scan { b: header, i: 1 };
+    let mut nid = s.u8()?;
+    if nid == K_ARCHIVE_PROPERTIES {
+        loop {
+            let id = s.u8()?;
+            if id == K_END {
+                break;
+            }
+            let size = s.num()?;
+            s.skip(usize::try_from(size).ok()?)?;
+        }
+        nid = s.u8()?;
+    }
+    if nid != K_MAIN_STREAMS_INFO {
+        return None;
+    }
+    streams_info_declared(&mut s)
+}
+
+/// The CONTENT half of the declared-size verdict: true when any block
+/// declares decoder memory (LZMA dictionaries plus PPMd model sizes)
+/// past [`SEVENZ_CONTENT_COST_FLOOR`] that its own packed bytes do not
+/// justify.
+///
+/// The asymmetry this keys on: a bomb is a tiny posted file whose
+/// declarations buy a huge allocation, while a real archive's memory
+/// use is proportionate to real content. Declared UNPACK sizes cannot
+/// carry the judgement - inflating one costs the attacker nothing, and
+/// the window is allocated before a single output byte could call the
+/// bluff. Packed bytes can: the pack region must actually fit inside
+/// the file, so declarations past the floor are held to the packed
+/// bytes genuinely present (rounded up to the next power of two for
+/// slack). A 384 MiB dictionary then requires posting hundreds of MB
+/// of real pack data - at which point it is just a big archive, which
+/// passes on its own weight. What this refuses beyond bombs: an
+/// archive whose USER-chosen dictionary exceeds both 64 MiB and
+/// anything its packed size justifies (a past-Ultra dictionary on
+/// highly compressible data). That corner is accepted: the refusal is
+/// a named job failure, not a crash, and every preset-made archive
+/// sits under the floor.
+fn content_declared_bomb(decl: &StreamsDecl, file_len: u64) -> bool {
+    let total_pack = decl
+        .pack_sizes
+        .iter()
+        .fold(0u64, |a, &s| a.saturating_add(s));
+    // Do the declared pack streams exist at all? Sizes reaching past
+    // the file's end are fiction, and fiction justifies nothing.
+    let pack_region_real = 32u64
+        .checked_add(decl.pack_pos)
+        .and_then(|s| s.checked_add(total_pack))
+        .is_some_and(|end| end <= file_len);
+    let mut next_pack = 0usize;
+    for b in &decl.blocks {
+        let pack = decl
+            .pack_sizes
+            .iter()
+            .skip(next_pack)
+            .take(b.packed as usize)
+            .fold(0u64, |a, &s| a.saturating_add(s));
+        next_pack = next_pack.saturating_add(b.packed as usize);
+        let cost = b.dict_size.saturating_add(b.ppmd_mem);
+        if cost <= SEVENZ_CONTENT_COST_FLOOR {
+            continue;
+        }
+        if !pack_region_real || cost > pack.checked_next_power_of_two().unwrap_or(u64::MAX) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Outcome of trying to read a packed (`kEncodedHeader`) end header's
+/// decoded bytes for the content scan.
+enum PackedHeader {
+    /// The decoded header (or as much of it as the pack bytes
+    /// produced; the library decodes the same bytes to the same
+    /// prefix, so scanning it stays equivalent).
+    Bytes(Vec<u8>),
+    /// Cannot be seen (AES on the chain) or did not decode - the
+    /// library will hit the same wall, so the content scan stands
+    /// aside without a verdict.
+    Opaque,
+    /// An unencrypted chain no known writer compresses headers with:
+    /// refuse rather than let it smuggle content declarations past the
+    /// scan.
+    Refuse,
+}
+
+/// Decode a packed end header in-process so the content scan can read
+/// the real header it hides. Only runs shapes real writers emit - one
+/// block, one pack stream, a single LZMA1/LZMA2/Copy coder - and only
+/// after [`encoded_header_bomb`] has already capped the declared
+/// output at [`SEVENZ_END_MAX`] and the declared dictionary at
+/// [`SEVENZ_DICT_MAX`]. The dictionary handed to the decoder is
+/// additionally clamped to the declared output rounded up: LZMA match
+/// distances can never exceed the bytes produced, so the clamp cannot
+/// change the decode, only the allocation.
+fn decode_packed_header(f: &mut (impl Read + Seek), window: &[u8]) -> PackedHeader {
+    let mut s = Scan { b: window, i: 1 };
+    let Some(decl) = streams_info_declared(&mut s) else {
+        return PackedHeader::Opaque;
+    };
+    let [b] = &decl.blocks[..] else {
+        return PackedHeader::Refuse;
+    };
+    if b.has_aes {
+        return PackedHeader::Opaque;
+    }
+    if b.coder_count != 1 || b.packed != 1 || decl.pack_sizes.len() != 1 {
+        return PackedHeader::Refuse;
+    }
+    let unpack = decl.unpack_total;
+    let pack = decl.pack_sizes[0];
+    if unpack == 0 || unpack > SEVENZ_END_MAX {
+        return PackedHeader::Opaque;
+    }
+    // A "compressed" header bigger than the largest header it could
+    // decode to is not compression.
+    if pack > SEVENZ_END_MAX {
+        return PackedHeader::Refuse;
+    }
+    let Some(off) = 32u64.checked_add(decl.pack_pos) else {
+        return PackedHeader::Refuse;
+    };
+    if f.seek(io::SeekFrom::Start(off)).is_err() {
+        return PackedHeader::Opaque;
+    }
+    let mut packed = vec![0u8; pack as usize];
+    if f.read_exact(&mut packed).is_err() {
+        return PackedHeader::Opaque;
+    }
+    // 4 KiB is LZMA's smallest window; unpack is <= 2 MiB here.
+    let need = unpack.next_power_of_two().max(1 << 12) as u32;
+    let mut out = Vec::new();
+    let done = match b.first_coder {
+        ScannedCoder::Copy => {
+            packed.truncate(unpack as usize);
+            out = packed;
+            true
+        }
+        ScannedCoder::Lzma1 { props, dict } => lzma_rust2::LzmaReader::new_with_props(
+            io::Cursor::new(&packed),
+            unpack,
+            props,
+            dict.min(need),
+            None,
+        )
+        .is_ok_and(|r| io::Read::take(r, unpack).read_to_end(&mut out).is_ok()),
+        ScannedCoder::Lzma2 { dict } => {
+            let r = lzma_rust2::Lzma2Reader::new(io::Cursor::new(&packed), dict.min(need), None);
+            io::Read::take(r, unpack).read_to_end(&mut out).is_ok()
+        }
+        ScannedCoder::Aes | ScannedCoder::Other => return PackedHeader::Refuse,
+    };
+    if done && !out.is_empty() {
+        PackedHeader::Bytes(out)
+    } else {
+        PackedHeader::Opaque
+    }
 }
 
 #[cfg(test)]
@@ -1186,6 +1538,350 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// 7z variable-length integer, the encoder half of `Scan::num`.
+    fn write_num(out: &mut Vec<u8>, value: u64) {
+        let mut first = 0u8;
+        let mut mask = 0x80u8;
+        let mut extra = 0usize;
+        while extra < 8 {
+            if value < (1u64 << (7 * (extra + 1))) {
+                first |= (value >> (8 * extra)) as u8;
+                break;
+            }
+            first |= mask;
+            mask >>= 1;
+            extra += 1;
+        }
+        out.push(first);
+        for j in 0..extra {
+            out.push((value >> (8 * j)) as u8);
+        }
+    }
+
+    /// A stored (kHeader) end header declaring one LZMA2 content block:
+    /// `props` picks the dictionary, the declared pack/unpack sizes are
+    /// the test's to choose. `extras` lands inside the streams info
+    /// (sub-streams section) and `tail` after it (files info), for
+    /// fixtures that must fully parse; gate-only fixtures pass empty.
+    fn content_header_full(
+        props: u8,
+        declared_pack: u64,
+        declared_unpack: u64,
+        extras: &[u8],
+        tail: &[u8],
+    ) -> Vec<u8> {
+        let mut h = vec![K_HEADER, K_MAIN_STREAMS_INFO, K_PACK_INFO];
+        write_num(&mut h, 0); // pack_pos
+        write_num(&mut h, 1); // one pack stream
+        h.push(K_SIZE);
+        write_num(&mut h, declared_pack);
+        h.push(K_END);
+        h.extend_from_slice(&[K_UNPACK_INFO, K_FOLDER]);
+        write_num(&mut h, 1); // one block
+        h.push(0); // stored inline, not external
+        write_num(&mut h, 1); // one coder
+        h.extend_from_slice(&[0x21, 0x21]); // 1-byte id + props attr; LZMA2
+        write_num(&mut h, 1); // props length
+        h.push(props);
+        h.push(K_CODERS_UNPACK_SIZE);
+        write_num(&mut h, declared_unpack);
+        h.push(K_END); // unpack info
+        h.extend_from_slice(extras);
+        h.push(K_END); // streams info
+        h.extend_from_slice(tail);
+        h.push(K_END); // header
+        h
+    }
+
+    /// [`content_header_full`] for the gate-only fixtures, which never
+    /// need to parse past the sizes.
+    fn content_header(props: u8, declared_pack: u64, declared_unpack: u64) -> Vec<u8> {
+        content_header_full(props, declared_pack, declared_unpack, &[], &[])
+    }
+
+    /// Seal pack bytes + a stored end header into an on-disk container.
+    fn seal_disk(pack: &[u8], header: &[u8]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(SEVENZ_MAGIC);
+        f.extend_from_slice(&[0x00, 0x04]);
+        f.extend_from_slice(&[0u8; 24]);
+        f.extend_from_slice(pack);
+        f.extend_from_slice(header);
+        let off = pack.len() as u64;
+        f[12..20].copy_from_slice(&off.to_le_bytes());
+        f[20..28].copy_from_slice(&(header.len() as u64).to_le_bytes());
+        f[28..32].copy_from_slice(&crc32fast::hash(header).to_le_bytes());
+        let crc = crc32fast::hash(&f[12..32]);
+        f[8..12].copy_from_slice(&crc.to_le_bytes());
+        f
+    }
+
+    /// A fully extractable single-file 7z whose LZMA2 content stream is
+    /// hand-built from STORED chunks - so a test can declare any
+    /// dictionary size without paying for a real compression pass, and
+    /// the decode side still allocates and runs exactly what the props
+    /// byte declares.
+    fn extractable_lzma2_7z(props: u8, payload: &[u8]) -> Vec<u8> {
+        let mut stream = Vec::new();
+        let mut first = true;
+        for chunk in payload.chunks(0x10000) {
+            // LZMA2 stored chunk: 0x01 resets the dictionary (required
+            // at stream start), 0x02 preserves it; then len-1 as u16be.
+            stream.push(if first { 1 } else { 2 });
+            first = false;
+            stream.extend_from_slice(&((chunk.len() - 1) as u16).to_be_bytes());
+            stream.extend_from_slice(chunk);
+        }
+        stream.push(0); // end of stream
+        const K_SUB_STREAMS_INFO: u8 = 0x08;
+        const K_FILES_INFO: u8 = 0x05;
+        const K_NAME: u8 = 0x11;
+        // Sub-streams with all defaults: one file per block, size =
+        // the block's unpack size, no CRCs.
+        let sub = [K_SUB_STREAMS_INFO, K_END];
+        let mut files = vec![K_FILES_INFO];
+        write_num(&mut files, 1); // one file
+        files.push(K_NAME);
+        let name: Vec<u8> = "a.bin\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        write_num(&mut files, 1 + name.len() as u64);
+        files.push(0); // names stored inline
+        files.extend_from_slice(&name);
+        files.push(K_END); // files-info property list
+        let header = content_header_full(
+            props,
+            stream.len() as u64,
+            payload.len() as u64,
+            &sub,
+            &files,
+        );
+        seal_disk(&stream, &header)
+    }
+
+    fn extract_single(archive: &[u8]) -> Vec<u8> {
+        let mut r = sevenz_rust2::ArchiveReader::new(
+            std::io::Cursor::new(archive.to_vec()),
+            sevenz_rust2::Password::empty(),
+        )
+        .expect("crafted archive must parse");
+        let mut out = Vec::new();
+        r.for_each_entries(|_, rd| {
+            std::io::Read::read_to_end(rd, &mut out)?;
+            Ok(true)
+        })
+        .expect("crafted archive must extract");
+        out
+    }
+
+    #[test]
+    fn a_zeroed_start_header_is_refused_before_the_recovery_scan() {
+        // The recovered-header bypass: real magic, a ZERO start-header
+        // CRC and twenty zero geometry bytes. sevenz_start says None,
+        // but Archive::read treats exactly this shape as header_valid =
+        // false and scans the last MiB for a kEncodedHeader to decode
+        // with no CRC check and no memory limit - here, the checked-in
+        // 384 MiB dictionary window. The gate must refuse it up front.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sevenz");
+        let window = std::fs::read(format!("{dir}/lzma2-dict-window.bin")).unwrap();
+        let mut file = Vec::new();
+        file.extend_from_slice(SEVENZ_MAGIC);
+        file.extend_from_slice(&[0x00, 0x04]);
+        file.extend_from_slice(&[0u8; 24]);
+        file.extend_from_slice(&window);
+        let mut f = std::io::Cursor::new(file.clone());
+        assert!(sevenz_disk_header_bomb(&mut f), "zeroed start must refuse");
+        let mut f = std::io::Cursor::new(file.clone());
+        assert_eq!(
+            sevenz_disk_declared_bomb(&mut f),
+            Some(SEVENZ_REFUSE_ZERO_START)
+        );
+        // A zero CRC field with NONZERO geometry is a different shape:
+        // the library reads the start header and fails its checksum
+        // cheaply, so the gate must keep standing aside.
+        let mut nonzero = file;
+        nonzero[13] = 1;
+        let mut f = std::io::Cursor::new(nonzero.clone());
+        assert!(!sevenz_disk_header_bomb(&mut f));
+        assert!(
+            sevenz_rust2::Archive::read(
+                &mut std::io::Cursor::new(nonzero),
+                &sevenz_rust2::Password::empty()
+            )
+            .is_err(),
+            "the library refuses the nonzero-geometry shape itself"
+        );
+    }
+
+    #[test]
+    fn content_dict_bomb_with_tiny_pack_is_refused() {
+        // A content block declaring a 384 MiB LZMA2 dictionary (props
+        // 0x21) out of 16 packed bytes: the header-scoped caps never
+        // see content coders, and the library would zero-fill the whole
+        // window before one output byte. The content gate keys on the
+        // asymmetry.
+        let file = seal_disk(&[0xAB; 16], &content_header(0x21, 16, 100));
+        let mut f = std::io::Cursor::new(file.clone());
+        assert_eq!(
+            sevenz_disk_declared_bomb(&mut f),
+            Some(SEVENZ_REFUSE_CONTENT)
+        );
+        // The header-only gate (probe and password callers) stays out
+        // of content judgements.
+        let mut f = std::io::Cursor::new(file);
+        assert!(!sevenz_disk_header_bomb(&mut f));
+    }
+
+    #[test]
+    fn ultra_preset_dict_passes_on_the_floor() {
+        // Props 28 = a 64 MiB dictionary, what 7-Zip's Ultra preset
+        // declares no matter how small the data: always accepted, even
+        // with a tiny pack stream.
+        let file = seal_disk(&[0xAB; 16], &content_header(28, 16, 100));
+        let mut f = std::io::Cursor::new(file);
+        assert_eq!(sevenz_disk_declared_bomb(&mut f), None);
+    }
+
+    #[test]
+    fn big_dict_backed_by_real_pack_bytes_passes() {
+        // Props 29 = a 96 MiB dictionary, past the floor - legitimate
+        // when the archive actually carries data on that scale. 65 MiB
+        // of packed bytes genuinely present round up past the
+        // declaration, so it passes.
+        let pack = vec![0u8; 65 << 20];
+        let file = seal_disk(&pack, &content_header(29, pack.len() as u64, 90 << 20));
+        let mut f = std::io::Cursor::new(file);
+        assert_eq!(sevenz_disk_declared_bomb(&mut f), None);
+    }
+
+    #[test]
+    fn big_dict_with_fictional_pack_sizes_is_refused() {
+        // Same 96 MiB declaration, but the 65 MiB of pack bytes are
+        // DECLARED and not present - the region runs past the file's
+        // end, and fiction justifies nothing.
+        let file = seal_disk(&[0xAB; 16], &content_header(29, 65 << 20, 90 << 20));
+        let mut f = std::io::Cursor::new(file);
+        assert_eq!(
+            sevenz_disk_declared_bomb(&mut f),
+            Some(SEVENZ_REFUSE_CONTENT)
+        );
+    }
+
+    #[test]
+    fn packed_header_content_bomb_is_seen_through_the_decode() {
+        // The same content bomb hidden behind a kEncodedHeader: the
+        // gate must decode the (already size-capped) packed header
+        // in-process and judge what it hides. The packed header is a
+        // genuine LZMA stream, exactly what real writers emit.
+        let build = |props: u8| {
+            let inner = content_header(props, 16, 100);
+            use std::io::Write as _;
+            let mut opts = lzma_rust2::LzmaOptions::with_preset(6);
+            opts.dict_size = 1 << 16;
+            let mut w = lzma_rust2::LzmaWriter::new_no_header(Vec::new(), &opts, false).unwrap();
+            w.write_all(&inner).unwrap();
+            let lclppb = w.props();
+            let comp = w.finish().unwrap();
+            let mut win = vec![K_ENCODED_HEADER, K_PACK_INFO];
+            write_num(&mut win, 0); // pack_pos: the compressed header sits at 32
+            write_num(&mut win, 1);
+            win.push(K_SIZE);
+            write_num(&mut win, comp.len() as u64);
+            win.push(K_END);
+            win.extend_from_slice(&[K_UNPACK_INFO, K_FOLDER]);
+            write_num(&mut win, 1);
+            win.push(0);
+            write_num(&mut win, 1); // one coder
+            win.push(0x23); // 3-byte id + props attr
+            win.extend_from_slice(&SEVENZ_ID_LZMA1);
+            write_num(&mut win, 5);
+            win.push(lclppb);
+            win.extend_from_slice(&(1u32 << 16).to_le_bytes());
+            win.push(K_CODERS_UNPACK_SIZE);
+            write_num(&mut win, inner.len() as u64);
+            win.extend_from_slice(&[K_END, K_END]);
+            seal_disk(&comp, &win)
+        };
+        let mut f = std::io::Cursor::new(build(0x21));
+        assert_eq!(
+            sevenz_disk_declared_bomb(&mut f),
+            Some(SEVENZ_REFUSE_CONTENT),
+            "a packed header must not hide a content dictionary bomb"
+        );
+        let mut f = std::io::Cursor::new(build(28));
+        assert_eq!(
+            sevenz_disk_declared_bomb(&mut f),
+            None,
+            "the same shape declaring the Ultra floor must pass"
+        );
+    }
+
+    #[test]
+    fn exotic_packed_header_chain_is_refused_not_decoded_blind() {
+        // A PPMd-compressed header passes the header caps at a sane
+        // memSize, but no known writer compresses headers with PPMd -
+        // and the content scan cannot see through a chain it cannot
+        // run. Refusing beats decoding blind.
+        let (head, tail) = seal(&ppmd_window(1 << 20));
+        let mut f = std::io::Cursor::new([head, tail].concat());
+        assert_eq!(
+            sevenz_disk_declared_bomb(&mut f),
+            Some(SEVENZ_REFUSE_HEADER_CHAIN)
+        );
+        // An AES header chain (-mhe) is different: it is a password
+        // question, not a refusal, and the content scan stands aside.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sevenz");
+        let enc = std::fs::read(format!("{dir}/header-encrypted.7z")).unwrap();
+        let mut f = std::io::Cursor::new(enc);
+        assert_eq!(sevenz_disk_declared_bomb(&mut f), None);
+    }
+
+    #[test]
+    fn ultra_floor_archive_still_extracts_end_to_end() {
+        // The no-regression half: a well-formed single-file archive
+        // whose content block declares the Ultra-preset 64 MiB
+        // dictionary (props 28) over a tiny payload. The gate must
+        // pass it and the library must extract it byte-identical.
+        let payload = b"ordinary content, ultra preset dictionary".to_vec();
+        let arch = extractable_lzma2_7z(28, &payload);
+        let mut f = std::io::Cursor::new(arch.clone());
+        assert_eq!(sevenz_disk_declared_bomb(&mut f), None);
+        assert_eq!(extract_single(&arch), payload);
+    }
+
+    #[test]
+    fn big_dict_archive_still_extracts_end_to_end() {
+        // A user-selected 96 MiB dictionary (props 29) over 65 MiB of
+        // incompressible payload: past the floor, justified by its own
+        // packed bytes, and it must both pass the gate and extract.
+        let payload = noise(65 << 20);
+        let arch = extractable_lzma2_7z(29, &payload);
+        let mut f = std::io::Cursor::new(arch.clone());
+        assert_eq!(sevenz_disk_declared_bomb(&mut f), None);
+        assert_eq!(extract_single(&arch), payload);
+    }
+
+    #[test]
+    fn writer_archives_pass_the_content_gate() {
+        // Real sevenz-rust2 writer output (LZMA-packed header, LZMA2
+        // content at the default dictionary) must sail through the
+        // full declared gate.
+        let arch = fixture(NAME, &noise(65536));
+        let mut f = std::io::Cursor::new(arch);
+        assert_eq!(sevenz_disk_declared_bomb(&mut f), None);
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sevenz");
+        let store = std::fs::read(format!("{dir}/store-single.7z")).unwrap();
+        let mut f = std::io::Cursor::new(store);
+        assert_eq!(sevenz_disk_declared_bomb(&mut f), None);
+        let bomb = std::fs::read(format!("{dir}/bomb-container.7z")).unwrap();
+        let mut f = std::io::Cursor::new(bomb);
+        assert_eq!(
+            sevenz_disk_declared_bomb(&mut f),
+            Some(SEVENZ_REFUSE_HEADER)
+        );
+    }
+
     #[test]
     fn checked_in_fuzz_seeds_keep_their_meaning() {
         // tests/fixtures/sevenz/* seed the sevenz_name_probe fuzz
@@ -1228,6 +1924,22 @@ mod tests {
                 "{name} must die at the declared-cost gate"
             );
         }
+        // Whole-container seeds for the disk gate: the zeroed-start
+        // shape that would otherwise reach the library's end-header
+        // recovery scan, and a content-block dictionary bomb (384 MiB
+        // declared out of 16 packed bytes).
+        let zeroed = std::fs::read(format!("{dir}/recovered-zero-start.bin")).unwrap();
+        assert_eq!(
+            sevenz_disk_declared_bomb(&mut std::io::Cursor::new(zeroed)),
+            Some(SEVENZ_REFUSE_ZERO_START),
+            "recovered-zero-start seed must refuse before the recovery scan"
+        );
+        let content = std::fs::read(format!("{dir}/bomb-content-dict.7z")).unwrap();
+        assert_eq!(
+            sevenz_disk_declared_bomb(&mut std::io::Cursor::new(content)),
+            Some(SEVENZ_REFUSE_CONTENT),
+            "content-dict seed must die at the content gate"
+        );
     }
 
     #[test]

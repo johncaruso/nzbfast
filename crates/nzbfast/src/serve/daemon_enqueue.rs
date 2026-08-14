@@ -302,6 +302,7 @@ impl Daemon {
             fetched: false,
             tombstone: false,
             del_on_drop: false,
+            delete_status: String::new(),
             suspended: false,
             downloaded_bytes: 0,
             elapsed_secs: 0.0,
@@ -446,9 +447,16 @@ impl Daemon {
         // job.started on the ring at seq 1, 54 ms ahead of the job.added
         // for the same nzo_id, which is a webhook consumer watching a
         // job start before it exists. The idle latch re-arms inside the
-        // same window for the same reason: an idle sweep between the
-        // push and a later store could emit a queue.idle that this add
-        // has already invalidated.
+        // same critical section for the same reason - and it must be
+        // INSIDE, not merely before it (Codex sweep 14 Aug M3): stored
+        // ahead of the lock, a notifier that had already scanned the
+        // empty queue could take its false-to-true CAS after this add
+        // published, emitting queue.idle over a runnable job and
+        // leaving the latch set - so if a global pause kept the job
+        // from the pick re-arm, its own genuine idle edge was
+        // swallowed too. Under the lock, the notifier either finishes
+        // before this add (its idle predates the job, correctly) or
+        // scans after it and sees the job.
         //
         // Deadlock-safe by lock order: the ring, the webhook channel and
         // the target list are leaves taken under the queue lock, and no
@@ -457,9 +465,9 @@ impl Daemon {
         // crash in that window loses a job a consumer was told about -
         // the same window every other reader of the add already had,
         // since the queue was live to the API at exactly this point.
-        self.queue_idle_latch.store(false, Ordering::Relaxed);
         {
             let mut q = self.queue.lock_ok();
+            self.queue_idle_latch.store(false, Ordering::Relaxed);
             self.life_emit(
                 "job.added",
                 json!({

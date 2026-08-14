@@ -15,6 +15,29 @@ pub(super) struct Fleet {
     pub(super) servers: Vec<(ServerConfig, PoolConfig)>,
 }
 
+/// Does any enabled server have a peer it could steer a CRC-failed
+/// article to: same LEVEL, different host, and not an explicit mirror of
+/// the same backbone?
+///
+/// Level matters because a deeper server's pickup gate demands the
+/// shallower one's 430 bit, so a primary + fill pair can never steer.
+/// That makes this sensitive to the M29 routing demotion in plan.rs
+/// (`demote_predicted_gone`): sinking servers to a new bottom tier can
+/// leave a survivor alone on level 0, which correctly turns the steer
+/// off rather than paying its forced CRC for a peer that cannot take
+/// the article.
+pub(super) fn has_steer_peer(servers: &[ServerConfig]) -> bool {
+    let on: Vec<_> = servers.iter().filter(|s| s.enabled).collect();
+    on.iter().enumerate().any(|(i, a)| {
+        on.iter().enumerate().any(|(j, b)| {
+            i != j
+                && a.level == b.level
+                && a.host != b.host
+                && (a.group.is_none() || b.group.is_none() || a.group != b.group)
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_fleet(
     cfg_all: &Config,
@@ -165,15 +188,7 @@ pub(super) async fn build_fleet(
     // same-host twins depend on =1); NZBFAST_CRC_RETRY is honored as
     // an alias - it named the same feature while the detection lived
     // in the pool, and the rig drivers still set it.
-    let on: Vec<_> = cfg_all.servers.iter().filter(|s| s.enabled).collect();
-    let multi_server = on.iter().enumerate().any(|(i, a)| {
-        on.iter().enumerate().any(|(j, b)| {
-            i != j
-                && a.level == b.level
-                && a.host != b.host
-                && (a.group.is_none() || b.group.is_none() || a.group != b.group)
-        })
-    });
+    let multi_server = has_steer_peer(&cfg_all.servers);
     let crc_steer = std::env::var("NZBFAST_CRC_STEER")
         .or_else(|_| std::env::var("NZBFAST_CRC_RETRY"))
         .map_or(multi_server, |v| v == "1");

@@ -118,6 +118,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "sevenz_disk_gate"
+path = "fuzz_targets/sevenz_disk_gate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "rar_name_probe"
 path = "fuzz_targets/rar_name_probe.rs"
 test = false

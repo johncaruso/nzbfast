@@ -430,6 +430,7 @@ fn a_correlation_suggestion_reaches_confirmed_through_the_indexer_lane() {
     });
     account(&d, "confirm-src", f.port);
     *d.corr_confirm_source.lock_ok() = "confirm-src".to_string();
+    d.predb_corr_enabled.store(true, Ordering::Relaxed);
     d.corr_confirm_enabled.store(true, Ordering::Relaxed);
 
     assert!(
@@ -511,6 +512,7 @@ fn the_confirm_grab_refuses_a_link_pointing_at_the_service_next_door() {
     });
     account(&d, "confirm-src", f.port);
     *d.corr_confirm_source.lock_ok() = "confirm-src".to_string();
+    d.predb_corr_enabled.store(true, Ordering::Relaxed);
     d.corr_confirm_enabled.store(true, Ordering::Relaxed);
 
     // The attempt is still spent - the lane looked, and the suggestion
@@ -528,5 +530,50 @@ fn the_confirm_grab_refuses_a_link_pointing_at_the_service_next_door() {
         .find(|r| r.id == rid)
         .expect("the release must still be there");
     assert_eq!(row.pre_title, "", "a refused fetch must not name anything");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex M6: the dashboard nests the confirm lane under the
+/// correlation switch, so correlation OFF greys every confirm control
+/// out - but the worker used to gate on its own flag alone and kept
+/// spending up to CONFIRM_PER_DAY indexer lookups a day on a lane the
+/// user could no longer see or reach. With the parent off, an armed
+/// child with a pending STRONG suggestion and a live account must
+/// spend nothing: no HTTP request, no quota increment, no checked_at
+/// stamp. The suggestion stays pickable for when correlation returns.
+#[test]
+fn confirm_stands_down_when_correlation_is_off_even_with_the_child_armed() {
+    let dir = tdir("corr-parent-off");
+    let d = crate::serve::testutil::test_daemon(&dir);
+    let title = "Some.Film.2026.1080p.WEB.H264-GRP";
+    let (_rid, _msgids) = seed_corr_suggestion(&d, title);
+    let mut f = fixture(move |path, _| panic!("no request may leave the daemon, got {path}"));
+    account(&d, "confirm-src", f.port);
+    *d.corr_confirm_source.lock_ok() = "confirm-src".to_string();
+    d.predb_corr_enabled.store(false, Ordering::Relaxed);
+    d.corr_confirm_enabled.store(true, Ordering::Relaxed);
+
+    assert!(
+        !super::indexer::corr_confirm_once(&d),
+        "with correlation off the lane must report no attempt spent"
+    );
+    assert!(f.paths().is_empty(), "zero confirmation HTTP requests");
+    let spent = d
+        .with_index(|ix| ix.kv_get("corr_confirm_spent"))
+        .unwrap_or_default();
+    assert!(
+        spent.is_empty() || spent == "0",
+        "the daily budget must not move, got {spent:?}"
+    );
+    // No checked_at stamp: the suggestion must still pick, so turning
+    // correlation back on resumes exactly where the user left off.
+    let picks = d
+        .with_index(|ix| ix.corr_confirm_pick(10).ok())
+        .unwrap_or_default();
+    assert_eq!(
+        picks.len(),
+        1,
+        "the suggestion must remain unchecked and pickable"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

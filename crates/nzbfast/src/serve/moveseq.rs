@@ -287,6 +287,10 @@ impl Daemon {
     /// priority - because this play IS the download trigger.
     pub(in crate::serve) fn activate_parked(&self, job: &Arc<Mutex<Job>>) {
         let nzo = job.lock_ok().nzo_id.clone();
+        // Same Q2 fence as retry: between this removal and commit_to_queue's
+        // save, a concurrent history compaction must carry the disk row or a
+        // crash in the window loses the record from both stores.
+        let _inflight = self.hist_inflight_begin(&nzo);
         self.history.lock_ok().retain(|x| !Arc::ptr_eq(x, job));
         stamp_move(job);
         let seq = job.lock_ok().move_seq;

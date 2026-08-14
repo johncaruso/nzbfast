@@ -142,6 +142,27 @@ fn a_false_positive_header_check_does_not_end_the_candidate_sweep() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The password probe decodes a content block to judge a key, so it
+/// holds the same content-aware declared-size gate as extraction
+/// (bug-sweep H1+H2, 14 Aug 2026): a content dictionary bomb and the
+/// zeroed-start recovery shape both answer Fails at the gate, before
+/// ArchiveReader allocates anything.
+#[test]
+fn bomb_declaring_containers_fail_the_key_check_at_the_gate() {
+    let fixtures = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../nzbkit/tests/fixtures/sevenz"
+    );
+    for name in ["bomb-content-dict.7z", "recovered-zero-start.bin"] {
+        let p = std::path::Path::new(fixtures).join(name);
+        assert_eq!(
+            sevenz_password_check_capped(&p, Some("any"), 1 << 20),
+            SevenzKey::Fails,
+            "{name} must fail at the gate"
+        );
+    }
+}
+
 /// Codex sweep M, 13 Aug 2026: what rejects a wrong key on a
 /// data-encrypted 7z entry is the entry's CHECKSUM, at its END. The key
 /// check reads at most 64 MB, so a first member bigger than that never

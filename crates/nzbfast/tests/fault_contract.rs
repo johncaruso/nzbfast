@@ -712,7 +712,7 @@ const BOUND_CLEAN: Duration = Duration::from_secs(20);
 /// corpus. Measured 1.10s; double the clean bound for the ratio.
 const BOUND_FLAP: Duration = Duration::from_secs(40);
 /// Dead air: matrix ratio 1.2x plus a fixed cost the ratio hides - each
-/// stalled article burns one pre-byte budget (~2s at the adaptive floor)
+/// stalled article burns one pre-byte budget (~4s at the adaptive floor)
 /// and 4 stalls over 4 connections is a couple of budgets deep.
 /// Measured 3.27s.
 const BOUND_DEADAIR: Duration = Duration::from_secs(40);

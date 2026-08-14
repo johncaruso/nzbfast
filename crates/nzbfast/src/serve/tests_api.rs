@@ -568,6 +568,56 @@ fn apikey_never_rides_an_error_string() {
     assert_eq!(redact_apikey("plain error"), "plain error");
 }
 
+/// The third surface: text the INDEXER wrote. Newznab reports protocol
+/// errors with HTTP 200, so an `<error description>` arrives after every
+/// transport-level scrubber has already run, and it is echoed to Test
+/// results, search notes, the wall and the logs. Indexers reflect the
+/// request back, and not always spelling the key `apikey=` (14 Aug
+/// sweep).
+#[test]
+fn an_indexer_written_error_never_carries_the_key() {
+    use crate::newznab::NewznabError as E;
+    let key = "SECRET123456";
+    // The reflected-parameter shape, which redact_apikey alone covers.
+    let got = scrub_indexer_body_error(E::Auth(100, format!("invalid apikey={key}")), key);
+    let E::Auth(_, m) = &got else {
+        panic!("{got:?}")
+    };
+    assert!(!m.contains(key), "{m}");
+    // The BARE reflection: the key with no parameter name in front of
+    // it, which is why the configured value itself has to be blanked.
+    let got = scrub_indexer_body_error(E::Api(200, format!("no such user {key} here")), key);
+    let E::Api(_, m) = &got else {
+        panic!("{got:?}")
+    };
+    assert!(!m.contains(key), "{m}");
+    assert_eq!(m, "no such user *** here");
+    // Limit answers carry the same body and the same risk.
+    let got = scrub_indexer_body_error(E::Limit(500, format!("quota for {key}")), key);
+    let E::Limit(_, m) = &got else {
+        panic!("{got:?}")
+    };
+    assert!(!m.contains(key), "{m}");
+    // An ordinary message is untouched...
+    let got = scrub_indexer_body_error(E::Api(0, "not a newznab API".into()), key);
+    let E::Api(_, m) = &got else {
+        panic!("{got:?}")
+    };
+    assert_eq!(m, "not a newznab API");
+    // ...and a short or empty configured key never turns prose into
+    // asterisks: blanking "abc" everywhere would redact real words.
+    let got = scrub_indexer_body_error(E::Api(0, "abc is a code".into()), "abc");
+    let E::Api(_, m) = &got else {
+        panic!("{got:?}")
+    };
+    assert_eq!(m, "abc is a code");
+    let got = scrub_indexer_body_error(E::Api(0, "plain trouble".into()), "");
+    let E::Api(_, m) = &got else {
+        panic!("{got:?}")
+    };
+    assert_eq!(m, "plain trouble");
+}
+
 /// The GRAB path needs more than [`redact_apikey`]. That scrubber
 /// knows the credential is spelled `apikey=` because WE built the
 /// search URL. An NZB enclosure link comes out of the indexer's own

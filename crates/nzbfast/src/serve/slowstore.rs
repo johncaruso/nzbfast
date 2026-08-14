@@ -751,13 +751,11 @@ pub(super) fn engage(d: &Arc<Daemon>, ev: &Evidence, path: &Path, probe: &Probe)
         probe_ms: *ms,
         healthy: 0,
     });
-    d.paused.store(true, Ordering::Relaxed);
-    *d.pause_source.lock_ok() = "storage";
-    bump(d);
     // A storage pause cancels any pending timed auto-resume: coming back
     // is the probe's call now, not a clock's.
-    d.pause_gen.fetch_add(1, Ordering::Relaxed);
-    *d.pause_until.lock_ok() = None;
+    crate::serve::set_paused_cancel_timer(d, true);
+    *d.pause_source.lock_ok() = "storage";
+    bump(d);
     // Graceful: in-flight articles finish and journal, so the resume
     // refetches only what was never started.
     d.suspend_active(true);

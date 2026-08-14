@@ -1526,7 +1526,18 @@ pub(crate) fn find_central_directory<S: Source + ?Sized>(parts: &S) -> Result<Di
             // where the directory ends on a zip64 archive, and measuring
             // to the EOCD instead would fold the record and its locator
             // into the stub and shift every offset by 76.
-            base = prepended_base(parts, z64_anchor.unwrap_or(anchor), cd_off, cd_size)?;
+            //
+            // The 76-back probe is only a CANDIDATE: on a non-zip64
+            // archive, four directory-tail bytes (a filename is arbitrary
+            // bytes) can coincidentally wear the signature. If no real
+            // directory record sits where the candidate implies, it does
+            // not count - measure to the EOCD anchor before refusing an
+            // archive every other reader opens (14 Aug sweep).
+            base = match z64_anchor {
+                Some(cand) => prepended_base(parts, cand, cd_off, cd_size)
+                    .or_else(|_| prepended_base(parts, anchor, cd_off, cd_size))?,
+                None => prepended_base(parts, anchor, cd_off, cd_size)?,
+            };
         }
         if per_disk != entries {
             return Err(ZipError::Malformed(

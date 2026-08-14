@@ -264,9 +264,12 @@ pub(crate) fn sevenz_password_check_capped(
     // ArchiveReader::open allocates on the declaration's say-so -
     // "does this password open it" is a question only a readable 7z
     // gets to ask, and this probe runs per candidate on the demoted
-    // container the in-stream gate just refused.
+    // container the in-stream gate just refused. The declared variant
+    // is the content-aware gate: the first-entry read below DECODES a
+    // content block, so its dictionary and PPMd declarations must be
+    // judged too.
     if let Ok(mut probe) = std::fs::File::open(container)
-        && nzbkit::nameprobe::sevenz_disk_header_bomb(&mut probe)
+        && nzbkit::nameprobe::sevenz_disk_declared_bomb(&mut probe).is_some()
     {
         return SevenzKey::Fails;
     }

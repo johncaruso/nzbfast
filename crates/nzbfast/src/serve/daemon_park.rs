@@ -17,6 +17,16 @@
 
 use super::*;
 
+/// Test seam: `note_queue_idle` trips between its empty scan and its
+/// latch CAS, inside the queue critical section - the exact window the
+/// M3 interleaving needed open. First barrier: the scan has run and the
+/// CAS has not; second: the test has staged its interleaved work and
+/// releases it. Same two-stage shape as `moveseq::COMMIT_TOMB_BARRIER`.
+#[cfg(test)]
+pub(in crate::serve) static IDLE_CAS_BARRIER: Mutex<
+    Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+> = Mutex::new(None);
+
 impl Daemon {
     /// Will [`park`](Daemon::park) arm an M32 automatic retry for this
     /// job? See [`auto_retry_eligible`], which both this and the hook
@@ -325,7 +335,13 @@ impl Daemon {
                         g.filed,
                     )
                 });
-                (del, g.tombstone.then(|| g.nzb_path.clone()))
+                // M5: a delete verb that files a history row keeps the
+                // spooled .nzb - the row is retryable and retry reads
+                // the spool. Only the history-less delete drops it.
+                (
+                    del,
+                    (g.tombstone && g.delete_status.is_empty()).then(|| g.nzb_path.clone()),
+                )
             };
             if let Some((tail, out_dir, stem, filed)) = del {
                 // The user pressed delete-with-files on a LIVE download
@@ -522,6 +538,51 @@ impl Daemon {
             if owes_move {
                 self.mover_enqueue(&job);
             }
+        } else if !job.lock_ok().delete_status.is_empty() {
+            // M5: the tombstone came from an NZBGet delete verb that
+            // owes a history row (GroupDelete / GroupDupeDelete /
+            // GroupParkDelete on an ACTIVE job - the queued case files
+            // directly from the handler). The abort's own fail verdict
+            // is not the story; stamp the delete's, then file. None of
+            // the failure duties above ran (give-up, failure-link,
+            // duplicate promotion are all tombstone-gated), which is
+            // right: this is a cancellation, not a failure.
+            {
+                let mut g = job.lock_ok();
+                g.state = JobState::Failed;
+                g.fail_message = if g.delete_status == "DUPE" {
+                    "deleted from the queue as a duplicate".into()
+                } else {
+                    "deleted from the queue".into()
+                };
+                g.fail_detail.clear();
+                // The record is done with its abort; clearing the
+                // tombstone here makes it an ordinary history row, so a
+                // later retry re-queues something pick_job will run.
+                g.tombstone = false;
+                if g.finished_unix.is_none() {
+                    g.finished_at = Some(Instant::now());
+                    g.finished_unix = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|t| t.as_secs() as i64);
+                }
+            }
+            // Not pushed twice: the handler files QUEUED deletes into
+            // history itself, and a late prefetch Ok can still walk that
+            // same record through this park.
+            let already = {
+                let mut h = self.history.lock_ok();
+                let already = h.iter().any(|j| Arc::ptr_eq(j, &job));
+                if !already {
+                    h.push(job.clone());
+                }
+                already
+            };
+            if !already {
+                let _ = self.history_upsert(std::slice::from_ref(&job));
+                self.history_enforce_retention();
+            }
         } else if filed_early {
             // §158.7: a delete landed INSIDE this park, after
             // `park_prewrite`. The job is dropped rather than filed, so
@@ -628,11 +689,31 @@ impl Daemon {
         if self.queue_idle_latch.load(Ordering::Relaxed) {
             return;
         }
-        let idle = !self.queue.lock_ok().iter().any(|j| {
+        // The scan, the CAS and the emit share ONE hold of the queue
+        // lock (Codex sweep 14 Aug M3). Dropped between scan and CAS,
+        // an enqueue could slip into the gap - re-arm the latch, push
+        // its job, publish job.added - and this thread's CAS then
+        // succeeded on the stale scan, announcing queue.idle over a
+        // runnable job with the latch left set. Enqueue publishes
+        // under this same lock, so holding it makes the pair a
+        // serialization: whichever side wins the lock, the emitted
+        // order is one the queue really passed through. Emitting under
+        // the queue lock follows enqueue's established order (ring and
+        // webhook channel are leaves under it).
+        let _q = self.queue.lock_ok();
+        let idle = !_q.iter().any(|j| {
             let g = j.lock_ok();
             matches!(g.state, JobState::Downloading | JobState::Finishing)
                 || (g.state == JobState::Queued && !g.paused)
         });
+        #[cfg(test)]
+        {
+            let pair = IDLE_CAS_BARRIER.lock_ok().clone();
+            if let Some((entered, released)) = pair {
+                entered.wait();
+                released.wait();
+            }
+        }
         if idle
             && self
                 .queue_idle_latch

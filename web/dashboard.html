@@ -581,6 +581,12 @@ body.dense #dashview .chgrip{display:none}
 #queue tbody tr[draggable="true"]{cursor:grab}
 #queue tbody tr.dragging{opacity:.45}
 #queue tbody tr.open td{border-bottom:none}
+/* A dotted release name is one unbreakable token, so an over-long one
+   used to widen the whole table past its card and paint out of bounds
+   (the card has no overflow rule outside dense). `anywhere` counts its
+   break opportunities in min-content sizing, so the name column wraps
+   instead of overflowing - at every width, not just on phones. */
+#queue td:nth-child(2),#hist td:nth-child(2),#idx td:first-child{overflow-wrap:anywhere}
 tr.drawer td{background:var(--surface-2);border-top:1px dashed var(--line);padding:10px 14px}
 tr.drawer:hover{background:transparent}
 .drow{display:flex;gap:10px;align-items:center;padding:2px 0;font-size:12.5px}
@@ -847,7 +853,9 @@ button.hlp{background:transparent;padding:0;font-weight:600;transition:filter .1
 /* The caret is the affordance: a row that opens has to look like one. */
 #hist .caret{flex:0 0 auto;width:9px;color:var(--dim);transition:transform .12s;font-size:10px}
 #hist tbody tr.item.open .caret{transform:rotate(90deg)}
-#hist .nmtxt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* min-width:0 lets the flex item actually shrink, so the ellipsis can
+   engage outside dense too instead of the name widening the table. */
+#hist .nmtxt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 /* Colour is opt-out (set.ui.histcolor): red/green on every row is a lot
    of colour for anyone who does not want status shouted at them. */
 body.histcolor #hist tbody tr.done .nmtxt{color:var(--ok)}
@@ -1340,7 +1348,6 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
   /* Long release names wrap instead of pushing the % / ETA off-screen. */
   #active>div{flex-wrap:wrap;gap:2px 10px}
   #active span{min-width:0;overflow-wrap:anywhere}
-  #queue td:nth-child(2),#hist td:nth-child(2),#idx td:first-child{overflow-wrap:anywhere}
   .card{padding:14px 13px;margin:12px 0}
   .tile .val{font-size:19px}
   table{font-size:12.5px}
@@ -1968,11 +1975,11 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input type="checkbox" id="s_adaptive_timeouts" onchange="setCfg('adaptive_timeouts',this.checked?1:0)"></div>
   <div class="row"><label data-i18n="set.speed.posthealth">Check posts before downloading<span class="hint" data-i18n="set.speed.posthealth.hint">while nothing is downloading, ask every server about a few of each queued post's articles and mark the row with the answer: a post your providers no longer carry is worth knowing about before the bandwidth is spent, not at 97%. Costs a few dozen tiny requests per job</span></label>
     <input type="checkbox" id="s_post_health" onchange="setCfg('post_health',this.checked?1:0)"></div>
-  <div class="row" data-adv="1"><label data-i18n="set.speed.posthealthdefer">Healthy-looking posts start first<span class="hint" data-i18n="set.speed.posthealthdefer.hint">a job whose check came back bad waits behind items of the same priority that checked out better. It only changes the ORDER: nothing is removed, paused or failed, and forcing a job or raising its priority overrides it. Off by default, because a post uploaded moments ago is missing everywhere too</span></label>
+  <div class="row" data-adv="1"><label data-i18n="set.speed.posthealthdefer">Healthy-looking posts start first<span class="hint" data-i18n="set.speed.posthealthdefer.hint">a job whose check came back bad waits behind items of the same priority that checked out better. It only changes the ORDER: nothing is removed, paused or failed, and forcing a job or raising its priority overrides it. On by default: a post uploaded moments ago can look missing everywhere too, but it only waits behind healthier items and still downloads</span></label>
     <input type="checkbox" id="s_post_health_defer" onchange="setCfg('post_health_defer',this.checked?1:0)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.speed.posthealthfail">Give up on posts no server can supply<span class="hint" data-i18n="set.speed.posthealthfail.hint">a job fails without downloading when EVERY one of your servers said EVERY sampled article was missing and the post is too old for that to be propagation. Sonarr or Radarr then blocklists the release and looks for another one straight away, instead of waiting out a download that cannot finish. Off by default and deliberately hard to trigger: one silent server, or one article still present, and the job runs as normal. Even so, a provider having a bad five minutes can look exactly like a dead post, so turn this on only if you would rather lose the occasional good release than spend the bandwidth. Needs the check above</span></label>
     <input type="checkbox" id="s_post_health_fail" onchange="setCfg('post_health_fail',this.checked?1:0)"></div>
-  <div class="row" data-adv="1"><label data-i18n="set.speed.oracleroute">Skip providers the oracle says are gone<span class="hint" data-i18n="set.speed.oracleroute.hint">experimental: when the availability check is confident a provider's backbone has lost a release (takedown), skip it for that download instead of waiting for it to fail. Never skips your last provider. Off by default</span></label>
+  <div class="row" data-adv="1"><label data-i18n="set.speed.oracleroute">Providers the oracle says are gone go last<span class="hint" data-i18n="set.speed.oracleroute.hint">experimental: when the availability check is confident a provider's backbone has lost a release (takedown), that provider is asked LAST for that download instead of first. It only changes the ORDER: nothing is removed, so a written-off provider is still asked once every other server has missed the article, and a wrong call costs a little time rather than the download. Off by default</span></label>
     <input type="checkbox" id="s_oracle_route" onchange="setCfg('oracle_route',this.checked?1:0)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.speed.oraclesample">Availability checks while idle<span class="hint" data-i18n="set.speed.oraclesample.hint">while nothing is downloading, ask each server about a few articles of indexed releases and remember the answers: that is the picture the setting above reads, and what lets a dead post be recognised before you queue it. Counted per server per hour; 0 turns the checking off. Default 300. Needs the built-in indexer, and stands down entirely while a download runs</span></label>
     <input class="txt sm" type="number" min="0" max="3600" id="s_oracle_sample" onchange="setCfg('oracle_sample',this.value)"></div>
@@ -2654,7 +2661,15 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
 </div>
 
 <div class="card set" data-sg="system" data-sk="log" id="logCard">
-  <h3 data-i18n="log.title">Log <button class="ghost" style="float:inline-end;margin-top:-4px" onclick="refreshLog(this)" data-i18n="log.refresh">Refresh</button></h3>
+  <h3 data-i18n="log.title">Log <span style="float:inline-end;margin-top:-4px;display:inline-flex;gap:6px;align-items:center">
+    <select class="sel" id="logView" onchange="renderLog()" data-i18n-title="log.view.title" title="choose which lines the pane shows, and what Export saves" aria-label="choose which lines the pane shows, and what Export saves">
+      <option value="all" data-i18n="log.view.all">everything</option>
+      <option value="app" data-i18n="log.view.app">app, without the indexer</option>
+      <option value="indexer" data-i18n="log.view.indexer">indexer only</option>
+    </select>
+    <button class="ghost" onclick="exportLog()" data-i18n="log.export" data-i18n-title="log.export.title" title="save the lines the current view shows as a text file">Export</button>
+    <button class="ghost" onclick="refreshLog(this)" data-i18n="log.refresh">Refresh</button>
+  </span></h3>
   <details id="logBox" ontoggle="if(this.open)refreshLog()">
     <summary class="dim" style="cursor:pointer;font-size:13px" data-i18n="log.show">show the daemon's recent output</summary>
     <pre id="logOut" style="max-height:320px;overflow:auto;font-size:11.5px;line-height:1.5;margin:10px 0 0;white-space:pre-wrap;color:var(--dim)"></pre>
@@ -9461,19 +9476,60 @@ function histMenu(e, id, failed){
 }
 
 // In-UI log viewer (stdout/stderr ring captured daemon-side).
-async function refreshLog(btn){
-  const j=await api('log','&value=400');
+// Every line's [tag] prefix is its tracing target, and these targets are
+// the indexer's lanes: the view select keys off membership in this set.
+// A tag missing from the list lands in the "app" view, which is the safe
+// side - residual noise beats hiding a download line. Tags that both
+// sides emit (oracle, watch, smart, nzbimport) stay out on purpose.
+const LOG_INDEX_TAGS=new Set(['index','indexer','spots','predb','claims','identity','confirm','scoreboard','wall','enrich','groups','gapfill','tip','pesto']);
+let logLines=[], logCapturing=true;
+function logFiltered(){
+  const v=(document.getElementById('logView')||{}).value||'all';
+  if(v==='all') return logLines;
+  return logLines.filter(l=>{
+    // First bracketed token = the tag (the prefix precedes any brackets
+    // in the message). Untagged lines (panic backtrace continuations)
+    // belong to the app view.
+    const m=/\[([a-z0-9_]+)\]/.exec(l);
+    const ix=!!(m&&LOG_INDEX_TAGS.has(m[1]));
+    return v==='indexer' ? ix : !ix;
+  });
+}
+function renderLog(jump){
   const o=document.getElementById('logOut');
-  if(!(j.lines||[]).length){
-    o.textContent=j.capturing===false
+  const ls=logFiltered();
+  if(!ls.length){
+    o.textContent=!logCapturing
       ? t('log.unavailable','log capture is not available on this platform')
+      : logLines.length ? t('log.viewempty','nothing in this view')
       : t('log.empty','nothing logged yet');
   } else {
     const atEnd=o.scrollTop+o.clientHeight>=o.scrollHeight-20;
-    o.textContent=j.lines.join('\n');
-    if(atEnd||btn) o.scrollTop=o.scrollHeight;
+    o.textContent=ls.join('\n');
+    if(atEnd||jump) o.scrollTop=o.scrollHeight;
   }
+}
+async function refreshLog(btn){
+  const j=await api('log','&value=400');
+  logLines=j.lines||[]; logCapturing=j.capturing!==false;
+  renderLog(!!btn);
   document.getElementById('logBox').open=true;
+}
+// Export what the view SHOWS. The point of the filter is that a user can
+// hand us a log with the lanes they'd rather keep private already
+// removed, so the file must match the pane exactly - filter the same
+// array through the same predicate, never re-fetch between pane and file.
+async function exportLog(){
+  if(!logLines.length) await refreshLog();
+  const ls=logFiltered();
+  if(!ls.length){ renderLog(); return; }
+  const v=(document.getElementById('logView')||{}).value||'all';
+  const stamp=new Date().toISOString().slice(0,19).replace(/[T:]/g,'-');
+  const url=URL.createObjectURL(new Blob([ls.join('\n')+'\n'],{type:'text/plain'}));
+  const a=document.createElement('a');
+  a.href=url; a.download=`nzbfast-log-${v}-${stamp}.txt`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),5000);
 }
 
 // M18b data usage: per-provider GB over today / 7 / 30 days.
@@ -12940,27 +12996,48 @@ async function refreshCorrConfirm(){
   try{
     const s=await api('corr_confirm_stats');
     const n=v=>(+(v||0)).toLocaleString(LOCALE);
-    const f=s.fold||{};
     if(!s.index_enabled){
       setHtml('foldState', t('predb.idxoff','the indexer is off, so there is nothing to name.'));
-    }else{
-      const parts=[t('fold.total','{rows} fragments merged into {posts} posts so far',
-                     {rows:n(f.rows_folded),posts:n(f.postings)})];
-      const top=+(f.top||0), cur=+(f.cursor||0);
-      const pct=top>0?Math.min(100,Math.floor(cur/top*100)):0;
-      // The first sweep of a grown index takes days by design (one
-      // short slice per scan pass), so say where it is rather than
-      // look stuck; after that the cursor just chases new posts.
-      if(!f.first_lap_done) parts.push(t('fold.first','first sweep of the index {pct}% done',{pct}));
-      else parts.push(pct>=100?t('fold.caught','caught up with new posts')
-                             :t('fold.sweep','sweeping new posts, {pct}% covered',{pct}));
-      setHtml('foldState', parts.join(' · '));
+      setHtml('corrConfirmState', t('predb.idxoff','the indexer is off, so there is nothing to name.'));
+      return;
     }
-    if(!s.index_enabled){ setHtml('corrConfirmState', t('predb.idxoff','the indexer is off, so there is nothing to name.')); return; }
+    // A saturated read pool (busy) or an unreadable index has no
+    // numbers to give; keep the last real ones on screen rather than
+    // paint exact zeroes - same shape as the catch below when the
+    // daemon itself is briefly unreachable.
+    if(s.busy||!s.fold) return;
+    const f=s.fold;
+    // A database upgraded across the release that added the counters
+    // merged rows nothing ever counted, so its totals are since the
+    // upgrade, never lifetime.
+    const parts=[ f.lifetime_known===false
+      ? t('fold.partial','{rows} fragments merged into {posts} posts since the update that added counting; earlier merges are not included',
+          {rows:n(f.rows_folded),posts:n(f.postings)})
+      : t('fold.total','{rows} fragments merged into {posts} posts so far',
+          {rows:n(f.rows_folded),posts:n(f.postings)})];
+    const top=+(f.top||0), cur=+(f.cursor||0);
+    const pct=top>0?Math.min(100,Math.floor(cur/top*100)):0;
+    // The first sweep of a grown index takes days by design (one
+    // short slice per scan pass), so say where it is rather than
+    // look stuck; after that the cursor just chases new posts.
+    if(!f.first_lap_done) parts.push(t('fold.first','first sweep of the index {pct}% done',{pct}));
+    else parts.push(pct>=100?t('fold.caught','caught up with new posts')
+                           :t('fold.sweep','sweeping new posts, {pct}% covered',{pct}));
+    setHtml('foldState', parts.join(' · '));
     if(!s.enabled){ setHtml('corrConfirmState', t('ccf.off','off.')); return; }
-    const parts=[t('ccf.today','today {u} of {cap} checks used',{u:n(s.spent_today),cap:n(s.per_day)})];
-    if(!s.source) parts.push('<span style="color:var(--warn)">'+t('ccf.nosrc','no account picked, so nothing is checked')+'</span>');
-    setHtml('corrConfirmState', parts.join(' · '));
+    const cparts=[t('ccf.today','today {u} of {cap} checks used',{u:n(s.spent_today),cap:n(s.per_day)})];
+    // The picker keeps a vanished account listed on purpose, so the
+    // warning must come from the daemon's live verdict: a deleted or
+    // turned-off account means every check is refused, and "0 of 24
+    // used" alone would read as healthy.
+    const st=s.source_state||(s.source?'ok':'none');
+    if(st!=='ok'){
+      const msg= st==='missing'  ? t('ccf.srcgone','the picked account is no longer in your indexer list, so nothing is checked')
+               : st==='disabled' ? t('ccf.srcoff','the picked account is turned off in your indexer list, so nothing is checked')
+               : t('ccf.nosrc','no account picked, so nothing is checked');
+      cparts.push('<span style="color:var(--warn)">'+msg+'</span>');
+    }
+    setHtml('corrConfirmState', cparts.join(' · '));
   }catch(e){}
 }
 async function startPredbSeed(){

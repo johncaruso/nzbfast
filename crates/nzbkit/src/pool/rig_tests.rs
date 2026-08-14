@@ -919,7 +919,8 @@ async fn safety_slowconn_ride_along_never_regresses() {
 /// PAYOUT (fault campaign, TODO 111): dead-air stalls price the
 /// adaptive timeout, dark since 96.1. Six ids hang BEFORE the
 /// status line; the flat path waits the whole read_timeout per hit,
-/// the adaptive TTFB budget gives up at its 2 s floor.
+/// the adaptive TTFB budget gives up at its floor (4 s since
+/// 14 Aug 2026, 2 s when this payout was first priced).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "wall-clock payout measurement - run with --ignored"]
 async fn payout_adaptive_timeout_cuts_dead_air_stalls() {
@@ -978,7 +979,7 @@ async fn payout_adaptive_timeout_cuts_dead_air_stalls() {
 /// actually costs WALL time: stalls near the queue's end, where the
 /// stalled article itself gates completion. BOTH legs run the
 /// adaptive budget - the A/B is suspicion. Off, a tail stall costs
-/// the full 2 s pre-byte floor plus a requeue round-trip before the
+/// the full pre-byte floor plus a requeue round-trip before the
 /// run can end; on, a sibling connection dup-races it after ~1 s of
 /// silence and the answer lands with a second of budget still on
 /// the clock. `greet` prices the same shape with a per-connection
@@ -1052,8 +1053,9 @@ async fn ttfb_hedge_deadair_legs(greet_delay_ms: u64) -> (Duration, Duration, us
 async fn payout_ttfb_hedge_beats_the_budget_on_dead_air() {
     let (off, on, _) = ttfb_hedge_deadair_legs(0).await;
     println!("ttfb-hedge payout: off {off:?} on {on:?}");
-    // Off: tail stalls sit out the 2 s budget floor before the run
-    // can end (healthy transfer alone is ~2.1 s).
+    // Off: tail stalls sit out the whole budget floor before the run
+    // can end (healthy transfer alone is ~2.1 s). The bound is a lower
+    // one, so the 4 s floor only widens the margin.
     assert!(
         off > Duration::from_secs(3),
         "off leg finished too fast for the dead air to have bitten ({off:?}) - rig broken"
@@ -1574,7 +1576,7 @@ async fn payout_rain_fade_drains_to_the_healthy_wan() {
 /// - after 20 bodies a connection's NAT entry ages out and it goes
 /// permanently mute, no close, no RST. The flat read timeout pays
 /// its full 12 s per eviction; the adaptive TTFB budget gives up
-/// at its 2 s floor and redials (a fresh accept = a fresh NAT
+/// at its floor and redials (a fresh accept = a fresh NAT
 /// entry). This is the recoverable half of the keepalive story -
 /// the idle-parked-connection half stays unpriceable on loopback.
 #[tokio::test(flavor = "multi_thread")]

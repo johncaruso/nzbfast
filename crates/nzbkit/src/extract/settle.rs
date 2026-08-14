@@ -1497,6 +1497,37 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// 14 Aug sweep: the same stale-record failure for a PLAIN slot. An
+    /// obfuscated post's bare payload file journals its placements under
+    /// the posted name; the PAR2 verified-name publish renames it on
+    /// disk, and the RarFallback-only gate left the journal pointing at
+    /// the old name - replay refetched a complete verified file. A Plain
+    /// slot's placements are identity-form by construction, so the
+    /// `S new-name` + `M` retarget is exactly as valid as it is for a
+    /// materialized volume.
+    #[test]
+    fn a_plain_slot_rename_refires_the_hook_with_the_new_name() {
+        let dir = tmpdir("plainrename");
+        let data = payload(200_000, 26); // no archive magic: sniffs Plain
+        let ex = Extractor::new(&dir, 1, true);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(usize, String, u64)>::new()));
+        let s2 = seen.clone();
+        ex.set_materialized_hook(Arc::new(move |slot, name: &str, size| {
+            s2.lock().unwrap().push((slot, name.to_string(), size))
+        }));
+        ex.write(0, "0Bf3qZ.bin", data.len() as u64, 0, &data)
+            .unwrap();
+        assert!(seen.lock().unwrap().is_empty(), "no rename, no hook");
+        std::fs::rename(dir.join("0Bf3qZ.bin"), dir.join("verified.mkv")).unwrap();
+        ex.note_slot_renamed(0, dir.join("verified.mkv"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(0, "verified.mkv".to_string(), data.len() as u64)],
+            "a plain slot's verified rename must retarget its journal identity"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn late_fallback_reconstructs_from_extracted() {
         let dir = tmpdir("latefb");

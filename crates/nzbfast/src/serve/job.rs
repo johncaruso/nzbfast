@@ -133,6 +133,16 @@ pub struct Job {
     /// gone. Not persisted (only ever true for the moment between abort and
     /// park).
     pub del_on_drop: bool,
+    /// The NZBGet delete verb that removed this job asked for a history
+    /// record: "MANUAL" (GroupDelete / GroupParkDelete) or "DUPE"
+    /// (GroupDupeDelete), empty for everything else. A non-empty value
+    /// changes three things: park() files a tombstoned job into history
+    /// instead of dropping it, the spooled .nzb is kept (the history row
+    /// is retryable, like NZBGet's HistoryReturn), and the JSON-RPC
+    /// history reports the row as DELETED/<value> rather than a
+    /// download verdict. Persisted: the row keeps saying "you deleted
+    /// this" across a restart.
+    pub delete_status: String,
     /// M23e: queue pause aborted this job mid-download. The tail handler
     /// re-queues it (the article journal resumes it later) instead of
     /// failing it into history.

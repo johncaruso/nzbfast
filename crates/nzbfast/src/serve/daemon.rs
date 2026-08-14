@@ -273,6 +273,19 @@ pub struct Daemon {
     /// unpause a queue the operator had paused themselves, which this
     /// remembers. Set only while holding the transition.
     pub paused_by_offline: std::sync::atomic::AtomicBool,
+    /// Set once the wind-down has started, and never cleared: this
+    /// process is leaving.
+    ///
+    /// Read by [`Self::index_db_wanted`], which is the single gate every
+    /// path to the index database passes through, so from this moment
+    /// nothing reopens it. That is what makes closing it on the way out
+    /// stick - the exit hands the write-ahead log back and drops the
+    /// connections, and a status poll arriving a hundred milliseconds
+    /// later must not lazily open a fresh one behind it and leave a new
+    /// -wal on disk. Queries answer as they do for an index that is
+    /// switched off (empty, never an error), which for the last moment
+    /// of a daemon's life is the right answer.
+    pub exiting: std::sync::atomic::AtomicBool,
     pub queue: Mutex<VecDeque<Arc<Mutex<Job>>>>,
     pub history: Mutex<Vec<Arc<Mutex<Job>>>>,
     /// §129 1b: the dashboard's change handles. Bumped at the
@@ -577,7 +590,7 @@ pub struct Daemon {
     pub post_health: std::sync::atomic::AtomicBool,
     /// TODO §77 auto-defer on the health verdict (live setting
     /// `post_health_defer`): a red job sinks below healthier ones of the
-    /// same priority in start order. OFF by default, and REORDERING ONLY
+    /// same priority in start order. ON by default, and REORDERING ONLY
     /// - nothing is removed, paused or failed. Eight STATs may put the
     /// healthy-looking items first, which costs the red job nothing when
     /// the sample was wrong; ending a release on them takes the far
@@ -732,10 +745,12 @@ pub struct Daemon {
     /// read. NZBFAST_ADAPTIVE_TIMEOUT overrides in either direction.
     pub adaptive_timeouts: std::sync::atomic::AtomicBool,
     /// M29 opt-in routing (`oracle_route`, OFF by default): when on, a
-    /// download skips any of your providers whose backbone the
+    /// download asks any of your providers whose backbone the
     /// availability ledger is confident is GONE for the release's
-    /// (family, age-bucket), saving the doomed round-trips on takedown'd
-    /// content. Guarded so it never removes your last usable provider.
+    /// (family, age-bucket) LAST, so the doomed round-trips on
+    /// takedown'd content come after every other server has missed.
+    /// Nothing is removed from the pool: a wrong verdict costs ordering,
+    /// not the download.
     pub oracle_route: std::sync::atomic::AtomicBool,
     /// The running prefetch sidecar, if any.
     pub sidecar: Mutex<Option<Sidecar>>,
@@ -2495,8 +2510,15 @@ impl Daemon {
     /// sources, so it is created and held for as long as EITHER switch
     /// is on - and with both off it is never opened, never created on a
     /// fresh install, exactly as when indexing was the only source.
+    ///
+    /// Answers no once the daemon is [`exiting`](Self::exiting),
+    /// whatever the switches say: the wind-down closes the database, and
+    /// a lazy reopen behind it would undo that.
     #[cfg(feature = "indexer")]
     pub(super) fn index_db_wanted(&self) -> bool {
+        if self.exiting.load(Ordering::Relaxed) {
+            return false;
+        }
         self.index_enabled.load(Ordering::Relaxed) || self.spot_enabled.load(Ordering::Relaxed)
     }
 
@@ -2571,6 +2593,25 @@ impl Daemon {
             ));
         }
         Ok(i.clone())
+    }
+
+    /// [`Self::corr_confirm_reference`]'s verdict as a display state
+    /// for the stats card, mirroring its rule (exists AND enabled) the
+    /// way `source_ok` mirrors `scoreboard_reference`. Four distinct
+    /// states because each wants a different fix from the user: the
+    /// picker deliberately keeps a vanished account listed, so without
+    /// this the card reads "0 of 24 checks used" while every worker
+    /// tick is refused.
+    pub(super) fn corr_confirm_source_state(&self) -> &'static str {
+        let source = self.corr_confirm_source.lock_ok().trim().to_string();
+        if source.is_empty() {
+            return "none";
+        }
+        match self.indexers.lock_ok().iter().find(|i| i.name == source) {
+            None => "missing",
+            Some(i) if !i.enabled => "disabled",
+            Some(_) => "ok",
+        }
     }
 
     /// The categories today's sample will actually ask for, in
@@ -2682,6 +2723,24 @@ impl Daemon {
     #[cfg(feature = "indexer")]
     pub(super) fn predb_feed_on(&self) -> bool {
         self.predb_enabled.load(Ordering::Relaxed) && self.index_enabled.load(Ordering::Relaxed)
+    }
+
+    /// May the indexer-confirm lane spend an attempt right now?
+    ///
+    /// Two switches, both required - the same rule as the pre feed.
+    /// The lane settles CORRELATION suggestions, and the dashboard
+    /// presents it as a child of the correlation switch: with
+    /// correlation off, the confirm controls grey out. The worker has
+    /// to honour that hierarchy too, or it keeps spending the user's
+    /// indexer quota (up to CONFIRM_PER_DAY lookups a day) on a lane
+    /// the UI says is off and will not let them reach. Requiring both
+    /// flags here, rather than having the correlation setter clear
+    /// this one, keeps the user's confirm preference across a parent
+    /// off/on cycle.
+    #[cfg(feature = "indexer")]
+    pub(super) fn corr_confirm_on(&self) -> bool {
+        self.predb_corr_enabled.load(Ordering::Relaxed)
+            && self.corr_confirm_enabled.load(Ordering::Relaxed)
     }
 
     /// Record what the feed is doing, for the settings card.
@@ -2800,6 +2859,60 @@ impl Daemon {
         // above), so there is no hot path behind it.
         self.queue_rev.fetch_add(1, Ordering::Relaxed);
         self.hub.rate.set(bps);
+    }
+
+    /// The watch-failed strip rides the revisioned queue payload, so
+    /// every mutation of the map must move `queue_rev` - an idle
+    /// dashboard skips the payload while `client_q == qrev`, and a row
+    /// removed without a bump is rendered forever: clicking its delete
+    /// button then answers "no such rejected file" for an entry the
+    /// daemon dropped long ago. Same trap as the update banner
+    /// (`latch_update_manifest`) and `set_limit`'s bump above; these
+    /// three helpers are the only doors to the map so the next
+    /// mutation site cannot forget. Each bumps only when the map
+    /// actually changed.
+    ///
+    /// Returns whether this insert changed anything - callers use that
+    /// to log the first appearance only.
+    pub(super) fn watch_failed_insert(
+        &self,
+        p: std::path::PathBuf,
+        v: (u64, u64, String, String),
+    ) -> bool {
+        let changed = {
+            let mut wf = self.watch_failed.lock_ok();
+            match wf.get(&p) {
+                Some(old) if *old == v => false,
+                _ => {
+                    wf.insert(p, v);
+                    true
+                }
+            }
+        };
+        if changed {
+            self.queue_rev.fetch_add(1, Ordering::Relaxed);
+        }
+        changed
+    }
+
+    pub(super) fn watch_failed_remove(&self, p: &std::path::Path) {
+        if self.watch_failed.lock_ok().remove(p).is_some() {
+            self.queue_rev.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Drop every entry whose file has left the disk (the user deleted
+    /// or moved it themselves).
+    pub(super) fn watch_failed_prune_missing(&self) {
+        let changed = {
+            let mut wf = self.watch_failed.lock_ok();
+            let before = wf.len();
+            wf.retain(|p, _| p.exists());
+            wf.len() != before
+        };
+        if changed {
+            self.queue_rev.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Record one daemon-owned moment for the throughput chart's marker
