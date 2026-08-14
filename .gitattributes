@@ -1,0 +1,40 @@
+# Line endings, pinned.
+#
+# With no file here, git on Windows defaults to core.autocrlf=true and
+# checks every file it guesses is text out with CRLF. That is how
+# `serve::tests::apply_arms_match_the_table` failed the first time the
+# suite was ever run on Windows: it reads its own source with include_str!
+# and splits on "\n}\n", which a CRLF checkout can never match, so the
+# guard reported "apply_setting has no recognisable end" instead of
+# reporting drift. Anything that hashes, embeds or parses our own source
+# has the same exposure, so the byte stream is one canonical thing on
+# every platform.
+* text=auto eol=lf
+
+# Test fixtures are BYTE-EXACT and must never be line-ending converted,
+# whatever git's text/binary heuristic guesses about them.
+#
+# Two of these have no NUL in the first 8000 bytes, so git reads them as
+# ordinary text and the rule above would silently rewrite them:
+# `vendor/rars/tests/fixtures/rar13/README` (49 CRLF pairs) and
+# `vendor/rars/tests/fixtures/rar15_40/ppmd/escape_64k.bin` (1337 of
+# them) - the second is a PPMd corpus where every byte is the thing under
+# test. `-text` also stops today's Windows checkout injecting 21 CRs into
+# `crates/nzbkit/testdata/spot/free.pt.over.tsv`, a latin-1 Spotnet
+# fixture that git likewise reads as text.
+crates/nzbkit/testdata/**          -text
+crates/nzbkit/tests/fixtures/**    -text
+vendor/rars/tests/fixtures/**      -text
+
+# cmd.exe's own format. `Start nzbfast.bat` has labels and a `goto` out of
+# a `for` block, which is the construct where an LF-only batch file misfires
+# on some cmd.exe versions, so this is pinned CRLF rather than left to the
+# default above. `packaging/windows/installer.iss` is deliberately NOT
+# here: Inno Setup reads LF, and LF is what the shipping installer has
+# been built from all along.
+#
+# The `build.cmd` that packaging/windows/make-installer.sh sends to the
+# build box is unaffected either way - that file is generated at run time
+# with literal \r\n and scp'd from a temp path, so it is never in git.
+*.bat text eol=crlf
+*.cmd text eol=crlf
