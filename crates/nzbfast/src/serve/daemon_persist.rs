@@ -181,13 +181,48 @@ impl Daemon {
         let (legacy_part, routed): (Vec<Job>, Vec<Job>) = from_file
             .into_iter()
             .partition(|j| legacy_ids.contains(&j.nzo_id));
+        // A routed TERMINAL queue row vs a stored history row for the same
+        // id is a torn move like any other, so the same `move_seq` rule
+        // decides it - the filter here used to be id-only, which threw the
+        // routed copy away whenever the store had the id. But the routed
+        // copy can be the NEWER one: a retry stamps N+1, the job runs to a
+        // terminal state, a save persists that terminal seq-N+1 snapshot
+        // into queue.json, and the crash lands before the stale seq-N
+        // history row was cleaned up. Discarding the routed copy then
+        // silently reverted the whole retry - the completed run reappeared
+        // as its previous failure (Codex sweep 13 Aug Q3). Ties keep the
+        // store's copy, which is the pre-stamp behaviour.
+        let mut superseded: std::collections::HashSet<String> = std::collections::HashSet::new();
         let routed: Vec<Job> = routed
             .into_iter()
-            .filter(|j| !stored_hist.iter().any(|s| s.nzo_id == j.nzo_id))
+            .filter(|j| {
+                let Some(s) = stored_hist.iter().find(|s| s.nzo_id == j.nzo_id) else {
+                    return true;
+                };
+                if moveseq::move_winner(j.move_seq, s.move_seq) == moveseq::MoveWinner::Queue {
+                    warn!(
+                        target: "queue",
+                        "{}: a restart caught a finished retry before its history \
+                         cleanup (queue seq {} > history seq {}) - keeping the \
+                         newer outcome",
+                        j.nzo_id,
+                        j.move_seq,
+                        s.move_seq
+                    );
+                    superseded.insert(j.nzo_id.clone());
+                    true
+                } else {
+                    false
+                }
+            })
             .collect();
         let routed_any = !routed.is_empty();
         let mut history = legacy_part;
-        history.extend(stored_hist);
+        history.extend(
+            stored_hist
+                .into_iter()
+                .filter(|s| !superseded.contains(&s.nzo_id)),
+        );
         history.extend(routed);
         // Cross-store reconciliation. A queue -> history move is two
         // independent durable writes - park appends and fsyncs the terminal

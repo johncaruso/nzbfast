@@ -32,6 +32,88 @@ fn encrypted_single_volume_decrypts_in_stream() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Codex sweep 13 Aug C1, half one: an encrypted span routed WITHOUT
+/// CryptoState commits its output to the ciphertext route AT ENQUEUE,
+/// under the routing lock. The physical pwrites run after the lock
+/// drops, so `written()` lags the commitment - the latch is what a
+/// concurrent router consults in that window. A check-less encrypted
+/// entry (RAR4, or RAR5 posted without its check) takes exactly this
+/// route: unproven key, ciphertext assembled at store offsets.
+#[test]
+fn a_ciphertext_route_is_latched_at_enqueue_not_at_write_time() {
+    let plain = payload(120_000, 75);
+    let mut f = fixtures::encrypt_file("right", &plain, 47);
+    f.no_check = true;
+    f.with_crc = true;
+    let vol =
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..f.cipher.len(), false, false)], None);
+    let dir = tmpdir("c1-latch");
+    let ex = Extractor::new(&dir, 1, true);
+    ex.set_password("right");
+    feed(&ex, 0, "v.rar", &vol, 7000, 75);
+    {
+        let inner = ex.inner.lock_ok();
+        assert!(
+            inner.ciphertext_files.contains("movie.mkv"),
+            "the route was committed at enqueue and must be latched there"
+        );
+        // A zero-written view of the same output name: what a concurrent
+        // router sees while the first span's pwrite is still in flight.
+        // The counter half of rule 2 is blind here; the latch refuses.
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let w = crate::disk::FileWriter::create(&scratch.join("movie.mkv"), 4096).unwrap();
+        assert_eq!(w.written(), 0);
+        assert!(
+            !Extractor::instream_decrypt_allowed(&inner, 0, 0, &w),
+            "an output owed ciphertext must never latch plaintext-once"
+        );
+    }
+    // One route for the whole file: finish decrypts the assembled
+    // ciphertext and publishes correct plaintext.
+    let rep = ex.finish().unwrap();
+    assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+    assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), plain);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Codex sweep 13 Aug C1, half two: the gate CONSULTS the latch. This
+/// set satisfies every plaintext-once condition (stored check, right
+/// password, zero bytes written) - the exact state a second span sees
+/// mid-window - and the pre-latched route must still refuse it, or the
+/// output mixes raw ciphertext with decrypted plaintext.
+#[test]
+fn a_latched_ciphertext_output_refuses_plaintext_once() {
+    let plain = payload(120_000, 76);
+    let mut f = fixtures::encrypt_file("right", &plain, 48);
+    f.with_crc = true;
+    let vol =
+        fixtures::rar5_volume_enc(&[("movie.mkv", &f, 0..f.cipher.len(), false, false)], None);
+    let dir = tmpdir("c1-consult");
+    let ex = Extractor::new(&dir, 1, true);
+    ex.set_password("right");
+    // The committed-but-unwritten ciphertext span, as the routing lock
+    // records it: only the latch, no bytes on disk yet.
+    ex.inner
+        .lock_ok()
+        .ciphertext_files
+        .insert("movie.mkv".to_string());
+    feed(&ex, 0, "v.rar", &vol, 7000, 76);
+    {
+        let inner = ex.inner.lock_ok();
+        assert!(
+            !inner.crypto_files.contains_key("movie.mkv"),
+            "plaintext-once latched over an output owed ciphertext"
+        );
+    }
+    // The whole file stays ciphertext and the finish pass adjudicates:
+    // correct plaintext, one route.
+    let rep = ex.finish().unwrap();
+    assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+    assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), plain);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Finding 8: an encrypted RAR5 STORE entry with a plain (non-tweaked)
 /// stored CRC must have its DECRYPTED plaintext verified. The password
 /// check proves the key, not that every ciphertext block survived the

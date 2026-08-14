@@ -68,6 +68,15 @@ you are not duplicating an in-flight session's work.
 - `manual-check.py` - structural parity for translated manuals vs
   `docs/MANUAL.html` (id/anchor sets, tag counts, byte-identical `<code>`,
   lang, switcher).
+- `pullsearch/port.py` - the pattern for adding a NEW manual section to
+  all 16 languages at once, kept as a worked example. The blocks live one
+  file per locale (`pullsearch/<lang>.html`, marked off with
+  `<!--BLOCK name-->`), rendered from `pullsearch/en.html` so only the
+  prose differs; `port.py --check` compares the tag stream, `href=` and
+  `<code>` content of every block against English BEFORE writing, and
+  each insertion anchors on an `id=` or a byte-identical `<code>` and
+  asserts a single match. Hand-writing the locale pages instead is what
+  puts `manual-check.py` red at gate time.
 
 ## Adding a locale (Latin / simple plural)
 1. `web/i18n/<tag>.json` - translate from `en.reference.json`.

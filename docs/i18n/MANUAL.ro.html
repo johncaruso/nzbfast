@@ -401,6 +401,9 @@ spre el pentru preluări cu un singur clic de pe site-urile de indexer.</td></tr
 <tr><td><b>Dintr-un URL</b></td><td>Lipește un link NZB (API <code>mode=addurl</code>, sau prin orice aplicație conectată).</td></tr>
 <tr><td><b>Legături nzblnk:</b></td><td>Lipește o legătură <code>nzblnk:</code> oriunde pe panou, sau trage-o înăuntru. Dacă ai instalat din DMG-ul macOS sau din instalatorul Windows, poți și să dai clic pe una direct pe un board. Vezi <a href="#nzblnk">legăturile nzblnk</a> mai jos.</td></tr>
 <tr><td><b>Răsfoiește indexul</b></td><td>Dă clic pe orice release complet din cardul Răsfoiește.</td></tr>
+<tr><td><b>Caută pe indexere</b></td><td>Caută pe conturile de indexer pe care le-ai
+adăugat și pune un rezultat în coadă direct din listă. Vezi <a href="#pullsearch">Căutarea
+pe conturile tale de indexer</a> mai jos.</td></tr>
 <tr><td><b>Watchlist / RSS</b></td><td>Automat - vezi <a href="#automation">Automatizare</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr etc.</b></td><td>Trimit preluările direct în coadă - vezi <a href="#arr">§11</a>.</td></tr>
 <tr><td><b>Linia de comandă</b></td><td><code>nzbfast get file.nzb</code> descarcă fără daemon.</td></tr>
@@ -417,6 +420,57 @@ descărcare, iar Folderele inteligente (vezi <a href="#automation">§10</a>) le 
 din Istoric (🔑).</li>
 </ul>
 
+<h3 id="pullsearch">Căutarea pe conturile tale de indexer</h3>
+<p>Dacă ai cont pe un site indexer de NZB, nzbfast poate căuta acolo de aici și poate pune
+în coadă ce alegi, în loc să te duci pe site, să descarci un NZB și să-l aduci înapoi.
+Vorbește interfața de indexer obișnuită pe care o oferă toate acele site-uri, așa că nu e
+nimic de configurat de la site la site: NZBGeek, NZBFinder, DrunkenSlug, DOGnzb și
+celelalte funcționează la fel. O instanță Prowlarr sau NZBHydra2 este tot o singură
+intrare și aduce cu ea fiecare indexer din spatele ei.</p>
+<p><b>Adăugarea unui cont.</b> Setări → Caută pe indexere →
+<b>+ Adaugă indexer</b>. Completează un nume la alegerea ta, adresa de API a site-ului
+(adresa lui web obișnuită e de ajuns; o intrare Prowlarr arată așa:
+<code>http://host:9696/1/api</code>) și cheia API din pagina ta de cont de acolo, apoi
+<b>Aplică indexerele</b>. <b>Testează</b> întreabă site-ul ce acceptă și arată ce a venit
+înapoi, ceea ce dovedește adresa și cheia dintr-un clic. O cheie salvată nu mai este
+arătată niciodată: căsuța o spune, iar dacă o lași goală păstrezi cheia care este deja
+acolo.</p>
+<p><b>Căutarea.</b> Deschide <b>🎬 peretele</b> din antet și treci la lista de release-uri.
+Meniul de lângă caseta de căutare hotărăște unde se uită o căutare: <b>Acest index</b>,
+adică ce a scanat singură mașina asta, <b>Indexere</b> sau <b>Ambele</b>. Alegerea ta este
+ținută minte. Ca să întrebi conturile trebuie să scrii ceva în casetă, fiindcă răsfoirea
+lor cu o interogare goală ar cheltui alocarea unei zile pe o listă pe care nu a cerut-o
+nimeni. Cu indexerul încorporat oprit, așa cum vine nzbfast, nu sunt afișe de arătat, iar
+pagina este exact atât: o casetă de căutare, conturile tale și rezultatele.</p>
+<p><b>Rezultatele.</b> Un rând pe release, cele mai noi întâi, cu mărimea, vechimea și de
+câte ori l-au luat utilizatorii acelui indexer. Un release pe care îl au mai multe dintre
+conturile tale apare o singură dată. La <b>Ambele</b>, copia pe care indexul tău o are
+deja câștigă, iar cea din exterior cade, fiindcă a lua ce ai indexat deja nu te costă
+nimic. <b>Descarcă</b> îl pune în coadă cu prioritate mare: nzbfast aduce singur NZB-ul,
+iar de acolo sarcina e ca oricare alta, cu reparare, extragere, categorii și scripturi
+neschimbate.</p>
+<p><b>Întrebarea despre un singur titlu.</b> Deschide fișa unui titlu de pe perete și apasă
+<b>⌕ Caută pe indexerele mele</b>. La filme întrebarea merge pe numărul IMDb oriunde
+site-ul acceptă unul, iar asta e diferența dintre filmul la care te gândeai și orice
+release al cărui nume conține din întâmplare acele cuvinte. nzbfast caută singur numărul,
+așa că pagina nu ține niciodată vreunul. Site-urile care nu oferă potrivire după număr
+sunt întrebate în cuvinte.</p>
+<p><b>Alocarea ta.</b> Conturile de indexer sunt măsurate: atâtea căutări și atâtea
+descărcări pe zi, după planul tău. Pune cele două numere pe intrare și nzbfast scade din
+ele, luând-o de la capăt la miezul nopții UTC. 0, valoarea implicită, înseamnă nelimitat,
+iar numărătoarea continuă oricum. Un cont care și-a cheltuit alocarea stă deoparte cât
+lucrează celelalte, iar un rând deasupra rezultatelor îl numește pe cel sărit: epuizarea
+nu este niciodată tăcută. Un site care răspunde cu o limită proprie, sau care ne cere să
+încetinim, este pus deoparte pentru o oră.</p>
+<p><b>Unde ajunge cheia ta.</b> Doar la indexerul căruia îi aparține. Cheile rămân pe
+mașina asta, nu ajung niciodată la browser - fiecare rând de rezultat poartă un tichet
+valabil o jumătate de oră în locul unei legături - și sunt scoase din jurnal și din orice
+eroare întoarsă de site, așa că un mesaj de eroare lipit nu poate scăpa niciuna. O
+descărcare poate aduce doar o legătură pe care a întors-o una dintre căutările tale.</p>
+<p>Sunt aceleași conturi la care recurge o <a href="#nzblnk">legătură nzblnk</a> când
+indexul local nu îi recunoaște antetul, și cele pe care watchlistul le poate întreba
+despre elementele dorite (<a href="#automation">§10</a>).</p>
+
 <h3 id="nzblnk">Legăturile nzblnk</h3>
 <p>Unele board-uri, mai ales germane și olandeze, publică o legătură
 <code>nzblnk:</code> în loc de un fișier NZB. Postarea este ofuscată, deci nu există
@@ -426,7 +480,7 @@ niciun nume de fișier către care s-ar putea trimite. Legătura duce în schimb
 trebuie mai întâi să se ducă și să găsească postarea.</p>
 <p>nzbfast caută antetul mai întâi în propriul index, ceea ce nu cere deloc rețea, și
 abia dacă acolo nu îl găsește întreabă indexatoarele de căutare pe care le-ai configurat
-(Setări → Indexatoare de căutare, <a href="#settings">§9</a>), sub aceleași bugete
+(Setări → Caută pe indexere, <a href="#settings">§9</a>), sub aceleași bugete
 zilnice și aceeași retragere ca orice altă căutare. Titlul devine numele sarcinii, iar
 parola se aplică automat.</p>
 <ul>
@@ -729,6 +783,20 @@ ai alege, sertarul fiecărui job are un buton <b>Descarcă fișierul .nzb</b>, a
 copie a fișierului <code>.nzb</code> al oricărui job nu e niciodată la mai mult de un
 clic distanță.</p>
 
+<h3 id="set-indexers">Caută pe indexere <span class="pill live">live</span></h3>
+<p>Conturile tale pe site-uri indexer de NZB, câte un rând fiecare, ca o căutare de pe
+perete să le poată întreba și pe ele. Ce face funcția, și cum cauți cu ea, este la
+<a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Câmp</th><th>Ce face</th></tr>
+<tr><td>Nume</td><td>O etichetă la alegerea ta, și identitatea sub care sunt ținute contoarele și limitele zilei. Redenumirea unui rând începe o intrare nouă, deci reintrodu cheia.</td></tr>
+<tr><td>Adresă API</td><td>Adresa de API a site-ului. Adresa lui web obișnuită e de ajuns; o intrare Prowlarr sau NZBHydra2 arată așa: <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>Cheie API</td><td>Din pagina ta de cont de pe acel site. Rămâne pe mașina asta, se trimite doar site-ului căruia îi aparține, nu mai este arătată și nu se scrie niciodată în jurnal. Gol păstrează cheia salvată.</td></tr>
+<tr><td>Căutări pe zi</td><td>Câte căutări poate cheltui contul acesta pe zi. 0 = nelimitat, și valoarea implicită.</td></tr>
+<tr><td>Descărcări pe zi</td><td>Câte preluări poate cheltui pe zi. 0 = nelimitat. Ambele contoare o iau de la capăt la miezul nopții UTC.</td></tr>
+<tr><td>pornit, Testează</td><td><b>pornit</b> este ce face un rând căutabil; scoate bifa ca să păstrezi un cont fără să-l folosești. <b>Testează</b> întreabă site-ul ce acceptă și arată răspunsul, sau eroarea, pe loc.</td></tr>
+</table></div>
+
 <h3>Indexare <span class="pill live">live</span></h3>
 <div class="note"><b>Indexatorul încorporat este oprit implicit.</b> Găsește postările
 făcute sub un nume de fișier real, iar o parte mare și în creștere din Usenet este
@@ -737,11 +805,13 @@ aruncate într-un grup de-a valma. Numele adevărat trăiește doar într-un NZB
 uploaderul îl publică în altă parte, deci nu a fost niciodată pe Usenet ca vreun scaner
 să îl citească. Măsurat pe propriul nostru index, 14,8 milioane de postări scanate au
 dat cam 31.000 de release-uri de răsfoit, aproximativ unul din cinci sute. Folosește
-mai departe indexatoare comerciale și adaugă-le la Setări → Indexatoare de căutare, ca
+mai departe indexatoare comerciale și adaugă-le la Setări → Caută pe indexere, ca
 să le poți interoga din perete. Pornește asta dacă urmărești grupuri anume în care lumea
 încă postează sub nume reale, sau dacă vrei să vezi ce duce de fapt furnizorul tău. Cu
-comutatorul oprit nu se scanează și nu se descarcă nimic, nu se creează nicio bază de
-date, iar peretele, Răsfoiește, Watchlist și fluxul newznab sunt ascunse.</div>
+comutatorul oprit nu se scanează și nu se descarcă nimic și nu se creează nicio bază de
+date; Răsfoiește și fluxul newznab dispar, peretele devine o simplă pagină de căutare
+pentru conturile de indexer pe care le-ai adăugat, iar Watchlist lucrează cu acele
+conturi.</div>
 <div class="tblwrap"><table>
 <tr><th>Setare</th><th>Ce face</th></tr>
 <tr><td>Indexator încorporat</td><td>Comutatorul principal, <b>oprit până nu îl pornești</b>. Oprit înseamnă fără scanare, fără căutări de metadate, fără eșantionare a disponibilității și fără flux newznab; un index deja aflat pe disc este păstrat (există un buton de ștergere), așa că repornirea reia în loc să rescaneze.</td></tr>
@@ -800,6 +870,16 @@ intenționat după mod: un cont conectat vede întreaga listă, deci un titlu ș
 este urmărit aici (descărcările deja finalizate rămân); un feed pe bază de adresă aduce doar
 cele mai recente intrări, deci absența nu dovedește nimic și titlurile sunt doar adăugate.
 Ambele valori implicite pot fi schimbate per sursă.</p>
+<p><b>Caută ce vreau și pe conturile mele de indexer</b>, la baza cardului watchlistului,
+îl lasă să întrebe conturile din Setări → Caută pe indexere pe lângă indexul tău
+(<a href="#pullsearch">§5</a>). Începe oprit, fiindcă este singurul lucru de aici care
+cheltuie un cont contorizat fără să dai tu clic. Pornit, fiecare element urmărit întreabă
+de vreo două ori pe zi, și doar despre ce nu a găsit deja, sub aceleași limite zilnice și
+cu aceleași note când un cont este sărit. Un candidat venit de la un indexer este judecat
+exact ca unul local, așa că pragurile de calitate, upgrade-urile, pachetele de sezon și
+tratarea duplicatelor se aplică toate, iar o copie locală câștigă orice egalitate fiindcă
+nu costă alocare. Cu indexerul încorporat oprit, asta este ce îi dă watchlistului ceva cu
+care să lucreze.</p>
 <h3 id="auto-rss">Feeduri RSS</h3>
 <p>Setări → RSS: orice URL RSS newznab/indexer cu interval per feed, categorie și
 reguli de filtrare (tipare de titlu, limite de dimensiune). Elementele care se potrivesc sunt descărcate
@@ -1172,7 +1252,7 @@ compatibil SABnzbd, așa că integrările SAB existente funcționează neschimba
 <tr><td>Config</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (fiecare câmp din Setări), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index și perete</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab la <code>/api?t=caps|search|tvsearch|movie</code> și <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automatizare</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>
-<tr><td>Diagnostice</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
+<tr><td>Diagnostice</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code></td></tr>
 <tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> - status, listgroups, history, append, editqueue, rate, pause, log (autentificare Basic: orice utilizator, cheia API drept parolă)</td></tr>
 <tr><td>Previzualizare / redare</td><td><code>/stream/&lt;nzo_id&gt;</code> (intervale HTTP; pornirea unui job de bibliotecă parcat necesită token <code>?t=</code> sau cheie), <code>/m3u/&lt;id&gt;</code> (necesită cheie; generează tokenul), <code>/wall</code>, <code>/art/…</code></td></tr>
 </table></div>

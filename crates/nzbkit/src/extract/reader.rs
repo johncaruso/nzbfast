@@ -740,12 +740,15 @@ impl Extractor {
     }
 
     /// (file name, size) of the slot's on-disk file - what the journal
-    /// records as the slot's restore destination.
+    /// records as the slot's restore destination. The LIVE path, not the
+    /// creation-time one: a verified-name publish renames the file, and
+    /// an `S` emitted afterwards must name the file replay will actually
+    /// find (same rule as [`Self::slot_path`], and half of R3).
     pub fn slot_file_info(&self, slot: usize) -> Option<(String, u64)> {
         let inner = self.inner.lock_ok();
         inner.slots[slot].writer.as_ref().map(|w| {
             (
-                w.path
+                w.current_path()
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
@@ -992,9 +995,36 @@ impl Extractor {
     /// No-op for writerless slots: those go through [`rename`](Self::rename),
     /// which retargets the name BEFORE any writer is created.
     pub fn note_slot_renamed(&self, slot: usize, new_path: std::path::PathBuf) {
-        let w = self.inner.lock_ok().slots[slot].writer.clone();
+        let (w, materialized, hook) = {
+            let inner = self.inner.lock_ok();
+            let s = &inner.slots[slot];
+            (
+                s.writer.clone(),
+                matches!(s.mode, SlotMode::RarFallback),
+                inner.materialized.clone(),
+            )
+        };
         if let Some(w) = w {
-            w.note_renamed(new_path);
+            w.note_renamed(new_path.clone());
+            // A MATERIALIZED slot's journal identity must follow the
+            // rename. Its `M` record rewrote every placed fragment to
+            // identity form under the then-current name, and the
+            // in-memory `renamed_to` above reaches no journal line - so
+            // after a crash, replay went looking for the OLD file, found
+            // nothing, and refetched a complete verified volume sitting
+            // right there under its new name (Codex sweep 13 Aug R3).
+            // Re-firing the materialized hook appends `S new-name` + `M`
+            // in one write: last-S-wins retargets the destination and
+            // the positional M rewrites the already-identity fragments
+            // to the new name. Root level only, like the hook install -
+            // the journal records in the root's slot space.
+            if self.depth == 0
+                && materialized
+                && let Some(h) = hook
+                && let Some(name) = new_path.file_name()
+            {
+                h(slot, &name.to_string_lossy(), w.size);
+            }
         }
     }
 

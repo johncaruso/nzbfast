@@ -548,11 +548,10 @@ impl NzbFile {
         if !name.contains(".par2") {
             return FileKind::Data;
         }
-        // Recovery volumes look like "foo.vol012+10.par2" (par2cmdline:
-        // first slice + count) or "foo.vol000-001.par2" (range convention,
-        // end-exclusive - some posters' tooling chains 000-001, 001-003,
-        // 003-007…). Anything else with .par2 is the index.
-        if par2_vol_count(&name).is_some() {
+        // Anything with .par2 that doesn't wear a recovery-volume
+        // suffix is the index. The suffix rule lives in
+        // `par2_vol_suffix`, shared with `extract::release_stem`.
+        if par2_vol_suffix(&name).is_some() {
             FileKind::Par2Volume
         } else {
             FileKind::Par2Main
@@ -582,13 +581,79 @@ pub fn quoted_filename(s: &str) -> Option<&str> {
     first
 }
 
-/// Declared recovery-slice count from a PAR2 volume filename:
-/// `.vol<first>+<count>` → count; `.vol<start>-<end>` (end-exclusive
-/// range) → end − start. `None` if the name doesn't carry a strict
-/// `.vol<digits><+|-><digits>` tail - i.e. not a recovery volume.
-pub fn par2_vol_count(name: &str) -> Option<usize> {
+/// Byte offset of the recovery-volume suffix in a PAR2 filename, or
+/// `None` when the name doesn't carry one. This is THE "is this a
+/// recovery volume?" rule: classification (`NzbFile::kind`, which
+/// drives deferral) and stem reduction (`extract::release_stem`, which
+/// drives index folding) both call it. The rule used to be written
+/// twice and drifted the same wrong way - both spellings demanded
+/// digits before the separator, so `.vol-01.par2` posts fetched their
+/// whole recovery set eagerly (7.5 GB measured on one 42 GiB post) and
+/// kept `.vol-01` on the release stem, shattering off their release in
+/// the index.
+///
+/// Accepted, case-insensitive, always directly before `.par2` or the
+/// end of the name:
+/// - `.vol<digits>+<digits>` - par2cmdline, first slice + count
+/// - `.vol<digits>-<digits>` - range convention, end-exclusive
+/// - `.vol-<NN>` - bare zero-padded ordinal, nothing before the dash
+///   (playWEB/NORViNE/GRACE posts, measured live 13 Aug 2026: always
+///   two digits, always straight before `.par2`). Two digits minimum
+///   on this shape only: a music compilation's index `VA.Hits.Vol-3.par2`
+///   numbers a release, not a volume, and single-digit is that
+///   convention's home ground.
+pub fn par2_vol_suffix(name: &str) -> Option<usize> {
     let lower = name.to_ascii_lowercase();
     let vol = lower.rfind(".vol")?;
+    let rest = &lower[vol + 4..];
+    let sep = rest.find(['+', '-'])?;
+    let first = &rest[..sep];
+    if !first.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let after = &rest[sep + 1..];
+    let end = after.find('.').unwrap_or(after.len());
+    let ordinal = &after[..end];
+    if ordinal.is_empty() || !ordinal.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if first.is_empty() && (rest.as_bytes()[sep] != b'-' || ordinal.len() < 2) {
+        return None;
+    }
+    // The suffix must CLOSE the filename: nothing after the ordinal
+    // (a stem already stripped of its .par2), or ".par2" followed by
+    // at most a non-name character - kind() falls back to the whole
+    // subject when nothing is quoted, so ".par2 yEnc (1/2)" tails are
+    // normal there. "Vol-52.2CD-2023-GRP.par2" stays a title: what
+    // follows its ordinal is more name, not the extension.
+    let tail = &after[end..];
+    match tail.strip_prefix(".par2") {
+        None if tail.is_empty() => Some(vol),
+        Some(t)
+            if !t
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.is_ascii_alphanumeric()) =>
+        {
+            Some(vol)
+        }
+        _ => None,
+    }
+}
+
+/// Declared recovery-slice count from a PAR2 volume filename:
+/// `.vol<first>+<count>` → count; `.vol<start>-<end>` (end-exclusive
+/// range) → end − start. `None` when the name declares no count: not a
+/// recovery volume at all, or the bare-ordinal `.vol-NN` shape, which
+/// numbers the volume without sizing it. "Is it a volume?" is
+/// [`par2_vol_suffix`]'s question - a `None` here does NOT mean the
+/// file is safe to fetch eagerly, and every count consumer already
+/// copes with `None` the way the obfuscated (nameless) path does:
+/// size-based estimates, a conservative 1, or the deferred-article
+/// proof in settle.
+pub fn par2_vol_count(name: &str) -> Option<usize> {
+    let lower = name.to_ascii_lowercase();
+    let vol = par2_vol_suffix(&lower)?;
     let rest = &lower[vol + 4..];
     let sep = rest.find(['+', '-'])?;
     let first: u64 = rest[..sep].parse().ok()?;
@@ -928,10 +993,24 @@ POST]]></segment>
         assert_eq!(f.kind(), FileKind::Par2Volume);
         f.subject = r#"< Rel > - "Rel.vol000-001.par2" yEnc (1/1)"#.to_string();
         assert_eq!(f.kind(), FileKind::Par2Volume);
+        // Bare-ordinal volumes: NOTHING before the dash, zero-padded
+        // ("Rel.vol-01.par2" … "Rel.vol-09.par2" - playWEB, NORViNE,
+        // GRACE posts, measured live 13 Aug 2026). Both spellings of
+        // the old rule demanded digits there, so these classified
+        // Par2Main and the whole recovery set (7.5 GB on one measured
+        // 42 GiB post) was fetched eagerly.
+        f.subject = r#"< Rel > - "Fightland.S01E01.1080p.AMZN.WEB-DL.DD+5.1.H.264-playWEB.vol-01.par2" yEnc (1/13)"#.to_string();
+        assert_eq!(f.kind(), FileKind::Par2Volume);
         // A dash in the release name alone must not demote the index.
         f.subject = r#"< Rel > - "Some.Film.2026.H.265-GRP.par2" yEnc (1/1)"#.to_string();
         assert_eq!(f.kind(), FileKind::Par2Main);
         f.subject = r#"< Rel > - "Some.Film-GRP.vol.par2" yEnc (1/1)"#.to_string();
+        assert_eq!(f.kind(), FileKind::Par2Main);
+        f.subject = r#"< Rel > - "Rel.volume-2.par2" yEnc (1/1)"#.to_string();
+        assert_eq!(f.kind(), FileKind::Par2Main);
+        // A compilation numbered "Vol-3" is a release name, not a
+        // recovery ordinal - single digit after the dash stays an index.
+        f.subject = r#"< Rel > - "VA.Best.Hits.Vol-3.par2" yEnc (1/1)"#.to_string();
         assert_eq!(f.kind(), FileKind::Par2Main);
     }
 
@@ -962,6 +1041,28 @@ POST]]></segment>
         assert_eq!(par2_vol_count("Rel.par2"), None);
         assert_eq!(par2_vol_count("Rel-GRP.par2"), None);
         assert_eq!(par2_vol_count("Rel.volume-2.par2"), None);
+        // Bare ordinal: IS a volume (par2_vol_suffix), but its name
+        // declares no slice count - callers fall back to estimates,
+        // exactly like the nameless obfuscated path.
+        assert_eq!(par2_vol_count("Rel.vol-01.par2"), None);
+        assert_eq!(par2_vol_suffix("Rel.vol-01.par2"), Some(3));
+        assert_eq!(par2_vol_suffix("Rel.vol-09.par2"), Some(3));
+        assert_eq!(par2_vol_suffix("Rel.vol012+10.par2"), Some(3));
+        assert_eq!(par2_vol_suffix("Rel.vol127-199.par2"), Some(3));
+        // Not volumes: non-numeric field before the separator, spelt-out
+        // "volume", a bare index, a single-digit compilation number.
+        assert_eq!(par2_vol_suffix("Rel.volume-2.par2"), None);
+        assert_eq!(par2_vol_suffix("Some.Film-GRP.vol.par2"), None);
+        assert_eq!(par2_vol_suffix("Some.Film.2026.H.265-GRP.par2"), None);
+        assert_eq!(par2_vol_suffix("VA.Best.Hits.Vol-3.par2"), None);
+        // The suffix must sit at the end of the name (or right before
+        // .par2) - "Vol-52" mid-name is a title, not a volume.
+        assert_eq!(par2_vol_suffix("VA.Hits.Vol-52.2CD-2023-GRP.par2"), None);
+        // kind() falls back to the RAW SUBJECT when nothing is quoted,
+        // so the rule must see through a " yEnc (n/m)" tail after .par2.
+        assert_eq!(par2_vol_suffix("set.vol000+01.par2 yEnc (1/1)"), Some(3));
+        assert_eq!(par2_vol_suffix("set.vol-01.par2 yEnc (1/1)"), Some(3));
+        assert_eq!(par2_vol_suffix("set.par2 yEnc (1/1)"), None);
     }
 
     #[test]

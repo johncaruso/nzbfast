@@ -1,0 +1,82 @@
+<!--BLOCK row-->
+<tr><td><b>Caută pe indexere</b></td><td>Caută pe conturile de indexer pe care le-ai
+adăugat și pune un rezultat în coadă direct din listă. Vezi <a href="#pullsearch">Căutarea
+pe conturile tale de indexer</a> mai jos.</td></tr>
+<!--BLOCK sec-->
+<h3 id="pullsearch">Căutarea pe conturile tale de indexer</h3>
+<p>Dacă ai cont pe un site indexer de NZB, nzbfast poate căuta acolo de aici și poate pune
+în coadă ce alegi, în loc să te duci pe site, să descarci un NZB și să-l aduci înapoi.
+Vorbește interfața de indexer obișnuită pe care o oferă toate acele site-uri, așa că nu e
+nimic de configurat de la site la site: NZBGeek, NZBFinder, DrunkenSlug, DOGnzb și
+celelalte funcționează la fel. O instanță Prowlarr sau NZBHydra2 este tot o singură
+intrare și aduce cu ea fiecare indexer din spatele ei.</p>
+<p><b>Adăugarea unui cont.</b> Setări → Caută pe indexere →
+<b>+ Adaugă indexer</b>. Completează un nume la alegerea ta, adresa de API a site-ului
+(adresa lui web obișnuită e de ajuns; o intrare Prowlarr arată așa:
+<code>http://host:9696/1/api</code>) și cheia API din pagina ta de cont de acolo, apoi
+<b>Aplică indexerele</b>. <b>Testează</b> întreabă site-ul ce acceptă și arată ce a venit
+înapoi, ceea ce dovedește adresa și cheia dintr-un clic. O cheie salvată nu mai este
+arătată niciodată: căsuța o spune, iar dacă o lași goală păstrezi cheia care este deja
+acolo.</p>
+<p><b>Căutarea.</b> Deschide <b>🎬 peretele</b> din antet și treci la lista de release-uri.
+Meniul de lângă caseta de căutare hotărăște unde se uită o căutare: <b>Acest index</b>,
+adică ce a scanat singură mașina asta, <b>Indexere</b> sau <b>Ambele</b>. Alegerea ta este
+ținută minte. Ca să întrebi conturile trebuie să scrii ceva în casetă, fiindcă răsfoirea
+lor cu o interogare goală ar cheltui alocarea unei zile pe o listă pe care nu a cerut-o
+nimeni. Cu indexerul încorporat oprit, așa cum vine nzbfast, nu sunt afișe de arătat, iar
+pagina este exact atât: o casetă de căutare, conturile tale și rezultatele.</p>
+<p><b>Rezultatele.</b> Un rând pe release, cele mai noi întâi, cu mărimea, vechimea și de
+câte ori l-au luat utilizatorii acelui indexer. Un release pe care îl au mai multe dintre
+conturile tale apare o singură dată. La <b>Ambele</b>, copia pe care indexul tău o are
+deja câștigă, iar cea din exterior cade, fiindcă a lua ce ai indexat deja nu te costă
+nimic. <b>Descarcă</b> îl pune în coadă cu prioritate mare: nzbfast aduce singur NZB-ul,
+iar de acolo sarcina e ca oricare alta, cu reparare, extragere, categorii și scripturi
+neschimbate.</p>
+<p><b>Întrebarea despre un singur titlu.</b> Deschide fișa unui titlu de pe perete și apasă
+<b>⌕ Caută pe indexerele mele</b>. La filme întrebarea merge pe numărul IMDb oriunde
+site-ul acceptă unul, iar asta e diferența dintre filmul la care te gândeai și orice
+release al cărui nume conține din întâmplare acele cuvinte. nzbfast caută singur numărul,
+așa că pagina nu ține niciodată vreunul. Site-urile care nu oferă potrivire după număr
+sunt întrebate în cuvinte.</p>
+<p><b>Alocarea ta.</b> Conturile de indexer sunt măsurate: atâtea căutări și atâtea
+descărcări pe zi, după planul tău. Pune cele două numere pe intrare și nzbfast scade din
+ele, luând-o de la capăt la miezul nopții UTC. 0, valoarea implicită, înseamnă nelimitat,
+iar numărătoarea continuă oricum. Un cont care și-a cheltuit alocarea stă deoparte cât
+lucrează celelalte, iar un rând deasupra rezultatelor îl numește pe cel sărit: epuizarea
+nu este niciodată tăcută. Un site care răspunde cu o limită proprie, sau care ne cere să
+încetinim, este pus deoparte pentru o oră.</p>
+<p><b>Unde ajunge cheia ta.</b> Doar la indexerul căruia îi aparține. Cheile rămân pe
+mașina asta, nu ajung niciodată la browser - fiecare rând de rezultat poartă un tichet
+valabil o jumătate de oră în locul unei legături - și sunt scoase din jurnal și din orice
+eroare întoarsă de site, așa că un mesaj de eroare lipit nu poate scăpa niciuna. O
+descărcare poate aduce doar o legătură pe care a întors-o una dintre căutările tale.</p>
+<p>Sunt aceleași conturi la care recurge o <a href="#nzblnk">legătură nzblnk</a> când
+indexul local nu îi recunoaște antetul, și cele pe care watchlistul le poate întreba
+despre elementele dorite (<a href="#automation">§10</a>).</p>
+
+<!--BLOCK set-->
+<h3 id="set-indexers">Caută pe indexere <span class="pill live">live</span></h3>
+<p>Conturile tale pe site-uri indexer de NZB, câte un rând fiecare, ca o căutare de pe
+perete să le poată întreba și pe ele. Ce face funcția, și cum cauți cu ea, este la
+<a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Câmp</th><th>Ce face</th></tr>
+<tr><td>Nume</td><td>O etichetă la alegerea ta, și identitatea sub care sunt ținute contoarele și limitele zilei. Redenumirea unui rând începe o intrare nouă, deci reintrodu cheia.</td></tr>
+<tr><td>Adresă API</td><td>Adresa de API a site-ului. Adresa lui web obișnuită e de ajuns; o intrare Prowlarr sau NZBHydra2 arată așa: <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>Cheie API</td><td>Din pagina ta de cont de pe acel site. Rămâne pe mașina asta, se trimite doar site-ului căruia îi aparține, nu mai este arătată și nu se scrie niciodată în jurnal. Gol păstrează cheia salvată.</td></tr>
+<tr><td>Căutări pe zi</td><td>Câte căutări poate cheltui contul acesta pe zi. 0 = nelimitat, și valoarea implicită.</td></tr>
+<tr><td>Descărcări pe zi</td><td>Câte preluări poate cheltui pe zi. 0 = nelimitat. Ambele contoare o iau de la capăt la miezul nopții UTC.</td></tr>
+<tr><td>pornit, Testează</td><td><b>pornit</b> este ce face un rând căutabil; scoate bifa ca să păstrezi un cont fără să-l folosești. <b>Testează</b> întreabă site-ul ce acceptă și arată răspunsul, sau eroarea, pe loc.</td></tr>
+</table></div>
+
+<!--BLOCK watch-->
+<p><b>Caută ce vreau și pe conturile mele de indexer</b>, la baza cardului watchlistului,
+îl lasă să întrebe conturile din Setări → Caută pe indexere pe lângă indexul tău
+(<a href="#pullsearch">§5</a>). Începe oprit, fiindcă este singurul lucru de aici care
+cheltuie un cont contorizat fără să dai tu clic. Pornit, fiecare element urmărit întreabă
+de vreo două ori pe zi, și doar despre ce nu a găsit deja, sub aceleași limite zilnice și
+cu aceleași note când un cont este sărit. Un candidat venit de la un indexer este judecat
+exact ca unul local, așa că pragurile de calitate, upgrade-urile, pachetele de sezon și
+tratarea duplicatelor se aplică toate, iar o copie locală câștigă orice egalitate fiindcă
+nu costă alocare. Cu indexerul încorporat oprit, asta este ce îi dă watchlistului ceva cu
+care să lucreze.</p>

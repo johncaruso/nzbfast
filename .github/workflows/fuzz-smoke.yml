@@ -84,6 +84,38 @@ jobs:
           path: crates/nzbkit/fuzz/corpus
           key: fuzz-corpus-${{ runner.os }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ runner.os }}-
+      # What the restore actually delivered, BEFORE the seed step adds
+      # in-tree fixtures on top. Without this the two are indistinguishable:
+      # a target showing 5 files at INITED looks the same whether the cache
+      # carried 5 inputs forward or the restore missed entirely and those 5
+      # are just the fixtures. On 14 Aug that ambiguity cost real time -
+      # run 31785434617 was read as having a 1,311-file corpus when it had
+      # started from 5, because the only corpus report ran AFTER the burst.
+      #
+      # The mechanism does work: PR run 31774036760 logs "Cache restored
+      # from key: fuzz-corpus-Linux-31744525472". What it had not done yet
+      # is work ON MAIN - caches written by a pull_request run are scoped
+      # to that PR and a run on main cannot read them, and the corpus steps
+      # only landed 13 Aug 14:30 UTC, so 31785434617 was the first
+      # scheduled run to reach them and had nothing main-scoped to restore.
+      # It saved one, so this step is also how we find out whether the next
+      # scheduled run picks that chain up. Non-zero totals = restored;
+      # zeros = cold start.
+      - name: corpus carried forward (restore check)
+        working-directory: crates/nzbkit/fuzz
+        run: |
+          if [ -d corpus ]; then
+            printf '%8s  %5s files  %s\n' \
+              "$(du -sh corpus 2>/dev/null | cut -f1)" \
+              "$(find corpus -type f | wc -l | tr -d ' ')" "corpus (restored)"
+            for d in corpus/*/; do
+              printf '%8s  %5s files  %s\n' \
+                "$(du -sh "$d" 2>/dev/null | cut -f1)" \
+                "$(find "$d" -type f | wc -l | tr -d ' ')" "$d"
+            done
+          else
+            echo "corpus/ absent - restore missed, this burst starts COLD"
+          fi
       - name: seed corpora from in-tree fixtures
         working-directory: crates/nzbkit/fuzz
         run: |
@@ -162,13 +194,57 @@ jobs:
               -max_total_time=60 -rss_limit_mb=4096 -timeout=10
             echo "::endgroup::"
           done
-          # sevenz_name_probe runs under a deliberately LOW rss limit: a
-          # legitimate probe peaks at a few MiB, so a header decompression
-          # bomb slipping past the declared-size gate shows up as an OOM
-          # here instead of hiding under the 4 GiB ceiling.
+          # sevenz_name_probe keeps a deliberately LOW ceiling - but on the
+          # MALLOC hook, not on RSS. The intent is unchanged: a header
+          # decompression bomb slipping past the declared-size gate must
+          # trip here rather than hide under the 4 GiB ceiling.
+          #
+          # It was `-rss_limit_mb=512` until 14 Aug, and that number was
+          # measuring the wrong thing. `-rss_limit_mb` bounds the WHOLE
+          # process, and most of that process is libFuzzer, not the probe.
+          # Run 31785434617 OOMed at 566Mb with a live heap of just 27.8 MB:
+          # the other ~540 MB was ASan's quarantine (212 MB) plus redzone
+          # metadata over 730k chunks, and every allocation context in the
+          # top 95% went through libstdc++ `operator new` - libFuzzer's C++,
+          # with no Rust frame in it. RSS tracked EXEC COUNT, not input
+          # (251Mb at 59k execs, 388Mb at 708k, 566Mb at 1.2M), so the
+          # failure was a race between a fast runner and the 60s budget:
+          # three reds in ten runs, and the reproducer libFuzzer saved was
+          # the EMPTY unit, which this target returns on before doing any
+          # work. A local run over an EMPTY corpus reaches 284Mb of RSS on
+          # nothing but sub-1 KB generated inputs - over half the old
+          # ceiling was harness overhead before a byte of 7z was parsed.
+          #
+          # `-malloc_limit_mb` is the single-allocation hook, and it only
+          # DEFAULTS to -rss_limit_mb when left unset. Pinning it keeps the
+          # exact guard we want - "never allocate from an untrusted declared
+          # length" - and lets RSS breathe. 128 MiB is the number because
+          # the gates themselves permit one legitimate allocation that big:
+          # SEVENZ_END_MAX caps a decoded header at 2 MiB, and
+          # SEVENZ_PPMD_MEM_MAX caps a declared PPMd model at 64 MiB, so
+          # 128 MiB clears the largest legal single allocation 2x over
+          # while sitting far below any bomb.
+          #
+          # Verified able to fire, not just assumed: with encoded_header_bomb
+          # stubbed to `false`, the seed fixture
+          # crates/nzbkit/tests/fixtures/sevenz/ppmd-mem-window.bin
+          # aborts immediately as
+          # `ERROR: libFuzzer: out-of-memory (malloc(4179881744))` - a 4.18 GB
+          # single allocation.
+          #
+          # And it earned its keep immediately: within seven minutes of
+          # running under the malloc ceiling it found a REAL unbounded
+          # allocation the RSS ceiling had never surfaced - a 33-byte window
+          # declaring 9 bytes of output but a 384 MiB LZMA2 dictionary, which
+          # `LzDecoder::ensure_capacity` allocated whole because the gate
+          # capped the decoded size and the PPMd memSize but not the
+          # dictionary. Fixed by SEVENZ_DICT_MAX; the reproducer is pinned as
+          # a unit fixture and as a seed in fuzz/seeds/sevenz_name_probe/.
+          # Note the 60s burst did NOT find it and the 420s soak did - one
+          # more reason a green burst is weak evidence.
           echo "::group::fuzz sevenz_name_probe"
           cargo +nightly fuzz run sevenz_name_probe -- \
-            -max_total_time=60 -rss_limit_mb=512 -timeout=10
+            -max_total_time=60 -rss_limit_mb=4096 -malloc_limit_mb=128 -timeout=10
           echo "::endgroup::"
       # Report what the corpus is costing before saving it. A corpus that
       # accumulates forever eventually evicts itself against the repo-wide
@@ -177,6 +253,13 @@ jobs:
       # step exists to prevent. `cargo fuzz cmin <target>` is the lever when
       # these numbers get uncomfortable; libFuzzer only keeps inputs that
       # expand coverage, so the growth is slow, not linear in runtime.
+      #
+      # Note this step measures the corpus AFTER the burst, so it cannot
+      # tell a warm start from a cold one - the numbers are what THIS run
+      # produced in 60s, and they look healthy either way. It read "1311
+      # files / 5.3M" for sevenz_name_probe on 14 Aug in a run that had
+      # started from 5. The `corpus carried forward (restore check)` step,
+      # up before the seed step, reports the other end.
       - name: corpus size
         if: always()
         working-directory: crates/nzbkit/fuzz

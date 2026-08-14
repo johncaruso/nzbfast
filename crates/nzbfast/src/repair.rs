@@ -297,6 +297,22 @@ const MAX_RECREATED_FILES: usize = 1000;
 /// `repair_dir` path unchanged, which re-fetches at worst one round of
 /// recovery volumes we already pulled (rare: only after a post-fetch
 /// failure).
+/// May an in-place plain patch KEEP the slot's classification?
+///
+/// A `plain_by_sniff` slot is Plain because offset 0 held no archive
+/// magic - and a bad block over the sniff window says those were the
+/// wrong bytes. Patching such a slot in place can restore a RAR
+/// signature into a file the extractor goes on treating as plain:
+/// nothing re-sniffs after repair, so the corrected archive retired as
+/// the payload, packed, on a Completed job (Codex sweep 13 Aug R2).
+/// False routes the set to the materialize + `repair_dir` +
+/// `reextract_dir` path, which re-extracts what it repairs. The sniff
+/// window is 8 bytes (the longest magic, RAR5); block b covers bytes
+/// `[b*bs, (b+1)*bs)`.
+fn plain_patch_keeps_sniff(bad_blocks: &[usize], block_size: usize) -> bool {
+    !bad_blocks.iter().any(|&b| b.saturating_mul(block_size) < 8)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_mapped_repair(
     servers: &[(ServerConfig, nzbkit::pool::PoolConfig)],
@@ -383,9 +399,11 @@ pub(crate) async fn try_mapped_repair(
                     // TODO 160 admission: without it, one bad article
                     // in a plain set member demoted every chased volume
                     // beside it to disk and re-extracted them.
+                    //
                     if !r.bad_blocks.is_empty()
                         && !extractor.is_mapped(*sidx)
-                        && !extractor.is_plain_patchable(*sidx)
+                        && (!extractor.is_plain_patchable(*sidx)
+                            || !plain_patch_keeps_sniff(&r.bad_blocks, bs))
                     {
                         return Ok(false);
                     }

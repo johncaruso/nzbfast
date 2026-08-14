@@ -1,0 +1,84 @@
+<!--BLOCK row-->
+<tr><td><b>Buscar en indexadores</b></td><td>Busca en las cuentas de indexador que has
+añadido y pon un resultado en cola directamente desde la lista. Véase
+<a href="#pullsearch">Buscar en tus cuentas de indexador</a> más abajo.</td></tr>
+<!--BLOCK sec-->
+<h3 id="pullsearch">Buscar en tus cuentas de indexador</h3>
+<p>Si tienes cuenta en un sitio indexador de NZB, nzbfast puede buscar allí desde aquí y
+poner en cola lo que elijas, en vez de que vayas al sitio, descargues un NZB y lo
+traigas de vuelta. Habla la API de indexador estándar que ofrecen todos esos sitios, así
+que no hay nada que configurar sitio por sitio: NZBGeek, NZBFinder, DrunkenSlug, DOGnzb
+y los demás funcionan igual. Una instancia de Prowlarr o NZBHydra2 también es una sola
+entrada, y trae consigo todos los indexadores que hay detrás.</p>
+<p><b>Añadir una cuenta.</b> Ajustes → Buscar en indexadores →
+<b>+ Añadir indexador</b>. Pon un nombre a tu elección, la dirección de API del sitio
+(su dirección web normal basta; una entrada de Prowlarr se parece a
+<code>http://host:9696/1/api</code>) y la clave API de tu página de cuenta allí, y luego
+<b>Aplicar indexadores</b>. <b>Probar</b> le pregunta al sitio qué admite y muestra lo
+que respondió, lo que valida la dirección y la clave en un clic. Una clave guardada no
+se vuelve a mostrar: la casilla lo dice, y dejarla en blanco conserva la que ya
+tiene.</p>
+<p><b>Buscar.</b> Abre <b>🎬 el muro</b> en la cabecera y cambia a la lista de releases.
+El desplegable junto al cuadro de búsqueda decide dónde mira una búsqueda: <b>Este
+índice</b>, es decir lo que esta máquina ha escaneado por su cuenta, <b>Indexadores</b> o
+<b>Ambos</b>. Tu elección se recuerda. Preguntar a tus cuentas exige algo escrito en el
+cuadro, porque hojearlas con una consulta vacía gastaría el cupo de un día en una lista
+que nadie pidió. Con el indexador integrado apagado, que es como llega nzbfast, no hay
+carteles que mostrar y la página es exactamente esto: un cuadro de búsqueda, tus cuentas
+y los resultados.</p>
+<p><b>Los resultados.</b> Una fila por release, las más nuevas primero, con su tamaño, su
+antigüedad y cuántas veces la han cogido los usuarios de ese indexador. Una release que
+llevan varias de tus cuentas aparece una sola vez. En <b>Ambos</b>, gana la copia que ya
+tiene tu propio índice y la de fuera se descarta, porque coger lo que ya has indexado no
+te cuesta nada. <b>Descargar</b> la pone en cola con prioridad alta: nzbfast recoge el
+NZB él mismo, y a partir de ahí el trabajo es como cualquier otro, con reparación,
+extracción, categorías y scripts sin cambios.</p>
+<p><b>Preguntar por un título concreto.</b> Abre la ficha de un título en el muro y pulsa
+<b>⌕ Buscar en mis indexadores</b>. Para películas la pregunta va por el número de IMDb
+allí donde el sitio lo acepte, que es la diferencia entre la película que querías y toda
+release cuyo nombre contenga por casualidad esas palabras. nzbfast busca ese número por
+su cuenta, así que la página nunca tiene ninguno. A los sitios que no ofrecen
+coincidencia por número se les pregunta con palabras.</p>
+<p><b>Tu cupo.</b> Las cuentas de indexador están medidas: tantas búsquedas y tantas
+descargas al día, según tu plan. Pon esos dos números en la entrada y nzbfast descuenta
+de ahí, empezando de nuevo a medianoche UTC. 0, el valor por omisión, significa
+ilimitado, y aun así se cuenta. Una cuenta que ha gastado su cupo se queda fuera mientras
+las demás trabajan, y una línea encima de los resultados nombra la que se saltó: quedarse
+sin cupo nunca es silencioso. Un sitio que responde con un límite propio, o que nos pide
+ir más despacio, se aparta durante una hora.</p>
+<p><b>Adónde va tu clave.</b> Solo al indexador al que pertenece. Las claves se quedan en
+esta máquina, nunca se entregan al navegador - cada fila de resultado lleva un vale
+válido media hora en lugar de un enlace - y se quitan del registro y de cualquier error
+que devuelva el sitio, de modo que un mensaje de error pegado no puede filtrar ninguna.
+Una descarga solo puede recoger un enlace que devolvió una de tus propias búsquedas.</p>
+<p>Son las mismas cuentas a las que recurre un <a href="#nzblnk">enlace nzblnk</a> cuando
+el índice local no reconoce su cabecera, y las que la lista de seguimiento puede
+preguntar por lo que quieres (<a href="#automation">§10</a>).</p>
+
+<!--BLOCK set-->
+<h3 id="set-indexers">Buscar en indexadores <span class="pill live">en directo</span></h3>
+<p>Tus cuentas en sitios indexadores de NZB, una fila cada una, para que una búsqueda en
+el muro pueda preguntarles también. Qué hace la función, y cómo buscar con ella, está en
+el <a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Campo</th><th>Qué hace</th></tr>
+<tr><td>Nombre</td><td>Una etiqueta a tu elección, y la identidad bajo la que se llevan los contadores y los límites del día. Renombrar una fila empieza una entrada nueva, así que vuelve a poner la clave.</td></tr>
+<tr><td>Dirección de API</td><td>La dirección de API del sitio. Su dirección web normal basta; una entrada de Prowlarr o NZBHydra2 se parece a <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>Clave API</td><td>De tu página de cuenta en ese sitio. Se queda en esta máquina, se envía solo al sitio al que pertenece, no se vuelve a mostrar y nunca se escribe en el registro. En blanco conserva la guardada.</td></tr>
+<tr><td>Búsquedas al día</td><td>Cuántas búsquedas puede gastar esta cuenta al día. 0 = ilimitado, y es el valor por omisión.</td></tr>
+<tr><td>Descargas al día</td><td>Cuántas recogidas puede gastar al día. 0 = ilimitado. Ambos contadores empiezan de nuevo a medianoche UTC.</td></tr>
+<tr><td>activo, Probar</td><td><b>activo</b> es lo que hace que una fila se consulte; quita la marca para conservar una cuenta sin usarla. <b>Probar</b> le pregunta al sitio qué admite y muestra la respuesta, o el error, ahí mismo.</td></tr>
+</table></div>
+
+<!--BLOCK watch-->
+<p><b>Buscar también en mis cuentas de indexador lo que quiero</b>, al pie de la tarjeta
+de la lista de seguimiento, le permite preguntar a las cuentas de Ajustes → Buscar
+en indexadores además de a tu propio índice (<a href="#pullsearch">§5</a>). Empieza
+apagado, porque es lo único de aquí que gasta una cuenta medida sin que tú hagas clic.
+Encendido, cada elemento seguido pregunta unas dos veces al día, y solo por lo que aún no
+ha encontrado, con los mismos límites diarios y con los mismos avisos cuando una cuenta
+se salta. Un candidato de un indexador se juzga exactamente igual que uno local, así que
+los mínimos de calidad, las mejoras, los packs de temporada y el trato de duplicados
+siguen aplicándose, y una copia local gana cualquier empate porque no cuesta cupo. Con el
+indexador integrado apagado, esto es lo que da a la lista de seguimiento algo con lo que
+trabajar.</p>

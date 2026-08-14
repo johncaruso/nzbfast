@@ -415,6 +415,9 @@ van je browser erop voor één-klik-grabs vanaf indexersites.</td></tr>
 <tr><td><b>Vanaf een URL</b></td><td>Plak een NZB-link (API <code>mode=addurl</code>, of via elke gekoppelde app).</td></tr>
 <tr><td><b>nzblnk:-links</b></td><td>Plak een <code>nzblnk:</code>-link ergens op het dashboard, of sleep hem erin. Heb je geïnstalleerd vanaf de macOS-DMG of het Windows-installatieprogramma, dan kun je er ook rechtstreeks een aanklikken op een board. Zie <a href="#nzblnk">nzblnk-links</a> hieronder.</td></tr>
 <tr><td><b>Index doorzoeken</b></td><td>Klik op een complete release in de kaart Index doorzoeken.</td></tr>
+<tr><td><b>Zoeken op indexers</b></td><td>Doorzoek de indexer-accounts die je hebt
+toegevoegd en zet een resultaat rechtstreeks vanuit de lijst in de wachtrij. Zie
+<a href="#pullsearch">Zoeken op je indexer-accounts</a> hieronder.</td></tr>
 <tr><td><b>Watchlist / RSS</b></td><td>Automatisch - zie <a href="#automation">Automatisering</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr e.d.</b></td><td>Die sturen grabs rechtstreeks de wachtrij in - zie <a href="#arr">§11</a>.</td></tr>
 <tr><td><b>Commandoregel</b></td><td><code>nzbfast get file.nzb</code> downloadt zonder de daemon.</td></tr>
@@ -432,6 +435,59 @@ toewijzen.</li>
 Geschiedenis (🔑) worden meegegeven.</li>
 </ul>
 
+<h3 id="pullsearch">Zoeken op je indexer-accounts</h3>
+<p>Heb je een account bij een NZB-indexersite, dan kan nzbfast daar vanaf hier zoeken en
+in de wachtrij zetten wat je kiest, in plaats van dat jij naar de site gaat, een NZB
+downloadt en die terugbrengt. Het spreekt de gangbare indexer-API die al die sites
+aanbieden, dus er valt niets per site in te stellen: NZBGeek, NZBFinder, DrunkenSlug,
+DOGnzb en de rest werken hetzelfde. Een Prowlarr- of NZBHydra2-instantie is ook één
+regel, en neemt elke indexer erachter meteen mee.</p>
+<p><b>Een account toevoegen.</b> Instellingen → Zoeken op indexers →
+<b>+ Indexer toevoegen</b>. Vul een naam van je keuze in, het API-adres van de site (het
+gewone webadres volstaat; een Prowlarr-regel ziet eruit als
+<code>http://host:9696/1/api</code>) en de API-sleutel van je accountpagina daar, en dan
+<b>Indexers toepassen</b>. <b>Testen</b> vraagt de site wat hij ondersteunt en toont wat
+er terugkwam, waarmee adres en sleutel in één klik bewezen zijn. Een opgeslagen sleutel
+wordt nooit meer getoond: het vak zegt dat, en leeg laten houdt de sleutel die er al
+staat.</p>
+<p><b>Zoeken.</b> Open <b>🎬 wall</b> in de kopbalk en schakel over naar de
+releaselijst. Het uitklapmenu naast het zoekvak bepaalt waar een zoekopdracht kijkt:
+<b>Deze index</b>, dus wat deze machine zelf gescand heeft, <b>Indexers</b>, of
+<b>Beide</b>. Je keuze wordt onthouden. Je accounts bevragen vraagt om iets in het vak,
+want ze met een lege opdracht doorbladeren zou het dagbudget uitgeven aan een lijst
+waar niemand om vroeg. Met de ingebouwde indexer uit, zoals nzbfast binnenkomt, zijn er
+geen posters te tonen en is de pagina precies dit: een zoekvak, je accounts en de
+resultaten.</p>
+<p><b>De resultaten.</b> Eén regel per release, de nieuwste bovenaan, met grootte,
+ouderdom en hoe vaak de gebruikers van die indexer hem gepakt hebben. Een release die
+meerdere van je accounts voeren verschijnt één keer. Onder <b>Beide</b> wint een kopie
+die je eigen index al heeft en valt die van buiten af, want pakken wat je al geïndexeerd
+hebt kost je niets. <b>Downloaden</b> zet hem met hoge prioriteit in de wachtrij:
+nzbfast haalt de NZB zelf op, en vanaf dat punt is de taak als elke andere, met
+reparatie, uitpakken, categorieën en scripts ongewijzigd.</p>
+<p><b>Naar één titel vragen.</b> Open de kaart van een titel op de wall en druk op
+<b>⌕ Zoek op mijn indexers</b>. Voor films gaat de vraag via het IMDb-nummer overal waar
+de site er een aanneemt, en dat is het verschil tussen de film die je bedoelde en elke
+release waarvan de naam toevallig die woorden bevat. nzbfast zoekt dat nummer zelf op,
+dus de pagina houdt er nooit een. Sites zonder overeenkomst op nummer worden gewoon met
+woorden bevraagd.</p>
+<p><b>Je tegoed.</b> Indexer-accounts worden geteld: zoveel zoekopdrachten en zoveel
+downloads per dag, afhankelijk van je abonnement. Zet die twee getallen op de regel en
+nzbfast telt ertegen af, met een nieuwe start om middernacht UTC. 0, de standaard,
+betekent onbeperkt, en er wordt toch geteld. Een account dat zijn tegoed op heeft, zit
+de zoekopdracht uit terwijl de andere doorgaan, en een regel boven de resultaten noemt
+degene die is overgeslagen: opraken is nooit stil. Een site die met een eigen limiet
+antwoordt, of ons vraagt te vertragen, wordt een uur opzijgezet.</p>
+<p><b>Waar je sleutel heen gaat.</b> Alleen naar de indexer waar hij bij hoort. Sleutels
+blijven op deze machine, gaan nooit naar de browser - elke resultaatregel draagt in
+plaats van een link een bon die een half uur geldig is - en worden uit het log gehaald
+en uit elke fout die de site teruggeeft, zodat een geplakte foutmelding er geen kan
+lekken. Een download kan alleen een link ophalen die een van je eigen zoekopdrachten
+teruggaf.</p>
+<p>Dit zijn dezelfde accounts waarop een <a href="#nzblnk">nzblnk-link</a> terugvalt als
+de lokale index zijn header niet kent, en die de watchlist over gewenste items kan
+bevragen (<a href="#automation">§10</a>).</p>
+
 <h3 id="nzblnk">nzblnk-links</h3>
 <p>Sommige boards, vooral Duitse en Nederlandse, publiceren een <code>nzblnk:</code>-link
 in plaats van een NZB-bestand. De post is versluierd, dus er is geen bestandsnaam om
@@ -440,7 +496,7 @@ zoeksleutel is en geen locatie, plus een optionele titel <code>t=</code>, wachtw
 <code>p=</code> en groep <code>g=</code>. Iemand moet de post eerst gaan vinden.</p>
 <p>nzbfast zoekt de header eerst op in zijn eigen index, waarvoor helemaal geen netwerk
 nodig is, en pas als dat misgaat vraagt het de zoekindexers die je hebt ingesteld
-(Instellingen → Zoekindexers, <a href="#settings">§9</a>), onder dezelfde dagbudgetten
+(Instellingen → Zoeken op indexers, <a href="#settings">§9</a>), onder dezelfde dagbudgetten
 en dezelfde terugval als elke andere zoekopdracht. De titel wordt de klusnaam en het
 wachtwoord wordt automatisch aan de klus meegegeven.</p>
 <ul>
@@ -753,6 +809,20 @@ om het nogmaals te downloaden. Wat je ook kiest, de lade van elke taak heeft een
 <b>Download de .nzb</b>, zodat een kopie van de <code>.nzb</code> van elke taak nooit
 meer dan één klik weg is.</p>
 
+<h3 id="set-indexers">Zoeken op indexers <span class="pill live">live</span></h3>
+<p>Je accounts bij NZB-indexersites, één regel per stuk, zodat een zoekopdracht op de
+wall ze ook kan bevragen. Wat de functie doet, en hoe je ermee zoekt, staat in
+<a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Veld</th><th>Wat het doet</th></tr>
+<tr><td>Naam</td><td>Een etiket van je keuze, en de identiteit waaronder de dagtellers en limieten worden bijgehouden. Een regel hernoemen begint een nieuwe regel, dus voer de sleutel opnieuw in.</td></tr>
+<tr><td>API-adres</td><td>Het API-adres van de site. Het gewone webadres volstaat; een Prowlarr- of NZBHydra2-regel ziet eruit als <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>API-sleutel</td><td>Van je accountpagina op die site. Blijft op deze machine, gaat alleen naar de site waar hij bij hoort, wordt nooit meer getoond en nooit in het log geschreven. Leeg houdt de opgeslagen sleutel.</td></tr>
+<tr><td>Zoekopdrachten per dag</td><td>Hoeveel zoekopdrachten dit account per dag mag uitgeven. 0 = onbeperkt, en de standaard.</td></tr>
+<tr><td>Downloads per dag</td><td>Hoeveel grabs het per dag mag uitgeven. 0 = onbeperkt. Beide tellers beginnen om middernacht UTC opnieuw.</td></tr>
+<tr><td>aan, Testen</td><td><b>aan</b> is wat een regel doorzoekbaar maakt; haal het vinkje weg om een account te bewaren zonder het te gebruiken. <b>Testen</b> vraagt de site wat hij ondersteunt en toont het antwoord, of de fout, ter plekke.</td></tr>
+</table></div>
+
 <h3>Indexeren <span class="pill live">live</span></h3>
 <div class="note"><b>De ingebouwde indexer staat standaard uit.</b> Hij vindt posts die
 onder een echte bestandsnaam zijn geplaatst, en een groot en groeiend deel van Usenet
@@ -761,11 +831,12 @@ bestandsnamen erin, gedumpt in een verzamelgroep. De echte naam leeft alleen in 
 die de uploader elders publiceert, dus hij stond nooit op Usenet waar een scanner hem
 kon lezen. Gemeten op onze eigen index leverden 14,8 miljoen gescande posts ongeveer
 31.000 doorzoekbare releases op, grofweg één op de vijfhonderd. Blijf commerciële
-indexers gebruiken en voeg ze toe onder Instellingen → Zoekindexers, zodat je ze vanaf
+indexers gebruiken en voeg ze toe onder Instellingen → Zoeken op indexers, zodat je ze vanaf
 de wall kunt doorzoeken. Zet dit aan als je specifieke groepen volgt waar mensen nog
 onder echte namen posten, of als je wilt zien wat je provider werkelijk draagt. Met de
-schakelaar uit wordt er niets gescand of opgehaald, wordt er geen database aangemaakt,
-en zijn de wall, Index doorzoeken, de watchlist en de newznab-feed verborgen.</div>
+schakelaar uit wordt er niets gescand of opgehaald en wordt er geen database aangemaakt;
+Index doorzoeken en de newznab-feed verdwijnen, de wall wordt een gewone zoekpagina voor
+de indexer-accounts die je hebt toegevoegd, en de watchlist werkt op die accounts.</div>
 <div class="tblwrap"><table>
 <tr><th>Instelling</th><th>Wat het doet</th></tr>
 <tr><td>Ingebouwde indexer</td><td>De hoofdschakelaar, <b>uit tenzij je hem aanzet</b>. Uit betekent geen scannen, geen metadata-opvragingen, geen beschikbaarheidssteekproeven en geen newznab-feed; een index die al op schijf staat blijft bewaard (er is een verwijderknop), dus weer aanzetten hervat in plaats van opnieuw te scannen.</td></tr>
@@ -824,6 +895,17 @@ verwijderingen verschilt bewust per modus: een gekoppeld account ziet de hele li
 daar verwijderde titel wordt hier niet langer gevolgd (al voltooide downloads blijven staan);
 een adresfeed bevat alleen de meest recente items, dus afwezigheid bewijst niets en titels
 worden alleen toegevoegd. Beide standaardinstellingen zijn per bron aan te passen.</p>
+<p><b>Zoek ook op mijn indexer-accounts naar gewenste items</b>, onderaan de
+watchlist-kaart, laat die naast je eigen index ook de accounts uit Instellingen →
+Zoeken op indexers bevragen (<a href="#pullsearch">§5</a>). Het begint uit, want het is
+het enige hier dat een afgerekend account uitgeeft zonder dat jij klikt. Aan vraagt elk
+gevolgd item ongeveer twee keer per dag, en alleen naar wat het nog niet gevonden heeft,
+onder dezelfde daglimieten en met dezelfde meldingen als een account wordt overgeslagen.
+Een kandidaat van een indexer wordt precies als een lokale beoordeeld, dus
+kwaliteitsdrempels, upgrades, seizoenpakketten en dubbelbehandeling gelden allemaal
+gewoon, en een lokale kopie wint elk gelijkspel omdat die geen tegoed kost. Met de
+ingebouwde indexer uit is dit wat de watchlist überhaupt iets geeft om mee te
+werken.</p>
 <h3 id="auto-rss">RSS-feeds</h3>
 <p>Instellingen → RSS: elke newznab/indexer-RSS-URL met per feed een interval, een
 categorie en filterregels (titelpatronen, grootte-grenzen). Passende items worden
@@ -1200,7 +1282,7 @@ de <b>API-sleutel</b> (volledige controle) en de <b>NZB-sleutel</b> (alleen toev
 <tr><td>Config</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (elk veld uit Instellingen), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index &amp; wall</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab op <code>/api?t=caps|search|tvsearch|movie</code> en <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automatisering</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>
-<tr><td>Diagnostiek</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
+<tr><td>Diagnostiek</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code></td></tr>
 <tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> - status, listgroups, history, append, editqueue, rate, pause, log (Basic auth: willekeurige gebruiker, API-sleutel als wachtwoord)</td></tr>
 <tr><td>Voorvertoning / afspelen</td><td><code>/stream/&lt;nzo_id&gt;</code> (HTTP-ranges; het starten van een geparkeerde bibliotheektaak vereist een <code>?t=</code>-token of de sleutel), <code>/m3u/&lt;id&gt;</code> (vereist de sleutel; geeft het token uit), <code>/wall</code>, <code>/art/…</code></td></tr>
 </table></div>

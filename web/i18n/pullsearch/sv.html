@@ -1,0 +1,81 @@
+<!--BLOCK row-->
+<tr><td><b>Sök på indexerare</b></td><td>Sök på de indexerarkonton du har lagt till och
+köa ett resultat direkt från listan. Se <a href="#pullsearch">Söka på dina
+indexerarkonton</a> längre ned.</td></tr>
+<!--BLOCK sec-->
+<h3 id="pullsearch">Söka på dina indexerarkonton</h3>
+<p>Har du ett konto hos en NZB-indexerarsajt kan nzbfast söka där härifrån och köa det du
+väljer, i stället för att du ska gå till sajten, hämta en NZB och bära tillbaka den. Det
+talar det vanliga indexerar-API som alla de sajterna erbjuder, så det finns inget att
+ställa in per sajt: NZBGeek, NZBFinder, DrunkenSlug, DOGnzb och de andra fungerar
+likadant. En Prowlarr- eller NZBHydra2-instans är också en enda rad, och tar med sig
+varje indexerare bakom sig.</p>
+<p><b>Lägga till ett konto.</b> Inställningar → Sök på indexerare →
+<b>+ Lägg till indexerare</b>. Fyll i ett namn du väljer själv, sajtens API-adress (dess
+vanliga webbadress räcker; en Prowlarr-rad ser ut som
+<code>http://host:9696/1/api</code>) och API-nyckeln från din kontosida där, och sedan
+<b>Tillämpa indexerare</b>. <b>Testa</b> frågar sajten vad den klarar och visar vad som
+kom tillbaka, vilket bevisar adressen och nyckeln med ett klick. En sparad nyckel visas
+aldrig igen: rutan säger det, och att lämna den tom behåller nyckeln som redan finns
+där.</p>
+<p><b>Att söka.</b> Öppna <b>🎬 väggen</b> i sidhuvudet och byt till releaselistan.
+Rullgardinen bredvid sökrutan avgör var en sökning tittar: <b>Detta index</b>, alltså
+det den här maskinen själv har skannat, <b>Indexerare</b>, eller <b>Båda</b>. Ditt val
+kommer ihåg. Att fråga dina konton kräver något i rutan, för att bläddra i dem med en
+tom fråga skulle göra av med ett dygns tilldelning på en lista ingen bad om. Med den
+inbyggda indexeraren avstängd, vilket är så nzbfast kommer, finns inga affischer att
+visa och sidan är precis detta: en sökruta, dina konton och resultaten.</p>
+<p><b>Resultaten.</b> En rad per release, de nyaste först, med storlek, ålder och hur
+ofta den indexerarens egna användare har hämtat den. En release som flera av dina konton
+har dyker upp en gång. Under <b>Båda</b> vinner en kopia som ditt eget index redan har
+och den utifrån faller bort, för att hämta det du redan indexerat kostar dig ingenting.
+<b>Ladda ned</b> köar den med hög prioritet: nzbfast hämtar NZB:n själv, och därifrån är
+jobbet som vilket annat som helst, med reparation, uppackning, kategorier och skript
+oförändrade.</p>
+<p><b>Att fråga om en enda titel.</b> Öppna en titels kort på väggen och tryck på
+<b>⌕ Sök på mina indexerare</b>. För filmer går frågan via IMDb-numret överallt där
+sajten tar emot ett, och det är skillnaden mellan filmen du menade och varje release vars
+namn råkar innehålla just de orden. nzbfast slår upp numret själv, så sidan håller aldrig
+något. Sajter som inte erbjuder matchning på nummer får frågan i ord i stället.</p>
+<p><b>Din tilldelning.</b> Indexerarkonton är mätta: så och så många sökningar och så och
+så många nedladdningar om dagen, beroende på din nivå. Skriv in de två talen på raden så
+räknar nzbfast mot dem, med start om från midnatt UTC. 0, standardvärdet, betyder
+obegränsat, och räkningen fortsätter ändå. Ett konto som gjort av med sin tilldelning
+sitter över medan de andra arbetar, och en rad ovanför resultaten namnger det som hoppades
+över: att ta slut är aldrig tyst. En sajt som svarar med en egen gräns, eller ber oss
+sakta ned, ställs åt sidan i en timme.</p>
+<p><b>Vart din nyckel tar vägen.</b> Bara till den indexerare den hör till. Nycklar
+stannar på den här maskinen, lämnas aldrig till webbläsaren - varje resultatrad bär en
+biljett som gäller en halvtimme i stället för en länk - och rensas ur loggen och ur varje
+fel sajten skickar tillbaka, så ett inklistrat felmeddelande kan inte läcka någon. En
+nedladdning kan bara hämta en länk som någon av dina egna sökningar gav.</p>
+<p>Det är samma konton som en <a href="#nzblnk">nzblnk-länk</a> faller tillbaka på när
+det lokala indexet inte känner igen dess huvud, och de som bevakningslistan kan fråga om
+det du vill ha (<a href="#automation">§10</a>).</p>
+
+<!--BLOCK set-->
+<h3 id="set-indexers">Sök på indexerare <span class="pill live">live</span></h3>
+<p>Dina konton hos NZB-indexerarsajter, en rad var, så att en sökning på väggen kan fråga
+dem också. Vad funktionen gör, och hur man söker med den, står i
+<a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Fält</th><th>Vad det gör</th></tr>
+<tr><td>Namn</td><td>En etikett du väljer själv, och den identitet dagens räknare och gränser förs under. Att byta namn på en rad börjar en ny rad, så skriv in nyckeln igen.</td></tr>
+<tr><td>API-adress</td><td>Sajtens API-adress. Dess vanliga webbadress räcker; en Prowlarr- eller NZBHydra2-rad ser ut som <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>API-nyckel</td><td>Från din kontosida på den sajten. Stannar på den här maskinen, skickas bara till sajten den hör till, visas aldrig igen och skrivs aldrig i loggen. Tom behåller den sparade.</td></tr>
+<tr><td>Sökningar per dag</td><td>Hur många sökningar det här kontot får göra av med per dag. 0 = obegränsat, och standard.</td></tr>
+<tr><td>Nedladdningar per dag</td><td>Hur många hämtningar det får göra av med per dag. 0 = obegränsat. Båda räknarna börjar om vid midnatt UTC.</td></tr>
+<tr><td>på, Testa</td><td><b>på</b> är det som gör en rad sökbar; kryssa ur för att behålla ett konto utan att använda det. <b>Testa</b> frågar sajten vad den klarar och visar svaret, eller felet, på plats.</td></tr>
+</table></div>
+
+<!--BLOCK watch-->
+<p><b>Sök även på mina indexerarkonton efter det jag vill ha</b>, längst ned på
+bevakningslistans kort, låter den fråga kontona från Inställningar → Sök på
+indexerare utöver ditt eget index (<a href="#pullsearch">§5</a>). Det börjar avstängt,
+för det är det enda här som gör av med ett mätt konto utan att du klickar. Påslaget
+frågar varje bevakad post ungefär två gånger om dagen, och bara efter det den inte redan
+hittat, under samma dagsgränser och med samma noteringar när ett konto hoppas över. En
+kandidat från en indexerare bedöms precis som en lokal, så kvalitetsgolv, uppgraderingar,
+säsongspaket och dubbletthantering gäller allihop, och en lokal kopia vinner varje
+lika-läge eftersom den inte kostar någon tilldelning. Med den inbyggda indexeraren
+avstängd är det detta som ger bevakningslistan något att arbeta med över huvud taget.</p>

@@ -284,6 +284,12 @@ pub struct Daemon {
     /// honest revision).
     pub queue_rev: AtomicU64,
     pub history_rev: AtomicU64,
+    /// nzo_ids whose park is between its history PREWRITE (on disk) and
+    /// its final filing into `history` (in memory). `history_compact`
+    /// snapshots memory, and a snapshot published inside that interval
+    /// would erase the prewrite - the durable copy a crash recovers the
+    /// job from. Registered by `park` via `hist_inflight_begin`'s guard.
+    pub(super) hist_inflight: Mutex<std::collections::HashSet<String>>,
     /// §129 1b: discrete lifecycle events (job.completed, job.failed...)
     /// with a monotonic `seq`, so clients stop inferring toasts from
     /// snapshot diffs. Ring bounded at `histstore::LIFE_RING`; a client

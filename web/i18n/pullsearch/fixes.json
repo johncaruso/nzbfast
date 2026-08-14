@@ -1,0 +1,118 @@
+{
+  "_comment": [
+    "Two per-locale corrections that ride with the pull-search section.",
+    "'sentence' replaces the stale tail of the Indexing note (the wall and the",
+    "watchlist both keep working off indexer accounts now, so listing them as",
+    "hidden is wrong; English is corrected in docs/MANUAL.html itself).",
+    "'card' renames every mention of the Settings card onto the name the UI",
+    "actually shows for it - web/i18n/<lang>.json key set.nnab.title - because",
+    "each manual had invented its own translation and a reader hunting the card",
+    "by the manual's name would not find it. Applied to every occurrence."
+  ],
+
+  "fr": {
+    "card": ["Indexeurs de recherche", "Chercher sur les indexeurs"],
+    "sentence": [
+      "Interrupteur éteint,\nrien n'est scanné ni récupéré, aucune base n'est créée, et le mur, Parcourir, la\nwatchlist et le flux newznab sont masqués.",
+      "Interrupteur éteint,\nrien n'est scanné ni récupéré et aucune base n'est créée ; Parcourir et le flux newznab\ndisparaissent, le mur devient une simple page de recherche pour les comptes indexeurs\nque vous avez ajoutés, et la liste de suivi travaille sur ces comptes."
+    ]
+  },
+  "de": {
+    "card": ["Suchindexer", "Indexer durchsuchen"],
+    "sentence": [
+      "Bei ausgeschaltetem Schalter wird nichts gescannt oder geholt, keine Datenbank\nangelegt, und Wand, Durchsuchen, Watchlist und der newznab-Feed sind ausgeblendet.",
+      "Bei ausgeschaltetem Schalter wird nichts gescannt oder geholt und keine Datenbank\nangelegt; Durchsuchen und der newznab-Feed verschwinden, die Wand wird zu einer reinen\nSuchseite für die Indexer-Konten, die du eingetragen hast, und die Watchlist arbeitet\nstattdessen mit diesen Konten."
+    ]
+  },
+  "it": {
+    "card": ["Indicizzatori di ricerca", "Cerca sugli indexer"],
+    "sentence": [
+      "Con\nl'interruttore spento non si scansiona né si scarica nulla, non si crea alcun database,\ne bacheca, Sfoglia, watchlist e feed newznab restano nascosti.",
+      "Con\nl'interruttore spento non si scansiona né si scarica nulla e non si crea alcun database;\nSfoglia e il feed newznab spariscono, la bacheca diventa una semplice pagina di ricerca\nper gli account indexer che hai aggiunto, e la watchlist lavora su quegli account."
+    ]
+  },
+  "es": {
+    "card": ["Indexadores de búsqueda", "Buscar en indexadores"],
+    "sentence": [
+      "Con el interruptor apagado no se escanea ni se\ndescarga nada, no se crea base de datos alguna, y el muro, Explorar, la watchlist y el\nfeed newznab quedan ocultos.",
+      "Con el interruptor apagado no se escanea ni se\ndescarga nada y no se crea base de datos alguna; Explorar y el feed newznab desaparecen,\nel muro se convierte en una simple página de búsqueda para las cuentas de indexador que\nhayas añadido, y la lista de seguimiento trabaja con esas cuentas."
+    ]
+  },
+  "nl": {
+    "card": ["Zoekindexers", "Zoeken op indexers"],
+    "sentence": [
+      "Met de\nschakelaar uit wordt er niets gescand of opgehaald, wordt er geen database aangemaakt,\nen zijn de wall, Index doorzoeken, de watchlist en de newznab-feed verborgen.",
+      "Met de\nschakelaar uit wordt er niets gescand of opgehaald en wordt er geen database aangemaakt;\nIndex doorzoeken en de newznab-feed verdwijnen, de wall wordt een gewone zoekpagina voor\nde indexer-accounts die je hebt toegevoegd, en de watchlist werkt op die accounts."
+    ]
+  },
+  "pt": {
+    "card": ["Indexadores de busca", "Pesquisar nos indexadores"],
+    "sentence": [
+      "Com a chave desligada nada é varrido nem buscado,\nnenhum banco é criado, e o mural, Explorar, a watchlist e o feed newznab ficam\nocultos.",
+      "Com a chave desligada nada é varrido nem buscado\ne nenhum banco é criado; Explorar e o feed newznab somem, o mural vira uma simples\npágina de pesquisa para as contas de indexador que você adicionou, e a watchlist passa a\ntrabalhar com essas contas."
+    ]
+  },
+  "sv": {
+    "card": ["Sökindexerare", "Sök på indexerare"],
+    "sentence": [
+      "Med reglaget av skannas eller\nhämtas ingenting, ingen databas skapas, och väggen, Bläddra, bevakningslistan och\nnewznab-flödet är dolda.",
+      "Med reglaget av skannas eller\nhämtas ingenting och ingen databas skapas; Bläddra och newznab-flödet försvinner, väggen\nblir en enkel söksida för de indexerarkonton du har lagt till, och bevakningslistan\narbetar mot de kontona i stället."
+    ]
+  },
+  "da": {
+    "card": ["Søgeindeksere", "Søg på indeksere"],
+    "sentence": [
+      "Med kontakten slået fra skannes eller hentes\ningenting, der oprettes ingen database, og væggen, Gennemse, overvågningslisten og\nnewznab-feedet er skjult.",
+      "Med kontakten slået fra skannes eller hentes\ningenting, og der oprettes ingen database; Gennemse og newznab-feedet forsvinder, væggen\nbliver en almindelig søgeside for de indekser-konti, du har tilføjet, og\novervågningslisten arbejder på de konti i stedet."
+    ]
+  },
+  "nb": {
+    "card": ["Søkeindeksere", "Søk på indeksere"],
+    "sentence": [
+      "Med bryteren av skannes eller hentes ingenting,\ningen database opprettes, og veggen, Utforsk, Watchlist og newznab-strømmen er\nskjult.",
+      "Med bryteren av skannes eller hentes ingenting,\nog ingen database opprettes; Utforsk og newznab-strømmen forsvinner, veggen blir en\nenkel søkeside for indekser-kontoene du har lagt til, og Watchlist arbeider mot de\nkontoene i stedet."
+    ]
+  },
+  "fi": {
+    "card": ["Hakuindeksoijat", "Hae indeksoijilta"],
+    "sentence": [
+      "Kytkin pois päältä: mitään ei skannata eikä haeta, tietokantaa ei luoda, ja\nseinä, Selaa, seurantalista ja newznab-syöte ovat piilossa.",
+      "Kytkin pois päältä: mitään ei skannata eikä haeta eikä tietokantaa luoda; Selaa ja\nnewznab-syöte katoavat, seinästä tulee pelkkä hakusivu lisäämillesi indeksoijatileille,\nja seurantalista toimii niiden tilien varassa."
+    ]
+  },
+  "tr": {
+    "card": ["Arama dizinleyicileri", "Indexer'larda ara"],
+    "sentence": [
+      "Anahtar\nkapalıyken hiçbir şey taranmaz veya çekilmez, veritabanı oluşturulmaz; duvar, Göz at,\nizleme listesi ve newznab beslemesi gizlenir.",
+      "Anahtar\nkapalıyken hiçbir şey taranmaz veya çekilmez ve veritabanı oluşturulmaz; Göz at ile\nnewznab beslemesi kaybolur, duvar eklediğin indexer hesapları için sade bir arama\nsayfasına döner, izleme listesi de onun yerine o hesaplarla çalışır."
+    ]
+  },
+  "ro": {
+    "card": ["Indexatoare de căutare", "Caută pe indexere"],
+    "sentence": [
+      "Cu\ncomutatorul oprit nu se scanează și nu se descarcă nimic, nu se creează nicio bază de\ndate, iar peretele, Răsfoiește, Watchlist și fluxul newznab sunt ascunse.",
+      "Cu\ncomutatorul oprit nu se scanează și nu se descarcă nimic și nu se creează nicio bază de\ndate; Răsfoiește și fluxul newznab dispar, peretele devine o simplă pagină de căutare\npentru conturile de indexer pe care le-ai adăugat, iar Watchlist lucrează cu acele\nconturi."
+    ]
+  },
+  "he": {
+    "card": ["Search indexers", "חיפוש באינדקסרים"],
+    "sentence": [
+      "כשהמתג כבוי\nדבר אינו נסרק או נמשך, לא נוצר מסד נתונים, והקיר, עיון, רשימת המעקב וערוץ ה-newznab\nמוסתרים.",
+      "כשהמתג כבוי\nדבר אינו נסרק או נמשך ולא נוצר מסד נתונים; עיון וערוץ ה-newznab נעלמים, הקיר הופך לדף\nחיפוש פשוט עבור חשבונות האינדקסר שהוספתם, ורשימת המעקב עובדת על החשבונות האלה."
+    ]
+  },
+  "ar": {
+    "card": ["مفهرسات البحث", "البحث في الفهارس"],
+    "sentence": [
+      "ومع إطفاء المفتاح لا\nيُمسَح شيء ولا يُجلَب، ولا تُنشَأ قاعدة بيانات، ويُخفى الجدار وتصفّح الفهرس وقائمة\nالمراقبة وتغذية newznab.",
+      "ومع إطفاء المفتاح لا\nيُمسَح شيء ولا يُجلَب، ولا تُنشَأ قاعدة بيانات؛ يختفي تصفّح الفهرس وتغذية newznab،\nويصير الجدار صفحة بحث بسيطة لحسابات الفهارس التي أضفتها، وتعمل قائمة المتابعة على تلك\nالحسابات بدلًا من ذلك."
+    ]
+  },
+  "fa": {
+    "card": ["ایندکسرهای جستجو", "جستجو در ایندکسرها"],
+    "sentence": [
+      "با کلید خاموش هیچ چیز اسکن یا دریافت\nنمی‌شود، هیچ پایگاه داده‌ای ساخته نمی‌شود، و دیوار، مرور ایندکس، فهرست پیگیری و خوراک\nnewznab پنهان می‌مانند.",
+      "با کلید خاموش هیچ چیز اسکن یا دریافت\nنمی‌شود و هیچ پایگاه داده‌ای ساخته نمی‌شود؛ مرور ایندکس و خوراک newznab ناپدید می‌شوند،\nدیوار به یک صفحهٔ جستجوی ساده برای حساب‌های ایندکسری که افزوده‌اید تبدیل می‌شود، و فهرست\nپیگیری به‌جای آن با همان حساب‌ها کار می‌کند."
+    ]
+  }
+}

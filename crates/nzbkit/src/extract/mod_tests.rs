@@ -27,6 +27,18 @@ fn release_stems_reduce_every_volume_shape() {
     assert_eq!(st("x.z01"), "x");
     assert_eq!(st("x.vol000+01.par2"), "x");
     assert_eq!(st("x.par2"), "x");
+    // Bare-ordinal recovery volumes: nothing before the dash. The stem
+    // must lose the ".vol-01" or the release shatters in the index -
+    // live rows sat at "….playWEB.vol-01" until 13 Aug 2026.
+    assert_eq!(st("x.vol-01.par2"), "x");
+    assert_eq!(
+        st("Fightland.S01E01.1080p.AMZN.WEB-DL.DD+5.1.H.264-playWEB.vol-07.par2"),
+        "Fightland.S01E01.1080p.AMZN.WEB-DL.DD+5.1.H.264-playWEB"
+    );
+    // Not volumes: "volume" spelt out, and a compilation numbered
+    // Vol-3 - that single digit names a release.
+    assert_eq!(st("Rel.volume-2.par2"), "Rel.volume-2");
+    assert_eq!(st("VA.Best.Hits.Vol-3.par2"), "VA.Best.Hits.Vol-3");
     // Split containers: parts and their par2 sidecars share a base.
     assert_eq!(st("Some.Set.7z.001"), "Some.Set.7z");
     assert_eq!(st("Some.Set.7z.122"), "Some.Set.7z");

@@ -1455,6 +1455,48 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Codex sweep 13 Aug R3: the OTHER ordering - materialize FIRST,
+    /// verified rename after. The `M` record rewrote the slot's
+    /// placements to identity form under the demote-time name, and the
+    /// rename then reached only the in-memory `renamed_to`: replay
+    /// looked for the old file, found nothing, and refetched a complete
+    /// verified volume. The rename must re-fire the hook so the journal
+    /// appends `S new-name` + `M`.
+    #[test]
+    fn a_rename_after_materialize_refires_the_hook_with_the_new_name() {
+        let dir = tmpdir("fbrenafter");
+        let data = payload(200_000, 25);
+        let vol = fixtures::rar5_volume(&[("g.bin", 200_000, &data, false, false)]);
+        let ex = Extractor::new(&dir, 1, true);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(usize, String, u64)>::new()));
+        let s2 = seen.clone();
+        ex.set_materialized_hook(Arc::new(move |slot, name: &str, size| {
+            s2.lock().unwrap().push((slot, name.to_string(), size))
+        }));
+        ex.write(0, "0Bf3qZ.bin", vol.len() as u64, 0, &vol)
+            .unwrap();
+        ex.materialize(0).unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(0, "0Bf3qZ.bin".to_string(), vol.len() as u64)]
+        );
+        // The verified-name publish: the file moves on disk, then the
+        // extractor is told - the callers' order.
+        std::fs::rename(dir.join("0Bf3qZ.bin"), dir.join("verified.part01.rar")).unwrap();
+        ex.note_slot_renamed(0, dir.join("verified.part01.rar"));
+        assert_eq!(
+            seen.lock().unwrap().get(1),
+            Some(&(0, "verified.part01.rar".to_string(), vol.len() as u64)),
+            "the rename must re-fire the hook with the live name"
+        );
+        // ...and any S emitted later names the file replay will find.
+        assert_eq!(
+            ex.slot_file_info(0).map(|(n, _)| n).as_deref(),
+            Some("verified.part01.rar")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn late_fallback_reconstructs_from_extracted() {
         let dir = tmpdir("latefb");

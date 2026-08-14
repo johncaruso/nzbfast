@@ -1,0 +1,89 @@
+<!--BLOCK row-->
+<tr><td><b>Chercher sur les indexeurs</b></td><td>Interrogez les comptes indexeurs que
+vous avez ajoutés et mettez un résultat en file directement depuis la liste. Voir
+<a href="#pullsearch">Chercher sur vos comptes indexeurs</a> plus bas.</td></tr>
+<!--BLOCK sec-->
+<h3 id="pullsearch">Chercher sur vos comptes indexeurs</h3>
+<p>Si vous avez un compte sur un site indexeur NZB, nzbfast peut l'interroger depuis
+ici et mettre en file ce que vous choisissez, au lieu de vous faire aller sur le site,
+télécharger un NZB et le rapporter. Il parle l'API indexeur standard que tous ces sites
+proposent, il n'y a donc rien à configurer par site : NZBGeek, NZBFinder, DrunkenSlug,
+DOGnzb et les autres fonctionnent de la même façon. Une instance Prowlarr ou NZBHydra2
+compte aussi pour une seule entrée, et amène avec elle tous les indexeurs qu'elle
+regroupe.</p>
+<p><b>Ajouter un compte.</b> Paramètres → Chercher sur les indexeurs →
+<b>+ Ajouter un indexeur</b>. Renseignez un nom de votre choix, l'adresse d'API du site
+(son adresse web ordinaire suffit ; une entrée Prowlarr ressemble à
+<code>http://host:9696/1/api</code>) et la clé API de votre page de compte là-bas, puis
+<b>Appliquer les indexeurs</b>. <b>Tester</b> demande au site ce qu'il sait faire et
+affiche sa réponse, ce qui valide l'adresse et la clé en un clic. Une clé enregistrée
+n'est jamais réaffichée : le champ le dit, et le laisser vide conserve la clé déjà
+en place.</p>
+<p><b>Chercher.</b> Ouvrez <b>🎬 le mur</b> dans l'en-tête et passez à la liste des
+releases. Le menu déroulant à côté du champ de recherche décide où la recherche
+regarde : <b>Cet index</b>, c'est-à-dire ce que cette machine a scanné elle-même,
+<b>Indexeurs</b>, ou <b>Les deux</b>. Votre choix est mémorisé. Interroger vos comptes
+exige quelque chose dans le champ, car les parcourir avec une requête vide dépenserait
+le quota d'une journée pour une liste que personne n'a demandée. Avec l'indexeur
+intégré éteint, ce qui est l'état d'origine de nzbfast, il n'y a pas d'affiches à
+montrer et la page se réduit exactement à cela : un champ de recherche, vos comptes,
+et les résultats.</p>
+<p><b>Les résultats.</b> Une ligne par release, les plus récentes d'abord, avec sa
+taille, son âge et le nombre de fois que les utilisateurs de cet indexeur l'ont
+récupérée. Une release que plusieurs de vos comptes proposent n'apparaît qu'une fois.
+Sous <b>Les deux</b>, une copie que votre propre index détient déjà l'emporte et celle
+de l'extérieur est écartée, car récupérer ce que vous avez déjà indexé ne vous coûte
+rien. <b>Télécharger</b> la met en file en priorité haute : nzbfast va chercher le NZB
+lui-même, et à partir de là la tâche est comme toutes les autres, réparation,
+extraction, catégories et scripts compris.</p>
+<p><b>Demander un titre précis.</b> Ouvrez la fiche d'un titre sur le mur et appuyez sur
+<b>⌕ Chercher sur mes indexeurs</b>. Pour les films, la question passe par le numéro
+IMDb partout où le site l'accepte, ce qui fait la différence entre le film que vous
+visiez et toutes les releases dont le nom contient par hasard ces mots-là. nzbfast
+retrouve ce numéro lui-même, la page n'en détient donc jamais aucun. Les sites qui ne
+proposent pas la correspondance par numéro sont interrogés en toutes lettres.</p>
+<p><b>Votre quota.</b> Les comptes indexeurs sont comptés : tant de recherches et tant
+de téléchargements par jour, selon votre formule. Inscrivez ces deux nombres sur
+l'entrée et nzbfast décompte, avec une remise à zéro à minuit UTC. 0, la valeur par
+défaut, veut dire illimité, et le décompte continue quand même. Un compte qui a épuisé
+son quota reste sur la touche pendant que les autres travaillent, et une ligne au-dessus
+des résultats nomme celui qui a été sauté : une fin de quota n'est jamais silencieuse.
+Un site qui répond par une limite à lui, ou qui nous demande de ralentir, est mis de
+côté pendant une heure.</p>
+<p><b>Où va votre clé.</b> Uniquement chez l'indexeur à qui elle appartient. Les clés
+restent sur cette machine, ne sont jamais remises au navigateur - chaque ligne de
+résultat porte un jeton valable une demi-heure à la place d'un lien - et sont retirées
+du journal comme de toute erreur renvoyée par le site, si bien qu'un message d'erreur
+recopié ne peut pas en divulguer une. Un téléchargement ne peut aller chercher qu'un
+lien renvoyé par l'une de vos propres recherches.</p>
+<p>Ce sont les mêmes comptes qu'un <a href="#nzblnk">lien nzblnk</a> interroge en repli
+quand l'index local ne reconnaît pas son en-tête, et ceux que la liste de suivi peut
+questionner sur les éléments voulus (<a href="#automation">§10</a>).</p>
+
+<!--BLOCK set-->
+<h3 id="set-indexers">Chercher sur les indexeurs <span class="pill live">en direct</span></h3>
+<p>Vos comptes sur les sites indexeurs NZB, une ligne chacun, pour qu'une recherche sur
+le mur puisse aussi les interroger. Ce que fait la fonction, et comment chercher avec,
+se trouve au <a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Champ</th><th>Ce qu'il fait</th></tr>
+<tr><td>Nom</td><td>Une étiquette de votre choix, et l'identité sous laquelle les compteurs et les limites du jour sont tenus. Renommer une ligne crée une nouvelle entrée : ressaisissez la clé.</td></tr>
+<tr><td>Adresse d'API</td><td>L'adresse d'API du site. Son adresse web ordinaire suffit ; une entrée Prowlarr ou NZBHydra2 ressemble à <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>Clé API</td><td>Prise sur votre page de compte du site. Gardée sur cette machine, envoyée seulement au site à qui elle appartient, jamais réaffichée et jamais écrite dans le journal. Laisser vide conserve celle qui est enregistrée.</td></tr>
+<tr><td>Recherches par jour</td><td>Combien de recherches ce compte peut dépenser par jour. 0 = illimité, et c'est la valeur par défaut.</td></tr>
+<tr><td>Téléchargements par jour</td><td>Combien de récupérations il peut dépenser par jour. 0 = illimité. Les deux compteurs repartent de zéro à minuit UTC.</td></tr>
+<tr><td>actif, Tester</td><td><b>actif</b> est ce qui rend une ligne interrogeable ; décochez pour garder un compte sans l'utiliser. <b>Tester</b> demande au site ce qu'il sait faire et affiche la réponse, ou l'erreur, sur place.</td></tr>
+</table></div>
+
+<!--BLOCK watch-->
+<p><b>Chercher aussi sur mes comptes indexeurs les éléments voulus</b>, au bas de la
+carte de la liste de suivi, lui permet d'interroger les comptes de Paramètres →
+Chercher sur les indexeurs en plus de votre propre index (<a href="#pullsearch">§5</a>).
+C'est éteint au départ, parce que c'est la seule chose ici qui dépense un compte
+facturé sans que vous cliquiez. Une fois activé, chaque élément suivi demande environ
+deux fois par jour, et seulement pour ce qu'il n'a pas déjà trouvé, sous les mêmes
+limites quotidiennes et avec les mêmes mentions quand un compte est sauté. Un candidat
+venu d'un indexeur est jugé exactement comme un candidat local : planchers de qualité,
+montées en qualité, packs de saison et gestion des doublons s'appliquent tous, et une
+copie locale l'emporte à égalité puisqu'elle ne coûte aucun quota. Avec l'indexeur
+intégré éteint, c'est ce qui donne à la liste de suivi de quoi travailler.</p>

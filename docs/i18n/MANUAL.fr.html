@@ -437,6 +437,9 @@ récupérations en un clic depuis les sites d'indexeurs.</td></tr>
 <tr><td><b>Depuis une URL</b></td><td>Collez un lien NZB (API <code>mode=addurl</code>, ou via n'importe quelle appli connectée).</td></tr>
 <tr><td><b>Liens nzblnk:</b></td><td>Collez un lien <code>nzblnk:</code> n'importe où sur le tableau de bord, ou glissez-le dedans. Si vous avez installé depuis le DMG macOS ou l'installateur Windows, vous pouvez aussi en cliquer un directement sur un board. Voir <a href="#nzblnk">les liens nzblnk</a> plus bas.</td></tr>
 <tr><td><b>Parcourir l'index</b></td><td>Cliquez sur n'importe quelle release complète dans la carte Parcourir.</td></tr>
+<tr><td><b>Chercher sur les indexeurs</b></td><td>Interrogez les comptes indexeurs que
+vous avez ajoutés et mettez un résultat en file directement depuis la liste. Voir
+<a href="#pullsearch">Chercher sur vos comptes indexeurs</a> plus bas.</td></tr>
 <tr><td><b>Liste de suivi / RSS</b></td><td>Automatique - voir <a href="#automation">Automatisation</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr etc.</b></td><td>Ils envoient leurs récupérations directement dans la file - voir <a href="#arr">§11</a>.</td></tr>
 <tr><td><b>Ligne de commande</b></td><td><code>nzbfast get file.nzb</code> télécharge sans le daemon.</td></tr>
@@ -454,6 +457,63 @@ de votre dossier de téléchargement, et les Dossiers intelligents (voir
 ou après coup depuis l'Historique (🔑).</li>
 </ul>
 
+<h3 id="pullsearch">Chercher sur vos comptes indexeurs</h3>
+<p>Si vous avez un compte sur un site indexeur NZB, nzbfast peut l'interroger depuis
+ici et mettre en file ce que vous choisissez, au lieu de vous faire aller sur le site,
+télécharger un NZB et le rapporter. Il parle l'API indexeur standard que tous ces sites
+proposent, il n'y a donc rien à configurer par site : NZBGeek, NZBFinder, DrunkenSlug,
+DOGnzb et les autres fonctionnent de la même façon. Une instance Prowlarr ou NZBHydra2
+compte aussi pour une seule entrée, et amène avec elle tous les indexeurs qu'elle
+regroupe.</p>
+<p><b>Ajouter un compte.</b> Paramètres → Chercher sur les indexeurs →
+<b>+ Ajouter un indexeur</b>. Renseignez un nom de votre choix, l'adresse d'API du site
+(son adresse web ordinaire suffit ; une entrée Prowlarr ressemble à
+<code>http://host:9696/1/api</code>) et la clé API de votre page de compte là-bas, puis
+<b>Appliquer les indexeurs</b>. <b>Tester</b> demande au site ce qu'il sait faire et
+affiche sa réponse, ce qui valide l'adresse et la clé en un clic. Une clé enregistrée
+n'est jamais réaffichée : le champ le dit, et le laisser vide conserve la clé déjà
+en place.</p>
+<p><b>Chercher.</b> Ouvrez <b>🎬 le mur</b> dans l'en-tête et passez à la liste des
+releases. Le menu déroulant à côté du champ de recherche décide où la recherche
+regarde : <b>Cet index</b>, c'est-à-dire ce que cette machine a scanné elle-même,
+<b>Indexeurs</b>, ou <b>Les deux</b>. Votre choix est mémorisé. Interroger vos comptes
+exige quelque chose dans le champ, car les parcourir avec une requête vide dépenserait
+le quota d'une journée pour une liste que personne n'a demandée. Avec l'indexeur
+intégré éteint, ce qui est l'état d'origine de nzbfast, il n'y a pas d'affiches à
+montrer et la page se réduit exactement à cela : un champ de recherche, vos comptes,
+et les résultats.</p>
+<p><b>Les résultats.</b> Une ligne par release, les plus récentes d'abord, avec sa
+taille, son âge et le nombre de fois que les utilisateurs de cet indexeur l'ont
+récupérée. Une release que plusieurs de vos comptes proposent n'apparaît qu'une fois.
+Sous <b>Les deux</b>, une copie que votre propre index détient déjà l'emporte et celle
+de l'extérieur est écartée, car récupérer ce que vous avez déjà indexé ne vous coûte
+rien. <b>Télécharger</b> la met en file en priorité haute : nzbfast va chercher le NZB
+lui-même, et à partir de là la tâche est comme toutes les autres, réparation,
+extraction, catégories et scripts compris.</p>
+<p><b>Demander un titre précis.</b> Ouvrez la fiche d'un titre sur le mur et appuyez sur
+<b>⌕ Chercher sur mes indexeurs</b>. Pour les films, la question passe par le numéro
+IMDb partout où le site l'accepte, ce qui fait la différence entre le film que vous
+visiez et toutes les releases dont le nom contient par hasard ces mots-là. nzbfast
+retrouve ce numéro lui-même, la page n'en détient donc jamais aucun. Les sites qui ne
+proposent pas la correspondance par numéro sont interrogés en toutes lettres.</p>
+<p><b>Votre quota.</b> Les comptes indexeurs sont comptés : tant de recherches et tant
+de téléchargements par jour, selon votre formule. Inscrivez ces deux nombres sur
+l'entrée et nzbfast décompte, avec une remise à zéro à minuit UTC. 0, la valeur par
+défaut, veut dire illimité, et le décompte continue quand même. Un compte qui a épuisé
+son quota reste sur la touche pendant que les autres travaillent, et une ligne au-dessus
+des résultats nomme celui qui a été sauté : une fin de quota n'est jamais silencieuse.
+Un site qui répond par une limite à lui, ou qui nous demande de ralentir, est mis de
+côté pendant une heure.</p>
+<p><b>Où va votre clé.</b> Uniquement chez l'indexeur à qui elle appartient. Les clés
+restent sur cette machine, ne sont jamais remises au navigateur - chaque ligne de
+résultat porte un jeton valable une demi-heure à la place d'un lien - et sont retirées
+du journal comme de toute erreur renvoyée par le site, si bien qu'un message d'erreur
+recopié ne peut pas en divulguer une. Un téléchargement ne peut aller chercher qu'un
+lien renvoyé par l'une de vos propres recherches.</p>
+<p>Ce sont les mêmes comptes qu'un <a href="#nzblnk">lien nzblnk</a> interroge en repli
+quand l'index local ne reconnaît pas son en-tête, et ceux que la liste de suivi peut
+questionner sur les éléments voulus (<a href="#automation">§10</a>).</p>
+
 <h3 id="nzblnk">Les liens nzblnk</h3>
 <p>Certains boards, surtout allemands et néerlandais, publient un lien
 <code>nzblnk:</code> au lieu d'un fichier NZB. Le post est obfusqué, il n'existe donc
@@ -463,7 +523,7 @@ mot de passe <code>p=</code> et un groupe <code>g=</code> facultatifs. Il faut d
 d'abord aller retrouver le post.</p>
 <p>nzbfast cherche d'abord cet en-tête dans son propre index, ce qui ne demande aucun
 réseau, et seulement si cela échoue il interroge les indexeurs de recherche que vous
-avez configurés (Paramètres → Indexeurs de recherche, <a href="#settings">§9</a>), sous
+avez configurés (Paramètres → Chercher sur les indexeurs, <a href="#settings">§9</a>), sous
 les mêmes budgets quotidiens et le même repli que toute autre recherche. Le titre
 devient le nom de la tâche et le mot de passe est appliqué automatiquement.</p>
 <ul>
@@ -797,6 +857,20 @@ télécharger à nouveau. Quel que soit votre choix, le tiroir de chaque tâche 
 bouton <b>Télécharger le .nzb</b>, donc une copie du <code>.nzb</code> de n'importe
 quelle tâche n'est jamais à plus d'un clic.</p>
 
+<h3 id="set-indexers">Chercher sur les indexeurs <span class="pill live">en direct</span></h3>
+<p>Vos comptes sur les sites indexeurs NZB, une ligne chacun, pour qu'une recherche sur
+le mur puisse aussi les interroger. Ce que fait la fonction, et comment chercher avec,
+se trouve au <a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Champ</th><th>Ce qu'il fait</th></tr>
+<tr><td>Nom</td><td>Une étiquette de votre choix, et l'identité sous laquelle les compteurs et les limites du jour sont tenus. Renommer une ligne crée une nouvelle entrée : ressaisissez la clé.</td></tr>
+<tr><td>Adresse d'API</td><td>L'adresse d'API du site. Son adresse web ordinaire suffit ; une entrée Prowlarr ou NZBHydra2 ressemble à <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>Clé API</td><td>Prise sur votre page de compte du site. Gardée sur cette machine, envoyée seulement au site à qui elle appartient, jamais réaffichée et jamais écrite dans le journal. Laisser vide conserve celle qui est enregistrée.</td></tr>
+<tr><td>Recherches par jour</td><td>Combien de recherches ce compte peut dépenser par jour. 0 = illimité, et c'est la valeur par défaut.</td></tr>
+<tr><td>Téléchargements par jour</td><td>Combien de récupérations il peut dépenser par jour. 0 = illimité. Les deux compteurs repartent de zéro à minuit UTC.</td></tr>
+<tr><td>actif, Tester</td><td><b>actif</b> est ce qui rend une ligne interrogeable ; décochez pour garder un compte sans l'utiliser. <b>Tester</b> demande au site ce qu'il sait faire et affiche la réponse, ou l'erreur, sur place.</td></tr>
+</table></div>
+
 <h3>Indexation <span class="pill live">en direct</span></h3>
 <div class="note"><b>L'indexeur intégré est désactivé par défaut.</b> Il trouve les
 posts publiés sous un vrai nom de fichier, et une part importante et croissante
@@ -806,11 +880,12 @@ que l'uploadeur publie ailleurs, il n'a donc jamais été sur Usenet où un scan
 pourrait le lire. Mesuré sur notre propre index, 14,8 millions de posts scannés ont
 produit environ 31 000 releases consultables, soit à peu près une sur cinq cents.
 Continuez d'utiliser des indexeurs commerciaux, et ajoutez-les dans Paramètres →
-Indexeurs de recherche pour pouvoir les interroger depuis le mur. Activez ceci si
+Chercher sur les indexeurs pour pouvoir les interroger depuis le mur. Activez ceci si
 vous suivez des groupes précis où les gens postent encore sous de vrais noms, ou si
 vous voulez voir ce que votre fournisseur transporte réellement. Interrupteur éteint,
-rien n'est scanné ni récupéré, aucune base n'est créée, et le mur, Parcourir, la
-watchlist et le flux newznab sont masqués.</div>
+rien n'est scanné ni récupéré et aucune base n'est créée ; Parcourir et le flux newznab
+disparaissent, le mur devient une simple page de recherche pour les comptes indexeurs
+que vous avez ajoutés, et la liste de suivi travaille sur ces comptes.</div>
 <div class="tblwrap"><table>
 <tr><th>Réglage</th><th>Effet</th></tr>
 <tr><td>Indexeur intégré</td><td>L'interrupteur principal, <b>éteint tant que vous ne l'allumez pas</b>. Éteint signifie aucun scan, aucune recherche de métadonnées, aucun échantillonnage de disponibilité et aucun flux newznab ; un index déjà sur le disque est conservé (il y a un bouton pour le supprimer), donc le rallumer reprend au lieu de tout rescanner.</td></tr>
@@ -872,6 +947,17 @@ retiré là-bas cesse d'être suivi ici (les téléchargements déjà terminés 
 un flux par adresse ne porte que les entrées les plus récentes, l'absence ne prouve
 donc rien et les titres ne sont jamais qu'ajoutés. Les deux réglages par défaut se
 changent source par source.</p>
+<p><b>Chercher aussi sur mes comptes indexeurs les éléments voulus</b>, au bas de la
+carte de la liste de suivi, lui permet d'interroger les comptes de Paramètres →
+Chercher sur les indexeurs en plus de votre propre index (<a href="#pullsearch">§5</a>).
+C'est éteint au départ, parce que c'est la seule chose ici qui dépense un compte
+facturé sans que vous cliquiez. Une fois activé, chaque élément suivi demande environ
+deux fois par jour, et seulement pour ce qu'il n'a pas déjà trouvé, sous les mêmes
+limites quotidiennes et avec les mêmes mentions quand un compte est sauté. Un candidat
+venu d'un indexeur est jugé exactement comme un candidat local : planchers de qualité,
+montées en qualité, packs de saison et gestion des doublons s'appliquent tous, et une
+copie locale l'emporte à égalité puisqu'elle ne coûte aucun quota. Avec l'indexeur
+intégré éteint, c'est ce qui donne à la liste de suivi de quoi travailler.</p>
 <h3 id="auto-rss">Flux RSS</h3>
 <p>Paramètres → RSS : n'importe quelle URL RSS newznab/indexeur, avec intervalle,
 catégorie et règles de filtrage par flux (motifs de titre, bornes de taille). Les
@@ -1266,7 +1352,7 @@ changement. Deux clés : la <b>clé API</b> (contrôle total) et la <b>clé NZB<
 <tr><td>Config</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (chaque champ des Paramètres), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index &amp; mur</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab sur <code>/api?t=caps|search|tvsearch|movie</code> et <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automatisation</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>
-<tr><td>Diagnostics</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
+<tr><td>Diagnostics</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code></td></tr>
 <tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> - status, listgroups, history, append, editqueue, rate, pause, log (auth Basic : n'importe quel utilisateur, la clé API comme mot de passe)</td></tr>
 <tr><td>Aperçu / lecture</td><td><code>/stream/&lt;nzo_id&gt;</code> (plages HTTP ; démarrer une tâche de bibliothèque en attente exige le jeton <code>?t=</code> ou la clé), <code>/m3u/&lt;id&gt;</code> (exige la clé ; génère le jeton), <code>/wall</code>, <code>/art/…</code></td></tr>
 </table></div>

@@ -392,13 +392,14 @@ impl Daemon {
         // retry - the record was still there and still retryable, but the
         // button the user pressed had done nothing.
         moveseq::stamp_move(&job);
+        let seq = job.lock_ok().move_seq;
         self.queue.lock_ok().push_back(job);
         drop(publish);
         // Queue first, tombstone second, and never the tombstone on its
         // own - `commit_to_queue` holds the ordering and the reasons for
         // it, shared with the library-stream activation that moves a
         // record the same way.
-        self.commit_to_queue(nzo_id, "retrying");
+        self.commit_to_queue(nzo_id, seq, "retrying");
         true
     }
 }

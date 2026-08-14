@@ -401,6 +401,9 @@ mapp mot den för grabbar med ett klick från indexersidor.</td></tr>
 <tr><td><b>Från en URL</b></td><td>Klistra in en NZB-länk (API <code>mode=addurl</code>, eller via valfri ansluten app).</td></tr>
 <tr><td><b>nzblnk:-länkar</b></td><td>Klistra in en <code>nzblnk:</code>-länk var som helst på panelen, eller dra in den. Har du installerat från macOS-DMG:en eller Windows-installeraren kan du också klicka på en direkt på ett board. Se <a href="#nzblnk">nzblnk-länkar</a> nedan.</td></tr>
 <tr><td><b>Bläddra i indexet</b></td><td>Klicka på valfri komplett release i Bläddra-kortet.</td></tr>
+<tr><td><b>Sök på indexerare</b></td><td>Sök på de indexerarkonton du har lagt till och
+köa ett resultat direkt från listan. Se <a href="#pullsearch">Söka på dina
+indexerarkonton</a> längre ned.</td></tr>
 <tr><td><b>Bevakningslista / RSS</b></td><td>Automatiskt - se <a href="#automation">Automatisering</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr m.fl.</b></td><td>De skickar grabbar rakt till kön - se <a href="#arr">§11</a>.</td></tr>
 <tr><td><b>Kommandoraden</b></td><td><code>nzbfast get file.nzb</code> laddar ner utan daemonen.</td></tr>
@@ -417,6 +420,56 @@ mapp, och Smarta mappar (se <a href="#automation">§10</a>) kan tilldela dem per
 Historik (🔑).</li>
 </ul>
 
+<h3 id="pullsearch">Söka på dina indexerarkonton</h3>
+<p>Har du ett konto hos en NZB-indexerarsajt kan nzbfast söka där härifrån och köa det du
+väljer, i stället för att du ska gå till sajten, hämta en NZB och bära tillbaka den. Det
+talar det vanliga indexerar-API som alla de sajterna erbjuder, så det finns inget att
+ställa in per sajt: NZBGeek, NZBFinder, DrunkenSlug, DOGnzb och de andra fungerar
+likadant. En Prowlarr- eller NZBHydra2-instans är också en enda rad, och tar med sig
+varje indexerare bakom sig.</p>
+<p><b>Lägga till ett konto.</b> Inställningar → Sök på indexerare →
+<b>+ Lägg till indexerare</b>. Fyll i ett namn du väljer själv, sajtens API-adress (dess
+vanliga webbadress räcker; en Prowlarr-rad ser ut som
+<code>http://host:9696/1/api</code>) och API-nyckeln från din kontosida där, och sedan
+<b>Tillämpa indexerare</b>. <b>Testa</b> frågar sajten vad den klarar och visar vad som
+kom tillbaka, vilket bevisar adressen och nyckeln med ett klick. En sparad nyckel visas
+aldrig igen: rutan säger det, och att lämna den tom behåller nyckeln som redan finns
+där.</p>
+<p><b>Att söka.</b> Öppna <b>🎬 väggen</b> i sidhuvudet och byt till releaselistan.
+Rullgardinen bredvid sökrutan avgör var en sökning tittar: <b>Detta index</b>, alltså
+det den här maskinen själv har skannat, <b>Indexerare</b>, eller <b>Båda</b>. Ditt val
+kommer ihåg. Att fråga dina konton kräver något i rutan, för att bläddra i dem med en
+tom fråga skulle göra av med ett dygns tilldelning på en lista ingen bad om. Med den
+inbyggda indexeraren avstängd, vilket är så nzbfast kommer, finns inga affischer att
+visa och sidan är precis detta: en sökruta, dina konton och resultaten.</p>
+<p><b>Resultaten.</b> En rad per release, de nyaste först, med storlek, ålder och hur
+ofta den indexerarens egna användare har hämtat den. En release som flera av dina konton
+har dyker upp en gång. Under <b>Båda</b> vinner en kopia som ditt eget index redan har
+och den utifrån faller bort, för att hämta det du redan indexerat kostar dig ingenting.
+<b>Ladda ned</b> köar den med hög prioritet: nzbfast hämtar NZB:n själv, och därifrån är
+jobbet som vilket annat som helst, med reparation, uppackning, kategorier och skript
+oförändrade.</p>
+<p><b>Att fråga om en enda titel.</b> Öppna en titels kort på väggen och tryck på
+<b>⌕ Sök på mina indexerare</b>. För filmer går frågan via IMDb-numret överallt där
+sajten tar emot ett, och det är skillnaden mellan filmen du menade och varje release vars
+namn råkar innehålla just de orden. nzbfast slår upp numret själv, så sidan håller aldrig
+något. Sajter som inte erbjuder matchning på nummer får frågan i ord i stället.</p>
+<p><b>Din tilldelning.</b> Indexerarkonton är mätta: så och så många sökningar och så och
+så många nedladdningar om dagen, beroende på din nivå. Skriv in de två talen på raden så
+räknar nzbfast mot dem, med start om från midnatt UTC. 0, standardvärdet, betyder
+obegränsat, och räkningen fortsätter ändå. Ett konto som gjort av med sin tilldelning
+sitter över medan de andra arbetar, och en rad ovanför resultaten namnger det som hoppades
+över: att ta slut är aldrig tyst. En sajt som svarar med en egen gräns, eller ber oss
+sakta ned, ställs åt sidan i en timme.</p>
+<p><b>Vart din nyckel tar vägen.</b> Bara till den indexerare den hör till. Nycklar
+stannar på den här maskinen, lämnas aldrig till webbläsaren - varje resultatrad bär en
+biljett som gäller en halvtimme i stället för en länk - och rensas ur loggen och ur varje
+fel sajten skickar tillbaka, så ett inklistrat felmeddelande kan inte läcka någon. En
+nedladdning kan bara hämta en länk som någon av dina egna sökningar gav.</p>
+<p>Det är samma konton som en <a href="#nzblnk">nzblnk-länk</a> faller tillbaka på när
+det lokala indexet inte känner igen dess huvud, och de som bevakningslistan kan fråga om
+det du vill ha (<a href="#automation">§10</a>).</p>
+
 <h3 id="nzblnk">nzblnk-länkar</h3>
 <p>Vissa board, mest tyska och nederländska, publicerar en <code>nzblnk:</code>-länk
 i stället för en NZB-fil. Inlägget är fördunklat, så det finns inget filnamn att länka
@@ -425,7 +478,7 @@ plats, plus en valfri titel <code>t=</code>, ett lösenord <code>p=</code> och e
 <code>g=</code>. Någon måste först gå och hitta inlägget.</p>
 <p>nzbfast slår upp huvudet i sitt eget index först, vilket inte kräver något nätverk
 alls, och bara om det missar frågar det sökindexerarna du har ställt in (Inställningar →
-Sökindexerare, <a href="#settings">§9</a>), under samma dagsbudgetar och samma backoff
+Sök på indexerare, <a href="#settings">§9</a>), under samma dagsbudgetar och samma backoff
 som varje annan sökning. Titeln blir jobbets namn och lösenordet läggs på jobbet
 automatiskt.</p>
 <ul>
@@ -722,6 +775,20 @@ köar den inte igen; spara om den för att ladda ner den på nytt. Oavsett vilke
 jobbs detaljlåda en knapp <b>Hämta .nzb-filen</b>, så en kopia av vilket jobbs
 <code>.nzb</code> som helst är aldrig mer än ett klick bort.</p>
 
+<h3 id="set-indexers">Sök på indexerare <span class="pill live">live</span></h3>
+<p>Dina konton hos NZB-indexerarsajter, en rad var, så att en sökning på väggen kan fråga
+dem också. Vad funktionen gör, och hur man söker med den, står i
+<a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Fält</th><th>Vad det gör</th></tr>
+<tr><td>Namn</td><td>En etikett du väljer själv, och den identitet dagens räknare och gränser förs under. Att byta namn på en rad börjar en ny rad, så skriv in nyckeln igen.</td></tr>
+<tr><td>API-adress</td><td>Sajtens API-adress. Dess vanliga webbadress räcker; en Prowlarr- eller NZBHydra2-rad ser ut som <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>API-nyckel</td><td>Från din kontosida på den sajten. Stannar på den här maskinen, skickas bara till sajten den hör till, visas aldrig igen och skrivs aldrig i loggen. Tom behåller den sparade.</td></tr>
+<tr><td>Sökningar per dag</td><td>Hur många sökningar det här kontot får göra av med per dag. 0 = obegränsat, och standard.</td></tr>
+<tr><td>Nedladdningar per dag</td><td>Hur många hämtningar det får göra av med per dag. 0 = obegränsat. Båda räknarna börjar om vid midnatt UTC.</td></tr>
+<tr><td>på, Testa</td><td><b>på</b> är det som gör en rad sökbar; kryssa ur för att behålla ett konto utan att använda det. <b>Testa</b> frågar sajten vad den klarar och visar svaret, eller felet, på plats.</td></tr>
+</table></div>
+
 <h3>Indexering <span class="pill live">live</span></h3>
 <div class="note"><b>Den inbyggda indexeraren är avstängd som standard.</b> Den hittar
 inlägg som postats under ett riktigt filnamn, och en stor och växande del av Usenet
@@ -730,11 +797,12 @@ samlingsgrupp. Det riktiga namnet finns bara i en NZB som uppladdaren publicerar
 någon annanstans, alltså fanns det aldrig på Usenet för någon skanner att läsa. Mätt på
 vårt eget index gav 14,8 miljoner skannade inlägg omkring 31 000 bläddringsbara
 releaser, ungefär en på femhundra. Fortsätt använda kommersiella indexerare och lägg in
-dem under Inställningar → Sökindexerare, så att du kan söka i dem från väggen. Slå på
+dem under Inställningar → Sök på indexerare, så att du kan söka i dem från väggen. Slå på
 det här om du följer bestämda grupper där folk fortfarande postar under riktiga namn,
 eller om du vill se vad din leverantör faktiskt bär. Med reglaget av skannas eller
-hämtas ingenting, ingen databas skapas, och väggen, Bläddra, bevakningslistan och
-newznab-flödet är dolda.</div>
+hämtas ingenting och ingen databas skapas; Bläddra och newznab-flödet försvinner, väggen
+blir en enkel söksida för de indexerarkonton du har lagt till, och bevakningslistan
+arbetar mot de kontona i stället.</div>
 <div class="tblwrap"><table>
 <tr><th>Inställning</th><th>Vad den gör</th></tr>
 <tr><td>Inbyggd indexerare</td><td>Huvudreglaget, <b>av tills du slår på det</b>. Av innebär ingen skanning, inga metadatasökningar, ingen tillgänglighetsprovtagning och inget newznab-flöde; ett index som redan finns på disk behålls (det finns en raderaknapp), så att slå på igen återupptar i stället för att skanna om.</td></tr>
@@ -793,6 +861,16 @@ konto ser hela listan, så en titel som tas bort där slutar bevakas här (redan
 nedladdningar blir kvar); ett adressflöde innehåller bara de senaste posterna, så
 frånvaro bevisar ingenting och titlar läggs bara till. Båda standardvalen kan ändras
 per källa.</p>
+<p><b>Sök även på mina indexerarkonton efter det jag vill ha</b>, längst ned på
+bevakningslistans kort, låter den fråga kontona från Inställningar → Sök på
+indexerare utöver ditt eget index (<a href="#pullsearch">§5</a>). Det börjar avstängt,
+för det är det enda här som gör av med ett mätt konto utan att du klickar. Påslaget
+frågar varje bevakad post ungefär två gånger om dagen, och bara efter det den inte redan
+hittat, under samma dagsgränser och med samma noteringar när ett konto hoppas över. En
+kandidat från en indexerare bedöms precis som en lokal, så kvalitetsgolv, uppgraderingar,
+säsongspaket och dubbletthantering gäller allihop, och en lokal kopia vinner varje
+lika-läge eftersom den inte kostar någon tilldelning. Med den inbyggda indexeraren
+avstängd är det detta som ger bevakningslistan något att arbeta med över huvud taget.</p>
 <h3 id="auto-rss">RSS-flöden</h3>
 <p>Inställningar → RSS: valfri newznab/indexer-RSS-URL med intervall per flöde, kategori och
 filterregler (titelmönster, storleksgränser). Matchande objekt laddas ner
@@ -1157,7 +1235,7 @@ SABnzbd-kompatibel, så befintliga SAB-integrationer fungerar oförändrade. Tv�
 <tr><td>Konfig</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (varje inställningsfält), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index &amp; vägg</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab på <code>/api?t=caps|search|tvsearch|movie</code> och <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automatisering</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>
-<tr><td>Diagnostik</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
+<tr><td>Diagnostik</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code></td></tr>
 <tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> - status, listgroups, history, append, editqueue, rate, pause, log (Basic auth: valfri användare, API-nyckel som lösenord)</td></tr>
 <tr><td>Förhandsgranskning / uppspelning</td><td><code>/stream/&lt;nzo_id&gt;</code> (HTTP-ranges; att starta ett parkerat biblioteksjobb kräver <code>?t=</code>-token eller nyckel), <code>/m3u/&lt;id&gt;</code> (kräver nyckel; skapar token), <code>/wall</code>, <code>/art/…</code></td></tr>
 </table></div>

@@ -2284,6 +2284,14 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input type="checkbox" id="s_index_nzbimport" onchange="setCfg('index_nzbimport',this.checked?1:0)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.idx.nzbimport.budget">Read budget (articles per hour)<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.nzbimport.budget.hint">most posted NZB files cost a single article; a large one is capped at about 48. The default 300 keeps up with the typical daily flow of these posts; 0 = off</span></label>
     <input class="txt sm" type="number" min="0" max="2000" id="s_index_nzbimport_budget" onchange="setCfg('index_nzbimport_budget',this.value)"></div>
+  <!-- The shatter fold's census (TODO 161). Read-only on purpose: the
+       fold always runs with the indexer, one short budgeted slice per
+       scan pass, and its running totals are the whole story. It merges
+       entries; it never names anything - the naming lanes above and the
+       correlation below do that, and only correlation can even score a
+       post once this has made its size real. -->
+  <div class="row"><label data-i18n="set.idx.fold">Scattered post merging<span class="hint" data-i18n="set.idx.fold.hint">some uploaders post every piece of an upload under a different random poster name and spread the pieces across several groups, so one upload arrives looking like thousands of unrelated fragments. On each scan pass this spends a moment merging fragments that clearly belong together back into one entry. Merging only makes the entry whole, so its size and timing become real; it never guesses a name</span></label>
+    <span id="foldState" class="dim" style="font-size:12.5px;line-height:1.5"></span></div>
   <div class="row"><label data-i18n="set.idx.scannow">Scan now<span class="hint" data-i18n="set.idx.scannow.hint">run a scan pass immediately; with a depth, one-off deep backfill: rescan that many recent headers per group even where already scanned (e.g. 500000)</span></label>
     <span><input class="txt sm" type="number" min="0" id="s_scan_depth" data-i18n-placeholder="set.idx.depth.ph" placeholder="depth (optional)">
     <button class="ghost" onclick="scanNow(this, +document.getElementById('s_scan_depth').value||0)" data-i18n="set.idx.scannow.btn">Scan now</button></span></div>
@@ -2321,6 +2329,18 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <span style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <button class="btn" id="predbSeedBtn" data-i18n="set.idx.seedbtn" onclick="startPredbSeed()">Import history</button>
       <span id="predbSeedState" class="dim" style="font-size:12.5px;line-height:1.5"></span></span></div>
+  <!-- The indexer-confirm lane (TODO 161). A child of correlation on
+       purpose: it only ever consumes correlation's STRONG suggestions,
+       so the rows grey with the switch above. There is no manual
+       URL+key fallback here, unlike the scoreboard - this lane fetches
+       NZBs, which indexers meter as grabs, so it only runs against an
+       account whose quotas the account editor already tracks. -->
+  <div class="row corr-sub" style="padding-left:16px"><label data-i18n="set.idx.ccf">Check suggestions with your indexer<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.ccf.hint">off unless you turn it on. Even a strong suggestion from the matching above is still a guess from size and timing. This takes up to 24 of those guesses a day, searches the suggested name on an indexer account you already added, and fetches the matching NZB from it. The name is applied only when the message ids inside that NZB point at the very post held here, and it is then marked as proven; anything less leaves the suggestion for you to review. Each check spends one search and at most one download from that account's daily allowance, and nothing is sent anywhere else</span></label>
+    <input type="checkbox" id="s_corr_confirm_enabled" onchange="setCfg('corr_confirm_enabled',this.checked?1:0);setTimeout(refreshCorrConfirm,400)"></div>
+  <div class="row corr-sub" style="padding-left:16px"><label data-i18n="set.idx.ccfsrc">Ask this account<span class="badge live" data-i18n="badge.live">live</span><span class="hint" data-i18n="set.idx.ccfsrc.hint">pick one of the indexer accounts you already added; its saved address, key and daily limits are reused. There is no box for a different account here on purpose: these checks download NZB files, which indexers count against an account, so only an account whose limits are already tracked can be asked</span></label>
+    <select class="sel" id="s_corr_confirm_source" style="max-width:300px" onchange="setCfg('corr_confirm_source',this.value);setTimeout(refreshCorrConfirm,400)"></select></div>
+  <div class="row corr-sub" style="padding-left:16px"><label data-i18n="set.idx.ccfstat">How it is going<span class="hint" data-i18n="set.idx.ccfstat.hint">how much of today's allowance is used. What the checks settle shows in the counters above: a confirmed check moves a suggestion to confirmed, a miss leaves it alone, and a day with no strong suggestions spends nothing</span></label>
+    <span id="corrConfirmState" class="dim" style="font-size:12.5px;line-height:1.5"></span></div>
   <!-- The parity scoreboard: the yardstick every naming lane is measured
        by. It asks an indexer the user already has an account with what
        THAT indexer found, and scores our own index against the answer.
@@ -11625,6 +11645,22 @@ async function loadSettings(){
     sbs.options[0].textContent=t('sb.src.other','another account, entered below');
     sbs.value=cur;
   }
+  // Indexer-confirm (§161). Opt-IN like the scoreboard; the picker
+  // offers the enabled indexer accounts only - no manual URL+key on
+  // purpose, the lane's NZB grabs are metered per account. A stored
+  // pick whose account has vanished stays listed so the box shows the
+  // truth instead of silently reading as "no account picked".
+  const ccf=document.getElementById('s_corr_confirm_enabled');
+  if(ccf&&document.activeElement!==ccf) ccf.checked=c.corr_confirm_enabled===true;
+  const ccs=document.getElementById('s_corr_confirm_source');
+  if(ccs&&document.activeElement!==ccs){
+    const names=(Array.isArray(c.indexers)?c.indexers:[]).filter(i=>i.enabled).map(i=>String(i.name));
+    const cur=c.corr_confirm_source||'';
+    if(cur&&!names.includes(cur)) names.push(cur);
+    ccs.innerHTML='<option value=""></option>'+names.map(nm=>`<option>${esc(nm)}</option>`).join('');
+    ccs.options[0].textContent=t('ccf.src.none','no account picked');
+    ccs.value=cur;
+  }
   put('s_scoreboard_url', c.scoreboard_url||'');
   const sbk=document.getElementById('s_scoreboard_key');
   if(sbk&&document.activeElement!==sbk){ sbk.value=''; sbk.placeholder=c.has_scoreboard_key?t('ph.keyset','set: paste a new key to replace'):t('ph.unset','not set'); }
@@ -11651,7 +11687,7 @@ async function loadSettings(){
   EVICT_KIND_BOXES
     .forEach(([k,id])=>{ const el=document.getElementById(id);
       if(el&&document.activeElement!==el) el.checked=!ekinds.length||ekinds.includes(k); });
-  evictToggles(); refreshDbState(); predbToggles(); refreshPredb(); refreshPredbCorr(); refreshProbe7z(); refreshPesto(); refreshScoreboard();
+  evictToggles(); refreshDbState(); predbToggles(); refreshPredb(); refreshPredbCorr(); refreshCorrConfirm(); refreshProbe7z(); refreshPesto(); refreshScoreboard();
   put('s_library_cats', (c.library_cats||[]).join(', '));
   put('s_library_recheck_secs', c.library_recheck_secs);
   put('s_port', c.port);
@@ -12804,7 +12840,7 @@ function predbToggles(){
   // Correlation gates its own children, NOT on the feed switch: the
   // imported history matches fine with the live connection off.
   const corr=(document.getElementById('s_predb_corr_enabled')||{}).checked;
-  document.querySelectorAll('.corr-sub input,.corr-sub button').forEach(el=>{ el.disabled=!corr; });
+  document.querySelectorAll('.corr-sub input,.corr-sub select,.corr-sub button').forEach(el=>{ el.disabled=!corr; });
 }
 // A feed that has quietly stopped working looks exactly like one with
 // nothing to announce, so report BOTH what it is doing and what it has
@@ -12893,6 +12929,38 @@ async function refreshPredbCorr(){
     const btn=document.getElementById('predbSeedBtn');
     if(btn) btn.disabled=s.seed_running===true
       || !(document.getElementById('s_predb_corr_enabled')||{}).checked;
+  }catch(e){}
+}
+// §161: the fold census and the indexer-confirm lane share one mode
+// because the second is gated on the first - a scattered fragment has
+// no believable size, so a suggestion strong enough to check can only
+// exist once the fold has made its post whole again.
+async function refreshCorrConfirm(){
+  const el=document.getElementById('corrConfirmState'); if(!el) return;
+  try{
+    const s=await api('corr_confirm_stats');
+    const n=v=>(+(v||0)).toLocaleString(LOCALE);
+    const f=s.fold||{};
+    if(!s.index_enabled){
+      setHtml('foldState', t('predb.idxoff','the indexer is off, so there is nothing to name.'));
+    }else{
+      const parts=[t('fold.total','{rows} fragments merged into {posts} posts so far',
+                     {rows:n(f.rows_folded),posts:n(f.postings)})];
+      const top=+(f.top||0), cur=+(f.cursor||0);
+      const pct=top>0?Math.min(100,Math.floor(cur/top*100)):0;
+      // The first sweep of a grown index takes days by design (one
+      // short slice per scan pass), so say where it is rather than
+      // look stuck; after that the cursor just chases new posts.
+      if(!f.first_lap_done) parts.push(t('fold.first','first sweep of the index {pct}% done',{pct}));
+      else parts.push(pct>=100?t('fold.caught','caught up with new posts')
+                             :t('fold.sweep','sweeping new posts, {pct}% covered',{pct}));
+      setHtml('foldState', parts.join(' · '));
+    }
+    if(!s.index_enabled){ setHtml('corrConfirmState', t('predb.idxoff','the indexer is off, so there is nothing to name.')); return; }
+    if(!s.enabled){ setHtml('corrConfirmState', t('ccf.off','off.')); return; }
+    const parts=[t('ccf.today','today {u} of {cap} checks used',{u:n(s.spent_today),cap:n(s.per_day)})];
+    if(!s.source) parts.push('<span style="color:var(--warn)">'+t('ccf.nosrc','no account picked, so nothing is checked')+'</span>');
+    setHtml('corrConfirmState', parts.join(' · '));
   }catch(e){}
 }
 async function startPredbSeed(){

@@ -1,0 +1,79 @@
+<!--BLOCK row-->
+<tr><td><b>Search indexers</b></td><td>Search the indexer accounts you have
+added and queue a result straight from the list. See <a href="#pullsearch">Search your
+indexer accounts</a> below.</td></tr>
+<!--BLOCK sec-->
+<h3 id="pullsearch">Search your indexer accounts</h3>
+<p>If you have an account at an NZB indexer site, nzbfast can search it from here and
+queue what you pick, instead of you going to the site, downloading an NZB and carrying
+it back. It speaks the standard indexer API that all of those sites offer, so there is
+nothing per-site to set up: NZBGeek, NZBFinder, DrunkenSlug, DOGnzb and the rest work
+the same way. A Prowlarr or NZBHydra2 instance is one entry as well, and brings every
+indexer behind it along with it.</p>
+<p><b>Adding an account.</b> Settings &rarr; Search indexers &rarr; <b>+ Add indexer</b>.
+Fill in a name of your choosing, the site's API address (its ordinary web address is
+enough; a Prowlarr entry looks like <code>http://host:9696/1/api</code>) and the API key
+from your account page there, then <b>Apply indexers</b>. <b>Test</b> asks the site what
+it supports and shows what came back, which proves the address and the key in one click.
+A saved key is never shown again: the box says so, and leaving it blank keeps the key it
+already has.</p>
+<p><b>Searching.</b> Open <b>🎬 wall</b> in the header and switch to the release list.
+The dropdown beside the search box decides where a search looks: <b>This index</b>, which
+is what this machine has scanned itself, <b>Indexers</b>, or <b>Both</b>. Your choice is
+remembered. Asking your accounts needs something typed in the box, because browsing them
+on an empty query would spend a day's allowance on a list nobody asked for. With the
+built-in indexer off, which is how nzbfast arrives, there are no posters to show and the
+page is exactly this: a search box, your accounts, and the results.</p>
+<p><b>The results.</b> One row per release, newest first, with its size, its age and how
+often that indexer's own users have grabbed it. A release several of your accounts carry
+appears once. Under <b>Both</b>, a copy your own index already holds wins and the outside
+one is dropped, because grabbing what you have already indexed costs you nothing.
+<b>Download</b> queues it at high priority: nzbfast fetches the NZB itself, and from
+there the job is like any other, with repair, extraction, categories and scripts all
+unchanged.</p>
+<p><b>Asking about one title.</b> Open a title's card on the wall and press
+<b>⌕ Search my indexers</b>. For films this asks by IMDb number wherever the site accepts
+one, which is the difference between the film you meant and every release whose name
+happens to contain those words. nzbfast looks that number up itself, so the page never
+holds one. Sites that do not offer number matching are asked in plain words instead.</p>
+<p><b>Your allowance.</b> Indexer accounts are metered: so many searches and so many
+downloads a day, depending on your tier. Put those two numbers on the entry and nzbfast
+counts against them, starting fresh at midnight UTC. 0, the default, means unlimited, and
+it still counts. An account that has spent its allowance sits the search out while the
+others run, and a line above the results names the one that was skipped, so running out
+is never silent. A site that answers with a limit of its own, or asks us to slow down, is
+set aside for an hour.</p>
+<p><b>Where your key goes.</b> Only to the indexer it belongs to. Keys are kept on this
+machine, never handed to the browser - each result row carries a ticket good for half an
+hour instead of a link - and stripped out of the log and out of any error the site hands
+back, so a pasted error message cannot leak one. A download can only ever fetch a link
+one of your own searches returned.</p>
+<p>These are the same accounts an <a href="#nzblnk">nzblnk link</a> falls back to when
+the local index does not recognise its header, and the ones the watchlist can ask about
+wanted items (<a href="#automation">§10</a>).</p>
+
+<!--BLOCK set-->
+<h3 id="set-indexers">Search indexers <span class="pill live">live</span></h3>
+<p>Your accounts at NZB indexer sites, one row each, so a search on the wall can ask them
+too. What the feature does, and how to search with it, is in <a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Field</th><th>What it does</th></tr>
+<tr><td>Name</td><td>A label of your choosing, and the identity the daily counters and limits are kept under. Renaming a row starts a new entry, so re-enter the key.</td></tr>
+<tr><td>API URL</td><td>The site's API address. Its ordinary web address is enough; a Prowlarr or NZBHydra2 entry looks like <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>API key</td><td>From your account page on that site. Kept on this machine, sent only to the site it belongs to, never shown again and never written to the log. Blank keeps the stored one.</td></tr>
+<tr><td>Searches a day</td><td>How many searches this account may spend per day. 0 = unlimited, and the default.</td></tr>
+<tr><td>Downloads a day</td><td>How many grabs it may spend per day. 0 = unlimited. Both counters start fresh at midnight UTC.</td></tr>
+<tr><td>on, Test</td><td><b>on</b> is what makes a row searchable; untick it to keep an account without using it. <b>Test</b> asks the site what it supports and shows the answer, or the error, in place.</td></tr>
+</table></div>
+
+<!--BLOCK watch-->
+<p><b>Also search my indexer accounts for wanted items</b>, at the foot of the
+watchlist card, lets it ask the accounts from Settings &rarr; Search indexers as well as
+your own index (<a href="#pullsearch">§5</a>). It starts off, because it is the one thing
+here that spends a metered account without you clicking anything. Switched on, each
+watched item asks about twice a day, and only about what it has not already found, under
+the same daily limits and with the same notes when an account is skipped. A candidate
+from an indexer is judged exactly like a local one, so quality floors, upgrades, season
+packs and duplicate handling all still apply, and a local copy wins any tie because it
+costs no allowance. With the built-in indexer off, this is what gives the watchlist
+something to work from at all.</p>

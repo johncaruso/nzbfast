@@ -203,3 +203,51 @@ fn a_capped_7z_key_check_is_indeterminate_not_a_pass() {
     crate::smart::set_operator_password_file(None);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Codex sweep 13 Aug U1+U2: two encrypted NAMED RAR groups need not
+/// share a password, and a harvested value must never shadow the one
+/// the caller supplied.
+///
+/// The level resolver probed only the FIRST encrypted RAR (a.rar), and
+/// its harvested answer replaced the job password for the whole level -
+/// so b.rar, a RAR4 set whose check-less header can only be opened by
+/// the password the user actually gave, was tried with a.rar's value,
+/// failed as "wrong password", and stayed packed while the run
+/// reported success. Per-group resolution keeps the caller's password
+/// leading each group's candidate order.
+#[test]
+fn each_encrypted_rar_group_resolves_its_own_password() {
+    let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../vendor/rars/tests/fixtures");
+    let dir = std::env::temp_dir().join(format!("nzbfast-pwrar-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // a.rar: RAR5, password "testpass", carries a check value so the
+    // harvest can prove its candidate. b.rar: RAR4, password "junrar",
+    // check-less - ONLY the caller's password can open it.
+    std::fs::copy(
+        fixtures.join("rar50/encrypted_solid.rar"),
+        dir.join("a.rar"),
+    )
+    .unwrap();
+    std::fs::copy(
+        fixtures.join("rar15_40/encrypted/rar4_junrar_password.rar"),
+        dir.join("b.rar"),
+    )
+    .unwrap();
+    let list = dir.join("pw.txt");
+    std::fs::write(&list, "testpass\n").unwrap();
+    crate::smart::set_operator_password_file(Some(list));
+
+    let out = extract_one_level(&dir, Some("junrar"), 0).unwrap();
+    assert_eq!(out, Some(NestOutcome::Produced), "both groups must unpack");
+    assert_eq!(
+        std::fs::read(dir.join("file1.txt")).unwrap(),
+        b"file1\n",
+        "the RAR4 group must be opened with the CALLER's password, \
+         not the harvested one"
+    );
+
+    crate::smart::set_operator_password_file(None);
+    let _ = std::fs::remove_dir_all(&dir);
+}

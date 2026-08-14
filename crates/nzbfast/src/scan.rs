@@ -1757,9 +1757,11 @@ pub(crate) async fn make_release_nzb(
             }
             let has_main = rel.keys().any(|n| {
                 let l = n.to_ascii_lowercase();
-                l.ends_with(".par2") && vol_count_from_name(n).is_none()
+                l.ends_with(".par2") && nzbkit::nzb::par2_vol_suffix(n).is_none()
             });
-            let has_vol = rel.keys().any(|n| vol_count_from_name(n).is_some());
+            let has_vol = rel
+                .keys()
+                .any(|n| nzbkit::nzb::par2_vol_suffix(n).is_some());
             let has_data = rel
                 .keys()
                 .any(|n| !n.to_ascii_lowercase().ends_with(".par2"));

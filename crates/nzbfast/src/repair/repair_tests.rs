@@ -36,6 +36,18 @@ async fn mapped_verdict(
     set: &Par2Set,
     missing: &[String],
 ) -> bool {
+    mapped_verdict_with_reports(dir, ex, set, missing, &[]).await
+}
+
+/// [`mapped_verdict`] with slot reports, for the gate cases that need
+/// a verified/damaged slot rather than an unclaimed file.
+async fn mapped_verdict_with_reports(
+    dir: &Path,
+    ex: &nzbkit::extract::Extractor,
+    set: &Par2Set,
+    missing: &[String],
+    reports: &[(usize, nzbkit::live::SlotReport)],
+) -> bool {
     let servers: Vec<(ServerConfig, nzbkit::pool::PoolConfig)> = Vec::new();
     let nzb = Nzb {
         files: Vec::new(),
@@ -51,7 +63,7 @@ async fn mapped_verdict(
         &[],
         nzbkit::pool::BufPool::new(4),
         ex,
-        &[],
+        reports,
         missing,
         &mut Vec::new(),
         false,
@@ -2122,4 +2134,52 @@ fn resolve_keeps_working_provided_password() {
         Some("rightpw")
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex sweep 13 Aug R2: a RAR whose signature block was damaged
+/// before posting sniffs as Plain (`plain_by_sniff`) - the TODO 160
+/// admission then patched the signature back through the Plain writer,
+/// nothing re-sniffed, and the corrected archive retired PACKED as the
+/// payload of a Completed job. Damage over the sniff window must
+/// decline the in-place lane and take the materialize + `repair_dir` +
+/// `reextract_dir` path, which re-extracts what it repairs.
+#[test]
+fn head_damage_disqualifies_the_in_place_plain_patch() {
+    // Block 0 covers the sniff window at every block size.
+    assert!(!plain_patch_keeps_sniff(&[0], 4096));
+    assert!(!plain_patch_keeps_sniff(&[0], 4));
+    // A tiny block size leaves the window spanning block 1 too.
+    assert!(!plain_patch_keeps_sniff(&[1], 4));
+    // Damage clear of the window keeps the one-pass win (TODO 160).
+    assert!(plain_patch_keeps_sniff(&[1], 4096));
+    assert!(plain_patch_keeps_sniff(&[2], 4));
+    assert!(plain_patch_keeps_sniff(&[], 4096));
+}
+
+/// ...and end to end through the gate: a plain-by-sniff slot whose bad
+/// block is the head block declines the whole mapped call, leaving the
+/// posted bytes for the disk lane to repair and re-extract.
+#[tokio::test]
+async fn head_damaged_plain_slot_declines_the_mapped_lane() {
+    let dir = tdir("sniffhead");
+    let ex = nzbkit::extract::Extractor::new(&dir, 1, true);
+    // Posted bytes with NO archive magic at offset 0: the slot sniffs
+    // Plain, by sniff, exactly like a signature-damaged volume.
+    let posted = vec![0x11u8; 8192];
+    ex.write(0, "v.rar", 8192, 0, &posted).unwrap();
+    assert!(ex.is_plain_patchable(0), "premise: the slot is admissible");
+    let set = pset(vec![pfile("v.rar", 8192)]);
+    let report = nzbkit::live::SlotReport {
+        par2_name: Some("v.rar".to_string()),
+        total_blocks: 2,
+        bad_blocks: vec![0],
+        live_blocks: 1,
+        readback_blocks: 0,
+        length: 8192,
+    };
+    assert!(
+        !mapped_verdict_with_reports(&dir, &ex, &set, &[], &[(0, report)]).await,
+        "head damage on a sniffed-plain slot must decline to the disk lane"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

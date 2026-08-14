@@ -190,6 +190,43 @@ fn m_probe7z_stats(
     }))
 }
 
+/// The shatter fold's census plus the indexer-confirm lane's budget
+/// readout (TODO 161). One mode for both because the second is gated
+/// on the first: a scattered fragment carries no believable size, and
+/// the confirm lane only ever sees suggestions strong enough to have
+/// one. Same polled-settings-card contract as probe7z_stats.
+fn m_corr_confirm_stats(
+    d: &Arc<Daemon>,
+    _req: &mut tiny_http::Request,
+    _params: &std::collections::HashMap<String, String>,
+    _ctx: &ApiCtx<'_>,
+    _api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    let today = (epoch_secs() as i64).div_euclid(86_400);
+    Some(json!({
+        "index_enabled": d.index_enabled.load(Ordering::Relaxed),
+        "enabled": d.corr_confirm_enabled.load(Ordering::Relaxed),
+        "source": d.corr_confirm_source.lock_ok().clone(),
+        "per_day": crate::serve::tasks::CONFIRM_PER_DAY,
+        // Read-only view of the day budget: a stale day reads as 0
+        // spent, the reset itself belongs to the lane.
+        "spent_today": d.with_index_read(|ix| {
+            let day: i64 = ix
+                .kv_get("corr_confirm_day")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            Some(if day == today {
+                ix.kv_get("corr_confirm_spent")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(0)
+            } else {
+                0
+            })
+        }),
+        "fold": d.with_index_read(|ix| Some(ix.shatter_fold_stats())),
+    }))
+}
+
 /// The pesto tiny-PAR2 rung's readout (TODO 131 red-team 5a). Same
 /// rationale as probe7z_stats: the band is one poster tool's output,
 /// and the daily numbers ARE the early warning - `parsefail` rising
@@ -2313,6 +2350,8 @@ pub(in crate::serve) fn dispatch(
         // a scan-time RAR lane and the verdict stands; see m_rar_name.
         "rar_name" => return m_rar_name(d, _req, params, ctx, _api_body),
         "pesto_stats" => return m_pesto_stats(d, _req, params, ctx, _api_body),
+        // §161: the fold census + the indexer-confirm day budget.
+        "corr_confirm_stats" => return m_corr_confirm_stats(d, _req, params, ctx, _api_body),
         // The parity scoreboard's readout: per-category coverage% /
         // named% / lag over a rolling window, plus the run state.
         // Same non-blocking with_index_read contract as predb_stats.

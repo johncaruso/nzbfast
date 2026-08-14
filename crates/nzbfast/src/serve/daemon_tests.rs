@@ -2344,7 +2344,9 @@ fn a_delete_inside_the_park_window_buries_the_row_park_already_wrote() {
 ///
 /// Phase 1 reproduces the shape save_queue had before the fix (every
 /// job serialized UNDER the queue lock); phase 2 is the shipped shape
-/// (Arc snapshot under the lock, serialization after). A contender
+/// (Arc snapshot under the lock, serialization after). Phases 3-4 put
+/// numbers on the residue walks: pick_job (runnable and all-paused) and
+/// note_queue_idle (arming edge, then latched). A contender
 /// thread hammers the queue lock throughout and reports the worst
 /// single acquire wait it saw in each phase - that wait is exactly what
 /// an API request or the dashboard felt at issue #38's queue size.
@@ -2401,12 +2403,79 @@ fn save_queue_lock_hold_at_15k_jobs() {
             }
         });
         assert_eq!(n_old, N);
+        // Phase 3: pick_job over 15k runnable jobs, x8 - the argmax walk
+        // the download worker runs every 500 ms while polling.
+        let (pick_took, pick_worst) = contend(&d.clone(), || {
+            for _ in 0..8 {
+                assert!(d.pick_job(false).is_some(), "pick on a runnable queue");
+            }
+        });
+        // Everything from here on wants the all-paused queue: pick_job's
+        // every-job continue, and the only shape where note_queue_idle's
+        // any() cannot exit on the first job.
+        {
+            let q = d.queue.lock_ok();
+            for j in q.iter() {
+                j.lock_ok().paused = true;
+            }
+        }
+        let (pickp_took, pickp_worst) = contend(&d.clone(), || {
+            for _ in 0..8 {
+                assert!(d.pick_job(false).is_none(), "all paused picks nothing");
+            }
+        });
+        // Phase 4: note_queue_idle on the arming edge (latch clear) -
+        // the full walk that actually earns its emit. Then x100 with the
+        // latch already set: what every park/delete on an already-idle
+        // queue pays. The fast path answers from the latch alone, so
+        // this leg no longer touches the queue lock at all.
+        d.queue_idle_latch.store(false, Ordering::Relaxed);
+        let (idle_took, idle_worst) = contend(&d.clone(), || d.note_queue_idle());
+        let (latched_took, latched_worst) = contend(&d.clone(), || {
+            for _ in 0..100 {
+                d.note_queue_idle();
+            }
+        });
         println!(
             "15k-queue probe:\n\
              \x20 old shape (serialize under queue lock, x1): {old_took:?}, \
              worst contender lock wait {old_worst} us\n\
              \x20 new save_queue x4 (full write to disk):     {new_took:?}, \
-             worst contender lock wait {new_worst} us"
+             worst contender lock wait {new_worst} us\n\
+             \x20 pick_job x8, 15k runnable:                  {pick_took:?}, \
+             worst contender lock wait {pick_worst} us\n\
+             \x20 pick_job x8, 15k all paused:                {pickp_took:?}, \
+             worst contender lock wait {pickp_worst} us\n\
+             \x20 note_queue_idle, arming edge (full walk):   {idle_took:?}, \
+             worst contender lock wait {idle_worst} us\n\
+             \x20 note_queue_idle x100, latch already set:    {latched_took:?}, \
+             worst contender lock wait {latched_worst} us"
+        );
+    });
+}
+
+/// The latched note_queue_idle answers from the latch ALONE - route
+/// assertion for the issue #38 residue fix, in the lock-placement-oracle
+/// style: hold the queue lock and call it. The fast path returns without
+/// ever wanting the lock; the pre-fix shape walks every job under it and
+/// parks here forever, which the recv timeout turns into a clean failure.
+#[test]
+fn latched_note_queue_idle_never_takes_the_queue_lock() {
+    with_daemon("idle-latched-route", |d| {
+        d.queue
+            .lock_ok()
+            .push_back(jv("SABnzbd_nzo_r1", "Held.Release", serde_json::json!({})));
+        d.queue_idle_latch.store(true, Ordering::Relaxed);
+        let _q = d.queue.lock_ok();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d2 = d.clone();
+        std::thread::spawn(move || {
+            d2.note_queue_idle();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "note_queue_idle with the latch set must answer from the \
+             latch, not the queue walk",
         );
     });
 }

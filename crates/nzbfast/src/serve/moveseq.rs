@@ -95,6 +95,18 @@ thread_local! {
     static LEGACY_RULE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Test seam: a two-stage barrier `commit_to_queue` trips between its
+/// queue save and its tombstone. The Q1 window is exactly that gap - a
+/// slow `save_queue` on a large queue lets the resumed job run and park
+/// again before the tombstone lands - and holding the commit open there
+/// is what makes the interleaving a schedule instead of a sleep. First
+/// barrier: the commit has saved the queue and is about to tombstone;
+/// second: the test has run its interleaved work and releases it.
+#[cfg(test)]
+pub(in crate::serve) static COMMIT_TOMB_BARRIER: Mutex<
+    Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+> = Mutex::new(None);
+
 /// Run `f` with the §158 rule in force on this thread.
 #[cfg(test)]
 pub(in crate::serve) fn with_legacy_rule<T>(f: impl FnOnce() -> T) -> T {
@@ -233,11 +245,28 @@ impl Daemon {
     /// reverts to is the parked one it came from.
     ///
     /// Returns whether the queue write landed. Call with no store locks
-    /// held, after [`stamp_move`].
-    pub(in crate::serve) fn commit_to_queue(&self, nzo_id: &str, why: &str) -> bool {
+    /// held, after [`stamp_move`]; `seq` is the stamp this move put on
+    /// the record, and bounds the tombstone below.
+    pub(in crate::serve) fn commit_to_queue(&self, nzo_id: &str, seq: u64, why: &str) -> bool {
         if self.save_queue() {
-            // The record has LEFT history: stop it replaying there.
-            self.history_tombstone(&[nzo_id.to_string()]);
+            #[cfg(test)]
+            {
+                let pair = COMMIT_TOMB_BARRIER.lock_ok().clone();
+                if let Some((entered, released)) = pair {
+                    entered.wait();
+                    released.wait();
+                }
+            }
+            // The record has LEFT history: stop it replaying there. Bound
+            // by THIS move's generation - `save_queue` can be slow on a
+            // large queue, and the resumed job can run and park again
+            // (seq+1) before this thread gets here. An id-only tombstone
+            // landing after that park's history row deleted it, and the
+            // next queue save omitted the parked job too: lost from both
+            // stores with no crash needed (Codex sweep 13 Aug Q1). The
+            // bounded tombstone still buries the seq-N row this move
+            // pulled out of history, and can never touch a later one.
+            self.history_tombstone_upto(nzo_id, seq);
             true
         } else {
             error!(
@@ -260,8 +289,9 @@ impl Daemon {
         let nzo = job.lock_ok().nzo_id.clone();
         self.history.lock_ok().retain(|x| !Arc::ptr_eq(x, job));
         stamp_move(job);
+        let seq = job.lock_ok().move_seq;
         self.queue.lock_ok().push_front(job.clone());
-        self.commit_to_queue(&nzo, "fetching");
+        self.commit_to_queue(&nzo, seq, "fetching");
     }
 }
 
@@ -611,5 +641,195 @@ mod harness {
         );
         assert_eq!(split.reverted, ["both"]);
         assert!(split.parked.is_empty());
+    }
+
+    /// Q1 (Codex sweep 13 Aug): a retry's tombstone, delayed behind its
+    /// own slow queue save, must not erase the NEWER park generation
+    /// that landed meanwhile.
+    ///
+    /// Schedule, held open by the commit barrier rather than a sleep:
+    /// the retry stamps seq 1 and saves the queue; before its tombstone
+    /// lands, the resumed job runs, fails and parks again at seq 2,
+    /// appending its terminal history row and dropping itself from the
+    /// queue; the retry's tombstone then lands LAST. Id-only, it deleted
+    /// the seq-2 row - and the queue save had already omitted the parked
+    /// job, so the record was in neither store after a restart, no crash
+    /// needed. Generation-bound, it buries only seq <= 1.
+    #[test]
+    fn a_delayed_retry_tombstone_cannot_erase_a_newer_park() {
+        let dir = tmp("tomb-race");
+        let d = test_daemon(&dir);
+        let j = job(&d, "nzo_t1", JobState::Failed);
+        d.history.lock_ok().push(j.clone());
+        assert!(d.history_upsert(std::slice::from_ref(&j)));
+        assert!(d.save_queue());
+
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let released = Arc::new(std::sync::Barrier::new(2));
+        *COMMIT_TOMB_BARRIER.lock_ok() = Some((entered.clone(), released.clone()));
+        let retry = {
+            let d = d.clone();
+            std::thread::spawn(move || assert!(d.retry("nzo_t1")))
+        };
+        // The retry has saved the queue (seq 1) and is held before its
+        // tombstone. Disarm the seam for THIS thread's park commit paths.
+        entered.wait();
+        *COMMIT_TOMB_BARRIER.lock_ok() = None;
+
+        // The resumed job runs and fails again: the real park, seq 2.
+        let jq = d
+            .queue
+            .lock_ok()
+            .iter()
+            .find(|x| x.lock_ok().nzo_id == "nzo_t1")
+            .cloned()
+            .expect("the retried job is in the queue");
+        jq.lock_ok().state = JobState::Failed;
+        d.park(jq);
+
+        // ...and only now does the retry's tombstone land.
+        released.wait();
+        retry.join().unwrap();
+
+        let (q, h) = on_disk(&dir, "nzo_t1");
+        assert_eq!(
+            h,
+            Some((JobState::Failed, 2)),
+            "the retry's stale tombstone erased the newer parked record"
+        );
+        assert_eq!(q, None, "the parked job must not also be queued");
+        assert_eq!(
+            restore(&dir, "nzo_t1"),
+            (None, Some(JobState::Failed)),
+            "a restart must find the park, in history, exactly once"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Q2 (Codex sweep 13 Aug): "Save queue" compacting history inside a
+    /// park's window must not erase the park's durable prewrite.
+    ///
+    /// The window is real code: park prewrites the history row to DISK,
+    /// drops the job from the live queue, and only files it into
+    /// `self.history` after the give-up bookkeeping. `history_compact`
+    /// snapshots memory, so a compaction run in that window published a
+    /// history.jsonl without the row - and the queue save beside it had
+    /// already omitted the job. If the park's later writes then never
+    /// land (a kill), the record was in neither store. The in-flight
+    /// carry-over keeps the disk row in the snapshot.
+    #[test]
+    fn a_compaction_inside_a_park_keeps_the_prewrite() {
+        let dir = tmp("park-compact");
+        let d = test_daemon(&dir);
+        let j = job(&d, "nzo_c1", JobState::Finishing);
+        d.queue.lock_ok().push_back(j.clone());
+        assert!(d.save_queue());
+        j.lock_ok().state = JobState::Failed;
+
+        super::super::storecut::on_park_gap(|d| {
+            // The exact interval: prewrite on disk, row out of the live
+            // queue, record not yet in self.history.
+            assert!(
+                !d.history
+                    .lock_ok()
+                    .iter()
+                    .any(|x| x.lock_ok().nzo_id == "nzo_c1"),
+                "the gap fires before the record is filed"
+            );
+            // The API's "Save queue": queue save + compaction, live.
+            assert!(d.save_queue());
+            assert!(d.history_compact());
+            // ...and the kill: every later durable write of this park -
+            // the final upsert - is dropped.
+            super::super::storecut::arm_cut(0);
+        });
+        d.park(j);
+        super::super::storecut::disarm();
+
+        let (q, h) = on_disk(&dir, "nzo_c1");
+        assert_eq!(q, None, "the queue save inside the gap dropped the row");
+        assert_eq!(
+            h.map(|(s, _)| s),
+            Some(JobState::Failed),
+            "the compaction erased the park's prewrite - the record \
+             survives in NEITHER store"
+        );
+        assert_eq!(
+            restore(&dir, "nzo_c1"),
+            (None, Some(JobState::Failed)),
+            "a restart must recover the parked record from the prewrite"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Q3 (Codex sweep 13 Aug): a TERMINAL queue snapshot carrying a
+    /// higher `move_seq` than the stored history row is the newer
+    /// outcome and must win - it used to be discarded on id alone,
+    /// which reverted a finished retry to its previous failure.
+    #[test]
+    fn a_newer_terminal_queue_snapshot_beats_stale_history() {
+        let dir = tmp("routed-seq");
+        let d = test_daemon(&dir);
+        let row = |state: &str, seq: u64, msg: &str| {
+            json!({
+                "nzo_id": "nzo_q3", "name": "Release.q3",
+                "out_dir": "/tmp/o", "nzb_path": "/tmp/n.nzb",
+                "state": state, "move_seq": seq, "fail_message": msg,
+            })
+            .to_string()
+        };
+        // The stale seq-1 failure the retry was retrying...
+        std::fs::write(
+            d.history_store_path(),
+            format!("{}\n", row("Failed", 1, "articles missing")),
+        )
+        .unwrap();
+        // ...and the retry's terminal seq-2 snapshot, persisted into
+        // queue.json by a save during post-processing, crash before the
+        // history cleanup.
+        std::fs::write(
+            d.spool.join("queue.json"),
+            format!(r#"{{"next_id":9,"queue":[{}]}}"#, row("Completed", 2, "")),
+        )
+        .unwrap();
+        drop(d);
+
+        assert_eq!(
+            restore(&dir, "nzo_q3"),
+            (None, Some(JobState::Completed)),
+            "the newer terminal outcome must be the one restored"
+        );
+        // Durably: the resolution ran a compaction, so the store now
+        // holds the winner and a second boot - where the still-routed
+        // queue row ties against it - reads the same answer.
+        let (_q, h) = on_disk(&dir, "nzo_q3");
+        assert_eq!(h, Some((JobState::Completed, 2)));
+        assert_eq!(
+            restore(&dir, "nzo_q3"),
+            (None, Some(JobState::Completed)),
+            "a second boot must reach the same answer"
+        );
+
+        // The other direction is unchanged: history newer (a park that
+        // landed after the queue snapshot) keeps the history copy.
+        let d = test_daemon(&dir);
+        std::fs::write(
+            d.history_store_path(),
+            format!("{}\n", row("Failed", 3, "wrong password")),
+        )
+        .unwrap();
+        std::fs::write(
+            d.spool.join("queue.json"),
+            format!(r#"{{"next_id":9,"queue":[{}]}}"#, row("Completed", 2, "")),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(d.spool.join("queue.json.bak"));
+        drop(d);
+        assert_eq!(
+            restore(&dir, "nzo_q3"),
+            (None, Some(JobState::Failed)),
+            "a newer history row still wins over a stale queue snapshot"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

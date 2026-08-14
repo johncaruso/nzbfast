@@ -1,0 +1,82 @@
+<!--BLOCK row-->
+<tr><td><b>Hae indeksoijilta</b></td><td>Hae lisäämiltäsi indeksoijatileiltä ja laita
+tulos jonoon suoraan listalta. Katso <a href="#pullsearch">Haku omilta
+indeksoijatileiltä</a> alempana.</td></tr>
+<!--BLOCK sec-->
+<h3 id="pullsearch">Haku omilta indeksoijatileiltä</h3>
+<p>Jos sinulla on tili NZB-indeksoijasivustolla, nzbfast voi hakea sieltä täältä käsin ja
+laittaa jonoon sen minkä valitset, sen sijaan että kävisit sivustolla, lataisit NZB:n ja
+kantaisit sen takaisin. Se puhuu tavallista indeksoija-rajapintaa, jota kaikki nuo
+sivustot tarjoavat, joten sivustokohtaista säätöä ei ole: NZBGeek, NZBFinder,
+DrunkenSlug, DOGnzb ja muut toimivat samalla tavalla. Prowlarr- tai
+NZBHydra2-asennuskin on yksi rivi, ja tuo mukanaan jokaisen takanaan olevan
+indeksoijan.</p>
+<p><b>Tilin lisääminen.</b> Asetukset → Hae indeksoijilta →
+<b>+ Lisää indeksoija</b>. Kirjoita valitsemasi nimi, sivuston rajapinnan osoite (sen
+tavallinen verkko-osoite riittää; Prowlarr-rivi näyttää tältä:
+<code>http://host:9696/1/api</code>) ja API-avain sivuston tilisivultasi, ja sitten
+<b>Ota indeksoijat käyttöön</b>. <b>Testaa</b> kysyy sivustolta mitä se tukee ja näyttää
+mitä tuli takaisin, mikä todistaa osoitteen ja avaimen yhdellä napsautuksella.
+Tallennettua avainta ei näytetä enää: kenttä sanoo niin, ja tyhjäksi jättäminen säilyttää
+jo tallennetun avaimen.</p>
+<p><b>Hakeminen.</b> Avaa <b>🎬 seinä</b> yläpalkista ja vaihda julkaisulistaan.
+Hakukentän vieressä oleva valikko päättää mistä haku katsoo: <b>Tämä indeksi</b>, eli se
+mitä tämä kone on itse skannannut, <b>Indeksoijat</b> tai <b>Molemmat</b>. Valintasi
+muistetaan. Tilien kysyminen vaatii jotain kenttään, sillä niiden selailu tyhjällä
+kyselyllä kuluttaisi päivän kiintiön listaan jota kukaan ei pyytänyt. Kun sisäänrakennettu
+indeksoija on pois päältä, ja niin nzbfast saapuu, julisteita ei ole näytettäväksi ja sivu
+on juuri tämä: hakukenttä, tilisi ja tulokset.</p>
+<p><b>Tulokset.</b> Yksi rivi julkaisua kohti, uusimmat ensin, koko, ikä ja se kuinka
+usein sen indeksoijan omat käyttäjät ovat hakeneet sen. Julkaisu jota useampi tileistäsi
+tarjoaa, näkyy kerran. <b>Molemmat</b>-tilassa oman indeksisi kopio voittaa ja ulkopuolinen
+karsiutuu, sillä jo indeksoidun hakeminen ei maksa sinulle mitään. <b>Lataa</b> laittaa
+sen jonoon korkealla prioriteetilla: nzbfast noutaa NZB:n itse, ja siitä eteenpäin työ on
+kuin mikä tahansa muu, korjaus, purku, kategoriat ja skriptit ennallaan.</p>
+<p><b>Yhden nimikkeen kysyminen.</b> Avaa nimikkeen kortti seinällä ja paina
+<b>⌕ Hae indeksoijiltani</b>. Elokuvissa kysymys kulkee IMDb-numerolla kaikkialla missä
+sivusto sen hyväksyy, ja siinä on ero tarkoittamasi elokuvan ja jokaisen sellaisen
+julkaisun välillä jonka nimessä sattuu olemaan samat sanat. nzbfast etsii numeron itse,
+joten sivulla ei ole koskaan yhtään. Sivustoilta jotka eivät tarjoa numerohakua kysytään
+pelkin sanoin.</p>
+<p><b>Kiintiösi.</b> Indeksoijatilit ovat mitattuja: näin monta hakua ja näin monta
+latausta päivässä, tasosi mukaan. Kirjoita nuo kaksi lukua riville, niin nzbfast laskee
+niitä vastaan ja aloittaa alusta keskiyöllä UTC. 0, oletusarvo, tarkoittaa rajatonta, ja
+laskenta jatkuu silti. Tili joka on käyttänyt kiintiönsä jää sivuun muiden tehdessä työtä,
+ja tulosten yläpuolella oleva rivi nimeää ohitetun: kiintiön loppuminen ei ole koskaan
+äänetöntä. Sivusto joka vastaa omalla rajallaan, tai pyytää meitä hidastamaan, siirretään
+sivuun tunniksi.</p>
+<p><b>Minne avaimesi menee.</b> Vain sille indeksoijalle jolle se kuuluu. Avaimet pysyvät
+tällä koneella, niitä ei anneta koskaan selaimelle - jokainen tulosrivi kantaa linkin
+sijasta puolen tunnin ajan kelpaavaa lippua - ja ne poistetaan lokista ja jokaisesta
+virheestä jonka sivusto palauttaa, joten liitetty virheilmoitus ei voi vuotaa yhtäkään.
+Lataus voi noutaa vain linkin jonka jokin omista hauistasi palautti.</p>
+<p>Nämä ovat samat tilit joihin <a href="#nzblnk">nzblnk-linkki</a> turvautuu kun
+paikallinen indeksi ei tunnista sen otsikkoa, ja ne joilta seurantalista voi kysyä
+haluamistasi kohteista (<a href="#automation">§10</a>).</p>
+
+<!--BLOCK set-->
+<h3 id="set-indexers">Hae indeksoijilta <span class="pill live">live</span></h3>
+<p>Tilisi NZB-indeksoijasivustoilla, rivi kutakin kohti, jotta seinällä tehty haku voi
+kysyä myös niiltä. Mitä toiminto tekee ja miten sillä haetaan, on kohdassa
+<a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Kenttä</th><th>Mitä se tekee</th></tr>
+<tr><td>Nimi</td><td>Valitsemasi nimilappu, ja se tunnus jonka alla päivän laskurit ja rajat pidetään. Rivin uudelleennimeäminen aloittaa uuden rivin, joten syötä avain uudelleen.</td></tr>
+<tr><td>Rajapinnan osoite</td><td>Sivuston rajapinnan osoite. Sen tavallinen verkko-osoite riittää; Prowlarr- tai NZBHydra2-rivi näyttää tältä: <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>API-avain</td><td>Sivuston tilisivultasi. Pysyy tällä koneella, lähetetään vain sille sivustolle jolle se kuuluu, ei näytetä enää eikä kirjoiteta koskaan lokiin. Tyhjä säilyttää tallennetun.</td></tr>
+<tr><td>Hakuja päivässä</td><td>Montako hakua tämä tili saa kuluttaa päivässä. 0 = rajaton, ja oletus.</td></tr>
+<tr><td>Latauksia päivässä</td><td>Montako noutoa se saa kuluttaa päivässä. 0 = rajaton. Molemmat laskurit alkavat alusta keskiyöllä UTC.</td></tr>
+<tr><td>päällä, Testaa</td><td><b>päällä</b> on se mikä tekee rivistä haettavan; ota rasti pois jos haluat säilyttää tilin käyttämättä sitä. <b>Testaa</b> kysyy sivustolta mitä se tukee ja näyttää vastauksen, tai virheen, paikan päällä.</td></tr>
+</table></div>
+
+<!--BLOCK watch-->
+<p><b>Hae haluamiani myös indeksoijatileiltäni</b>, seurantalistan kortin alalaidassa,
+antaa sen kysyä oman indeksisi lisäksi myös tileiltä kohdasta Asetukset → Hae
+indeksoijilta (<a href="#pullsearch">§5</a>). Se alkaa pois päältä, koska se on täällä
+ainoa asia joka kuluttaa mitattua tiliä ilman että napsautat mitään. Päällä jokainen
+seurattu kohde kysyy noin kahdesti päivässä, ja vain sitä mitä se ei ole jo löytänyt,
+samojen päivärajojen alla ja samoin merkinnöin kun tili ohitetaan. Indeksoijalta tullutta
+ehdokasta arvioidaan täsmälleen kuten paikallista, joten laatulattiat, päivitykset,
+kausipaketit ja kaksoiskappaleiden käsittely pätevät kaikki, ja paikallinen kopio voittaa
+jokaisen tasatilanteen koska se ei maksa kiintiötä. Kun sisäänrakennettu indeksoija on
+pois päältä, tämä on se mikä ylipäätään antaa seurantalistalle jotain työstettävää.</p>

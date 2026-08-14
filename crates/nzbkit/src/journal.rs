@@ -1677,6 +1677,59 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Codex sweep 13 Aug R3: the reverse ordering - the slot
+    /// MATERIALIZES under its posted name, and the PAR2 verify renames
+    /// it afterwards. The extractor re-fires the materialized hook on
+    /// that rename, which lands here as a second `S new-name` + `M`
+    /// pair: last-S-wins retargets the destination and the positional
+    /// rewrite carries every earlier placement onto the file that now
+    /// exists. Replay against a directory holding ONLY the verified
+    /// name must restore every placement - it used to find nothing and
+    /// refetch the whole post.
+    #[test]
+    fn a_rename_after_materialize_restores_under_the_new_name() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-journal-renm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let nzb = b"<nzb>renafter</nzb>";
+
+        let (j, _) = Journal::open(&dir, nzb).unwrap();
+        // Placed under the obfuscated posted name, demoted under it...
+        j.record_placed(
+            0,
+            "<a@x>",
+            None,
+            "0Bf3qZlM8kTn4dWx",
+            20_000,
+            &[frag("inner.bin", 7_000, 3_000, 5_000)],
+        );
+        j.record_materialized(0, "0Bf3qZlM8kTn4dWx", 20_000);
+        // ...one more placement while the demote-time name stands...
+        j.record_placed(
+            0,
+            "<b@x>",
+            None,
+            "0Bf3qZlM8kTn4dWx",
+            20_000,
+            &[frag("0Bf3qZlM8kTn4dWx", 20_000, 9_000, 1_000)],
+        );
+        // ...and then the verified-name publish (the re-fired hook).
+        j.record_materialized(0, "verified.part01.rar", 20_000);
+        std::fs::write(dir.join("verified.part01.rar"), vec![0xAAu8; 20_000]).unwrap();
+        drop(j);
+
+        let (_j2, resume) = Journal::open(&dir, nzb).unwrap();
+        let restored = restore(&dir, &resume, None);
+        assert!(
+            restored.ids.contains("<a@x>") && restored.ids.contains("<b@x>"),
+            "every placement is on disk under the verified name: {:?}",
+            restored.ids
+        );
+        let seed = restored.seeds.iter().find(|s| s.slot == 0).unwrap();
+        assert_eq!(seed.name, "verified.part01.rar");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn materialized_rewrite_is_positional_and_x_still_retires() {
         let dir = std::env::temp_dir().join(format!("nzbfast-journal-mx-{}", std::process::id()));

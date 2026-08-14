@@ -399,6 +399,9 @@ siihen saadaksesi yhden napsautuksen nappaukset indeksoijasivustoilta.</td></tr>
 <tr><td><b>URL:sta</b></td><td>Liitä NZB-linkki (API <code>mode=addurl</code> tai minkä tahansa yhdistetyn sovelluksen kautta).</td></tr>
 <tr><td><b>nzblnk:-linkit</b></td><td>Liitä <code>nzblnk:</code>-linkki mihin tahansa kohtaan hallintapaneelia tai raahaa se sisään. Jos asensit macOS-DMG:stä tai Windows-asennusohjelmasta, voit myös napsauttaa linkkiä suoraan boardilla. Katso <a href="#nzblnk">nzblnk-linkit</a> alempaa.</td></tr>
 <tr><td><b>Selaa indeksiä</b></td><td>Napsauta mitä tahansa täydellistä julkaisua Selaa-kortissa.</td></tr>
+<tr><td><b>Hae indeksoijilta</b></td><td>Hae lisäämiltäsi indeksoijatileiltä ja laita
+tulos jonoon suoraan listalta. Katso <a href="#pullsearch">Haku omilta
+indeksoijatileiltä</a> alempana.</td></tr>
 <tr><td><b>Seurantalista / RSS</b></td><td>Automaattinen - katso <a href="#automation">Automaatio</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr yms.</b></td><td>Ne lähettävät nappaukset suoraan jonoon - katso <a href="#arr">§11</a>.</td></tr>
 <tr><td><b>Komentorivi</b></td><td><code>nzbfast get file.nzb</code> lataa ilman daemonia.</td></tr>
@@ -415,6 +418,57 @@ alikansio, ja Älykkäät kansiot (katso <a href="#automation">§10</a>) voivat 
 Historiasta (🔑).</li>
 </ul>
 
+<h3 id="pullsearch">Haku omilta indeksoijatileiltä</h3>
+<p>Jos sinulla on tili NZB-indeksoijasivustolla, nzbfast voi hakea sieltä täältä käsin ja
+laittaa jonoon sen minkä valitset, sen sijaan että kävisit sivustolla, lataisit NZB:n ja
+kantaisit sen takaisin. Se puhuu tavallista indeksoija-rajapintaa, jota kaikki nuo
+sivustot tarjoavat, joten sivustokohtaista säätöä ei ole: NZBGeek, NZBFinder,
+DrunkenSlug, DOGnzb ja muut toimivat samalla tavalla. Prowlarr- tai
+NZBHydra2-asennuskin on yksi rivi, ja tuo mukanaan jokaisen takanaan olevan
+indeksoijan.</p>
+<p><b>Tilin lisääminen.</b> Asetukset → Hae indeksoijilta →
+<b>+ Lisää indeksoija</b>. Kirjoita valitsemasi nimi, sivuston rajapinnan osoite (sen
+tavallinen verkko-osoite riittää; Prowlarr-rivi näyttää tältä:
+<code>http://host:9696/1/api</code>) ja API-avain sivuston tilisivultasi, ja sitten
+<b>Ota indeksoijat käyttöön</b>. <b>Testaa</b> kysyy sivustolta mitä se tukee ja näyttää
+mitä tuli takaisin, mikä todistaa osoitteen ja avaimen yhdellä napsautuksella.
+Tallennettua avainta ei näytetä enää: kenttä sanoo niin, ja tyhjäksi jättäminen säilyttää
+jo tallennetun avaimen.</p>
+<p><b>Hakeminen.</b> Avaa <b>🎬 seinä</b> yläpalkista ja vaihda julkaisulistaan.
+Hakukentän vieressä oleva valikko päättää mistä haku katsoo: <b>Tämä indeksi</b>, eli se
+mitä tämä kone on itse skannannut, <b>Indeksoijat</b> tai <b>Molemmat</b>. Valintasi
+muistetaan. Tilien kysyminen vaatii jotain kenttään, sillä niiden selailu tyhjällä
+kyselyllä kuluttaisi päivän kiintiön listaan jota kukaan ei pyytänyt. Kun sisäänrakennettu
+indeksoija on pois päältä, ja niin nzbfast saapuu, julisteita ei ole näytettäväksi ja sivu
+on juuri tämä: hakukenttä, tilisi ja tulokset.</p>
+<p><b>Tulokset.</b> Yksi rivi julkaisua kohti, uusimmat ensin, koko, ikä ja se kuinka
+usein sen indeksoijan omat käyttäjät ovat hakeneet sen. Julkaisu jota useampi tileistäsi
+tarjoaa, näkyy kerran. <b>Molemmat</b>-tilassa oman indeksisi kopio voittaa ja ulkopuolinen
+karsiutuu, sillä jo indeksoidun hakeminen ei maksa sinulle mitään. <b>Lataa</b> laittaa
+sen jonoon korkealla prioriteetilla: nzbfast noutaa NZB:n itse, ja siitä eteenpäin työ on
+kuin mikä tahansa muu, korjaus, purku, kategoriat ja skriptit ennallaan.</p>
+<p><b>Yhden nimikkeen kysyminen.</b> Avaa nimikkeen kortti seinällä ja paina
+<b>⌕ Hae indeksoijiltani</b>. Elokuvissa kysymys kulkee IMDb-numerolla kaikkialla missä
+sivusto sen hyväksyy, ja siinä on ero tarkoittamasi elokuvan ja jokaisen sellaisen
+julkaisun välillä jonka nimessä sattuu olemaan samat sanat. nzbfast etsii numeron itse,
+joten sivulla ei ole koskaan yhtään. Sivustoilta jotka eivät tarjoa numerohakua kysytään
+pelkin sanoin.</p>
+<p><b>Kiintiösi.</b> Indeksoijatilit ovat mitattuja: näin monta hakua ja näin monta
+latausta päivässä, tasosi mukaan. Kirjoita nuo kaksi lukua riville, niin nzbfast laskee
+niitä vastaan ja aloittaa alusta keskiyöllä UTC. 0, oletusarvo, tarkoittaa rajatonta, ja
+laskenta jatkuu silti. Tili joka on käyttänyt kiintiönsä jää sivuun muiden tehdessä työtä,
+ja tulosten yläpuolella oleva rivi nimeää ohitetun: kiintiön loppuminen ei ole koskaan
+äänetöntä. Sivusto joka vastaa omalla rajallaan, tai pyytää meitä hidastamaan, siirretään
+sivuun tunniksi.</p>
+<p><b>Minne avaimesi menee.</b> Vain sille indeksoijalle jolle se kuuluu. Avaimet pysyvät
+tällä koneella, niitä ei anneta koskaan selaimelle - jokainen tulosrivi kantaa linkin
+sijasta puolen tunnin ajan kelpaavaa lippua - ja ne poistetaan lokista ja jokaisesta
+virheestä jonka sivusto palauttaa, joten liitetty virheilmoitus ei voi vuotaa yhtäkään.
+Lataus voi noutaa vain linkin jonka jokin omista hauistasi palautti.</p>
+<p>Nämä ovat samat tilit joihin <a href="#nzblnk">nzblnk-linkki</a> turvautuu kun
+paikallinen indeksi ei tunnista sen otsikkoa, ja ne joilta seurantalista voi kysyä
+haluamistasi kohteista (<a href="#automation">§10</a>).</p>
+
 <h3 id="nzblnk">nzblnk-linkit</h3>
 <p>Osa boardeista, etenkin saksalaiset ja hollantilaiset, julkaisee
 <code>nzblnk:</code>-linkin NZB-tiedoston sijaan. Postaus on hämärretty, joten
@@ -424,7 +478,7 @@ tiedostonimeä, johon linkittää, ei ole. Linkki kantaa sen sijaan otsikkoa
 ensin etsittävä.</p>
 <p>nzbfast hakee otsikkoa ensin omasta indeksistään, mikä ei vaadi verkkoa lainkaan, ja
 vasta jos se ei osu, se kysyy määrittämiltäsi hakuindeksoijilta (Asetukset →
-Hakuindeksoijat, <a href="#settings">§9</a>) samoilla päivittäisillä budjeteilla ja
+Hae indeksoijilta, <a href="#settings">§9</a>) samoilla päivittäisillä budjeteilla ja
 samalla perääntymisellä kuin mikä tahansa muu haku. Otsikosta tulee työn nimi ja
 salasana liitetään työhön automaattisesti.</p>
 <ul>
@@ -730,6 +784,20 @@ ladataksesi sen uudestaan. Valitsitpa kumman tahansa, jokaisen työn tietolaatik
 <b>Lataa .nzb-tiedosto</b> -painike, joten kopio minkä tahansa työn <code>.nzb</code>-tiedostosta
 on aina vain napsautuksen päässä.</p>
 
+<h3 id="set-indexers">Hae indeksoijilta <span class="pill live">live</span></h3>
+<p>Tilisi NZB-indeksoijasivustoilla, rivi kutakin kohti, jotta seinällä tehty haku voi
+kysyä myös niiltä. Mitä toiminto tekee ja miten sillä haetaan, on kohdassa
+<a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Kenttä</th><th>Mitä se tekee</th></tr>
+<tr><td>Nimi</td><td>Valitsemasi nimilappu, ja se tunnus jonka alla päivän laskurit ja rajat pidetään. Rivin uudelleennimeäminen aloittaa uuden rivin, joten syötä avain uudelleen.</td></tr>
+<tr><td>Rajapinnan osoite</td><td>Sivuston rajapinnan osoite. Sen tavallinen verkko-osoite riittää; Prowlarr- tai NZBHydra2-rivi näyttää tältä: <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>API-avain</td><td>Sivuston tilisivultasi. Pysyy tällä koneella, lähetetään vain sille sivustolle jolle se kuuluu, ei näytetä enää eikä kirjoiteta koskaan lokiin. Tyhjä säilyttää tallennetun.</td></tr>
+<tr><td>Hakuja päivässä</td><td>Montako hakua tämä tili saa kuluttaa päivässä. 0 = rajaton, ja oletus.</td></tr>
+<tr><td>Latauksia päivässä</td><td>Montako noutoa se saa kuluttaa päivässä. 0 = rajaton. Molemmat laskurit alkavat alusta keskiyöllä UTC.</td></tr>
+<tr><td>päällä, Testaa</td><td><b>päällä</b> on se mikä tekee rivistä haettavan; ota rasti pois jos haluat säilyttää tilin käyttämättä sitä. <b>Testaa</b> kysyy sivustolta mitä se tukee ja näyttää vastauksen, tai virheen, paikan päällä.</td></tr>
+</table></div>
+
 <h3>Indeksointi <span class="pill live">live</span></h3>
 <div class="note"><b>Sisäänrakennettu indeksoija on oletuksena pois päältä.</b> Se
 löytää postaukset, jotka on julkaistu oikealla tiedostonimellä, ja iso ja kasvava osa
@@ -738,11 +806,12 @@ tiedostonimet sisällä, pudotettuna kaatoryhmään. Oikea nimi elää vain NZB-
 jonka lataaja julkaisee muualla, joten se ei koskaan ollut Usenetissä minkään skannerin
 luettavaksi. Omalla indeksillämme mitattuna 14,8 miljoonaa skannattua postausta tuotti
 noin 31 000 selattavaa julkaisua, karkeasti yksi viidestäsadasta. Jatka kaupallisten
-indeksoijien käyttöä ja lisää ne kohtaan Asetukset → Hakuindeksoijat, jotta voit hakea
+indeksoijien käyttöä ja lisää ne kohtaan Asetukset → Hae indeksoijilta, jotta voit hakea
 niistä seinältä. Kytke tämä päälle, jos seuraat tiettyjä ryhmiä, joissa yhä
 julkaistaan oikeilla nimillä, tai jos haluat nähdä, mitä palveluntarjoajasi oikeasti
-kantaa. Kytkin pois päältä: mitään ei skannata eikä haeta, tietokantaa ei luoda, ja
-seinä, Selaa, seurantalista ja newznab-syöte ovat piilossa.</div>
+kantaa. Kytkin pois päältä: mitään ei skannata eikä haeta eikä tietokantaa luoda; Selaa ja
+newznab-syöte katoavat, seinästä tulee pelkkä hakusivu lisäämillesi indeksoijatileille,
+ja seurantalista toimii niiden tilien varassa.</div>
 <div class="tblwrap"><table>
 <tr><th>Asetus</th><th>Mitä se tekee</th></tr>
 <tr><td>Sisäänrakennettu indeksoija</td><td>Pääkytkin, <b>pois päältä ellet kytke sitä</b>. Pois tarkoittaa: ei skannausta, ei metatietohakuja, ei saatavuusotantaa eikä newznab-syötettä; levyllä jo oleva indeksi säilytetään (poistopainike on olemassa), joten päälle kytkeminen jatkaa sen sijaan että skannaisi uudelleen.</td></tr>
@@ -800,6 +869,16 @@ yhdistetty tili näkee koko listan, joten sieltä poistetun nimikkeen seuranta l
 (jo valmistuneet lataukset säilyvät); osoitesyöte sisältää vain uusimmat kohteet, joten
 puuttuminen ei todista mitään ja nimikkeitä vain lisätään. Molemmat oletukset voi muuttaa
 lähdekohtaisesti.</p>
+<p><b>Hae haluamiani myös indeksoijatileiltäni</b>, seurantalistan kortin alalaidassa,
+antaa sen kysyä oman indeksisi lisäksi myös tileiltä kohdasta Asetukset → Hae
+indeksoijilta (<a href="#pullsearch">§5</a>). Se alkaa pois päältä, koska se on täällä
+ainoa asia joka kuluttaa mitattua tiliä ilman että napsautat mitään. Päällä jokainen
+seurattu kohde kysyy noin kahdesti päivässä, ja vain sitä mitä se ei ole jo löytänyt,
+samojen päivärajojen alla ja samoin merkinnöin kun tili ohitetaan. Indeksoijalta tullutta
+ehdokasta arvioidaan täsmälleen kuten paikallista, joten laatulattiat, päivitykset,
+kausipaketit ja kaksoiskappaleiden käsittely pätevät kaikki, ja paikallinen kopio voittaa
+jokaisen tasatilanteen koska se ei maksa kiintiötä. Kun sisäänrakennettu indeksoija on
+pois päältä, tämä on se mikä ylipäätään antaa seurantalistalle jotain työstettävää.</p>
 <h3 id="auto-rss">RSS-syötteet</h3>
 <p>Asetukset → RSS: mikä tahansa newznab/indeksoija-RSS-URL syötekohtaisella välillä, kategorialla ja
 suodatussäännöillä (nimikemallit, kokorajat). Vastaavat kohteet ladataan
@@ -1170,7 +1249,7 @@ SABnzbd-yhteensopiva, joten olemassa olevat SAB-integraatiot toimivat muuttumatt
 <tr><td>Määritys</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (jokainen Asetukset-kenttä), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Indeksi &amp; seinä</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, sekä newznab osoitteessa <code>/api?t=caps|search|tvsearch|movie</code> ja <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automaatio</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>
-<tr><td>Diagnostiikka</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
+<tr><td>Diagnostiikka</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code></td></tr>
 <tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> - status, listgroups, history, append, editqueue, rate, pause, log (Basic-todennus: mikä tahansa käyttäjä, API-avain salasanana)</td></tr>
 <tr><td>Esikatselu / toisto</td><td><code>/stream/&lt;nzo_id&gt;</code> (HTTP-alueet; pysäköidyn kirjastotyön käynnistys tarvitsee <code>?t=</code>-tunnisteen tai avaimen), <code>/m3u/&lt;id&gt;</code> (tarvitsee avaimen; luo tunnisteen), <code>/wall</code>, <code>/art/…</code></td></tr>
 </table></div>

@@ -1540,6 +1540,24 @@ impl Extractor {
         // only one that still holds for a check field this function does
         // not know about yet. Bytes under an output with no crypto state
         // are ciphertext: the plaintext-once writes all go through one.
+        //
+        // TWO halves. The route latch is the authoritative one: it is
+        // stamped at enqueue under the routing lock, where the decision
+        // is actually made. The written() counter lags it - pwrites run
+        // after the lock drops, so a routed-but-unwritten ciphertext
+        // job was invisible here, and a span arriving in that window
+        // (a live password candidate landing mid-file) latched
+        // plaintext-once over it: a mixed output (Codex sweep 13 Aug
+        // C1). The counter stays as the belt - it is what covers
+        // resume, where bytes from a prior run sit under an output the
+        // latch never saw.
+        if w.path.file_name().is_some_and(|k| {
+            inner
+                .ciphertext_files
+                .contains(k.to_string_lossy().as_ref())
+        }) {
+            return false;
+        }
         if w.written() > 0 {
             return false;
         }

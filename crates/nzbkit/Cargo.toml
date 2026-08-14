@@ -132,7 +132,7 @@ rusqlite = { version = "0.40.1", features = ["hooks"] }
 # nowhere - which is what those drivers exist to print.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
 rand = "0.8"
-rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+rcgen = { version = "0.14.9", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 # 7z test fixtures are written in-process (the writer needs the encoder
 # half of the crate; release builds keep it off).
 sevenz-rust2 = { version = "0.21", default-features = false, features = ["aes256", "bzip2", "deflate", "ppmd", "compress"] }

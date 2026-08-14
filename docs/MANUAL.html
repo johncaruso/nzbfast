@@ -417,6 +417,9 @@ directory at it for one-click grabs from indexer sites.</td></tr>
 <tr><td><b>From a URL</b></td><td>Paste an NZB link (API <code>mode=addurl</code>, or via any connected app).</td></tr>
 <tr><td><b>nzblnk: links</b></td><td>Paste an <code>nzblnk:</code> link anywhere on the dashboard, or drag it in. If you installed from the macOS DMG or the Windows installer you can also click one straight from a board. See <a href="#nzblnk">nzblnk links</a> below.</td></tr>
 <tr><td><b>Browse index</b></td><td>Click any complete release in the Browse card.</td></tr>
+<tr><td><b>Search indexers</b></td><td>Search the indexer accounts you have
+added and queue a result straight from the list. See <a href="#pullsearch">Search your
+indexer accounts</a> below.</td></tr>
 <tr><td><b>Watchlist / RSS</b></td><td>Automatic; see <a href="#automation">Automation</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr etc.</b></td><td>They send grabs straight to the queue; see <a href="#arr">§11</a>.</td></tr>
 <tr><td><b>Command line</b></td><td><code>nzbfast get file.nzb</code> downloads without the daemon.</td></tr>
@@ -432,6 +435,55 @@ directory, and Smart Folders (see <a href="#automation">§10</a>) can assign the
 <a href="#nzblnk">nzblnk link</a>, and can be supplied per-job through the
 API or afterwards from History (🔑).</li>
 </ul>
+
+<h3 id="pullsearch">Search your indexer accounts</h3>
+<p>If you have an account at an NZB indexer site, nzbfast can search it from here and
+queue what you pick, instead of you going to the site, downloading an NZB and carrying
+it back. It speaks the standard indexer API that all of those sites offer, so there is
+nothing per-site to set up: NZBGeek, NZBFinder, DrunkenSlug, DOGnzb and the rest work
+the same way. A Prowlarr or NZBHydra2 instance is one entry as well, and brings every
+indexer behind it along with it.</p>
+<p><b>Adding an account.</b> Settings → Search indexers → <b>+ Add indexer</b>.
+Fill in a name of your choosing, the site's API address (its ordinary web address is
+enough; a Prowlarr entry looks like <code>http://host:9696/1/api</code>) and the API key
+from your account page there, then <b>Apply indexers</b>. <b>Test</b> asks the site what
+it supports and shows what came back, which proves the address and the key in one click.
+A saved key is never shown again: the box says so, and leaving it blank keeps the key it
+already has.</p>
+<p><b>Searching.</b> Open <b>🎬 wall</b> in the header and switch to the release list.
+The dropdown beside the search box decides where a search looks: <b>This index</b>, which
+is what this machine has scanned itself, <b>Indexers</b>, or <b>Both</b>. Your choice is
+remembered. Asking your accounts needs something typed in the box, because browsing them
+on an empty query would spend a day's allowance on a list nobody asked for. With the
+built-in indexer off, which is how nzbfast arrives, there are no posters to show and the
+page is exactly this: a search box, your accounts, and the results.</p>
+<p><b>The results.</b> One row per release, newest first, with its size, its age and how
+often that indexer's own users have grabbed it. A release several of your accounts carry
+appears once. Under <b>Both</b>, a copy your own index already holds wins and the outside
+one is dropped, because grabbing what you have already indexed costs you nothing.
+<b>Download</b> queues it at high priority: nzbfast fetches the NZB itself, and from
+there the job is like any other, with repair, extraction, categories and scripts all
+unchanged.</p>
+<p><b>Asking about one title.</b> Open a title's card on the wall and press
+<b>⌕ Search my indexers</b>. For films this asks by IMDb number wherever the site accepts
+one, which is the difference between the film you meant and every release whose name
+happens to contain those words. nzbfast looks that number up itself, so the page never
+holds one. Sites that do not offer number matching are asked in plain words instead.</p>
+<p><b>Your allowance.</b> Indexer accounts are metered: so many searches and so many
+downloads a day, depending on your tier. Put those two numbers on the entry and nzbfast
+counts against them, starting fresh at midnight UTC. 0, the default, means unlimited, and
+it still counts. An account that has spent its allowance sits the search out while the
+others run, and a line above the results names the one that was skipped, so running out
+is never silent. A site that answers with a limit of its own, or asks us to slow down, is
+set aside for an hour.</p>
+<p><b>Where your key goes.</b> Only to the indexer it belongs to. Keys are kept on this
+machine, never handed to the browser - each result row carries a ticket good for half an
+hour instead of a link - and stripped out of the log and out of any error the site hands
+back, so a pasted error message cannot leak one. A download can only ever fetch a link
+one of your own searches returned.</p>
+<p>These are the same accounts an <a href="#nzblnk">nzblnk link</a> falls back to when
+the local index does not recognise its header, and the ones the watchlist can ask about
+wanted items (<a href="#automation">§10</a>).</p>
 
 <h3 id="nzblnk">nzblnk links</h3>
 <p>Some boards, mostly German and Dutch ones, publish an <code>nzblnk:</code> link
@@ -754,6 +806,19 @@ again; re-save it to download it again. Whichever you choose, every job's drawer
 has a <b>Download .nzb</b> button, so a copy of any job's <code>.nzb</code> is
 never more than a click away.</p>
 
+<h3 id="set-indexers">Search indexers <span class="pill live">live</span></h3>
+<p>Your accounts at NZB indexer sites, one row each, so a search on the wall can ask them
+too. What the feature does, and how to search with it, is in <a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Field</th><th>What it does</th></tr>
+<tr><td>Name</td><td>A label of your choosing, and the identity the daily counters and limits are kept under. Renaming a row starts a new entry, so re-enter the key.</td></tr>
+<tr><td>API URL</td><td>The site's API address. Its ordinary web address is enough; a Prowlarr or NZBHydra2 entry looks like <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>API key</td><td>From your account page on that site. Kept on this machine, sent only to the site it belongs to, never shown again and never written to the log. Blank keeps the stored one.</td></tr>
+<tr><td>Searches a day</td><td>How many searches this account may spend per day. 0 = unlimited, and the default.</td></tr>
+<tr><td>Downloads a day</td><td>How many grabs it may spend per day. 0 = unlimited. Both counters start fresh at midnight UTC.</td></tr>
+<tr><td>on, Test</td><td><b>on</b> is what makes a row searchable; untick it to keep an account without using it. <b>Test</b> asks the site what it supports and shows the answer, or the error, in place.</td></tr>
+</table></div>
+
 <h3>Indexing <span class="pill live">live</span></h3>
 <div class="note"><b>The built-in indexer is off by default.</b> It finds posts made
 under a real filename, and a large and growing share of Usenet is deliberately posted
@@ -764,8 +829,9 @@ posts produced about 31,000 browsable releases, roughly one in five hundred. Kee
 commercial indexers, and add them under Settings → Search indexers so you can search
 them from the wall. Turn this on if you follow specific groups where people still post
 under real names, or you want to see what your provider actually carries. With the
-switch off nothing is scanned or fetched, no database is created, and the wall, Browse,
-the watchlist and the newznab feed are hidden.</div>
+switch off nothing is scanned or fetched and no database is created; Browse and the
+newznab feed go away, the wall becomes a plain search page for the indexer accounts you
+have added, and the watchlist works off those accounts instead.</div>
 <div class="tblwrap"><table>
 <tr><th>Setting</th><th>What it does</th></tr>
 <tr><td>Built-in indexer</td><td>The master switch, <b>off unless you turn it on</b>. Off means no scanning, no metadata lookups, no availability sampling and no newznab feed; an index already on disk is kept (there is a delete button) so switching back on resumes rather than rescanning.</td></tr>
@@ -833,6 +899,16 @@ syncing differs by mode on purpose: a linked account sees the whole list, so a
 title removed there stops being watched here (already-finished downloads stay);
 an address feed carries only the most recent entries, so absence proves nothing
 and titles are only ever added. Both defaults can be changed per source.</p>
+<p><b>Also search my indexer accounts for wanted items</b>, at the foot of the
+watchlist card, lets it ask the accounts from Settings → Search indexers as well as
+your own index (<a href="#pullsearch">§5</a>). It starts off, because it is the one thing
+here that spends a metered account without you clicking anything. Switched on, each
+watched item asks about twice a day, and only about what it has not already found, under
+the same daily limits and with the same notes when an account is skipped. A candidate
+from an indexer is judged exactly like a local one, so quality floors, upgrades, season
+packs and duplicate handling all still apply, and a local copy wins any tie because it
+costs no allowance. With the built-in indexer off, this is what gives the watchlist
+something to work from at all.</p>
 <h3 id="auto-rss">RSS feeds</h3>
 <p>Settings → RSS: any newznab/indexer RSS URL with per-feed interval, category and
 filter rules (title patterns, size bounds). Matching items are downloaded
@@ -1213,7 +1289,7 @@ the <b>API key</b> (full control) and the <b>NZB key</b> (add-only:
 <tr><td>Config</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (every Settings field), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Index &amp; wall</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, plus newznab at <code>/api?t=caps|search|tvsearch|movie</code> and <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automation</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>
-<tr><td>Diagnostics</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
+<tr><td>Diagnostics</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code></td></tr>
 <tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code>: status, listgroups, history, append, editqueue, rate, pause, log (Basic auth: any user, API key as password)</td></tr>
 <tr><td>Preview / playback</td><td><code>/stream/&lt;nzo_id&gt;</code> (HTTP ranges; starting a parked library job needs <code>?t=</code> token or key), <code>/m3u/&lt;id&gt;</code> (needs key; mints the token), <code>/wall</code>, <code>/art/…</code></td></tr>
 </table></div>

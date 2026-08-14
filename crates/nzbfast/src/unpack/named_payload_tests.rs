@@ -58,6 +58,40 @@ fn a_named_cb7_is_never_collected_as_sevenz() {
     std::fs::remove_dir_all(&d).unwrap();
 }
 
+/// Codex sweep 13 Aug U3: a `.cbr` beside the set must not suppress a
+/// genuinely nested extensionless RAR.
+///
+/// The `pre_obfuscated` census read "any RAR magic without RAR grammar"
+/// as "the outer set is obfuscated", and a comic is exactly that shape -
+/// so an extensionless RAR produced from `outer.zip` was classed as a
+/// rebuilt member of an outer set that never existed, and the recursion
+/// that would have opened it was skipped: `hello.txt` never appeared and
+/// the job still reported success.
+#[test]
+fn a_cbr_beside_the_set_does_not_suppress_a_nested_extensionless_rar() {
+    let d = dir("cbr-nested");
+    let comic = write_with_head(&d, "Event Leviathan 02.cbr", RAR5);
+    let comic_bytes = std::fs::read(&comic).unwrap();
+    let inner = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../vendor/rars/tests/fixtures/rar50/solid.rar"
+    ))
+    .unwrap();
+    let z =
+        nzbkit::zip::fixtures::zip_of(&[nzbkit::zip::fixtures::Spec::stored("deadbeef", &inner)]);
+    std::fs::write(d.join("outer.zip"), &z).unwrap();
+
+    assert_eq!(extract_nested(&d, None, 0).unwrap(), NestOutcome::Produced);
+    assert!(
+        d.join("hello.txt").is_file() && d.join("tiny.txt").is_file(),
+        "the nested extensionless RAR must be recursed into"
+    );
+    // ...and the comic is untouched: excluding it from the census must
+    // not turn it back into packaging.
+    assert_eq!(std::fs::read(&comic).unwrap(), comic_bytes);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
 /// The whole-ladder pin: a directory whose only archive-headed file
 /// is a `.cbr` has NOTHING to unpack - `Ok(None)`, not the stray
 /// "looks like an archive but no extractor claimed it" failure, and

@@ -184,6 +184,18 @@ impl Daemon {
         !tombstone && self.history_upsert(std::slice::from_ref(job))
     }
 
+    /// Register a park's nzo_id as in flight between its prewrite and its
+    /// final filing, so `history_compact` carries the disk-only prewrite
+    /// row into any snapshot it publishes meanwhile (Q2). Returns a guard;
+    /// dropping it - however the park exits - deregisters the id.
+    pub(super) fn hist_inflight_begin(&self, id: &str) -> HistInflightGuard<'_> {
+        self.hist_inflight.lock_ok().insert(id.to_string());
+        HistInflightGuard {
+            d: self,
+            id: id.to_string(),
+        }
+    }
+
     /// Persist removals: tombstone lines. For a record leaving history
     /// for good (delete) AND for one moving back into the queue (retry,
     /// stream) - in both cases the id must stop replaying into history;
@@ -194,6 +206,28 @@ impl Daemon {
             .map(|id| json!({"nzo_id": id, "deleted": true}).to_string())
             .collect();
         self.history_append(&lines);
+    }
+
+    /// A GENERATION-BOUND tombstone: deletes only history rows whose
+    /// `move_seq` is at or below `seq`. For the move paths (retry,
+    /// stream activation), never for a user delete.
+    ///
+    /// The plain tombstone above is id-only, and the move paths used it
+    /// too - which let an OLD move erase a NEWER generation of the same
+    /// job. A retry stamps seq N+1, saves the queue, and only then
+    /// tombstones; `save_queue` can be slow on a large queue, and in
+    /// that window the resumed job can run, fail and PARK again at seq
+    /// N+2, appending its terminal history row. The retry's id-only
+    /// tombstone then landed after that row and, last-line-wins, deleted
+    /// it - while the next queue save omits the parked job too. Lost
+    /// from both stores, no crash required (Codex sweep 13 Aug Q1).
+    ///
+    /// Bounded by the mover's OWN stamp, the tombstone still buries the
+    /// row it is meant to bury (the seq-N record the move pulled out of
+    /// history) and can never touch a generation stamped after it.
+    pub(super) fn history_tombstone_upto(&self, id: &str, seq: u64) {
+        let line = json!({"nzo_id": id, "deleted": true, "move_seq": seq}).to_string();
+        self.history_append(&[line]);
     }
 
     /// Rewrite the store as exactly the live records, atomically. Called
@@ -207,16 +241,66 @@ impl Daemon {
     /// own note for what an unsynchronised rewrite cost.
     pub(super) fn history_compact(&self) -> bool {
         let _g = HIST_IO.lock_ok();
+        let path = self.history_store_path();
+        let mut snap_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let lines: Vec<String> = self
             .history
             .lock_ok()
             .iter()
-            .map(|j| job_json(&j.lock_ok()).to_string())
+            .map(|j| {
+                let g = j.lock_ok();
+                snap_ids.insert(g.nzo_id.clone());
+                job_json(&g).to_string()
+            })
             .collect();
         let mut buf = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
         for l in &lines {
             buf.push_str(l);
             buf.push('\n');
+        }
+        // A park in flight has its prewrite on DISK and its record not yet
+        // in `self.history` - park removes the row from the live queue
+        // right after the prewrite and only files it into history at the
+        // end. A snapshot built from memory alone drops exactly that row,
+        // and "Save queue" runs this compaction on a live daemon: a crash
+        // before park's final upsert then left the job in neither store -
+        // the very hole `park_prewrite` exists to close (Codex sweep
+        // 13 Aug Q2). Parks register in `hist_inflight` around that
+        // interval; carry their latest disk line into the snapshot.
+        let inflight: Vec<String> = {
+            let set = self.hist_inflight.lock_ok();
+            set.iter()
+                .filter(|id| !snap_ids.contains(*id))
+                .cloned()
+                .collect()
+        };
+        if !inflight.is_empty()
+            && let Ok(raw) = std::fs::read(&path)
+        {
+            let mut last: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+            for chunk in raw.split(|b| *b == b'\n') {
+                let Ok(line) = std::str::from_utf8(chunk) else {
+                    continue;
+                };
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                if let Some(id) = v.get("nzo_id").and_then(Value::as_str)
+                    && let Some(want) = inflight.iter().find(|w| *w == id)
+                {
+                    last.insert(want.as_str(), line);
+                }
+            }
+            for id in &inflight {
+                if let Some(line) = last.get(id.as_str()) {
+                    buf.push_str(line);
+                    buf.push('\n');
+                }
+            }
         }
         #[cfg(test)]
         {
@@ -225,7 +309,6 @@ impl Daemon {
                 b.wait();
             }
         }
-        let path = self.history_store_path();
         let ok = match crate::persist::write_atomic(&path, buf.as_bytes()) {
             Ok(()) => true,
             Err(e) => {
@@ -286,8 +369,19 @@ impl Daemon {
                 continue;
             };
             if v.get("deleted").and_then(Value::as_bool).unwrap_or(false) {
-                live.remove(&id);
-                order.retain(|o| *o != id);
+                // A tombstone carrying a `move_seq` is generation-bound:
+                // it buries rows stamped at or below it and must never
+                // touch a LATER generation (a park that raced ahead of a
+                // slow retry commit - Q1). An id-only tombstone (user
+                // delete, retention) stays unconditional.
+                let applies = match v.get("move_seq").and_then(Value::as_u64) {
+                    None => true,
+                    Some(ts) => live.get(&id).is_none_or(|j| j.move_seq <= ts),
+                };
+                if applies {
+                    live.remove(&id);
+                    order.retain(|o| *o != id);
+                }
                 continue;
             }
             let Some(mut job) = job_from_json(&v) else {
@@ -321,6 +415,22 @@ impl Daemon {
         // More dead lines than live rows: worth a rewrite once loaded.
         let wants_compaction = lines > records.len().saturating_mul(2).max(64);
         (records, wants_compaction)
+    }
+}
+
+/// The Q2 fence's other half: holds a parked id in `hist_inflight` for
+/// exactly as long as the park is between its prewrite and its final
+/// filing. Drop-based so an early return or a panic cannot leave the id
+/// registered forever (which would only cost compaction a lookup, but
+/// stale entries would accrete for the life of the daemon).
+pub(super) struct HistInflightGuard<'a> {
+    d: &'a Daemon,
+    id: String,
+}
+
+impl Drop for HistInflightGuard<'_> {
+    fn drop(&mut self) {
+        self.d.hist_inflight.lock_ok().remove(&self.id);
     }
 }
 

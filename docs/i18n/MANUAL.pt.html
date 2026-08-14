@@ -401,6 +401,9 @@ para ela para capturas de um clique a partir de sites indexadores.</td></tr>
 <tr><td><b>De uma URL</b></td><td>Cole um link NZB (API <code>mode=addurl</code>, ou por qualquer app conectado).</td></tr>
 <tr><td><b>Links nzblnk:</b></td><td>Cole um link <code>nzblnk:</code> em qualquer lugar do painel, ou arraste-o para dentro. Se você instalou pelo DMG do macOS ou pelo instalador do Windows, também dá para clicar num direto no board. Veja <a href="#nzblnk">os links nzblnk</a> mais abaixo.</td></tr>
 <tr><td><b>Explorar índice</b></td><td>Clique em qualquer lançamento completo no cartão Explorar.</td></tr>
+<tr><td><b>Pesquisar nos indexadores</b></td><td>Pesquise nas contas de indexador que
+adicionou e ponha um resultado na fila diretamente a partir da lista. Veja
+<a href="#pullsearch">Pesquisar nas suas contas de indexador</a> mais abaixo.</td></tr>
 <tr><td><b>Lista de acompanhamento / RSS</b></td><td>Automático - veja <a href="#automation">Automação</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr etc.</b></td><td>Eles enviam capturas direto para a fila - veja <a href="#arr">§11</a>.</td></tr>
 <tr><td><b>Linha de comando</b></td><td><code>nzbfast get file.nzb</code> baixa sem o daemon.</td></tr>
@@ -417,6 +420,59 @@ downloads, e as Pastas inteligentes (veja <a href="#automation">§10</a>) podem 
 depois, pelo Histórico (🔑).</li>
 </ul>
 
+<h3 id="pullsearch">Pesquisar nas suas contas de indexador</h3>
+<p>Se tem conta num site indexador de NZB, o nzbfast pode pesquisá-lo daqui e pôr na
+fila o que escolher, em vez de ter de ir ao site, transferir um NZB e trazê-lo de volta.
+Fala a API de indexador comum que todos esses sites oferecem, por isso não há nada a
+configurar site a site: NZBGeek, NZBFinder, DrunkenSlug, DOGnzb e os restantes funcionam
+da mesma maneira. Uma instância Prowlarr ou NZBHydra2 também é uma única entrada, e traz
+consigo todos os indexadores que estão por trás.</p>
+<p><b>Adicionar uma conta.</b> Ajustes → Pesquisar nos indexadores →
+<b>+ Adicionar indexador</b>. Ponha um nome à sua escolha, o endereço de API do site (o
+endereço web normal chega; uma entrada Prowlarr parece-se com
+<code>http://host:9696/1/api</code>) e a chave da API da sua página de conta lá, e depois
+<b>Aplicar indexadores</b>. <b>Testar</b> pergunta ao site o que ele suporta e mostra o
+que veio de volta, o que prova o endereço e a chave num clique. Uma chave guardada nunca
+é mostrada outra vez: a caixa diz isso, e deixá-la em branco mantém a que já lá
+está.</p>
+<p><b>Pesquisar.</b> Abra <b>🎬 o mural</b> no cabeçalho e passe à lista de releases. A
+lista pendente ao lado da caixa de pesquisa decide onde a pesquisa olha: <b>Este
+índice</b>, ou seja o que esta máquina analisou por si, <b>Indexadores</b>, ou
+<b>Ambos</b>. A sua escolha fica guardada. Perguntar às suas contas exige algo escrito na
+caixa, porque folheá-las com um pedido vazio gastaria a quota de um dia numa lista que
+ninguém pediu. Com o indexador integrado desligado, que é como o nzbfast chega, não há
+cartazes para mostrar e a página é exatamente isto: uma caixa de pesquisa, as suas contas
+e os resultados.</p>
+<p><b>Os resultados.</b> Uma linha por release, as mais recentes primeiro, com o tamanho,
+a idade e quantas vezes os utilizadores desse indexador a apanharam. Uma release que
+várias das suas contas trazem aparece uma só vez. Em <b>Ambos</b>, ganha a cópia que o
+seu próprio índice já tem e a de fora cai, porque apanhar o que já indexou não lhe custa
+nada. <b>Transferir</b> põe-na na fila com prioridade alta: o nzbfast vai buscar o NZB
+sozinho, e daí em diante a tarefa é como qualquer outra, com reparação, extração,
+categorias e scripts iguais.</p>
+<p><b>Perguntar por um título só.</b> Abra a ficha de um título no mural e carregue em
+<b>⌕ Pesquisar nos meus indexadores</b>. Para filmes a pergunta vai pelo número do IMDb
+onde quer que o site o aceite, e é essa a diferença entre o filme que queria e todas as
+releases cujo nome por acaso contém aquelas palavras. O nzbfast procura esse número
+sozinho, por isso a página nunca guarda nenhum. Os sites que não fazem correspondência
+por número são interrogados por palavras.</p>
+<p><b>A sua quota.</b> As contas de indexador são medidas: tantas pesquisas e tantas
+transferências por dia, conforme o plano. Ponha esses dois números na entrada e o nzbfast
+desconta a partir daí, recomeçando à meia-noite UTC. 0, o valor por omissão, quer dizer
+sem limite, e continua a contar na mesma. Uma conta que gastou a quota fica de fora
+enquanto as outras trabalham, e uma linha por cima dos resultados nomeia a que foi
+saltada: ficar sem quota nunca é silencioso. Um site que responde com um limite próprio,
+ou que nos pede para abrandar, é posto de lado durante uma hora.</p>
+<p><b>Para onde vai a sua chave.</b> Só para o indexador a que pertence. As chaves ficam
+nesta máquina, nunca são entregues ao navegador - cada linha de resultado leva um bilhete
+válido meia hora em vez de uma ligação - e são retiradas do registo e de qualquer erro
+que o site devolva, de modo que uma mensagem de erro colada não pode deixar escapar
+nenhuma. Uma transferência só pode ir buscar uma ligação que uma das suas próprias
+pesquisas devolveu.</p>
+<p>São as mesmas contas a que uma <a href="#nzblnk">ligação nzblnk</a> recorre quando o
+índice local não reconhece o cabeçalho, e as que a lista de acompanhamento pode
+interrogar sobre o que quer (<a href="#automation">§10</a>).</p>
+
 <h3 id="nzblnk">Os links nzblnk</h3>
 <p>Alguns boards, sobretudo alemães e holandeses, publicam um link <code>nzblnk:</code>
 em vez de um arquivo NZB. A postagem está ofuscada, então não existe nome de arquivo
@@ -426,7 +482,7 @@ uma chave de busca e não um lugar, mais um título <code>t=</code>, uma senha
 postagem primeiro.</p>
 <p>O nzbfast procura o cabeçalho primeiro no próprio índice, o que não exige rede
 nenhuma, e só se isso falhar consulta os indexadores de busca que você configurou
-(Ajustes → Indexadores de busca, <a href="#settings">§9</a>), sob os mesmos orçamentos
+(Ajustes → Pesquisar nos indexadores, <a href="#settings">§9</a>), sob os mesmos orçamentos
 diários e o mesmo recuo de qualquer outra busca. O título vira o nome do trabalho e a
 senha é aplicada automaticamente.</p>
 <ul>
@@ -728,6 +784,20 @@ fila; salve-o de novo para baixá-lo outra vez. Seja qual for a escolha, a gavet
 cada trabalho tem um botão <b>Transferir o .nzb</b>, então uma cópia do <code>.nzb</code>
 de qualquer trabalho nunca está a mais de um clique.</p>
 
+<h3 id="set-indexers">Pesquisar nos indexadores <span class="pill live">ao vivo</span></h3>
+<p>As suas contas em sites indexadores de NZB, uma linha cada, para que uma pesquisa no
+mural lhes possa perguntar também. O que a funcionalidade faz, e como pesquisar com ela,
+está no <a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Campo</th><th>O que faz</th></tr>
+<tr><td>Nome</td><td>Um rótulo à sua escolha, e a identidade sob a qual os contadores e os limites do dia são guardados. Renomear uma linha começa uma entrada nova, por isso volte a introduzir a chave.</td></tr>
+<tr><td>Endereço de API</td><td>O endereço de API do site. O endereço web normal chega; uma entrada Prowlarr ou NZBHydra2 parece-se com <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>Chave da API</td><td>Da sua página de conta nesse site. Fica nesta máquina, é enviada só para o site a que pertence, nunca é mostrada outra vez e nunca é escrita no registo. Em branco mantém a guardada.</td></tr>
+<tr><td>Pesquisas por dia</td><td>Quantas pesquisas esta conta pode gastar por dia. 0 = sem limite, e é o valor por omissão.</td></tr>
+<tr><td>Transferências por dia</td><td>Quantas recolhas pode gastar por dia. 0 = sem limite. Ambos os contadores recomeçam à meia-noite UTC.</td></tr>
+<tr><td>ligado, Testar</td><td><b>ligado</b> é o que torna uma linha pesquisável; desmarque para guardar uma conta sem a usar. <b>Testar</b> pergunta ao site o que ele suporta e mostra a resposta, ou o erro, ali mesmo.</td></tr>
+</table></div>
+
 <h3>Indexação <span class="pill live">ao vivo</span></h3>
 <div class="note"><b>O indexador embutido vem desligado.</b> Ele encontra posts feitos
 sob um nome de arquivo real, e uma fatia grande e crescente da Usenet é postada de
@@ -736,11 +806,12 @@ grupo genérico. O nome verdadeiro só vive num NZB que o uploader publica em ou
 ou seja, nunca esteve na Usenet para qualquer scanner ler. Medido no nosso próprio
 índice, 14,8 milhões de posts varridos renderam cerca de 31.000 releases exploráveis,
 mais ou menos um em quinhentos. Continue usando indexadores comerciais e adicione-os em
-Ajustes → Indexadores de busca, para poder consultá-los a partir do mural. Ligue isto se
+Ajustes → Pesquisar nos indexadores, para poder consultá-los a partir do mural. Ligue isto se
 você acompanha grupos específicos onde ainda se posta com nomes reais, ou se quer ver o
-que o seu provedor realmente carrega. Com a chave desligada nada é varrido nem buscado,
-nenhum banco é criado, e o mural, Explorar, a watchlist e o feed newznab ficam
-ocultos.</div>
+que o seu provedor realmente carrega. Com a chave desligada nada é varrido nem buscado
+e nenhum banco é criado; Explorar e o feed newznab somem, o mural vira uma simples
+página de pesquisa para as contas de indexador que você adicionou, e a watchlist passa a
+trabalhar com essas contas.</div>
 <div class="tblwrap"><table>
 <tr><th>Ajuste</th><th>O que faz</th></tr>
 <tr><td>Indexador embutido</td><td>A chave mestra, <b>desligada a menos que você a ligue</b>. Desligada significa sem varredura, sem consultas de metadados, sem amostragem de disponibilidade e sem feed newznab; um índice que já esteja em disco é preservado (há um botão para apagar), então religar retoma em vez de varrer tudo de novo.</td></tr>
@@ -798,6 +869,17 @@ difere por modo de propósito: uma conta vinculada vê a lista inteira, então u
 deixa de ser acompanhado aqui (downloads já concluídos permanecem); um feed por endereço traz apenas
 as entradas mais recentes, então a ausência não prova nada e os títulos são apenas adicionados. Os
 dois padrões podem ser alterados por fonte.</p>
+<p><b>Pesquisar também nas minhas contas de indexador o que quero</b>, ao fundo do cartão
+da lista de acompanhamento, deixa-a perguntar às contas de Ajustes → Pesquisar nos
+indexadores além do seu próprio índice (<a href="#pullsearch">§5</a>). Começa desligado,
+porque é a única coisa aqui que gasta uma conta medida sem que carregue em nada. Ligado,
+cada item acompanhado pergunta cerca de duas vezes por dia, e só pelo que ainda não
+encontrou, sob os mesmos limites diários e com as mesmas notas quando uma conta é
+saltada. Um candidato vindo de um indexador é julgado exatamente como um local, por isso
+os mínimos de qualidade, as melhorias, os pacotes de temporada e o tratamento de
+duplicados continuam todos a valer, e uma cópia local ganha qualquer empate porque não
+custa quota. Com o indexador integrado desligado, é isto que dá à lista de acompanhamento
+algo com que trabalhar.</p>
 <h3 id="auto-rss">Feeds RSS</h3>
 <p>Ajustes → RSS: qualquer URL RSS newznab/indexador com intervalo por feed, categoria e
 regras de filtro (padrões de título, limites de tamanho). Os itens correspondentes são baixados
@@ -1163,7 +1245,7 @@ a <b>chave de API</b> (controle total) e a <b>chave NZB</b> (apenas adição:
 <tr><td>Configuração</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (cada campo de Ajustes), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Índice e mural</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, além de newznab em <code>/api?t=caps|search|tvsearch|movie</code> e <code>/getnzb/&lt;id&gt;</code></td></tr>
 <tr><td>Automação</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>
-<tr><td>Diagnóstico</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
+<tr><td>Diagnóstico</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code></td></tr>
 <tr><td>JSON-RPC do NZBGet</td><td><code>/jsonrpc</code> - status, listgroups, history, append, editqueue, rate, pause, log (autenticação Basic: qualquer usuário, chave de API como senha)</td></tr>
 <tr><td>Pré-visualização / reprodução</td><td><code>/stream/&lt;nzo_id&gt;</code> (intervalos HTTP; iniciar um trabalho de biblioteca estacionado precisa de token <code>?t=</code> ou chave), <code>/m3u/&lt;id&gt;</code> (precisa da chave; gera o token), <code>/wall</code>, <code>/art/…</code></td></tr>
 </table></div>

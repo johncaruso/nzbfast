@@ -420,6 +420,14 @@ impl Daemon {
         // so a requeued job is never stamped; a tombstoned one is stamped
         // and dropped, which is inert because it reaches neither store.
         moveseq::stamp_move(&job);
+        // Q2: from the prewrite until the record is filed into
+        // `self.history` below, its only durable copy is the disk row the
+        // prewrite is about to append - and `history_compact` snapshots
+        // MEMORY. The guard keeps the id registered for the whole
+        // interval so a concurrent compaction ("Save queue" runs one on
+        // a live daemon) carries the disk row into its snapshot instead
+        // of erasing it.
+        let _inflight = self.hist_inflight_begin(&id);
         // §158.7: the DESTINATION store FIRST, before the row leaves the
         // live queue - `park_prewrite` carries the why, and the demote arm
         // above is why it has to know about the tombstone.
@@ -610,6 +618,16 @@ impl Daemon {
     /// starts a media scan or spins a disk down when the queue empties
     /// simply never heard about those two.
     pub(in crate::serve) fn note_queue_idle(&self) {
+        // Latch already set = idle is already announced and nothing has
+        // re-armed it, so the CAS below cannot succeed and the answer to
+        // the walk is moot - return rather than take 15,000 job locks
+        // under the queue lock to learn that (issue #38 residue). This
+        // can only suppress an emit the CAS would have refused anyway:
+        // "said once until re-armed" is decided by the latch, and the
+        // walk was only ever evidence for the arming edge.
+        if self.queue_idle_latch.load(Ordering::Relaxed) {
+            return;
+        }
         let idle = !self.queue.lock_ok().iter().any(|j| {
             let g = j.lock_ok();
             matches!(g.state, JobState::Downloading | JobState::Finishing)

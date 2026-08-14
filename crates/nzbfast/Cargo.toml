@@ -163,7 +163,7 @@ getrandom = "0.2"
 # basicConstraints CA:FALSE by construction - the CaUsedAsEndEntity trap a
 # hand-run `openssl req -x509` falls into), and rustls is the verifying
 # client that fetches / and /api over https trusting exactly that cert.
-rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+rcgen = { version = "0.14.9", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 # The 7z ENCODER, for building container fixtures in the extraction tests.
 # Dev-only on purpose: resolver 2 does not unify dev-dependency features
 # into a normal build, so `cargo build` still links the decode-only

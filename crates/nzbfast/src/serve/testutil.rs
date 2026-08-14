@@ -32,6 +32,7 @@ pub(crate) fn test_daemon(dir: &Path) -> Arc<Daemon> {
         history: Mutex::new(Vec::new()),
         queue_rev: AtomicU64::new(1),
         history_rev: AtomicU64::new(1),
+        hist_inflight: Mutex::new(std::collections::HashSet::new()),
         life_seq: AtomicU64::new(0),
         life_events: Mutex::new(VecDeque::new()),
         queue_idle_latch: AtomicBool::new(true),

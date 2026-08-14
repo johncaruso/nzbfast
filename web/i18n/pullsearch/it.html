@@ -1,0 +1,82 @@
+<!--BLOCK row-->
+<tr><td><b>Cerca sugli indexer</b></td><td>Cerca sugli account indexer che hai
+aggiunto e metti in coda un risultato direttamente dalla lista. Vedi
+<a href="#pullsearch">Cercare sui tuoi account indexer</a> più sotto.</td></tr>
+<!--BLOCK sec-->
+<h3 id="pullsearch">Cercare sui tuoi account indexer</h3>
+<p>Se hai un account su un sito indexer NZB, nzbfast può cercarci da qui e mettere in
+coda quello che scegli, invece di farti andare sul sito, scaricare un NZB e riportarlo
+indietro. Parla l'API indexer standard che tutti quei siti offrono, quindi non c'è
+nulla da configurare sito per sito: NZBGeek, NZBFinder, DrunkenSlug, DOGnzb e gli altri
+funzionano allo stesso modo. Anche un'istanza Prowlarr o NZBHydra2 è una sola voce, e
+si porta dietro tutti gli indexer che raccoglie.</p>
+<p><b>Aggiungere un account.</b> Impostazioni → Cerca sugli indexer →
+<b>+ Aggiungi indexer</b>. Metti un nome a tua scelta, l'indirizzo API del sito (il suo
+normale indirizzo web basta; una voce Prowlarr somiglia a
+<code>http://host:9696/1/api</code>) e la chiave API dalla tua pagina account lì, poi
+<b>Applica indexer</b>. <b>Prova</b> chiede al sito che cosa supporta e mostra la
+risposta, il che convalida indirizzo e chiave con un clic. Una chiave salvata non viene
+più mostrata: il campo lo dice, e lasciarlo vuoto conserva quella già presente.</p>
+<p><b>Cercare.</b> Apri <b>🎬 la bacheca</b> nell'intestazione e passa alla lista delle
+release. Il menu a tendina accanto al campo di ricerca decide dove guarda una ricerca:
+<b>Questo indice</b>, cioè quello che questa macchina ha scansionato da sé,
+<b>Indexer</b>, oppure <b>Entrambi</b>. La tua scelta viene ricordata. Interrogare i
+tuoi account richiede qualcosa nel campo, perché sfogliarli con una richiesta vuota
+spenderebbe la quota di una giornata per una lista che nessuno ha chiesto. Con
+l'indexer integrato spento, che è come nzbfast arriva, non ci sono locandine da mostrare
+e la pagina è esattamente questo: un campo di ricerca, i tuoi account e i risultati.</p>
+<p><b>I risultati.</b> Una riga per release, le più recenti in cima, con dimensione, età
+e quante volte gli utenti di quell'indexer l'hanno presa. Una release che più di un tuo
+account offre compare una volta sola. Sotto <b>Entrambi</b>, una copia che il tuo indice
+ha già vince e quella esterna cade, perché prendere ciò che hai già indicizzato non ti
+costa nulla. <b>Scarica</b> la mette in coda ad alta priorità: nzbfast recupera l'NZB da
+sé, e da lì il lavoro è come ogni altro, con riparazione, estrazione, categorie e script
+invariati.</p>
+<p><b>Chiedere di un singolo titolo.</b> Apri la scheda di un titolo sulla bacheca e
+premi <b>⌕ Cerca sui miei indexer</b>. Per i film la domanda passa dal numero IMDb
+ovunque il sito lo accetti, ed è la differenza fra il film che intendevi e ogni release
+il cui nome contiene per caso quelle parole. nzbfast cerca quel numero da sé, quindi la
+pagina non ne tiene mai uno. I siti che non offrono la corrispondenza per numero
+vengono interrogati a parole.</p>
+<p><b>La tua quota.</b> Gli account indexer sono contati: tante ricerche e tanti
+download al giorno, secondo il tuo piano. Metti quei due numeri sulla voce e nzbfast
+scala da lì, ripartendo a mezzanotte UTC. 0, il valore predefinito, vuol dire
+illimitato, e il conteggio prosegue lo stesso. Un account che ha finito la quota resta
+fuori mentre gli altri lavorano, e una riga sopra i risultati nomina quello saltato:
+una quota esaurita non è mai silenziosa. Un sito che risponde con un limite suo, o che
+ci chiede di rallentare, viene messo da parte per un'ora.</p>
+<p><b>Dove va la tua chiave.</b> Solo all'indexer a cui appartiene. Le chiavi restano su
+questa macchina, non vengono mai consegnate al browser - ogni riga di risultato porta un
+gettone valido mezz'ora al posto di un link - e sono tolte dal log e da qualunque errore
+il sito restituisca, così un messaggio di errore incollato non può rivelarne una. Un
+download può recuperare solo un link che una delle tue ricerche ha restituito.</p>
+<p>Sono gli stessi account a cui un <a href="#nzblnk">link nzblnk</a> ripiega quando
+l'indice locale non riconosce il suo header, e quelli che la watchlist può interrogare
+sugli elementi voluti (<a href="#automation">§10</a>).</p>
+
+<!--BLOCK set-->
+<h3 id="set-indexers">Cerca sugli indexer <span class="pill live">live</span></h3>
+<p>I tuoi account sui siti indexer NZB, una riga ciascuno, così una ricerca sulla
+bacheca può chiedere anche a loro. Che cosa fa la funzione, e come cercarci, sta nel
+<a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Campo</th><th>Che cosa fa</th></tr>
+<tr><td>Nome</td><td>Un'etichetta a tua scelta, e l'identità sotto cui sono tenuti i contatori e i limiti del giorno. Rinominare una riga apre una voce nuova, quindi reinserisci la chiave.</td></tr>
+<tr><td>Indirizzo API</td><td>L'indirizzo API del sito. Il suo normale indirizzo web basta; una voce Prowlarr o NZBHydra2 somiglia a <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>Chiave API</td><td>Dalla tua pagina account su quel sito. Resta su questa macchina, va solo al sito a cui appartiene, non viene più mostrata e non viene mai scritta nel log. Vuoto conserva quella salvata.</td></tr>
+<tr><td>Ricerche al giorno</td><td>Quante ricerche questo account può spendere al giorno. 0 = illimitato, ed è il valore predefinito.</td></tr>
+<tr><td>Download al giorno</td><td>Quanti prelievi può spendere al giorno. 0 = illimitato. Entrambi i contatori ripartono a mezzanotte UTC.</td></tr>
+<tr><td>attivo, Prova</td><td><b>attivo</b> è ciò che rende una riga interrogabile; togli la spunta per tenere un account senza usarlo. <b>Prova</b> chiede al sito che cosa supporta e mostra la risposta, o l'errore, sul posto.</td></tr>
+</table></div>
+
+<!--BLOCK watch-->
+<p><b>Cerca anche sui miei account indexer gli elementi desiderati</b>, in fondo alla
+scheda della watchlist, le permette di chiedere agli account di Impostazioni →
+Cerca sugli indexer oltre che al tuo indice (<a href="#pullsearch">§5</a>). Parte
+spento, perché è l'unica cosa qui che spende un account a consumo senza che tu clicchi.
+Acceso, ogni elemento seguito chiede circa due volte al giorno, e solo di ciò che non ha
+già trovato, sotto gli stessi limiti giornalieri e con le stesse note quando un account
+viene saltato. Un candidato da un indexer è giudicato esattamente come uno locale,
+quindi soglie di qualità, upgrade, pacchetti di stagione e gestione dei doppioni valgono
+tutti, e una copia locale vince ogni parità perché non costa quota. Con l'indexer
+integrato spento, è questo a dare alla watchlist qualcosa su cui lavorare.</p>

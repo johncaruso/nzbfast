@@ -1,0 +1,82 @@
+<!--BLOCK row-->
+<tr><td><b>Søg på indeksere</b></td><td>Søg på de indekser-konti, du har tilføjet, og
+sæt et resultat i kø direkte fra listen. Se <a href="#pullsearch">Søg på dine
+indekser-konti</a> længere nede.</td></tr>
+<!--BLOCK sec-->
+<h3 id="pullsearch">Søg på dine indekser-konti</h3>
+<p>Har du en konto hos et NZB-indekserwebsted, kan nzbfast søge der herfra og sætte det,
+du vælger, i kø, i stedet for at du skal gå til webstedet, hente en NZB og bære den
+tilbage. Det taler det almindelige indekser-API, som alle de websteder tilbyder, så der
+er ikke noget at sætte op pr. websted: NZBGeek, NZBFinder, DrunkenSlug, DOGnzb og resten
+virker ens. En Prowlarr- eller NZBHydra2-instans er også kun én linje, og tager alle de
+indeksere, der ligger bag den, med sig.</p>
+<p><b>Tilføj en konto.</b> Indstillinger → Søg på indeksere →
+<b>+ Tilføj indekser</b>. Udfyld et navn efter eget valg, webstedets API-adresse (dets
+almindelige webadresse er nok; en Prowlarr-linje ser ud som
+<code>http://host:9696/1/api</code>) og API-nøglen fra din kontoside der, og derefter
+<b>Anvend indeksere</b>. <b>Test</b> spørger webstedet, hvad det understøtter, og viser,
+hvad der kom tilbage, hvilket beviser adressen og nøglen med ét klik. En gemt nøgle vises
+aldrig igen: feltet siger det, og lader du det stå tomt, beholdes den nøgle, der allerede
+er der.</p>
+<p><b>At søge.</b> Åbn <b>🎬 væggen</b> i overskriftslinjen, og skift til
+release-listen. Rullemenuen ved siden af søgefeltet afgør, hvor en søgning kigger:
+<b>Dette indeks</b>, altså det, denne maskine selv har skannet, <b>Indeksere</b> eller
+<b>Begge</b>. Dit valg huskes. At spørge dine konti kræver noget i feltet, for at blade i
+dem med en tom forespørgsel ville bruge et døgns tildeling på en liste, ingen bad om. Med
+den indbyggede indekser slået fra, hvilket er sådan nzbfast kommer, er der ingen plakater
+at vise, og siden er præcis dette: et søgefelt, dine konti og resultaterne.</p>
+<p><b>Resultaterne.</b> Én linje pr. release, de nyeste først, med størrelse, alder og
+hvor ofte den indeksers egne brugere har hentet den. En release, som flere af dine konti
+fører, optræder én gang. Under <b>Begge</b> vinder en kopi, dit eget indeks allerede har,
+og den udefra falder væk, for at hente det, du allerede har indekseret, koster dig ikke
+noget. <b>Hent</b> sætter den i kø med høj prioritet: nzbfast henter selv NZB'en, og
+derfra er jobbet som ethvert andet, med reparation, udpakning, kategorier og scripts
+uændret.</p>
+<p><b>At spørge om én titel.</b> Åbn en titels kort på væggen, og tryk på
+<b>⌕ Søg på mine indeksere</b>. For film går spørgsmålet via IMDb-nummeret alle de
+steder, webstedet tager imod et, og det er forskellen på den film, du mente, og enhver
+release, hvis navn tilfældigvis indeholder de ord. nzbfast slår selv nummeret op, så
+siden har aldrig et. Websteder uden match på nummer bliver spurgt med ord i stedet.</p>
+<p><b>Din tildeling.</b> Indekser-konti tælles: så og så mange søgninger og så og så
+mange downloads om dagen, alt efter dit niveau. Skriv de to tal på linjen, så trækker
+nzbfast fra dem og begynder forfra ved midnat UTC. 0, standardværdien, betyder
+ubegrænset, og der tælles alligevel. En konto, der har brugt sin tildeling, sidder over,
+mens de andre arbejder, og en linje over resultaterne nævner den, der blev sprunget over:
+at løbe tør er aldrig tavst. Et websted, der svarer med en grænse af sin egen, eller beder
+os sætte farten ned, sættes til side i en time.</p>
+<p><b>Hvor din nøgle havner.</b> Kun hos den indekser, den hører til. Nøgler bliver på
+denne maskine, gives aldrig til browseren - hver resultatlinje bærer en billet, der
+gælder en halv time, i stedet for et link - og fjernes fra loggen og fra enhver fejl,
+webstedet sender tilbage, så en indsat fejlmeddelelse ikke kan lække en. En download kan
+kun hente et link, som en af dine egne søgninger gav.</p>
+<p>Det er de samme konti, som et <a href="#nzblnk">nzblnk-link</a> falder tilbage på, når
+det lokale indeks ikke kender dets hoved, og dem, overvågningslisten kan spørge om det,
+du vil have (<a href="#automation">§10</a>).</p>
+
+<!--BLOCK set-->
+<h3 id="set-indexers">Søg på indeksere <span class="pill live">live</span></h3>
+<p>Dine konti hos NZB-indekserwebsteder, én linje hver, så en søgning på væggen også kan
+spørge dem. Hvad funktionen gør, og hvordan man søger med den, står i
+<a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Felt</th><th>Hvad det gør</th></tr>
+<tr><td>Navn</td><td>En etiket efter eget valg, og den identitet, dagens tællere og grænser føres under. At omdøbe en linje begynder en ny linje, så indtast nøglen igen.</td></tr>
+<tr><td>API-adresse</td><td>Webstedets API-adresse. Dets almindelige webadresse er nok; en Prowlarr- eller NZBHydra2-linje ser ud som <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>API-nøgle</td><td>Fra din kontoside på det websted. Bliver på denne maskine, sendes kun til det websted, den hører til, vises aldrig igen og skrives aldrig i loggen. Tom beholder den gemte.</td></tr>
+<tr><td>Søgninger om dagen</td><td>Hvor mange søgninger denne konto må bruge om dagen. 0 = ubegrænset, og standard.</td></tr>
+<tr><td>Downloads om dagen</td><td>Hvor mange hentninger den må bruge om dagen. 0 = ubegrænset. Begge tællere begynder forfra ved midnat UTC.</td></tr>
+<tr><td>til, Test</td><td><b>til</b> er det, der gør en linje søgbar; fjern fluebenet for at beholde en konto uden at bruge den. <b>Test</b> spørger webstedet, hvad det understøtter, og viser svaret, eller fejlen, på stedet.</td></tr>
+</table></div>
+
+<!--BLOCK watch-->
+<p><b>Søg også på mine indekser-konti efter det, jeg vil have</b>, nederst på
+overvågningslistens kort, lader den spørge kontiene fra Indstillinger → Søg på
+indeksere ud over dit eget indeks (<a href="#pullsearch">§5</a>). Det begynder slået fra,
+for det er det eneste her, der bruger en målt konto, uden at du klikker. Slået til
+spørger hver overvåget post cirka to gange om dagen, og kun efter det, den ikke allerede
+har fundet, under de samme daglige grænser og med de samme bemærkninger, når en konto
+springes over. En kandidat fra en indekser bedømmes præcis som en lokal, så
+kvalitetsgulve, opgraderinger, sæsonpakker og dublethåndtering gælder alle sammen, og en
+lokal kopi vinder enhver lige stilling, fordi den ikke koster tildeling. Med den
+indbyggede indekser slået fra er det dette, der overhovedet giver overvågningslisten
+noget at arbejde med.</p>

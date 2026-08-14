@@ -164,10 +164,15 @@ pub(crate) fn extract_nested(
     // stem guard above, so remember whether the input set held any: a
     // NEW extensionless Rar!-magic file appearing beside such a set is a
     // rebuilt member of it (.rev/RR output), not a nested archive -
-    // archives a pass genuinely produces carry their packed names.
+    // archives a pass genuinely produces carry their packed names. A
+    // final payload (.cbr, .cb7) is RAR magic without RAR grammar too,
+    // but it is the download, not an outer volume - counting it here
+    // made an unrelated comic beside the set suppress recursion into a
+    // genuinely nested extensionless RAR (Codex sweep 13 Aug U3). Same
+    // exclusion its sibling censuses already apply.
     let pre_obfuscated = before
         .iter()
-        .any(|p| !looks_like_named_rar(p) && rar_magic(p));
+        .any(|p| !looks_like_named_rar(p) && !nzbkit::extract::is_final_file(p) && rar_magic(p));
     let is_new_nested_archive = |p: &PathBuf| {
         if !is_extractable_archive(p) {
             return false;
@@ -625,9 +630,19 @@ pub(crate) fn extract_one_level(
     // Nested password-chain auto-unlock: an encrypted archive here may be
     // unlockable by a password sitting in a sibling text file the level
     // above just extracted. Harvest and verify a candidate before the
-    // extraction attempt; on a hit, use it in place of the job password.
+    // extraction attempt.
+    //
+    // A harvested value JOINS the candidate order, it must not replace
+    // the caller's: replacing it starved every later container of the
+    // password the user actually supplied, so a level with one
+    // harvest-unlockable archive left the OTHER one packed with its
+    // correct password in hand (Codex sweep 13 Aug U2). The arms with
+    // per-container candidate sweeps (named RAR groups, zip, 7z) take
+    // the ORIGINAL password and re-resolve per container - their sweeps
+    // lead with it and re-harvest this same directory. Only the arms
+    // without one (obfuscated RAR, SFX) take the level's resolved value.
     let harvested = resolve_level_password(dir, password);
-    let password = harvested.as_deref().or(password);
+    let level_pw = harvested.as_deref().or(password);
     // Phase 0(b) prevalence: one line per nested inner archive the disk
     // post-pass handles (a demoted-from-stream inner, or one never
     // eligible for streaming - RAR4, multipart 7z, a resumed job). Nested
@@ -676,7 +691,7 @@ pub(crate) fn extract_one_level(
     let obf = entries_left(&obf);
     if !obf.is_empty() {
         claim(
-            NestOutcome::from_produced(extract_obfuscated_rar(dir, &obf, password, depth)),
+            NestOutcome::from_produced(extract_obfuscated_rar(dir, &obf, level_pw, depth)),
             &mut out,
         );
     }
@@ -697,7 +712,7 @@ pub(crate) fn extract_one_level(
         let sfx = collect_sfx_archives(dir)?;
         if !sfx.is_empty() {
             claim(
-                NestOutcome::from_produced(extract_sfx(dir, &sfx, password)),
+                NestOutcome::from_produced(extract_sfx(dir, &sfx, level_pw)),
                 &mut out,
             );
         }

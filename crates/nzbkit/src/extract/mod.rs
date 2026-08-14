@@ -184,15 +184,12 @@ pub fn release_stem(name: &str) -> String {
     };
     end = cut(&lower, end, &|s| s.strip_suffix(".par2").map(|r| r.len()));
     end = cut(&lower, end, &|s| {
-        let vol = s.rfind(".vol")?;
-        let tail = &s[vol + 4..];
-        // par2cmdline "vol01+02" or range-style "vol001-003".
-        let (a, b) = tail.split_once(['+', '-'])?;
-        (!a.is_empty()
-            && a.bytes().all(|c| c.is_ascii_digit())
-            && !b.is_empty()
-            && b.bytes().all(|c| c.is_ascii_digit()))
-        .then_some(vol)
+        // par2cmdline "vol01+02", range-style "vol001-003", or the
+        // bare-ordinal "vol-01". One rule, shared with the deferral
+        // classifier in nzb::kind() - this cut and that classifier
+        // drifted apart once (both missing `.vol-NN`), which left the
+        // ordinal on the stem and shattered the release in the index.
+        crate::nzb::par2_vol_suffix(s)
     });
     end = cut(&lower, end, &|s| {
         // Split-container volume: 3-4 digit tail (7-Zip names volumes
@@ -863,6 +860,12 @@ struct Inner {
     /// its articles journal as `D` records (restorable only by
     /// re-encryption), and the finish decrypt skips it.
     crypto_files: HashMap<String, Arc<CryptoState>>,
+    /// The OTHER route's latch, same key space: outputs with an
+    /// encrypted span COMMITTED to the ciphertext route, stamped at
+    /// enqueue under the routing lock (C1). Why `written()` alone cannot
+    /// carry this: rule 2 of [`Extractor::instream_decrypt_allowed`].
+    /// Never removed for the life of the chain, like `crypto_files`.
+    ciphertext_files: std::collections::HashSet<String>,
     /// Resume-journal events from every [`CryptoState`] in the chain
     /// (children share it like the holds budget); drained by
     /// [`Extractor::drain_crypto_events`].
@@ -1082,6 +1085,7 @@ impl Extractor {
                 instream_decrypt: enabled
                     && std::env::var("NZBFAST_NO_INSTREAM_DECRYPT").map_or(true, |v| v != "1"),
                 crypto_files: HashMap::new(),
+                ciphertext_files: std::collections::HashSet::new(),
                 crypto_events: Arc::new(Mutex::new(Vec::new())),
                 pw_probe: None,
                 pw_probe_due: false,
@@ -2448,6 +2452,20 @@ impl Extractor {
                     } else {
                         None
                     };
+                    // C1: an encrypted span routing WITHOUT CryptoState
+                    // is the ciphertext route, decided HERE, under the
+                    // lock - the pwrite runs after it drops, so
+                    // `written()` lags the commitment. Latch at enqueue
+                    // or a racing sibling span latches plaintext-once
+                    // over it (instream_decrypt_allowed rule 2).
+                    if encrypted
+                        && crypto.is_none()
+                        && let Some(k) = w.path.file_name()
+                    {
+                        inner
+                            .ciphertext_files
+                            .insert(k.to_string_lossy().into_owned());
+                    }
                     match sink.as_mut() {
                         Some((jobs, _)) => jobs.push(WriteJob {
                             writer: w,

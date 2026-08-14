@@ -1157,20 +1157,46 @@ impl SlotState {
         let mut claimed = active.claimed.lock_ok();
 
         if let Some(name) = &self.name {
+            // EXACT first, across the whole set, before any approximate
+            // tier is allowed to claim. One first-hit loop over the
+            // three match classes let an approximate claim consume a
+            // FileDesc whose exact owner had not arrived yet: with
+            // slots A.txt and a.txt on a case-sensitive filesystem and
+            // FileDesc order [a.txt, A.txt], whichever slot matched
+            // first claimed the OTHER file's descriptor case-
+            // insensitively and both ended crossed - each verifying,
+            // repairing and publishing under the other's name, up to
+            // and including one rename unlinking the other's inode
+            // (Codex sweep 13 Aug R1).
             let sname = crate::disk::sanitize_filename(name);
-            for (fi, f) in files.iter().enumerate() {
-                if claimed[fi].is_some() {
-                    continue;
+            let exact = files
+                .iter()
+                .enumerate()
+                .find(|(fi, f)| claimed[*fi].is_none() && f.name == **name)
+                .map(|(fi, _)| fi);
+            let hit = exact.or_else(|| {
+                // Approximate (case-folded or sanitized) only when it is
+                // UNIQUE among the unclaimed descriptors. Two candidates
+                // is ambiguity, not a choice for FileDesc order to make:
+                // leave the slot unclaimed and let the md5-16k fallback
+                // below settle it by content.
+                let mut it = files.iter().enumerate().filter(|(fi, f)| {
+                    claimed[*fi].is_none()
+                        && (f.name.eq_ignore_ascii_case(name)
+                            || crate::disk::sanitize_filename(&f.name) == sname)
+                });
+                let first = it.next();
+                if it.next().is_none() {
+                    first.map(|(fi, _)| fi)
+                } else {
+                    None
                 }
-                if f.name == *name
-                    || f.name.eq_ignore_ascii_case(name)
-                    || crate::disk::sanitize_filename(&f.name) == sname
-                {
-                    claimed[fi] = Some(slot);
-                    self.file = Some(fi);
-                    self.blocks = vec![BlockState::Pending; f.blocks.len()];
-                    return true;
-                }
+            });
+            if let Some(fi) = hit {
+                claimed[fi] = Some(slot);
+                self.file = Some(fi);
+                self.blocks = vec![BlockState::Pending; files[fi].blocks.len()];
+                return true;
             }
         }
         // md5-16k fallback (obfuscated names).
@@ -1754,6 +1780,49 @@ mod tests {
         let r = v.finish_slot(0, None).unwrap();
         assert!(r.all_ok(), "{r:?}");
         assert_eq!(r.par2_name.as_deref(), Some("real-name.bin"));
+    }
+
+    /// Codex sweep 13 Aug R1: slots differing only by case must never
+    /// cross-claim each other's descriptors. With FileDesc order
+    /// [a.txt, A.txt] the first slot to match used to take the OTHER
+    /// file's descriptor case-insensitively (one first-hit loop over
+    /// exact and approximate classes), and the second slot then claimed
+    /// what was left - both crossed, each verifying and publishing
+    /// under the other's name.
+    #[test]
+    fn same_name_different_case_slots_never_cross_claim() {
+        let a = data_of(3000, 21);
+        let b = data_of(3000, 22);
+        // Adversarial descriptor order: the lowercase twin first.
+        let (v, _set) = active_verifier(&[("a.txt", &a), ("A.txt", &b)], 1024);
+        // The uppercase slot arrives first.
+        v.on_data(0, "A.txt", 3000, 0, &b);
+        v.on_data(1, "a.txt", 3000, 0, &a);
+        let r0 = v.finish_slot(0, None).unwrap();
+        let r1 = v.finish_slot(1, None).unwrap();
+        assert_eq!(r0.par2_name.as_deref(), Some("A.txt"), "crossed claim");
+        assert_eq!(r1.par2_name.as_deref(), Some("a.txt"), "crossed claim");
+        assert!(r0.all_ok() && r1.all_ok(), "{r0:?} {r1:?}");
+    }
+
+    /// ...and when the name tier is genuinely AMBIGUOUS - one slot
+    /// whose sanitized name matches two descriptors - FileDesc order
+    /// must not pick the winner. The name tier declines and the
+    /// md5-16k tier settles it by content.
+    #[test]
+    fn ambiguous_sanitized_names_settle_by_content_not_desc_order() {
+        let a = data_of(3000, 23);
+        let b = data_of(3000, 24);
+        // Both descriptor names sanitize to "a_b.txt".
+        let (v, _set) = active_verifier(&[("a/b.txt", &a), ("a\\b.txt", &b)], 1024);
+        v.on_data(0, "a_b.txt", 3000, 0, &b);
+        let r = v.finish_slot(0, None).unwrap();
+        assert_eq!(
+            r.par2_name.as_deref(),
+            Some("a\\b.txt"),
+            "content, not descriptor order, must decide the ambiguous claim"
+        );
+        assert!(r.all_ok(), "{r:?}");
     }
 
     /// A slot whose name AND head both match nothing (nfo/sfv/sample)

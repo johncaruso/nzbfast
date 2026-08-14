@@ -1,0 +1,87 @@
+<!--BLOCK row-->
+<tr><td><b>Indexer durchsuchen</b></td><td>Durchsuche die Indexer-Konten, die du
+hinzugefügt hast, und stell ein Ergebnis direkt aus der Liste in die Warteschlange.
+Siehe <a href="#pullsearch">Deine Indexer-Konten durchsuchen</a> weiter unten.</td></tr>
+<!--BLOCK sec-->
+<h3 id="pullsearch">Deine Indexer-Konten durchsuchen</h3>
+<p>Wenn du ein Konto bei einer NZB-Indexer-Seite hast, kann nzbfast sie von hier aus
+durchsuchen und in die Warteschlange stellen, was du auswählst, statt dass du zur Seite
+gehst, ein NZB herunterlädst und es zurückträgst. Es spricht die übliche Indexer-API,
+die all diese Seiten anbieten, es gibt also nichts pro Seite einzurichten: NZBGeek,
+NZBFinder, DrunkenSlug, DOGnzb und der Rest laufen gleich. Eine Prowlarr- oder
+NZBHydra2-Instanz ist ebenfalls nur ein Eintrag und bringt jeden Indexer dahinter
+gleich mit.</p>
+<p><b>Ein Konto eintragen.</b> Einstellungen → Indexer durchsuchen →
+<b>+ Indexer hinzufügen</b>. Trag einen Namen deiner Wahl ein, die API-Adresse der Seite
+(ihre normale Webadresse genügt; ein Prowlarr-Eintrag sieht aus wie
+<code>http://host:9696/1/api</code>) und den API-Schlüssel von deiner Kontoseite dort,
+dann <b>Indexer übernehmen</b>. <b>Testen</b> fragt die Seite, was sie unterstützt, und
+zeigt die Antwort, was Adresse und Schlüssel mit einem Klick belegt. Ein gespeicherter
+Schlüssel wird nie wieder angezeigt: das Feld sagt es, und leer lassen behält den
+Schlüssel, der schon da ist.</p>
+<p><b>Suchen.</b> Öffne <b>🎬 Wand</b> in der Kopfzeile und wechsle zur Release-Liste.
+Das Auswahlfeld neben dem Suchfeld entscheidet, wo eine Suche nachsieht: <b>Dieser
+Index</b>, also das, was diese Maschine selbst gescannt hat, <b>Indexer</b> oder
+<b>Beides</b>. Deine Wahl wird gemerkt. Für eine Frage an deine Konten muss etwas im
+Feld stehen, denn sie mit leerer Anfrage zu durchblättern würde das Tagesbudget für
+eine Liste ausgeben, die niemand verlangt hat. Mit ausgeschaltetem eingebautem Indexer,
+so wie nzbfast ausgeliefert wird, gibt es keine Poster zu zeigen und die Seite ist
+genau das: ein Suchfeld, deine Konten und die Ergebnisse.</p>
+<p><b>Die Ergebnisse.</b> Eine Zeile pro Release, die neuesten zuerst, mit Größe, Alter
+und wie oft die Nutzer dieses Indexers es geholt haben. Ein Release, das mehrere deiner
+Konten führen, erscheint einmal. Unter <b>Beides</b> gewinnt eine Kopie, die dein
+eigener Index schon hat, und die von außen fällt weg, denn zu holen, was du bereits
+indexiert hast, kostet dich nichts. <b>Download</b> stellt es mit hoher Priorität in
+die Warteschlange: nzbfast holt das NZB selbst, und ab da ist der Job wie jeder andere,
+mit Reparatur, Entpacken, Kategorien und Skripten unverändert.</p>
+<p><b>Nach einem einzelnen Titel fragen.</b> Öffne die Karte eines Titels auf der Wand
+und drück <b>⌕ Meine Indexer durchsuchen</b>. Bei Filmen fragt das über die
+IMDb-Nummer, wo immer die Seite eine annimmt, und das ist der Unterschied zwischen dem
+Film, den du meintest, und jedem Release, in dessen Namen diese Wörter zufällig
+vorkommen. nzbfast schlägt die Nummer selbst nach, die Seite hält also nie eine. Seiten
+ohne Nummernabgleich werden stattdessen mit den bloßen Wörtern gefragt.</p>
+<p><b>Dein Kontingent.</b> Indexer-Konten sind gezählt: so viele Suchen und so viele
+Downloads pro Tag, je nach Tarif. Trag diese zwei Zahlen am Eintrag ein, und nzbfast
+rechnet dagegen, mit einem Neustart um Mitternacht UTC. 0, die Vorgabe, heißt
+unbegrenzt, und gezählt wird trotzdem. Ein Konto, das sein Kontingent verbraucht hat,
+setzt die Suche aus, während die anderen laufen, und eine Zeile über den Ergebnissen
+nennt das übersprungene: ein leeres Kontingent bleibt nie unbemerkt. Eine Seite, die
+mit einer eigenen Grenze antwortet oder um Langsamkeit bittet, wird für eine Stunde
+beiseitegelegt.</p>
+<p><b>Wohin dein Schlüssel geht.</b> Nur zu dem Indexer, dem er gehört. Schlüssel
+bleiben auf dieser Maschine, gehen nie an den Browser - jede Ergebniszeile trägt statt
+eines Links eine halbe Stunde lang gültige Marke - und werden aus dem Log und aus jedem
+Fehler entfernt, den die Seite zurückgibt, sodass eine kopierte Fehlermeldung keinen
+verraten kann. Ein Download kann immer nur einen Link holen, den eine deiner eigenen
+Suchen geliefert hat.</p>
+<p>Das sind dieselben Konten, auf die ein <a href="#nzblnk">nzblnk-Link</a> zurückfällt,
+wenn der lokale Index seinen Header nicht kennt, und die, die die Watchlist nach
+Gewünschtem fragen kann (<a href="#automation">§10</a>).</p>
+
+<!--BLOCK set-->
+<h3 id="set-indexers">Indexer durchsuchen <span class="pill live">live</span></h3>
+<p>Deine Konten bei NZB-Indexer-Seiten, je eine Zeile, damit eine Suche auf der Wand
+auch sie fragen kann. Was die Funktion tut und wie man damit sucht, steht in
+<a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Feld</th><th>Was es tut</th></tr>
+<tr><td>Name</td><td>Ein Etikett deiner Wahl, und die Identität, unter der die Tageszähler und Grenzen geführt werden. Eine Zeile umzubenennen beginnt einen neuen Eintrag, also gib den Schlüssel neu ein.</td></tr>
+<tr><td>API-Adresse</td><td>Die API-Adresse der Seite. Ihre normale Webadresse genügt; ein Prowlarr- oder NZBHydra2-Eintrag sieht aus wie <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>API-Schlüssel</td><td>Von deiner Kontoseite auf dieser Seite. Bleibt auf dieser Maschine, geht nur an die Seite, der er gehört, wird nie wieder angezeigt und nie ins Log geschrieben. Leer lassen behält den gespeicherten.</td></tr>
+<tr><td>Suchen pro Tag</td><td>Wie viele Suchen dieses Konto pro Tag ausgeben darf. 0 = unbegrenzt, und die Vorgabe.</td></tr>
+<tr><td>Downloads pro Tag</td><td>Wie viele Grabs es pro Tag ausgeben darf. 0 = unbegrenzt. Beide Zähler starten um Mitternacht UTC neu.</td></tr>
+<tr><td>an, Testen</td><td><b>an</b> ist es, was eine Zeile durchsuchbar macht; nimm den Haken weg, um ein Konto zu behalten, ohne es zu nutzen. <b>Testen</b> fragt die Seite, was sie unterstützt, und zeigt die Antwort oder den Fehler an Ort und Stelle.</td></tr>
+</table></div>
+
+<!--BLOCK watch-->
+<p><b>Auch meine Indexer-Konten nach Gewünschtem durchsuchen</b>, am Fuß der
+Watchlist-Karte, lässt sie zusätzlich zu deinem eigenen Index die Konten aus
+Einstellungen → Indexer durchsuchen fragen (<a href="#pullsearch">§5</a>). Es
+beginnt ausgeschaltet, weil es das Einzige hier ist, das ein gezähltes Konto ausgibt,
+ohne dass du klickst. Eingeschaltet fragt jeder beobachtete Eintrag etwa zweimal am Tag
+und nur nach dem, was er noch nicht gefunden hat, unter denselben Tagesgrenzen und mit
+denselben Hinweisen, wenn ein Konto übersprungen wird. Ein Kandidat von einem Indexer
+wird genau wie ein lokaler beurteilt, Qualitätsuntergrenzen, Upgrades, Staffelpakete und
+Dublettenbehandlung gelten also alle weiter, und eine lokale Kopie gewinnt jeden
+Gleichstand, weil sie kein Kontingent kostet. Mit ausgeschaltetem eingebautem Indexer
+ist das, was der Watchlist überhaupt etwas zum Arbeiten gibt.</p>

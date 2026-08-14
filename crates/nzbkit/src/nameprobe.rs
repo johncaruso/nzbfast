@@ -40,6 +40,19 @@ pub const SEVENZ_MAGIC: &[u8] = &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 /// hostile start header can make the prober fetch and buffer.
 pub const SEVENZ_END_MAX: u64 = 2 << 20;
 
+/// Cap on the LZMA/LZMA2 dictionary a packed header's coder props may
+/// declare. `LzDecoder::ensure_capacity` allocates the whole match
+/// window up front, and lzma-rust2 does NOT clamp it to the unpack size
+/// on the LZMA2 path - so a header declaring 9 bytes of output can still
+/// drive a 384 MiB allocation. Found by fuzz on 14 Aug 2026 (a 33-byte
+/// window, LZMA2 props byte 0x21 = `3 << 27`); the same byte at its
+/// maximum 40 buys 4 GiB. Headers are metadata a real writer compresses
+/// with a small window, and the decoded result is capped at
+/// [`SEVENZ_END_MAX`] = 2 MiB anyway, so a window bigger than the output
+/// it can produce is never useful - 64 MiB matches the PPMd cap and is
+/// generous slack over any real writer.
+pub const SEVENZ_DICT_MAX: u64 = 64 << 20;
+
 /// Cap on the PPMd model memory a packed header's coder props may
 /// declare. `Ppmd7Decoder::new` allocates the props' 32-bit memSize up
 /// front - before a single output byte exists for the unpack-size cap
@@ -62,9 +75,16 @@ const K_FOLDER: u8 = 0x0B;
 const K_CODERS_UNPACK_SIZE: u8 = 0x0C;
 const K_ENCODED_HEADER: u8 = 0x17;
 
-/// 7z method id of PPMd, the one coder whose construction cost is set
-/// by its props (memSize) rather than by the declared output size.
+/// 7z method id of PPMd, whose construction cost is set by its props
+/// (memSize) rather than by the declared output size.
 const SEVENZ_ID_PPMD: [u8; 3] = [0x03, 0x04, 0x01];
+
+/// 7z method ids of LZMA1 and LZMA2. Both declare a dictionary size in
+/// their props, and `LzDecoder::ensure_capacity` allocates that window
+/// whole before a single output byte exists - so, like PPMd, the cost
+/// is set by the props and NOT by the declared output size.
+const SEVENZ_ID_LZMA1: [u8; 3] = [0x03, 0x01, 0x01];
+const SEVENZ_ID_LZMA2: [u8; 1] = [0x21];
 
 /// The parsed 32-byte 7z start header. Offsets are relative to byte 32,
 /// so the end header (the archive map, kept at the TAIL of a 7z)
@@ -242,13 +262,19 @@ impl Scan<'_> {
 struct DeclaredCost {
     /// Sum of every unpack size - the number sevenz-rust2 hands
     /// `Read::take` as the decode bound, plus every intermediate coder
-    /// buffer (and the LZMA dictionary, which lzma-rust2 clamps to the
-    /// unpack size).
+    /// buffer.
     unpack: u64,
     /// Sum of every PPMd coder's props-declared memSize -
     /// `Ppmd7Decoder::new` allocates it up front, independent of any
     /// output bound, so it needs its own cap ([`SEVENZ_PPMD_MEM_MAX`]).
     ppmd_mem: u64,
+    /// Sum of every LZMA1/LZMA2 coder's props-declared dictionary size.
+    /// `LzDecoder::ensure_capacity` allocates the match window whole,
+    /// and lzma-rust2 does NOT clamp it to the unpack size on the LZMA2
+    /// path - this field used to be assumed away as "clamped", which is
+    /// what let a 9-byte declared output allocate 384 MiB. Own cap:
+    /// [`SEVENZ_DICT_MAX`].
+    dict_size: u64,
 }
 
 /// The declared decode cost of a `kEncodedHeader` window. A byte-exact
@@ -301,6 +327,7 @@ fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
     // truncates out of the loop before it can balloon this vec.
     let mut block_outs = Vec::new();
     let mut ppmd_mem = 0u64;
+    let mut dict_size = 0u64;
     for _ in 0..num_blocks {
         let num_coders = s.num()?;
         if num_coders > limit {
@@ -312,7 +339,10 @@ fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
             let bits = s.u8()?;
             let id_at = s.i;
             s.skip((bits & 0xF) as usize)?;
-            let is_ppmd = s.b[id_at..s.i] == SEVENZ_ID_PPMD;
+            let id = &s.b[id_at..s.i];
+            let is_ppmd = id == SEVENZ_ID_PPMD;
+            let is_lzma1 = id == SEVENZ_ID_LZMA1;
+            let is_lzma2 = id == SEVENZ_ID_LZMA2;
             let (n_in, n_out) = if bits & 0x10 == 0 {
                 (1, 1)
             } else {
@@ -337,6 +367,31 @@ fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
                     let p = &s.b[props_at..];
                     let mem = u32::from_le_bytes([p[1], p[2], p[3], p[4]]);
                     ppmd_mem = ppmd_mem.saturating_add(mem as u64);
+                }
+                // LZMA1 props: lclppb byte, then the 32-bit dictionary
+                // size the LZ decoder allocates whole. Same shape as
+                // PPMd's memSize, one field over.
+                if is_lzma1 && props >= 5 {
+                    let p = &s.b[props_at..];
+                    let dict = u32::from_le_bytes([p[1], p[2], p[3], p[4]]);
+                    dict_size = dict_size.saturating_add(dict as u64);
+                }
+                // LZMA2 props: ONE byte, and the dictionary it names
+                // grows exponentially - `(2 | p & 1) << (p / 2 + 11)`,
+                // so 0x21 is 384 MiB and the maximum 40 is 4 GiB out of
+                // a single attacker-chosen byte. Above 40 the library
+                // refuses, and so do we.
+                if is_lzma2 && props >= 1 {
+                    let p = s.b[props_at];
+                    if p > 40 {
+                        return None;
+                    }
+                    let dict = if p == 40 {
+                        u32::MAX as u64
+                    } else {
+                        (2 | (p as u64 & 1)) << (p / 2 + 11)
+                    };
+                    dict_size = dict_size.saturating_add(dict);
                 }
             }
             if bits & 0x80 != 0 {
@@ -375,26 +430,34 @@ fn encoded_header_declared_cost(window: &[u8]) -> Option<DeclaredCost> {
     Some(DeclaredCost {
         unpack: total,
         ppmd_mem,
+        dict_size,
     })
 }
 
 /// The decompression-bomb verdict on a located end-header window,
 /// shared by BOTH 7z entry points (the in-stream tail probe and the
 /// on-disk password probe): true when a packed (`kEncodedHeader`)
-/// window declares a decoded size above [`SEVENZ_END_MAX`] or a PPMd
-/// memSize above [`SEVENZ_PPMD_MEM_MAX`]. sevenz-rust2 decodes the
+/// window declares a decoded size above [`SEVENZ_END_MAX`], a PPMd
+/// memSize above [`SEVENZ_PPMD_MEM_MAX`], or an LZMA/LZMA2 dictionary
+/// above [`SEVENZ_DICT_MAX`]. sevenz-rust2 decodes the
 /// window with the DECLARED sizes as its only bounds - LZMA ratios
 /// would turn a couple MB of hostile pack bytes into hundreds of MB of
 /// RAM, synchronously - so the declaration must be read out of the
 /// window and judged before the library is allowed to decode it. Real
 /// posters' packed headers decode to a few hundred bytes; 2 MiB of
-/// decoded header metadata is generous. A PPMd coder's memSize is a
-/// second declared allocation the output cap never touches, so it gets
-/// its own cap.
+/// decoded header metadata is generous. A PPMd coder's memSize and an
+/// LZMA/LZMA2 coder's dictionary size are two FURTHER declared
+/// allocations the output cap never touches, so each gets its own cap -
+/// the dictionary one because lzma-rust2 does not clamp the LZMA2 window
+/// to the unpack size, which this gate assumed until fuzz proved
+/// otherwise on 14 Aug 2026.
 fn encoded_header_bomb(window: &[u8]) -> bool {
     window.first() == Some(&K_ENCODED_HEADER)
-        && encoded_header_declared_cost(window)
-            .is_some_and(|d| d.unpack > SEVENZ_END_MAX || d.ppmd_mem > SEVENZ_PPMD_MEM_MAX)
+        && encoded_header_declared_cost(window).is_some_and(|d| {
+            d.unpack > SEVENZ_END_MAX
+                || d.ppmd_mem > SEVENZ_PPMD_MEM_MAX
+                || d.dict_size > SEVENZ_DICT_MAX
+        })
 }
 
 /// A sparse Read+Seek view over the two byte ranges a probe actually
@@ -1144,11 +1207,19 @@ mod tests {
             "real store-mode seed must still name itself"
         );
         // The window seeds are raw kEncodedHeader windows (the fuzz
-        // target seals them into a container itself). Both are bomb
+        // target seals them into a container itself). All three are bomb
         // declarations and must die at the gate: one declares an
-        // oversize decoded size, the other a ~4 GiB PPMd memSize (the
-        // fuzz-found OOM of 10 Aug 2026).
-        for name in ["bomb-encoded-header.bin", "ppmd-mem-window.bin"] {
+        // oversize decoded size, one a ~4 GiB PPMd memSize (the
+        // fuzz-found OOM of 10 Aug 2026), and one a 384 MiB LZMA2
+        // dictionary out of a SINGLE props byte while declaring just 9
+        // bytes of output - so the unpack cap never saw it, and
+        // `LzDecoder::ensure_capacity` allocated the window whole (the
+        // fuzz-found OOM of 14 Aug 2026, malloc(402653184)).
+        for name in [
+            "bomb-encoded-header.bin",
+            "ppmd-mem-window.bin",
+            "lzma2-dict-window.bin",
+        ] {
             let window = std::fs::read(format!("{dir}/{name}")).unwrap();
             let (head, tail) = seal(&window);
             assert_eq!(

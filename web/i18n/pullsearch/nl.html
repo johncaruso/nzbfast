@@ -1,0 +1,85 @@
+<!--BLOCK row-->
+<tr><td><b>Zoeken op indexers</b></td><td>Doorzoek de indexer-accounts die je hebt
+toegevoegd en zet een resultaat rechtstreeks vanuit de lijst in de wachtrij. Zie
+<a href="#pullsearch">Zoeken op je indexer-accounts</a> hieronder.</td></tr>
+<!--BLOCK sec-->
+<h3 id="pullsearch">Zoeken op je indexer-accounts</h3>
+<p>Heb je een account bij een NZB-indexersite, dan kan nzbfast daar vanaf hier zoeken en
+in de wachtrij zetten wat je kiest, in plaats van dat jij naar de site gaat, een NZB
+downloadt en die terugbrengt. Het spreekt de gangbare indexer-API die al die sites
+aanbieden, dus er valt niets per site in te stellen: NZBGeek, NZBFinder, DrunkenSlug,
+DOGnzb en de rest werken hetzelfde. Een Prowlarr- of NZBHydra2-instantie is ook één
+regel, en neemt elke indexer erachter meteen mee.</p>
+<p><b>Een account toevoegen.</b> Instellingen → Zoeken op indexers →
+<b>+ Indexer toevoegen</b>. Vul een naam van je keuze in, het API-adres van de site (het
+gewone webadres volstaat; een Prowlarr-regel ziet eruit als
+<code>http://host:9696/1/api</code>) en de API-sleutel van je accountpagina daar, en dan
+<b>Indexers toepassen</b>. <b>Testen</b> vraagt de site wat hij ondersteunt en toont wat
+er terugkwam, waarmee adres en sleutel in één klik bewezen zijn. Een opgeslagen sleutel
+wordt nooit meer getoond: het vak zegt dat, en leeg laten houdt de sleutel die er al
+staat.</p>
+<p><b>Zoeken.</b> Open <b>🎬 wall</b> in de kopbalk en schakel over naar de
+releaselijst. Het uitklapmenu naast het zoekvak bepaalt waar een zoekopdracht kijkt:
+<b>Deze index</b>, dus wat deze machine zelf gescand heeft, <b>Indexers</b>, of
+<b>Beide</b>. Je keuze wordt onthouden. Je accounts bevragen vraagt om iets in het vak,
+want ze met een lege opdracht doorbladeren zou het dagbudget uitgeven aan een lijst
+waar niemand om vroeg. Met de ingebouwde indexer uit, zoals nzbfast binnenkomt, zijn er
+geen posters te tonen en is de pagina precies dit: een zoekvak, je accounts en de
+resultaten.</p>
+<p><b>De resultaten.</b> Eén regel per release, de nieuwste bovenaan, met grootte,
+ouderdom en hoe vaak de gebruikers van die indexer hem gepakt hebben. Een release die
+meerdere van je accounts voeren verschijnt één keer. Onder <b>Beide</b> wint een kopie
+die je eigen index al heeft en valt die van buiten af, want pakken wat je al geïndexeerd
+hebt kost je niets. <b>Downloaden</b> zet hem met hoge prioriteit in de wachtrij:
+nzbfast haalt de NZB zelf op, en vanaf dat punt is de taak als elke andere, met
+reparatie, uitpakken, categorieën en scripts ongewijzigd.</p>
+<p><b>Naar één titel vragen.</b> Open de kaart van een titel op de wall en druk op
+<b>⌕ Zoek op mijn indexers</b>. Voor films gaat de vraag via het IMDb-nummer overal waar
+de site er een aanneemt, en dat is het verschil tussen de film die je bedoelde en elke
+release waarvan de naam toevallig die woorden bevat. nzbfast zoekt dat nummer zelf op,
+dus de pagina houdt er nooit een. Sites zonder overeenkomst op nummer worden gewoon met
+woorden bevraagd.</p>
+<p><b>Je tegoed.</b> Indexer-accounts worden geteld: zoveel zoekopdrachten en zoveel
+downloads per dag, afhankelijk van je abonnement. Zet die twee getallen op de regel en
+nzbfast telt ertegen af, met een nieuwe start om middernacht UTC. 0, de standaard,
+betekent onbeperkt, en er wordt toch geteld. Een account dat zijn tegoed op heeft, zit
+de zoekopdracht uit terwijl de andere doorgaan, en een regel boven de resultaten noemt
+degene die is overgeslagen: opraken is nooit stil. Een site die met een eigen limiet
+antwoordt, of ons vraagt te vertragen, wordt een uur opzijgezet.</p>
+<p><b>Waar je sleutel heen gaat.</b> Alleen naar de indexer waar hij bij hoort. Sleutels
+blijven op deze machine, gaan nooit naar de browser - elke resultaatregel draagt in
+plaats van een link een bon die een half uur geldig is - en worden uit het log gehaald
+en uit elke fout die de site teruggeeft, zodat een geplakte foutmelding er geen kan
+lekken. Een download kan alleen een link ophalen die een van je eigen zoekopdrachten
+teruggaf.</p>
+<p>Dit zijn dezelfde accounts waarop een <a href="#nzblnk">nzblnk-link</a> terugvalt als
+de lokale index zijn header niet kent, en die de watchlist over gewenste items kan
+bevragen (<a href="#automation">§10</a>).</p>
+
+<!--BLOCK set-->
+<h3 id="set-indexers">Zoeken op indexers <span class="pill live">live</span></h3>
+<p>Je accounts bij NZB-indexersites, één regel per stuk, zodat een zoekopdracht op de
+wall ze ook kan bevragen. Wat de functie doet, en hoe je ermee zoekt, staat in
+<a href="#pullsearch">§5</a>.</p>
+<div class="tblwrap"><table>
+<tr><th>Veld</th><th>Wat het doet</th></tr>
+<tr><td>Naam</td><td>Een etiket van je keuze, en de identiteit waaronder de dagtellers en limieten worden bijgehouden. Een regel hernoemen begint een nieuwe regel, dus voer de sleutel opnieuw in.</td></tr>
+<tr><td>API-adres</td><td>Het API-adres van de site. Het gewone webadres volstaat; een Prowlarr- of NZBHydra2-regel ziet eruit als <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>API-sleutel</td><td>Van je accountpagina op die site. Blijft op deze machine, gaat alleen naar de site waar hij bij hoort, wordt nooit meer getoond en nooit in het log geschreven. Leeg houdt de opgeslagen sleutel.</td></tr>
+<tr><td>Zoekopdrachten per dag</td><td>Hoeveel zoekopdrachten dit account per dag mag uitgeven. 0 = onbeperkt, en de standaard.</td></tr>
+<tr><td>Downloads per dag</td><td>Hoeveel grabs het per dag mag uitgeven. 0 = onbeperkt. Beide tellers beginnen om middernacht UTC opnieuw.</td></tr>
+<tr><td>aan, Testen</td><td><b>aan</b> is wat een regel doorzoekbaar maakt; haal het vinkje weg om een account te bewaren zonder het te gebruiken. <b>Testen</b> vraagt de site wat hij ondersteunt en toont het antwoord, of de fout, ter plekke.</td></tr>
+</table></div>
+
+<!--BLOCK watch-->
+<p><b>Zoek ook op mijn indexer-accounts naar gewenste items</b>, onderaan de
+watchlist-kaart, laat die naast je eigen index ook de accounts uit Instellingen →
+Zoeken op indexers bevragen (<a href="#pullsearch">§5</a>). Het begint uit, want het is
+het enige hier dat een afgerekend account uitgeeft zonder dat jij klikt. Aan vraagt elk
+gevolgd item ongeveer twee keer per dag, en alleen naar wat het nog niet gevonden heeft,
+onder dezelfde daglimieten en met dezelfde meldingen als een account wordt overgeslagen.
+Een kandidaat van een indexer wordt precies als een lokale beoordeeld, dus
+kwaliteitsdrempels, upgrades, seizoenpakketten en dubbelbehandeling gelden allemaal
+gewoon, en een lokale kopie wint elk gelijkspel omdat die geen tegoed kost. Met de
+ingebouwde indexer uit is dit wat de watchlist überhaupt iets geeft om mee te
+werken.</p>

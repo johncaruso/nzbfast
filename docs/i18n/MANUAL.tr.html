@@ -402,6 +402,9 @@ yönlendir.</td></tr>
 <tr><td><b>Bir URL'den</b></td><td>Bir NZB bağlantısı yapıştır (API <code>mode=addurl</code> ya da bağlı herhangi bir uygulama üzerinden).</td></tr>
 <tr><td><b>nzblnk: bağlantıları</b></td><td>Bir <code>nzblnk:</code> bağlantısını panonun herhangi bir yerine yapıştırın ya da içine sürükleyin. macOS DMG'sinden veya Windows kurulumundan kurduysanız bir board üzerinde doğrudan tıklayabilirsiniz de. Aşağıdaki <a href="#nzblnk">nzblnk bağlantıları</a> bölümüne bakın.</td></tr>
 <tr><td><b>Dizine göz at</b></td><td>Göz at kartındaki tam bir sürüme tıkla.</td></tr>
+<tr><td><b>Indexer'larda ara</b></td><td>Eklediğin indexer hesaplarında ara ve bir
+sonucu doğrudan listeden kuyruğa al. Aşağıdaki <a href="#pullsearch">Kendi indexer
+hesaplarında arama</a> bölümüne bak.</td></tr>
 <tr><td><b>İzleme listesi / RSS</b></td><td>Otomatik - bkz. <a href="#automation">Otomasyon</a>.</td></tr>
 <tr><td><b>Sonarr/Radarr vb.</b></td><td>Yakalamaları doğrudan kuyruğa gönderir - bkz. <a href="#arr">§11</a>.</td></tr>
 <tr><td><b>Komut satırı</b></td><td><code>nzbfast get file.nzb</code> arka plan süreci olmadan indirir.</td></tr>
@@ -419,6 +422,53 @@ atlar.</li>
 <a href="#nzblnk">nzblnk bağlantısının</a> <code>p=</code> alanından otomatik alınır;
 ayrıca iş başına API üzerinden veya sonradan Geçmiş'ten (🔑) verilebilir.</li>
 </ul>
+
+<h3 id="pullsearch">Kendi indexer hesaplarında arama</h3>
+<p>Bir NZB indexer sitesinde hesabın varsa, nzbfast oraya buradan sorabilir ve seçtiğini
+kuyruğa alabilir; siteye gidip bir NZB indirip geri taşımana gerek kalmaz. Bütün o
+sitelerin sunduğu standart indexer arayüzünü konuşur, yani site başına ayarlanacak bir
+şey yoktur: NZBGeek, NZBFinder, DrunkenSlug, DOGnzb ve diğerleri aynı biçimde çalışır.
+Bir Prowlarr ya da NZBHydra2 kurulumu da tek bir satırdır ve arkasındaki bütün
+indexer'ları beraberinde getirir.</p>
+<p><b>Hesap ekleme.</b> Ayarlar → Indexer'larda ara →
+<b>+ Indexer ekle</b>. Kendi seçtiğin bir ad, sitenin API adresi (sıradan web adresi
+yeter; bir Prowlarr satırı şuna benzer: <code>http://host:9696/1/api</code>) ve oradaki
+hesap sayfandan aldığın API anahtarını gir, sonra <b>Indexer'ları uygula</b>.
+<b>Sına</b> siteye neyi desteklediğini sorar ve dönen yanıtı gösterir; adresi ve anahtarı
+tek tıkla kanıtlar. Kaydedilmiş bir anahtar bir daha gösterilmez: kutu bunu söyler ve boş
+bırakmak hâlihazırdaki anahtarı korur.</p>
+<p><b>Arama.</b> Üst çubuktan <b>🎬 duvar</b>'ı aç ve release listesine geç. Arama
+kutusunun yanındaki açılır menü aramanın nereye bakacağını belirler: <b>Bu dizin</b>,
+yani bu makinenin kendi taradığı şey, <b>Indexer'lar</b> ya da <b>İkisi de</b>. Seçimin
+hatırlanır. Hesaplarına sormak kutuda bir şey yazmayı gerektirir, çünkü boş bir sorguyla
+onlara göz atmak, kimsenin istemediği bir liste için bir günlük hakkı harcardı. Yerleşik
+dizinleyici kapalıyken, ki nzbfast öyle gelir, gösterilecek afiş yoktur ve sayfa tam
+olarak şudur: bir arama kutusu, hesapların ve sonuçlar.</p>
+<p><b>Sonuçlar.</b> Her release için bir satır, en yenisi başta; boyutu, yaşı ve o
+indexer'ın kendi kullanıcılarının onu kaç kez aldığı. Birden çok hesabının taşıdığı bir
+release bir kez görünür. <b>İkisi de</b> altında, kendi dizinindeki kopya kazanır ve
+dışarıdaki düşer, çünkü zaten dizinlediğin şeyi almak sana hiçbir şeye mal olmaz.
+<b>İndir</b> onu yüksek öncelikle kuyruğa alır: NZB'yi nzbfast kendi getirir ve oradan
+sonra iş her iş gibidir; onarım, çıkarma, kategoriler ve betikler değişmez.</p>
+<p><b>Tek bir başlığı sorma.</b> Duvarda bir başlığın kartını aç ve
+<b>⌕ Indexer'larımda ara</b>'ya bas. Filmlerde soru, sitenin kabul ettiği her yerde IMDb
+numarası üzerinden gider; kastettiğin filmle adında o sözcükler rastgele geçen her release
+arasındaki fark budur. Numarayı nzbfast kendi bulur, yani sayfa hiçbir zaman bir numara
+tutmaz. Numarayla eşleştirme sunmayan siteler bunun yerine düz sözcüklerle sorulur.</p>
+<p><b>Hakkın.</b> Indexer hesapları ölçülür: paketine göre günde şu kadar arama ve şu
+kadar indirme. Bu iki sayıyı satıra yaz, nzbfast onlara karşı sayar ve UTC gece yarısında
+yeniden başlar. Varsayılan olan 0 sınırsız demektir, sayım yine de sürer. Hakkını
+harcamış bir hesap diğerleri çalışırken dışarıda kalır ve sonuçların üstündeki bir satır
+atlananın adını verir: hakkın bitmesi hiçbir zaman sessiz değildir. Kendi sınırıyla
+yanıt veren ya da yavaşlamamızı isteyen bir site bir saatliğine kenara alınır.</p>
+<p><b>Anahtarın nereye gider.</b> Yalnızca ait olduğu indexer'a. Anahtarlar bu makinede
+kalır, tarayıcıya asla verilmez - her sonuç satırı bağlantı yerine yarım saat geçerli bir
+fiş taşır - ve günlükten de sitenin döndürdüğü her hatadan da çıkarılır, böylece
+yapıştırılan bir hata iletisi hiçbirini sızdıramaz. Bir indirme yalnızca senin kendi
+aramalarından birinin döndürdüğü bir bağlantıyı getirebilir.</p>
+<p>Bunlar, yerel dizin başlığını tanımadığında bir <a href="#nzblnk">nzblnk bağlantısının</a>
+başvurduğu hesapların aynısıdır ve izleme listesinin istenen ögeler için sorabildiği
+hesaplardır (<a href="#automation">§10</a>).</p>
 
 <h3 id="nzblnk">nzblnk bağlantıları</h3>
 <p>Bazı board'lar, çoğunlukla Alman ve Hollanda kaynaklı olanlar, NZB dosyası yerine bir
@@ -729,6 +779,20 @@ Hangisini seçersen seç, her işin çekmecesinde bir <b>.nzb dosyasını indir<
 vardır; böylece herhangi bir işin <code>.nzb</code> dosyasının bir kopyası hiçbir
 zaman bir tıktan uzakta değildir.</p>
 
+<h3 id="set-indexers">Indexer'larda ara <span class="pill live">canlı</span></h3>
+<p>NZB indexer sitelerindeki hesapların, her biri bir satır; böylece duvardaki bir arama
+onlara da sorabilir. Özelliğin ne yaptığı ve onunla nasıl arandığı
+<a href="#pullsearch">§5</a>'te.</p>
+<div class="tblwrap"><table>
+<tr><th>Alan</th><th>Ne yapar</th></tr>
+<tr><td>Ad</td><td>Kendi seçtiğin bir etiket ve günün sayaçlarıyla sınırlarının altında tutulduğu kimlik. Bir satırı yeniden adlandırmak yeni bir satır başlatır, o yüzden anahtarı yeniden gir.</td></tr>
+<tr><td>API adresi</td><td>Sitenin API adresi. Sıradan web adresi yeter; bir Prowlarr ya da NZBHydra2 satırı şuna benzer: <code>http://host:9696/1/api</code>.</td></tr>
+<tr><td>API anahtarı</td><td>O sitedeki hesap sayfandan. Bu makinede kalır, yalnızca ait olduğu siteye gönderilir, bir daha gösterilmez ve günlüğe hiç yazılmaz. Boş bırakmak kayıtlı olanı korur.</td></tr>
+<tr><td>Günlük arama</td><td>Bu hesabın günde kaç arama harcayabileceği. 0 = sınırsız, ve varsayılan.</td></tr>
+<tr><td>Günlük indirme</td><td>Günde kaç alma harcayabileceği. 0 = sınırsız. İki sayaç da UTC gece yarısında yeniden başlar.</td></tr>
+<tr><td>açık, Sına</td><td><b>açık</b>, bir satırı aranabilir yapan şeydir; bir hesabı kullanmadan tutmak için işareti kaldır. <b>Sına</b> siteye neyi desteklediğini sorar ve yanıtı, ya da hatayı, yerinde gösterir.</td></tr>
+</table></div>
+
 <h3>Dizinleme <span class="pill live">canlı</span></h3>
 <div class="note"><b>Dahili dizinleyici varsayılan olarak kapalıdır.</b> Gerçek bir
 dosya adıyla atılmış gönderileri bulur; Usenet'in büyük ve büyüyen bir bölümü ise
@@ -737,11 +801,12 @@ her şeyin atıldığı bir gruba bırakılmış. Gerçek ad yalnızca yükleyic
 yayımladığı bir NZB'de yaşar, yani hiçbir tarayıcının okuyabileceği biçimde Usenet'te
 hiç bulunmadı. Kendi dizinimizde ölçtük: taranan 14,8 milyon gönderi yaklaşık 31.000
 göz atılabilir yayın verdi, kabaca beş yüzde bir. Ticari dizinleyicileri kullanmayı
-sürdürün ve onları Ayarlar → Arama dizinleyicileri altına ekleyin ki duvardan
+sürdürün ve onları Ayarlar → Indexer'larda ara altına ekleyin ki duvardan
 arayabilesiniz. İnsanların hâlâ gerçek adlarla attığı belirli grupları izliyorsanız ya
 da sağlayıcınızın gerçekte ne taşıdığını görmek istiyorsanız bunu açın. Anahtar
-kapalıyken hiçbir şey taranmaz veya çekilmez, veritabanı oluşturulmaz; duvar, Göz at,
-izleme listesi ve newznab beslemesi gizlenir.</div>
+kapalıyken hiçbir şey taranmaz veya çekilmez ve veritabanı oluşturulmaz; Göz at ile
+newznab beslemesi kaybolur, duvar eklediğin indexer hesapları için sade bir arama
+sayfasına döner, izleme listesi de onun yerine o hesaplarla çalışır.</div>
 <div class="tblwrap"><table>
 <tr><th>Ayar</th><th>Ne yapar</th></tr>
 <tr><td>Dahili dizinleyici</td><td>Ana anahtar, <b>siz açmadıkça kapalı</b>. Kapalı demek: tarama yok, meta veri sorgusu yok, erişilebilirlik örneklemesi yok, newznab beslemesi yok; diskte hâlihazırda duran bir dizin korunur (silme düğmesi vardır), dolayısıyla yeniden açmak baştan taramak yerine kaldığı yerden sürdürür.</td></tr>
@@ -799,6 +864,15 @@ farklıdır: bağlı bir hesap listenin tamamını görür, dolayısıyla orada 
 burada da izlenmeyi bırakır (zaten tamamlanmış indirmeler kalır); bir adres beslemesi yalnızca
 en son girdileri taşır, dolayısıyla yokluk hiçbir şey kanıtlamaz ve başlıklar yalnızca eklenir.
 Her iki varsayılan da kaynak başına değiştirilebilir.</p>
+<p>İzleme listesi kartının altındaki <b>İstediklerimi indexer hesaplarımda da ara</b>,
+listenin kendi dizininin yanı sıra Ayarlar → Indexer'larda ara altındaki hesaplara
+da sormasını sağlar (<a href="#pullsearch">§5</a>). Kapalı başlar, çünkü burada sen
+tıklamadan ölçülü bir hesabı harcayan tek şey odur. Açıkken izlenen her öge günde iki kez
+kadar sorar, yalnızca henüz bulamadığı şey için, aynı günlük sınırlar altında ve bir
+hesap atlandığında aynı notlarla. Bir indexer'dan gelen aday tam olarak yerel bir aday
+gibi değerlendirilir; kalite tabanları, yükseltmeler, sezon paketleri ve yineleme işlemesi
+hepsi geçerlidir ve yerel bir kopya her eşitliği kazanır, çünkü hiç hak harcamaz. Yerleşik
+dizinleyici kapalıyken izleme listesine çalışacak bir şey veren de budur.</p>
 <h3 id="auto-rss">RSS beslemeleri</h3>
 <p>Ayarlar → RSS: besleme başına aralık, kategori ve filtre kurallarıyla (başlık kalıpları,
 boyut sınırları) herhangi bir newznab/dizinleyici RSS URL'si. Eşleşen öğeler otomatik
@@ -1162,7 +1236,7 @@ SABnzbd uyumlu, bu yüzden mevcut SAB tümleştirmeleri değişmeden çalışır
 <tr><td>Yapılandırma</td><td><code>get_config</code>, <code>config&amp;name=&lt;setting&gt;&amp;value=…</code> (her Ayarlar alanı), <code>server_save/delete/test/enable/reorder</code>, <code>import_probe/apply</code></td></tr>
 <tr><td>Dizin &amp; duvar</td><td><code>index_search</code>, <code>index_get</code>, <code>index_stats</code>, <code>index_scan_now</code>, <code>wall</code>, <code>wall_search/fix/refresh/art</code>, ayrıca <code>/api?t=caps|search|tvsearch|movie</code> ve <code>/getnzb/&lt;id&gt;</code>'de newznab</td></tr>
 <tr><td>Otomasyon</td><td><code>watchlist</code>, <code>watchlist_check_now</code>, <code>watch_calendar</code>, <code>feeds</code>, <code>smart_folders</code>, <code>schedule</code></td></tr>
-<tr><td>Tanılama</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code>, <code>update_apply</code></td></tr>
+<tr><td>Tanılama</td><td><code>sysbench</code>, <code>bench_history</code>, <code>connladder</code>, <code>pooltest</code>, <code>diversity</code>, <code>update_check</code></td></tr>
 <tr><td>NZBGet JSON-RPC</td><td><code>/jsonrpc</code> - status, listgroups, history, append, editqueue, rate, pause, log (Basic auth: herhangi bir kullanıcı, parola olarak API anahtarı)</td></tr>
 <tr><td>Önizleme / oynatma</td><td><code>/stream/&lt;nzo_id&gt;</code> (HTTP aralıkları; park edilmiş bir kitaplık işini başlatmak <code>?t=</code> belirteci ya da anahtar gerektirir), <code>/m3u/&lt;id&gt;</code> (anahtar gerektirir; belirteci üretir), <code>/wall</code>, <code>/art/…</code></td></tr>
 </table></div>

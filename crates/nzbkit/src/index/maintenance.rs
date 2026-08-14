@@ -924,6 +924,18 @@ impl Index {
                 break;
             }
         }
+        // Lifetime tallies for the settings-card census: the per-pass
+        // log line scrolls away, and "how much of the dark band has
+        // been merged" needs running totals.
+        if folded > 0 {
+            for (key, add) in [
+                ("shatter_fold_rows", folded),
+                ("shatter_fold_groups", groups),
+            ] {
+                let cur: u64 = self.kv_get(key).and_then(|v| v.parse().ok()).unwrap_or(0);
+                self.kv_set(key, &(cur + add as u64).to_string())?;
+            }
+        }
         let done = reached_top;
         if done && self.kv_get("shatter_fold_lap_v1").is_none() {
             self.kv_set("shatter_fold_lap_v1", "1")?;
@@ -937,6 +949,28 @@ impl Index {
             self.kv_set("predb_seed_gen", &(g + 1).to_string())?;
         }
         Ok((groups, folded, done))
+    }
+
+    /// The fold's running census for the settings card: lifetime rows
+    /// merged and postings made whole, plus how far the current sweep
+    /// has got. Read-only; same readout contract as `probe7z_stats`.
+    pub fn shatter_fold_stats(&self) -> serde_json::Value {
+        let kv_u64 = |k: &str| {
+            self.kv_get(k)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let top: i64 = self
+            .db
+            .query_row("SELECT COALESCE(MAX(id),0) FROM releases", [], |r| r.get(0))
+            .unwrap_or(0);
+        serde_json::json!({
+            "rows_folded": kv_u64("shatter_fold_rows"),
+            "postings": kv_u64("shatter_fold_groups"),
+            "cursor": kv_u64("shatter_fold_cursor"),
+            "top": top,
+            "first_lap_done": self.kv_get("shatter_fold_lap_v1").is_some(),
+        })
     }
 
     /// Fold every posting sharing `stem`, ONE FILENAME AT A TIME.

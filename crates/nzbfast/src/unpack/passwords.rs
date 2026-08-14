@@ -430,6 +430,26 @@ pub(crate) fn resolve_zip_password(
     None
 }
 
+/// The GROUP-scoped twin of [`resolve_rar_password`]: resolve a working
+/// password for one named-RAR stem group by probing that group's own
+/// crypt record.
+///
+/// The level-wide resolver probes only the first encrypted RAR it finds
+/// in the directory, and its answer used to be handed to every group -
+/// so with two encrypted sets under different passwords, the second was
+/// tried with the first one's value, failed as "wrong password", and
+/// stayed packed while the run reported success (Codex sweep 13 Aug U1).
+/// Returns `None` to keep the caller's password (it already verifies,
+/// the set is check-less, or nothing matched).
+pub(crate) fn resolve_rar_group_password(
+    dir: &std::path::Path,
+    group: &[PathBuf],
+    provided: Option<&str>,
+) -> Option<String> {
+    let enc = group.iter().find(|p| nzbkit::rar::needs_password(p))?;
+    resolve_rar_password(enc, dir, provided)
+}
+
 pub(crate) fn resolve_rar_password(
     rar: &std::path::Path,
     dir: &std::path::Path,

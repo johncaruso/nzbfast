@@ -232,7 +232,15 @@ pub(crate) fn try_unrar_spent(
             } else {
                 stem.clone()
             };
-            match try_rars_native(dir, &group_first, password) {
+            // Per GROUP, like the zip and 7z arms (Codex sweep G): two
+            // encrypted sets in one directory need not share a password,
+            // and handing every group the level's single resolved value
+            // left the second set packed on a run that reported success
+            // (Codex sweep 13 Aug U1). The caller's password leads the
+            // candidate order, so it is never shadowed by a harvest (U2).
+            let group_pw = crate::unpack::resolve_rar_group_password(dir, group, password);
+            let pw = group_pw.as_deref().or(password);
+            match try_rars_native(dir, &group_first, pw) {
                 Ok(consumed) => {
                     println!("native unpack complete ✔ ({})", group_first.display());
                     consumed_all.extend(consumed);
@@ -265,14 +273,17 @@ pub(crate) fn try_unrar_spent(
         println!("falling back to unrar…");
     }
     println!("unpacking archive with unrar…");
-    // `-p<pw>` must be a single argument; bare `-p` would prompt and hang.
-    let parg = match password {
-        Some(p) if !p.is_empty() => format!("-p{p}"),
-        _ => "-p-".to_string(),
-    };
     // One subprocess per stem group, on the same list and the same success
-    // rule as the native pass above.
-    let unrar_group = |group_first: &PathBuf| -> Option<Vec<PathBuf>> {
+    // rule as the native pass above. The password resolves per GROUP here
+    // too (U1/U2, same reasoning as the native loop above).
+    let unrar_group = |group_first: &PathBuf, group: &[PathBuf]| -> Option<Vec<PathBuf>> {
+        let group_pw = crate::unpack::resolve_rar_group_password(dir, group, password);
+        let pw = group_pw.as_deref().or(password);
+        // `-p<pw>` must be a single argument; bare `-p` would prompt and hang.
+        let parg = match pw {
+            Some(p) if !p.is_empty() => format!("-p{p}"),
+            _ => "-p-".to_string(),
+        };
         // The volume set the subprocess is about to read, listed BEFORE it
         // runs - the unpack can publish rar-named members of its own, and
         // those must never be mistaken for input volumes.
@@ -320,7 +331,7 @@ pub(crate) fn try_unrar_spent(
                     None
                 }
             },
-            Ok(st) if password.is_some() => {
+            Ok(st) if pw.is_some() => {
                 println!("⚠ unrar exited with {st} - wrong password, or damaged volumes");
                 None
             }
@@ -354,7 +365,7 @@ pub(crate) fn try_unrar_spent(
         let Some(group_first) = first_rar_volume(group) else {
             continue;
         };
-        match unrar_group(&group_first) {
+        match unrar_group(&group_first, group) {
             Some(consumed) => {
                 consumed_all.extend(consumed);
                 produced = true;
