@@ -18,6 +18,35 @@ the [home](https://nzbfast.github.io/nzbfast/) and
 measured numbers with full method notes are on the
 [benchmarks](https://nzbfast.github.io/nzbfast/benchmarks.html) page.
 
+## Run it
+
+**Docker, NAS, seedbox** - the compose file in this repo,
+[`docker-compose.yml`](docker-compose.yml), is the whole install. Put it in a
+folder of its own and:
+
+```sh
+docker compose up -d
+```
+
+Then open `http://<host>:6789` and add your Usenet provider in the Welcome
+panel: there is no config file to write, and no provider details go in the
+compose file. The one line worth changing first is the downloads volume, so
+it points at your own storage. Updating later is
+`docker compose pull && docker compose up -d`. Every line in the file is
+commented, and the volume mappings, the Sonarr/Radarr paths and the API key
+are covered in [Docker and NAS](#docker-and-nas) below.
+
+**macOS, Windows, Linux** - take the installer or archive for your machine
+from the [download page](https://nzbfast.github.io/nzbfast/download.html) or
+the [latest release](https://github.com/nzbfast/nzbfast/releases/latest) and
+run it: the setup wizard asks for your provider, and offers to adopt an
+existing SABnzbd or NZBGet config if it finds one. On macOS and Linux
+`brew install nzbfast/tap/nzbfast` does the same job in one command.
+
+**Unraid** - search `nzbfast` in the Apps tab of Community Applications.
+**Synology** - [docs/SYNOLOGY.md](docs/SYNOLOGY.md) walks through Container
+Manager step by step, no SSH. Both run the same image as the compose file.
+
 ## Why it's fast
 
 - **Pipelined NNTP** - many article requests in flight per connection, so
@@ -56,7 +85,12 @@ Full documentation: [**User Manual**](https://nzbfast.github.io/nzbfast/MANUAL.h
 Downloads: [Releases](https://github.com/nzbfast/nzbfast/releases) ·
 Issues: [issue tracker](https://github.com/nzbfast/nzbfast/issues)
 
-**NAS / Docker** - multi-arch image (amd64 + arm64) on Docker Hub and ghcr:
+## Docker and NAS
+
+The image is multi-arch (amd64 + arm64) and lives on Docker Hub and ghcr.
+[`docker-compose.yml`](docker-compose.yml) is the shortest way in: it carries
+everything below already, and updating it is one command
+(`docker compose pull && docker compose up -d`). The same thing by hand:
 
 ```sh
 docker run -d -p 6789:6789 \
@@ -72,9 +106,8 @@ mapped `/config` folder *is* your install (settings, API key, queue), and a
 relative path like `./config` points at a different, empty folder every
 time the command runs from a different directory - which looks exactly like
 an update that wiped your settings. To update, pull the new image and
-recreate the container with the same mappings. Easier still is the repo's
-[docker-compose.yml](docker-compose.yml), where updating is
-`docker compose pull && docker compose up -d`.
+recreate the container with the same mappings, which is the bookkeeping the
+compose file does for you.
 
 **Running Sonarr or Radarr too?** The downloads line above is mapped to the
 same path on both sides, and under a root you also give them, and both

@@ -1,9 +1,18 @@
-# nzbfast - NAS / seedbox deployment.
-#   1. docker compose up -d
-#   2. open http://<host>:6789 and add your Usenet server in the
+# nzbfast - the whole install, anywhere Docker runs: home server, NAS,
+# seedbox, VPS, a laptop.
+#   1. put this file in a folder of its own
+#   2. docker compose up -d
+#   3. open http://<host>:6789 and add your Usenet server in the
 #      Welcome panel (no file to edit - it applies live)
 # Web UI + SABnzbd/NZBGet-compatible API at http://<host>:6789
-# Synology walkthrough: docs/SYNOLOGY.md
+# Later, updating is: docker compose pull && docker compose up -d
+#
+# This file is generic: no provider details go in it, and the one line
+# worth setting first is the downloads volume, below. NAS owners who would
+# rather click than type have per-platform guides: Synology (Container
+# Manager, no SSH) is docs/SYNOLOGY.md, and Unraid has a Community
+# Applications template - search nzbfast in the Apps tab. Same image, and
+# the same program, either way.
 services:
   nzbfast:
     image: nzbfast/nzbfast:latest        # Docker Hub (searchable in Synology/Unraid GUIs)
