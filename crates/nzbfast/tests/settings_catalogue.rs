@@ -264,6 +264,13 @@ fn serve_locked(dir: &Path) -> Running {
     serve_env(dir, &[("NZBFAST_PORT_LOCKED", "1")])
 }
 
+/// `serve` as a Flatpak install. `FLATPAK_ID` is one of the two markers
+/// `flatpak_install()` reads; the other is `/.flatpak-info`, which a test
+/// cannot create.
+fn serve_flatpak(dir: &Path) -> Running {
+    serve_env(dir, &[("FLATPAK_ID", "io.github.nzbfast.nzbfast")])
+}
+
 fn serve_env(dir: &Path, env: &[(&str, &str)]) -> Running {
     for attempt in 0..3 {
         let port = free_port();
@@ -1361,4 +1368,51 @@ fn max_source_ips_round_trips_and_clears() {
 
     drop(d);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Flatpak install must be told apart from a container install, because
+/// the dashboard shows a DIFFERENT update recipe for each and the
+/// container one is Docker-specific to the last word - compose files,
+/// Watchtower, the Synology Container Manager. Showing that to somebody
+/// who installed from a software centre would be worse than showing
+/// nothing.
+///
+/// The download page is equally wrong for both (a Flatpak cannot replace
+/// its own files), which is the trap this guards: folding `flatpak` into
+/// `container` makes the chip work and the advice nonsense, and nothing
+/// downstream would fail.
+#[test]
+fn a_flatpak_install_is_reported_separately_from_a_container_one() {
+    let dir = scratch("flatpak-flag");
+    let d = serve_flatpak(&dir);
+    let q = api(d.port, "mode=queue");
+
+    assert_eq!(
+        q["queue"]["flatpak"].as_bool(),
+        Some(true),
+        "a Flatpak install did not report itself: {q}"
+    );
+    assert_eq!(
+        q["queue"]["container"].as_bool(),
+        Some(false),
+        "a Flatpak was reported as a container, which would show the \
+         compose-file update recipe to a desktop user: {q}"
+    );
+
+    drop(d);
+}
+
+/// The same daemon with nothing set reports neither, so the assertion
+/// above is about FLATPAK_ID and not about a field that is simply always
+/// true.
+#[test]
+fn a_plain_install_reports_neither_flatpak_nor_container() {
+    let dir = scratch("plain-flags");
+    let d = serve(&dir);
+    let q = api(d.port, "mode=queue");
+
+    assert_eq!(q["queue"]["flatpak"].as_bool(), Some(false), "{q}");
+    assert_eq!(q["queue"]["container"].as_bool(), Some(false), "{q}");
+
+    drop(d);
 }

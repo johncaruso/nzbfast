@@ -1,0 +1,7 @@
+# Build output, none of which belongs in the repo.
+.build/
+.repo/
+.flatpak-builder/
+.flatpak-cargo-generator.py
+.io.github.nzbfast.nzbfast.local.yaml
+*.flatpak

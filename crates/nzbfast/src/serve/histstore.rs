@@ -53,8 +53,14 @@ static HIST_IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// either misses the window or goes flaky. Parking the compaction
 /// exactly in the gap lets the test hold it open and prove what an
 /// appender does there - which, with the lock in place, is wait.
+///
+/// Keyed by the owning daemon's spool path: the bin tests run in
+/// parallel and `history_compact` is on the save-queue path, so an
+/// unkeyed seam pairs this test's compactor with a stranger's and the
+/// test's own `wait()` then never returns (the 15 Aug
+/// `daemon_park::PARK_GEN_BARRIER` wedge, same shape).
 #[cfg(test)]
-pub(super) static COMPACT_BARRIER: std::sync::Mutex<Option<Arc<std::sync::Barrier>>> =
+pub(super) static COMPACT_BARRIER: std::sync::Mutex<Option<(String, Arc<std::sync::Barrier>)>> =
     std::sync::Mutex::new(None);
 
 impl Daemon {
@@ -171,17 +177,79 @@ impl Daemon {
     /// torn state is "in both", which `load_queue` already reconciles in
     /// history's favour.
     ///
-    /// `tombstone` is not a convenience: a record that is NOT bound for
+    /// `dropping` is not a convenience: a record that is NOT bound for
     /// history must not be written here. `park`'s demote arm returns the
     /// job to the queue, and a history line for it would make that same
-    /// reconciliation drop the requeued row.
+    /// reconciliation drop the requeued row. It is narrower than
+    /// "tombstoned" - an M5 delete verb's tombstone IS filed into
+    /// history, so the caller passes false for that one and this row is
+    /// what covers the interval before it lands.
     ///
     /// Not the final word on the record either. The auto-retry stamps and
     /// the demote scrub settle it afterwards and the upsert beside the
     /// history push writes it again; last line wins on replay, so this one
     /// only has to EXIST.
-    pub(super) fn park_prewrite(&self, job: &Arc<Mutex<Job>>, tombstone: bool) -> bool {
-        !tombstone && self.history_upsert(std::slice::from_ref(job))
+    pub(super) fn park_prewrite(&self, job: &Arc<Mutex<Job>>, dropping: bool) -> bool {
+        !dropping && self.history_upsert(std::slice::from_ref(job))
+    }
+
+    /// The same idea one caller further back: the DELETE's history row,
+    /// written while the job it names is still downloading.
+    ///
+    /// A delete verb that owes a history row files it from `park` when
+    /// the job is active - which is a long way off. The handler drops
+    /// the queue row and calls `save_queue`, so from that save until
+    /// park's own prewrite (after the fetch drains, after the deferred
+    /// file removal, which on a hung NAS is unbounded) nothing durable
+    /// names the record at all. A kill in there and the row is gone from
+    /// both stores: no DELETED/MANUAL record for the dupe check or the
+    /// retry button, and for `GroupParkDelete` - whose whole contract is
+    /// "files KEPT" - a full payload on disk that nothing names (Codex
+    /// sweep 14 Aug M1).
+    ///
+    /// The terminal keys are overridden in the JSON rather than written
+    /// to the live `Job`: the pipeline is still running, and stamping
+    /// `state = Failed` on it would confuse the runner. An un-overridden
+    /// row is worse than none - a nonterminal state restores as `Queued`
+    /// (job_wire.rs), so replay would mint a queued-looking record
+    /// sitting in history.
+    ///
+    /// The id is registered in `hist_inflight` and deliberately NOT
+    /// deregistered here: the Q2 hazard runs from this write until park
+    /// files the record into `self.history`, and a compaction anywhere
+    /// in that span ("Save queue" runs one on a live daemon) snapshots
+    /// MEMORY and would erase the disk-only row. park re-registers the
+    /// same id and its guard is what takes it back out - the set is
+    /// id-keyed, so the two never fight, and a tombstoned delete always
+    /// reaches that guard (park's demote arm, the one early return
+    /// ahead of it, cannot claim a tombstoned job).
+    ///
+    /// In-memory `self.history` is deliberately NOT touched: park's M5
+    /// arm handles both "already present" and "not present", and a
+    /// still-Downloading job surfacing as a history row would race that
+    /// check and `dir_claim`'s two-store scan. Last line wins on replay,
+    /// so park's later rows simply overwrite this one.
+    pub(super) fn delete_prewrite(&self, job: &Arc<Mutex<Job>>, status: &str) {
+        // FinalDelete's contract is that no record survives at all, so
+        // an empty status must never reach here.
+        if status.is_empty() {
+            return;
+        }
+        let (id, line) = {
+            let g = job.lock_ok();
+            let mut v = job_json(&g);
+            v["state"] = json!("Failed");
+            v["fail_message"] = json!(if status == "DUPE" {
+                "deleted from the queue as a duplicate"
+            } else {
+                "deleted from the queue"
+            });
+            v["finished_unix"] = json!(unix_now());
+            v["delete_status"] = json!(status);
+            (g.nzo_id.clone(), v.to_string())
+        };
+        self.hist_inflight.lock_ok().insert(id);
+        self.history_append(&[line]);
     }
 
     /// Register a park's nzo_id as in flight between its prewrite and its
@@ -304,8 +372,12 @@ impl Daemon {
         }
         #[cfg(test)]
         {
-            let barrier = COMPACT_BARRIER.lock_ok().clone();
-            if let Some(b) = barrier {
+            let spool = self.spool.display().to_string();
+            let barrier = COMPACT_BARRIER
+                .lock_ok()
+                .clone()
+                .filter(|(k, _)| *k == spool);
+            if let Some((_, b)) = barrier {
                 b.wait();
             }
         }
@@ -875,7 +947,7 @@ mod store_tests {
         // Hold the compaction open in the exact gap: snapshot taken,
         // replacement not yet renamed into place.
         let gate = Arc::new(std::sync::Barrier::new(2));
-        *super::COMPACT_BARRIER.lock_ok() = Some(gate.clone());
+        *super::COMPACT_BARRIER.lock_ok() = Some((d.spool.display().to_string(), gate.clone()));
         let compactor = {
             let d = d.clone();
             std::thread::spawn(move || assert!(d.history_compact()))
@@ -1021,6 +1093,74 @@ mod store_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// An NZBGet delete verb that owes a history row must not depend on
+    /// `park` to make that row durable.
+    ///
+    /// For a job caught DOWNLOADING, park is a long way off: the fetch
+    /// has to drain and the deferred file removal has to run (unbounded
+    /// on a hung NAS) before it writes anything. The handler meanwhile
+    /// drops the queue row and calls `save_queue`, publishing a
+    /// queue.json the record has already left - so a kill in between
+    /// lost it from BOTH stores: no DELETED/MANUAL row for the dupe
+    /// check or the retry button, and under `GroupParkDelete` (files
+    /// KEPT by contract) a whole payload on disk that nothing named
+    /// (Codex sweep 14 Aug M1).
+    #[test]
+    fn a_deleted_active_job_is_durable_before_park_can_file_it() {
+        let dir = tmp("del-prewrite");
+        let d = test_daemon(&dir);
+        let v = json!({
+            "nzo_id": "nzo-actdel-1", "name": "Cancelled.Release",
+            "out_dir": "/tmp/o", "nzb_path": "/tmp/n.nzb", "state": "Downloading",
+        });
+        let job = Arc::new(Mutex::new(job_from_json(&v).expect("job")));
+        // `job_from_json` restores every nonterminal state as Queued -
+        // that is the point of the override below, so set the live state
+        // by hand rather than through the wire form.
+        job.lock_ok().state = JobState::Downloading;
+        d.queue.lock_ok().push_back(job.clone());
+        assert!(d.save_queue(), "the queue snapshot the delete starts from");
+
+        // The delete verb's active arm, in order: the durable
+        // placeholder, then the tombstone, then the row leaving the
+        // queue and the save that publishes its absence.
+        d.delete_prewrite(&job, "MANUAL");
+        {
+            let mut g = job.lock_ok();
+            g.tombstone = true;
+            g.delete_status = "MANUAL".into();
+        }
+        d.queue.lock_ok().retain(|j| !Arc::ptr_eq(j, &job));
+        assert!(d.save_queue());
+        // The live record is untouched by the prewrite: the pipeline is
+        // still running, and stamping it terminal here would be a lie
+        // the runner reads.
+        assert_eq!(job.lock_ok().state, JobState::Downloading);
+
+        // ...and the process dies right there, before the fetch drains.
+        let d2 = test_daemon(&dir);
+        d2.load_queue();
+        let h = d2.history.lock_ok();
+        let row = h
+            .iter()
+            .find(|j| j.lock_ok().nzo_id == "nzo-actdel-1")
+            .cloned()
+            .expect("the deleted record was lost from BOTH stores");
+        drop(h);
+        let g = row.lock_ok();
+        assert_eq!(g.delete_status, "MANUAL", "the row must say why it is here");
+        // A nonterminal state restores as Queued, so an un-overridden
+        // row would sit in history looking like a job waiting to run.
+        assert_eq!(g.state, JobState::Failed);
+        assert!(g.finished_unix.is_some(), "and it must have an age");
+        drop(g);
+        assert!(
+            d2.queue.lock_ok().is_empty(),
+            "and it must not come back as a queued job as well"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The queue going idle without a park still says so.
     ///
     /// `queue.idle` was evaluated only from `Daemon::park`, so deleting
@@ -1042,6 +1182,72 @@ mod store_tests {
             .filter(|e| e["kind"] == "queue.idle")
             .collect();
         assert_eq!(idle.len(), 1, "{events:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ...and RESUMING a job is one of the things that re-arms it.
+    ///
+    /// Only the add and the runner's pick used to clear the latch, and
+    /// neither can happen while a global pause (or an offline/disk/quota
+    /// hold) keeps `pick_job` away. So pause -> resume -> pause on the
+    /// last job announced the first idle edge and swallowed the second,
+    /// even though the queue had genuinely gone runnable and quiet again
+    /// in between (Codex sweep 14 Aug L2).
+    #[test]
+    fn resuming_a_job_re_arms_the_idle_latch() {
+        let dir = tmp("idle-resume");
+        let d = test_daemon(&dir);
+        let v = json!({
+            "nzo_id": "nzo-idle-1", "name": "Runnable.Release",
+            "out_dir": "/tmp/o", "nzb_path": "/tmp/n.nzb", "state": "Queued",
+        });
+        let job = Arc::new(Mutex::new(job_from_json(&v).expect("job")));
+        d.queue.lock_ok().push_back(job.clone());
+
+        let idles = |d: &Arc<Daemon>| {
+            d.life_since(0)
+                .0
+                .iter()
+                .filter(|e| e["kind"] == "queue.idle")
+                .count()
+        };
+        // A runnable job means the queue is not idle, whatever the latch
+        // says - so this emits nothing and leaves the latch as it found it.
+        d.queue_idle_latch
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        d.note_queue_idle();
+        assert_eq!(idles(&d), 0, "a runnable queue is not idle");
+
+        let pause = |d: &Arc<Daemon>, job: &Arc<Mutex<Job>>, on: bool| {
+            let _q = d.queue.lock_ok();
+            let mut g = job.lock_ok();
+            assert!(crate::serve::api::queue::apply_pause(d, &mut g, on));
+        };
+        pause(&d, &job, true);
+        d.note_queue_idle();
+        assert_eq!(
+            idles(&d),
+            1,
+            "pausing the last runnable job idles the queue"
+        );
+
+        // The queue is runnable again, and nothing can pick it up.
+        pause(&d, &job, false);
+        d.note_queue_idle();
+        assert_eq!(idles(&d), 1, "a runnable queue is still not idle");
+
+        pause(&d, &job, true);
+        d.note_queue_idle();
+        assert_eq!(
+            idles(&d),
+            2,
+            "the second idle transition was swallowed - the resume never re-armed the latch"
+        );
+
+        // And the latch still keeps repeats silent, which is what stops
+        // an over-broad re-arm from turning every poll into an event.
+        d.note_queue_idle();
+        assert_eq!(idles(&d), 2, "the latch must keep repeats silent");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

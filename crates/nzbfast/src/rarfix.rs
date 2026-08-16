@@ -163,20 +163,42 @@ pub(crate) fn try_unrar_spent(
                     .to_lowercase(),
             )
         };
+        // A numeric-only set (`Movie.001`, `Movie.002`) shares no
+        // release_stem - release_stem keeps a generic numeric tail on
+        // purpose, so `.001` and `.002` are different stems - and the
+        // walk below only admits files named `.rar`. Both together meant
+        // a second numeric set in the same directory was invisible here,
+        // even though `stem_volume_set` groups it correctly once it is
+        // handed the lead volume (Fable sweep 15 Aug). Key those by
+        // numeric base, in a namespace no release_stem can collide with,
+        // and require the magic on both sides so a `.7z.001` or
+        // `.zip.001` part owned by another arm can never form a group.
+        let num_key = |p: &std::path::Path| -> Option<String> {
+            let name = p.file_name()?.to_string_lossy().to_lowercase();
+            Some(format!("\u{0}num:{}", numeric_vol_base(&name)?))
+        };
+        let group_key = |p: &std::path::Path| -> String {
+            match num_key(p) {
+                Some(k) if rar_magic(p) => k,
+                _ => key(p).to_string(),
+            }
+        };
         let mut by_stem: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
-        by_stem.entry(key(&first)).or_default().push(first.clone());
+        by_stem
+            .entry(group_key(&first))
+            .or_default()
+            .push(first.clone());
         if let Ok(entries) = std::fs::read_dir(dir) {
             for e in entries.flatten() {
                 let p = e.path();
-                if p != first
-                    && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("rar"))
-                    && rar_magic(&p)
-                {
-                    by_stem.entry(key(&p)).or_default().push(p);
+                let named_rar = p.extension().is_some_and(|x| x.eq_ignore_ascii_case("rar"));
+                let numeric = num_key(&p).is_some();
+                if p != first && (named_rar || numeric) && rar_magic(&p) {
+                    by_stem.entry(group_key(&p)).or_default().push(p);
                 }
             }
         }
-        let lead = key(&first);
+        let lead = group_key(&first);
         if let Some(g) = by_stem.remove(&lead) {
             groups.push((lead, g));
         }
@@ -611,7 +633,7 @@ pub(crate) fn sweep_stale_rev_temps(dir: &std::path::Path) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if !name.to_string_lossy().starts_with("revtmp") {
+        if !is_owned_rev_temp(&name.to_string_lossy()) {
             continue;
         }
         let stale = entry
@@ -623,6 +645,32 @@ pub(crate) fn sweep_stale_rev_temps(dir: &std::path::Path) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// Exactly the staging shape written below: `revtmp<pid>-<slot>-<n>`, all
+/// three fields decimal digits.
+///
+/// The sweep used to accept the bare `revtmp` prefix, and its delete is
+/// unconditional, so any pre-existing file whose name merely started with
+/// those six letters and whose mtime was over six hours old was destroyed.
+/// That reaches the user's own files: `nzbfast extract <dir>` points this at
+/// a directory of arbitrary content, and every restored file carries the
+/// archive's recorded mtime, which is routinely years old. Matching the whole
+/// grammar keeps the sweep to names this code wrote. Leading zeros and
+/// oversized pid fields still match, so no live temp is orphaned.
+fn is_owned_rev_temp(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("revtmp") else {
+        return false;
+    };
+    let mut fields = rest.split('-');
+    let (Some(pid), Some(slot), Some(n), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    [pid, slot, n]
+        .iter()
+        .all(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Last case-insensitive occurrence of an ASCII `needle`, as a byte offset
@@ -1021,10 +1069,25 @@ pub(crate) fn collect_rar_volumes(dir: &std::path::Path) -> Result<Vec<PathBuf>>
     Ok(volumes)
 }
 
-/// The named RAR volumes in `dir` sharing `first`'s release stem, natural
+/// The base of a WinRAR numeric volume name: `film.001` -> `film`. `None`
+/// for anything whose extension is not a 2-4 digit ordinal, which is the
+/// same tail width `stem_volume_set`'s name grammar already accepts.
+///
+/// Deliberately narrow, and never a substitute for `release_stem`: this
+/// only answers "are these two names the same numeric series", and every
+/// caller pairs it with the Rar! magic before believing it.
+pub(crate) fn numeric_vol_base(name: &str) -> Option<&str> {
+    let p = name.rfind('.')?;
+    let tail = &name[p + 1..];
+    ((2..=4).contains(&tail.len()) && tail.bytes().all(|c| c.is_ascii_digit())).then(|| &name[..p])
+}
+
+/// The named RAR volumes in `dir` belonging to `first`'s set, natural
 /// volume order - the on-disk set an unpack starting at `first` reads.
 /// Same volume-name grammar as reextract_dir: .rar/.rNN by name, rollover
-/// (.sNN..) and numeric (.001) only with the Rar! magic.
+/// (.sNN..) and numeric (.001) only with the Rar! magic. Membership is the
+/// shared release stem, except for a numeric-only set, which has no stem
+/// to share - see the note on `numeric_base` below.
 pub(crate) fn stem_volume_set(
     dir: &std::path::Path,
     first: &std::path::Path,
@@ -1045,7 +1108,22 @@ pub(crate) fn stem_volume_set(
     // pass, and an outright failure on a box with no unrar) and left all
     // 55 GB of spent volumes on disk, because the caller deletes exactly
     // what this reports.
-    let stem = release_stem(&first_name.to_lowercase());
+    let lower_first = first_name.to_lowercase();
+    let stem = release_stem(&lower_first);
+    // A numeric-only set (`film.001`, `film.002` …) has no stem to group by:
+    // `release_stem` deliberately keeps a bare numeric tail, so that
+    // `Backup.2019.001` stays one release in the index. Applied here it made
+    // every volume its own stem, and the set arrived at the extractor as ONE
+    // volume of a split archive: "RAR 5 split entry is incomplete", then a
+    // fallback to an unrar that a default install does not ship, so the job
+    // failed with both volumes sitting on disk. Where the FIRST volume is
+    // itself a magic-carrying numeric volume, group by the numeric base
+    // instead. The magic is required on both sides so a byte-split
+    // `.zip.001`/`.7z.001` part - owned by other arms of the ladder - can
+    // never be swept in, because the caller DELETES what this reports.
+    let numeric_base = numeric_vol_base(&lower_first)
+        .filter(|_| rar_magic(first))
+        .map(str::to_string);
     let mut volumes: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
@@ -1066,7 +1144,11 @@ pub(crate) fn stem_volume_set(
                 && t[1..].bytes().all(|c| c.is_ascii_digit()))
                 || ((2..=4).contains(&t.len()) && t.bytes().all(|c| c.is_ascii_digit()))
         });
-        if (by_name || (rollover_or_numeric && rar_magic(&path))) && release_stem(&name) == stem {
+        let same_set = match numeric_base.as_deref() {
+            Some(base) => numeric_vol_base(&name).is_some_and(|b| b == base) && rar_magic(&path),
+            None => release_stem(&name) == stem,
+        };
+        if (by_name || (rollover_or_numeric && rar_magic(&path))) && same_set {
             volumes.push(path);
         }
     }
@@ -1904,6 +1986,10 @@ pub(crate) fn rar_magic(path: &std::path::Path) -> bool {
 #[cfg(test)]
 #[path = "rarfix_rev_recovery_tests.rs"]
 mod rarfix_rev_recovery_tests;
+
+#[cfg(test)]
+#[path = "rarfix_numeric_volume_tests.rs"]
+mod rarfix_numeric_volume_tests;
 
 #[cfg(test)]
 mod native_unrar_tests {

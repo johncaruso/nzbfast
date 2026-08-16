@@ -1,0 +1,29 @@
+#!/bin/sh
+# Stop the daemon when the package is going away - and ONLY then.
+#
+# prerm also runs with $1 = "upgrade", where stopping would be wrong: the
+# postinst try-restarts a running daemon after the new binary is in
+# place, so an upgrade is a restart, not a stop-and-hope-something-starts.
+set -e
+
+UNIT=nzbfast.service
+
+case "$1" in
+    remove|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            if command -v deb-systemd-invoke >/dev/null 2>&1; then
+                deb-systemd-invoke stop "$UNIT" >/dev/null 2>&1 || true
+            else
+                systemctl stop "$UNIT" >/dev/null 2>&1 || true
+            fi
+        fi
+        ;;
+    upgrade|failed-upgrade)
+        ;;
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

@@ -1089,11 +1089,10 @@ palveluntarjoajillasi, punainen varmuudella mennyttä. Ei merkintää tarkoittaa
 kaikki näyttää hyvältä.</li>
 <li><b>siivottu</b>-merkin ryhmissä, joista tuoreita julkaisuja jo poistetaan, jolloin
 erotat kuolevan ryhmän epäonnisesta julkaisusta.</li>
-<li><b>Ohita palveluntarjoajat, jotka oraakkeli on todennut tyhjiksi</b> (Asetukset,
-<b>oletuksena pois, kokeellinen</b>): kun tarkistus on varma, että yhden
-palveluntarjoajan runkoverkko on menettänyt julkaisun, se ohitetaan tuon latauksen
-osalta suoraan sen sijaan että odotettaisiin sen epäonnistumista. Viimeistä jäljellä
-olevaa palveluntarjoajaasi se ei ohita koskaan.</li>
+<li><b>Oraakkelin tyhjiksi toteamat palveluntarjoajat kysytään viimeisenä</b> (Asetukset,
+<b>oletuksena pois, kokeellinen</b>): kun tarkistus on varma, että yhden palveluntarjoajan runkoverkko on menettänyt
+julkaisun, siltä kysytään tuossa latauksessa viimeisenä eikä ensimmäisenä. Mitään ei
+poisteta, joten väärä arvio maksaa hieman aikaa eikä latausta.</li>
 </ul>
 <p class="dim">Tuomio on aihetodisteisiin perustuva ennuste, ei takuu. Yhtä NZB:tä
 koskevan varman vastauksen antaa <code>nzbfast check</code>
@@ -1202,6 +1201,11 @@ luo se uudelleen samoilla taltioasetuksilla - Synology-oppaan läpikävely näyt
 sen napsautus napsautukselta, myös aikataulutettuna.</td></tr>
 <tr><td>Synology (paketti)</td><td>Asenna uusi <code>.spk</code> Package
 Centerissä; se päivittyy paikallaan.</td></tr>
+<tr><td>QNAP (paketti, beta)</td><td>Asenna uusi <code>.qpkg</code> App
+Centerissä; se päivittyy paikalleen. Asetuksesi ja latauksesi ovat sovelluksen
+oman kansion ulkopuolella, joten päivitys tai poisto ei vie niitä
+mukanaan.</td></tr>
+<tr><td>Debian / Ubuntu (.deb)<br>Fedora / RHEL (.rpm)</td><td>Asenna uusi paketti vanhan päälle: <code>sudo dpkg -i nzbfast_*.deb</code> tai <code>sudo rpm -U nzbfast-*.rpm</code>. Asetuskansiosi ei kuulu pakettiin, joten päivitys ei voi korvata siellä mitään, ja omat muutoksesi tiedostoon <code>/etc/nzbfast/nzbfast.env</code> säilyvät. Palvelu käynnistetään uudelleen vain, jos se oli jo käynnissä.</td></tr>
 <tr><td>Homebrew</td><td><code>brew upgrade nzbfast</code></td></tr>
 <tr><td>Pelkkä binääri</td><td>Korvaa binääri. Määrityksesi pysyy siellä, minne
 sen teit (<a href="#files">§17</a>).</td></tr>
@@ -1265,6 +1269,11 @@ kansio sisältää kaiken varmuuskopioimisen arvoisen:</p>
 isäntäkoneen kansio, jonka liitit siihen. Unraidilla se on sovelluksen
 appdata-kansio.</td></tr>
 <tr><td>Synology-paketti</td><td><code>/var/packages/nzbfast/var/</code></td></tr>
+<tr><td>QNAP-paketti</td><td>Yleensä
+<code>/share/Download/nzbfast/config/</code>. Kansio valitaan asennuksessa ja se
+näkyy App Centerin lokissa; myös sovelluksen oma <code>nzbfast.env</code> kirjaa
+sen.</td></tr>
+<tr><td>Debian-/RPM-paketti</td><td><code>/var/lib/nzbfast/</code></td></tr>
 <tr><td>Terminaali</td><td>Kansio, jossa ajoit komennon <code>nzbfast setup</code>,
 tai minne <code>--config</code> / <code>$NZBFAST_CONFIG</code> osoittaa.</td></tr>
 </table></div>

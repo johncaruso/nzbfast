@@ -197,6 +197,32 @@ pub(super) fn crc_gate(
     })
 }
 
+/// Build the gate for a stored whole-file CRC whose OWNING piece is
+/// known - the piece whose header actually stored the value. For a split
+/// entry that is the TAIL piece, and its record is the one that decides
+/// the comparison: real `rar` sets the tweaked-checksum flag on the tail
+/// alone (the earlier pieces store their own volume's plain CRC), so a
+/// gate built from the head's record compared the bare CRC against the
+/// tail's keyed fold and false-failed every intact split set. The fold
+/// key also derives from the owner's own salt, not the head's.
+///
+/// `None` when nothing is checkable: no stored value, or a tweaked value
+/// whose fold key cannot be derived (no password / RAR4-shaped record) -
+/// a plain comparison against a folded value would false-fail.
+pub(super) fn crc_gate_from(
+    stored: Option<u32>,
+    owner: Option<&EntryCrypt>,
+    pw: Option<&str>,
+) -> Option<CrcGate> {
+    let stored = stored?;
+    let hash_key = if owner.is_some_and(|c| c.tweaked_checksum()) {
+        Some(owner?.derive(pw?)?.hash_key?)
+    } else {
+        None
+    };
+    Some(CrcGate { stored, hash_key })
+}
+
 /// per-file mutex.
 pub(super) struct CryptoState {
     pub(super) key: rarcrypt::AesKey,
@@ -205,10 +231,18 @@ pub(super) struct CryptoState {
     pub(super) unp: u64,
     /// Posted ciphertext length = align16(unp).
     pub(super) cipher_len: u64,
-    /// Stored plaintext checksum when checkable (single-piece entry);
-    /// verified at finish from the composed runs, through the keyed fold
-    /// when the entry's checksum is tweaked.
+    /// Stored plaintext checksum when checkable at creation (single-piece
+    /// entry); verified at finish from the composed runs, through the
+    /// keyed fold when the entry's checksum is tweaked. A SPLIT entry's
+    /// whole-file CRC lives on its tail piece, which may not have arrived
+    /// when this state is created - `None` here, and `decrypt_finished`
+    /// resolves the gate then and adjudicates via [`Self::crc_verdict_with`].
     pub(super) expect_crc: Option<CrcGate>,
+    /// Maintain the plaintext CRC runs. True when `expect_crc` is set OR
+    /// the entry is split (its tail piece's stored CRC becomes checkable
+    /// at finish); false only when no whole-file value can ever exist,
+    /// where the composition would be a pure extra pass.
+    pub(super) track_plain: bool,
     /// Output name + shared sink for the resume-journal events.
     pub(super) out_name: String,
     pub(super) events: CryptoEventSink,
@@ -225,7 +259,7 @@ pub(super) struct CryptoSt {
     /// wire as spans stream past. Pure posted bytes; repair refreshes
     /// any it overwrites.
     pub(super) checkpoints: HashMap<u64, [u8; 16]>,
-    /// Plaintext CRC composition (maintained only when expect_crc is
+    /// Plaintext CRC composition (maintained only when `track_plain` is
     /// set - otherwise it would be a pure extra pass).
     pub(super) plain: CrcRuns,
     /// Plaintext of the final cipher block beyond `unp` (the <=15
@@ -265,6 +299,7 @@ impl CryptoState {
         iv: [u8; 16],
         unp: u64,
         expect_crc: Option<CrcGate>,
+        track_plain: bool,
         out_name: String,
         events: CryptoEventSink,
     ) -> CryptoState {
@@ -273,6 +308,7 @@ impl CryptoState {
             iv,
             unp,
             cipher_len: rarcrypt::align16(unp),
+            track_plain: track_plain || expect_crc.is_some(),
             expect_crc,
             out_name,
             events,
@@ -342,7 +378,7 @@ impl CryptoState {
         if plain_end > at {
             let n = (plain_end - at) as usize;
             w.write_at(at, &buf[..n])?;
-            if self.expect_crc.is_some() {
+            if self.track_plain {
                 if overwrite_crc {
                     st.plain.overwrite(at, &buf[..n]);
                 } else {
@@ -681,6 +717,15 @@ impl CryptoState {
     /// the file is not complete).
     pub(super) fn crc_verdict(&self) -> Option<bool> {
         let gate = self.expect_crc?;
+        self.crc_verdict_with(&gate)
+    }
+
+    /// [`Self::crc_verdict`] against a gate resolved at FINISH rather
+    /// than at state creation: a split entry's whole-file CRC lives on
+    /// its tail piece, which may not have been mapped when the first
+    /// span latched this state. Meaningful only when `track_plain` was
+    /// set - otherwise the runs are empty and the verdict is None.
+    pub(super) fn crc_verdict_with(&self, gate: &CrcGate) -> Option<bool> {
         let st = self.st.lock_ok();
         let got = st.plain.whole(self.unp)?;
         Some(gate.accepts(got))
@@ -1453,10 +1498,30 @@ impl Extractor {
             // first: the re-parse re-stashes whatever is still header
             // (and maps the rest), so leaving the old charge would
             // double-bill every stashed byte.
-            let headers = std::mem::take(&mut inner.slots[slot].header_spans);
-            for (off, span) in headers {
-                let bytes = Self::reclaim_span(inner, span)?;
-                self.rar_span(inner, slot, off, &bytes, None, false, None)?;
+            // The stash is OUT of the slot now, so a reclaim or a
+            // re-parse that fails partway must uncharge every span it
+            // never visited: dropping the rest of the vec frees the
+            // memory but leaves the budget - and the scratch reservation
+            // - charged for it, and the extractor then demotes on a
+            // ceiling it is no longer using. Same shape as the chase and
+            // 7z attach paths.
+            let mut rest = std::mem::take(&mut inner.slots[slot].header_spans).into_iter();
+            let mut failed = None;
+            for (off, span) in rest.by_ref() {
+                let fed = match Self::reclaim_span(inner, span) {
+                    Ok(bytes) => self.rar_span(inner, slot, off, &bytes, None, false, None),
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = fed {
+                    failed = Some(e);
+                    break;
+                }
+            }
+            if let Some(e) = failed {
+                for (_, span) in rest {
+                    Self::uncharge_span(inner, &span);
+                }
+                return Err(e);
             }
             self.drain_holds(inner, slot)?;
             println!(
@@ -1710,13 +1775,18 @@ impl Extractor {
         // Only a single-piece entry's stored CRC covers the whole
         // plaintext. A tweaked checksum is keyed rather than useless -
         // the gate folds the computed CRC before comparing (Increment
-        // B), same rules as the legacy finish pass.
+        // B), same rules as the legacy finish pass. A SPLIT entry's
+        // whole-file CRC lives on its tail piece, which may not be
+        // mapped yet - no gate here, but the plain runs still compose
+        // (`track_plain`) so `decrypt_finished` can adjudicate against
+        // the tail's stored value once every volume is in.
         let expect_crc = crc_gate(file_crc.filter(|_| !split_after), &c, &keys);
         let cs = Arc::new(CryptoState::new(
             keys.aes.clone(),
             keys.iv,
             unp,
             expect_crc,
+            split_after,
             key.clone(),
             inner.crypto_events.clone(),
         ));
@@ -1912,7 +1982,12 @@ impl Extractor {
                 // which is why a multi-volume encrypted set used to have
                 // no verifiable checksum at all. By finish every volume
                 // has arrived, so the tail is simply here to be read.
-                let mut tail_crcs: HashMap<&str, u32> = HashMap::new();
+                // The tail's own crypt record rides along: it owns the
+                // stored value, so ITS tweaked-checksum flag (and salt)
+                // decide the comparison - real `rar` sets the flag on
+                // the tail alone, and a gate built from the head's
+                // record false-failed every intact split set.
+                let mut tail_crcs: HashMap<&str, (u32, Option<&EntryCrypt>)> = HashMap::new();
                 // ...and, from the same piece, whether the entry states a
                 // digest instead of a CRC32. Read off the TAIL for the same
                 // reason: the whole-file checks live there.
@@ -1928,7 +2003,7 @@ impl Extractor {
                         if !e.split_after {
                             match e.file_crc {
                                 Some(crc) => {
-                                    tail_crcs.insert(e.name.as_str(), crc);
+                                    tail_crcs.insert(e.name.as_str(), (crc, e.crypt.as_ref()));
                                 }
                                 None if e.hash.is_some() => {
                                     tail_hash_only.insert(e.name.as_str());
@@ -1961,7 +2036,7 @@ impl Extractor {
                             // above). Using the head's value on a split file
                             // would false-fail - it describes only that
                             // volume's bytes.
-                            let whole_crc = tail_crcs.get(e.name.as_str()).copied();
+                            let whole_crc = tail_crcs.get(e.name.as_str()).map(|&(c, _)| c);
                             let hash_only =
                                 whole_crc.is_none() && tail_hash_only.contains(e.name.as_str());
                             heads.entry(e.name.clone()).or_insert((
@@ -1974,10 +2049,14 @@ impl Extractor {
                         }
                     }
                 }
-                for (_fname, (c, unp, out, file_crc, hash_only)) in heads {
+                for (fname, (c, unp, out, file_crc, hash_only)) in heads {
                     let Some(w) = inner.inner_writers.get(&out) else {
                         continue;
                     };
+                    // The record that OWNS the stored whole-file CRC (the
+                    // tail piece's, for a split entry) - the one whose
+                    // tweaked flag and salt the gate must use.
+                    let crc_owner = tail_crcs.get(fname.as_str()).and_then(|&(_, c)| c);
                     // Plaintext-once file: already decrypted in-stream.
                     // Verify instead of building a decrypt job - an
                     // incomplete cipher record condemns the group like a
@@ -1986,7 +2065,18 @@ impl Extractor {
                     // archive damaged before posting; the posted bytes
                     // remain reproducible through the shim for fallback).
                     if let Some(cs) = inner.crypto_files.get(&out) {
-                        if cs.crc_verdict() == Some(false) {
+                        // Unsplit: the state's own gate. Split: the gate
+                        // could not exist at state creation (the tail may
+                        // not have been mapped) - resolve it NOW from the
+                        // tail's stored CRC; the plain runs composed all
+                        // along (`track_plain`).
+                        let verdict = if cs.expect_crc.is_some() {
+                            cs.crc_verdict()
+                        } else {
+                            crc_gate_from(file_crc, crc_owner, inner.password.as_deref())
+                                .and_then(|gate| cs.crc_verdict_with(&gate))
+                        };
+                        if verdict == Some(false) {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "encrypted RAR file failed its stored CRC after decryption",
@@ -2037,7 +2127,12 @@ impl Extractor {
                         // default), a set one stores its keyed fold, and the
                         // gate handles both. Password-check proves the KEY,
                         // not that every ciphertext block survived the wire.
-                        expect_crc: aes.as_ref().and_then(|k| crc_gate(file_crc, &c, k)),
+                        // Built from the record that OWNS the stored value
+                        // (the tail piece's, for a split entry): its
+                        // tweaked flag and salt decide the comparison, and
+                        // the head's record disagreeing with them is
+                        // exactly the real-`rar` split shape.
+                        expect_crc: crc_gate_from(file_crc, crc_owner, inner.password.as_deref()),
                         verified: aes.as_ref().is_some_and(|k| c.check_verifies(k)),
                         hash_only,
                         crypt: c,

@@ -236,7 +236,10 @@ pub fn import(ini_path: &Path, out_path: &Path, force: bool) -> Result<()> {
                 "host": s.host,
                 "port": s.port.unwrap_or(if s.ssl { 563 } else { 119 }),
                 "tls": s.ssl,
-                "connections": s.connections.unwrap_or(8),
+                // Same default as config.rs's own sabnzbd.ini loader: an
+                // ini with no connections line must not import at 8 when
+                // the direct-read fallback would run it at 100.
+                "connections": s.connections.unwrap_or(nzbkit::config::default_connections()),
             });
             if let Some(u) = &s.username {
                 o["username"] = json!(u);
@@ -302,7 +305,8 @@ pub fn import(ini_path: &Path, out_path: &Path, force: bool) -> Result<()> {
             s.name,
             s.host,
             s.port.unwrap_or(if s.ssl { 563 } else { 119 }),
-            s.connections.unwrap_or(8),
+            s.connections
+                .unwrap_or(nzbkit::config::default_connections()),
             if s.ssl { ", tls" } else { "" },
             if s.username.is_some() { ", auth" } else { "" },
             // Say the tier out loud: the whole point of the fix is that a

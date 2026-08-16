@@ -1,0 +1,159 @@
+# nzbfast Flatpak - BETA
+#
+# Built from source, as Flathub requires for a source-available project
+# (nzbfast is GPL-3.0-or-later). The Rust dependency set is pre-fetched
+# through cargo-sources.json because there is no network access during a
+# Flathub build; regenerate it with ./generate-cargo-sources.sh whenever
+# Cargo.lock changes.
+#
+# NOT in the signed update manifest (packaging/make-latest-json.sh), and
+# never will be, for the same reason the .deb and .rpm are not: Flatpak
+# owns the files it installed and has its own update channel. The daemon
+# detects the sandbox (serve/update.rs `flatpak_install`) and the
+# dashboard shows `flatpak update` instead of the download page, so the
+# in-app updater never offers an install path that cannot work here.
+app-id: io.github.nzbfast.nzbfast
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: nzbfast-launcher
+
+# ---------------------------------------------------------------------
+# Sandbox permissions
+#
+# This is the part that decides whether the package works or generates
+# support tickets. A Flatpak sees only what it is granted, and a denial
+# surfaces to the daemon as a plain EPERM on a folder that looks
+# perfectly writable from a terminal - the same failure shape that took
+# the live daemon's downloads offline for a day under macOS TCC on
+# 15 Aug 2026, with no prompt and no error the user could act on.
+#
+# Every line below is here because something breaks without it.
+finish-args:
+  # NNTP to the providers, and the dashboard/API listener itself. The
+  # whole program is network I/O; nothing works without this.
+  - --share=network
+
+  # THE DOWNLOAD FOLDER. This is the permission that matters.
+  #
+  # A Usenet downloader's output can be anywhere: a second disk, a NAS
+  # mount, an external drive, a folder inside the home directory that is
+  # not ~/Downloads. The user picks it in the dashboard AFTER install, so
+  # the manifest cannot know the path and cannot ask for it later - a
+  # Flatpak's permissions are fixed at install time.
+  #
+  # `home` plus the mount points below is deliberately BROADER than
+  # SABnzbd's Flathub package (xdg-download + the three mount points) and
+  # deliberately NARROWER than qBittorrent's, Transmission's and
+  # Fragments', which all take `--filesystem=host`. SABnzbd's set breaks
+  # the moment somebody downloads to ~/media instead of ~/Downloads,
+  # which is a normal thing to do and a support ticket we would rather
+  # not field. `host` would cover that too, but it also hands over /etc,
+  # /usr and /var, which nzbfast has no business reading - and
+  # qBittorrent's own maintainers document `host` as a mistake they can
+  # no longer undo without breaking existing users.
+  #
+  # `home` is a flatpak-builder-lint ERROR
+  # (`finish-args-home-filesystem-access`), and so is `host`
+  # (`finish-args-host-filesystem-access`) - both need a Flathub
+  # exception, which is what qBittorrent, Transmission and Fragments
+  # each hold for `host`. Only SABnzbd's narrower set lints clean.
+  # MEASURED, all three variants, 15 Aug 2026. That exception is a
+  # submission-time conversation, and it does not apply to the .flatpak
+  # bundle we ship ourselves, where this line is simply the difference
+  # between working and not working for anyone whose downloads do not
+  # live in ~/Downloads. To trade it for a clean lint, swap this one line
+  # for `--filesystem=xdg-download`; everything else stays as it is.
+  - --filesystem=home
+  # Removable and secondary drives. The three standard mount roots
+  # between them cover every desktop distribution: /run/media/$USER on
+  # udisks2 systems (Fedora, Arch, KDE), /media on Debian and Ubuntu,
+  # /mnt for hand-mounted and fstab volumes.
+  - --filesystem=/mnt
+  - --filesystem=/media
+  - --filesystem=/run/media
+  # Where a home server keeps its data, and a common download target on
+  # a box that also runs Sonarr or Plex.
+  - --filesystem=/srv
+  # Network shares mounted by the desktop rather than by fstab (smb://,
+  # nfs://) live under /run/user/$UID/gvfs. Without this a share that is
+  # visible in the file manager is invisible to nzbfast, which is a
+  # confusing way to fail.
+  - --filesystem=xdg-run/gvfs
+  - --talk-name=org.gtk.vfs.*
+
+  # NOT REQUESTED, on purpose:
+  #
+  # --socket=wayland / --socket=fallback-x11 / --share=ipc
+  #   nzbfast draws nothing. Its interface is a web page, and the
+  #   launcher reaches the user's browser through the OpenURI portal,
+  #   which every Flatpak may use without holding a display socket. Peer
+  #   packages hold these for tray icons; nzbfast has no Linux tray.
+  #
+  # --filesystem=host
+  #   see above.
+  #
+  # The config, queue spool, index and API key need no permission at all:
+  # inside the sandbox XDG_CONFIG_HOME already points at the app's own
+  # private directory (~/.var/app/io.github.nzbfast.nzbfast/config), and
+  # the launcher puts the data directory there.
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/nzbfast/cargo
+    CARGO_NET_OFFLINE: 'true'
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/man
+
+modules:
+  - name: nzbfast
+    buildsystem: simple
+    build-commands:
+      # The dashboard, the wall and the 25 translation catalogues are
+      # include_str!'d into the binary, so this one command produces the
+      # whole application - there is nothing to install alongside it.
+      - cargo --offline build --release -p nzbfast --bin nzbfast
+      - install -Dm755 target/release/nzbfast -t /app/bin
+
+      # The desktop entry runs the launcher, not the daemon directly:
+      # clicking the icon has to open the dashboard, and clicking it a
+      # second time must not try to bind the port twice.
+      - install -Dm755 packaging/flatpak/nzbfast-launcher.sh /app/bin/nzbfast-launcher
+
+      - install -Dm644 packaging/flatpak/io.github.nzbfast.nzbfast.desktop
+        -t /app/share/applications
+      - install -Dm644 packaging/flatpak/io.github.nzbfast.nzbfast.metainfo.xml
+        -t /app/share/metainfo
+      # PNG, not the SVG master, and the reason is load-bearing:
+      # appstreamcli compose (which flatpak-builder runs at the end of
+      # every build) cannot read our icon.svg - "Unrecognized image file
+      # format" - and it fails the whole compose, so no metadata is
+      # produced and no bundle comes out. Regenerate with ./make-icon.sh;
+      # the full reasoning is in that script's header.
+      - install -Dm644 packaging/flatpak/io.github.nzbfast.nzbfast.png
+        /app/share/icons/hicolor/256x256/apps/io.github.nzbfast.nzbfast.png
+      - install -Dm644 LICENSE -t /app/share/licenses/io.github.nzbfast.nzbfast
+    sources:
+      - type: archive
+        url: https://github.com/nzbfast/nzbfast/archive/refs/tags/v1.1.2.tar.gz
+        sha256: 8e70b5f843fb36f20d5e4ac6735084d1517074a4117fe934543037419fef68cd
+        # `json` rather than `anitya`: nzbfast is not registered on
+        # release-monitoring.org, and this needs no registration - it
+        # reads the GitHub releases API directly. The tags carry a `v`
+        # prefix that the version must not, hence the sub().
+        x-checker-data:
+          type: json
+          is-main-source: true
+          url: https://api.github.com/repos/nzbfast/nzbfast/releases/latest
+          version-query: .tag_name | sub("^v"; "")
+          url-query: '"https://github.com/nzbfast/nzbfast/archive/refs/tags/"
+            + .tag_name + ".tar.gz"'
+      # Regenerate with ./generate-cargo-sources.sh after any Cargo.lock
+      # change, or the build fails offline on the first missing crate.
+      - cargo-sources.json

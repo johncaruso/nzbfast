@@ -423,7 +423,11 @@ fn wikidata_candidates(years: (u32, u32), minutes: u32, lang: Option<&str>) -> S
     let Some(rows) = v["results"]["bindings"].as_array() else {
         return out;
     };
-    out.answered = true;
+    // A row count at the query's own LIMIT means the window was cut off:
+    // a survivor past the cap was never seen, so this source has not
+    // ruled the rest of the window out and must not read as certainty.
+    out.answered = rows.len() < MAX_ROWS;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for row in rows.iter().take(MAX_ROWS) {
         let title = row["label"]["value"].as_str().unwrap_or("").trim();
         // A published runtime is a decimal in the graph ("108.0"); a
@@ -443,17 +447,26 @@ fn wikidata_candidates(years: (u32, u32), minutes: u32, lang: Option<&str>) -> S
         if title.is_empty() || !(0.0..=1000.0).contains(&mins) {
             continue;
         }
+        // ".../entity/Q116921951" -> "Q116921951"
+        let id = row["film"]["value"]
+            .as_str()
+            .and_then(|u| u.rsplit('/').next())
+            .unwrap_or("")
+            .to_string();
+        // One film, two rows: the query accepts an `en` label AND a `mul`
+        // one (Wikidata is migrating single-form names to `mul`), and an
+        // entity carrying both arrives twice. The uniqueness rule that
+        // decides a verdict counts rows, so the duplicate read as two
+        // different films and the answer came back Ambiguous.
+        if !id.is_empty() && !seen.insert(id.clone()) {
+            continue;
+        }
         out.window.push(Candidate {
             source: "wikidata",
             title: title.to_string(),
             year,
             runtime_min: mins as u32,
-            // ".../entity/Q116921951" -> "Q116921951"
-            id: row["film"]["value"]
-                .as_str()
-                .and_then(|u| u.rsplit('/').next())
-                .unwrap_or("")
-                .to_string(),
+            id,
         });
     }
     out
@@ -607,8 +620,16 @@ fn tmdb_candidates(key: &str, years: (u32, u32), minutes: u32, lang: Option<&str
             if title.is_empty() {
                 continue;
             }
-            let Some(runtime) = tmdb_runtime(key, id) else {
+            let Some(answer) = tmdb_runtime(key, id) else {
+                // The detail ask failed (429 mid-burst, transport, bad
+                // body). Dropping the candidate silently would count a
+                // failed lookup as evidence - a second exact-minute
+                // survivor could vanish and leave a false unique match.
+                any_failed = true;
                 continue;
+            };
+            let Some(runtime) = answer else {
+                continue; // answered: no runtime published
             };
             if !(lo..=hi).contains(&runtime) {
                 continue;
@@ -622,8 +643,13 @@ fn tmdb_candidates(key: &str, years: (u32, u32), minutes: u32, lang: Option<&str
             });
         }
         // More hits than we were willing to price: the window is bigger
-        // than we saw, so this source has NOT ruled the rest out.
-        if rows.len() > DETAIL_BUDGET {
+        // than we saw, so this source has NOT ruled the rest out. The
+        // page carries at most 20 rows (TMDB's fixed page size, equal to
+        // DETAIL_BUDGET) and only page 1 is ever fetched, so the row
+        // count alone can never exceed the budget - the declared total
+        // is the only honest measure of the window.
+        let total = v["total_results"].as_i64().unwrap_or(i64::MAX);
+        if total as usize > rows.len().min(DETAIL_BUDGET) || rows.len() > DETAIL_BUDGET {
             any_failed = true;
         }
     }
@@ -639,7 +665,12 @@ fn tmdb_candidates(key: &str, years: (u32, u32), minutes: u32, lang: Option<&str
 /// above that means the query went wrong.
 const DETAIL_BUDGET: usize = 20;
 
-fn tmdb_runtime(key: &str, id: i64) -> Option<u32> {
+/// Outer `None` = the ask itself failed (transport, status, bad body):
+/// the caller must not treat the window as fully covered. `Some(None)` =
+/// TMDB answered and publishes no usable runtime: the candidate is
+/// legitimately outside the exact-minute rule and may be dropped without
+/// weakening the answer.
+fn tmdb_runtime(key: &str, id: i64) -> Option<Option<u32>> {
     ratelimit::acquire(Provider::Tmdb);
     let url = format!("https://api.themoviedb.org/3/movie/{id}?api_key={key}");
     let body = crate::serve::shared_enrich_agent()
@@ -650,8 +681,7 @@ fn tmdb_runtime(key: &str, id: i64) -> Option<u32> {
         .into_string()
         .ok()?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let mins = v["runtime"].as_i64()?;
-    (mins > 0).then_some(mins as u32)
+    Some(v["runtime"].as_i64().filter(|m| *m > 0).map(|m| m as u32))
 }
 
 /// Minimal percent-encoding for a SPARQL query in a URL. Everything not

@@ -12,4 +12,11 @@ targets = [
   "aarch64-apple-darwin",
   "x86_64-apple-darwin",
   "x86_64-pc-windows-gnu",
+  # 32-bit ARM (Raspberry Pi 2/3/Zero 2 W on 32-bit Raspberry Pi OS),
+  # BETA - TODO 178. musl because those images' glibc predates every
+  # build host we have. Listed here so `cargo zigbuild --target
+  # armv7-unknown-linux-musleabihf` works from a fresh checkout: the
+  # target is where 64-bit assumptions surface (usize is 32-bit), and a
+  # target nobody can build without a setup step is one nobody checks.
+  "armv7-unknown-linux-musleabihf",
 ]

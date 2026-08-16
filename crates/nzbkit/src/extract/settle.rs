@@ -1332,6 +1332,24 @@ impl Extractor {
         }
         for si in 0..inner.slots.len() {
             if !inner.slots[si].holds.is_empty() {
+                // A RAR slot that never formed a group (sniffed at offset
+                // 0, but its first FILE header straddled into a lost
+                // article) is invisible to both group loops above, and
+                // drain_holds just re-holds its spans: the volume then
+                // produced no file on disk and no fallback line - the
+                // bytes evaporated when the extractor dropped, while the
+                // byte-identical situation one parse step later (group
+                // formed) materialized for repair/quarantine. Demote it
+                // like its grouped twin.
+                if matches!(inner.slots[si].mode, SlotMode::Rar) && inner.slots[si].group.is_none()
+                {
+                    self.fallback_slot_or_group(
+                        inner,
+                        si,
+                        "incomplete mapping at end of download",
+                    )?;
+                    continue;
+                }
                 if matches!(inner.slots[si].mode, SlotMode::Unknown) {
                     if inner.protect_sources {
                         let name = inner.slots[si].name.clone();

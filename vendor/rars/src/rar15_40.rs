@@ -2714,15 +2714,34 @@ mod tests {
             add_size: Some(0x89ab_cdef),
             offset: 0,
         };
-        let file = parse_file_like_header(&header, block, 0).unwrap();
+        // The declared packed size is 0x1_89ab_cdef (~6.6 GB), which is a
+        // legal FHD_LARGE value and does not fit a 32-bit `usize`.
+        // `packed_range` is a `Range<usize>`, so a 32-bit host (armv7)
+        // cannot represent this extent and the parser REFUSES the header
+        // rather than truncating it - the shape asserted below. That
+        // refusal is the whole point: a wrapped range would hand the
+        // extractor a window into the wrong bytes.
+        #[cfg(target_pointer_width = "32")]
+        {
+            assert!(matches!(
+                parse_file_like_header(&header, block, 0),
+                Err(Error::InvalidHeader(
+                    "RAR 1.5 packed file size overflows usize"
+                ))
+            ));
+        }
+        #[cfg(not(target_pointer_width = "32"))]
+        {
+            let file = parse_file_like_header(&header, block, 0).unwrap();
 
-        assert_eq!(file.pack_size, 0x0000_0001_89ab_cdef);
-        assert_eq!(file.unp_size, 0x0000_0002_7654_3210);
-        assert_eq!(file.name, name);
-        assert_eq!(
-            file.packed_range,
-            head_size..head_size + 0x0000_0001_89ab_cdefusize
-        );
+            assert_eq!(file.pack_size, 0x0000_0001_89ab_cdef);
+            assert_eq!(file.unp_size, 0x0000_0002_7654_3210);
+            assert_eq!(file.name, name);
+            assert_eq!(
+                file.packed_range,
+                head_size..head_size + 0x0000_0001_89ab_cdef_usize
+            );
+        }
     }
 
     #[test]
@@ -2751,6 +2770,21 @@ mod tests {
         archive.extend_from_slice(name);
         test_write_header_crc(&mut archive, start);
 
+        // pack_size is 0x1_0000_0000 - low word zero, high word one - so a
+        // parser that ignored the high word would compute a ZERO-length
+        // extent and sail past. It must refuse. WHICH refusal depends on
+        // the pointer width and both are correct: 64-bit builds the 4 GiB
+        // extent and finds the archive too short for it, while 32-bit
+        // cannot represent the extent at all and says so at the cast.
+        // What must never happen on either is Ok.
+        #[cfg(target_pointer_width = "32")]
+        assert!(matches!(
+            Archive::parse(&archive),
+            Err(Error::InvalidHeader(
+                "RAR 1.5 packed file size overflows usize"
+            ))
+        ));
+        #[cfg(not(target_pointer_width = "32"))]
         assert!(matches!(Archive::parse(&archive), Err(Error::TooShort)));
     }
 

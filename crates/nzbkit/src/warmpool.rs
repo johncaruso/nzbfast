@@ -175,6 +175,14 @@ pub struct WarmStats {
 
 pub struct WarmPool {
     idle: Mutex<HashMap<String, Vec<Parked>>>,
+    /// The identity keys the last `retain_servers` kept, `None` until the
+    /// first reconciliation (= everything is allowed). Consulted by
+    /// `give` under the map lock: a park landing AFTER a config reload
+    /// re-created its removed key via `entry().or_default()` stamped with
+    /// the CURRENT generation, so the reap fence built for in-flight DATE
+    /// crossers could not touch it and a stale-password session sat on
+    /// the provider's cap for up to `max_idle`.
+    retained: std::sync::Mutex<Option<std::collections::HashSet<String>>>,
     /// Whether the pool will take new connections at all.
     ///
     /// `clear` is a one-shot drain, and a drain alone cannot express
@@ -247,6 +255,7 @@ impl WarmPool {
     pub fn new(max_idle: Duration, per_server: usize) -> Arc<WarmPool> {
         let pool = Arc::new(WarmPool {
             idle: Mutex::new(HashMap::new()),
+            retained: std::sync::Mutex::new(None),
             accepting: AtomicBool::new(true),
             generation: AtomicU64::new(0),
             max_idle,
@@ -434,6 +443,20 @@ impl WarmPool {
             conn.quit().await;
             return;
         }
+        // A key `retain_servers` removed must not reappear: this park's
+        // session was authenticated under the OLD config (password, tier),
+        // and re-creating the key here would stamp it with the current
+        // generation, past the reap fence.
+        if self
+            .retained
+            .lock_ok()
+            .as_ref()
+            .is_some_and(|keep| !keep.contains(&k))
+        {
+            drop(idle);
+            conn.quit().await;
+            return;
+        }
         let v = idle.entry(k).or_default();
         if v.len() >= self.per_server {
             drop(idle);
@@ -478,6 +501,9 @@ impl WarmPool {
         let keep: std::collections::HashSet<String> = servers.iter().map(key).collect();
         let drained: Vec<Parked> = {
             let mut idle = self.idle.lock().await;
+            // Published under the map lock so a `give` serialized behind
+            // us sees the new set before it can re-create a removed key.
+            *self.retained.lock_ok() = Some(keep.clone());
             // Also invalidates DATE calls currently outside the map. It is
             // safe to drop a valid ping crossing a job boundary; it is not
             // safe to let a removed identity reappear after this returns.

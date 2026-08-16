@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.nzbfast.nzbfast</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>nzbfast</name>
+  <summary>Speed-focused Usenet downloader</summary>
+  <developer id="io.github.nzbfast">
+    <name>nzbfast</name>
+  </developer>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#dfe6f2</color>
+    <color type="primary" scheme_preference="dark">#1b2431</color>
+  </branding>
+
+  <description>
+    <p>
+      nzbfast downloads from Usenet in one pass. Fetching, decoding,
+      verifying, repairing and extracting all happen while the data is
+      arriving rather than in separate stages afterwards, so a job is
+      usually finished a moment after the last article lands.
+    </p>
+    <p>
+      It runs as a background program with a dashboard you open in your
+      browser. Clicking the nzbfast icon starts it and opens that
+      dashboard; closing the browser tab leaves it running.
+    </p>
+    <p>
+      It speaks the SABnzbd API, so Sonarr, Radarr, Lidarr, Readarr and
+      the usual phone apps talk to it without changes.
+    </p>
+    <p>Other things it does:</p>
+    <ul>
+      <li>Repairs and unpacks as the download arrives, including nested and split archives</li>
+      <li>Watches a folder for .nzb files, and takes them from your browser</li>
+      <li>Handles obfuscated and badly named posts</li>
+      <li>Shows what a file is before it has finished arriving</li>
+      <li>Speaks 25 languages</li>
+    </ul>
+    <p>
+      You need an account with a Usenet provider before nzbfast can
+      download anything. It asks for those details the first time you
+      open the dashboard.
+    </p>
+    <p>
+      This Flatpak package is a beta. The program inside it is the
+      shipped release; the packaging is what is new, and a Flatpak can
+      only reach the folders it has been granted. It comes with access to
+      your home folder and the usual places removable and network drives
+      are mounted. If you download somewhere else, grant it with Flatseal
+      or flatpak override.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.nzbfast.nzbfast.desktop</launchable>
+
+  <categories>
+    <category>Network</category>
+    <category>FileTransfer</category>
+  </categories>
+
+  <keywords>
+    <keyword>usenet</keyword>
+    <keyword>nzb</keyword>
+    <keyword>nntp</keyword>
+    <keyword>download</keyword>
+    <keyword>newsreader</keyword>
+  </keywords>
+
+  <url type="homepage">https://nzbfast.github.io/nzbfast/</url>
+  <url type="bugtracker">https://github.com/nzbfast/nzbfast/issues</url>
+  <url type="vcs-browser">https://github.com/nzbfast/nzbfast</url>
+  <url type="help">https://github.com/nzbfast/nzbfast#readme</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>The dashboard while a job is downloading</caption>
+      <image>https://nzbfast.github.io/nzbfast/assets/dash-hero.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Queue details for a running job</caption>
+      <image>https://nzbfast.github.io/nzbfast/assets/dash-queue-drawer.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Browsing what has been downloaded</caption>
+      <image>https://nzbfast.github.io/nzbfast/assets/dash-browse.png</image>
+    </screenshot>
+  </screenshots>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="1.1.2" date="2026-08-14">
+      <url type="details">https://github.com/nzbfast/nzbfast/releases/tag/v1.1.2</url>
+    </release>
+  </releases>
+</component>

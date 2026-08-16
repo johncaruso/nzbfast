@@ -110,6 +110,44 @@ fn a_junk_dot_000_does_not_hide_the_valid_set() {
 }
 
 #[test]
+fn a_split_final_payload_is_not_a_container() {
+    // Read-only sweep 2 M11: `comic.cbz.001`/`.002` is a byte-split of
+    // the COMIC. The final-name rule looked at the on-disk name, whose
+    // extension is `.001`, so it never saw `cbz` - the set grouped here,
+    // part 1 sniffed the zip magic, and the pages were extracted while
+    // `comic.cbz` was never written. The name survives the suffix.
+    let d = tmp("final-split");
+    for base in ["comic.cbz", "book.epub", "sheet.xlsx", "app.apk"] {
+        write(&d, &format!("{base}.001"), PK);
+        write(&d, &format!("{base}.002"), b"two");
+    }
+    assert!(
+        scan(&d).is_empty(),
+        "a split payload is the plain joiner's, not the zip arm's"
+    );
+    // And the stream side, which declares its sets from the NZB's own
+    // file list before a byte lands.
+    for base in ["comic.cbz", "book.epub", "sheet.xlsx", "app.apk"] {
+        assert!(
+            numeric_split_part_name(&format!("{base}.001")).is_none(),
+            "{base}.001 must not declare a zip split"
+        );
+    }
+    // The shapes either side of it are untouched: a bare-numeric set with
+    // no final extension is still a zip candidate, and a declared
+    // `.zip.NNN` set still is too.
+    assert_eq!(
+        numeric_split_part_name("Movie.001"),
+        Some(("movie".into(), 1))
+    );
+    assert_eq!(
+        split_part_name("comic.cbz.zip.001"),
+        Some(("comic.cbz.zip".into(), 1)),
+        "a real zip OF a comic is still a container"
+    );
+}
+
+#[test]
 fn obfuscated_extensionless_container() {
     let d = tmp("obf");
     write(&d, "a3f9c1d2e", PK);

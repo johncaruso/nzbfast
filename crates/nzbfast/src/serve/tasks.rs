@@ -2179,6 +2179,8 @@ pub(super) fn spawn_download_worker(
                 on_disk_bytes,
                 verifier,
                 shaper,
+                #[cfg(feature = "indexer")]
+                oracle_samples,
             } = settle_job_tail(&d, &nzo_id, &mut ledger);
             lane.submit(PostprocTicket {
                 job,
@@ -2190,6 +2192,8 @@ pub(super) fn spawn_download_worker(
                 dl_secs,
                 on_disk_bytes,
                 index_job_guard,
+                #[cfg(feature = "indexer")]
+                oracle_samples,
             })
             .await;
         }

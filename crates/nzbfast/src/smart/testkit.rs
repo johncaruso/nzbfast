@@ -74,3 +74,59 @@ pub(super) fn assert_portable(name: &str) {
         "reserved device: {name:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// The trash tests' process-global serialisation, moved out of smart.rs
+// under the size gate (TODO 106). Test-only code in a test-only module,
+// so the per-fn #[cfg(test)] each of these carried inline is dropped:
+// `mod testkit` is already gated. smart.rs re-exports them, so both the
+// sibling test children and serve/tests_jobs.rs reach them unchanged.
+/// The flags below are process-global and the trash tests write them, so
+/// those tests take this first and run one at a time. Without it `cargo
+/// test` runs them together and one test's latch - or its reset - lands
+/// inside another test's delete: `a_junk_delete_is_recoverable_and_the_
+/// opt_out_is_not` then finds its fixture hard-deleted rather than binned.
+/// Lives out here, not in one test module, because both of them need it.
+///
+/// A writer excluding only other writers was not enough: every delete in
+/// the suite READS these globals (`delete_to_trash` at its entry, the
+/// latch inside the gate), so a delete-asserting test that overlapped a
+/// writer's window saw `TRASH` on and its delete came back refused - the
+/// file it asserted gone was still there, roughly one full-suite run in
+/// four. Worse, a reader that caught the window made a REAL Trash call,
+/// which set `TRASH_ANSWERED` under nobody's lock and broke
+/// `concurrent_callers_probe_a_dead_trash_only_once` from across the
+/// module. So this is a reader-writer lock: flag-writing tests take the
+/// write side, and every test whose delete reads the flags holds
+/// [`trash_globals_steady`] across the delete and its asserts - shared
+/// among themselves, exclusive against any writer.
+fn trash_globals_lock() -> &'static std::sync::RwLock<()> {
+    static SERIAL: std::sync::RwLock<()> = std::sync::RwLock::new(());
+    &SERIAL
+}
+
+/// Exclusive side, for tests that WRITE the trash globals.
+pub(crate) fn one_trash_test_at_a_time() -> std::sync::RwLockWriteGuard<'static, ()> {
+    // Poison is nothing here: each test sets the flags it cares about on
+    // the way in, so a panicking predecessor leaves nothing to inherit.
+    crate::RwLockExt::write_ok(trash_globals_lock())
+}
+
+/// Shared side, for tests whose deletes READ the trash globals: any test
+/// that asserts what a `remove_user_file`-family delete left on disk.
+/// Take it before creating fixtures and hold it past the last assert.
+pub(crate) fn trash_globals_steady() -> std::sync::RwLockReadGuard<'static, ()> {
+    crate::RwLockExt::read_ok(trash_globals_lock())
+}
+
+/// Pretend every Trash route has given up, for tests that need a REFUSED
+/// recoverable delete without a machine that has one. The refusal is the
+/// interesting case - it is what leaves a user's download on disk after
+/// they asked for it to go - and it is otherwise unreachable from a test:
+/// the real latch only sets after a backend blows `TRASH_DEADLINE`.
+///
+/// Take [`one_trash_test_at_a_time`] first, and set it back on the way
+/// out: this is the same process-global every other trash test reads.
+pub(crate) fn force_trash_unresponsive(v: bool) {
+    TRASH_UNRESPONSIVE.store(v, std::sync::atomic::Ordering::Relaxed);
+}

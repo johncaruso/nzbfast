@@ -204,9 +204,17 @@ impl Skip {
 pub struct VerdictRow {
     /// None = the ledger declined to predict (too thin).
     pub verdict: Option<Verdict>,
+    /// Releases with CONCLUSIVE ground truth for this predicted class.
     pub releases: usize,
     /// Measured completable: carried by at least one enabled backbone.
     pub completable: usize,
+    /// Releases whose ground truth is inconclusive: no backbone carried
+    /// them, but at least one enabled backbone was never measured for
+    /// them (it failed to connect, or gave up mid-run). Counted apart
+    /// from `releases` because "nobody we asked had it" is not "nobody
+    /// has it" - and the backbone we could not ask is often exactly the
+    /// one the ledger calls healthy.
+    pub partial: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -312,14 +320,19 @@ pub fn score(
     });
 
     // Per-release verdict scoring: a release is completable when any
-    // enabled backbone carried it.
-    let mut per_rel: BTreeMap<i64, (String, u32, bool, bool)> = BTreeMap::new();
+    // enabled backbone carried it. The fourth field is WHICH backbones
+    // answered, not merely whether any did: `Snapshot::verdict` spans
+    // every enabled backbone, so scoring a "nobody carried it" against
+    // it is only honest when every enabled backbone was measured. A
+    // backbone that failed to connect contributes no pair at all, so
+    // coverage gaps are silent unless they are counted here.
+    let mut per_rel: BTreeMap<i64, (String, u32, bool, BTreeSet<String>)> = BTreeMap::new();
     for p in pairs {
         let e = per_rel
             .entry(p.release_id)
-            .or_insert((p.family.clone(), p.age_days, false, false));
+            .or_insert_with(|| (p.family.clone(), p.age_days, false, BTreeSet::new()));
         if let Some(c) = p.carried(truth) {
-            e.3 = true; // measured at all
+            e.3.insert(p.backbone.clone());
             e.2 |= c;
         }
     }
@@ -330,17 +343,28 @@ pub fn score(
         Some(Verdict::Gone) => 2,
         None => 3,
     };
-    for (_id, (family, age, completable, measured)) in per_rel {
-        if !measured {
-            continue;
+    for (_id, (family, age, completable, measured_bbs)) in per_rel {
+        if measured_bbs.is_empty() {
+            continue; // nothing measured at all
         }
         let v = snap.verdict(backbones, &family, age);
         let row = rows.entry(key(v)).or_insert(VerdictRow {
             verdict: v,
             ..Default::default()
         });
-        row.releases += 1;
-        row.completable += usize::from(completable);
+        if completable {
+            // A measured carrier is proof, whatever went unprobed.
+            row.releases += 1;
+            row.completable += 1;
+        } else if backbones.iter().all(|b| measured_bbs.contains(b)) {
+            row.releases += 1;
+        } else {
+            // Asymmetric on purpose: dropping every partially covered
+            // release would throw away valid positives and bias what
+            // remains toward runs where every provider happened to be
+            // reachable.
+            row.partial += 1;
+        }
     }
     (cells, skip, rows.into_values().collect())
 }
@@ -446,13 +470,17 @@ pub fn render(r: &Report) -> String {
     o.push_str("\nrelease verdicts (Snapshot::verdict vs measured completable)\n");
     for v in &r.verdicts {
         let label = v.verdict.map(|x| x.as_str()).unwrap_or("unknown");
+        // The rate divides by the CONCLUSIVE count only. Folding the
+        // partial ones back in would silently reintroduce the dilution
+        // that counting them as incompletable caused in the first place.
         let rate = (v.releases > 0).then(|| v.completable as f64 / v.releases as f64);
         o.push_str(&format!(
-            "  {:<8} {:>4} releases   completable {:>4}  ({})\n",
+            "  {:<8} {:>4} releases   completable {:>4}  ({})   partial {:>4}\n",
             label,
             v.releases,
             v.completable,
-            pct(rate)
+            pct(rate),
+            v.partial
         ));
     }
 
@@ -522,6 +550,7 @@ pub fn json(r: &Report) -> serde_json::Value {
             "verdict": v.verdict.map(|x| x.as_str()).unwrap_or("unknown"),
             "releases": v.releases,
             "completable": v.completable,
+            "partial": v.partial,
         })).collect::<Vec<_>>(),
         "hosts": r.hosts.iter().map(|h| serde_json::json!({
             "host": h.host,
@@ -970,6 +999,58 @@ mod tests {
         assert_eq!(cells[0].releases, 1);
         assert_eq!(skip.predicted(), 1);
         assert_eq!(verdicts.iter().map(|v| v.releases).sum::<usize>(), 1);
+    }
+
+    /// Two enabled backbones, one never dialed. `Snapshot::verdict`
+    /// spans BOTH, so a release the one probed backbone missed is not
+    /// proof the release was incompletable - the unprobed backbone is
+    /// exactly the one the ledger calls healthy. A connect failure on
+    /// alpha used to score a correct green prediction as disproved.
+    #[test]
+    fn unprobed_backbone_does_not_disprove_a_green_verdict() {
+        let mut snap = Snapshot::default();
+        snap.insert("alpha", "hdtv", 2, 6000, 60); // green
+        snap.insert("omicron", "hdtv", 2, 2871, 57071); // red
+        let backbones = vec!["alpha".to_string(), "omicron".to_string()];
+        // Only omicron answered, and it missed. Alpha contributes no
+        // pair at all: a failed connect is a MISSING pair, never a
+        // zero-count one.
+        let (_, _, verdicts) = score(&[pair(1, "omicron", 0, 3)], &snap, &backbones, 0.5);
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].verdict, Some(Verdict::Ok));
+        assert_eq!(
+            (
+                verdicts[0].releases,
+                verdicts[0].completable,
+                verdicts[0].partial
+            ),
+            (0, 0, 1),
+            "a green verdict scored wrong on a backbone that was never dialed"
+        );
+
+        // The other direction is preserved: a measured CARRIER is proof
+        // whatever went unprobed, so partial coverage still scores.
+        let (_, _, verdicts) = score(&[pair(1, "omicron", 3, 0)], &snap, &backbones, 0.5);
+        assert_eq!(
+            (
+                verdicts[0].releases,
+                verdicts[0].completable,
+                verdicts[0].partial
+            ),
+            (1, 1, 0)
+        );
+
+        // And full coverage with nobody carrying is conclusive.
+        let full = vec![pair(1, "omicron", 0, 3), pair(1, "alpha", 0, 3)];
+        let (_, _, verdicts) = score(&full, &snap, &backbones, 0.5);
+        assert_eq!(
+            (
+                verdicts[0].releases,
+                verdicts[0].completable,
+                verdicts[0].partial
+            ),
+            (1, 0, 0)
+        );
     }
 
     /// Truth threshold: half-present is carried at 0.5, not at 0.9.

@@ -106,17 +106,25 @@ pub fn iso_date(s: &str) -> String {
 /// One lookup via whichever provider fits: TMDB with a key, else
 /// TVmaze (tv) / Wikidata (movies). `None` = looked, found nothing.
 pub fn lookup(api_key: Option<&str>, kind: &Kind, title: &str, year: u32) -> Option<TitleMeta> {
-    match api_key {
-        Some(k) => tmdb_lookup(k, kind, title, year),
-        None => match kind {
-            Kind::Tv => tvmaze_lookup(title),
-            Kind::Movie => wikidata_movie(title, year),
-            Kind::Music | Kind::Book => media_lookup(kind, title),
-            // Custom categories are never enriched: "Formula 1 Round 11"
-            // has no meaningful identity at any provider, and a wrong
-            // poster is worse than none.
-            Kind::Software | Kind::Other | Kind::Custom(_) => None,
+    // Kind decides the provider FAMILY before the key decides the
+    // provider: TMDB is a film/tv database, so a configured key must not
+    // divert an album or a book into a movie search - that either stamps
+    // the row empty forever or stores a same-named film's date on an
+    // album card. Same rule the enrich lane states for its own arms.
+    match kind {
+        Kind::Tv => match api_key {
+            Some(k) => tmdb_lookup(k, kind, title, year),
+            None => tvmaze_lookup(title),
         },
+        Kind::Movie => match api_key {
+            Some(k) => tmdb_lookup(k, kind, title, year),
+            None => wikidata_movie(title, year),
+        },
+        Kind::Music | Kind::Book => media_lookup(kind, title),
+        // Custom categories are never enriched: "Formula 1 Round 11"
+        // has no meaningful identity at any provider, and a wrong
+        // poster is worse than none.
+        Kind::Software | Kind::Other | Kind::Custom(_) => None,
     }
 }
 
@@ -203,6 +211,20 @@ pub fn tmdb_lookup(api_key: &str, kind: &Kind, title: &str, year: u32) -> Option
     {
         Ok(r) => r,
         Err(e) => {
+            // Same rule as get_json: a 429/503 is "ask again later", not
+            // an answer. `note_http_err` counts a 429 as a real reply (it
+            // is a 4xx), so one rate-limited burst would stamp every row
+            // it touched checked-and-empty for good. Penalise so the lane
+            // backs off instead of drawing the next 429 immediately.
+            if let ureq::Error::Status(code @ (429 | 503), r) = &e {
+                let wait = r
+                    .header("Retry-After")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(if *code == 429 { 30 } else { 5 });
+                ratelimit::penalise(Provider::Tmdb, wait);
+                note_unreachable();
+                return None;
+            }
             note_http_err(&e);
             return None;
         }
@@ -214,7 +236,7 @@ pub fn tmdb_lookup(api_key: &str, kind: &Kind, title: &str, year: u32) -> Option
             return None;
         }
     };
-    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let v = parse_answer(&body)?;
     let hit = v["results"].get(0)?;
     let genres = hit["genre_ids"]
         .as_array()
@@ -278,7 +300,7 @@ fn get_json(p: Provider, url: &str) -> Option<serde_json::Value> {
         }
     };
     match resp.into_string() {
-        Ok(body) => serde_json::from_str(&body).ok(),
+        Ok(body) => parse_answer(&body),
         Err(_) => {
             note_unreachable();
             None
@@ -1031,7 +1053,7 @@ fn get_json_ua(p: Provider, url: &str) -> Option<serde_json::Value> {
         {
             Ok(resp) => {
                 return match resp.into_string() {
-                    Ok(body) => serde_json::from_str(&body).ok(),
+                    Ok(body) => parse_answer(&body),
                     Err(_) => {
                         note_unreachable();
                         None
@@ -1092,6 +1114,23 @@ fn note_unreachable() {
 
 /// A 5xx means the provider is broken right now, which is worth
 /// retrying; a 404 or other 4xx is a real answer and must not be.
+/// Parse a provider's 200 body, counting an unparseable one as "could
+/// not ask", never "looked, found nothing". A captive portal, proxy
+/// error page, or CDN interstitial answers 200 with HTML for every
+/// request for a few minutes - without the unreachable mark, every
+/// title the lane touched in that window was stamped checked-and-empty
+/// permanently, the exact mass-blanking UNREACHABLE exists to stop
+/// (transport errors and 5xx were caught; 200-with-garbage was not).
+fn parse_answer(body: &str) -> Option<serde_json::Value> {
+    match serde_json::from_str(body) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            note_unreachable();
+            None
+        }
+    }
+}
+
 fn note_http_err(e: &ureq::Error) {
     let no_answer = match e {
         ureq::Error::Status(code, _) => *code >= 500,
@@ -1990,7 +2029,7 @@ pub fn anilist_lookup(title: &str) -> Option<TitleMeta> {
             return None;
         }
     };
-    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let v = parse_answer(&body)?;
     parse_anilist(&v)
 }
 
@@ -2069,7 +2108,7 @@ fn get_json_paced(p: Provider, url: &str) -> Option<serde_json::Value> {
                     note_unreachable();
                     return None;
                 }
-                return serde_json::from_str(&body).ok();
+                return parse_answer(&body);
             }
             Err(ureq::Error::Status(429 | 503, r)) => {
                 let wait = r
@@ -2337,8 +2376,11 @@ fn parse_openlibrary(v: &serde_json::Value, title: &str) -> Option<TitleMeta> {
             exact + starts + d["edition_count"].as_i64().unwrap_or(0).min(99_999)
         })?;
     // Nothing matched even loosely - better no card than the wrong book.
+    // A doc with a cover and NO title passes the filter above, and an
+    // empty title is a prefix of everything, so the guard used to wave
+    // exactly the doc it can say the least about straight through.
     let btitle = norm_title(best["title"].as_str().unwrap_or(""));
-    if !btitle.starts_with(&want) && !want.starts_with(&btitle) {
+    if btitle.is_empty() || (!btitle.starts_with(&want) && !want.starts_with(&btitle)) {
         return None;
     }
     let names: Vec<String> = best["author_name"]
@@ -2491,11 +2533,18 @@ pub fn fetch_image(url: &str) -> Option<Vec<u8>> {
         .ok()?;
     let mut bytes = Vec::new();
     use std::io::Read;
+    // cap + 1, and REFUSE anything that fills past the cap: a bare
+    // take(cap) silently truncated an oversized original-resolution
+    // poster to a torn head-of-file, which passed the only check
+    // (non-empty) and was cached in an art dir that never re-fetches -
+    // a permanently corrupt image. Truncated JSON self-corrects at the
+    // parse; truncated image bytes pass everything.
+    const CAP: u64 = 4 * 1024 * 1024;
     resp.into_reader()
-        .take(4 * 1024 * 1024)
+        .take(CAP + 1)
         .read_to_end(&mut bytes)
         .ok()?;
-    (!bytes.is_empty()).then_some(bytes)
+    (!bytes.is_empty() && bytes.len() as u64 <= CAP).then_some(bytes)
 }
 
 // ---------------------------------------------------------------------------

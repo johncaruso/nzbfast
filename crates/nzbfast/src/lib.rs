@@ -64,6 +64,7 @@ pub mod serve;
 mod setup;
 mod sfx;
 mod smart;
+mod splitjoin;
 mod srrdb;
 mod tools;
 mod unpack;
@@ -92,6 +93,7 @@ use rarfix::*;
 use repair::*;
 #[cfg(feature = "indexer")]
 use scan::*;
+use splitjoin::*;
 use streamhub::*;
 
 /// The [`serve::ServeOpts`] an embedded host runs with: the CLI's

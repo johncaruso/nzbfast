@@ -1,5 +1,20 @@
 use super::*;
 
+/// Test seam: the JSON-RPC delete arm trips it once its rows have left
+/// the queue and before their durable replacements are written - the
+/// window a save landing in the middle publishes absence from. First
+/// barrier says the window is open, second says the test has staged its
+/// save and releases it. Same two-stage shape as
+/// `daemon_park::PARK_GEN_BARRIER`, and keyed the same way - by the
+/// owning daemon's spool path - so a delete verb belonging to some
+/// other test can never wander into a two-party barrier that is not its
+/// own. Unkeyed, a stranger is a third waiter and the parallel bin run
+/// hangs instead of failing.
+#[cfg(test)]
+pub(in crate::serve) static DELETE_PREWRITE_BARRIER: Mutex<
+    Option<(String, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+> = Mutex::new(None);
+
 /// Version we report to API clients. The *arrs feature-gate on the SAB
 /// version string, so claim parity with the release whose API we match.
 pub(super) const SAB_VERSION: &str = "4.5.0";
@@ -255,296 +270,10 @@ fn public_base_from(
 #[path = "sabcompat_public_base_tests.rs"]
 mod public_base_tests;
 
-/// M12: the newznab facade - enough of the protocol for Sonarr/Radarr
-/// to use the built-in index as an indexer (caps, search, tvsearch,
-/// movie; results link to /getnzb/<id>).
 #[cfg(feature = "indexer")]
-pub(super) fn newznab_xml(
-    d: &Daemon,
-    params: &std::collections::HashMap<String, String>,
-    base: &str,
-    apikey: &str,
-) -> String {
-    let t = params.get("t").map(String::as_str).unwrap_or("");
-    // Canonicalize the accepted spellings BEFORE anything reads `t`.
-    // Dispatch took `t=tv-search` and `t=moviesearch`, but the
-    // no-cat kind fallback below matched only the canonical names, so
-    // the alias forms lost their implicit TV/movie filter and a movie
-    // search could come back holding TV (Codex sweep 5 Aug M11).
-    let t = match t {
-        "tv-search" => "tvsearch",
-        "moviesearch" => "movie",
-        other => other,
-    };
-    // The facade IS the index, published over newznab, so the master
-    // switch closes it too - otherwise an *arr keeps a healthy indexer
-    // entry pointed at something that can only ever answer zero results.
-    // Code 101 is the spec's "account suspended", the nearest thing it
-    // has to "this indexer is switched off"; Sonarr and Radarr surface
-    // the description verbatim, so the description is the real message.
-    // caps is refused as well, on purpose: it is what an *arr tests with,
-    // so the failure shows up when someone adds us, not weeks later on a
-    // search that quietly returns nothing.
-    if d.indexer_off() {
-        return newznab_error(
-            101,
-            "nzbfast's built-in indexer is switched off (Settings → Indexing)",
-        );
-    }
-    if t == "caps" {
-        return r#"<?xml version="1.0" encoding="UTF-8"?>
-<caps>
-  <server title="nzbfast" version="1.0"/>
-  <limits max="200" default="100"/>
-  <searching>
-    <search available="yes" supportedParams="q,cat"/>
-    <tv-search available="yes" supportedParams="q,season,ep,cat"/>
-    <movie-search available="yes" supportedParams="q,imdbid,tmdbid,cat"/>
-  </searching>
-  <categories>
-    <category id="2000" name="Movies"/>
-    <category id="4000" name="PC"/>
-    <category id="5000" name="TV"/>
-    <category id="8000" name="Other"/>
-  </categories>
-</caps>"#
-            .to_string();
-    }
-    // Function dispatch. Everything that searches shares one path; the
-    // categories we carry no rows for get the spec's own "not available"
-    // rather than falling through, which used to answer a Lidarr audio
-    // search with the whole index. Errors ride HTTP 200 + an <error>
-    // body, which is the newznab convention (only bad credentials, which
-    // the caller handles, answer with a status code).
-    match t {
-        "" | "search" | "tvsearch" | "movie" => {}
-        "music" | "audio" | "book" | "bookssearch" | "booksearch" => {
-            return newznab_error(203, "Function not available");
-        }
-        _ => return newznab_error(202, "No such function"),
-    }
-    let mut q = params.get("q").cloned().unwrap_or_default();
-    // Season/episode narrowing. A *season-pack* search sends `season=`
-    // with NO `ep=`, and dropping the season there answered with every
-    // release of the series - so the season alone still narrows the
-    // query. Two shapes deliberately do not: a season that is really a
-    // year (daily series are filed by airdate, never SxxEyy) and an `ep`
-    // that will not parse as a number (the `ep=07/28` daily form). Both
-    // keep today's plain-title search, which Sonarr then date-filters,
-    // instead of an `s2026` that can never match anything.
-    let season = params.get("season").and_then(|v| v.parse::<u32>().ok());
-    let ep = params.get("ep").and_then(|v| v.parse::<u32>().ok());
-    let ep_given = params.get("ep").is_some_and(|v| !v.trim().is_empty());
-    match (season, ep) {
-        (Some(se), Some(ep)) if se < 100 => q = format!("{q} s{se:02}e{ep:02}").trim().to_string(),
-        (Some(se), None) if se < 100 && !ep_given => q = format!("{q} s{se:02}").trim().to_string(),
-        _ => {}
-    }
-    let limit: u32 = params
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100)
-        .min(200);
-    let offset: u32 = params
-        .get("offset")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    // cat= is a comma list of Newznab category ids (2xxx Movies, 4xxx
-    // PC/software, 5xxx TV, 8xxx Other). When every requested id maps to
-    // one kind, filter in SQL; mixed/absent = no kind filter.
-    // Sonarr/Radarr only ever ask within their own top-level category.
-    let cats: Vec<u32> = params
-        .get("cat")
-        .map(String::as_str)
-        .unwrap_or("")
-        .split(',')
-        .filter_map(|c| c.trim().parse::<u32>().ok())
-        .collect();
-    let kinds: Vec<&str> = cats.iter().filter_map(|c| kind_for_cat(*c)).collect();
-    let kind = match kinds.as_slice() {
-        [first, rest @ ..] if rest.iter().all(|k| k == first) => Some(first.to_string()),
-        // No usable `cat`, so let the OPERATION speak. `t=movie` and
-        // `t=tvsearch` are each already a statement about which half of
-        // the index is being asked for, and an id-only query - Radarr's
-        // primary lookup - routinely carries no cat at all. Without
-        // this, such a query was answered with no kind filter whatever,
-        // so a movie search could come back holding TV.
-        _ => match t {
-            "movie" => Some("movie".to_string()),
-            "tvsearch" => Some("tv".to_string()),
-            _ => None,
-        },
-    };
-    // Every requested id names a category we do not carry (audio, books,
-    // console, xxx): the honest answer is an empty feed. Falling through
-    // to an unfiltered query would answer a Lidarr audio search with our
-    // whole index.
-    let unavailable = !cats.is_empty() && kinds.is_empty();
-    // `maxage` is the age ceiling in days, and the *arrs lean on it for
-    // RSS sync. It filters on the same upload date the items report, so
-    // a row can never be returned by a query that its own pubDate would
-    // then fail.
-    let newer_than = params
-        .get("maxage")
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .filter(|d| *d > 0)
-        // Saturating on BOTH operations: the value is client-supplied and
-        // unclamped, so `maxage=999999999999999` wrapped the product
-        // large-negative and turned `newer_than` into a far-future cutoff
-        // - a silently EMPTY feed where an unfiltered one was owed - and
-        // the subtraction then overflowed independently. Saturated, a
-        // huge age lands at i64::MIN, which browse() reads as "no age
-        // filter", the same answer the maxage=99999 test already pins.
-        // Normal values take the identical path they always did. Same
-        // treatment as the neighbouring spot handler.
-        .map(|days| (epoch_secs() as i64).saturating_sub(days.saturating_mul(86_400)))
-        .unwrap_or(0);
-    // An id-based search (Radarr's primary lookup) resolves through the
-    // enriched titles table to the parse-key its releases carry. An id
-    // we hold nothing for answers EMPTY: the old code ignored the param
-    // entirely, so an id-only query - which has no q, no season and
-    // often no cat - returned the whole index newest-first for the *arr
-    // to title-match against.
-    let mut id_missing = false;
-    let title_key = ["imdbid", "tmdbid"].iter().find_map(|p| {
-        let raw = params.get(*p)?.trim().to_string();
-        if raw.is_empty() {
-            return None;
-        }
-        let found = d.with_index_read(|ix| {
-            if *p == "imdbid" {
-                ix.title_key_for_imdb(&raw).ok().flatten()
-            } else {
-                ix.title_key_for_tmdb(raw.parse().unwrap_or(0))
-                    .ok()
-                    .flatten()
-            }
-        });
-        id_missing = found.is_none();
-        found
-    });
-    // Honest SQL pagination + complete-only in the query itself - the
-    // old path pulled limit+offset rows and filtered/paged in memory,
-    // so deep pages silently thinned out.
-    let bq = nzbkit::index::BrowseQuery {
-        q,
-        kind,
-        complete_only: true,
-        newer_than,
-        title_key,
-        limit,
-        offset,
-        ..Default::default()
-    };
-    let (hits, total) = if unavailable || id_missing {
-        (Vec::new(), 0)
-    } else {
-        d.with_index_read(|ix| ix.browse(&bq).ok())
-            .unwrap_or_default()
-    };
-    // §131 D3 search-miss log. The *arr surface is where the misses
-    // that matter most show up - Sonarr asks the same question every
-    // RSS sync, so a query it never gets an answer to is a coverage
-    // hole with a date on it. First page only (a deep page is the same
-    // search), and only when a query was actually typed: an id lookup
-    // that resolved to no title_key is an ENRICHMENT gap, not a
-    // catalogue one, and belongs in a different readout. `unavailable`
-    // is excluded outright: a Lidarr audio search we answer empty by
-    // POLICY is not a hole anyone should backfill.
-    if offset == 0 && !unavailable && !bq.q.trim().is_empty() {
-        d.note_search(
-            "newznab",
-            &bq.q,
-            bq.kind.as_deref().unwrap_or(""),
-            total as usize,
-        );
-    }
-    let mut items = String::new();
-    for r in hits.iter() {
-        let link = format!(
-            "{base}/getnzb/{}.nzb?apikey={}",
-            r.id,
-            super::http::query_escape(apikey)
-        );
-        // The name a *arr client parses, which for a release the pre
-        // feed rescued is the real title rather than the random stem it
-        // was posted under. Sonarr and Radarr match on this string and
-        // nothing else, so an obfuscated stem here is a release they can
-        // never accept.
-        let name = r.display_name();
-        let cat = newznab_category(&r.kind, name);
-        // pubDate is the UPLOAD date, not when we happened to index it.
-        // Sonarr and Radarr derive a release's age from it and reject on
-        // that age twice over (retention, and the minimum-age hold that
-        // lets a bad post get replaced before they grab it) - answering
-        // with first_seen advertises every backfilled release as posted
-        // today, so the minimum-age hold never fires. first_posted 0 is
-        // the live sentinel for "the OVER Date did not parse"; emitting
-        // it bare would date those rows to 1970, which reads as
-        // infinitely old and is rejected wholesale, so they keep
-        // first_seen.
-        let posted = if r.first_posted > 0 {
-            r.first_posted
-        } else {
-            r.first_seen
-        };
-        // The extended attrs cost one row each and are what the *arrs
-        // and Prowlarr show without re-fetching the NZB. `usenetdate`
-        // repeats pubDate deliberately: clients that treat pubDate as
-        // the indexing date read age off this one instead.
-        let mut extra = String::new();
-        if r.files > 0 {
-            extra.push_str(&format!(
-                "      <newznab:attr name=\"files\" value=\"{}\"/>\n",
-                r.files
-            ));
-        }
-        if !r.grp.is_empty() {
-            extra.push_str(&format!(
-                "      <newznab:attr name=\"group\" value=\"{}\"/>\n",
-                esc_xml(&r.grp)
-            ));
-        }
-        if !r.poster.is_empty() {
-            extra.push_str(&format!(
-                "      <newznab:attr name=\"poster\" value=\"{}\"/>\n",
-                esc_xml(&r.poster)
-            ));
-        }
-        items.push_str(&format!(
-            r#"    <item>
-      <title>{title}</title>
-      <guid isPermaLink="false">nzbfast-{id}</guid>
-      <link>{link}</link>
-      <pubDate>{date}</pubDate>
-      <enclosure url="{link}" length="{size}" type="application/x-nzb"/>
-      <newznab:attr name="category" value="{cat}"/>
-      <newznab:attr name="size" value="{size}"/>
-      <newznab:attr name="usenetdate" value="{date}"/>
-{extra}    </item>
-"#,
-            title = esc_xml(name),
-            id = r.id,
-            link = esc_xml(&link),
-            date = httpdate(posted),
-            size = r.total_bytes,
-        ));
-    }
-    // <newznab:response> is how a client knows whether to ask for
-    // another page. Without it Prowlarr and Sonarr treat every response
-    // as the last one, so a search never went past its first 100 rows -
-    // and browse() had the real total all along, it was being discarded.
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">
-  <channel>
-    <title>nzbfast</title>
-    <description>nzbfast built-in index</description>
-    <newznab:response offset="{offset}" total="{total}"/>
-{items}  </channel>
-</rss>"#
-    )
-}
+mod newznab;
+#[cfg(feature = "indexer")]
+pub(super) use newznab::newznab_xml;
 
 /// A newznab error body. The spec puts these on HTTP 200 with the code
 /// in the payload, which is what every client parses.
@@ -1615,6 +1344,12 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         // image is the update channel. The dashboard shows the container
         // recipe instead when this is set.
         "container": container_install(),
+        // Same reason, different recipe: a Flatpak owns the files it
+        // installed and `flatpak update` is its channel, so the download
+        // page is a dead end here too. Kept as its own flag rather than
+        // folded into `container` - the container recipe is all compose
+        // files and Watchtower, which is wrong advice inside a Flatpak.
+        "flatpak": flatpak_install(),
         // The launcher owns the port: the settings field is disabled and
         // says where to change it instead (see `port_locked`).
         "port_locked": d.port_locked,
@@ -2312,9 +2047,10 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                 // park, and this facade answered true without saying so
                 // while the REST arm has announced it since the 10 Aug
                 // sweep (Codex sweep 14 Aug M4). Resume takes the same
-                // call as the REST arm does, deliberately: it re-arms
-                // nothing on its own, and the latch keeps a still-idle
-                // queue silent.
+                // call as the REST arm does, deliberately: it never
+                // EMITS on its own (the latch keeps a still-idle queue
+                // silent), and the re-arm a resume owes lives inside
+                // `apply_pause`, under the queue lock the loop holds.
                 if ok {
                     d.note_queue_idle();
                 }
@@ -2340,6 +2076,12 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                 // its directory - the *arrs delete through here, so this
                 // is an ordinary path, not a corner of one.
                 d.poke_sidecar(hit_id);
+                // ...and a job the sidecar is RUNNING still has live
+                // writers, however queued its row looks. Snapshotted
+                // here, before the queue lock: reading the sidecar mutex
+                // inside `q.retain` would take it under queue+job, a
+                // lock edge nothing else in the daemon has.
+                let sidecar_owner = d.sidecar_owner();
                 // §129, same as the REST arm: a Finishing job's repair
                 // must stop pulling recovery volumes. The hub abort at
                 // the bottom cannot do it - it is scoped to the hub's
@@ -2353,10 +2095,36 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                 let mut kept: Vec<(String, std::path::PathBuf, String)> = Vec::new();
                 let mut doomed: Vec<(String, std::path::PathBuf, bool, crate::smart::FiledTail)> =
                     Vec::new();
+                // The same, for the one job whose writers are the
+                // sidecar's: removed only once that has wound down.
+                let mut pending_sidecar: Vec<(
+                    String,
+                    std::path::PathBuf,
+                    bool,
+                    crate::smart::FiledTail,
+                )> = Vec::new();
                 // Jobs owed a history row, filed after the queue lock
                 // drops - park() pushes to history without the queue
                 // lock held, and this path keeps that order.
                 let mut to_history: Vec<Arc<Mutex<Job>>> = Vec::new();
+                // Active jobs owed a history row park cannot file until
+                // its pipeline drains: they get a durable placeholder
+                // row instead, written before the save_queue at the end
+                // of this handler publishes their absence (M1).
+                let mut prewrite: Vec<Arc<Mutex<Job>>> = Vec::new();
+                // ...but "before the save_queue at the end of this
+                // handler" was only ever true of THIS handler's save.
+                // The row leaves the queue on the next line, the
+                // placeholder is a file write and cannot go under the
+                // queue mutex, and any other mutation's save - the
+                // coalescing saver's own thread included - could land
+                // in between and publish a queue.json the record had
+                // already left while nothing in history named it yet. A
+                // stop right there lost the record from BOTH stores
+                // (read-only sweep 2, M8). Held until every replacement
+                // row is durable, so no save can describe the gap.
+                // IO then queue, the order `save_queue` takes them in.
+                let publish_hold = Daemon::hold_queue_writes();
                 let mut q = d.queue.lock_ok();
                 let before = q.len();
                 q.retain(|j| {
@@ -2374,6 +2142,22 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                             // it, the pre-M5 shape, when it is empty).
                             g.tombstone = true;
                             stopped_active = true;
+                            // ...but park is a long way off - the fetch
+                            // has to drain and the deferred file removal
+                            // has to run (unbounded on a hung NAS)
+                            // before it writes anything durable, while
+                            // the save_queue at the end of THIS handler
+                            // publishes a queue.json the row has already
+                            // left. A kill in between and the record is
+                            // in neither store: no DELETED row for the
+                            // dupe check or the retry button, and for
+                            // GroupParkDelete a kept payload nothing
+                            // names (M1). Collected here, written after
+                            // the lock drops - a file write has no
+                            // business under the queue mutex.
+                            if !hist_status.is_empty() {
+                                prewrite.push(j.clone());
+                            }
                         } else {
                             // Tombstoned even though it is leaving the
                             // queue right here: a queued job can still be
@@ -2417,6 +2201,25 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                                 // documents both halves.
                                 g.del_on_drop = true;
                                 d.reserved.lock_ok().insert(g.out_dir.clone());
+                            } else if sidecar_owner
+                                .as_ref()
+                                .is_some_and(|(id, _)| *id == g.nzo_id)
+                            {
+                                // A prefetching job is Queued and not
+                                // finalizing, so it fell into the arm
+                                // below and had its directory removed
+                                // while the sidecar was still writing
+                                // into it - and the next file's first
+                                // article recreated it (M2). Same
+                                // reservation, released by the drain.
+                                let tail = delete_tail(&g, || d.job_suffix(filed_stem(&g)));
+                                d.reserved.lock_ok().insert(g.out_dir.clone());
+                                pending_sidecar.push((
+                                    filed_stem(&g).to_string(),
+                                    g.out_dir.clone(),
+                                    g.filed,
+                                    tail,
+                                ));
                             } else {
                                 let tail = delete_tail(&g, || d.job_suffix(filed_stem(&g)));
                                 d.reserved.lock_ok().insert(g.out_dir.clone());
@@ -2435,11 +2238,37 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                 });
                 ok = q.len() < before;
                 drop(q);
+                // The rows are gone from the live queue and every
+                // durable replacement is still ahead of us.
+                #[cfg(test)]
+                {
+                    let spool = d.spool.display().to_string();
+                    let seam = DELETE_PREWRITE_BARRIER
+                        .lock_ok()
+                        .clone()
+                        .filter(|(k, _, _)| *k == spool);
+                    if let Some((_, open, release)) = seam {
+                        open.wait();
+                        release.wait();
+                    }
+                }
+                // The active job's placeholder goes down first, and in
+                // any case before this handler's save_queue publishes
+                // the queue without it.
+                for j in &prewrite {
+                    d.delete_prewrite(j, hist_status);
+                }
                 // History first, so a poll that races the delete sees the
                 // row appear rather than the job vanish and return.
                 if !to_history.is_empty() {
                     d.history.lock_ok().extend(to_history.iter().cloned());
                     let _ = d.history_upsert(&to_history);
+                }
+                // Every record this handler removed now has a durable
+                // row of its own, so saves may resume. Retention runs
+                // outside the hold - it prunes, it does not replace.
+                drop(publish_hold);
+                if !to_history.is_empty() {
                     d.history_enforce_retention();
                 }
                 // The slow half, with no global lock held. Reservations
@@ -2462,6 +2291,14 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                 // invisible unless the notice names it.
                 for (name, dir, why) in kept {
                     d.note_delete_kept(&name, &dir, &why);
+                }
+                // The sidecar's job waits for the sidecar. Its own
+                // reservation is released by the drain, not by the batch
+                // above - the removal is still ahead of it.
+                if let Some((_, target)) = sidecar_owner {
+                    for (name, dir, filed, tail) in pending_sidecar {
+                        d.remove_after_sidecar_drain(target.clone(), name, dir, filed, tail);
+                    }
                 }
                 // `owns_hub`, exactly as the REST arm does it, and for
                 // the reason spelled out there: `state == Downloading`
@@ -2918,3 +2755,6 @@ pub(super) fn handle_jsonrpc(
 
 #[cfg(test)]
 mod tail_truth_tests;
+
+#[cfg(test)]
+mod delete_durability_tests;

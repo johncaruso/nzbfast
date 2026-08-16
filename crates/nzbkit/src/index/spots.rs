@@ -279,11 +279,21 @@ impl Index {
             // `proven:msgid-set:spot` row back to the unarbitrable
             // i32::MAX grade that `applied_strength` gives anything
             // without a `proven:` prefix.
-            self.db
-                .execute("UPDATE releases SET pre_title='' WHERE id=?1", [rid])?;
+            // One transaction for the clear-and-reapply pair: as two
+            // autocommit statements, an error or kill between them left
+            // the row permanently un-named AND outside the driving LIKE
+            // predicate, so the re-run never revisited it. apply_named
+            // runs on the same connection, so it joins this transaction;
+            // an error unwinds the clear.
+            let tx = rusqlite::Transaction::new_unchecked(
+                &self.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            tx.execute("UPDATE releases SET pre_title='' WHERE id=?1", [rid])?;
             if self.apply_named(*rid, &title, label, now)? {
                 fixed += 1;
             }
+            tx.commit()?;
         }
         self.kv_set("spot_cdata_fix_v1", "1")?;
         Ok(fixed)

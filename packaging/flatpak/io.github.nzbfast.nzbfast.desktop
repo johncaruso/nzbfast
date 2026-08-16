@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=nzbfast
+GenericName=Usenet downloader
+Comment=Download from Usenet
+Exec=nzbfast-launcher %f
+Icon=io.github.nzbfast.nzbfast
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=usenet;nzb;nntp;download;newsreader;binaries;
+MimeType=application/x-nzb;
+StartupNotify=false

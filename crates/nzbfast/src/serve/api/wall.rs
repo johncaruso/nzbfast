@@ -103,6 +103,26 @@ fn m_wall_fix(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|t| t.as_secs() as i64)
             .unwrap_or(1);
+        // The manual arm's "keep what you were not editing" read, taken
+        // BEFORE the identity write below. A busy read pool stops the
+        // whole edit (see the arm itself), and an identity that had
+        // already landed left the row renamed with the rest of the edit
+        // refused - half of what the user pressed Save for.
+        let manual = !body.get("meta").is_some_and(Value::is_object)
+            && body["refetch"].as_bool() != Some(true);
+        let old = if manual && !key.is_empty() && !title.is_empty() {
+            match d.index_read_checked(|ix| ix.title_get(&key).ok().flatten()) {
+                Ok(old) => old,
+                Err(_) => {
+                    return Some(json!({
+                        "status": false,
+                        "error": "the index is busy - try again in a moment",
+                    }));
+                }
+            }
+        } else {
+            None
+        };
         if key.is_empty() || title.is_empty() {
             json!({"status": false, "error": "key and title are required"})
         } else if d
@@ -171,22 +191,14 @@ fn m_wall_fix(
                 // the typed text; absent fields keep their
                 // old values.
                 //
-                // index_read_checked, not with_index_read: this
-                // read IS the "keep" half, and its `None` feeds
+                // `old` was read above, with index_read_checked
+                // rather than with_index_read: this read IS the
+                // "keep" half, and its `None` feeds
                 // `unwrap_or_default()` straight into title_fill -
                 // a zeroed row that blanks the poster, rating,
                 // imdb id and cast the user was not editing. A
                 // saturated read pool must stop the edit and say
                 // so, never strip it silently.
-                let old = match d.index_read_checked(|ix| ix.title_get(&key).ok().flatten()) {
-                    Ok(old) => old,
-                    Err(_) => {
-                        return Some(json!({
-                            "status": false,
-                            "error": "the index is busy - try again in a moment",
-                        }));
-                    }
-                };
                 let (oid, orating, opost, obd, oview, ogen, oimdb, oact, oair) = old
                     .map(|t| {
                         (

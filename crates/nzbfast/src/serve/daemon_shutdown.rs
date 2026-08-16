@@ -104,8 +104,29 @@ pub(in crate::serve) fn wind_down(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, 
     // what actually returns the session slot to the account. It also
     // costs less on resume: what landed is journalled instead of being
     // re-fetched.
-    d.paused.store(true, Ordering::Relaxed);
+    // Through the timer-aware setter, not a bare store: a timed pause
+    // armed a thread that clears `paused` when its generation is still
+    // current, and a bare store leaves that generation alone - so a
+    // stale timer could fire mid-shutdown and admit a job to the very
+    // queue this is tearing down. Not persisted (see `persist_pause`):
+    // a clean quit must not come back paused.
+    set_paused_cancel_timer(d, true);
     d.suspend_active(true);
+    // The prefetch sidecar is its own hub and its own fleet, so the
+    // wind-down above does not reach it - `suspend_active`, the pause
+    // and the gauge below all read `d.hub` alone. Its sessions are on
+    // the same account and count against the same cap, so a stop that
+    // ignored them closed those sockets without a QUIT and left the
+    // provider counting them until its own idle timeout, which is
+    // exactly the connection-cap refusal the restart then met (read-
+    // only sweep 2, M9). The offline path has poked the sidecar
+    // explicitly for this reason since it was written; this one had
+    // the same gap and not the same line.
+    //
+    // Sync context (a signal thread with no reactor of its own), so
+    // this is `poke_sidecar` rather than the async `stop_sidecar` -
+    // same signal, and the gauge below is what actually waits.
+    d.poke_sidecar(|_| true);
     d.save_queue();
     // Off to its own thread NOW, to run alongside the connection drain
     // below rather than after it: both are waits, and they share one
@@ -123,9 +144,14 @@ pub(in crate::serve) fn wind_down(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, 
     // after 0.3 s with eight connections still open and not one QUIT
     // sent - measured against a mock provider that logs its commands.
     // The live gauge is the honest signal.
-    let connected = || -> usize {
-        d.hub
-            .pool_live
+    //
+    // BOTH hubs. The provider counts sessions, not jobs, and the
+    // sidecar's fleet is not on `d.hub` - so a wind-down that watched
+    // the main gauge alone reached zero while the prefetch was still
+    // connected, and the process exited before those workers had said
+    // goodbye (read-only sweep 2, M9).
+    let hub_connected = |h: &crate::StreamHub| -> usize {
+        h.pool_live
             .lock_ok()
             .as_ref()
             .map(|l| {
@@ -135,6 +161,14 @@ pub(in crate::serve) fn wind_down(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, 
                     .sum()
             })
             .unwrap_or(0)
+    };
+    let connected = || -> usize {
+        hub_connected(&d.hub)
+            + d.sidecar
+                .lock_ok()
+                .as_ref()
+                .map(|s| hub_connected(&s.hub))
+                .unwrap_or(0)
     };
     let open_at_signal = connected();
     while started.elapsed() < WIND_DOWN_BUDGET && connected() > 0 {
@@ -164,7 +198,23 @@ pub(in crate::serve) fn wind_down(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, 
     // pooled anything, asking for the pool in order to empty it panicked
     // the wind-down thread - and with SIGTERM's default disposition
     // already replaced, that left a process no `docker stop` could end.
-    if let Some(warm) = d.hub.warm.get() {
+    //
+    // The sidecar's hub parks its own, and on the same account: same
+    // accessor rule, same reason.
+    let warms: Vec<_> = d
+        .hub
+        .warm
+        .get()
+        .into_iter()
+        .cloned()
+        .chain(
+            d.sidecar
+                .lock_ok()
+                .as_ref()
+                .and_then(|s| s.hub.warm.get().cloned()),
+        )
+        .collect();
+    for warm in warms {
         let left = WIND_DOWN_BUDGET.saturating_sub(started.elapsed());
         let _ = rt.block_on(async {
             tokio::time::timeout(
@@ -278,9 +328,13 @@ fn close_index_for_exit(d: &Arc<Daemon>) {
     let deadline = Instant::now() + INDEX_LOCK_WAIT;
     let taken = loop {
         if let Ok(mut guard) = d.index.try_lock() {
-            // Out of the mutex, not merely borrowed: `exiting` already
-            // stops every path from reopening it, so the connection is
-            // ours to close.
+            // Out of the mutex, not merely borrowed: the connection is
+            // ours to close. Safe because every lazy open asks
+            // `index_db_wanted` again UNDER this mutex (`open_locked`),
+            // not only at its entry gate - the bare `exiting` store was
+            // not enough on its own, because a caller admitted a moment
+            // before it and parked here would wake onto the empty mutex
+            // we are about to leave behind and reopen the database.
             break guard.take();
         }
         if Instant::now() >= deadline {
@@ -630,4 +684,114 @@ pub(in crate::serve) fn restore_pause(d: &Arc<Daemon>, saved: &serde_json::Map<S
     d.paused.store(true, Ordering::Relaxed);
     arm_pause_timer(d, std::time::Duration::from_secs(left as u64));
     info!(target: "pause", "restored: paused, {} min left", (left + 59) / 60);
+}
+
+#[cfg(test)]
+mod shutdown_sidecar_tests {
+    use super::*;
+    use crate::serve::sidecar::Sidecar;
+
+    fn live_one(host: &str) -> Arc<nzbkit::pool::LiveStats> {
+        nzbkit::pool::LiveStats::for_servers(&[(
+            nzbkit::config::ServerConfig {
+                host: host.into(),
+                port: 563,
+                tls: false,
+                username: None,
+                password: None,
+                connections: 4,
+                pin_connections: false,
+                rcvbuf: None,
+                level: 0,
+                group: None,
+                retention_days: 0,
+                block_bytes: None,
+                block_account: false,
+                bind_ip: None,
+                socks5: None,
+                enabled: true,
+                warm_pool: false,
+                idle_release_secs: None,
+                idle_keep: None,
+                max_source_ips: None,
+            },
+            nzbkit::pool::PoolConfig::default(),
+        )])
+    }
+
+    /// A clean stop hands every open NNTP session back with a QUIT, and
+    /// the prefetch sidecar's sessions are on the same account and the
+    /// same cap - but the pause, the gauge and the warm-pool clear all
+    /// read `d.hub` alone, and the sidecar owns a hub of its own. So a
+    /// SIGTERM with a prefetch running signalled nothing at it and
+    /// watched a gauge it was not in: the main count reached zero, the
+    /// process exited, and the provider went on counting those sockets
+    /// until its own idle timeout - which is the connection-cap refusal
+    /// the restart then met. The offline path has poked the sidecar
+    /// explicitly since it was written; this one had the same gap and
+    /// not the same line (read-only sweep 2, M9).
+    #[test]
+    fn the_wind_down_signals_and_waits_for_the_sidecar_hub_too() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-winddown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let d = crate::serve::testutil::test_daemon(&dir);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        // A prefetch with one open session on its OWN hub, and none on
+        // the daemon's: exactly the shape the main gauge cannot see.
+        let hub = Arc::new(crate::StreamHub::default());
+        let live = live_one("news.example");
+        live.servers[0].connected.store(1, Ordering::Relaxed);
+        *hub.pool_live.lock_ok() = Some(live.clone());
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *d.sidecar.lock_ok() = Some(Sidecar {
+            nzo_id: "nzo-winddown-1".into(),
+            hub: hub.clone(),
+            progress: Arc::new(AtomicU64::new(0)),
+            cancelled: cancelled.clone(),
+            task: rt.spawn(async {}),
+            borrowed: false,
+        });
+
+        // That session says goodbye a while after the signal, as a real
+        // one does - the abort is read at the worker's next response
+        // boundary, not inside the read it is parked on.
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r2 = released.clone();
+        let quitter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1_200));
+            live.servers[0].connected.store(0, Ordering::Relaxed);
+            r2.store(true, Ordering::Relaxed);
+        });
+
+        let t0 = Instant::now();
+        wind_down(&d, rt.handle(), "test stop");
+        let waited = t0.elapsed();
+        // Read BEFORE the join, or the join itself makes it true and
+        // the assertion says nothing at all.
+        let left_before_the_quit = !released.load(Ordering::Relaxed);
+        quitter.join().expect("quitter");
+
+        assert!(
+            cancelled.load(Ordering::Relaxed),
+            "the stop never reached the prefetch - its sockets close with no QUIT"
+        );
+        assert!(
+            !left_before_the_quit,
+            "the stop exited with the prefetch still connected, so the provider \
+             goes on counting those sessions"
+        );
+        // ...and it must stop waiting when the sessions are gone, not
+        // burn the whole budget: a wind-down that always waits is the
+        // abrupt exit it replaced, one timeout further on.
+        assert!(
+            waited < WIND_DOWN_BUDGET,
+            "the wind-down spent its entire budget instead of leaving when the \
+             connections had gone ({waited:?})"
+        );
+
+        *d.sidecar.lock_ok() = None;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -194,6 +194,23 @@ impl MemBudget {
     // keeps small machines safe; --mem-limit / the mem_limit setting
     // still overrides in either direction.
     const AUTO_CEIL: u64 = 16 << 30;
+    /// Hard ceiling on 32-bit hosts (armv7 Raspberry Pi OS). Two
+    /// independent reasons, either one sufficient:
+    ///   - The consumers below are `usize`-sized. A total whose 45%/30%
+    ///     slice exceeds 4 GiB used to `as usize` straight off the end -
+    ///     `--mem-limit 10G` handed the extractor a 512 MB cap while the
+    ///     log and the settings page both said 10 GB. Wrapping only ever
+    ///     under-promised, so nothing corrupted; it just made the knob
+    ///     lie, silently, on the one platform where memory is scarce.
+    ///   - A 32-bit process has ~3 GiB of user address space TOTAL, and
+    ///     these tiers are ~90% of the budget between them before any
+    ///     untracked allocation. A budget the address space cannot hold
+    ///     is not a budget, it is a deferred OOM.
+    /// 1 GiB leaves every tier spendable with room for fragmentation.
+    /// The auto default never reaches it (RAM/4 on a 1 GB Pi is the
+    /// 256 MB floor), so this only ever binds an explicit --mem-limit.
+    #[cfg(target_pointer_width = "32")]
+    const ADDRESS_SPACE_CEIL: u64 = 1 << 30;
 
     /// Quarter of physical RAM, clamped - the no-configuration default.
     /// In a container, additionally capped at half the cgroup memory
@@ -211,27 +228,44 @@ impl MemBudget {
         let host = ram
             .map(|r| (r / 4).clamp(Self::AUTO_FLOOR, Self::AUTO_CEIL))
             .unwrap_or(1 << 30);
-        match cgroup_limit {
+        let total = match cgroup_limit {
             Some(lim) => host.min((lim / 2).max(Self::MIN)),
             None => host,
-        }
+        };
+        Self::fit_address_space(total)
     }
 
     pub fn with_total(total: u64) -> MemBudget {
         MemBudget {
-            total: total.max(Self::MIN),
+            total: Self::fit_address_space(total.max(Self::MIN)),
+        }
+    }
+
+    /// No-op on 64-bit; clamps to [`Self::ADDRESS_SPACE_CEIL`] on 32-bit.
+    fn fit_address_space(total: u64) -> u64 {
+        #[cfg(target_pointer_width = "32")]
+        {
+            total.min(Self::ADDRESS_SPACE_CEIL)
+        }
+        #[cfg(not(target_pointer_width = "32"))]
+        {
+            total
         }
     }
 
     /// Extractor held-span ceiling (spill: materialize volumes to disk).
     pub fn holds_cap(&self) -> usize {
-        (self.total / 100 * 45) as usize
+        // `as usize` here truncated on 32-bit rather than saturating.
+        // `fit_address_space` already keeps the total in range, so this
+        // is the belt: a cap that saturates is merely generous, a cap
+        // that wraps is arbitrary.
+        usize::try_from(self.total / 100 * 45).unwrap_or(usize::MAX)
     }
 
     /// Verifier partial-block ceiling, GLOBAL across all slots (spill:
     /// leave blocks Pending → settle read-back hashes them from disk).
     pub fn partials_cap(&self) -> usize {
-        (self.total / 100 * 30) as usize
+        usize::try_from(self.total / 100 * 30).unwrap_or(usize::MAX)
     }
 
     /// Body-buffer pool retention count (~800 KB each; spill: plain
@@ -404,9 +438,16 @@ fn concurrency_caps_for(ram: Option<u64>, cgroup_limit: Option<u64>) -> Option<C
     }
 }
 
-/// Peak resident set size of this process in bytes (getrusage; Linux
-/// reports KB, macOS bytes; Windows: peak working set). The number
-/// benchmarks quote.
+/// Peak resident set size of this process in bytes (getrusage; Windows:
+/// peak working set). The number benchmarks quote.
+///
+/// `ru_maxrss` is the one getrusage field whose UNIT is per-platform:
+/// Apple's kernels report bytes, and every other unix we build for -
+/// Linux, Android, the BSDs including FreeBSD - reports kilobytes. The
+/// scaling test below is therefore "is this an Apple platform", not "is
+/// this Linux": written the other way round it silently under-reports by
+/// 1024x on Android and FreeBSD, which reads as a suspiciously tiny
+/// process rather than as an obvious failure.
 pub fn peak_rss() -> Option<u64> {
     #[cfg(unix)]
     // SAFETY: libc::rusage is plain data (integer fields only) so zeroed()
@@ -415,10 +456,10 @@ pub fn peak_rss() -> Option<u64> {
         let mut ru: libc::rusage = std::mem::zeroed();
         if libc::getrusage(libc::RUSAGE_SELF, &mut ru) == 0 {
             let raw = ru.ru_maxrss as u64;
-            return Some(if cfg!(target_os = "linux") {
-                raw * 1024
-            } else {
+            return Some(if cfg!(any(target_os = "macos", target_os = "ios")) {
                 raw
+            } else {
+                raw * 1024
             });
         }
     }
@@ -734,6 +775,42 @@ pub fn opt_out_of_power_throttling() {}
 mod tests {
     use super::*;
 
+    /// The budget a host of THIS pointer width can actually hold.
+    /// `MemBudget` clamps to [`MemBudget::ADDRESS_SPACE_CEIL`] on 32-bit
+    /// (armv7), so an expectation written as a flat 16 GiB is not wrong
+    /// there so much as unreachable - a 32-bit process has ~3 GiB of
+    /// address space in total. Capping the EXPECTATION keeps one set of
+    /// assertions instead of two, and keeps them honest: the clamp is
+    /// pinned on its own in `a_32_bit_budget_is_held_to_the_address_space`.
+    fn fits(bytes: u64) -> u64 {
+        #[cfg(target_pointer_width = "32")]
+        {
+            bytes.min(MemBudget::ADDRESS_SPACE_CEIL)
+        }
+        #[cfg(not(target_pointer_width = "32"))]
+        {
+            bytes
+        }
+    }
+
+    /// A 32-bit host holds the budget to something it can address, and
+    /// every cap below it stays consistent with the total it reports.
+    /// The failure this guards is not a crash: `(total / 100 * 45) as
+    /// usize` used to WRAP, so `--mem-limit 10G` printed 10 GB and gave
+    /// the extractor 512 MB, with nothing anywhere saying so.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn a_32_bit_budget_is_held_to_the_address_space() {
+        let b = MemBudget::with_total(10 << 30);
+        assert_eq!(b.total, MemBudget::ADDRESS_SPACE_CEIL);
+        // Every slice fits inside the whole - the property a wrap breaks.
+        assert!(b.holds_cap() as u64 <= b.total);
+        assert!(b.partials_cap() as u64 <= b.total);
+        assert!(b.holds_cap() + b.partials_cap() < b.total as usize);
+        // And a budget UNDER the ceiling is untouched.
+        assert_eq!(MemBudget::with_total(512 << 20).total, 512 << 20);
+    }
+
     #[test]
     fn budget_slices_and_clamps() {
         let b = MemBudget::with_total(1 << 30);
@@ -747,12 +824,19 @@ mod tests {
         );
         assert_eq!(MemBudget::with_total(256 << 20).channel_depth(), 20);
         assert_eq!(MemBudget::with_total(64 << 20).channel_depth(), 8); // floor
-        assert_eq!(MemBudget::with_total(16 << 30).channel_depth(), 256); // cap
         // B3: wire-side in-flight cap scales with the budget, clamped.
         assert_eq!(b.inflight_cap(), (1u64 << 30) / 4);
         assert_eq!(MemBudget::with_total(256 << 20).inflight_cap(), 64 << 20);
         assert_eq!(MemBudget::with_total(64 << 20).inflight_cap(), 32 << 20); // floor
-        assert_eq!(MemBudget::with_total(16 << 30).inflight_cap(), 2 << 30); // cap
+        // The UPPER clamps need a budget large enough to reach them, and
+        // a 32-bit host cannot hold one (see `fits`). There the budget
+        // stops at the address-space ceiling first, so these would pin
+        // the ceiling's arithmetic rather than the clamp they name.
+        #[cfg(not(target_pointer_width = "32"))]
+        {
+            assert_eq!(MemBudget::with_total(16 << 30).channel_depth(), 256); // cap
+            assert_eq!(MemBudget::with_total(16 << 30).inflight_cap(), 2 << 30); // cap
+        }
         // Slices always fit inside the whole.
         assert!(b.holds_cap() + b.partials_cap() < b.total as usize);
         // Floor: even absurd --mem-limit values keep the engine viable.
@@ -767,12 +851,15 @@ mod tests {
     fn auto_respects_cgroup_limit() {
         let gb = 1u64 << 30;
         // Uncontained: quarter of RAM, clamped.
-        assert_eq!(MemBudget::auto_total(Some(64 * gb), None), 16 * gb);
+        assert_eq!(MemBudget::auto_total(Some(64 * gb), None), fits(16 * gb));
         assert_eq!(MemBudget::auto_total(Some(512 << 20), None), 256 << 20);
         // docker --memory 1g on a big host: half the limit, not RAM/4.
         assert_eq!(MemBudget::auto_total(Some(25 * gb), Some(gb)), gb / 2);
         // Roomy limit doesn't inflate the host-derived figure.
-        assert_eq!(MemBudget::auto_total(Some(8 * gb), Some(32 * gb)), 2 * gb);
+        assert_eq!(
+            MemBudget::auto_total(Some(8 * gb), Some(32 * gb)),
+            fits(2 * gb)
+        );
         // Tiny limit floors at MIN, not at the 256 MB auto floor.
         assert_eq!(
             MemBudget::auto_total(Some(25 * gb), Some(96 << 20)),
@@ -883,10 +970,16 @@ mod tests {
         assert!(small.flat_output_limit < 200 << 20, "{small:?}");
         assert!(small.max_workers <= 2, "{small:?}");
 
-        // A 16 GB budget clears the built-in 256 MiB chain cap.
-        let large = MemBudget::with_total(16 << 30).rar_execution_policy();
-        assert!(large.flat_output_limit > 256 << 20, "{large:?}");
-        assert!(large.max_workers >= 8, "{large:?}");
+        // A 16 GB budget clears the built-in 256 MiB chain cap - on a host
+        // that can hold a 16 GB budget. A 32-bit one cannot, so there the
+        // answer is correctly "stays on the bounded modes", which the
+        // `small` block above already pins.
+        #[cfg(not(target_pointer_width = "32"))]
+        {
+            let large = MemBudget::with_total(16 << 30).rar_execution_policy();
+            assert!(large.flat_output_limit > 256 << 20, "{large:?}");
+            assert!(large.max_workers >= 8, "{large:?}");
+        }
 
         // Monotone: more budget never shrinks the allowances.
         let mut previous = MemBudget::with_total(MemBudget::MIN).rar_execution_policy();

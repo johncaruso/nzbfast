@@ -35,6 +35,11 @@ thread_local! {
     static PARK_GAP: RefCell<Option<Box<dyn FnOnce(&Daemon)>>> = const {
         RefCell::new(None)
     };
+    /// One-shot callback for the activation window; see
+    /// [`on_activate_gap`].
+    static ACTIVATE_GAP: RefCell<Option<Box<dyn FnOnce(&Daemon)>>> = const {
+        RefCell::new(None)
+    };
 }
 
 /// Let `writes` further durable store writes land on this thread, then
@@ -48,6 +53,7 @@ pub(in crate::serve) fn arm_cut(writes: u32) {
 pub(in crate::serve) fn disarm() {
     BUDGET.with(|b| b.set(None));
     PARK_GAP.with(|g| *g.borrow_mut() = None);
+    ACTIVATE_GAP.with(|g| *g.borrow_mut() = None);
 }
 
 /// Called by the durable-write seams themselves. `true` means this write
@@ -73,6 +79,21 @@ pub(in crate::serve) fn on_park_gap(f: impl FnOnce(&Daemon) + 'static) {
 /// runs, so a callback that parks again cannot re-enter itself.
 pub(in crate::serve) fn park_gap(d: &Daemon) {
     let f = PARK_GAP.with(|g| g.borrow_mut().take());
+    if let Some(f) = f {
+        f(d);
+    }
+}
+
+/// Run `f` the next time `activate_parked` has dropped a record from
+/// history and not yet pushed it onto the queue on this thread. One
+/// shot, like [`on_park_gap`].
+pub(in crate::serve) fn on_activate_gap(f: impl FnOnce(&Daemon) + 'static) {
+    ACTIVATE_GAP.with(|g| *g.borrow_mut() = Some(Box::new(f)));
+}
+
+/// The `activate_parked` side of [`on_activate_gap`].
+pub(in crate::serve) fn activate_gap(d: &Daemon) {
+    let f = ACTIVATE_GAP.with(|g| g.borrow_mut().take());
     if let Some(f) = f {
         f(d);
     }

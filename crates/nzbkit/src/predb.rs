@@ -437,6 +437,32 @@ fn plain_kind(word: &str) -> Option<PreKind> {
 /// seconds. The title is anchored from the LEFT (keyword, then
 /// section), and what remains is taken opaquely, per the survey's
 /// warning that the trailing field has no terminator.
+/// The `pre | SECTION | RELEASE` shape (predataba.se). `None` when the
+/// line is not that shape, which is [`parse_plain`]'s cue to keep trying.
+fn parse_pipe(t: &str) -> Option<PreLine> {
+    let parts: Vec<&str> = t.split('|').map(str::trim).collect();
+    let kind = plain_kind(parts[0])?;
+    if parts.len() < 3 {
+        return None;
+    }
+    let title = parts[2];
+    if title.is_empty() || is_absent_marker(title) {
+        return None;
+    }
+    let mut p = PreLine {
+        kind,
+        title: title.to_string(),
+        ..Default::default()
+    };
+    if !is_absent_marker(parts[1]) {
+        p.category = parts[1].to_string();
+    }
+    if kind == PreKind::Nuk && parts.len() > 3 {
+        p.nuke_reason = parts[3..].join(" ");
+    }
+    Some(p)
+}
+
 fn parse_plain(text: &str) -> Option<PreLine> {
     let t = text.trim();
     if t.is_empty() {
@@ -445,27 +471,14 @@ fn parse_plain(text: &str) -> Option<PreLine> {
     // predataba.se: split on '|'. The release field is the one shape
     // that cannot collide with its delimiter ('|' never appears in a
     // release name), so the fields are taken verbatim.
-    if t.contains('|') {
-        let parts: Vec<&str> = t.split('|').map(str::trim).collect();
-        let kind = plain_kind(parts[0])?;
-        if parts.len() < 3 {
-            return None;
-        }
-        let title = parts[2];
-        if title.is_empty() || is_absent_marker(title) {
-            return None;
-        }
-        let mut p = PreLine {
-            kind,
-            title: title.to_string(),
-            ..Default::default()
-        };
-        if !is_absent_marker(parts[1]) {
-            p.category = parts[1].to_string();
-        }
-        if kind == PreKind::Nuk && parts.len() > 3 {
-            p.nuke_reason = parts[3..].join(" ");
-        }
+    //
+    // Tried, not COMMITTED to: a pipe anywhere in the line used to route
+    // it here for good, so a corrupt-net line carrying one (in a nuke
+    // reason, say) parsed as a broken pipe line and was dropped without
+    // the shapes below ever seeing it.
+    if t.contains('|')
+        && let Some(p) = parse_pipe(t)
+    {
         return Some(p);
     }
     // corrupt-net "PRE: [SECTION] RELEASE" / scenep2p
@@ -498,7 +511,11 @@ fn parse_plain(text: &str) -> Option<PreLine> {
     // both futures, because release names never contain spaces. A
     // trailing ")" from the fully-parenthesized variant is shed.
     let mut it = rest.split_whitespace();
-    let title = it.next()?.trim_start_matches('(').trim_end_matches(')');
+    // ONE wrapping paren from the fully-parenthesized variant, not every
+    // trailing one: `trim_end_matches` would eat a release name's own.
+    let title = it.next()?;
+    let title = title.strip_prefix('(').unwrap_or(title);
+    let title = title.strip_suffix(')').unwrap_or(title);
     if title.is_empty() || is_absent_marker(title) {
         return None;
     }
@@ -742,6 +759,10 @@ pub async fn run_once(
     let mut registered = false;
     let mut joined = false;
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    // The previous round truncated a line at MAX_LINE, so what arrives
+    // next is that line's TAIL - not a message. Parsed as one it let a
+    // peer inject any line it liked simply by padding ahead of it.
+    let mut resync = false;
     let opened = tokio::time::Instant::now();
     let mut last_traffic = opened;
     loop {
@@ -749,59 +770,68 @@ pub async fn run_once(
             let _ = wr.write_all(b"QUIT :bye\r\n").await;
             return IrcStop::Cancelled;
         }
+        // Read in short slices rather than waiting out the whole
+        // timeout in one call. The timeouts below are still the real
+        // ones; slicing is what lets switching the feature off take
+        // effect in seconds instead of at the end of a ten-minute
+        // idle window - a connection the user has just turned off
+        // must actually close.
+        //
+        // Cancelling `read_until` mid-line is safe HERE and only
+        // here: `buf` is not cleared between slices, so bytes
+        // already moved out of the reader stay in it and the next
+        // slice continues the same line.
+        const POLL: Duration = Duration::from_secs(2);
+        let room = MAX_LINE - buf.len() as u64;
+        // Bytes, not read_line: IRC has no charset and relay bots
+        // send latin-1 titles routinely. read_line would fail the
+        // whole connection on the first one; lossy decoding costs a
+        // mangled character in a field we do not match on.
+        let mut limited = (&mut lines).take(room);
+        match tokio::time::timeout(POLL, limited.read_until(b'\n', &mut buf)).await {
+            // Nothing this slice. Two clocks: a short one until
+            // registration completes, a long idle one afterwards.
+            // Without the first, a server that accepts the TCP
+            // connection and then says nothing holds a task forever.
+            Err(_) => {
+                if !registered && opened.elapsed() >= REGISTER_TIMEOUT {
+                    return IrcStop::Transient("registration timed out".into());
+                }
+                if registered && last_traffic.elapsed() >= IDLE_TIMEOUT {
+                    return IrcStop::Transient("no traffic for 10 minutes".into());
+                }
+                continue;
+            }
+            Ok(Err(e)) => return IrcStop::Transient(format!("read: {e}")),
+            Ok(Ok(0)) => return IrcStop::Transient("server closed the connection".into()),
+            Ok(Ok(_)) => {}
+        }
+        // A slice that returned bytes but no terminator is a line
+        // still arriving; keep reading it.
+        if buf.last() != Some(&b'\n') && (buf.len() as u64) < MAX_LINE {
+            continue;
+        }
         // An oversized line: the peer sent MAX_LINE bytes with no
         // terminator. Take what there is and resync at the next newline
         // rather than growing the buffer for it.
-        if buf.len() as u64 >= MAX_LINE {
-            buf.push(b'\n');
-        } else {
-            // Read in short slices rather than waiting out the whole
-            // timeout in one call. The timeouts below are still the real
-            // ones; slicing is what lets switching the feature off take
-            // effect in seconds instead of at the end of a ten-minute
-            // idle window - a connection the user has just turned off
-            // must actually close.
-            //
-            // Cancelling `read_until` mid-line is safe HERE and only
-            // here: `buf` is not cleared between slices, so bytes
-            // already moved out of the reader stay in it and the next
-            // slice continues the same line.
-            const POLL: Duration = Duration::from_secs(2);
-            let room = MAX_LINE - buf.len() as u64;
-            // Bytes, not read_line: IRC has no charset and relay bots
-            // send latin-1 titles routinely. read_line would fail the
-            // whole connection on the first one; lossy decoding costs a
-            // mangled character in a field we do not match on.
-            let mut limited = (&mut lines).take(room);
-            match tokio::time::timeout(POLL, limited.read_until(b'\n', &mut buf)).await {
-                // Nothing this slice. Two clocks: a short one until
-                // registration completes, a long idle one afterwards.
-                // Without the first, a server that accepts the TCP
-                // connection and then says nothing holds a task forever.
-                Err(_) => {
-                    if !registered && opened.elapsed() >= REGISTER_TIMEOUT {
-                        return IrcStop::Transient("registration timed out".into());
-                    }
-                    if registered && last_traffic.elapsed() >= IDLE_TIMEOUT {
-                        return IrcStop::Transient("no traffic for 10 minutes".into());
-                    }
-                    continue;
-                }
-                Ok(Err(e)) => return IrcStop::Transient(format!("read: {e}")),
-                Ok(Ok(0)) => return IrcStop::Transient("server closed the connection".into()),
-                Ok(Ok(_)) => {}
-            }
-            // A slice that returned bytes but no terminator is a line
-            // still arriving; keep reading it.
-            if buf.last() != Some(&b'\n') && (buf.len() as u64) < MAX_LINE {
-                continue;
-            }
-        }
+        //
+        // Sampled HERE, after the read, and not before it: the read is
+        // what fills the buffer to the cap, so a sample taken ahead of
+        // it always reads false on the very slice that truncates. The
+        // tail then arrived as a line of its own and a peer could inject
+        // any message it liked simply by padding to exactly MAX_LINE
+        // ahead of it - which is the attack the resync exists to stop.
+        let oversized = buf.last() != Some(&b'\n');
         last_traffic = tokio::time::Instant::now();
         let decoded = String::from_utf8_lossy(&buf);
         let line = decoded.trim_end_matches(['\r', '\n']).to_string();
         buf.clear();
         let line = line.as_str();
+        // Whatever followed a truncated line is the rest of it; drop it,
+        // and keep dropping until one arrives that we did not cut.
+        if std::mem::replace(&mut resync, oversized) {
+            continue;
+        }
         if line.is_empty() {
             continue;
         }
@@ -1544,6 +1574,43 @@ mod tests {
         assert!(matches!(stop, IrcStop::Transient(_)), "{stop:?}");
         assert_eq!(msgs.len(), 1, "{msgs:?}");
         assert_eq!(msgs[0].2, "NEW: [TT: Y-GRP]");
+    }
+
+    /// The truncation is decided by the read that FILLS the buffer, not
+    /// by a sample taken before it. A peer that sends exactly MAX_LINE
+    /// bytes with no terminator has its NEXT newline-terminated run
+    /// discarded as the tail of that line - even though the tail is a
+    /// syntactically perfect PRIVMSG, which is exactly what an injector
+    /// would pad ahead of. Only the line after the resync is a message.
+    #[tokio::test]
+    async fn a_tail_after_an_exactly_max_line_run_is_not_a_message() {
+        let (stop, msgs) = run_against(
+            vec!["#pre".into()],
+            Arc::new(AtomicBool::new(false)),
+            |sock| async move {
+                let (rd, mut wr) = sock.into_split();
+                let mut rd = TokioBufReader::new(rd);
+                srv_line(&mut rd).await;
+                srv_line(&mut rd).await;
+                wr.write_all(b":srv 001 me :welcome\r\n").await.unwrap();
+                assert_eq!(srv_line(&mut rd).await, "JOIN #pre");
+                // Exactly MAX_LINE bytes, no terminator among them: the
+                // bounded read returns with the buffer full and the line
+                // still unfinished.
+                wr.write_all(&vec![b'a'; MAX_LINE as usize]).await.unwrap();
+                wr.write_all(b":bot!u@h PRIVMSG #pre :NEW: [TT: INJECTED-GRP]\r\n")
+                    .await
+                    .unwrap();
+                wr.write_all(b":bot!u@h PRIVMSG #pre :NEW: [TT: LEGIT-GRP]\r\n")
+                    .await
+                    .unwrap();
+                wr.write_all(b"ERROR :done\r\n").await.unwrap();
+            },
+        )
+        .await;
+        assert!(matches!(stop, IrcStop::Transient(_)), "{stop:?}");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].2, "NEW: [TT: LEGIT-GRP]");
     }
 
     /// Config guards: an empty host cannot connect, and TLS against a

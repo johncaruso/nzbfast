@@ -1,8 +1,13 @@
 name: sign-windows
 
-# Build the Windows installer (nzbfast.exe + nzbtray.exe inside an Inno
-# Setup exe) entirely in CI, from public source, so it can be signed by
+# Build the Windows installers (nzbfast.exe + nzbtray.exe inside an Inno
+# Setup exe) entirely in CI, from public source, so they can be signed by
 # the SignPath Foundation's free OSS code-signing pipeline.
+#
+# TWO installers, one per job: the x64 package and the ARM64 BETA package.
+# Both are built here, and both are submitted for signing when Phase C
+# lands - see the long note above the arm64 job for why a beta gets a
+# signature, which is a decision and not a default.
 #
 # WHY CI (and not the local mingw cross-build): SignPath requires that a
 # signed binary be built from source "in a verifiable way". Building on a
@@ -15,15 +20,16 @@ name: sign-windows
 #     workflow artifact. Fully testable on the PRIVATE repo before the
 #     SignPath project exists. Manual dispatch only - never auto-runs.
 #   Phase C (after SignPath approval): paste the signing step that the
-#     SignPath console generates for this project into the marked slot,
-#     and add the SIGNPATH_API_TOKEN secret + SIGNPATH_ORGANIZATION_ID
-#     variable to the PUBLIC repo. Then `sign: true` submits for signing.
+#     SignPath console generates for this project into the marked slot IN
+#     EACH JOB (there are two), and add the SIGNPATH_API_TOKEN secret +
+#     SIGNPATH_ORGANIZATION_ID variable to the PUBLIC repo. Then
+#     `sign: true` submits for signing.
 
 on:
   workflow_dispatch:
     inputs:
       sign:
-        description: "Submit the installer to SignPath for signing (needs a provisioned project + secrets)"
+        description: "Submit both installers (x64 + ARM64 beta) to SignPath for signing (needs a provisioned project + secrets)"
         type: boolean
         default: false
 
@@ -144,4 +150,177 @@ jobs:
       #     with:
       #       name: nzbfast-setup-signed
       #       path: packaging/windows/out-signed/*.exe
+      # ------------------------------------------------------------------
+
+  # ====================================================================
+  # ARM64 (Windows on ARM), the BETA package. Same installer script, same
+  # two-phase rollout, native aarch64 binaries instead of emulated x64.
+  #
+  # WHY THIS JOB EXISTS. Today every Windows asset is unsigned, so the
+  # ARM64 beta is no worse off than the x64 download. The moment the
+  # Phase C block above starts signing the x64 installer, an ARM64 leg
+  # this workflow did not know about becomes the ONLY unsigned Windows
+  # download - on the platform whose SmartScreen and Defender behaviour
+  # we have the least data about. That is a worse position than today and
+  # it would arrive by omission rather than by decision.
+  #
+  # DOES A BETA GET SUBMITTED FOR SIGNING? YES - decided, not defaulted.
+  # The `sign` input covers both jobs and the Phase C block at the bottom
+  # of this one is the arm64 half of the block above.
+  #
+  # The reasoning, so nobody has to re-derive it: a signature attests WHO
+  # built the file, not that the file is good. "Beta" is a fitness claim,
+  # and it is already made in three places a signature does not touch -
+  # the `-beta` in the asset name, the first screen of the installer
+  # itself (see installer.iss's #ifdef Arm64 WelcomeLabel2), and the
+  # deliberate absence from the signed update manifest (the note above
+  # PLATFORMS in packaging/make-latest-json.sh). Withholding the
+  # signature would instead attach our scariest install experience to our
+  # least-tested platform, which is backwards: the beta is the build a
+  # user most needs to be able to identify before double-clicking it, and
+  # SmartScreen reputation accrues per publisher, so the beta both feeds
+  # and benefits from the same pool as the x64 installer. The cost is one
+  # extra manual approval per release in the SignPath UI - which is
+  # exactly where a human can still refuse any individual artifact
+  # without touching this file.
+  #
+  # To reverse the decision, delete the Phase C steps from THIS job only.
+  # Everything above them (build, attest, upload unsigned) stands alone
+  # and is what the beta ships from today.
+  #
+  # NOT `continue-on-error: true`, unlike the beta job in release.yml.
+  # There it earns its keep because the `release` job waits on it and a
+  # red beta must not withhold a release. Here the two jobs are already
+  # independent - a broken ARM64 leg cannot delay or damage the x64
+  # installer - so the flag would only hide a real breakage in the one
+  # workflow whose entire purpose is producing a signable artifact.
+  # ====================================================================
+  windows-installer-arm64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Only the target is added - no `rustup update stable`. The ARM64
+      # MSVC toolchain (VS "MSVC v143 - ARM64/ARM64EC build tools") is
+      # already in the windows-latest image, so an x64 runner
+      # cross-compiles to ARM64 with nothing else to install. This is
+      # also why the build is CI-only: mingw emits x86_64 PE objects
+      # only, and aarch64-pc-windows-msvc links with MSVC's link.exe,
+      # which does not run on the Mac the x64 assets are cross-built on.
+      - name: Install Rust + windows-arm64 target
+        shell: bash
+        run: rustup target add aarch64-pc-windows-msvc
+
+      # No CARGO_TARGET_*_RUSTFLAGS here either, and for the identical
+      # reason: the env var REPLACES .cargo/config.toml's rustflags
+      # rather than adding to them, which is how v1.0.0 shipped with
+      # build-host paths in it. aarch64-pc-windows-msvc deliberately has
+      # no [target] section in that file, so it inherits the remap from
+      # [build] unchanged.
+      #
+      # Both packages in ONE invocation: `-p nzbtray` alone resolves a
+      # crate graph without the engine's feature unification and yields a
+      # smaller, wrong tray.
+      - name: Build nzbfast.exe + nzbtray.exe (aarch64)
+        shell: bash
+        run: cargo build --release --target aarch64-pc-windows-msvc -p nzbfast -p nzbtray
+
+      - name: Read version from Cargo.toml
+        id: ver
+        shell: bash
+        run: echo "v=$(grep '^version' crates/nzbfast/Cargo.toml | head -1 | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+      # Identical to the x64 staging step but for the target directory,
+      # the manual included: docs/MANUAL.html carries a
+      # __NZBFAST_UI_TOKENS__ placeholder the daemon substitutes at serve
+      # time, so a plain `cp` ships a page that renders the marker as
+      # body text and styles itself against CSS variables nothing
+      # declared. make-offline-manual.sh is what resolves it.
+      - name: Stage installer payload
+        shell: bash
+        run: |
+          STAGE=packaging/windows/stage
+          rm -rf "$STAGE" && mkdir -p "$STAGE" packaging/windows/out
+          BIN=target/aarch64-pc-windows-msvc/release
+          cp "$BIN/nzbfast.exe" "$BIN/nzbtray.exe" "$STAGE/"
+          packaging/make-offline-manual.sh docs/MANUAL.html "$STAGE/MANUAL.html"
+          cp LICENSE COPYRIGHT.md "$STAGE/"
+
+      # Same invocation as the x64 job plus /DArm64, which is what
+      # switches ArchitecturesAllowed to arm64, adds the beta paragraph
+      # to the welcome screen, and names the output
+      # nzbfast-<ver>-windows-arm64-beta-setup.exe. Inno itself is an x86
+      # program building an ARM64 package: fine and normal, it never
+      # inspects the payload, it stores it.
+      - name: Compile Inno Setup installer (arm64)
+        shell: cmd
+        # %APPVER% rather than direct ${{ }} interpolation, so a
+        # malformed Cargo.toml version cannot inject into the cmd shell.
+        env:
+          APPVER: ${{ steps.ver.outputs.v }}
+        run: |
+          choco install innosetup -y --no-progress
+          cd packaging\windows
+          ISCC /DAppVersion=%APPVER% /DStageDir=stage /DArm64 /Oout installer.iss
+
+      # Its own subject-path. The x64 job's glob is
+      # nzbfast-*-windows-x64-setup.exe and must keep matching only that
+      # file; this one names the beta explicitly so neither can quietly
+      # start attesting the other's build.
+      - name: Attest installer provenance (arm64)
+        if: ${{ github.repository == 'nzbfast/nzbfast' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: packaging/windows/out/nzbfast-*-windows-arm64-beta-setup.exe
+
+      # Its own artifact name too - `nzbfast-setup-unsigned` is the x64
+      # one and is referenced by name in the Phase C block above and in
+      # the SignPath project configuration.
+      - name: Upload UNSIGNED installer (arm64)
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nzbfast-setup-arm64-beta-unsigned
+          path: packaging/windows/out/nzbfast-*-windows-arm64-beta-setup.exe
+          if-no-files-found: error
+
+      # ------------------------------------------------------------------
+      # PHASE C (arm64) - the second half of the block in the x64 job.
+      # Paste the step the SignPath console generates, with the SAME
+      # project-slug and signing-policy-slug as the x64 installer (it is
+      # the same product and the same release policy; only the payload
+      # architecture differs), consuming THIS job's artifact:
+      #
+      #   - name: Sign ARM64 installer via SignPath Foundation
+      #     if: ${{ inputs.sign }}
+      #     uses: signpath/github-action-submit-signing-request@ced31329c0317e779dad2eec2a7c3bb46ea1343e # v1
+      #     with:
+      #       api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+      #       organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+      #       project-slug: nzbfast
+      #       signing-policy-slug: release-signing
+      #       artifact-configuration-slug: installer
+      #       github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      #       wait-for-completion: true
+      #       output-artifact-directory: packaging/windows/out-signed
+      #
+      #   # Authenticode signing rewrites the file, so the signed exe has
+      #   # a different digest from the one attested above and needs its
+      #   # own attestation - that digest is what users download.
+      #   - name: Attest SIGNED ARM64 installer provenance
+      #     if: ${{ inputs.sign }}
+      #     uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      #     with:
+      #       subject-path: packaging/windows/out-signed/*.exe
+      #
+      #   - name: Upload SIGNED ARM64 installer
+      #     if: ${{ inputs.sign }}
+      #     uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      #     with:
+      #       name: nzbfast-setup-arm64-beta-signed
+      #       path: packaging/windows/out-signed/*.exe
+      #
+      # The signed exe keeps `-beta` in its name. Signing says who built
+      # it; the name says how much it has been tested, and it is still
+      # not in latest.json either way.
       # ------------------------------------------------------------------

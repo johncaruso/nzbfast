@@ -1452,6 +1452,15 @@ mod tests {
         assert!(result.is_err(), "a short source must not repair silently");
     }
 
+    // 64-bit only. `group_count` is a u64 off the wire and the plan
+    // measures shards in `usize`, so on a 32-bit host (armv7) a 20 GiB
+    // group is refused at `usize::try_from(group.len) ->
+    // RecoveryError::PlanOverflow` in `repair_stream` rather than
+    // planned - a clean decline, which is the right answer when the
+    // extent does not fit the address space. Spelled `20 << 30` through
+    // a 32-bit `usize` the value is silently ZERO, so this used to fail
+    // as `OddShardSize` and look like a bug in the planner.
+    #[cfg(not(target_pointer_width = "32"))]
     #[test]
     fn a_multi_gigabyte_declared_volume_is_planned_without_reading_it() {
         // What must scale to 20 GB is the PLANNING: deciding the stripe and

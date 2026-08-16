@@ -180,7 +180,12 @@ const TABLE: &[Row] = &[
         video: false,
         mkv: &["a_eac3"],
         fourcc: &["ec-3"],
-        avi: &["0x2001"],
+        // No classic WAVE tag: 0x2001 is WAVE_FORMAT_DTS and belongs to
+        // the dts row below - claiming it here shadowed that row (lookup
+        // returns the first match) and a real DTS AVI read as "DDP",
+        // raising the exact false Audio mismatch facts::check must never
+        // make.
+        avi: &[],
         support: Transcode,
     },
     Row {

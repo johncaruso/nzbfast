@@ -78,11 +78,13 @@ fn imdb_of(rel: &serde_json::Value) -> String {
     else {
         return String::new();
     };
+    // Validated INSIDE the search, not after it: a first `imdb:` entry
+    // that is malformed (or empty) used to be the answer, and a valid
+    // one further down the list was never looked at.
     uris.iter()
         .filter_map(|u| u.as_str())
-        .find_map(|u| u.strip_prefix("imdb:"))
-        .map(str::trim)
-        .filter(|id| {
+        .filter_map(|u| u.strip_prefix("imdb:").map(str::trim))
+        .find(|id| {
             id.len() > 2 && id.starts_with("tt") && id[2..].chars().all(|c| c.is_ascii_digit())
         })
         .unwrap_or("")

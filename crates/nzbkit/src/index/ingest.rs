@@ -454,6 +454,111 @@ fn gen_candidates(
     Ok(out)
 }
 
+/// How many of the batch's own message-ids [`hidden_home`] probes
+/// through the reverse map. `msgid_map_insert` keys the lowest
+/// [`MSGID_KEYS_PER_FILE`] segments of each file, so probing that many
+/// per file is the whole set the map could be holding for this posting
+/// - anything beyond it is a lookup that cannot hit. The overall cut
+/// bounds a cluster carrying hundreds of files; it costs the tail of a
+/// wide cluster its probe, never a wrong answer.
+const MAX_HOME_PROBES: usize = 32;
+
+/// How many rows the reverse probe will TEST. Ordered by how many of
+/// the batch's ids each one matched, so the row that shares the most
+/// evidence is tested first; a stranger that collided on one truncated
+/// hash cannot push the real home out of a window this wide.
+const MAX_HOME_ROWS: usize = 4;
+
+/// The row of this triple that already holds one of the batch's own
+/// ARTICLES, found through the reverse message-id map rather than
+/// through a key derived from coverage.
+///
+/// The saturated path's exact-home lookup is keyed on
+/// `msgid_set_key(lowest present part of each present file)`, and that
+/// is a function of what the BATCH carries, not of the generation it
+/// belongs to. Coverage grows - a second server's spool carries part 1
+/// where the first only had part 2, or carries a file the first never
+/// saw - and the later batch computes a different key. The key lookup
+/// misses, the LIMITed window cannot reach the row either, and the
+/// cluster is dropped on every scan forever: the parts that had just
+/// become available could never be added to the generation waiting for
+/// them (read-only sweep 2, 15 Aug 2026, M4).
+///
+/// A message-id is the invariant: it does not change when its
+/// neighbours arrive, and `msgid_map` is append-only per release, so
+/// the ids a row was written under keep joining after it grows. Two
+/// gates keep this from being a merge tool. The row must belong to
+/// THIS triple's marked namespace - same stem, same group, the same
+/// plain poster - so a shared article can never fold two postings by
+/// different posters together. And `contradicts` still decides:
+/// 64 bits of msgid hash can collide, and a batch that shares one
+/// article while disagreeing on another part IS a second posting, which
+/// is the case the D3 backstop exists for.
+fn hidden_home(
+    db: &Connection,
+    stem: &str,
+    poster: &str,
+    grp: &str,
+    files: &ClusterFiles,
+    seen: &[(i64, String)],
+) -> rusqlite::Result<Option<(String, ExistingFiles)>> {
+    // Deterministic order over a HashMap, so which ids a very wide
+    // cluster spends its budget on is a property of the batch and not
+    // of this run's hash seed.
+    let mut names: Vec<&String> = files.keys().collect();
+    names.sort_unstable();
+    let mut probes: Vec<&str> = Vec::new();
+    for name in names {
+        let (_, parts) = &files[name];
+        for (id, _) in parts.values().take(MSGID_KEYS_PER_FILE) {
+            probes.push(id.as_str());
+        }
+        if probes.len() >= MAX_HOME_PROBES {
+            probes.truncate(MAX_HOME_PROBES);
+            break;
+        }
+    }
+    let mut sel = db.prepare_cached("SELECT release_id FROM msgid_map WHERE h=?1")?;
+    let mut hits: BTreeMap<i64, u32> = BTreeMap::new();
+    let mut probed: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for id in probes {
+        let h = claims::msgid_hash(id);
+        if !probed.insert(h) {
+            continue;
+        }
+        for rid in sel.query_map([h], |r| r.get::<_, i64>(0))? {
+            let rid = rid?;
+            // Every candidate the window offered was already fetched
+            // and contradicted above; re-testing them buys nothing.
+            if seen.iter().any(|(id, _)| *id == rid) {
+                continue;
+            }
+            *hits.entry(rid).or_default() += 1;
+        }
+    }
+    let mut ranked: Vec<(i64, u32)> = hits.into_iter().collect();
+    ranked.sort_by_key(|&(rid, n)| (std::cmp::Reverse(n), rid));
+    let mark = format!("{poster}{POSTER_GEN_MARK}");
+    let mut q =
+        db.prepare_cached("SELECT poster FROM releases WHERE id=?1 AND stem=?2 AND grp=?3")?;
+    for (rid, _) in ranked.into_iter().take(MAX_HOME_ROWS) {
+        let Some(row_poster) = q
+            .query_row(rusqlite::params![rid, stem, grp], |r| r.get::<_, String>(0))
+            .optional()?
+        else {
+            continue;
+        };
+        if row_poster != poster && !row_poster.starts_with(&mark) {
+            continue;
+        }
+        let existing = fetch_existing(db, rid, files)?;
+        if !contradicts(&existing, files) {
+            return Ok(Some((row_poster, existing)));
+        }
+    }
+    Ok(None)
+}
+
 /// What [`pick_release_row`] decided for one cluster.
 enum RowPick {
     /// Write into this row (plain or marked); the batch does not
@@ -462,10 +567,10 @@ enum RowPick {
     /// Every candidate is contradicted: write under this brand-new
     /// marked poster value.
     Mint(String),
-    /// Every candidate is contradicted AND the marked namespace is
-    /// already at [`MAX_GEN_SIBLINGS`]. Drop the cluster - the articles
-    /// re-arrive on the next scan of this window, exactly like the
-    /// [`MAX_GEN_PASSES`] overflow.
+    /// Every candidate is contradicted, the marked namespace is already
+    /// at [`MAX_GEN_SIBLINGS`], and no existing row is this batch's exact
+    /// home. Drop the cluster - the articles re-arrive on the next scan
+    /// of this window, exactly like the [`MAX_GEN_PASSES`] overflow.
     Saturated,
 }
 
@@ -489,7 +594,12 @@ enum RowPick {
 /// index (14 Aug 2026): 6.5M marked rows, 166k families past the cap,
 /// one family at 2,730 rows - flood bots reinject the same posting
 /// under fresh message-ids, which this key treats as a new generation
-/// every time. Past the cap the cluster is dropped instead.
+/// every time. Past the cap the cluster is dropped instead, but only
+/// after one exact lookup of the batch's own marked key: no row of its
+/// own can be minted, and dropping is right only when no EXISTING row
+/// is its exact home. A family already past the cap has siblings the
+/// candidate window cannot reach, and the pre-cap code reached them
+/// through the caller's `ON CONFLICT` upsert.
 fn pick_release_row(
     db: &Connection,
     stem: &str,
@@ -515,9 +625,6 @@ fn pick_release_row(
     if !candidates.iter().any(|(_, p)| p == poster) {
         return Ok(RowPick::Adopt(poster.to_string(), ExistingFiles::new()));
     }
-    if candidates.iter().filter(|(_, p)| p != poster).count() >= MAX_GEN_SIBLINGS as usize {
-        return Ok(RowPick::Saturated);
-    }
     // Marked, keyed by the batch's own articles so the value is a
     // function of what it carries rather than an ordinal - the same
     // property the spot marker has, though here it is the adopt test
@@ -528,6 +635,9 @@ fn pick_release_row(
     // test can see. That costs the agreeing file a duplicate row on the
     // new release; the contradicted one is still kept apart, which is
     // the half that corrupts a download.
+    //
+    // Computed BEFORE the saturation test because the test needs it: see
+    // the exact-home probe below.
     let lowest: Vec<&str> = files
         .values()
         .filter_map(|(_, parts)| parts.values().next().map(|(id, _)| id.as_str()))
@@ -536,6 +646,47 @@ fn pick_release_row(
         "{poster}{POSTER_GEN_MARK}{}",
         &msgid_set_key(&lowest)[..GEN_HEX]
     );
+    if candidates.iter().filter(|(_, p)| p != poster).count() >= MAX_GEN_SIBLINGS as usize {
+        // The cap stops new rows being MINTED; it was never meant to
+        // stop an existing row being FED. `gen_candidates` cuts at
+        // MAX_GEN_SIBLINGS in poster order, so on a family already past
+        // the cap - 166k of them on the live index, plus anything the
+        // uncapped spot minting site pushes over - this batch's own
+        // deterministic home can sort outside the window and never be
+        // offered for adoption. Before the fix that row was invisible
+        // and the cluster was dropped on every scan, forever: a second
+        // server's spool holding parts the first missed could never add
+        // them. One indexed point lookup, only on the already-rare
+        // saturated path, and only when the window did not already show
+        // the key (in which case it was tested and contradicted above).
+        if !candidates.iter().any(|(_, p)| *p == marked)
+            && let Some(rid) = db
+                .prepare_cached("SELECT id FROM releases WHERE stem=?1 AND poster=?2 AND grp=?3")?
+                .query_row(rusqlite::params![stem, &marked, grp], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .optional()?
+        {
+            // Still gated on `contradicts`: 12 hex digits of the msgid
+            // set key can collide, and adopting on the key alone would
+            // union two postings into one row - the "complete download
+            // that extracts to garbage" the D3 backstop exists to stop.
+            let existing = fetch_existing(db, rid, files)?;
+            if !contradicts(&existing, files) {
+                return Ok(RowPick::Adopt(marked, existing));
+            }
+        }
+        // The key above only finds a row minted from the SAME coverage
+        // this batch carries. `hidden_home` asks the question the key
+        // cannot: which row past the window already holds one of these
+        // very articles.
+        if let Some((row_poster, existing)) =
+            hidden_home(db, stem, poster, grp, files, &candidates)?
+        {
+            return Ok(RowPick::Adopt(row_poster, existing));
+        }
+        return Ok(RowPick::Saturated);
+    }
     // debug, not warn: reinjection floods hit this thousands of times a
     // tick, and the per-cluster storm wrote 90 MB of daemon.log in one
     // day on a tester's box (which Windows never caps - the logtee's
@@ -636,9 +787,15 @@ impl Index {
                 &self.db,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
+            // COALESCE(pre_title, stem), the same name every other
+            // classification site reads (ingest_pass, the quality_v8
+            // backfill): classifying the raw stem here rewrote pre-named
+            // obfuscated releases back to kind=other / blank title_key /
+            // junk>=70 on any category edit, and the naming seam refuses
+            // rows whose pre_title is already set, so nothing healed them.
             let rows: Vec<(i64, String, i64, bool)> = {
                 let mut sel = tx.prepare_cached(&format!(
-                    "SELECT id, stem, total_bytes,
+                    "SELECT id, COALESCE(NULLIF(pre_title,''), stem), total_bytes,
                             EXISTS(SELECT 1 FROM files
                                    WHERE release_id=releases.id AND {EXE_FILE_SQL})
                      FROM releases WHERE id > ?1 ORDER BY id LIMIT 10000"
@@ -658,13 +815,13 @@ impl Index {
                     "UPDATE releases SET kind=?2, title_key=?3, junk=?4
                      WHERE id=?1 AND (kind<>?2 OR title_key<>?3 OR junk<>?4)",
                 )?;
-                for (id, stem, bytes, has_exe) in &rows {
-                    let p = self.classify(stem);
+                for (id, name, bytes, has_exe) in &rows {
+                    let p = self.classify(name);
                     changed += upd.execute(rusqlite::params![
                         id,
                         kind_str(&p.kind),
                         p.key,
-                        junk_score(stem, &p, *bytes as u64, *has_exe),
+                        junk_score(name, &p, *bytes as u64, *has_exe),
                     ])? as u64;
                 }
             }
@@ -770,7 +927,24 @@ impl Index {
         // every pass has committed (see the note at the bottom of the
         // pass loop).
         let mut hits: Vec<WatchHit> = Vec::new();
-        let mut deferred = self.ingest_pass(grp, entries, now, &mut completed, &mut hits)?;
+        // `hits` is the per-pass carrier only: each pass announces its
+        // own after ITS commit, so this is empty by the time we return.
+        let outcome = self.ingest_passes(grp, entries, now, &mut completed, &mut hits);
+        debug_assert!(hits.is_empty(), "a pass kept watch hits past its commit");
+        outcome.map(|()| completed)
+    }
+
+    /// [`Self::ingest`]'s pass loop, split out so its early exits cannot
+    /// skip the watch journalling above.
+    fn ingest_passes(
+        &mut self,
+        grp: &str,
+        entries: &[OverEntry],
+        now: i64,
+        completed: &mut u32,
+        hits: &mut Vec<WatchHit>,
+    ) -> rusqlite::Result<()> {
+        let mut deferred = self.ingest_pass(grp, entries, now, completed, hits)?;
         let mut pass = 1u32;
         while !deferred.is_empty() {
             if pass >= MAX_GEN_PASSES {
@@ -784,12 +958,9 @@ impl Index {
             }
             pass += 1;
             let batch = std::mem::take(&mut deferred);
-            deferred = self.ingest_pass(grp, &batch, now, &mut completed, &mut hits)?;
+            deferred = self.ingest_pass(grp, &batch, now, completed, hits)?;
         }
-        for h in hits {
-            self.push_watch_hit(h);
-        }
-        Ok(completed)
+        Ok(())
     }
 
     /// One clustering-and-write pass over `entries`. Returns the
@@ -1179,6 +1350,15 @@ impl Index {
             }
         }
         tx.commit()?;
+        // Journalled only NOW, and only for the pass that committed: a
+        // pass whose transaction rolled back has no rows to announce and
+        // its ids may name nothing at all, so announcing them told a
+        // watch about arrivals that do not exist (Fable sweep 15 Aug).
+        // A later pass erroring still leaves THIS pass's hits announced,
+        // which is the property 9bf3022e added them for.
+        for h in std::mem::take(hits) {
+            self.push_watch_hit(h);
+        }
         if gen_minted > 0 || gen_dropped > 0 {
             warn!(
                 target: "index",
@@ -1672,6 +1852,365 @@ mod tests {
         )];
         ix.ingest("alt.test", &again, 5000).unwrap();
         assert_eq!(rows(&ix), 1 + MAX_GEN_SIBLINGS);
+        teardown(&dir, ix);
+    }
+
+    /// The cap bounds MINTING, not feeding. A family already past
+    /// MAX_GEN_SIBLINGS (166k of them on the live index on 14 Aug 2026,
+    /// plus whatever the uncapped spot minting site pushes over) has
+    /// siblings the LIMITed candidate window cannot reach. When one of
+    /// those unreachable rows is the batch's own deterministic home -
+    /// a second server's scan of the same articles carrying parts the
+    /// first server's spool missed - the pre-fix code returned
+    /// Saturated and dropped the cluster on every scan, forever.
+    #[test]
+    fn a_saturated_family_still_feeds_its_exact_generation_row() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-gensat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+
+        /// One release row plus the single file row that decides whether
+        /// it contradicts: part 1 under `part_id`.
+        fn add_row(db: &rusqlite::Connection, stem: &str, poster: &str, part_id: &str) {
+            db.execute(
+                "INSERT INTO releases(stem, poster, grp, first_seen, first_posted)
+                 VALUES(?1, ?2, 'alt.test', 1000, 1000)",
+                rusqlite::params![stem, poster],
+            )
+            .unwrap();
+            let rid = db.last_insert_rowid();
+            db.execute(
+                "INSERT INTO files(release_id, filename, total_parts, bytes, segments, nsegs)
+                 VALUES(?1, 'Pin.S01E01.mkv', 2, 1000, ?2, 1)",
+                rusqlite::params![rid, format!("[[1,\"{part_id}\",1000]]")],
+            )
+            .unwrap();
+        }
+        let rows = |ix: &Index| -> i64 {
+            ix.db
+                .query_row("SELECT COUNT(*) FROM releases", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        // The plain row, holding a DIFFERENT posting of the same name:
+        // part 1 under another message-id, so it contradicts below.
+        ix.ingest(
+            "alt.test",
+            &[entry(
+                "\"Pin.S01E01.mkv\" yEnc (1/2)",
+                "pin@x",
+                "other-1",
+                1000,
+            )],
+            1000,
+        )
+        .unwrap();
+        let (stem, poster): (String, String) = ix
+            .db
+            .query_row("SELECT stem, poster FROM releases", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+
+        // The key is MD5 over the lowest part's message-id, so it is the
+        // same value on every re-arrival of this article set - which is
+        // what makes an existing row the batch's exact home.
+        let key = msgid_set_key(["<pin-1@x>"])[..GEN_HEX].to_string();
+        let fillers: Vec<String> = (0..MAX_GEN_SIBLINGS).map(|i| format!("{i:012x}")).collect();
+        assert!(
+            key.as_str() > fillers.last().unwrap().as_str(),
+            "this pin needs the exact-home row to sort PAST the whole \
+             candidate window, and MD5 fixed the key at {key}"
+        );
+        for (i, suffix) in fillers.iter().enumerate() {
+            add_row(
+                &ix.db,
+                &stem,
+                &format!("{poster}{POSTER_GEN_MARK}{suffix}"),
+                &format!("<filler-{i}@x>"),
+            );
+        }
+        add_row(
+            &ix.db,
+            &stem,
+            &format!("{poster}{POSTER_GEN_MARK}{key}"),
+            "<pin-1@x>",
+        );
+        assert_eq!(rows(&ix), 2 + MAX_GEN_SIBLINGS);
+
+        // The same articles arrive again, this time with part 2 as well.
+        // Every row the window can see contradicts them; only the row it
+        // cannot see agrees.
+        ix.ingest(
+            "alt.test",
+            &[
+                entry("\"Pin.S01E01.mkv\" yEnc (1/2)", "pin@x", "pin-1@x", 1000),
+                entry("\"Pin.S01E01.mkv\" yEnc (2/2)", "pin@x", "pin-2@x", 900),
+            ],
+            2000,
+        )
+        .unwrap();
+
+        // Nothing minted (the cap still holds) and part 2 landed in the
+        // exact-home row rather than being dropped.
+        assert_eq!(rows(&ix), 2 + MAX_GEN_SIBLINGS);
+        let segs: String = ix
+            .db
+            .query_row(
+                "SELECT f.segments FROM files f
+                   JOIN releases r ON r.id = f.release_id
+                  WHERE r.poster = ?1",
+                [format!("{poster}{POSTER_GEN_MARK}{key}")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let parts: Vec<(u32, String, u64)> = serde_json::from_str(&segs).unwrap();
+        assert_eq!(
+            parts.len(),
+            2,
+            "the batch must have been merged into its exact home, got {segs}"
+        );
+        teardown(&dir, ix);
+    }
+
+    /// The exact-home key is a function of the batch's OWN coverage: it
+    /// hashes the lowest part number PRESENT of each file PRESENT. But
+    /// coverage GROWS - a second server's spool carries part 1 where the
+    /// first only had part 2, or carries a file the first never saw -
+    /// and the key the later batch computes is then not the key the row
+    /// was minted under. The point lookup missed, the LIMITed window
+    /// could not reach the row either, and the cluster was dropped on
+    /// every scan forever: the newly available parts could never be
+    /// added to the generation that was waiting for them.
+    ///
+    /// The reverse `msgid_map` is the invariant evidence - an article id
+    /// does not change when its neighbours arrive - and the two
+    /// directions below are BOTH the point: the growing batch must land
+    /// in the row that already holds one of its articles, and a batch
+    /// that merely SHARES an article while disagreeing elsewhere must
+    /// still be kept out of it.
+    #[test]
+    fn a_saturated_family_feeds_its_row_when_coverage_grows() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-gengrow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+
+        /// One release row plus its file row, keyed into the reverse
+        /// message-id map exactly as `ingest` keys its own writes.
+        fn add_row(
+            db: &rusqlite::Connection,
+            stem: &str,
+            poster: &str,
+            parts: &[(u32, &str)],
+        ) -> i64 {
+            db.execute(
+                "INSERT INTO releases(stem, poster, grp, first_seen, first_posted)
+                 VALUES(?1, ?2, 'alt.test', 1000, 1000)",
+                rusqlite::params![stem, poster],
+            )
+            .unwrap();
+            let rid = db.last_insert_rowid();
+            let segs: Vec<(u32, String, u64)> = parts
+                .iter()
+                .map(|(n, id)| (*n, (*id).into(), 1000))
+                .collect();
+            db.execute(
+                "INSERT INTO files(release_id, filename, total_parts, bytes, segments, nsegs)
+                 VALUES(?1, 'Grow.S01E01.part01.rar', 2, 1000, ?2, ?3)",
+                rusqlite::params![
+                    rid,
+                    serde_json::to_string(&segs).unwrap(),
+                    segs.len() as i64
+                ],
+            )
+            .unwrap();
+            claims::msgid_map_insert(db, rid, parts.iter().map(|(_, id)| *id)).unwrap();
+            rid
+        }
+        let rows = |ix: &Index| -> i64 {
+            ix.db
+                .query_row("SELECT COUNT(*) FROM releases", [], |r| r.get(0))
+                .unwrap()
+        };
+        let segs_of = |ix: &Index, rid: i64, fname: &str| -> Vec<(u32, String, u64)> {
+            let s: String = ix
+                .db
+                .query_row(
+                    "SELECT segments FROM files WHERE release_id=?1 AND filename=?2",
+                    rusqlite::params![rid, fname],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&s).unwrap()
+        };
+
+        // The plain row, holding a DIFFERENT posting of the same name.
+        ix.ingest(
+            "alt.test",
+            &[entry(
+                "\"Grow.S01E01.part01.rar\" yEnc (1/2)",
+                "grow@x",
+                "other-1@x",
+                1000,
+            )],
+            1000,
+        )
+        .unwrap();
+        let (stem, poster): (String, String) = ix
+            .db
+            .query_row("SELECT stem, poster FROM releases", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+
+        // The hidden row was minted when only PART 2 had been seen, so
+        // its key hashes part 2's id. Sixteen fillers sort ahead of it,
+        // which is what puts it past the candidate window.
+        let key = msgid_set_key(["<grow-2@x>"])[..GEN_HEX].to_string();
+        let fillers: Vec<String> = (0..MAX_GEN_SIBLINGS).map(|i| format!("{i:012x}")).collect();
+        assert!(
+            key.as_str() > fillers.last().unwrap().as_str(),
+            "this pin needs the hidden row to sort PAST the whole candidate \
+             window, and MD5 fixed the key at {key}"
+        );
+        for (i, suffix) in fillers.iter().enumerate() {
+            add_row(
+                &ix.db,
+                &stem,
+                &format!("{poster}{POSTER_GEN_MARK}{suffix}"),
+                &[(1, &format!("<filler-{i}@x>"))],
+            );
+        }
+        let hidden = add_row(
+            &ix.db,
+            &stem,
+            &format!("{poster}{POSTER_GEN_MARK}{key}"),
+            &[(2, "<grow-2@x>")],
+        );
+        assert_eq!(rows(&ix), 2 + MAX_GEN_SIBLINGS);
+
+        // Coverage grows: another server's spool has part 1 as well, so
+        // the batch's own key is now key(part 1) - not the key the row
+        // carries. Every row the window can see contradicts it; the row
+        // it cannot see shares part 2's article and contradicts nothing.
+        ix.ingest(
+            "alt.test",
+            &[
+                entry(
+                    "\"Grow.S01E01.part01.rar\" yEnc (1/2)",
+                    "grow@x",
+                    "grow-1@x",
+                    1000,
+                ),
+                entry(
+                    "\"Grow.S01E01.part01.rar\" yEnc (2/2)",
+                    "grow@x",
+                    "grow-2@x",
+                    900,
+                ),
+            ],
+            2000,
+        )
+        .unwrap();
+        assert_eq!(rows(&ix), 2 + MAX_GEN_SIBLINGS, "the cap still holds");
+        let got = segs_of(&ix, hidden, "Grow.S01E01.part01.rar");
+        assert_eq!(
+            got.len(),
+            2,
+            "part 1 must have landed in the generation that was waiting for it, got {got:?}"
+        );
+        assert_eq!(got[0].1, "<grow-1@x>", "{got:?}");
+
+        // The other half of the same trigger: a file the row has never
+        // held moves the key just as surely as a lower part does.
+        ix.ingest(
+            "alt.test",
+            &[
+                entry(
+                    "\"Grow.S01E01.part01.rar\" yEnc (1/2)",
+                    "grow@x",
+                    "grow-1@x",
+                    1000,
+                ),
+                entry(
+                    "\"Grow.S01E01.part02.rar\" yEnc (1/2)",
+                    "grow@x",
+                    "vol2-1@x",
+                    1000,
+                ),
+            ],
+            2500,
+        )
+        .unwrap();
+        assert_eq!(rows(&ix), 2 + MAX_GEN_SIBLINGS, "the cap still holds");
+        assert_eq!(
+            segs_of(&ix, hidden, "Grow.S01E01.part02.rar").len(),
+            1,
+            "the new file belongs to the generation that already holds this posting"
+        );
+
+        // The other direction, and the one a too-permissive key would
+        // break: a batch that SHARES part 1's article but disagrees on
+        // part 2 is a different posting, and must stay out of the row it
+        // just matched on. Dropped, not unioned.
+        ix.ingest(
+            "alt.test",
+            &[
+                entry(
+                    "\"Grow.S01E01.part01.rar\" yEnc (1/2)",
+                    "grow@x",
+                    "grow-1@x",
+                    1000,
+                ),
+                entry(
+                    "\"Grow.S01E01.part01.rar\" yEnc (2/2)",
+                    "grow@x",
+                    "mix-2@x",
+                    900,
+                ),
+            ],
+            3000,
+        )
+        .unwrap();
+        assert_eq!(rows(&ix), 2 + MAX_GEN_SIBLINGS, "the cap still holds");
+        let got = segs_of(&ix, hidden, "Grow.S01E01.part01.rar");
+        assert_eq!(
+            got.iter()
+                .map(|(n, id, _)| (*n, id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "<grow-1@x>"), (2, "<grow-2@x>")],
+            "a contradicting batch must not be unioned into the row it shares an article with"
+        );
+
+        // And a generation sharing NO article with anything reaches no
+        // row at all - the reverse lookup is evidence, not a guess.
+        ix.ingest(
+            "alt.test",
+            &[
+                entry(
+                    "\"Grow.S01E01.part01.rar\" yEnc (1/2)",
+                    "grow@x",
+                    "flood-1@x",
+                    1000,
+                ),
+                entry(
+                    "\"Grow.S01E01.part01.rar\" yEnc (2/2)",
+                    "grow@x",
+                    "flood-2@x",
+                    900,
+                ),
+            ],
+            4000,
+        )
+        .unwrap();
+        assert_eq!(rows(&ix), 2 + MAX_GEN_SIBLINGS, "the cap still holds");
+        assert_eq!(
+            segs_of(&ix, hidden, "Grow.S01E01.part01.rar").len(),
+            2,
+            "untouched by a stranger"
+        );
         teardown(&dir, ix);
     }
 

@@ -31,6 +31,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// HANDLE bounded by kernel memory rather than by a per-process soft cap, so
 /// 0 means "unlimited as far as this matters", NOT "no descriptors": callers
 /// must not size the spill path off this number.
+// The two `as u64` at the returns are no-ops where rlim_t IS u64 (Linux,
+// macOS - the only two platforms clippy ever runs on here) and are the
+// conversion that makes this compile at all where it is i64 (the BSDs).
+// Without this the lint is a build error on the platforms we gate on and
+// removing the cast is a build error on the platform we ship to.
+#[allow(clippy::unnecessary_cast)]
 pub fn raise_fd_limit() -> u64 {
     #[cfg(unix)]
     // SAFETY: libc::rlimit is a plain all-integer C struct, so the zeroed
@@ -41,27 +47,32 @@ pub fn raise_fd_limit() -> u64 {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
             return 0;
         }
+        // Everything below is in `libc::rlim_t`, never a hardcoded u64:
+        // rlim_t is u64 on Linux and macOS but i64 on the BSDs, so the
+        // literals have to be converted to the target's own type and the
+        // result converted back at the return. Writing `u64` here builds
+        // on the two platforms we test on and fails to compile on FreeBSD.
         let start = lim.rlim_cur;
         let hard = lim.rlim_max;
-        let cap = |v: u64| {
+        let cap = |v: libc::rlim_t| {
             if hard == libc::RLIM_INFINITY {
                 v
             } else {
                 v.min(hard)
             }
         };
-        for target in [65536u64, 16384, 4096, 1024] {
-            let want = cap(target);
+        for target in [65536, 16384, 4096, 1024] {
+            let want = cap(target as libc::rlim_t);
             if want <= lim.rlim_cur {
                 continue;
             }
             let mut next = lim;
             next.rlim_cur = want;
             if libc::setrlimit(libc::RLIMIT_NOFILE, &next) == 0 {
-                return want;
+                return want as u64;
             }
         }
-        start
+        start as u64
     }
     #[cfg(not(unix))]
     0

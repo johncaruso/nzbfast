@@ -8,6 +8,26 @@
 
 use super::*;
 
+/// Test seam: `enqueue` trips it once a duplicate collision has been
+/// SELECTED and before the add publishes - the window a concurrent
+/// delete of the chosen original lands in. `add_lock` serializes adds
+/// against each other but not against deletion, so in production the
+/// window is the whole job build; in a test without a seam it is zero
+/// width. Same two-stage shape as `daemon_park::PARK_GEN_BARRIER`:
+/// first barrier says the window is open, second says the test has
+/// staged its delete and releases it.
+///
+/// Keyed by stem, unlike the other seams, and that is load-bearing:
+/// `cargo test` runs this binary's tests in parallel and EVERY add
+/// reaches this point, so an unkeyed barrier is tripped by whatever
+/// unrelated test happens to be adding a duplicate at the time - a
+/// third waiter on a `Barrier::new(2)`, which is a hang, not a
+/// failure. Only the add whose stem contains the key waits.
+#[cfg(test)]
+pub(in crate::serve) static DUPE_ADMIT_BARRIER: Mutex<
+    Option<(String, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+> = Mutex::new(None);
+
 impl Daemon {
     /// `pp` is the post-processing mode the CALLER requested (0-3, None
     /// = none named). The pre-queue hook receives it - SAB's contract
@@ -217,7 +237,19 @@ impl Daemon {
         } else {
             self.dupe_collision(&stem)
         };
-        let duplicate = collision.is_some();
+        #[cfg(test)]
+        if collision.is_some() {
+            let seam = DUPE_ADMIT_BARRIER.lock_ok().clone();
+            if let Some((key, open, release)) = seam
+                && stem.contains(&key)
+            {
+                open.wait();
+                release.wait();
+            }
+        }
+        // Not final: the original can be deleted between here and the
+        // publish, and the queue critical section below re-asks.
+        let mut duplicate = collision.is_some();
         // §129 2d: what a duplicate add becomes is the user's call now.
         // "pause" is the M14f hold; "discard" refuses the add outright;
         // "fail" files it straight to history as Failed (the *arr
@@ -229,6 +261,12 @@ impl Daemon {
             // A hook REJECT outranks the duplicates setting: the job is
             // about to file to history with the hook's reason.
             && hook_reject.is_none()
+            // And the original still has to be there. Refusing an add
+            // outright against a record that was deleted while this one
+            // was being admitted loses the download for nothing - the
+            // caller is told "duplicate" and there is nothing left for
+            // it to be a duplicate OF.
+            && self.dupe_collision_stands(c)
         {
             drop(publish);
             // The spool copy was written above; a refused add must not
@@ -402,6 +440,11 @@ impl Daemon {
         // is in place and retry asks the duplicates question afresh.
         if let Some(c) = &collision
             && dupe_action == "fail"
+            // Same as the discard arm: filing a valid add to history as
+            // Failed against a vanished original tells the *arr that
+            // submitted it to go and find another release, for a title
+            // nothing is downloading.
+            && self.dupe_collision_stands(c)
         {
             {
                 let mut g = job.lock_ok();
@@ -467,6 +510,61 @@ impl Daemon {
         // since the queue was live to the API at exactly this point.
         {
             let mut q = self.queue.lock_ok();
+            // Last look at the collision, under the very lock this add
+            // publishes with. `add_lock` serializes adds against each
+            // other, but a delete takes only the queue (or history)
+            // lock, so the original chosen above can be gone by now -
+            // and a hold outlives its original: `held_for` is released
+            // by park promotion, which runs when the original FAILS, so
+            // a job that no longer exists never releases anything. The
+            // alternative would sit paused at Duplicate priority for
+            // good, pointing at an id nothing will ever park.
+            //
+            // Deliberately NOT a re-run of `dupe_collision`: its alias
+            // arm parses release names and asks the index for show ids,
+            // and running that under the queue lock stalls every API
+            // request behind it (the #38 follow-up). Only the CHOSEN
+            // original is re-checked. If a second, still-live original
+            // existed and this one was the one deleted, the add queues
+            // normally - the pre-M14f outcome, and the mild direction
+            // to be wrong in next to holding a job against nothing.
+            //
+            // A deleted original does NOT release a hold that was
+            // already published: that stays deliberate (`park` refuses
+            // to promote a tombstone - the user cancelled that title on
+            // purpose). This is only about an add that was never a
+            // duplicate by the time it landed.
+            if let Some(c) = &collision {
+                let stands = if c.where_ == "queue" {
+                    q.iter().any(|j| j.lock_ok().nzo_id == c.nzo_id)
+                } else {
+                    // The one nested acquisition here, and only on
+                    // the history arm: a scan of a few ids, no I/O. No
+                    // path in serve/ takes the history lock and then
+                    // the queue lock - every reader of both takes them
+                    // one at a time - so queue -> history cannot ABBA.
+                    self.history.lock_ok().iter().any(|j| {
+                        let g = j.lock_ok();
+                        g.nzo_id == c.nzo_id && g.state == JobState::Completed
+                    })
+                };
+                if !stands {
+                    duplicate = false;
+                    {
+                        let mut g = job.lock_ok();
+                        g.priority = enqueue_priority(priority, false);
+                        g.paused = priority == -2;
+                        g.held_for.clear();
+                    }
+                    info!(
+                        target: "queue",
+                        "{nzo_id}: {} ({}) is gone - it was deleted while this add \
+                         was being admitted, so the add queues normally rather \
+                         than holding against a record nothing can fail",
+                        c.name, c.nzo_id
+                    );
+                }
+            }
             self.queue_idle_latch.store(false, Ordering::Relaxed);
             self.life_emit(
                 "job.added",

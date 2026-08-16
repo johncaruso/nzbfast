@@ -1,0 +1,143 @@
+# nzbfast RPM - built by packaging/linux/make-packages.sh from a staged
+# file tree, NOT from source. rpmbuild is used here purely as a package
+# writer: the binary is already compiled (statically, for the target
+# architecture) before this spec is read.
+#
+# Everything below the Name/Version block is either a switch that keeps
+# rpmbuild's hands off a prebuilt cross-architecture binary, or a
+# scriptlet that mirrors the .deb maintainer scripts exactly.
+
+# rpmbuild's post-install pipeline strips binaries, extracts debuginfo and
+# builds build-id links. All three assume it compiled what it is packaging
+# and run host tools against it, which for the aarch64 package on an
+# x86_64 builder means the wrong strip against the wrong ELF. The binary
+# arrives already stripped; leave it alone.
+%global __os_install_post %{nil}
+%global debug_package %{nil}
+%global _build_id_links none
+
+# BUILDHOST is recorded in the package header and shown by `rpm -qi`. Left
+# to itself rpmbuild writes the build machine's hostname into every
+# package, which is a machine name shipped to the public for no reason.
+%global _buildhost nzbfast-build
+
+# gzip payload rather than the modern default. zstd-compressed packages
+# are unreadable to the rpm in RHEL 8 and older SUSE, and this is a
+# prebuilt binary - the compression ratio buys nothing worth a distro.
+%global _binary_payload w9.gzdio
+
+Name:           nzbfast
+Version:        @@VERSION@@
+Release:        @@RELEASE@@
+Summary:        Speed-focused Usenet (NZB) downloader (BETA package)
+License:        GPL-3.0-or-later
+URL:            https://github.com/nzbfast/nzbfast
+# Nothing is compiled here and the payload is a static binary, so the
+# dependency generator has nothing true to say. Left on, it reads the
+# scriptlets and the ELF and invents interpreter and library requires
+# that differ by builder.
+AutoReqProv:    no
+Requires(post): shadow-utils
+
+%description
+nzbfast downloads, verifies, repairs and unpacks Usenet posts in one
+pass: articles are decoded as they arrive, PAR2 verification runs
+incrementally against what has already landed, and archives are
+extracted while the rest is still coming down.
+
+It serves a web dashboard and a SABnzbd-compatible API on port 6789, so
+Sonarr, Radarr and the rest connect to it as they would to SABnzbd. PAR2
+repair and RAR extraction are built in - no external unrar or par2
+needed. The binary is statically linked, so this package pulls in no
+libraries and runs on any distribution with systemd.
+
+This package is BETA. The program itself is the shipped release; it is
+the packaging - the service unit, the account, the upgrade path - that
+is new and wants testing. Report anything it gets wrong at
+https://github.com/nzbfast/nzbfast/issues
+
+%prep
+# Nothing to unpack: the payload is staged on disk by make-packages.sh.
+
+%build
+# Nothing to build: see the header.
+
+%install
+cp -a %{_stagedir}/. %{buildroot}/
+
+%files
+%license /usr/share/doc/nzbfast/copyright
+%doc /usr/share/doc/nzbfast/README.linux-packages.md
+/usr/bin/nzbfast
+/usr/lib/systemd/system/nzbfast.service
+%dir /usr/share/nzbfast
+/usr/share/nzbfast/config.example.json
+/usr/share/nzbfast/setup-data-dir.sh
+%dir /etc/nzbfast
+%config(noreplace) /etc/nzbfast/nzbfast.env
+# NOTHING under /var/lib/nzbfast is listed, on purpose. The data
+# directory is created by setup-data-dir.sh at install time, so rpm has
+# no record of a single path inside it: settings.json, the API key, the
+# queue spool and the downloads cannot be replaced by an upgrade or
+# removed by an erase, because as far as rpm is concerned they are not
+# part of this package.
+
+%post
+/usr/share/nzbfast/setup-data-dir.sh
+if [ -d /run/systemd/system ] || command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+if [ "$1" -eq 1 ]; then
+    # First install: enable for the next boot, do NOT start. There is no
+    # provider configured yet, so starting here would put a dashboard on
+    # the network before the admin has seen it.
+    #
+    # Deliberately `systemctl enable` rather than the `systemctl preset`
+    # a Fedora-native package would use: the preset policy for a
+    # third-party unit is "disabled", which would silently make this
+    # package behave differently from the .deb built from the same tree.
+    systemctl enable nzbfast.service >/dev/null 2>&1 || true
+    cat <<'NOTE'
+
+nzbfast is installed (BETA package) and enabled at boot, but NOT started.
+
+  1. sudo nzbfast setup --config /var/lib/nzbfast/config.json
+        or edit /var/lib/nzbfast/config.json by hand
+  2. sudo systemctl start nzbfast
+  3. open http://<this-host>:6789 - the API key is printed by
+        `journalctl -u nzbfast` on the first start
+
+  Settings, queue and downloads all live in /var/lib/nzbfast, and no
+  upgrade or removal of this package touches that folder.
+  Service options (port, folders): /etc/nzbfast/nzbfast.env
+
+NOTE
+fi
+
+%preun
+# $1 is the number of instances that will remain: 0 is a real erase, 1 is
+# the erase half of an upgrade, where stopping the daemon would leave it
+# down until someone noticed.
+if [ "$1" -eq 0 ]; then
+    systemctl --no-reload disable --now nzbfast.service >/dev/null 2>&1 || true
+fi
+
+%postun
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+if [ "$1" -ge 1 ]; then
+    # Upgrade: restart it only if it was running. `try-restart`, never
+    # `restart` - the second one starts a daemon somebody stopped on
+    # purpose.
+    systemctl try-restart nzbfast.service >/dev/null 2>&1 || true
+fi
+if [ "$1" -eq 0 ] && [ -d /var/lib/nzbfast ]; then
+    echo "nzbfast: your settings and downloads are still in /var/lib/nzbfast" >&2
+    echo "nzbfast: (the 'nzbfast' account still owns them). Delete that" >&2
+    echo "nzbfast: folder by hand if you want it gone." >&2
+fi
+
+%changelog
+* @@RPMDATE@@ nzbfast <releases@nzbfast.com> - @@VERSION@@-@@RELEASE@@
+- BETA packaging of nzbfast @@VERSION@@ for RPM distributions.

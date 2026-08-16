@@ -83,6 +83,27 @@ jobs:
       # Parity with ci-private.yml; TODO 106's regrowth ratchet.
       - name: size gate
         run: tools/size-gate.py
+      # The .deb/.rpm packaging, checked without installing anything: the
+      # generated systemd unit, and the property that no maintainer
+      # script can remove or replace /var/lib/nzbfast (which is where the
+      # user's settings.json and API key live). Pure shell, under a
+      # second. The install itself is tested by installing -
+      # packaging/tests/linux-install.sh, which needs docker.
+      - name: linux packaging gate
+        run: packaging/tests/linux-packages.sh
+      # The human-download tarballs: that the builder's own owner flags
+      # actually zero the headers, and that the upload gate refuses an
+      # asset naming the account that built it. Structural, because the
+      # pattern scanner only catches the one build account it knows.
+      - name: linux tarball gate
+        run: packaging/tests/linux-tarballs.sh
+      # The DSM package's postinst: where a Synology user's downloads
+      # land, which is the one decision in that package that cannot be
+      # tried before a NAS installs it. Fake volume trees, pure shell,
+      # under a second. It had never been wired into a workflow, so it
+      # had rotted quietly until a developer ran it by hand.
+      - name: synology postinst gate
+        run: packaging/tests/synology-postinst.sh
       - name: clippy
         # No escapes: every warning blocks. The categories still allowed
         # are named in the workspace lints table in Cargo.toml, each with
@@ -190,3 +211,35 @@ jobs:
       # crate and reports one crate's worth per round.
       - name: clippy
         run: cargo clippy -p nzbkit -p nzbfast -p nzbtray --all-targets --no-deps --keep-going -- -D warnings
+      # The ARM64 gate. `cargo clippy --target` runs in check mode - it
+      # never links - so an x64 runner covers aarch64-pc-windows-msvc with
+      # nothing installed but the rust target, and the ARM64 MSVC linker
+      # is only needed by the release job that actually emits exes.
+      #
+      # What it is really guarding is not lint but COMPILATION, and two
+      # specific ways this target diverges from the x64 one that shares
+      # all its `cfg(windows)` code:
+      #   - rapidyenc's C++ kernels are compiled here by cl.exe for ARM64
+      #     rather than cl.exe for x64, taking the `_M_ARM64` arms of
+      #     vendor/rapidyenc/src/common.h that no other job compiles;
+      #   - nzbkit's own aarch64 paths (gf16's NEON kernels, the
+      #     `is_aarch64_feature_detected!` probes in nntp.rs and
+      #     sysbench.rs) meet Windows runtime feature detection for the
+      #     first time - every other aarch64 build we make is macOS or
+      #     Linux.
+      # Neither is reachable from any other runner in CI, which is the
+      # same hole - `cfg` code linted nowhere - that the clippy step above
+      # exists to close, one axis over.
+      #
+      # nzbtray is in the list because the tray ships in the ARM64 package
+      # exactly as it does in the x64 one, and it is the crate where
+      # Windows-only code is ALL of the crate.
+      #
+      # Deliberately not --all-targets: the shipped artifacts are the lib
+      # and the two bins, and pulling the test targets in would compile a
+      # second copy of the dependency graph for a target we do not run
+      # tests on. Runs last, so a lint here cannot cost us the suites.
+      - name: cross-check aarch64-pc-windows-msvc (ARM64 beta target)
+        run: |
+          rustup target add aarch64-pc-windows-msvc
+          cargo clippy --target aarch64-pc-windows-msvc -p nzbfast -p nzbtray --no-deps -- -D warnings

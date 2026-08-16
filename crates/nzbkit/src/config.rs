@@ -377,7 +377,7 @@ fn default_port() -> u16 {
 fn default_true() -> bool {
     true
 }
-fn default_connections() -> u32 {
+pub fn default_connections() -> u32 {
     // The allowance most providers sell. Jobs use min(global setting,
     // this cap, measured knee), so a big default costs nothing on a
     // provider that grants less - the grant probe and knee trim it -

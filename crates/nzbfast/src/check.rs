@@ -173,7 +173,12 @@ pub(crate) async fn check(
         .filter(|f| f.kind() == FileKind::Par2Volume)
     {
         match vol_count_from_name(f.filename_hint().unwrap_or(&f.subject)) {
-            Some(n) => recovery += n,
+            // Saturating, not `+=`: the count comes from a filename in
+            // a file we were handed, and a budget that wraps is worse
+            // than one that pegs. `par2_vol_count` caps the per-volume
+            // figure; this keeps the sum honest even if that cap is
+            // ever raised (14 Aug sweep).
+            Some(n) => recovery = recovery.saturating_add(n),
             None => recovery_unknown = true,
         }
     }

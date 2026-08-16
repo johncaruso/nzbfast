@@ -305,6 +305,12 @@ pub(super) struct Intake {
 /// - A wrong verdict costs only latency again. `required_mask`
 ///   (nzbkit::pool) hands a level-N server the article once every live
 ///   lower-level server has missed it, so nothing becomes unreachable.
+///   "Missed" has to mean more than a 430 for that to hold: a primary
+///   that resets or stalls on one article answers no question and files
+///   no refusal, so the gate also opens for a server that has spent its
+///   whole retry budget on the article (`Shared::spent`, M5). Without
+///   that, a demoted-but-healthy server watched the article die on a
+///   server that could not fetch it.
 /// - The red cell can heal. `OracleSink` binds to the POOL's servers
 ///   (see fleet.rs), so a REMOVED server recorded neither hits nor
 ///   misses: the only healer left was the idle STAT sampler at 5

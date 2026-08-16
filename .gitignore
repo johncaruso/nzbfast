@@ -32,6 +32,8 @@ settings.json
 packaging/windows/stage/
 packaging/windows/out/
 packaging/mac/build/
+# .deb / .rpm built by packaging/linux/make-packages.sh
+packaging/linux/out/
 settings.json.bak
 settings.json.corrupt
 # a bare key dumped out of settings.json to talk to a local daemon -

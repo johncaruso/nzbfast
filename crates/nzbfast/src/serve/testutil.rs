@@ -120,6 +120,7 @@ pub(crate) fn test_daemon(dir: &Path) -> Arc<Daemon> {
         ui_locale: Mutex::new(String::new()),
         cors_origin: Mutex::new(CORS_DEFAULT.to_string()),
         sidecar: Mutex::new(None),
+        sidecar_tails: Mutex::new(Vec::new()),
         media_rejudge: Mutex::new(Vec::new()),
         best_rate_bps: AtomicU64::new(0),
         speed_ceiling: AtomicU64::new(0),

@@ -1702,6 +1702,13 @@ struct Shared {
     /// the counter beside it keeps the hot path off this lock.
     soft_rearm: std::sync::Mutex<HashMap<String, u32>>,
     soft_rearm_n: AtomicUsize,
+    /// M5: servers that burned their WHOLE retry budget on one article,
+    /// keyed by message-id, the value being their server bits. Routing
+    /// only, never evidence - pool/gates.rs holds the reasoning and
+    /// everything that reads it. Empty on every healthy run, and the
+    /// counter beside it keeps the queue scan off this lock.
+    spent: std::sync::Mutex<HashMap<String, u32>>,
+    spent_n: AtomicUsize,
     /// TODO 114 consumer steer: Done outcomes handed to the consumer
     /// whose `complete_one` is DEFERRED until the consumer's decode
     /// verdict arrives via [`QueueControl::note_decoded`]. The stashed
@@ -1774,6 +1781,39 @@ struct Shared {
     draining: AtomicBool,
     /// When the last article went terminal (vs when the pool returned).
     drained_at: std::sync::Mutex<Option<Instant>>,
+    /// Serializes the drained verdict against a revive. `complete_one`'s
+    /// fetch_sub landing `pending` on zero and its `finished.send` are
+    /// two steps; [`QueueControl::requeue`]'s raise-then-check-finished
+    /// could land whole inside that gap - the raise too late to stop the
+    /// zero-crossing, the check too early to see the send - and the
+    /// requeued articles then sat in a queue every worker had already
+    /// left (or were swept up as failures by `seal_run`), with the
+    /// caller told they would be fetched. Every zero-crossing send now
+    /// re-reads `pending` under this lock ([`Shared::finish_if_drained`])
+    /// and requeue raises+checks under the same lock, so exactly one
+    /// side wins: the send happens and requeue sees it and rolls back,
+    /// or the raise happens and the send stays unfired. Leaf lock, cold
+    /// path (taken once per run end plus once per requeue call).
+    finish_gate: std::sync::Mutex<()>,
+    /// Test seam: trips `complete_one` between the fetch_sub that lands
+    /// `pending` on zero and the gated finished-send decision - the
+    /// exact window a concurrent `requeue` must win. Two-stage shape as
+    /// daemon_park::IDLE_CAS_BARRIER (first: the crossing has happened
+    /// and the verdict has not; second: the test has run its interleaved
+    /// work and releases it). Per-instance, not a static - lib tests in
+    /// one process must not trip each other's pools.
+    #[cfg(test)]
+    drain_send_barrier:
+        std::sync::Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    /// Test seam: trips [`QueueControl::requeue`] between dropping
+    /// `finish_gate` and taking the queue lock - the window in which the
+    /// last worker can retire (`WorkerLife::retire` touches no gate) and
+    /// both terminal seals can drain a queue the requeue has not written
+    /// to yet. Same two-stage shape and per-instance rationale as
+    /// `drain_send_barrier` above.
+    #[cfg(test)]
+    requeue_gate_barrier:
+        std::sync::Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
     /// Work items removed by [`QueueControl::cancel`], kept whole (retry
     /// budget, retention seed) so [`QueueControl::requeue`] can resurrect
     /// them exactly as they were - the in-stream PAR2 sniff un-defers a
@@ -1924,6 +1964,14 @@ struct Shared {
     /// the question the terminal-state invariant turns on. The last
     /// worker out owns [`seal_run`]; see it for why that matters.
     workers_live: AtomicUsize,
+    /// How many workers this run has EVER had. `workers_live == 0` is
+    /// ambiguous on its own - it is equally "the fleet is exhausted" and
+    /// "the fleet has not been born yet" - and a guard that cannot tell
+    /// them apart drops work racing fleet birth (Fable sweep 15 Aug,
+    /// TODO 170). Paired with `workers_live`, this disambiguates: born
+    /// and none live is a dead fleet, never born is a fleet still
+    /// arriving.
+    workers_born: AtomicUsize,
     /// M11 stream mode: deadline (ms since `start`, 0 = never engaged)
     /// until which a live /stream reader is considered attached. While
     /// active, workers cap their pipeline to `stream_window()` so a
@@ -2046,6 +2094,13 @@ const PROMOTE_SHED_MIN_AGE: Duration = Duration::from_millis(400);
 // for pool and its descendants exactly as the private ones were.
 mod runlife;
 use runlife::*;
+
+// pool/gates.rs. Inherent methods on `Shared` plus the two server-bit
+// helpers; the glob puts the free functions back in scope for pool and
+// its descendants exactly as the private ones were, and `pub(super)`
+// does the same for the methods.
+mod gates;
+use gates::*;
 
 mod session;
 use session::*;
@@ -2192,6 +2247,7 @@ struct WorkerLife {
 impl WorkerLife {
     fn birth(shared: &Arc<Shared>, idx: usize) -> WorkerLife {
         shared.alive[idx].fetch_add(1, Ordering::Relaxed);
+        shared.workers_born.fetch_add(1, Ordering::AcqRel);
         shared.workers_live.fetch_add(1, Ordering::AcqRel);
         WorkerLife {
             shared: shared.clone(),
@@ -2375,18 +2431,6 @@ impl Shared {
         m
     }
 
-    /// Bits a level-L server must see in tried_430 before it may take
-    /// queued work: every live server on a lower level.
-    fn required_mask(&self, level: u32) -> u32 {
-        let mut m = 0u32;
-        for (si, &l) in self.levels.iter().enumerate() {
-            if l < level && self.alive[si].load(Ordering::Relaxed) > 0 {
-                m |= server_bit(si);
-            }
-        }
-        m
-    }
-
     /// Build the queue, seeding each Work's `tried_430` with the servers
     /// whose retention can't cover it. Articles outside EVERY server's
     /// retention never enter the queue (no worker could pop them - they'd
@@ -2465,6 +2509,8 @@ impl Shared {
             crc_retried: std::sync::Mutex::new(HashSet::new()),
             soft_rearm: std::sync::Mutex::new(HashMap::new()),
             soft_rearm_n: AtomicUsize::new(0),
+            spent: std::sync::Mutex::new(HashMap::new()),
+            spent_n: AtomicUsize::new(0),
             handed: std::sync::Mutex::new(HashMap::new()),
             steer_inbox: std::sync::Mutex::new(Vec::new()),
             done_ok: std::sync::Mutex::new(HashSet::new()),
@@ -2476,6 +2522,11 @@ impl Shared {
             aborted: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             drained_at: std::sync::Mutex::new(None),
+            finish_gate: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            drain_send_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            requeue_gate_barrier: std::sync::Mutex::new(None),
             cancelled: std::sync::Mutex::new(HashMap::new()),
             dup_wins: AtomicU64::new(0),
             arrival_ack: servers.iter().any(|(_, c)| c.arrival_ack),
@@ -2512,6 +2563,7 @@ impl Shared {
             connected: (0..n_servers).map(|_| AtomicBool::new(false)).collect(),
             auth: (0..n_servers).map(|_| AuthState::default()).collect(),
             workers_live: AtomicUsize::new(0),
+            workers_born: AtomicUsize::new(0),
             stream_until: AtomicU64::new(0),
             promote_gen: tokio::sync::watch::Sender::new(0),
             promoted_pending: AtomicUsize::new(0),
@@ -2589,6 +2641,30 @@ impl Shared {
     /// Mark one article terminal; wakes every worker when the last lands.
     fn complete_one(&self) {
         if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            #[cfg(test)]
+            {
+                let pair = self.drain_send_barrier.lock_ok().clone();
+                if let Some((entered, released)) = pair {
+                    entered.wait();
+                    released.wait();
+                }
+            }
+            self.finish_if_drained();
+        }
+    }
+
+    /// A decrement just landed `pending` on zero: decide, under
+    /// `finish_gate`, whether the run really drained. A concurrent
+    /// [`QueueControl::requeue`] raises `pending` under the same gate
+    /// before it checks `finished`, so the re-read here and requeue's
+    /// check cannot both come up in the revived-but-finished state that
+    /// left work behind: whichever takes the gate second sees the other
+    /// side's write. Staying silent on a revived count is correct - the
+    /// requeue owns the articles now, and THEIR last completion (or its
+    /// own rollback) reaches this same decision again.
+    fn finish_if_drained(&self) {
+        let _gate = self.finish_gate.lock_ok();
+        if self.pending.load(Ordering::Acquire) == 0 {
             self.mark_drained();
             let _ = self.finished.send(true);
         }
@@ -2739,31 +2815,6 @@ impl Shared {
         self.rate(server) / alive
     }
 
-    /// True when some OTHER live server could take this work item: it
-    /// hasn't 430'd it, hasn't transport-failed it, and its fill gate (if
-    /// any) is satisfied. Used to steer a transport-failed article's retry
-    /// away from the server that just failed it.
-    fn other_can_take(&self, w: &Work, me: usize) -> bool {
-        for (si, &level) in self.levels.iter().enumerate() {
-            if si == me || self.alive[si].load(Ordering::Relaxed) == 0 {
-                continue;
-            }
-            let bit = server_bit(si);
-            if w.tried_430 & bit != 0 || w.tried_fail & bit != 0 {
-                continue;
-            }
-            let required = if level > 0 {
-                self.required_mask(level)
-            } else {
-                0
-            };
-            if w.tried_430 & required == required {
-                return true;
-            }
-        }
-        false
-    }
-
     /// M11 stream mode: should this server LEAVE a promoted (seek) item
     /// for a faster one? Seek latency is per-article latency - a slow
     /// backbone's connection sitting on a playhead article costs the
@@ -2777,6 +2828,7 @@ impl Shared {
     /// of the run.
     fn faster_can_take(&self, w: &Work, me: usize) -> bool {
         let mine = self.steer_rate_per_worker(me);
+        let evidence = w.tried_430 | self.spent_mask(&w.id);
         for (si, &level) in self.levels.iter().enumerate() {
             if si == me || self.alive[si].load(Ordering::Relaxed) == 0 {
                 continue;
@@ -2790,7 +2842,7 @@ impl Shared {
             } else {
                 0
             };
-            if w.tried_430 & required != required {
+            if evidence & required != required {
                 continue;
             }
             if self.steer_rate_per_worker(si) > 2.0 * mine {
@@ -2867,6 +2919,15 @@ impl Shared {
 
     /// First-emitter check: true exactly once per id.
     fn claim_done(&self, id: &str) -> bool {
+        // A terminal article has no ladder left to route, so drop its
+        // spent bits with it - the map is keyed by message-id and would
+        // otherwise carry every rescued article to the end of the run.
+        if self.spent_n.load(Ordering::Acquire) > 0 {
+            let mut m = self.spent.lock_ok();
+            if m.remove(id).is_some() {
+                self.spent_n.store(m.len(), Ordering::Release);
+            }
+        }
         self.done.lock_ok().insert(id.to_string())
     }
 
@@ -3311,31 +3372,6 @@ struct ServerCtx {
 /// [`server_bit`] total in practice.
 pub const MAX_SERVERS: usize = 32;
 
-/// The routing bit for a server index.
-///
-/// This used to be spelled `1u32 << si.min(31)`, which ALIASED every server
-/// from index 31 upward onto bit 31. Server 31 returning 430 therefore set
-/// the bit that server 32 reads as "I already tried here", so once servers
-/// 0-31 had missed, an article could go terminal Missing without server 32
-/// ever being sent a BODY - even when it held the article. A hostile or
-/// merely broken provider at index 31 could suppress the last healthy one.
-///
-/// Returning 0 for an unrepresentable index is defence in depth only: no bit
-/// is strictly safer than another server's bit, but the config cap above is
-/// what actually keeps this reachable.
-#[inline]
-fn server_bit(si: usize) -> u32 {
-    if si < MAX_SERVERS { 1u32 << si } else { 0 }
-}
-
-fn servers_mask(n: usize) -> u32 {
-    if n >= MAX_SERVERS {
-        u32::MAX
-    } else {
-        (1u32 << n) - 1
-    }
-}
-
 fn ctx_for(servers: &[(ServerConfig, PoolConfig)], si: usize) -> ServerCtx {
     let me = &servers[si].0;
     let mut group_bits = server_bit(si);
@@ -3433,8 +3469,20 @@ async fn next_work(
                 unservable.push(w.id);
                 continue;
             }
+            // M5: the fill gate asks for refusals, and a lower-level
+            // server that killed this article's connection on every
+            // attempt never files one - the deeper tier holding a good
+            // copy stayed locked out until the retries ran out and the
+            // article was reported lost. A server that spent its whole
+            // budget has answered as finally as a 430 does, so it
+            // satisfies the gate here (and NOWHERE else: `spent` is not
+            // evidence, so unanimous-Missing above still counts 430s
+            // alone). The lookup is skipped entirely while the gate is
+            // already satisfied, which includes every level-0 pick.
+            let gated = w.tried_430 & required != required
+                && (w.tried_430 | shared.spent_mask(&w.id)) & required != required;
             if w.tried_430 & ctx.bit != 0
-                || w.tried_430 & required != required
+                || gated
                 || (w.tried_fail & ctx.bit != 0 && shared.other_can_take(&w, ctx.idx))
                 || (endgame && pipe.payload > 0 && w.tried_430 != 0)
             {
@@ -3510,6 +3558,31 @@ async fn next_work(
     shared.pick_dup(ctx.idx, ctx.bit, ctx.group_bits, required, pipe, ctx.level)
 }
 
+/// Deal every configured connection round-robin across `shards.max(1)`
+/// plans as (server index, per-server ramp step, pre-born life),
+/// birthing each [`WorkerLife`] on the spot. The whole fleet is counted
+/// in `alive` and `workers_live` before this returns - the caller's
+/// shard threads must be able to trust the head-counts from their first
+/// instruction. A plan dropped unspawned (a shard runtime that failed
+/// to build) releases its lives through `Drop`, exactly like its
+/// workers dying.
+fn deal_shard_plans(
+    shared: &Arc<Shared>,
+    servers: &[(ServerConfig, PoolConfig)],
+    shards: usize,
+) -> Vec<Vec<(usize, u32, WorkerLife)>> {
+    let n_shards = shards.max(1);
+    let mut plans: Vec<Vec<(usize, u32, WorkerLife)>> = (0..n_shards).map(|_| Vec::new()).collect();
+    let mut next_shard = 0usize;
+    for (si, (_, cfg)) in servers.iter().enumerate() {
+        for ci in 0..cfg.connections {
+            plans[next_shard % n_shards].push((si, ci as u32, WorkerLife::birth(shared, si)));
+            next_shard += 1;
+        }
+    }
+    plans
+}
+
 /// Sharded variant: split all servers' connections across `shards`
 /// independent tokio runtimes (each on its own OS threads with its OWN
 /// kqueue/epoll I/O driver), all pulling one shared queue. This is the fix
@@ -3559,25 +3632,23 @@ pub fn fetch_all_sharded(
         })
         .collect();
 
-    // Deal (server, per-server ramp step) assignments round-robin to shards.
-    let n_shards = shards.max(1);
-    let mut plans: Vec<Vec<(usize, u32)>> = vec![Vec::new(); n_shards];
-    let mut next_shard = 0usize;
-    for (si, (_, cfg)) in servers.iter().enumerate() {
-        for ci in 0..cfg.connections {
-            plans[next_shard % n_shards].push((si, ci as u32));
-            next_shard += 1;
-        }
-    }
+    // Deal the fleet BEFORE any shard thread starts - every worker's
+    // life is born inside deal_shard_plans, so `alive` (which feeds
+    // `live_mask`/`required_mask`) and `workers_live` count the complete
+    // fleet from here. Shard threads come up in whatever order the OS
+    // schedules them: birthing inside each shard let an early shard read
+    // a partial fleet - a 430 there became a premature unanimous
+    // Missing, and a fill server could take queued work against
+    // required_mask == 0. Same invariant the single-runtime path pins by
+    // counting from spawn. The pre-born lives also make a spawn gate
+    // unnecessary: an early-dying shard cannot seal a run whose other
+    // shards are still being built, because those shards' workers are
+    // already in the live count.
+    let plans = deal_shard_plans(&shared, &servers, shards);
 
     let servers = Arc::new(servers);
     let counters = Arc::new(counters);
     let mut threads = Vec::new();
-    // One spawn-gate reference per shard, released by that shard once its
-    // own workers exist (see fetch_all_multi_ctl): shards start on their
-    // own OS threads, so an early-dying shard must not seal a run whose
-    // other shards have not been built yet.
-    shared.workers_live.fetch_add(plans.len(), Ordering::AcqRel);
     for plan in plans {
         let servers = servers.clone();
         let counters = counters.clone();
@@ -3591,25 +3662,25 @@ pub fn fetch_all_sharded(
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    // This shard never created workers, so release the
-                    // spawn gate it was charged before the OS thread
-                    // started. Panicking here leaked that count and made
-                    // every surviving shard believe work could still
-                    // finish, suppressing terminal outcomes.
+                    // This shard never spawned its workers; returning
+                    // drops `plan`, whose pre-born lives release their
+                    // head-counts through `Drop` exactly as if the
+                    // workers had died. Panicking here instead leaked
+                    // the counts and made every surviving shard believe
+                    // work could still finish, suppressing terminal
+                    // outcomes.
                     warn!(target: "pool", "shard runtime: {e}");
-                    shared.workers_live.fetch_sub(1, Ordering::AcqRel);
                     return;
                 }
             };
             rt.block_on(async move {
                 let mut tasks = Vec::new();
-                for (si, ramp_step) in plan {
+                for (si, ramp_step, life) in plan {
                     let ctx = ctx_for(&servers, si);
                     let (server, cfg) = servers[si].clone();
                     let (_, connects, reconnects) = counters[si].clone();
                     let shared = shared.clone();
                     let out = out.clone();
-                    let life = WorkerLife::birth(&shared, si);
                     // `ramp_step` is the per-server worker ordinal, so it
                     // doubles as the live-target slot.
                     let ramp = cfg.ramp_delay * ramp_step;
@@ -3621,9 +3692,6 @@ pub fn fetch_all_sharded(
                         .await;
                     }));
                 }
-                // This shard's workers exist now - hand the live count over
-                // to them.
-                shared.workers_live.fetch_sub(1, Ordering::AcqRel);
                 // Each shard joins its own tasks; `seal_run` is gated on
                 // the run-wide live count, so only the shard whose workers
                 // are genuinely the last ones out seals anything.

@@ -1131,10 +1131,10 @@ download) to keep it current. It never downloads payload to find out.</p>
 confidently gone. No mark means it looks fine.</li>
 <li>A <b>reaped</b> badge on groups where fresh posts are already being taken down,
 so you can tell a dying group from an unlucky release.</li>
-<li><b>Skip providers the oracle says are gone</b> (Settings, <b>off by default,
-experimental</b>): when the check is confident one provider's backbone has lost a
-release, skip straight past it for that download instead of waiting for it to fail.
-It will never skip your last remaining provider.</li>
+<li><b>Providers the oracle says are gone go last</b> (Settings, <b>off by default,
+experimental</b>): when the check is confident one provider's backbone has lost a release, that provider is
+asked last for that download instead of first. Nothing is removed, so a wrong call costs
+a little time rather than the download.</li>
 </ul>
 <p class="dim">The verdict is a prediction from evidence, not a guarantee. For a hard
 answer on one NZB, <code>nzbfast check</code> (<a href="#cli">§15</a>) counts the
@@ -1243,6 +1243,15 @@ the Synology guide covers it click by click, including doing it on a
 schedule.</td></tr>
 <tr><td>Synology (package)</td><td>Install the new <code>.spk</code> in Package
 Center; it upgrades in place.</td></tr>
+<tr><td>QNAP (package, beta)</td><td>Install the new <code>.qpkg</code> in App
+Center; it upgrades in place. Your settings and downloads sit outside the app's
+own folder, so neither an upgrade nor a removal takes them with it.</td></tr>
+<tr><td>Debian / Ubuntu (.deb)<br>Fedora / RHEL (.rpm)</td><td>Install the new
+package over the old one: <code>sudo dpkg -i nzbfast_*.deb</code> or
+<code>sudo rpm -U nzbfast-*.rpm</code>. Your settings folder is not part of the
+package, so an upgrade cannot replace anything in it, and your own edits to
+<code>/etc/nzbfast/nzbfast.env</code> are kept. The daemon is restarted only if
+it was already running.</td></tr>
 <tr><td>Homebrew</td><td><code>brew upgrade nzbfast</code></td></tr>
 <tr><td>Plain binary</td><td>Replace the binary. Your config stays wherever you
 made it (<a href="#files">§17</a>).</td></tr>
@@ -1305,6 +1314,11 @@ folder holds everything worth backing up:</p>
 container, which is the host folder you mapped to it. On Unraid that is the
 app's appdata folder.</td></tr>
 <tr><td>Synology package</td><td><code>/var/packages/nzbfast/var/</code></td></tr>
+<tr><td>QNAP package</td><td>Usually
+<code>/share/Download/nzbfast/config/</code>. The folder is chosen when the app
+is installed and named in the App Center log; the app's own
+<code>nzbfast.env</code> records it too.</td></tr>
+<tr><td>Debian / RPM package</td><td><code>/var/lib/nzbfast/</code></td></tr>
 <tr><td>Terminal</td><td>The folder you ran <code>nzbfast setup</code> in, or
 wherever <code>--config</code> / <code>$NZBFAST_CONFIG</code> points.</td></tr>
 </table></div>

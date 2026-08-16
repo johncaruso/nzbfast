@@ -320,11 +320,15 @@ impl Nzb {
                         buf.clear();
                         continue;
                     }
-                    let text = text.trim();
-                    if text.is_empty() {
-                        // nothing
-                    } else if let Some(seg) = cur_segment.as_mut() {
-                        seg.message_id.push_str(text);
+                    // Message-ids accumulate UNTRIMMED like meta values,
+                    // trimmed once at </segment>: per-fragment trimming ate
+                    // the spaces around entities, so an id declared with
+                    // interior whitespace (wire-unsafe, owed to
+                    // dropped_segments) was silently rewritten into a
+                    // fabricated id that passed is_wire_safe and was
+                    // fetched as something never posted.
+                    if let Some(seg) = cur_segment.as_mut() {
+                        seg.message_id.push_str(&text);
                     }
                 }
                 Event::CData(c) => {
@@ -350,11 +354,10 @@ impl Nzb {
                         buf.clear();
                         continue;
                     }
-                    let text = raw.trim();
-                    if text.is_empty() {
-                        // nothing
-                    } else if let Some(seg) = cur_segment.as_mut() {
-                        seg.message_id.push_str(text);
+                    // Same rule as Text above: accumulate untrimmed,
+                    // whole-value trim at </segment>.
+                    if let Some(seg) = cur_segment.as_mut() {
+                        seg.message_id.push_str(&raw);
                     }
                 }
                 Event::GeneralRef(r) => {
@@ -430,8 +433,18 @@ impl Nzb {
                             }
                         }
                         b"segment" => {
-                            if let (Some(f), Some(seg)) = (cur_file.as_mut(), cur_segment.take()) {
-                                if !seg.message_id.is_empty() && is_wire_safe(&seg.message_id) {
+                            if let (Some(f), Some(mut seg)) =
+                                (cur_file.as_mut(), cur_segment.take())
+                            {
+                                // One whole-value trim, like </meta>:
+                                // element-formatting whitespace goes,
+                                // interior whitespace stays and fails
+                                // is_wire_safe into dropped_segments.
+                                let id = seg.message_id.trim();
+                                if !id.is_empty() && is_wire_safe(id) {
+                                    if id.len() != seg.message_id.len() {
+                                        seg.message_id = id.to_string();
+                                    }
                                     f.segments.push(seg);
                                 } else {
                                     f.dropped_segments += 1;
@@ -661,8 +674,9 @@ pub fn par2_vol_suffix(name: &str) -> Option<usize> {
 /// Declared recovery-slice count from a PAR2 volume filename:
 /// `.vol<first>+<count>` → count; `.vol<start>-<end>` (end-exclusive
 /// range) → end − start. `None` when the name declares no count: not a
-/// recovery volume at all, or the bare-ordinal `.vol-NN` shape, which
-/// numbers the volume without sizing it. "Is it a volume?" is
+/// recovery volume at all, the bare-ordinal `.vol-NN` shape, which
+/// numbers the volume without sizing it, or a figure too large to be a
+/// real slice count (see the cap below). "Is it a volume?" is
 /// [`par2_vol_suffix`]'s question - a `None` here does NOT mean the
 /// file is safe to fetch eagerly, and every count consumer already
 /// copes with `None` the way the obfuscated (nameless) path does:
@@ -677,10 +691,29 @@ pub fn par2_vol_count(name: &str) -> Option<usize> {
     let after = &rest[sep + 1..];
     let end = after.find('.').unwrap_or(after.len());
     let second: u64 = after[..end].parse().ok()?;
-    match rest.as_bytes()[sep] {
-        b'+' => Some(second as usize),
-        _ => Some(second.saturating_sub(first).max(1) as usize),
+    let count = match rest.as_bytes()[sep] {
+        b'+' => second,
+        _ => second.saturating_sub(first).max(1),
+    };
+    // A name is not evidence. PAR2's GF(16) Reed-Solomon tops out at
+    // 32768 recovery blocks, so a filename claiming a million-odd
+    // slices is not sizing a volume - it is feeding an addend into
+    // somebody's budget arithmetic. `Rel.vol0+18446744073709551615.par2`
+    // parsed as u64 and cast straight to usize, and two such volumes
+    // overflowed the `recovery` sum in `nzbfast check` (panic in debug,
+    // an attacker-chosen wrapped budget in release, which then picked
+    // the REPAIRABLE / IMPOSSIBLE verdict). Cap it and hand back the
+    // documented "declares no count" answer, which every consumer
+    // already copes with; classification stays `par2_vol_suffix`'s
+    // question, so the file is still a recovery volume and still never
+    // gets a download slot. `try_from` rather than `as` also stops the
+    // silent truncation this had on 32-bit targets, where
+    // `.vol0+4294967297.par2` reported a count of 1.
+    const MAX_DECLARED_SLICES: u64 = 1 << 20;
+    if count > MAX_DECLARED_SLICES {
+        return None;
     }
+    usize::try_from(count).ok()
 }
 
 #[cfg(test)]
@@ -737,6 +770,40 @@ mod tests {
         assert!(
             Nzb::parse(unknown).is_err(),
             "entities outside the latin-1 table must still reject"
+        );
+    }
+
+    /// A message-id whose declared character content carries interior
+    /// whitespace (an entity splits the text, so it arrives as separate
+    /// fragments) is wire-unsafe and owed to `dropped_segments`.
+    /// Per-fragment trimming used to eat the spaces around the entity
+    /// and hand back a FABRICATED id that passed `is_wire_safe` - the
+    /// manifest then counted a fetched-and-missing article instead of an
+    /// unfetchable declared segment. Ids get the same
+    /// accumulate-then-trim-once treatment meta values and groups got.
+    #[test]
+    fn an_entity_split_id_with_interior_whitespace_drops_instead_of_rewriting() {
+        let xml = br#"<?xml version="1.0"?>
+<nzb><file subject="s" poster="p" date="1">
+  <groups><group>a.b</group></groups>
+  <segments>
+    <segment bytes="1" number="1">abc &amp;def@news.example</segment>
+    <segment bytes="1" number="2"> ok@news.example </segment>
+  </segments>
+</file></nzb>"#;
+        let nzb = Nzb::parse(xml).expect("parses");
+        let f = &nzb.files[0];
+        assert_eq!(
+            f.dropped_segments, 1,
+            "the whitespace-carrying id is declared-but-unfetchable, never rewritten"
+        );
+        assert_eq!(
+            f.segments
+                .iter()
+                .map(|s| s.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ok@news.example"],
+            "element-formatting whitespace still trims off a clean id"
         );
     }
 
@@ -1047,6 +1114,33 @@ POST]]></segment>
             ..NzbFile::default()
         };
         assert_eq!(g.filename_hint(), Some("some label"));
+    }
+
+    /// A hostile .nzb can name its volumes anything. `u64::MAX` parses,
+    /// and used to be cast straight to `usize` and added into the
+    /// pre-flight recovery budget - two such volumes overflowed the sum
+    /// (panic in a debug build, a wrapped attacker-chosen budget in
+    /// release, which then chose the REPAIRABLE / IMPOSSIBLE verdict).
+    /// The file must stay classified as a recovery volume, because a
+    /// volume never gets a download slot; only the COUNT goes unknown.
+    #[test]
+    fn absurd_declared_slice_counts_are_undeclared_not_sizes() {
+        assert_eq!(par2_vol_count("Rel.vol0+18446744073709551615.par2"), None);
+        assert_eq!(par2_vol_count("Rel.vol0-18446744073709551615.par2"), None);
+        // Above u64 entirely: already None via the parse, pinned so the
+        // two paths keep agreeing.
+        assert_eq!(par2_vol_count("Rel.vol0+184467440737095516150.par2"), None);
+        // Truncated to 1 on a 32-bit target before `try_from`.
+        assert_eq!(par2_vol_count("Rel.vol0+4294967297.par2"), None);
+        // Still a volume: classification is par2_vol_suffix's question.
+        assert_eq!(
+            par2_vol_suffix("Rel.vol0+18446744073709551615.par2"),
+            Some(3)
+        );
+        // Real shapes, including the largest ones anyone posts, unchanged.
+        assert_eq!(par2_vol_count("Rel.vol012+10.par2"), Some(10));
+        assert_eq!(par2_vol_count("x.vol10000+12345.par2"), Some(12345));
+        assert_eq!(par2_vol_count("x.vol0+32768.par2"), Some(32768));
     }
 
     #[test]

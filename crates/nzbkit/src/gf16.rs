@@ -509,7 +509,7 @@ pub fn multi_fold_width() -> usize {
 /// caller runs the remainder per source.
 pub fn xor_mul_multi_into(dst: &mut [u16], srcs: &[&[u8]], coeffs: &[u16]) -> usize {
     debug_assert_eq!(srcs.len(), coeffs.len());
-    debug_assert!(srcs.iter().all(|s| s.len() >= dst.len() * 2 - 1));
+    debug_assert!(srcs.iter().all(|s| s.len() >= dst.len() * 2));
     #[cfg(target_arch = "aarch64")]
     {
         if std::arch::is_aarch64_feature_detected!("sha3") {

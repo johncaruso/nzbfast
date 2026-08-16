@@ -1611,9 +1611,12 @@ enum TrashVerdict {
 /// and the notice repeats it a third time in its own sentence.
 fn refusal(why: &str) -> std::io::Error {
     std::io::Error::other(format!(
-        "the Trash would not take it ({why}). Turn off \"Deleted files go \
-         to the Trash\" in Settings if you want files removed outright \
-         rather than left alone"
+        "the Trash would not take it ({why}). If something else has the \
+         files open - a virus scanner or a backup tool often does, for a \
+         while after a big download - deleting again in a few minutes \
+         usually works. If it keeps happening, turn off \"Deleted files go \
+         to the Trash\" in Settings to remove files outright rather than \
+         leave them."
     ))
 }
 
@@ -2055,60 +2058,6 @@ fn trash_answered() -> bool {
     TRASH_ANSWERED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The flags below are process-global and the trash tests write them, so
-/// those tests take this first and run one at a time. Without it `cargo
-/// test` runs them together and one test's latch - or its reset - lands
-/// inside another test's delete: `a_junk_delete_is_recoverable_and_the_
-/// opt_out_is_not` then finds its fixture hard-deleted rather than binned.
-/// Lives out here, not in one test module, because both of them need it.
-///
-/// A writer excluding only other writers was not enough: every delete in
-/// the suite READS these globals (`delete_to_trash` at its entry, the
-/// latch inside the gate), so a delete-asserting test that overlapped a
-/// writer's window saw `TRASH` on and its delete came back refused - the
-/// file it asserted gone was still there, roughly one full-suite run in
-/// four. Worse, a reader that caught the window made a REAL Trash call,
-/// which set `TRASH_ANSWERED` under nobody's lock and broke
-/// `concurrent_callers_probe_a_dead_trash_only_once` from across the
-/// module. So this is a reader-writer lock: flag-writing tests take the
-/// write side, and every test whose delete reads the flags holds
-/// [`trash_globals_steady`] across the delete and its asserts - shared
-/// among themselves, exclusive against any writer.
-#[cfg(test)]
-fn trash_globals_lock() -> &'static std::sync::RwLock<()> {
-    static SERIAL: std::sync::RwLock<()> = std::sync::RwLock::new(());
-    &SERIAL
-}
-
-/// Exclusive side, for tests that WRITE the trash globals.
-#[cfg(test)]
-pub(crate) fn one_trash_test_at_a_time() -> std::sync::RwLockWriteGuard<'static, ()> {
-    // Poison is nothing here: each test sets the flags it cares about on
-    // the way in, so a panicking predecessor leaves nothing to inherit.
-    crate::RwLockExt::write_ok(trash_globals_lock())
-}
-
-/// Shared side, for tests whose deletes READ the trash globals: any test
-/// that asserts what a `remove_user_file`-family delete left on disk.
-/// Take it before creating fixtures and hold it past the last assert.
-#[cfg(test)]
-pub(crate) fn trash_globals_steady() -> std::sync::RwLockReadGuard<'static, ()> {
-    crate::RwLockExt::read_ok(trash_globals_lock())
-}
-
-/// Pretend every Trash route has given up, for tests that need a REFUSED
-/// recoverable delete without a machine that has one. The refusal is the
-/// interesting case - it is what leaves a user's download on disk after
-/// they asked for it to go - and it is otherwise unreachable from a test:
-/// the real latch only sets after a backend blows `TRASH_DEADLINE`.
-///
-/// Take [`one_trash_test_at_a_time`] first, and set it back on the way
-/// out: this is the same process-global every other trash test reads.
-#[cfg(test)]
-pub(crate) fn force_trash_unresponsive(v: bool) {
-    TRASH_UNRESPONSIVE.store(v, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Latched when a Trash call gives up waiting - and on macOS only once
 /// BOTH routes have (`trash_delete_bounded` falls through to
 /// `NSFileManager` before it reports a failure at all). Deliberately never
@@ -2292,8 +2241,15 @@ mod deferred_trash {
 /// So the recoverable default follows the platform, and Linux installs
 /// delete outright unless the operator turns `delete_to_trash` back on.
 /// Cleanup still tells the log what it removed either way.
+///
+/// FreeBSD is in the same carve-out for the same reason, not by analogy:
+/// the `trash` crate routes every unix except macOS through its one
+/// freedesktop backend, so a FreeBSD install reaches the identical
+/// `.Trash-<uid>`-on-the-download-volume code, and the population that
+/// runs nzbfast on FreeBSD - NAS boxes, jails, headless servers - is the
+/// population with no desktop session to ever empty it.
 const fn trash_suits_this_platform() -> bool {
-    !cfg!(target_os = "linux")
+    !cfg!(any(target_os = "linux", target_os = "freebsd"))
 }
 
 /// Process-global so the free functions in here need no Daemon handle.
@@ -2663,8 +2619,13 @@ fn move_iopol() -> Option<&'static str> {
 struct BackgroundIo {
     #[cfg(target_os = "macos")]
     prev: i32,
+    // `libc::syscall` is variadic and takes/returns `c_long`, which is
+    // 32-bit on 32-bit Linux (armv7). Typing this i64 built fine on
+    // x86_64/aarch64 and pushed 8-byte variadic args at a kernel wrapper
+    // expecting longs on armv7 - where ARM EABI also 8-byte-aligns them,
+    // so the restore would have addressed the wrong argument slots.
     #[cfg(target_os = "linux")]
-    prev: i64,
+    prev: libc::c_long,
 }
 
 #[cfg(target_os = "macos")]
@@ -2708,14 +2669,15 @@ impl BackgroundIo {
             // "utility" meaning "idle" beats the surprise of a knob that
             // works on one platform and silently not the other.
             let _ = which;
-            const IOPRIO_WHO_PROCESS: i64 = 1;
-            const IOPRIO_CLASS_IDLE: i64 = 3;
+            const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+            const IOPRIO_CLASS_IDLE: libc::c_long = 3;
             unsafe {
-                let prev = libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0i64);
+                let prev =
+                    libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0 as libc::c_long);
                 if libc::syscall(
                     libc::SYS_ioprio_set,
                     IOPRIO_WHO_PROCESS,
-                    0i64,
+                    0 as libc::c_long,
                     IOPRIO_CLASS_IDLE << 13,
                 ) != 0
                 {
@@ -2741,8 +2703,13 @@ impl Drop for BackgroundIo {
         }
         #[cfg(target_os = "linux")]
         unsafe {
-            const IOPRIO_WHO_PROCESS: i64 = 1;
-            let _ = libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0i64, self.prev);
+            const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+            let _ = libc::syscall(
+                libc::SYS_ioprio_set,
+                IOPRIO_WHO_PROCESS,
+                0 as libc::c_long,
+                self.prev,
+            );
         }
     }
 }
@@ -3937,6 +3904,15 @@ pub fn unlock(dir: &Path, password: &str) -> bool {
 mod sweep_rename_tests;
 #[cfg(test)]
 mod testkit;
+// The trash tests' process-global serialisation lives in testkit (it is
+// test-only, and testkit is already the test-only module), but its
+// callers are spread across smart's four test children AND
+// serve/tests_jobs.rs. Re-exported here so every one of them keeps
+// reaching it at the path it always used.
+#[cfg(test)]
+pub(crate) use testkit::{
+    force_trash_unresponsive, one_trash_test_at_a_time, trash_globals_steady,
+};
 #[cfg(test)]
 mod tests;
 

@@ -279,6 +279,28 @@ pub(super) fn container_install() -> bool {
     })
 }
 
+/// True when this process is running inside a Flatpak sandbox.
+///
+/// Deliberately NOT folded into [`container_install`], even though both
+/// mean "this install cannot replace its own binary". The container
+/// recipe the dashboard shows is Docker-specific - compose files,
+/// Watchtower, the Synology Container Manager - and every word of it is
+/// wrong advice inside a Flatpak, where the update channel is
+/// `flatpak update` and the user may never have seen a container. Two
+/// flags, two recipes; the dashboard picks the one that applies.
+///
+/// `/.flatpak-info` is the canonical marker: flatpak-run mounts it into
+/// every sandbox it starts, and nothing outside a sandbox has it.
+/// `FLATPAK_ID` is checked as well because a `flatpak-spawn --host`
+/// child inherits the variable without the mount, and such a child is
+/// still an install whose binary comes from the Flatpak.
+pub(super) fn flatpak_install() -> bool {
+    static IN_FLATPAK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IN_FLATPAK.get_or_init(|| {
+        std::path::Path::new("/.flatpak-info").exists() || std::env::var_os("FLATPAK_ID").is_some()
+    })
+}
+
 /// True when the LAUNCHER owns the listening port and the dashboard must
 /// not move it.
 ///

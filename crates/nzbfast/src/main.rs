@@ -61,6 +61,7 @@ mod serve;
 mod setup;
 mod sfx;
 mod smart;
+mod splitjoin;
 mod srrdb;
 mod tools;
 mod unpack;
@@ -92,6 +93,7 @@ use rarfix::*;
 use repair::*;
 #[cfg(feature = "indexer")]
 use scan::*;
+use splitjoin::*;
 use streamhub::*;
 
 #[derive(Parser)]
@@ -804,6 +806,33 @@ fn main() -> Result<()> {
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
+/// The mockserve throughput line, every 10 s while it serves.
+///
+/// Out of line only because `run()` is at the §106 function ceiling and
+/// this is the one piece of that arm that stands alone. Silent while
+/// nothing is being served: a bench log that prints zeros every ten
+/// seconds buries the run it is measuring.
+fn spawn_benchserve_stats(set: std::sync::Arc<nzbkit::benchserve::BenchSet>) {
+    tokio::spawn(async move {
+        let (mut last_b, mut last_n) = (0u64, 0u64);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let b = set.bytes.load(std::sync::atomic::Ordering::Relaxed);
+            let n = set.served.load(std::sync::atomic::Ordering::Relaxed);
+            if b != last_b {
+                info!(
+                    target: "benchserve",
+                    "{:>7.2} Gbps wire · {} articles ({} total)",
+                    (b - last_b) as f64 * 8.0 / 10.0 / 1e9,
+                    n - last_n,
+                    n
+                );
+            }
+            (last_b, last_n) = (b, n);
+        }
+    });
+}
+
 #[tokio::main]
 async fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -1042,25 +1071,7 @@ async fn run() -> Result<()> {
                     "  self-signed: run the client with NZBFAST_EXTRA_CA=<cert.pem>"
                 );
             }
-            let stats_set = set.clone();
-            tokio::spawn(async move {
-                let (mut last_b, mut last_n) = (0u64, 0u64);
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                    let b = stats_set.bytes.load(std::sync::atomic::Ordering::Relaxed);
-                    let n = stats_set.served.load(std::sync::atomic::Ordering::Relaxed);
-                    if b != last_b {
-                        info!(
-                            target: "benchserve",
-                            "{:>7.2} Gbps wire · {} articles ({} total)",
-                            (b - last_b) as f64 * 8.0 / 10.0 / 1e9,
-                            n - last_n,
-                            n
-                        );
-                    }
-                    (last_b, last_n) = (b, n);
-                }
-            });
+            spawn_benchserve_stats(set.clone());
             nzbkit::benchserve::serve_with(&format!("{bind}:{port}"), set, tls).await?;
             Ok(())
         }

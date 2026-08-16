@@ -1,0 +1,25 @@
+Package: nzbfast
+Version: @@VERSION@@
+Architecture: @@ARCH@@
+Maintainer: nzbfast <releases@nzbfast.com>
+Installed-Size: @@INSTALLED_SIZE@@
+Depends: passwd
+Section: net
+Priority: optional
+Homepage: https://github.com/nzbfast/nzbfast
+Description: speed-focused Usenet (NZB) downloader (BETA package)
+ nzbfast downloads, verifies, repairs and unpacks Usenet posts in one
+ pass: articles are decoded as they arrive, PAR2 verification runs
+ incrementally against what has already landed, and archives are
+ extracted while the rest is still coming down.
+ .
+ It serves a web dashboard and a SABnzbd-compatible API on port 6789, so
+ Sonarr, Radarr and the rest connect to it as they would to SABnzbd. PAR2
+ repair and RAR extraction are built in - no external unrar or par2
+ needed. The binary is statically linked, so this package pulls in no
+ libraries and runs on any distribution with systemd.
+ .
+ This package is BETA. The program itself is the shipped release; it is
+ the packaging - the service unit, the account, the upgrade path - that
+ is new and wants testing. Report anything it gets wrong at
+ https://github.com/nzbfast/nzbfast/issues

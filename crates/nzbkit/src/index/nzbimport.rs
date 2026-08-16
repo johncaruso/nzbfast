@@ -94,13 +94,19 @@ impl Index {
         after: i64,
         limit: usize,
     ) -> rusqlite::Result<Vec<PostedNzbCandidate>> {
+        // The completeness test uses the nsegs-or-count shape every other
+        // site uses: pre-migration rows carry nsegs=0 until the backfill
+        // converges, and the daemon's durable nzbimport_cursor advances
+        // past them - a raw `nsegs >= total_parts` skipped those rows
+        // here, and once backfilled they sat behind the cursor forever.
         let mut stmt = self.db.prepare_cached(
             "SELECT r.id, r.arrival_seq, r.stem, r.grp, r.junk, f.segments, f.bytes
                FROM releases r JOIN files f ON f.release_id = r.id
               WHERE r.arrival_seq > ?1
                 AND r.files = 1
                 AND lower(f.filename) LIKE '%.nzb'
-                AND f.nsegs >= f.total_parts
+                AND (CASE WHEN f.nsegs > 0 THEN f.nsegs
+                          ELSE json_array_length(f.segments) END) >= f.total_parts
               ORDER BY r.arrival_seq LIMIT ?2",
         )?;
         let rows: Vec<(i64, i64, String, String, i64, String, i64)> = stmt

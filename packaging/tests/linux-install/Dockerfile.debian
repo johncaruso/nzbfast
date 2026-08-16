@@ -1,0 +1,16 @@
+# Debian with a real systemd as PID 1, for testing the .deb the way a
+# user installs it: dpkg -i, systemctl start, then an upgrade over the
+# running daemon.
+FROM debian:bookworm
+RUN apt-get -qq update \
+    && apt-get -qq install -y --no-install-recommends systemd systemd-sysv curl procps \
+    && rm -rf /var/lib/apt/lists/*
+# The debian image ships /usr/sbin/policy-rc.d returning 101, which is what
+# stops apt from starting daemons during a `docker build`. A real Debian host
+# has no such file, and while it is there deb-systemd-invoke declines every
+# start and restart - so the package looks like it never restarts the daemon
+# on upgrade, which is a property this test exists to check. Measured: the
+# upgrade check failed here and nowhere else.
+RUN rm -f /usr/sbin/policy-rc.d
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

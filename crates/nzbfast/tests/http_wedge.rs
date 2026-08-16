@@ -441,6 +441,59 @@ fn held_index_lock_does_not_wedge_the_api() {
 /// rest of the API is untouched. Past `INDEX_READ_CONNS` a read is told
 /// the index is busy INSTEAD of queueing - the worker goes back to the
 /// pool rather than waiting out the slow query.
+/// A handler that reads the index TWICE has to stay honest on the
+/// SECOND read too. `rar_name` did not: its classification read used
+/// `index_read_checked` and reported busy, then its file-rows read used
+/// `with_index_read`, which maps a saturated pool to None, and
+/// `unwrap_or_default` turned that into "no such release" - about a
+/// release that plainly exists (read-only sweep 2, 15 Aug 2026, L5).
+///
+/// Holding connections from other requests cannot reach this: it can
+/// only ever make the FIRST read busy. The window between one handler's
+/// two reads is microseconds wide from outside and wide open on a live
+/// daemon, so the pool is saturated from INSIDE instead, with the
+/// hooks-gated `mode=debug_index_read_busy` - one read through, every
+/// read after it refused.
+#[test]
+fn a_busy_second_read_is_not_a_missing_release() {
+    let dir = scratch("rarname_busy");
+    seed_index(&dir, 4);
+    let d = serve(&dir);
+    let port = d.port;
+
+    // Prime the read path so `index_migrated` is set and the pool is
+    // what answers, not the startup fallback to with_index.
+    let s = api(port, "mode=index_search&q=wedge");
+    assert_eq!(
+        s["results"].as_array().map(Vec::len),
+        Some(4),
+        "seed visible: {s}"
+    );
+    let id = s["results"][0]["id"].as_i64().expect("a seeded release id");
+
+    // Sanity: with the pool free, the release is found - the handler
+    // gets past both reads and on to the wire, which has no server
+    // configured, so the answer is about the FETCH, never "no such
+    // release".
+    let ok = api(port, &format!("mode=rar_name&id={id}"));
+    assert_ne!(
+        ok["error"], "no such release",
+        "the seeded release is readable before anything is armed: {ok}"
+    );
+
+    // One read through - the classification read - then the pool is
+    // busy for everything after it, which is the file-rows read.
+    let armed = api(port, "mode=debug_index_read_busy&value=1");
+    assert_eq!(armed["armed"], 1, "hook armed: {armed}");
+
+    let r = api(port, &format!("mode=rar_name&id={id}"));
+    assert_eq!(
+        r["busy"], true,
+        "a busy second read must say so, not deny the release exists: {r}"
+    );
+    assert_ne!(r["error"], "no such release", "{r}");
+}
+
 #[test]
 fn a_slow_index_read_cannot_starve_the_http_pool() {
     let dir = scratch("readpool");
@@ -665,6 +718,18 @@ fn debug_hook_absent_without_env() {
         t.elapsed() < Duration::from_secs(5),
         "unknown-mode answer took {}ms - did the read hook run?",
         t.elapsed().as_millis()
+    );
+    // And the fault injector, which would make every later index read
+    // on this daemon answer "busy" for as long as it ran.
+    let r = api(port, "mode=debug_index_read_busy&value=1");
+    assert!(
+        r.get("armed").is_none(),
+        "the read-pool fault injector must not arm without the env var: {r}"
+    );
+    let w = api(port, "mode=wall2&all=1&matched=0");
+    assert_ne!(
+        w["busy"], true,
+        "nothing was armed, so the index must not be reporting busy: {w}"
     );
 }
 

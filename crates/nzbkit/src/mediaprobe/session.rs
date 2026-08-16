@@ -454,10 +454,15 @@ impl RemuxSession {
                     self.warn("this file has groups of pictures longer than six seconds");
                 }
                 self.held = Some(s);
+                // Read BEFORE the emit: `emit_fragment` zeroes
+                // `pending_bytes`, so asking after it always answered 0
+                // and every prefetch asked for the 4 MiB floor whatever
+                // the fragment actually weighed.
+                let ahead = (self.pending_bytes as u64).max(4 << 20);
                 let e = self.emit_fragment();
                 // Keep the download one fragment ahead of the muxer.
                 if let Some(h) = &self.held {
-                    src.prefetch(h.src_off, (self.pending_bytes as u64).max(4 << 20));
+                    src.prefetch(h.src_off, ahead);
                 }
                 return Ok(e);
             }

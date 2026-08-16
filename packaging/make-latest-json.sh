@@ -19,6 +19,12 @@
 #   ALLOW_MISSING="linux-arm64 windows-x64" packaging/make-latest-json.sh dist
 # ALLOW_MISSING=all waives them all, but an EMPTY payloads map is always
 # fatal - a manifest that installs nowhere is never what anyone meant.
+#
+# <dist-dir>/RELEASE_NOTES.md must ALREADY EXIST (write the notes before
+# the manifest). It is validated here, and its first body line becomes
+# the manifest's `notes` when [notes] is not given. Builds with no
+# release notes at all - tester bundles, work-in-progress cuts - say so:
+#   SKIP_NOTES_CHECK=1 packaging/make-latest-json.sh dist
 set -eu
 
 DIST=${1:?usage: make-latest-json.sh <dist-dir> [notes]}
@@ -28,9 +34,41 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/crates/nzbfast/Cargo.toml" 
 [ -n "$VERSION" ] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
 BASE="https://github.com/nzbfast/nzbfast/releases/download/v$VERSION"
 
-if [ -z "$NOTES" ] && [ -f "$DIST/RELEASE_NOTES.md" ]; then
+# Gate the notes here because this is the one step every release runs
+# and cannot skip: the manifest must be signed, and the notes sit right
+# next to it. Nothing else reads this file - no CI job, no other script -
+# so when this gate does not fire, a platform can be dropped from the
+# download table and the only reviewer is whoever happens to read the
+# release page.
+#
+# The file is REQUIRED, not "checked if it happens to be there". This
+# block used to be wrapped in `if [ -f ... ]`, which made the gate
+# fail-open: publish-release documented the manifest step BEFORE the
+# notes step, so a straight top-to-bottom run signed a manifest with an
+# empty `notes` field, exited 0, and never validated anything. The
+# sentence promising a release "cannot be signed past" bad notes was
+# false for exactly the run the skill told you to make.
+#
+# SKIP_NOTES_CHECK=1 is the only waiver, and it says so on stderr. It is
+# for builds that legitimately have no release notes: work-in-progress
+# cuts, and the tester bundles release-bundle produces. Never a release.
+NOTES_FILE="$DIST/RELEASE_NOTES.md"
+if [ "${SKIP_NOTES_CHECK:-0}" = "1" ]; then
+    echo "! SKIP_NOTES_CHECK=1 - release notes NOT validated" >&2
+elif [ -f "$NOTES_FILE" ]; then
+    python3 "$ROOT/packaging/check-release-notes.py" "$NOTES_FILE" "$VERSION"
+else
+    echo "ERROR: $NOTES_FILE is missing - the notes gate cannot run." >&2
+    echo "       Write the notes BEFORE the manifest:" >&2
+    echo "         packaging/make-release-notes.sh $VERSION <body-file> \\" >&2
+    echo "             > $NOTES_FILE" >&2
+    echo "       Tester and work-in-progress bundles have no release" >&2
+    echo "       notes and waive this loudly: SKIP_NOTES_CHECK=1 $0 $DIST" >&2
+    exit 1
+fi
+if [ -z "$NOTES" ] && [ -f "$NOTES_FILE" ]; then
     # First non-heading, non-blank line of the release notes.
-    NOTES=$(grep -v '^#' "$DIST/RELEASE_NOTES.md" | grep -m1 . || true)
+    NOTES=$(grep -v '^#' "$NOTES_FILE" | grep -m1 . || true)
 fi
 
 sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
@@ -59,6 +97,82 @@ sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 # self-update is notify-only (today: the daemon reads version/serial/
 # notes and never touches this map); the moment the opt-in updater
 # ships, this shape is frozen.
+#
+# WINDOWS-ARM64 IS DELIBERATELY ABSENT FROM THIS LIST. The Windows on ARM
+# package ships as a clearly-labelled BETA asset on the release page
+# (nzbfast-X.Y.Z-windows-arm64-beta.zip and its -setup.exe, built by the
+# windows-arm64-beta job in .github/workflows/release.yml) and nowhere
+# else, because nobody has yet run it on ARM64 hardware.
+#
+# Adding a key here is not a small step and is not easily undone. Every
+# entry is ed25519-signed inside a body that also carries the monotonic
+# anti-rollback serial above, and clients ratchet that serial one way
+# with no server-side reset - so a payload that turns out to be broken
+# cannot be withdrawn by publishing a corrected manifest that clients
+# would accept as older. An asset on the release page, by contrast, is
+# deleted with one gh command and nothing has ever ratcheted on it.
+#
+# The order is therefore: a tester confirms the beta actually runs on a
+# Snapdragon X box -> drop the `-beta` suffix from installer.iss's
+# AssetArch and the release job -> build a `nzbfast-updater-$VERSION-
+# windows-arm64.exe` payload -> and only then add `windows-arm64` here.
+# Until that first step happens, this line is the gate.
+#
+# NEITHER NAS PACKAGE IS IN THIS LIST EITHER, and for the Synology .spk
+# that has always been true: a package manager owns the binary it
+# installed, so the update story there is "install the new package", not
+# a payload this manifest hands to an updater. The QNAP .qpkg
+# (packaging/qnap/, shipped as a clearly-labelled beta) inherits that,
+# with the reasoning above on top - nobody has run it on real hardware,
+# and this is the one place a mistake cannot be withdrawn. There is no
+# `qnap` or `synology` key to add and no work here to do when a tester
+# confirms the beta; the checklist in packaging/qnap/README.md says so,
+# so that nobody reads the absence as an oversight and "fixes" it.
+#
+# THE FLATPAK IS NOT IN THIS LIST EITHER, and never will be, for the
+# same reason as the packages below plus one of its own: Flatpak owns the
+# files it installed AND runs them in a sandbox where the daemon cannot
+# write its own binary at all. It has its own update channel, so an
+# updater that fought it would be fighting the thing the user actually
+# uses. The daemon detects the sandbox (serve/update.rs
+# `flatpak_install`) and the dashboard shows `flatpak update` instead of
+# the download page, which is the whole of the in-app story. There is no
+# `flatpak` key to add and nothing here to do when the beta graduates -
+# packaging/flatpak/README.md says so, so the absence does not read as an
+# oversight.
+#
+# THE .deb AND .rpm ARE NOT IN THIS LIST, and never will be, for the
+# first of those two reasons: dpkg and rpm own the binary they installed,
+# and a self-updater that swapped /usr/bin/nzbfast underneath them would
+# leave the package database describing a file that is no longer there.
+# `apt upgrade` / `dnf upgrade` is the update path (they are
+# download-and-install packages today, so in practice: install the newer
+# package). Nothing to add here when the beta graduates - see
+# packaging/linux/README.md.
+#
+# LINUX-ARMV7 IS ABSENT FOR THE SAME REASON AS WINDOWS-ARM64, and the
+# same order applies. The 32-bit ARM build (TODO 178) ships as
+# nzbfast-X.Y.Z-linux-armv7-beta.tar.gz and nowhere else. Its whole test
+# record is emulation - qemu-user, where the full suite passes with zero
+# armv7-only failures - and emulation cannot answer what a real Pi 3
+# does under sustained load on 1 GB of RAM. A Pi is also the worst place
+# to be wrong: headless, unattended, and rarely watched. A tester
+# confirms it on hardware -> drop `-beta` from
+# packaging/build-linux-tarballs.sh and the release job -> build a
+# `nzbfast-updater-$VERSION-linux-armv7` payload -> and only then add
+# `linux-armv7` here.
+#
+# THE FREEBSD TARBALL IS NOT IN THIS LIST EITHER, for the Windows-ARM64
+# reason exactly: nobody has run it on a real FreeBSD machine. It is
+# built and end-to-end smoke-tested inside a FreeBSD VM on every release
+# (the freebsd-beta job in .github/workflows/release.yml), which is more
+# than the ARM64 build gets, and it is still not a NAS with real disks -
+# so it ships as `nzbfast-X.Y.Z-freebsd-x64-beta.tar.gz` on the release
+# page and nowhere else. The order is the same: a tester confirms it runs
+# on real FreeBSD -> drop `-beta` from the asset name -> build a
+# `nzbfast-updater-$VERSION-freebsd-x64` payload -> and only then add a
+# `freebsd-x64` key here. Until that first step happens, this line is the
+# gate. The tester checklist is in packaging/freebsd/README.md.
 PLATFORMS='macos-universal macos-arm64 macos-x64 windows-x64 linux-x64 linux-arm64'
 payload() {   # $1 = platform key -> path of its RAW autoupdate payload
     if [ "$1" = windows-x64 ]; then

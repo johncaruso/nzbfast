@@ -139,19 +139,55 @@ pub fn res_label(w: u32, h: u32) -> Option<String> {
     } else {
         u64::from(h).max(u64::from(w) * 9 / 16)
     };
-    Some(
-        match eh {
-            1800.. => "2160p",
-            1250..1800 => "1440p",
-            900..1250 => "1080p",
-            650..900 => "720p",
-            530..650 => "576p",
-            400..530 => "480p",
-            300..400 => "360p",
-            _ => "240p",
-        }
-        .to_string(),
-    )
+    Some(res_bucket(eh).to_string())
+}
+
+/// The scene bucket for an effective height, shared by [`res_label`]
+/// and the narrow-frame stand-down in [`check`].
+fn res_bucket(eh: u64) -> &'static str {
+    match eh {
+        1800.. => "2160p",
+        1250..1800 => "1440p",
+        900..1250 => "1080p",
+        650..900 => "720p",
+        530..650 => "576p",
+        400..530 => "480p",
+        300..400 => "360p",
+        _ => "240p",
+    }
+}
+
+/// The full 16:9 frame width of a scene resolution class. The claim
+/// vocabulary is `release::res_of`'s closed set, so this is a table and
+/// not a calculation.
+fn class_width(label: &str) -> Option<u32> {
+    Some(match label {
+        "2160p" => 3840,
+        "1440p" => 2560,
+        "1080p" => 1920,
+        "720p" => 1280,
+        "576p" => 1024,
+        "480p" => 854,
+        _ => return None,
+    })
+}
+
+/// The narrow-frame stand-down [`check`] applies to a resolution claim:
+/// a 4:3 frame encoded at the claimed class's OWN full width.
+///
+/// Both halves are load-bearing, and neither of them is "taller than
+/// 16:9". That test plus a width-implied bucket was the whole condition
+/// once, and it excused far more than the 4:3 shape it was written for:
+/// a square 1440x1440 frame measures 1440p while its width implies 810
+/// rows, which buckets as 720p, so a 720p name walked; a 1920x2560
+/// portrait walked against 1080p the same way. Neither is a broadcast
+/// frame and both are exactly the mislabel the rule exists to catch.
+fn four_by_three_at_class_width(w: u32, h: u32, claimed: &str) -> bool {
+    // Codecs pad to macroblock multiples (a 1440-row frame is spelled
+    // 1456), so the ratio is matched within one macroblock row rather
+    // than exactly - the same tolerance `res_label` gives its heights.
+    (u64::from(w) * 3).abs_diff(u64::from(h) * 4) <= 64
+        && class_width(claimed).is_some_and(|cw| w.abs_diff(cw) <= 16)
 }
 
 /// Canonical probe codec → the spelling a release name would print.
@@ -343,8 +379,21 @@ pub fn check(info: &MediaInfo, name: &str) -> MediaFacts {
     // Resolution. Flagged in BOTH directions: a name and a frame size
     // that disagree is a mislabel whichever way round it goes, and the
     // sentence the UI writes reports both sides rather than accusing.
+    //
+    // EXCEPT the narrow-frame shape: a 4:3 episode encoded at the full
+    // class width (1920x1440 inside a series named 1080p - Gary's SNW
+    // "Chiaroscuro" report) is taller than 16:9, so the label reads a
+    // height past the named class while the WIDTH is exactly the class
+    // the name claims. That is the mirror of the scope case res_label
+    // already handles (2592x1080 stays 1080p), and it is not a
+    // mislabel: the chip still shows the measured label as a fact, but
+    // the warning stands down. A genuine 2560x1440 named 1080p still
+    // warns - it is not a 4:3 frame at all. See
+    // `four_by_three_at_class_width` for why the shape is tested and
+    // not just the height-to-width direction.
     if let (Some(claimed), Some(actual)) = (&claim.res, &facts.res)
         && claimed != actual
+        && !four_by_three_at_class_width(v.width, v.height, claimed)
     {
         facts.mismatch.push(Mismatch {
             field: Field::Resolution,
@@ -508,6 +557,80 @@ mod tests {
             assert!(
                 m.iter().all(|x| x.field == Field::Resolution),
                 "false accusation on {name}: {m:?}"
+            );
+        }
+    }
+
+    /// A 4:3 episode encoded at the full class width (1920x1440 inside
+    /// a 1080p-named series - Gary's SNW "Chiaroscuro" report) is not a
+    /// mislabel: the width IS the named class, the height is just the
+    /// 4:3 shape. The chip may state 1440p as a fact, but the warning
+    /// stands down. A genuine 2560x1440 named 1080p still warns.
+    #[test]
+    fn a_full_width_four_by_three_frame_is_not_a_resolution_mislabel() {
+        let mut info = probed(&testmux::mkv_full());
+        info.video[0].width = 1920;
+        info.video[0].height = 1440;
+        let m = check(&info, "Example.Show.S04E04.1080p.WEB.x264.DD5.1-GRP").mismatch;
+        assert!(
+            !m.iter().any(|x| x.field == Field::Resolution),
+            "false accusation on a 1920x1440 4:3 frame named 1080p: {m:?}"
+        );
+        info.video[0].width = 2560;
+        let m = check(&info, "Example.Show.S04E04.1080p.WEB.x264.DD5.1-GRP").mismatch;
+        assert!(
+            m.iter().any(|x| x.field == Field::Resolution),
+            "a real 2560x1440 named 1080p must still warn"
+        );
+        // The same shape one class down: 1280x960 measures 1080p and is
+        // named 720p, and 1280 IS the 720p class width.
+        info.video[0].width = 1280;
+        info.video[0].height = 960;
+        let m = check(&info, "Example.Show.S04E04.720p.WEB.x264.DD5.1-GRP").mismatch;
+        assert!(
+            !m.iter().any(|x| x.field == Field::Resolution),
+            "false accusation on a 1280x960 4:3 frame named 720p: {m:?}"
+        );
+    }
+
+    /// The stand-down is for a 4:3 frame at the claimed class's OWN full
+    /// width, and for nothing else. Every one of these is taller than
+    /// 16:9 and every one has a width whose implied bucket lands on the
+    /// claimed class - which is all the older test asked for, so all
+    /// three were excused. None of them is a 4:3 broadcast frame, and
+    /// each is exactly the mislabel the rule exists to catch.
+    #[test]
+    fn a_square_or_portrait_frame_is_not_excused_as_a_narrow_frame() {
+        for (w, h, name, why) in [
+            // Square: measures 1440p, width implies 810 rows -> 720p.
+            (
+                1440,
+                1440,
+                "Example.Show.S04E04.720p.WEB.x264.DD5.1-GRP",
+                "square",
+            ),
+            // Portrait: measures 2160p, width implies 1080 -> 1080p.
+            (
+                1920,
+                2560,
+                "Example.Show.S04E04.1080p.WEB.x264.DD5.1-GRP",
+                "portrait",
+            ),
+            // 2:3, at the 1080p class width but nowhere near 4:3.
+            (
+                1920,
+                2880,
+                "Example.Show.S04E04.1080p.WEB.x264.DD5.1-GRP",
+                "2:3 tall",
+            ),
+        ] {
+            let mut info = probed(&testmux::mkv_full());
+            info.video[0].width = w;
+            info.video[0].height = h;
+            let m = check(&info, name).mismatch;
+            assert!(
+                m.iter().any(|x| x.field == Field::Resolution),
+                "a {why} {w}x{h} frame named {name} must still warn: {m:?}"
             );
         }
     }

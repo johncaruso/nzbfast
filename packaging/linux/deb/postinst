@@ -1,0 +1,70 @@
+#!/bin/sh
+# dpkg calls this after unpacking, on install AND on every upgrade.
+#
+# The upgrade case is the one that matters: $2 is the version being
+# replaced, the daemon may be running, and /var/lib/nzbfast is full of
+# somebody's settings, queue and downloads. Nothing here writes into that
+# directory except through setup-data-dir.sh, which only ever creates
+# what is missing.
+set -e
+
+UNIT=nzbfast.service
+
+case "$1" in
+    configure)
+        /usr/share/nzbfast/setup-data-dir.sh
+
+        if [ -d /run/systemd/system ] || command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+
+        # Enable, do NOT start. A fresh install has no provider
+        # configured, so starting the daemon here would put a dashboard
+        # on the network before the admin has looked at it once; enabling
+        # means it comes back on its own after the first reboot, which is
+        # what a service package is for. The postinst message below says
+        # both, because "enabled but not running" surprises people.
+        if [ -z "$2" ]; then
+            if command -v deb-systemd-helper >/dev/null 2>&1; then
+                deb-systemd-helper unmask "$UNIT" >/dev/null 2>&1 || true
+                deb-systemd-helper enable "$UNIT" >/dev/null 2>&1 || true
+            elif command -v systemctl >/dev/null 2>&1; then
+                systemctl --no-reload enable "$UNIT" >/dev/null 2>&1 || true
+            fi
+            cat <<'NOTE'
+
+nzbfast is installed (BETA package) and enabled at boot, but NOT started.
+
+  1. sudo nzbfast setup --config /var/lib/nzbfast/config.json
+        or edit /var/lib/nzbfast/config.json by hand
+  2. sudo systemctl start nzbfast
+  3. open http://<this-host>:6789 - the API key is printed by
+        `journalctl -u nzbfast` on the first start
+
+  Settings, queue and downloads all live in /var/lib/nzbfast, and no
+  upgrade or removal of this package touches that folder.
+  Service options (port, folders): /etc/nzbfast/nzbfast.env
+
+NOTE
+        else
+            # An upgrade restarts the daemon only if it was already
+            # running. `try-restart` is the whole distinction: `restart`
+            # would start a daemon the admin had deliberately stopped.
+            if [ -d /run/systemd/system ]; then
+                if command -v deb-systemd-invoke >/dev/null 2>&1; then
+                    deb-systemd-invoke try-restart "$UNIT" >/dev/null 2>&1 || true
+                else
+                    systemctl try-restart "$UNIT" >/dev/null 2>&1 || true
+                fi
+            fi
+        fi
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

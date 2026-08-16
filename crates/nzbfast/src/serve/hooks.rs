@@ -82,11 +82,36 @@ impl Daemon {
     /// Both go on the blocking pool, together, so a slow script delays
     /// the scan rather than the queue.
     pub(in crate::serve) fn run_post_job_hooks(self: &Arc<Self>, job: &Arc<Mutex<Job>>) {
+        self.run_post_job_hooks_gen(job, None)
+    }
+
+    /// [`Self::run_post_job_hooks`], fenced to the round of the record's
+    /// life the caller started on.
+    ///
+    /// A job ends in a long-running tail, and a delete verb plus a retry
+    /// can hand that record to a new generation while the tail is still
+    /// on its way here. Firing then is not a stale script run against a
+    /// dead job: it announces a completion (or a failure, and reports it
+    /// to the indexer, and re-grabs against it) for a release that is at
+    /// that moment sitting in the queue waiting to download again
+    /// (read-only sweep 2, H1 and M5). Read under the same hold as the
+    /// plan, because the plan is what the whole fan-out is decided from.
+    pub(in crate::serve) fn run_post_job_hooks_gen(
+        self: &Arc<Self>,
+        job: &Arc<Mutex<Job>>,
+        gen0: Option<(u32, u64)>,
+    ) {
         let script = self.resolve_script(job);
         let targets = self.notify_targets.lock_ok().clone();
         let mode = self.failure_link.lock_ok().clone();
         let secs = self.auto_retry_secs.load(Ordering::Relaxed);
-        let Some(failing) = post_job_plan(&job.lock_ok(), &mode, secs) else {
+        let plan = {
+            let g = job.lock_ok();
+            Daemon::same_generation(&g, gen0)
+                .then(|| post_job_plan(&g, &mode, secs))
+                .flatten()
+        };
+        let Some(failing) = plan else {
             return;
         };
         if script.is_none() && targets.is_empty() && !failing {

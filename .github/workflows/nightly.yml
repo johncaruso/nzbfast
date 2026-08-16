@@ -264,6 +264,215 @@ jobs:
           path: soak-report.json
           if-no-files-found: warn
 
+  # 32-bit ARM (armv7), BETA - TODO 178. A CROSS-BUILD PROVES ALMOST
+  # NOTHING HERE, which is why this job runs the suite instead of just
+  # compiling it. `usize` is 32 bits on this target and the engine
+  # deliberately handles large declared sizes from untrusted input, so
+  # the interesting failures are silent truncations and overflow panics
+  # that only appear when the code RUNS. The three found on 15 Aug 2026
+  # were all invisible to a clean build: an `i64` where the target's
+  # `c_long` is 32-bit, a 2^32 constant that wrapped to a budget of
+  # zero, and a >4 GiB extent a `Range<usize>` cannot hold.
+  #
+  # Debug profile on purpose: overflow checks are the oracle. qemu-user
+  # costs roughly 10x, which is why this is nightly and not per-push.
+  # The seven heavy targets are excluded exactly as ci-private excludes
+  # them; `heavy-tests` is not passed, so they are not even built.
+  armv7-cross:
+    if: github.repository != 'nzbfast/nzbfast'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The pinned toolchain, not `stable`: this target is in
+      # rust-toolchain.toml's `targets` list, so rustup installs the
+      # std for it here without a separate `target add`.
+      - name: toolchain
+        run: rustc -vV && rustup target list --installed
+      # This job builds the whole workspace for a SECOND target - a
+      # release binary plus ~40 debug test binaries, every one of them
+      # statically linked - on top of the host artifacts cargo still
+      # needs for build scripts and proc macros. On 15 Aug that filled
+      # the runner's disk, and it did not look like disk: zig cc died on
+      # the nzbfast link with a bare `signal: 6 (SIGABRT) (core dumped)`
+      # and an EMPTY stderr, which reads exactly like a linker crash. The
+      # rustc still running alongside it said what zig would not, 22
+      # seconds later - `No space left on device`, with the runner
+      # reporting 6 MB free. So reclaim the preinstalled toolchains this
+      # job never touches (~25 GB) and print the free space either side,
+      # so a repeat is diagnosable from the log instead of guessed at.
+      - name: reclaim disk
+        run: |
+          set -euo pipefail
+          echo "free before: $(df -h --output=avail / | tail -1)"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift /usr/local/share/powershell || true
+          echo "free after:  $(df -h --output=avail / | tail -1)"
+      # zig supplies the musl cross-toolchain (Ubuntu packages none for
+      # armv7, and rapidyenc is C++ so musl-gcc alone would not do);
+      # qemu-user-static plus binfmt is what lets the test binaries -
+      # and the daemon processes some of them spawn - actually execute.
+      - name: cross + emulation toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static binfmt-support
+          # A venv, not `pip install --user`: Ubuntu 24.04 marks its
+          # system Python externally-managed (PEP 668) and refuses. Same
+          # recipe and same pins as release.yml's `packages` job - see
+          # the comments there.
+          python3 -m venv /tmp/zigvenv
+          /tmp/zigvenv/bin/pip install --quiet ziglang==0.16.0
+          printf '#!/bin/sh\nexec /tmp/zigvenv/bin/python -m ziglang "$@"\n' \
+            | sudo tee /usr/local/bin/zig >/dev/null
+          sudo chmod +x /usr/local/bin/zig
+          zig version
+          ver=0.23.0
+          sha=f0aa9cc8220a84788c6e4a9b6d80422f041659227b680fdef982d5a8ddffddb4
+          url="https://github.com/rust-cross/cargo-zigbuild/releases/download/v${ver}/cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz"
+          curl -fsSL -o cargo-zigbuild.tar.xz "$url"
+          echo "$sha  cargo-zigbuild.tar.xz" | sha256sum -c -
+          # --strip-components=1: the release archive nests its payload
+          # one directory down (cargo-zigbuild-<triple>/cargo-zigbuild),
+          # so a bare `tar xf` leaves nothing named cargo-zigbuild in cwd
+          # and the mv below fails - after the sha check has printed OK,
+          # which is why this read as a pinning problem and was not one.
+          tar xf cargo-zigbuild.tar.xz --strip-components=1
+          sudo mv cargo-zigbuild /usr/local/bin/
+          rm -f cargo-zigbuild.tar.xz
+          # Plain shims for the step that is NOT cargo-zigbuild. The
+          # release build below goes through cargo-zigbuild because that
+          # is the recipe we ship (packaging/build-linux-tarballs.sh) and
+          # this job should gate it; nextest shells out to a bare
+          # `cargo test --no-run`, which never sees cargo-zigbuild, so it
+          # needs the linker and the C/C++ compilers named directly.
+          # Same zig, same libc, either way.
+          mkdir -p "$HOME/zigshim"
+          T=arm-linux-musleabihf
+          # The cc crate appends rustc's triple as --target=..., and it
+          # lands AFTER the -target these shims pin, so it is the one zig
+          # actually reads. zig calls this target arm-linux-musleabihf and
+          # does not know the arch spelling `armv7`, so aws-lc-sys died
+          # with `unknown architecture: 'armv7'` before it compiled a
+          # single object. Drop any --target= and let the pinned one
+          # stand. release.yml's two zig jobs never hit this: they set no
+          # CC_*, so cargo-zigbuild translates the triple itself.
+          # The loop pops each argument off the front and pushes the
+          # keepers onto the back, exactly $# times.
+          strip='n=$#\nwhile [ "$n" -gt 0 ]; do\n  a=$1; shift; n=$((n-1))\n  case "$a" in --target=*) ;; *) set -- "$@" "$a" ;; esac\ndone\n'
+          printf "#!/bin/sh\n${strip}exec zig cc -target %s \"\$@\"\n"  "$T" > "$HOME/zigshim/zig-cc"
+          printf "#!/bin/sh\n${strip}exec zig c++ -target %s \"\$@\"\n" "$T" > "$HOME/zigshim/zig-cxx"
+          printf '#!/bin/sh\nexec zig ar "$@"\n'                  > "$HOME/zigshim/zig-ar"
+          printf '#!/bin/sh\nexec zig ranlib "$@"\n'              > "$HOME/zigshim/zig-ranlib"
+          chmod +x "$HOME/zigshim"/zig-*
+          echo "--- generated zig-cc shim ---"; cat "$HOME/zigshim/zig-cc"
+          # NOT the linker: cargo-zigbuild installs its own linker wrapper,
+          # and overriding it with the plain shim made rustc's
+          # self-contained musl crt and zig's crt BOTH get linked -
+          # `ld.lld: duplicate symbol: _start`. The release build below
+          # is a cargo-zigbuild build and wants zigbuild's wrapper; the
+          # nextest step, which never sees cargo-zigbuild, names the
+          # linker for itself.
+          {
+            echo "CC_armv7_unknown_linux_musleabihf=$HOME/zigshim/zig-cc"
+            echo "CXX_armv7_unknown_linux_musleabihf=$HOME/zigshim/zig-cxx"
+            echo "AR_armv7_unknown_linux_musleabihf=$HOME/zigshim/zig-ar"
+            echo "RANLIB_armv7_unknown_linux_musleabihf=$HOME/zigshim/zig-ranlib"
+          } >> "$GITHUB_ENV"
+      # Prebuilt binary pinned by version and checked by SHA256 rather
+      # than trusted - the same pattern (and rationale) as ci-private's
+      # nextest step and the cargo-deny step below.
+      - name: install cargo-nextest
+        run: |
+          set -euo pipefail
+          ver="0.9.140"
+          curl -sSfL --retry 5 --retry-delay 3 --retry-all-errors \
+            --connect-timeout 20 -o cargo-nextest.tar.gz \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${ver}/cargo-nextest-${ver}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "4ee9aaa0d0171a985a5d0eb735b87355894c1c455972e9674fb9fdbd1387c9a3  cargo-nextest.tar.gz" | sha256sum -c -
+          tar -xzf cargo-nextest.tar.gz
+          sudo mv cargo-nextest /usr/local/bin/
+          rm cargo-nextest.tar.gz
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: nightly-armv7-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      # Release binary first: it is the shipped artifact, and a link
+      # failure here is a different (and cheaper) verdict than a test
+      # failure below.
+      - name: build the release binary
+        run: cargo zigbuild --release --locked -p nzbfast --target armv7-unknown-linux-musleabihf
+      - name: it is a 32-bit ARM static binary
+        run: |
+          set -euo pipefail
+          out=$(file target/armv7-unknown-linux-musleabihf/release/nzbfast)
+          echo "$out"
+          # Assert the positive of each claim: an unreadable `file` line
+          # must fail here rather than pass by not matching a negative.
+          echo "$out" | grep -q "ELF 32-bit"
+          echo "$out" | grep -q "ARM"
+          echo "$out" | grep -q "statically linked"
+          qemu-arm-static target/armv7-unknown-linux-musleabihf/release/nzbfast --version
+      # The memory ladder is a shipped feature and every cap under the
+      # budget is a `usize`. Print it rather than assume it: this is the
+      # one place a truncation between the budget and its caps shows.
+      - name: memory ladder on a 32-bit target
+        run: |
+          set -euo pipefail
+          cargo zigbuild --release --locked -p nzbkit --example memprobe \
+            --target armv7-unknown-linux-musleabihf
+          probe=target/armv7-unknown-linux-musleabihf/release/examples/memprobe
+          qemu-arm-static "$probe"
+          # An over-large --mem-limit must CLAMP, never wrap. A wrapped
+          # budget prints a resolved total unrelated to both the request
+          # and the ceiling, so pin the ceiling exactly.
+          qemu-arm-static "$probe" 8G | tee ladder.txt
+          grep -q "resolved budget: 1.00 GB" ladder.txt
+      - name: unit suites under qemu
+        env:
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUNNER: /usr/bin/qemu-arm-static
+          # This step shells out to a bare `cargo test --no-run`, so
+          # there is no cargo-zigbuild wrapper here and the linker has to
+          # be named. link-self-contained=no is the other half: without
+          # it rustc adds its own musl crt on top of the one zig already
+          # links, and every test binary dies on a duplicate _start.
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: /home/runner/zigshim/zig-cc
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS: "-C link-self-contained=no"
+          # Debuginfo off for the cross test build - this is the other
+          # half of `reclaim disk` above. These test binaries are STATIC,
+          # so DWARF is paid once per binary instead of being shared
+          # through a libstd everyone links dynamically, and ~40 of them
+          # at `debuginfo=2` is what actually filled the disk. Setting it
+          # on the profile rather than in RUSTFLAGS is deliberate: it
+          # also flips the `DEBUG` variable cargo hands build scripts, so
+          # the cc crate drops its own `-g` and aws-lc-sys stops emitting
+          # thousands of debug-laden objects. Nothing here asserts on
+          # debuginfo; panics keep their symbol names, just not lines.
+          # `test` inherits `dev`, so the first line is the one that
+          # bites - the second is a belt if that ever stops being true.
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          # Incremental state is dead weight for a one-shot CI build, and
+          # it is written into the same target dir that ran out of room.
+          CARGO_INCREMENTAL: "0"
+          NZBFAST_NO_ENRICH: "1"
+        run: |
+          set -euo pipefail
+          # On the EXIT trap, not after the run: this step's shell is
+          # `bash -e`, so a red suite would skip a trailing plain `df` -
+          # and a red suite is the one case where the number is wanted.
+          trap 'echo "free after build+run: $(df -h --output=avail / | tail -1)"' EXIT
+          echo "free before build: $(df -h --output=avail / | tail -1)"
+          cargo nextest run --profile ci --workspace --no-fail-fast \
+            --target armv7-unknown-linux-musleabihf \
+            -E 'not binary(conn_tuner) and not binary(index_size_cap) and
+                not binary(http_wedge) and not binary(queue_soak) and
+                not binary(daemon) and not binary(e2e) and not binary(leak_soak)'
+
   # Full cargo-deny pass (advisories, licenses, bans, sources) against
   # deny.toml at the repo root. ci-private runs the same check on every
   # push; the nightly run is what catches a NEW advisory published

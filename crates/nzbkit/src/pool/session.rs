@@ -74,6 +74,7 @@ pub(super) async fn dial_session(
     reconnects: &Arc<AtomicU64>,
     finished: &mut tokio::sync::watch::Receiver<bool>,
     connect_failures: &mut u32,
+    flap_bounces: &mut u32,
     cap_bounces: &mut u32,
     ever_connected: &mut bool,
     am_keeper: bool,
@@ -174,6 +175,7 @@ pub(super) async fn dial_session(
             *ever_connected = true;
             shared.connected[ctx.idx].store(true, Ordering::Relaxed);
             *connect_failures = 0;
+            *flap_bounces = 0;
             *cap_bounces = 0;
             // The capacity episode (if any) is over: free the probe
             // role for a future episode and wake the parked yielders -
@@ -285,6 +287,22 @@ pub(super) async fn dial_session(
                             );
                         }
                     }
+                    // The account is settled, so this is the third way
+                    // an episode ends and it owes the parked fleet the
+                    // same verdict the prober's horizon publishes. Every
+                    // worker still in the dial loop reads `rejected` at
+                    // the top and quits - but a worker that yielded to
+                    // an EARLIER capacity episode is not in that loop at
+                    // all, and wakes only for a newer Reopened, a Dead,
+                    // `finished` or `draining`. On a single-server run
+                    // nothing else can finish the work, so `finished`
+                    // never comes either: the parkers held `workers_live`
+                    // above zero and the run never reached its terminal
+                    // seal (read-only sweep 2, M3). Unconditional, as at
+                    // the two `outage_budget_blown` sites - `first` is
+                    // about who gets to LOG, and a later refusal may be
+                    // the first one any parker could have heard.
+                    shared.auth[ctx.idx].publish_episode(CapEpisode::Dead);
                     DialStep::Quit
                 }
                 crate::nntp::AuthRefusal::Capacity => {
@@ -352,10 +370,12 @@ pub(super) async fn dial_session(
                         // Own counter: via connect_failures a
                         // few bounces + ONE dial error retired
                         // the keeper - the exhaustion promised
-                        // above never to happen on a bounce.
-                        *cap_bounces = cap_bounces.saturating_add(1).min(5);
+                        // above never to happen on a bounce. Its
+                        // own, and not the PROBE ladder's either
+                        // (see the two locals in `worker`).
+                        *flap_bounces = flap_bounces.saturating_add(1).min(5);
                         if !backoff_or_finish(
-                            cfg.connect_backoff * 2u32.pow(*cap_bounces - 1),
+                            cfg.connect_backoff * 2u32.pow(*flap_bounces - 1),
                             finished,
                             shared,
                         )
@@ -473,6 +493,15 @@ pub(super) async fn park_or_probe(
                 (CapEpisode::Dead, _) => return DialStep::Quit,
                 (CapEpisode::Idle | CapEpisode::Probing | CapEpisode::Reopened, _) => {}
             }
+            // `drain()` deliberately does not send `finished`, and the
+            // prober's own drain exits quit WITHOUT publishing an episode
+            // event - so a park that only awaited the watch and `finished`
+            // outlived a graceful pause forever: workers_live never reached
+            // zero and join_fleet never returned. Poll draining on the same
+            // 250 ms slice as run_over/backoff_or_finish.
+            if shared.draining.load(Ordering::Acquire) {
+                return DialStep::Quit;
+            }
             tokio::select! {
                 r = sub.changed() => {
                     if r.is_err() {
@@ -480,6 +509,7 @@ pub(super) async fn park_or_probe(
                     }
                 }
                 _ = finished.wait_for(|f| *f) => return DialStep::Quit,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
             }
         }
     }
@@ -1765,6 +1795,13 @@ pub(super) async fn session_loop(
     // TODO 115: capacity bounces while holding a keeper slot pace their
     // retries on this counter, never on connect_failures - a keeper must
     // not walk toward connect exhaustion on bounces (see the keeper arm).
+    let mut flap_bounces: u32 = 0;
+    // The capacity-PROBE ladder's own step count, which is also how
+    // `park_or_probe` tells the elected prober re-entering from its own
+    // ladder (bounces > 0) from a worker arriving fresh. The keeper's
+    // flap counter above must stay out of it: sharing one counter let a
+    // keeper that had flapped and then exhausted its dial attempts walk
+    // straight past the single-prober election.
     let mut cap_bounces: u32 = 0;
     // Consecutive sessions that connected and then died without doing any
     // useful work, and the delay they have armed for the next connect.
@@ -1893,6 +1930,7 @@ pub(super) async fn session_loop(
                 &reconnects,
                 &mut finished,
                 &mut connect_failures,
+                &mut flap_bounces,
                 &mut cap_bounces,
                 &mut ever_connected,
                 am_keeper,

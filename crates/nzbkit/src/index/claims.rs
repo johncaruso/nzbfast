@@ -779,7 +779,6 @@ impl Index {
             rids = select(0)?;
         }
         let next = rids.last().copied().unwrap_or(0);
-        let _ = self.kv_set(CURSOR, &next.to_string());
         let mut applied = 0usize;
         for rid in rids {
             let Some((name, tier, key, source, _)) = self.name_claims(rid)?.into_iter().next()
@@ -802,6 +801,12 @@ impl Index {
                 applied += 1;
             }
         }
+        // Advance the durable cursor only once every row in the window
+        // was decided: persisting it up front meant a mid-window error
+        // (a SQLITE_BUSY_SNAPSHOT from apply_proven_name) skipped the
+        // remaining rows until the walk lapped the whole population.
+        // On error the cursor stays put and the SAME window retries.
+        let _ = self.kv_set(CURSOR, &next.to_string());
         Ok(applied)
     }
 

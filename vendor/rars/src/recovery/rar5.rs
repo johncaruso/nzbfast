@@ -3498,6 +3498,19 @@ mod tests {
         assert!(source.peak_window.get() <= stripe);
     }
 
+    // 64-bit only, and the reason is the property under test rather than
+    // the test's convenience: `StripeRepairPlan` measures a shard in
+    // `usize`, so on a 32-bit host (armv7) a 20 GiB shard is not a plan
+    // that comes out badly sized - it is a plan that cannot be built.
+    // Both production callers already refuse it there, at
+    // `usize::try_from(shard_len) -> RecoveryError::PlanOverflow`
+    // (rar50.rs `repair_volume_set`, recovery/stream.rs `repair_stream`),
+    // so the 32-bit answer is a clean decline. Written as `20 << 30` in a
+    // 32-bit `usize` the constant is silently ZERO, which is how this
+    // read as an `OddShardSize` failure rather than as "not applicable".
+    // The striping arithmetic itself is pinned for 32-bit by
+    // `rar5_striped_plan_budgets_the_largest_shard_a_32_bit_host_can_hold`.
+    #[cfg(not(target_pointer_width = "32"))]
     #[test]
     fn rar5_striped_plan_budgets_a_multi_gigabyte_volume_without_allocating_it() {
         // A 20 GiB declared volume: planning and budgeting must depend on
@@ -3521,6 +3534,30 @@ mod tests {
         assert!(small.working_bytes(small.stripe_len_for_budget(8 << 20).unwrap()) <= 8 << 20);
 
         // A budget too small to run on is a clean refusal, not a crawl.
+        assert_eq!(
+            plan.stripe_len_for_budget(1024),
+            Err(Error::RepairTooLarge)
+        );
+    }
+
+    /// The 32-bit twin of the test above: the same "the stripe is bounded
+    /// by the budget, not by the shard" property, at the largest shard a
+    /// 32-bit host can actually express. Without this, armv7 would carry
+    /// no coverage of the striping arithmetic at scale at all.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn rar5_striped_plan_budgets_the_largest_shard_a_32_bit_host_can_hold() {
+        const SHARD_LEN: usize = 3 << 30; // 3 GiB, and it fits
+        let damaged = vec![11usize];
+        let rows = vec![0usize];
+        let plan = StripeRepairPlan::new(60, 1, SHARD_LEN, &damaged, &rows).unwrap();
+
+        let stripe = plan.stripe_len_for_budget(64 << 20).unwrap();
+        assert!(plan.working_bytes(stripe) <= 64 << 20);
+        assert!(
+            stripe <= 64 << 20,
+            "the stripe is bounded by the budget, not by the 3 GiB shard"
+        );
         assert_eq!(
             plan.stripe_len_for_budget(1024),
             Err(Error::RepairTooLarge)

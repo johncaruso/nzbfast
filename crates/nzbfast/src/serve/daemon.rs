@@ -754,6 +754,17 @@ pub struct Daemon {
     pub oracle_route: std::sync::atomic::AtomicBool,
     /// The running prefetch sidecar, if any.
     pub sidecar: Mutex<Option<Sidecar>>,
+    /// The cancel flag of every finished prefetch whose DETACHED
+    /// completion tail is still running (`sidecar::completion_tail`).
+    ///
+    /// The slot above is emptied the moment the download task exits, so
+    /// it says nothing about the tail that task spawned - and that tail
+    /// is what unlocks, sweeps, renames and moves inside the directory.
+    /// `sidecar_still_holds` consults both, so a delete waiting for the
+    /// prefetch's writers waits for the last of them (read-only sweep
+    /// 2, M6). Keyed by the flag's ALLOCATION, like every other sidecar
+    /// identity test here: a retry keeps its nzo_id.
+    pub sidecar_tails: Mutex<Vec<Arc<std::sync::atomic::AtomicBool>>>,
     /// nzo_ids whose media chip settled before the identity oracle
     /// answered, so the §76 prober owes them one more on-disk pass
     /// against the canonical name. Pushed by post-processing, drained
@@ -3252,85 +3263,6 @@ impl Daemon {
             p = p.join(nzbkit::disk::sanitize_filename(c));
         }
         p.join(dir_stem)
-    }
-
-    /// Where an equivalent release already lives, if anywhere: `("queue" |
-    /// "history", that job's name)`. This is the M14f identity check,
-    /// lifted out of `enqueue` so the UI can ASK before it adds rather
-    /// than only discovering the hold afterwards - a wall Play that
-    /// silently became a paused duplicate looked, from the outside, like
-    /// a download that simply never started.
-    ///
-    /// PROPERs are never duplicates, and a stem with no derivable key is
-    /// never one either. Same rules the hold itself applies, because it
-    /// is the same code.
-    pub(crate) fn dupe_collision(&self, stem: &str) -> Option<DupeCollision> {
-        if is_proper(stem) {
-            return None;
-        }
-        // dupe_scope = "exact" (#41): only a re-add of the same release
-        // name is a duplicate, compared through `exact_dupe_key` so
-        // separator styles still meet. The smart key stays on the job
-        // either way - held alternatives keep auto-promoting by
-        // identity, this only narrows what collides at add time.
-        let exact = self.dupe_scope.lock_ok().as_str() == "exact";
-        let smart_k = dupe_key(stem);
-        let exact_k = exact_dupe_key(stem);
-        if exact {
-            if exact_k.is_empty() {
-                return None;
-            }
-        } else {
-            smart_k.as_ref()?;
-        }
-        let hit = |g: &Job| {
-            if exact {
-                exact_dupe_key(&g.name) == exact_k
-            } else {
-                g.dupe_key == smart_k
-            }
-        };
-        let queued = self.queue.lock_ok().iter().find_map(|j| {
-            let g = j.lock_ok();
-            hit(&g).then(|| DupeCollision {
-                where_: "queue",
-                name: g.name.clone(),
-                nzo_id: g.nzo_id.clone(),
-            })
-        });
-        if queued.is_some() {
-            return queued;
-        }
-        self.history.lock_ok().iter().find_map(|j| {
-            let g = j.lock_ok();
-            (hit(&g) && g.state == JobState::Completed).then(|| DupeCollision {
-                where_: "history",
-                name: g.name.clone(),
-                nzo_id: g.nzo_id.clone(),
-            })
-        })
-    }
-
-    // `enqueue` lives in daemon_enqueue.rs (TODO 106 size-gate split),
-    // a child module declared at the top of this file.
-
-    /// Truth-audit I: did this job park as a held ALTERNATIVE instead of
-    /// joining the queue to run? Read back rather than returned out of
-    /// `enqueue`, whose signature sixteen call sites share; the job is in
-    /// the queue by the time any caller can ask, and reading it here also
-    /// answers correctly for the paths that add through
-    /// `enqueue_fetched`.
-    ///
-    /// Without this the add reply said "Added to the queue" for a job that
-    /// is paused at Duplicate priority and will not download until the
-    /// original fails - the single most confusing thing the add flow could
-    /// say, because the row then sits there doing nothing with no
-    /// explanation the user asked for.
-    pub(super) fn held_as_duplicate(&self, nzo_id: &str) -> bool {
-        self.queue.lock_ok().iter().any(|j| {
-            let g = j.lock_ok();
-            g.nzo_id == nzo_id && g.paused && g.priority == DUPE_PRIORITY
-        })
     }
 
     /// All-core CPU% (0-100) from the process cpu-time delta since the

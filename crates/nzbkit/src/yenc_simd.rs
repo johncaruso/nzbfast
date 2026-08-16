@@ -217,7 +217,9 @@ pub fn decode_into_integrity(
                     name = String::from_utf8_lossy(v).into_owned();
                 }
                 file_size = field_u64(h, b"size").unwrap_or(0);
-                part = field_u64(h, b"part").map(|n| n as u32);
+                part = field_u64(h, b"part")
+                    .filter(|n| *n <= u64::from(u32::MAX))
+                    .map(|n| n as u32);
                 end = file_size;
                 pos = next;
             } else if line.starts_with(b"=ypart ") {
@@ -239,7 +241,9 @@ pub fn decode_into_integrity(
                 let h = line.get(6..).unwrap_or(&[]);
                 expected_len = field_u64(h, b"size");
                 expected_crc = field_hex(h, b"pcrc32").or_else(|| field_hex(h, b"crc32"));
-                yend_part = field_u64(h, b"part").map(|n| n as u32);
+                yend_part = field_u64(h, b"part")
+                    .filter(|n| *n <= u64::from(u32::MAX))
+                    .map(|n| n as u32);
                 pos = next;
             } else if seen_begin {
                 // First payload line: switch to SIMD block mode from the raw
@@ -302,7 +306,9 @@ pub fn decode_into_integrity(
                         let h = rest.get(4..).unwrap_or(&[]);
                         expected_len = field_u64(h, b"size");
                         expected_crc = field_hex(h, b"pcrc32").or_else(|| field_hex(h, b"crc32"));
-                        yend_part = field_u64(h, b"part").map(|n| n as u32);
+                        yend_part = field_u64(h, b"part")
+                            .filter(|n| *n <= u64::from(u32::MAX))
+                            .map(|n| n as u32);
                     } else if rest.starts_with(b"begin ") {
                         seen_begin = true;
                         let h = &rest[6..];
@@ -310,7 +316,9 @@ pub fn decode_into_integrity(
                             name = String::from_utf8_lossy(v).into_owned();
                         }
                         file_size = field_u64(h, b"size").unwrap_or(0);
-                        part = field_u64(h, b"part").map(|n| n as u32);
+                        part = field_u64(h, b"part")
+                            .filter(|n| *n <= u64::from(u32::MAX))
+                            .map(|n| n as u32);
                         end = file_size;
                     } else if rest.starts_with(b"part ") {
                         let h = &rest[5..];

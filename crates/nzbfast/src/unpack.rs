@@ -329,7 +329,13 @@ pub(crate) fn extract_nested(
         }
     };
 
-    let after = if top == Some(NestOutcome::Produced) {
+    // Snapshot whenever any arm ran and the level did not hard-fail. Since
+    // the ladder became record-and-carry-on, one level can hold real output
+    // from its RAR/7z arms and still combine to ZipGap (Produced.and(ZipGap)
+    // = ZipGap); reusing `before` for that shape made the diff empty, so a
+    // healthy nested archive an earlier arm just produced was never
+    // descended into while the zip gap was forgiven as a sidecar.
+    let after = if matches!(top, Some(NestOutcome::Produced | NestOutcome::ZipGap)) {
         snapshot_recursive(dir)?
     } else {
         before.clone() // nothing extracted at this level: empty diff
@@ -558,14 +564,29 @@ impl ExtractStaging {
     pub(crate) fn new(dir: &std::path::Path) -> Result<ExtractStaging> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let sub = dir.join(format!(".nzbfast-extract-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&sub);
-        std::fs::create_dir_all(&sub)?;
-        Ok(ExtractStaging {
-            dir: sub,
-            keep: false,
-        })
+        std::fs::create_dir_all(dir)?;
+        // `create_dir`, never `remove_dir_all` - the same never-adopt
+        // rule the nest scratch above earned. The name carries a pid and
+        // a per-process counter, and the OS recycles pids: after a
+        // restart, `.nzbfast-extract-<pid>-0` can be a dir a PREVIOUS run
+        // deliberately kept (`keep` = publishing failed, payload left for
+        // the operator), and clearing it destroys the only copy. Take the
+        // next free name instead.
+        for _ in 0..1024 {
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let sub = dir.join(format!(".nzbfast-extract-{}-{n}", std::process::id()));
+            match std::fs::create_dir(&sub) {
+                Ok(()) => {
+                    return Ok(ExtractStaging {
+                        dir: sub,
+                        keep: false,
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        anyhow::bail!("no free extraction staging name in {}", dir.display())
     }
 
     pub(crate) fn path(&self) -> &std::path::Path {
@@ -673,6 +694,12 @@ pub(crate) fn extract_one_level(
     let obf = collect_obfuscated_rar_volumes(dir)?;
     let sevenz = collect_sevenz_archives(dir)?;
     let zips = nzbkit::zip::scan(dir);
+    // The plain-split collector runs here for the same reason as the rest:
+    // whatever it sees now is what the post ARRIVED with, so no arm's
+    // output can be mistaken for a split part. Its arm still runs last -
+    // see step 6, which re-scans and keeps only the sets that survive
+    // unchanged.
+    let arrived_splits = collect_split_sets(dir)?;
     let entries_left =
         |ps: &[PathBuf]| -> Vec<PathBuf> { ps.iter().filter(|p| p.exists()).cloned().collect() };
     let mut out: Option<NestOutcome> = None;
@@ -753,6 +780,47 @@ pub(crate) fn extract_one_level(
             claim(NestOutcome::Produced, &mut out);
         } else {
             claim(NestOutcome::ZipGap, &mut out);
+        }
+    }
+    // 6. Plain split files: an HJSplit-style `.001/.002/…` (or `.1/.2/…`)
+    //    run whose parts carry NO archive header at all. There is no
+    //    container to open - the poster byte-split a raw payload, and the
+    //    extraction IS a concatenation in numeric order. SABnzbd's
+    //    post-processing joiner does this; we used to land the parts loose.
+    //
+    //    LAST RESORT, explicitly - but last-resort in the LADDER, not
+    //    conditional on it. The arm used to run only when `out.is_none()`,
+    //    which made any archive anywhere in the directory suppress it: a
+    //    `subs.zip` beside a byte-split `Movie.mkv` exited 0 with the
+    //    subtitles extracted, both parts still on disk and no `Movie.mkv`
+    //    (read-only sweep 2 M10). The two payloads are unrelated; one
+    //    being packed says nothing about the other.
+    //
+    //    What that guard really bought is the invariant below, and it is
+    //    kept explicitly instead: an arm's OUTPUT must never become this
+    //    collector's INPUT (an extracted RAR can itself produce numeric
+    //    parts). So the set list is the INTERSECTION of the scan taken
+    //    before anything unpacked and a scan taken now - a set qualifies
+    //    only if it is byte-for-byte the same set it was on arrival.
+    //    Anything an arm produced is absent from the first scan; any set
+    //    an arm consumed, extended, resized or whose output name an arm
+    //    has since occupied is absent from (or different in) the second.
+    //
+    //    `collect_split_sets` refuses far more than it accepts - a hole in
+    //    the run, an archive head on any part, a `.par2`/`.vol`/`.rar`/
+    //    `.7z`/`.zip` base, mismatched part sizes - because a refusal
+    //    simply leaves the parts on disk exactly as they arrived, while a
+    //    wrong accept publishes a truncated file and DELETES its parts.
+    if !arrived_splits.is_empty() {
+        let sets: Vec<SplitSet> = collect_split_sets(dir)?
+            .into_iter()
+            .filter(|s| arrived_splits.contains(s))
+            .collect();
+        if !sets.is_empty() {
+            claim(
+                NestOutcome::from_produced(join_split_sets(dir, &sets)),
+                &mut out,
+            );
         }
     }
     if let Some(out) = out {

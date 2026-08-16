@@ -408,13 +408,15 @@ impl Daemon {
     /// recategorize mid-flight).
     pub(super) fn mover_process(self: &Arc<Self>, job: &Arc<Mutex<Job>>) -> bool {
         let (id, out_dir, cat) = {
-            let g = job.lock_ok();
+            let mut g = job.lock_ok();
             if !g.move_pending || g.state != JobState::Completed || g.tombstone {
                 // Nothing owed (a delete or a second enqueue got here
                 // first). Clear the marker if it survived a tombstone,
-                // so a restart does not resurrect the move.
-                drop(g);
-                job.lock_ok().move_pending = false;
+                // so a restart does not resurrect the move. Under the
+                // SAME hold that read it: dropping and re-taking the lock
+                // let a completion in between raise `move_pending`, and
+                // this store then erased an owed move nobody would run.
+                g.move_pending = false;
                 return false;
             }
             if g.finalizing {

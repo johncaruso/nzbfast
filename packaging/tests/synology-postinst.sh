@@ -14,11 +14,28 @@ TEMPLATE="$SELF/../synology/spk/scripts/postinst"
 # in the script is against a literal "@@PORT@@" and silently takes the
 # non-default branch.
 SUBST="$(mktemp -d)"
-trap 'rm -rf "$SUBST"' EXIT
+T="$(mktemp -d)"
+trap 'rm -rf "$SUBST" "$T"' EXIT
 POSTINST="$SUBST/postinst"
 sed 's/@@PORT@@/6789/g' "$TEMPLATE" > "$POSTINST"
 POSTINST_ALT="$SUBST/postinst-alt"
 sed 's/@@PORT@@/6790/g' "$TEMPLATE" > "$POSTINST_ALT"
+
+# Stubs for the two commands postinst runs against the HOST rather than
+# against the fake volume tree below. Each is shadowed only by the cases
+# that want it, by putting its directory first on PATH; neither is on
+# PATH otherwise.
+STUB_CURL="$SUBST/stub-curl"; mkdir -p "$STUB_CURL"
+cat > "$STUB_CURL/curl" <<'EOF'
+#!/bin/sh
+exit "${STUB_CURL_RC:-0}"
+EOF
+STUB_DF="$SUBST/stub-df"; mkdir -p "$STUB_DF"
+cat > "$STUB_DF/df" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod +x "$STUB_CURL/curl" "$STUB_DF/df"
 
 pass=0; fail=0
 check() {
@@ -30,16 +47,23 @@ check() {
     fi
 }
 
+# Every folder-choice case skips the port probe, and every invocation
+# below tolerates a non-zero exit. The probe is the one part of this
+# script that talks to the REAL host - `curl http://127.0.0.1:6789/` -
+# so on any machine running nzbfast (a developer's, mostly) postinst
+# refused before it chose anything: three cases read back an empty path,
+# the fourth exited non-zero under `set -e` and killed the run before it
+# reached the other ten, and the summary line never printed. The probe
+# gets its own cases further down with curl stubbed, so skipping it here
+# costs no coverage.
 run_case() {
     root="$1"
     var="$root/var"
     mkdir -p "$var"
-    SPK_TEST_ROOT="$root" SYNOPKG_PKGVAR="$var" sh "$POSTINST" >/dev/null 2>&1
-    grep '^NZBFAST_OUT=' "$var/nzbfast.env" | cut -d= -f2-
+    SPK_TEST_ROOT="$root" SYNOPKG_PKGVAR="$var" SPK_TEST_SKIP_PORTCHECK=1 \
+        sh "$POSTINST" >/dev/null 2>&1 || true
+    grep '^NZBFAST_OUT=' "$var/nzbfast.env" 2>/dev/null | cut -d= -f2-
 }
-
-T="$(mktemp -d)"
-trap 'rm -rf "$T"' EXIT
 
 # 1. Single volume with a conventional downloads share -> use it, because
 #    only a shared folder is visible in File Station.
@@ -59,7 +83,8 @@ check "media share accepted" "$r/volume1/media/nzbfast/downloads" "$(run_case "$
 r="$T/d"; mkdir -p "$r/volume1/downloads" "$r/var"
 printf 'NZBFAST_PORT=6789\nNZBFAST_OUT=/somewhere/chosen\nNZBFAST_WATCH=/somewhere/w\n' \
     > "$r/var/nzbfast.env"
-SPK_TEST_ROOT="$r" SYNOPKG_PKGVAR="$r/var" sh "$POSTINST" >/dev/null 2>&1
+SPK_TEST_ROOT="$r" SYNOPKG_PKGVAR="$r/var" SPK_TEST_SKIP_PORTCHECK=1 \
+    sh "$POSTINST" >/dev/null 2>&1 || true
 check "upgrade keeps existing paths" "/somewhere/chosen" \
     "$(grep '^NZBFAST_OUT=' "$r/var/nzbfast.env" | cut -d= -f2-)"
 
@@ -82,7 +107,7 @@ arch_case() {
     mkdir -p "$root/volume1/downloads"
     SPK_TEST_ROOT="$root" SPK_TEST_UNAME="$machine" \
         SYNOPKG_PKGVAR="$root/var" SYNOPKG_PKGDEST="$root/target" \
-        sh "$POSTINST" >/dev/null 2>&1
+        SPK_TEST_SKIP_PORTCHECK=1 sh "$POSTINST" >/dev/null 2>&1 || true
 }
 
 r="$T/f"; arch_case "$r" x86_64
@@ -103,7 +128,8 @@ check "aarch64 links the aarch64 binary" "nzbfast-aarch64" \
 r="$T/h"; mkdir -p "$r/var" "$r/target/bin" "$r/volume1/downloads"
 : > "$r/target/bin/nzbfast-x86_64"; : > "$r/target/bin/nzbfast-aarch64"
 if SPK_TEST_ROOT="$r" SPK_TEST_UNAME="armv7l" SYNOPKG_PKGVAR="$r/var" \
-     SYNOPKG_PKGDEST="$r/target" sh "$POSTINST" >/dev/null 2>&1; then
+     SYNOPKG_PKGDEST="$r/target" SPK_TEST_SKIP_PORTCHECK=1 \
+     sh "$POSTINST" >/dev/null 2>&1; then
     fail=$((fail + 1)); echo "  FAIL armv7l install was allowed to succeed" >&2
 else
     pass=$((pass + 1)); echo "  ok   unsupported arch refuses to install"
@@ -115,7 +141,8 @@ r="$T/i"; arch_case "$r" x86_64
 : > "$r/target/bin/nzbfast-aarch64"          # as a fresh payload would
 rm -f "$r/target/bin/nzbfast"
 SPK_TEST_ROOT="$r" SPK_TEST_UNAME="x86_64" SYNOPKG_PKGVAR="$r/var" \
-    SYNOPKG_PKGDEST="$r/target" sh "$POSTINST" >/dev/null 2>&1
+    SYNOPKG_PKGDEST="$r/target" SPK_TEST_SKIP_PORTCHECK=1 \
+    sh "$POSTINST" >/dev/null 2>&1 || true
 check "upgrade relinks the binary" "nzbfast-x86_64" \
     "$(readlink "$r/target/bin/nzbfast")"
 
@@ -130,7 +157,7 @@ check "upgrade relinks the binary" "nzbfast-x86_64" \
 # the lowercase candidate and make the expected path ambiguous.
 r="$T/j"; mkdir -p "$r/volume1/downloads" "$r/var"
 SPK_TEST_ROOT="$r" SYNOPKG_PKGVAR="$r/var" SPK_TEST_SKIP_PORTCHECK=1 \
-    sh "$POSTINST_ALT" >/dev/null 2>&1
+    sh "$POSTINST_ALT" >/dev/null 2>&1 || true
 check "non-default port gets its own parent dir" \
     "$r/volume1/downloads/nzbfast-port6790/downloads" \
     "$(grep '^NZBFAST_OUT=' "$r/var/nzbfast.env" | cut -d= -f2-)"
@@ -144,12 +171,17 @@ r="$T/k"
 mkdir -p "$r/volume1/downloads/nzbfast/downloads" \
          "$r/volume1/downloads/nzbfast/watch" "$r/var"
 echo "existing data" > "$r/volume1/downloads/nzbfast/downloads/keep.txt"
-before=$(stat -f "%Su:%Sg" "$r/volume1/downloads/nzbfast/downloads" 2>/dev/null \
-         || stat -c "%U:%G" "$r/volume1/downloads/nzbfast/downloads")
+# GNU stat and BSD stat spell this differently, and GNU's -f is a
+# different question entirely (it stats the FILESYSTEM), so ask the GNU
+# way first: on macOS -c simply fails and the BSD form answers, whereas
+# the other order gets a filesystem answer out of GNU stat and compares
+# it against itself.
+before=$(stat -c "%U:%G" "$r/volume1/downloads/nzbfast/downloads" 2>/dev/null \
+         || stat -f "%Su:%Sg" "$r/volume1/downloads/nzbfast/downloads")
 SPK_TEST_ROOT="$r" SYNOPKG_PKGVAR="$r/var" SPK_TEST_SKIP_PORTCHECK=1 \
     sh "$POSTINST" >/dev/null 2>&1
-after=$(stat -f "%Su:%Sg" "$r/volume1/downloads/nzbfast/downloads" 2>/dev/null \
-        || stat -c "%U:%G" "$r/volume1/downloads/nzbfast/downloads")
+after=$(stat -c "%U:%G" "$r/volume1/downloads/nzbfast/downloads" 2>/dev/null \
+        || stat -f "%Su:%Sg" "$r/volume1/downloads/nzbfast/downloads")
 check "existing folder keeps its ownership" "$before" "$after"
 if [ -f "$r/volume1/downloads/nzbfast/downloads/keep.txt" ]; then
     pass=$((pass + 1)); echo "  ok   existing contents untouched"
@@ -203,6 +235,48 @@ check "unwritable reused folder falls back to package storage" \
 # accepting one.
 check "probe leaves nothing behind" "" \
     "$(ls -A "$r/volume1/downloads/nzbfast/downloads" 2>/dev/null)"
+
+# --- the port probe, against a stub and never against the host ----------
+#
+# postinst refuses to install over something already serving the port,
+# because the likeliest something is nzbfast in Container Manager, and two
+# instances on one download folder claim the same jobs. Every case above
+# skips that probe, so this is where it is covered - with curl stubbed,
+# so the result does not depend on what the machine running these tests
+# happens to be serving on 6789.
+r="$T/n"; mkdir -p "$r/volume1/downloads" "$r/var"
+if PATH="$STUB_CURL:$PATH" STUB_CURL_RC=0 SPK_TEST_ROOT="$r" \
+     SYNOPKG_PKGVAR="$r/var" sh "$POSTINST" >/dev/null 2>&1; then
+    fail=$((fail + 1)); echo "  FAIL install proceeded over a served port" >&2
+else
+    pass=$((pass + 1)); echo "  ok   a served port refuses the install"
+fi
+check "a refused install writes no env file" "" \
+    "$(cat "$r/var/nzbfast.env" 2>/dev/null)"
+
+# 7 is curl's "could not connect", which is what a free port answers with.
+r="$T/o"; mkdir -p "$r/volume1/downloads" "$r/var"
+PATH="$STUB_CURL:$PATH" STUB_CURL_RC=7 SPK_TEST_ROOT="$r" \
+    SYNOPKG_PKGVAR="$r/var" sh "$POSTINST" >/dev/null 2>&1 || true
+check "a free port installs normally" \
+    "$r/volume1/downloads/nzbfast/downloads" \
+    "$(grep '^NZBFAST_OUT=' "$r/var/nzbfast.env" 2>/dev/null | cut -d= -f2-)"
+
+# --- free space is a tie-break, not a requirement -----------------------
+#
+# The share search used to compare free space before it would take a share
+# at all, so a df that reports nothing left every volume at zero free, no
+# share selected, and the downloads in package storage where File Station
+# cannot show them - the exact outcome the share search exists to avoid.
+# df can report nothing for reasons that have nothing to do with the
+# volume: a mount it cannot stat, or a device name long enough that
+# busybox wraps the row and NR==2 is no longer the numbers.
+r="$T/p"; mkdir -p "$r/volume1/downloads" "$r/var"
+PATH="$STUB_DF:$PATH" SPK_TEST_ROOT="$r" SYNOPKG_PKGVAR="$r/var" \
+    SPK_TEST_SKIP_PORTCHECK=1 sh "$POSTINST" >/dev/null 2>&1 || true
+check "a share still wins when df says nothing" \
+    "$r/volume1/downloads/nzbfast/downloads" \
+    "$(grep '^NZBFAST_OUT=' "$r/var/nzbfast.env" 2>/dev/null | cut -d= -f2-)"
 
 echo
 echo "$pass passed, $fail failed"

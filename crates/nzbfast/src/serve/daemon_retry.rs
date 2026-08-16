@@ -379,6 +379,17 @@ impl Daemon {
             // tombstone would make pick_job skip the row forever.
             j.delete_status.clear();
             j.tombstone = false;
+            // Same reasoning one field further: a retry is an
+            // instruction to RUN the job and KEEP what it produces. The
+            // delete that filed this row set `del_on_drop` on the same
+            // Arc, and for the `finalizing` shape the HANDLER files the
+            // row while the tail is still on its way to park - so the
+            // record can reach here with the flag still set, and the
+            // first park after a successful re-run would delete the
+            // payload it just produced (Codex sweep 14 Aug H1). park
+            // now spends the flag as it reads it; this is the belt to
+            // that brace and the only cover for the row filed by hand.
+            j.del_on_drop = false;
             j.finished_at = None;
             j.finished_unix = None;
             j.retries += 1;

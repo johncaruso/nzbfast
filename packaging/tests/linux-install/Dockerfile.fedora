@@ -1,0 +1,5 @@
+# Fedora with a real systemd as PID 1, for testing the .rpm.
+FROM fedora:41
+RUN dnf -y -q install systemd procps-ng curl && dnf clean all
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

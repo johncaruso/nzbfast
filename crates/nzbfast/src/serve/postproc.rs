@@ -27,6 +27,18 @@
 use super::*;
 use std::sync::atomic::AtomicUsize;
 
+/// Test seam: [`run_tail`] trips it once the download task has resolved
+/// and before the tail's FIRST mutation of the record - the window a
+/// delete-then-retry lands in. Keyed by nzo_id so a lane tail belonging
+/// to some other test can never wander into a two-party barrier that is
+/// not its own. Same two-stage shape as `daemon_park::PARK_GEN_BARRIER`:
+/// first barrier says the window is open, second says the test has
+/// staged its retry and releases it.
+#[cfg(test)]
+pub(in crate::serve) static TAIL_GEN_BARRIER: Mutex<
+    Option<(String, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+> = Mutex::new(None);
+
 /// Everything the old inline tail closure captured, as a named ticket.
 /// The worker builds it between `net_rx` and lane submission, after the
 /// per-job accounting that must read the hub singletons before the next
@@ -46,6 +58,11 @@ pub(super) struct PostprocTicket {
     pub(super) dl_secs: f64,
     pub(super) on_disk_bytes: u64,
     pub(super) index_job_guard: IndexJobGuard,
+    /// M29 oracle samples the runner drained off the hub for this job.
+    /// Ingested here rather than there: the fold takes the index write
+    /// mutex, and the runner must never wait on it.
+    #[cfg(feature = "indexer")]
+    pub(super) oracle_samples: Vec<nzbkit::oracle::Sample>,
 }
 
 /// The bounded lane. Width says how many tails may RUN at once; the
@@ -265,8 +282,35 @@ pub(super) async fn run_tail(d2: Arc<Daemon>, t: PostprocTicket) {
         dl_secs,
         on_disk_bytes,
         index_job_guard,
+        #[cfg(feature = "indexer")]
+        oracle_samples,
     } = t;
     let _index_job_guard = index_job_guard;
+    // M29: fold this job's per-article outcomes into the availability
+    // ledger. On the lane, not on the runner - `with_index` waits on
+    // the index write mutex, and a wait there stops the queue picking
+    // at all (see `settle_job_tail`). Here the wait costs one lane
+    // slot, which the lane's own backpressure already accounts for and
+    // reports as a hold.
+    #[cfg(feature = "indexer")]
+    if !oracle_samples.is_empty() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|t| t.as_secs() as i64)
+            .unwrap_or(0);
+        let d3 = d2.clone();
+        // A blocking SQLite fold does not belong on an async worker,
+        // and this one has a whole tail waiting behind it either way.
+        let _ = tokio::task::spawn_blocking(move || {
+            d3.with_index(|ix| ix.oracle_ingest(&oracle_samples, now).ok())
+        })
+        .await;
+    }
+    // The round of this record's life the lane is working on. Sampled
+    // BEFORE the await, because everything that can take the record away
+    // (a delete verb filing it to history, then a retry re-queueing the
+    // same Arc) happens while this tail runs.
+    let gen0 = Daemon::record_generation(&job2.lock_ok());
     let res = match fetch.await {
         Ok(r) => r,
         Err(e) => Err(anyhow::anyhow!("download task panicked: {e}")),
@@ -300,6 +344,48 @@ pub(super) async fn run_tail(d2: Arc<Daemon>, t: PostprocTicket) {
         && let Err(e) = ex.park_outputs()
     {
         warn!(target: "cleanup", "could not release the output handles: {e}");
+    }
+    // The record may have left this lane's custody while the download
+    // ran, and everything below here writes to it: terminal state,
+    // statistics, timestamps, the finalize marker, the payload
+    // directory, the pp-script and the notification targets.
+    //
+    // The fence used to start at the very last statement - `park_gen` -
+    // so the guard covered the filing and nothing that had already
+    // happened to the record by the time it was reached. One of the
+    // NZBGet delete verbs files a `Finishing` job into history from
+    // under the lane, and a RETRY of that row (retryable by design)
+    // clears the tombstone and re-queues the SAME Arc one generation
+    // on. The old tail then stamped `Completed` plus the old run's
+    // statistics onto the freshly queued record, ran the whole
+    // finalization over the retry's output directory - unlock, rename,
+    // TV filing, the move to the destination folder - and fired the
+    // pp-script and every notification target for it, before park
+    // finally declined to file it (read-only sweep 2, H1).
+    //
+    // Checked here and again inside each write's own lock hold below:
+    // this one is what stops the tail dead, those are what make the
+    // guard and the write one operation.
+    #[cfg(test)]
+    {
+        let seam = TAIL_GEN_BARRIER
+            .lock_ok()
+            .clone()
+            .filter(|(id, _, _)| *id == job2.lock_ok().nzo_id);
+        if let Some((_, open, release)) = seam {
+            open.wait();
+            release.wait();
+        }
+    }
+    if !Daemon::same_generation(&job2.lock_ok(), Some(gen0)) {
+        info!(
+            target: "lane",
+            "{}: the record left this post-processing tail's custody while it ran \
+             (deleted, or deleted and sent round again) - leaving the round that owns it alone",
+            job2.lock_ok().nzo_id
+        );
+        d2.park_gen(job2, Some(gen0));
+        return;
     }
     // M23e: a pause aborted this job - put it back in the
     // queue (not history) so resume continues it from the
@@ -341,103 +427,120 @@ pub(super) async fn run_tail(d2: Arc<Daemon>, t: PostprocTicket) {
     }
     let demoted = {
         let mut j = job2.lock_ok();
-        match &res {
-            Ok(_) => {
-                j.state = JobState::Completed;
-                j.fetched = true;
-            }
-            Err(e) => {
-                j.state = JobState::Failed;
-                j.fail_message = e.to_string();
-                // TODO §77: fold the pre-flight sample into
-                // the failure evidence. "It was already
-                // short when you added it" and "it rotted
-                // out from under the download" call for
-                // different things - a replacement from the
-                // indexer versus a retry - and after the
-                // fact nothing else can tell them apart.
-                //
-                // APPENDED, never prefixed: `fail_kind`, the
-                // *arr health mapping and the diag tests all
-                // key on the opening clause, exactly as the
-                // segment census does in `incomplete_reason`.
-                if let Some(h) = j.health.as_ref()
-                    && crate::serve::fail_kind(&j.fail_message).post_unavailable()
-                    && let Some(clause) = crate::health::failure_clause(h)
-                {
-                    j.fail_message.push_str(&clause);
+        // The check and the first write it guards, under ONE hold. The
+        // disk-full arm above awaits, so the entry check is stale by
+        // the time this runs.
+        if !Daemon::same_generation(&j, Some(gen0)) {
+            None
+        } else {
+            match &res {
+                Ok(_) => {
+                    j.state = JobState::Completed;
+                    j.fetched = true;
                 }
-                // A disk that filled up during the unpack is
-                // the one failure where the fix is entirely
-                // in the user's hands and the cost of the
-                // retry is near zero: the spent-volume sweep
-                // only removes volumes after a SUCCESSFUL
-                // extraction, so the downloaded parts are
-                // still on disk and mode=retry resumes from
-                // the article journal without re-fetching a
-                // byte. Say so, with the amount to free -
-                // the extracted payload is roughly the size
-                // of the set. APPENDED, same rule as the
-                // health clause above.
-                // Not for the mid-download halt: its verdict
-                // already says the fetch resumes from the
-                // journal, and "only the unpack re-runs"
-                // would be flatly wrong for it.
-                if crate::serve::disk_full_failure(&j.fail_message)
-                    && !crate::serve::disk_full_mid_download(&j.fail_message)
-                {
-                    let clause = format!(
-                        "; free about {:.1} GB on that disk and hit Retry - the downloaded archive parts are kept, so nothing is re-downloaded and only the unpack re-runs",
-                        j.total_bytes as f64 / 1e9
-                    );
-                    j.fail_message.push_str(&clause);
+                Err(e) => {
+                    j.state = JobState::Failed;
+                    j.fail_message = e.to_string();
+                    // TODO §77: fold the pre-flight sample into
+                    // the failure evidence. "It was already
+                    // short when you added it" and "it rotted
+                    // out from under the download" call for
+                    // different things - a replacement from the
+                    // indexer versus a retry - and after the
+                    // fact nothing else can tell them apart.
+                    //
+                    // APPENDED, never prefixed: `fail_kind`, the
+                    // *arr health mapping and the diag tests all
+                    // key on the opening clause, exactly as the
+                    // segment census does in `incomplete_reason`.
+                    if let Some(h) = j.health.as_ref()
+                        && crate::serve::fail_kind(&j.fail_message).post_unavailable()
+                        && let Some(clause) = crate::health::failure_clause(h)
+                    {
+                        j.fail_message.push_str(&clause);
+                    }
+                    // A disk that filled up during the unpack is
+                    // the one failure where the fix is entirely
+                    // in the user's hands and the cost of the
+                    // retry is near zero: the spent-volume sweep
+                    // only removes volumes after a SUCCESSFUL
+                    // extraction, so the downloaded parts are
+                    // still on disk and mode=retry resumes from
+                    // the article journal without re-fetching a
+                    // byte. Say so, with the amount to free -
+                    // the extracted payload is roughly the size
+                    // of the set. APPENDED, same rule as the
+                    // health clause above.
+                    // Not for the mid-download halt: its verdict
+                    // already says the fetch resumes from the
+                    // journal, and "only the unpack re-runs"
+                    // would be flatly wrong for it.
+                    if crate::serve::disk_full_failure(&j.fail_message)
+                        && !crate::serve::disk_full_mid_download(&j.fail_message)
+                    {
+                        let clause = format!(
+                            "; free about {:.1} GB on that disk and hit Retry - the downloaded archive parts are kept, so nothing is re-downloaded and only the unpack re-runs",
+                            j.total_bytes as f64 / 1e9
+                        );
+                        j.fail_message.push_str(&clause);
+                    }
+                    // Keep the console block that explains the
+                    // one-liner. Failures are where a user
+                    // needs the log MOST and where it is least
+                    // likely to still be there when they look.
+                    j.fail_detail = crate::fail_detail_snapshot(log_mark);
                 }
-                // Keep the console block that explains the
-                // one-liner. Failures are where a user
-                // needs the log MOST and where it is least
-                // likely to still be there when they look.
-                j.fail_detail = crate::fail_detail_snapshot(log_mark);
             }
+            j.downloaded_bytes = dl_bytes;
+            j.elapsed_secs = dl_secs;
+            // A verdict only where something actually verified.
+            // `live_counts()` is (ok + bad, bad): no verifier at
+            // all (par2-less post) and a verifier that mapped
+            // nothing (the resume case) both check zero blocks,
+            // and neither is evidence the payload is clean. Keep
+            // an earlier run's verdict rather than overwriting it
+            // with "unknown" - a retry that maps nothing in
+            // stream must not erase what the first pass proved.
+            let (checked, bad) = verifier.as_ref().map_or((0, 0), |v| v.live_counts());
+            if checked > 0 {
+                j.bad_blocks = Some(bad);
+                j.verify_blocks = checked;
+            }
+            // Latch the shape for history. Keep whatever a
+            // previous run learned if this one recognized
+            // nothing (a resume maps nothing in-stream, and
+            // reporting "no archive" for a retried RAR5 set
+            // would be a downgrade, not an update).
+            if let Some(tag) = shaper.as_ref().and_then(|e| e.archive_shape()) {
+                j.archive_shape = tag.tag();
+            }
+            // Same latch-don't-downgrade rule, same reason:
+            // a resumed run maps nothing in-stream, and the
+            // headers this key came from are not on disk to
+            // read again.
+            if let Some((_, crc)) = shaper.as_ref().and_then(|e| e.inner_crc()) {
+                j.inner_crc = crc;
+            }
+            j.finished_at = Some(Instant::now());
+            j.finished_unix = Some(unix_now());
+            // A demotion only HAPPENED if the watchdog's abort
+            // actually took the download down. When the flag
+            // loses the race with the finish line the job is a
+            // plain completion: it gets its hooks below, and
+            // park files it to history (clearing the flag)
+            // instead of re-queueing a finished release.
+            Some(res.is_err() && j.demote)
         }
-        j.downloaded_bytes = dl_bytes;
-        j.elapsed_secs = dl_secs;
-        // A verdict only where something actually verified.
-        // `live_counts()` is (ok + bad, bad): no verifier at
-        // all (par2-less post) and a verifier that mapped
-        // nothing (the resume case) both check zero blocks,
-        // and neither is evidence the payload is clean. Keep
-        // an earlier run's verdict rather than overwriting it
-        // with "unknown" - a retry that maps nothing in
-        // stream must not erase what the first pass proved.
-        let (checked, bad) = verifier.as_ref().map_or((0, 0), |v| v.live_counts());
-        if checked > 0 {
-            j.bad_blocks = Some(bad);
-            j.verify_blocks = checked;
-        }
-        // Latch the shape for history. Keep whatever a
-        // previous run learned if this one recognized
-        // nothing (a resume maps nothing in-stream, and
-        // reporting "no archive" for a retried RAR5 set
-        // would be a downgrade, not an update).
-        if let Some(tag) = shaper.as_ref().and_then(|e| e.archive_shape()) {
-            j.archive_shape = tag.tag();
-        }
-        // Same latch-don't-downgrade rule, same reason:
-        // a resumed run maps nothing in-stream, and the
-        // headers this key came from are not on disk to
-        // read again.
-        if let Some((_, crc)) = shaper.as_ref().and_then(|e| e.inner_crc()) {
-            j.inner_crc = crc;
-        }
-        j.finished_at = Some(Instant::now());
-        j.finished_unix = Some(unix_now());
-        // A demotion only HAPPENED if the watchdog's abort
-        // actually took the download down. When the flag
-        // loses the race with the finish line the job is a
-        // plain completion: it gets its hooks below, and
-        // park files it to history (clearing the flag)
-        // instead of re-queueing a finished release.
-        res.is_err() && j.demote
+    };
+    let Some(demoted) = demoted else {
+        info!(
+            target: "lane",
+            "{}: the record was sent round again while this tail was settling - \
+             leaving its verdict, its files and its hooks to the round that owns it",
+            job2.lock_ok().nzo_id
+        );
+        d2.park_gen(job2, Some(gen0));
+        return;
     };
     // Feed the watchdog's reference: every job's average
     // network rate is an observed "the line can do this"
@@ -446,14 +549,17 @@ pub(super) async fn run_tail(d2: Arc<Daemon>, t: PostprocTicket) {
         let avg = (dl_bytes as f64 / dl_secs) as u64;
         d2.best_rate_bps.fetch_max(avg, Ordering::Relaxed);
     }
-    finalize_completed(&d2, &job2).await;
+    finalize_completed_gen(&d2, &job2, Some(gen0)).await;
     // A watchdog demotion is not a completion - no
     // script and no notification; park() requeues it
     // deferred.
     if !demoted {
-        d2.run_post_job_hooks(&job2);
+        d2.run_post_job_hooks_gen(&job2, Some(gen0));
     }
-    d2.park(job2);
+    // With the generation this lane started on: a delete verb can file
+    // this job into history mid-tail, and a retry of that row re-queues
+    // the same Arc. Parking it then would consume the retry.
+    d2.park_gen(job2, Some(gen0));
 }
 
 #[cfg(test)]
@@ -535,5 +641,178 @@ mod tests {
             d.clear_postproc_hold();
             assert!(d.queue_hold.lock_ok().is_none());
         });
+    }
+
+    /// A ticket for a job that is already whole on disk: the download
+    /// task hands back Ok immediately, so the tail is all that runs.
+    fn done_ticket(d: &Arc<Daemon>, job: &Arc<Mutex<Job>>) -> PostprocTicket {
+        PostprocTicket {
+            job: job.clone(),
+            fetch: tokio::spawn(async { Ok(()) }),
+            verifier: None,
+            shaper: None,
+            log_mark: 0,
+            dl_bytes: 1_000,
+            dl_secs: 1.0,
+            on_disk_bytes: 1_000,
+            index_job_guard: d.begin_index_job(),
+            // No articles were fetched, so there is nothing for the
+            // availability ledger to learn.
+            #[cfg(feature = "indexer")]
+            oracle_samples: Vec::new(),
+        }
+    }
+
+    /// The lane tail belongs to ONE round of a record's life, and the
+    /// fence used to start at its very last statement.
+    ///
+    /// `park_gen` carries the generation, so the FILING declined a
+    /// record that had been retried out from under the tail - but
+    /// everything ahead of it did not. A delete verb files a `Finishing`
+    /// job into history, the user retries that row (retryable by
+    /// design), and the same Arc comes back to the queue one generation
+    /// on. The old tail then stamped `Completed` and the old run's
+    /// statistics onto the freshly queued record, ran the whole
+    /// finalization over the retry's output directory, and fired the
+    /// pp-script and every notification target for a release that was at
+    /// that moment waiting to download again (read-only sweep 2, H1).
+    ///
+    /// Driven through `TAIL_GEN_BARRIER` because the window between the
+    /// download resolving and the first write is zero-width without one.
+    /// Both directions in one test on purpose: the seam is a global, and
+    /// a guard that declines everything would pass the stale half alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lane_tail_never_writes_over_a_record_that_was_retried_out_from_under_it() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-lane-tailgen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let d = crate::serve::testutil::test_daemon(&dir);
+
+        // --- the stale direction ---------------------------------------
+        let out = d.out_dir().join("Laned.Release");
+        std::fs::create_dir_all(&out).expect("payload dir");
+        let job = Arc::new(Mutex::new(
+            job_from_json(&json!({
+                "nzo_id": "nzo-tailgen-1",
+                "name": "Laned.Release",
+                "nzb_path": dir.join("laned.nzb").to_string_lossy(),
+                "out_dir": out.to_string_lossy(),
+                "state": "Queued",
+            }))
+            .expect("job"),
+        ));
+        // What the lane submission does before it hands the ticket over.
+        job.lock_ok().state = JobState::Finishing;
+        d.queue.lock_ok().push_back(job.clone());
+
+        let open = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *TAIL_GEN_BARRIER.lock_ok() =
+            Some(("nzo-tailgen-1".to_string(), open.clone(), release.clone()));
+
+        let ticket = done_ticket(&d, &job);
+        let tail = tokio::spawn(run_tail(d.clone(), ticket));
+
+        // The download has resolved and the tail has written nothing
+        // yet. This is the window.
+        let o2 = open.clone();
+        tokio::task::spawn_blocking(move || o2.wait())
+            .await
+            .unwrap();
+        // The delete verb: the Finishing row leaves the queue and is
+        // filed into history, tombstoned.
+        d.queue.lock_ok().retain(|j| !Arc::ptr_eq(j, &job));
+        {
+            let mut g = job.lock_ok();
+            g.state = JobState::Failed;
+            g.tombstone = true;
+            g.delete_status = "MANUAL".into();
+            g.fail_message = "deleted from the queue".into();
+            g.finished_unix = Some(1);
+        }
+        d.history.lock_ok().push(job.clone());
+        // ...and the user presses Retry on it, which is an instruction
+        // to RUN: the tombstone goes and the same Arc is queued again,
+        // one generation on.
+        assert!(
+            d.retry("nzo-tailgen-1"),
+            "the filed delete row is retryable"
+        );
+        let r2 = release.clone();
+        tokio::task::spawn_blocking(move || r2.wait())
+            .await
+            .unwrap();
+        tail.await.expect("lane tail");
+        *TAIL_GEN_BARRIER.lock_ok() = None;
+
+        {
+            let g = job.lock_ok();
+            assert_eq!(
+                g.state,
+                JobState::Queued,
+                "the stale tail stamped its own verdict onto the record the retry queued"
+            );
+            assert!(!g.fetched, "and reported the retry as already downloaded");
+            assert!(
+                !g.finalizing,
+                "and left the retry carrying a finalize marker"
+            );
+        }
+        assert!(
+            d.queue
+                .lock_ok()
+                .iter()
+                .any(|j| j.lock_ok().nzo_id == "nzo-tailgen-1"),
+            "the stale tail pulled the freshly retried row out of the queue"
+        );
+        assert_eq!(
+            d.history
+                .lock_ok()
+                .iter()
+                .filter(|j| j.lock_ok().nzo_id == "nzo-tailgen-1")
+                .count(),
+            0,
+            "and filed it into history, consuming the retry the user pressed"
+        );
+
+        // --- the live direction ----------------------------------------
+        // Same tail, nothing taken away from it: it must still complete
+        // the job and file it. A fence that declines everything would
+        // look green above and break every download.
+        let out2 = d.out_dir().join("Ordinary.Release");
+        std::fs::create_dir_all(&out2).expect("payload dir");
+        let job2 = Arc::new(Mutex::new(
+            job_from_json(&json!({
+                "nzo_id": "nzo-tailgen-2",
+                "name": "Ordinary.Release",
+                "nzb_path": dir.join("ordinary.nzb").to_string_lossy(),
+                "out_dir": out2.to_string_lossy(),
+                "state": "Queued",
+            }))
+            .expect("job"),
+        ));
+        job2.lock_ok().state = JobState::Finishing;
+        d.queue.lock_ok().push_back(job2.clone());
+        run_tail(d.clone(), done_ticket(&d, &job2)).await;
+        {
+            let g = job2.lock_ok();
+            assert_eq!(
+                g.state,
+                JobState::Completed,
+                "an untouched job still completes"
+            );
+            assert!(g.fetched);
+        }
+        assert_eq!(
+            d.history
+                .lock_ok()
+                .iter()
+                .filter(|j| j.lock_ok().nzo_id == "nzo-tailgen-2")
+                .count(),
+            1,
+            "and the tail still files it into history"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

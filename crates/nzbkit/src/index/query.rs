@@ -302,6 +302,29 @@ impl Index {
             .optional()
     }
 
+    /// The TVmaze show id the enricher recorded for a TV title key, or
+    /// None when the key is unknown, not a TV row, or not yet enriched.
+    ///
+    /// This is the duplicate check's alias oracle: a show posted under
+    /// two spellings ("Show" vs "Show The Full Subtitle") parses into
+    /// two title keys, and the ONLY safe statement that they are one
+    /// show is that a provider resolved both to the same id. Filtered
+    /// to `kind='tv'` for the reason `title_key_for_tmdb` documents:
+    /// this column holds a TMDB movie id on movie rows, an unrelated
+    /// numbering scheme that would collide.
+    pub fn tv_show_id(&self, key: &str) -> rusqlite::Result<Option<i64>> {
+        if key.is_empty() {
+            return Ok(None);
+        }
+        self.db
+            .query_row(
+                "SELECT tmdb_id FROM titles WHERE key=?1 AND kind='tv' AND tmdb_id > 0",
+                rusqlite::params![key],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
     /// The one year the index knows a movie title by - or None when it
     /// knows none, or more than one. The renamer asks this for a
     /// yearless post, and the ambiguity rule is the whole safety story:
@@ -379,6 +402,36 @@ mod tests {
             ix.title_key_for_tmdb(603).unwrap().as_deref(),
             Some("m:another film")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `tv_show_id` is the duplicate check's alias oracle, so what it
+    /// refuses matters as much as what it answers: no row, an
+    /// unenriched row (tmdb_id=0), and a movie row that happens to hold
+    /// the same number all read as "unknown".
+    #[test]
+    fn a_tv_show_id_answers_only_enriched_tv_rows() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-tvid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ix = Index::open(&dir.join("index.db")).unwrap();
+        let put = |key: &str, kind: &str, id: i64| {
+            ix.db
+                .execute(
+                    "INSERT INTO titles(key, kind, title, year, tmdb_id)
+                     VALUES(?1, ?2, ?3, 0, ?4)",
+                    rusqlite::params![key, kind, "x", id],
+                )
+                .unwrap();
+        };
+        put("t:a series", "tv", 1399);
+        put("t:unresolved", "tv", 0);
+        put("m:a film", "movie", 77);
+        assert_eq!(ix.tv_show_id("t:a series").unwrap(), Some(1399));
+        assert_eq!(ix.tv_show_id("t:unresolved").unwrap(), None);
+        assert_eq!(ix.tv_show_id("t:absent").unwrap(), None);
+        assert_eq!(ix.tv_show_id("m:a film").unwrap(), None);
+        assert_eq!(ix.tv_show_id("").unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

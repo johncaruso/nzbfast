@@ -32,6 +32,11 @@ fn limit_of(params: &std::collections::HashMap<String, String>) -> usize {
     params
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
+        // `limit=0` is the default, not an empty page: every other list
+        // in the daemon reads 0 as "no window" (SAB's own history call
+        // does), and answering a phone poll with zero rows because it
+        // borrowed that idiom is the one reading nobody wants.
+        .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_LIMIT)
         .min(MAX_LIMIT)
 }
@@ -239,5 +244,7 @@ mod tests {
         assert_eq!(limit_of(&p("9999")), MAX_LIMIT);
         // Nonsense is the default, not an error: this is a poll.
         assert_eq!(limit_of(&p("all")), DEFAULT_LIMIT);
+        // ...and so is a borrowed "0 means everything".
+        assert_eq!(limit_of(&p("0")), DEFAULT_LIMIT);
     }
 }

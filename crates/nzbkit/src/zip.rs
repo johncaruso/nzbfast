@@ -224,6 +224,15 @@ pub fn numeric_split_part_name(name: &str) -> Option<(String, u32)> {
     {
         return None;
     }
+    // Rule 2 reaches through the numeric suffix. `comic.cbz.001` is a
+    // byte-split of the COMIC: the deliverable's own name is still there,
+    // one extension along, and part 1 sniffing `PK\x03\x04` is what a
+    // `.cbz` looks like rather than evidence of packaging. Chasing it
+    // unpacked the comic and never wrote it (read-only sweep 2 M11); the
+    // disk path's plain-split joiner owns this shape.
+    if is_final_name(&lower_head) {
+        return None;
+    }
     let idx: u32 = tail.parse().ok()?;
     (idx >= 1).then_some((lower_head, idx))
 }
@@ -295,6 +304,17 @@ pub fn scan(dir: &Path) -> Vec<Finding> {
                 .unwrap_or(lower);
             named.insert(stem, path);
         } else if let Some((stem, n)) = numeric_part(&lower) {
+            // A `.001` whose STEM is a final payload name (`comic.cbz`,
+            // `book.epub`, an office document) is a byte-split of that
+            // payload. Grouping it here sniffed the zip magic in part 1
+            // and unpacked the comic instead of rebuilding it, while the
+            // plain-split joiner refused the same set for carrying
+            // archive magic - so the file simply never appeared
+            // (read-only sweep 2 M11). Rule 2 above is a NAME rule, and
+            // the name survives the numeric suffix.
+            if is_final_name(&stem) {
+                continue;
+            }
             numeric.entry(stem).or_default().insert(n, path);
         } else if path.extension().is_none() && has_magic(&path) {
             obfuscated.push(path);

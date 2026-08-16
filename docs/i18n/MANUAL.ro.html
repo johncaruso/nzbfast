@@ -1092,10 +1092,10 @@ indexului (<a href="#wall">§6</a>): „?” chihlimbariu pentru incert la provi
 roșu pentru dispărut cu certitudine. Fără marcaj înseamnă că arată bine.</li>
 <li>O insignă <b>curățat</b> pe grupurile unde postările proaspete sunt deja retrase,
 ca să deosebești un grup pe moarte de un release ghinionist.</li>
-<li><b>Sari peste providerii pe care oracolul i-a scos din calcul</b> (Setări,
-<b>dezactivat implicit, experimental</b>): când verificarea e sigură că backbone-ul unui
-provider a pierdut un release, acesta e sărit direct pentru descărcarea respectivă, în
-loc să se aștepte eșecul. Nu va sări niciodată peste ultimul tău provider rămas.</li>
+<li><b>Providerii scoși din calcul de oracol sunt întrebați ultimii</b> (Setări,
+<b>dezactivat implicit, experimental</b>): când verificarea e sigură că backbone-ul unui provider a pierdut un release, acel
+provider e întrebat ultimul pentru descărcarea respectivă, nu primul. Nimic nu e șters,
+așa că o apreciere greșită costă puțin timp în loc de descărcare.</li>
 </ul>
 <p class="dim">Verdictul este o predicție pornind de la indicii, nu o garanție. Pentru
 un răspuns ferm despre un NZB, <code>nzbfast check</code> (<a href="#cli">§15</a>)
@@ -1206,6 +1206,11 @@ containerul și recreează-l cu aceleași setări de volume - ghidul Synology
 acoperă totul clic cu clic, inclusiv cum să faci asta programat.</td></tr>
 <tr><td>Synology (pachet)</td><td>Instalează noul <code>.spk</code> în Package
 Center; se actualizează pe loc.</td></tr>
+<tr><td>QNAP (pachet, beta)</td><td>Instalează noul <code>.qpkg</code> în App
+Center; se actualizează pe loc. Setările și descărcările tale stau în afara
+folderului aplicației, așa că nici o actualizare, nici o dezinstalare nu le ia cu
+ele.</td></tr>
+<tr><td>Debian / Ubuntu (.deb)<br>Fedora / RHEL (.rpm)</td><td>Instalați noul pachet peste cel vechi: <code>sudo dpkg -i nzbfast_*.deb</code> sau <code>sudo rpm -U nzbfast-*.rpm</code>. Folderul cu setări nu face parte din pachet, așa că o actualizare nu poate înlocui nimic din el, iar modificările dumneavoastră din <code>/etc/nzbfast/nzbfast.env</code> se păstrează. Serviciul este repornit doar dacă rula deja.</td></tr>
 <tr><td>Homebrew</td><td><code>brew upgrade nzbfast</code></td></tr>
 <tr><td>Binar simplu</td><td>Înlocuiește binarul. Configul tău rămâne oriunde
 l-ai făcut (<a href="#files">§17</a>).</td></tr>
@@ -1268,6 +1273,11 @@ nzbfast. Acest singur folder conține tot ce merită salvat într-un backup:</p>
 containerului, adică folderul de pe gazdă pe care l-ai mapat la el. Pe Unraid,
 acesta este folderul appdata al aplicației.</td></tr>
 <tr><td>Pachetul Synology</td><td><code>/var/packages/nzbfast/var/</code></td></tr>
+<tr><td>Pachetul QNAP</td><td>De obicei
+<code>/share/Download/nzbfast/config/</code>. Folderul este ales la instalare și
+apare în jurnalul App Center; fișierul <code>nzbfast.env</code> al aplicației îl
+notează și el.</td></tr>
+<tr><td>Pachet Debian / RPM</td><td><code>/var/lib/nzbfast/</code></td></tr>
 <tr><td>Terminal</td><td>Folderul în care ai rulat <code>nzbfast setup</code>,
 sau oriunde arată <code>--config</code> / <code>$NZBFAST_CONFIG</code>.</td></tr>
 </table></div>

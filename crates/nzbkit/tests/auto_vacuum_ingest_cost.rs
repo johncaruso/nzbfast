@@ -92,7 +92,12 @@ fn run_arm(path: &Path, incremental: bool, releases: usize, parts: usize) -> Arm
     let bytes = ix.db_bytes().unwrap();
     // The other half of the bill: freeing pages also touches ptrmap.
     let t = Instant::now();
-    ix.prune_age(200 * 86_400, now).unwrap();
+    ix.prune_age(
+        200 * 86_400,
+        now,
+        std::time::Instant::now() + std::time::Duration::from_secs(3_600),
+    )
+    .unwrap();
     let delete_secs = t.elapsed().as_secs_f64();
     Arm {
         ingest_secs,

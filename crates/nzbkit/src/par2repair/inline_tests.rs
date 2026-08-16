@@ -152,23 +152,33 @@ fn demo_slices(n: usize, block_size: usize) -> Vec<Vec<u8>> {
 #[test]
 fn ntt_gates_route_field_shapes_correctly() {
     let gib = 1usize << 30;
+    // The gate's budget operand, sized so the shapes below are decided
+    // by the gate and not by the operand: 4 GiB is not representable in
+    // a 32-bit `usize`, and the largest corpus asserted here is
+    // 16381 x 64 KiB (~1 GiB), so usize::MAX serves the same purpose on
+    // armv7. `ntt_default_budget`'s own 32-bit ceiling is pinned
+    // separately in `ntt_budget_ceiling_survives_a_32_bit_usize`.
+    #[cfg(target_pointer_width = "32")]
+    let budget = usize::MAX;
+    #[cfg(not(target_pointer_width = "32"))]
+    let budget = 4 * gib;
     // Heavy leg: 16384 x 64 KiB, 1500 missing -> NTT.
-    assert!(ntt_gates_pass(65536, 14884, 1500, 1499, 4 * gib));
+    assert!(ntt_gates_pass(65536, 14884, 1500, 1499, budget));
     // Light/medium damage: fold.
-    assert!(!ntt_gates_pass(65536, 16381, 3, 2, 4 * gib));
-    assert!(!ntt_gates_pass(65536, 16283, 101, 100, 4 * gib));
+    assert!(!ntt_gates_pass(65536, 16381, 3, 2, budget));
+    assert!(!ntt_gates_pass(65536, 16283, 101, 100, budget));
     // Below the measured crossover margin: fold. 300 sits under the
     // m~288 end-to-end crossover measured on both the 32-core and the
     // 20-core box; 384 (the gate) sits above it.
-    assert!(!ntt_gates_pass(65536, 16084, 300, 299, 4 * gib));
-    assert!(ntt_gates_pass(65536, 16000, 384, 383, 4 * gib));
+    assert!(!ntt_gates_pass(65536, 16084, 300, 299, budget));
+    assert!(ntt_gates_pass(65536, 16000, 384, 383, budget));
     // Small source set (640 KiB / 1 MiB blocks at ~1 GiB): fold,
     // regardless of damage fraction.
-    assert!(!ntt_gates_pass(655360, 870, 768, 767, 4 * gib));
+    assert!(!ntt_gates_pass(655360, 870, 768, 767, budget));
     // Pathological exponent gap (max exponent >= 3m): fold.
-    assert!(!ntt_gates_pass(65536, 14884, 1500, 4500, 4 * gib));
+    assert!(!ntt_gates_pass(65536, 14884, 1500, 4500, budget));
     // Realistic gaps stay eligible (alt = 2m - 2).
-    assert!(ntt_gates_pass(65536, 14884, 1500, 2998, 4 * gib));
+    assert!(ntt_gates_pass(65536, 14884, 1500, 2998, budget));
     // Corpus over the memory budget: fold (amendment 2).
     assert!(!ntt_gates_pass(65536, 14884, 1500, 1499, gib / 2));
 }
@@ -681,17 +691,37 @@ fn payload_bytes(len: usize, seed: u64) -> Vec<u8> {
 #[test]
 fn ntt_default_budget_scales_to_the_machine() {
     let gib = 1u64 << 30;
-    assert_eq!(ntt_default_budget(None, None), (4 * gib) as usize);
-    assert_eq!(ntt_default_budget(Some(64 * gib), None), (4 * gib) as usize);
-    assert_eq!(ntt_default_budget(Some(8 * gib), None), (2 * gib) as usize);
+    // The flat ceiling is 4 GiB, which a 32-bit `usize` cannot hold, so
+    // there it lands on the address-space ceiling instead. Naming the
+    // expectation per width keeps BOTH facts pinned; writing
+    // `(4 * gib) as usize` here is what let the production wrap-to-zero
+    // through in the first place (the cast agreed with itself).
+    #[cfg(target_pointer_width = "32")]
+    let ceil = 1usize << 30;
+    #[cfg(not(target_pointer_width = "32"))]
+    let ceil = (4 * gib) as usize;
+    assert_eq!(ntt_default_budget(None, None), ceil);
+    assert_eq!(ntt_default_budget(Some(64 * gib), None), ceil);
+    assert_eq!(
+        ntt_default_budget(Some(8 * gib), None),
+        ((2 * gib) as usize).min(ceil)
+    );
     assert_eq!(ntt_default_budget(Some(4 * gib), None), gib as usize);
     assert_eq!(
         ntt_default_budget(Some(64 * gib), Some(2 * gib)),
         (gib / 2) as usize,
         "cgroup limit caps regardless of host RAM"
     );
+    // A budget is never zero and never wraps, whatever the probes say.
+    // The 4 GiB ceiling is exactly 2^32: `b as usize` used to hand a
+    // 32-bit host a budget of 0, which fails the gate for every corpus
+    // and made the NTT path unreachable on armv7 without one line of
+    // code saying so.
+    assert!(ntt_default_budget(None, None) >= gib as usize);
     // The heavy benchmark corpus (~0.93 GiB) still clears the gate
-    // on a 16 GiB machine (budget 4 GiB) but not on a 2 GiB one.
+    // on a 16 GiB machine (budget 4 GiB, or the 1 GiB address-space
+    // ceiling on 32-bit - the corpus fits either) but not on a 2 GiB
+    // one.
     assert!(ntt_gates_pass(
         65536,
         14884,

@@ -1,0 +1,152 @@
+#!/bin/sh
+#
+# nzbfast daemon - FreeBSD rc.d script. The counterpart to
+# packaging/systemd/nzbfast.service on Linux, in FreeBSD's own idiom.
+#
+# BETA. Nothing here has run on a real FreeBSD box yet - see
+# packaging/freebsd/README.md, which is also where the tester checklist
+# lives.
+#
+# Install:
+#   # the binary
+#   install -m 755 nzbfast /usr/local/bin/nzbfast
+#   # a service account that owns nothing else
+#   pw groupadd nzbfast
+#   pw useradd nzbfast -g nzbfast -d /var/db/nzbfast -s /usr/sbin/nologin \
+#      -c "nzbfast daemon"
+#   mkdir -p /usr/local/etc/nzbfast /var/db/nzbfast/downloads \
+#            /var/db/nzbfast/watch
+#   # config.json holds your provider username and password: install it
+#   # 0600 from the start rather than cp'ing an 0644 example into a
+#   # directory every local account can search.
+#   install -m 600 -o nzbfast -g nzbfast config.example.json \
+#           /usr/local/etc/nzbfast/config.json     # then edit it
+#   chown -R nzbfast:nzbfast /usr/local/etc/nzbfast /var/db/nzbfast
+#   chmod 750 /usr/local/etc/nzbfast
+#   # the service
+#   install -m 755 rc.d/nzbfast /usr/local/etc/rc.d/nzbfast
+#   sysrc nzbfast_enable=YES
+#   service nzbfast start
+#
+# Configuration (in /etc/rc.conf, via sysrc):
+#   nzbfast_enable      YES to run at boot                    (default NO)
+#   nzbfast_user        account to run as                (default nzbfast)
+#   nzbfast_bin         path to the binary  (default /usr/local/bin/nzbfast)
+#   nzbfast_config      config.json    (default /usr/local/etc/nzbfast/...)
+#   nzbfast_datadir     spool + index db      (default /var/db/nzbfast)
+#   nzbfast_out         completed downloads   (default $datadir/downloads)
+#   nzbfast_watch       .nzb drop folder          (default $datadir/watch)
+#   nzbfast_port        dashboard/API port              (default 6789)
+#   nzbfast_bind        listen address             (default 127.0.0.1)
+#   nzbfast_logfile     daemon output       (default /var/log/nzbfast.log)
+#   nzbfast_flags       extra `nzbfast serve` arguments
+#
+# ZFS note: nzbfast_out is the one to move. Point it at its own dataset
+# (`zfs create tank/media`) and give nzbfast_user write access there;
+# nothing else in this file needs to change.
+#
+# PROVIDE: nzbfast
+# REQUIRE: LOGIN NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="nzbfast"
+rcvar="nzbfast_enable"
+
+load_rc_config $name
+
+: ${nzbfast_enable:="NO"}
+: ${nzbfast_user:="nzbfast"}
+: ${nzbfast_group:="nzbfast"}
+: ${nzbfast_bin:="/usr/local/bin/nzbfast"}
+: ${nzbfast_config:="/usr/local/etc/nzbfast/config.json"}
+: ${nzbfast_datadir:="/var/db/nzbfast"}
+: ${nzbfast_out:="${nzbfast_datadir}/downloads"}
+: ${nzbfast_watch:="${nzbfast_datadir}/watch"}
+# 127.0.0.1 by default, NOT 0.0.0.0. The dashboard is the whole control
+# surface - queue, settings, provider credentials - so a box that starts
+# the service before an API key exists must not be reachable from the
+# LAN while that window is open. Widen it deliberately once you have
+# logged in and set a key: `sysrc nzbfast_bind=0.0.0.0`.
+: ${nzbfast_bind:="127.0.0.1"}
+: ${nzbfast_port:="6789"}
+: ${nzbfast_logfile:="/var/log/${name}.log"}
+: ${nzbfast_flags:=""}
+
+# Its own directory under /var/run, not /var/run/nzbfast.pid directly:
+# rc.subr drops to nzbfast_user before running the command, so daemon(8)
+# writes this file as that user, and /var/run itself is root-owned and
+# not group-writable. The precmd below creates and chowns the directory
+# (/var/run is cleared at boot, so it has to happen on every start).
+pidfile="/var/run/${name}/${name}.pid"
+# What rc.subr expects to find at the pid in pidfile. Without it, `service
+# nzbfast status` reports the service down while it is up, because the pid
+# belongs to the binary and not to daemon(8) itself.
+procname="${nzbfast_bin}"
+
+# daemon(8) does the backgrounding, the pidfile and the output
+# redirection - nzbfast serve stays in the foreground and logs to stdout
+# by design, the same shape the systemd unit relies on.
+command="/usr/sbin/daemon"
+command_args="-f -t ${name} -p ${pidfile} -o ${nzbfast_logfile} \
+    ${nzbfast_bin} serve \
+    --config ${nzbfast_config} \
+    --bind ${nzbfast_bind} \
+    --port ${nzbfast_port} \
+    --out ${nzbfast_out} \
+    --watch ${nzbfast_watch} \
+    --index-db ${nzbfast_datadir}/index.db \
+    ${nzbfast_flags}"
+
+start_precmd="${name}_precmd"
+
+nzbfast_precmd()
+{
+	# The spool holds the API key, provider credentials and job state,
+	# so anything the daemon creates stays owner-only rather than
+	# inheriting the caller's 022. Same reasoning as UMask=0077 in the
+	# systemd unit.
+	umask 077
+
+	if [ ! -x "${nzbfast_bin}" ]; then
+		err 1 "${nzbfast_bin} is not there or not executable"
+	fi
+
+	# The daemon writes its index db and spool RELATIVE to nothing -
+	# every path is passed explicitly above - but it still needs the
+	# directories to exist and to be writable by nzbfast_user.
+	for d in "${nzbfast_datadir}" "${nzbfast_out}" "${nzbfast_watch}"; do
+		if [ ! -d "${d}" ]; then
+			mkdir -p "${d}" || err 1 "cannot create ${d}"
+			chown "${nzbfast_user}:${nzbfast_group}" "${d}" ||
+			    err 1 "cannot chown ${d}"
+		fi
+	done
+
+	# Same for the run directory that holds the pidfile.
+	if [ ! -d "/var/run/${name}" ]; then
+		install -d -o "${nzbfast_user}" -g "${nzbfast_group}" -m 755 \
+		    "/var/run/${name}" || err 1 "cannot create /var/run/${name}"
+	fi
+
+	# Create the log with the right owner BEFORE daemon(8) opens it:
+	# daemon runs as nzbfast_user (rc.subr's ${name}_user drops
+	# privilege with su before the command runs), and a missing
+	# /var/log/nzbfast.log in a root-owned directory would leave the
+	# service failing to start with nothing written down.
+	if [ ! -e "${nzbfast_logfile}" ]; then
+		install -o "${nzbfast_user}" -g "${nzbfast_group}" -m 640 \
+		    /dev/null "${nzbfast_logfile}" ||
+		    err 1 "cannot create ${nzbfast_logfile}"
+	fi
+
+	if [ ! -f "${nzbfast_config}" ]; then
+		warn "${nzbfast_config} does not exist - the daemon will start" \
+		    "with no providers configured. Add them in the dashboard" \
+		    "on port ${nzbfast_port}, or copy config.example.json into" \
+		    "place (mode 600, owner ${nzbfast_user})."
+	fi
+}
+
+run_rc_command "$1"

@@ -1638,8 +1638,8 @@ fn set_delete_to_trash(
         // Deletes of the downloads themselves go to the Trash so a
         // wrong click is recoverable. On by default on macOS and
         // Windows, where the Trash is a place the user can see and
-        // empty; off by default on Linux, where it is not - see
-        // `trash_suits_this_platform`. Off means a permanent delete.
+        // empty; off by default on Linux and FreeBSD, where it is not -
+        // see `trash_suits_this_platform`. Off means a permanent delete.
         // Garbage cleanup follows this too unless `cleanup_delete_mode`
         // says otherwise.
         let on = flag();

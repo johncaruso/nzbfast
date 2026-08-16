@@ -1,6 +1,15 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # Write the OFFLINE copy of a manual: the shipped HTML with the shared
 # design tokens inlined.
+#
+# bash, not zsh, and that matters: this is the one script in packaging/
+# that CI runs ON WINDOWS. Both the sign-windows installer job and the
+# release workflow's Windows ARM64 job stage the manual with it, and a
+# windows-latest runner has Git bash and no zsh at all - a `#!/bin/zsh`
+# here is `bad interpreter: No such file or directory`, exit 126, which
+# is exactly how it failed the first time either job was run. Nothing
+# below is zsh-specific; `set -o pipefail` is the only reason it is not
+# plain `#!/bin/sh`.
 #
 #   packaging/make-offline-manual.sh <src.html> <dest.html>
 #

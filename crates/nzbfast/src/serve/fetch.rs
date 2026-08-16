@@ -691,8 +691,54 @@ pub(super) fn fetch_head(
     url: &str,
     origin: Option<&SourceOrigin>,
 ) -> Result<(ureq::Response, String, String)> {
+    // Deliberately case-SENSITIVE, unlike every other scheme test in this
+    // file. `HTTPS://host/...` passes `failure_link_allowed` and
+    // `supplied_link_scheme_ok` (both `eq_ignore_ascii_case`) and dies
+    // here instead, which is the safe direction: accepting it would reach
+    // the `https:` flag below, which asks `starts_with("https://")` and
+    // would therefore record such a job as a PLAIN-HTTP origin - and a
+    // plain-http origin is what lets a plain-http failure link through
+    // the downgrade guard. Loosen this and that flag must be loosened in
+    // the same change. The message names the whole url, so every caller
+    // that logs or returns it runs it through `redact_url_creds`, which
+    // is scheme-agnostic for exactly this reason - but a string this
+    // guard REJECTS need not be a well-formed url at all, and the
+    // redactor finds one by its `://`. A single-slash `https:/host/x?
+    // apikey=...` has no such marker and used to travel whole into the
+    // API answer and the log. So name at most scheme and authority,
+    // which is all the redactor would have left of a good url anyway,
+    // and keep it as the belt rather than the only guard (Fable sweep
+    // 15 Aug).
     if !(url.starts_with("http://") || url.starts_with("https://")) {
-        anyhow::bail!("addurl: unsupported url {url}");
+        // Scheme and HOST, never the userinfo, path or query. On a
+        // well-formed url that is exactly what the redactor would have
+        // left, so the host still names the problem; on a malformed one
+        // with no `://` for the redactor to find, this cut is the only
+        // thing that keeps the credential out.
+        //
+        // The userinfo half of that has to be done here too, and was
+        // not: `https:user:pw@idx.example/feed` has no `://`, so the
+        // authority started at 0, the cut landed at the first slash,
+        // and `https:user:pw@idx.example` went whole into the bail -
+        // then through `redact_url_creds`, which finds a url by its
+        // `://` and so had nothing to strip. Feed health stores that
+        // string in the settings row and the log ring (sweep 2 L3).
+        let after_scheme = url.find("://").map(|i| i + 3).unwrap_or(0);
+        let cut = url[after_scheme..]
+            .find(['/', '?', '#'])
+            .map(|i| after_scheme + i)
+            .unwrap_or(url.len());
+        // Where the authority begins. With no `://` to anchor it, the
+        // scheme is whatever precedes the first `:` and everything from
+        // there to the last `@` is userinfo - the same shape the
+        // redactor drops on a url it can parse.
+        let authority = if after_scheme > 0 {
+            after_scheme
+        } else {
+            url[..cut].find(':').map(|i| i + 1).unwrap_or(0)
+        };
+        let host = url[authority..cut].rsplit('@').next().unwrap_or("");
+        anyhow::bail!("addurl: unsupported url {}{}", &url[..authority], host);
     }
     // Release assets redirect to a CDN host; follow the whole chain, but
     // every hop is SSRF-filtered so a public URL can't 302 into 127.0.0.1

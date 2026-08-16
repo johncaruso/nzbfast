@@ -41,6 +41,9 @@ mod busy;
 mod daemon;
 use daemon::*;
 
+// serve/dupe.rs: inherent methods on `Daemon`, so no glob is needed.
+mod dupe;
+
 mod giveup;
 mod histstore;
 mod moveseq;

@@ -428,7 +428,7 @@ enum Hit {
     Synonym,
 }
 
-fn match_group(g: &CatGroup, terms: &[String], syns: &[String]) -> Option<Hit> {
+fn match_group(g: &CatGroup, terms: &[String]) -> Option<Hit> {
     let lname = g.name.to_ascii_lowercase();
     // A query carrying wildcards IS the pattern - match the whole name
     // against it and skip the word logic entirely (an implicit `*x*` is
@@ -456,10 +456,20 @@ fn match_group(g: &CatGroup, terms: &[String], syns: &[String]) -> Option<Hit> {
         } else if !g.desc.is_empty() && g.desc.to_ascii_lowercase().contains(t.as_str()) {
             Hit::Description
         } else {
-            // Literal miss: a synonym of THIS term may still hit.
-            if syns.iter().any(|s| {
-                lname.split(['.', '-']).any(|seg| seg == s)
-                    || (!g.desc.is_empty() && g.desc.to_ascii_lowercase().contains(s.as_str()))
+            // Literal miss: a synonym of THIS term may still hit. This
+            // term's own synonyms only - the old parameter was the union
+            // over every term, and consulting the union let one term's synonym
+            // satisfy a DIFFERENT term, so every multi-term query
+            // degenerated toward OR whenever any term had a synonym list
+            // ("auto tv" matched motorsports groups with no tv hit).
+            let own: Vec<&str> = SYNONYMS
+                .iter()
+                .filter(|(k, _)| *k == t.as_str())
+                .flat_map(|(_, v)| v.iter().copied())
+                .collect();
+            if own.iter().any(|s| {
+                lname.split(['.', '-']).any(|seg| seg == *s)
+                    || (!g.desc.is_empty() && g.desc.to_ascii_lowercase().contains(s))
             }) {
                 Hit::Synonym
             } else {
@@ -593,15 +603,14 @@ impl Catalog {
                 .map(str::to_string)
                 .filter(|t| !t.is_empty())
                 .collect();
-        let syns: Vec<String> = terms
-            .iter()
-            .flat_map(|t| {
-                SYNONYMS
-                    .iter()
-                    .filter(move |(k, _)| k == t)
-                    .flat_map(|(_, v)| v.iter().map(|s| s.to_string()))
-            })
-            .collect();
+        // Wall-clock now, NOT fetched_at: "active in the last N days"
+        // measured against the catalogue's fetch time let a 10-day-old
+        // catalogue answer "last 1 day" with groups whose newest sampled
+        // post was 11 days old.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|t| t.as_secs() as i64)
+            .unwrap_or(0);
         let mut hits: Vec<(Hit, &CatGroup)> = self
             .groups
             .iter()
@@ -612,14 +621,23 @@ impl Catalog {
             })
             .filter(|g| !q.binaries_only || is_binary(&g.name))
             .filter(|g| g.posts >= q.min_posts)
-            .filter(|g| q.only.is_none_or(|set| set.contains(&g.name)))
+            // Case-insensitive to match how the scan list itself is
+            // maintained (interests.rs merges/removes with
+            // eq_ignore_ascii_case): a hand-typed ALT.BINARIES.FOO is
+            // scanned, so it must not vanish from the subscribed-only
+            // view. The set is the user's own scan list (tens of rows),
+            // so the linear probe costs nothing that matters.
+            .filter(|g| {
+                q.only
+                    .is_none_or(|set| set.iter().any(|n| n.eq_ignore_ascii_case(&g.name)))
+            })
             .filter(|g| !q.with_desc || !g.desc.is_empty())
-            .filter(|g| q.stats_allow(&g.name, self.fetched_at))
+            .filter(|g| q.stats_allow(&g.name, now))
             .filter_map(|g| {
                 if terms.is_empty() {
                     Some((Hit::NamePrefix, g))
                 } else {
-                    match_group(g, &terms, &syns).map(|h| (h, g))
+                    match_group(g, &terms).map(|h| (h, g))
                 }
             })
             .collect();

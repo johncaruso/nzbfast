@@ -355,9 +355,15 @@ impl GroupStats {
         if self.sample_n == 0 {
             return None;
         }
+        // Reversed so a TIE resolves to the FIRST kind in ALL order
+        // (max_by_key keeps the last maximum): a 50/50 video-packed
+        // sample must report Video, not Packed - ties toward the least
+        // informative kind excluded half-video groups from kind=video,
+        // against this function's own stated intent.
         Kind::ALL
             .into_iter()
             .filter(|k| *k != Kind::Other)
+            .rev()
             .max_by_key(|k| self.kinds[k.index()])
             .filter(|k| self.kinds[k.index()] > 0)
             .or(Some(Kind::Other))

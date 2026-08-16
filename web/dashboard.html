@@ -774,11 +774,13 @@ button.hlp{background:transparent;padding:0;font-weight:600;transition:filter .1
 #cumodal .fsfoot{flex-wrap:wrap}
 #fswrite.ok{color:var(--ok)}#fswrite.warn{color:var(--warn)}
 @media(max-width:560px){.fsbody{grid-template-columns:1fr}.fsroots{display:none}}
-/* Container update recipe (fs modal skeleton, scrolling prose body) */
-#cuov{position:fixed;inset:0;z-index:70;display:none;place-items:center;
+/* Container update recipe (fs modal skeleton, scrolling prose body).
+   The Flatpak recipe (#fuov/#fumodal) is a second, much shorter panel of
+   the same shape, so it rides these rules rather than copying them. */
+#cuov,#fuov{position:fixed;inset:0;z-index:70;display:none;place-items:center;
   background:color-mix(in srgb,#000 55%,transparent);backdrop-filter:blur(2px);padding:16px}
-#cuov.on{display:grid}
-#cumodal{background:var(--surface);border:1px solid var(--line);border-radius:14px;
+#cuov.on,#fuov.on{display:grid}
+#cumodal,#fumodal{background:var(--surface);border:1px solid var(--line);border-radius:14px;
   width:min(680px,96vw);max-height:88vh;display:flex;flex-direction:column;
   box-shadow:0 24px 70px rgba(0,0,0,.5);overflow:hidden}
 .cubody{overflow-y:auto;padding:4px 18px 16px;font-size:13.5px;line-height:1.55}
@@ -2849,6 +2851,46 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <button onclick="cuClose()" data-i18n="cu.close">Close</button>
   </div>
 </div></div>
+<!-- Flatpak update recipe. A Flatpak owns the files it installed and
+     replaces them only through its own channel, so the download page is
+     the wrong advice here exactly as it is in a container - but the
+     container recipe is all compose files and Watchtower, which means
+     nothing to someone who installed from Flathub or a .flatpak bundle.
+     Shown when the daemon reports it is running inside a Flatpak. -->
+<div id="fuov" onclick="if(event.target===this)fuClose()"><div id="fumodal" role="dialog" aria-modal="true" aria-labelledby="futitle">
+  <div class="fshead"><b id="futitle"></b><span class="grow"></span>
+    <button class="ghost mini" onclick="fuClose()" data-i18n-title="btn.close.title"
+      title="Close this panel" aria-label="Close this panel">✕</button></div>
+  <div class="cubody">
+    <p data-i18n="fu.intro">nzbfast was installed as a Flatpak, so it never replaces its own files:
+    Flatpak does that for it. Your settings, queue and downloads are untouched by an update.</p>
+
+    <h4 data-i18n="fu.now">Update it now</h4>
+    <p data-i18n="fu.now.lead">In a terminal:</p>
+    <pre class="cuyaml" id="fucmd">flatpak update io.github.nzbfast.nzbfast</pre>
+    <p><button class="ghost mini" onclick="fuCopy()" data-i18n="fu.copy">Copy this command</button></p>
+    <div class="cup" data-i18n-html="fu.gui">Or open your software centre - <b>GNOME Software</b>,
+    <b>KDE Discover</b> or <b>Bazaar</b> - and update nzbfast there. Most of them check on their own
+    and will offer it without being asked.</div>
+
+    <div class="cup cunote" data-i18n-html="fu.beta">The Flatpak is a <b>beta</b> package. The program
+    inside it is the shipped release; what is new is the packaging, and that is the part worth
+    reporting on.</div>
+    <div class="cup cunote" data-i18n-html="fu.folders">If a download folder gives permission errors, that
+    is the sandbox rather than a bug: a Flatpak reaches only the folders it was granted. Your home folder
+    and the usual places drives get mounted are granted already. To add another:</div>
+    <pre class="cuyaml" id="fugrant">flatpak override --user --filesystem=/path/to/folder io.github.nzbfast.nzbfast</pre>
+    <div class="cup cunote" data-i18n-html="fu.flatseal">The <b>Flatseal</b> app does the same thing with
+    checkboxes if you would rather not use a terminal. Either way, restart nzbfast afterwards.</div>
+  </div>
+  <!-- No guide link in this footer on purpose: the panel already carries
+       both commands, and there is no Linux page on the site to point at
+       (checked, 15 Aug - /linux.html and /manual.html are both 404). -->
+  <div class="fsfoot">
+    <span class="grow"></span>
+    <button onclick="fuClose()" data-i18n="fu.close">Close</button>
+  </div>
+</div></div>
 <div id="gbov" onclick="if(event.target===this)gbClose()"><div id="gbmodal" role="dialog" aria-modal="true" aria-labelledby="gbtitle">
   <div class="fshead"><b id="gbtitle" data-i18n="grp.title">Find newsgroups</b><span class="grow"></span>
     <button class="ghost mini" onclick="gbClose()" data-i18n-title="btn.close.title"
@@ -4810,6 +4852,13 @@ async function tick(){
         uc.textContent='⬆ '+t('upd.container','v{v} available - how to update',{v:q.update_version});
         uc.title=t('hdr.upd.container.title','Show how to update the container');
         uc.onclick=cuOpen;
+      }else if(q.flatpak){
+        // Same dead end as a container, different channel: a Flatpak is
+        // updated by Flatpak, and the release page's tarballs would put
+        // a second, unmanaged copy on the machine.
+        uc.textContent='⬆ '+t('upd.flatpak','v{v} available - how to update',{v:q.update_version});
+        uc.title=t('hdr.upd.flatpak.title','Show how to update the Flatpak');
+        uc.onclick=fuOpen;
       }else{
         uc.textContent='⬆ '+t('upd.download','v{v} available - download',{v:q.update_version});
         uc.title=t('hdr.upd.title','Open the download page for the new version');
@@ -8870,7 +8919,7 @@ addEventListener('keydown', e=>{
   }
   const hd=document.getElementById('helpDrawer');
   if(inSettings
-    ||document.querySelector('#fsov.on,#keyov.on,#gbov.on,#cuov.on,#stopped.on')
+    ||document.querySelector('#fsov.on,#keyov.on,#gbov.on,#cuov.on,#fuov.on,#stopped.on')
     ||(hd&&hd.classList.contains('open'))
     ||document.getElementById('ctxmenu')) return;
   switch(e.key){
@@ -9399,7 +9448,7 @@ function closeMenu(restore){
   if(o && (restore===true || inside) && document.contains(o)) o.focus();
 }
 addEventListener('click', ()=>closeMenu());
-addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeMenu(true); fsClose(); gbClose(); cuClose(); keyCancel(); shClose(); pvClose(); } });
+addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeMenu(true); fsClose(); gbClose(); cuClose(); fuClose(); keyCancel(); shClose(); pvClose(); } });
 // Arrow-walk the open menu. Wraps at both ends, the way a menu should.
 function menuKey(e){
   const m=document.getElementById('ctxmenu'); if(!m) return;
@@ -9430,6 +9479,27 @@ function cuOpen(){
 }
 function cuClose(){ document.getElementById('cuov').classList.remove('on');
   modalClose(document.getElementById('cumodal')); }
+function fuOpen(){
+  const ov=document.getElementById('fuov');
+  document.getElementById('futitle').textContent =
+    updVersion ? t('fu.title.v','Update to v{v}',{v:updVersion}) : t('fu.title','Update nzbfast');
+  ov.classList.add('on');
+  modalOpen(document.getElementById('fumodal'));
+}
+function fuClose(){ document.getElementById('fuov').classList.remove('on');
+  modalClose(document.getElementById('fumodal')); }
+async function fuCopy(){
+  const pre=document.getElementById('fucmd');
+  try{ await navigator.clipboard.writeText(pre.textContent); toast(t('fu.copied','Copied. Paste it into a terminal.')); }
+  catch(e){
+    // Same clipboard denial as the compose block: plain-HTTP origins and
+    // embedded webviews refuse the write, so select the line instead and
+    // the manual copy is one keystroke.
+    try{ const r=document.createRange(); r.selectNodeContents(pre);
+         const s=getSelection(); s.removeAllRanges(); s.addRange(r); }catch(_){}
+    toast(t('fu.copyfail','Could not reach the clipboard - select the command and copy it by hand.'), true);
+  }
+}
 async function cuCopy(){
   const pre=document.getElementById('cuyaml');
   try{ await navigator.clipboard.writeText(pre.textContent); toast(t('cu.copied','Copied. Paste it into your compose file.')); }
@@ -9479,9 +9549,15 @@ function histMenu(e, id, failed){
 // Every line's [tag] prefix is its tracing target, and these targets are
 // the indexer's lanes: the view select keys off membership in this set.
 // A tag missing from the list lands in the "app" view, which is the safe
-// side - residual noise beats hiding a download line. Tags that both
-// sides emit (oracle, watch, smart, nzbimport) stay out on purpose.
-const LOG_INDEX_TAGS=new Set(['index','indexer','spots','predb','claims','identity','confirm','scoreboard','wall','enrich','groups','gapfill','tip','pesto']);
+// side for HIDING a download line but the unsafe side for the export:
+// "app, without the indexer" is a promise, and exportLog() hands the
+// filtered lines to whoever asked for them. `scan` and `probe7z` were
+// missing and leaked provider hostnames, group names and release names
+// into a log a user had asked to have the indexer removed from.
+// Tags that both sides emit (oracle, watch, smart, nzbimport, cats)
+// stay out on purpose. tests/log_lanes.rs walks the indexer sources for
+// `target: "..."` and fails if a new lane is missing from here.
+const LOG_INDEX_TAGS=new Set(['index','indexer','scan','probe7z','spots','predb','claims','identity','confirm','scoreboard','wall','enrich','groups','gapfill','tip','pesto']);
 let logLines=[], logCapturing=true;
 function logFiltered(){
   const v=(document.getElementById('logView')||{}).value||'all';

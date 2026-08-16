@@ -312,6 +312,43 @@ fn rev_reconstruct_sweeps_temps_abandoned_by_an_earlier_crash() {
 }
 
 #[test]
+fn rev_sweep_spares_a_stale_lookalike_that_is_not_ours() {
+    // The sweep's delete is unconditional, so its predicate is the only
+    // thing standing between it and the user's files. A prefix match is
+    // not enough: `nzbfast extract <dir>` runs this over a directory of
+    // arbitrary content, and a restored file carries the archive's own
+    // mtime, which is commonly years old. Only the full staging grammar
+    // - revtmp<pid>-<slot>-<n>, all digits - is ours to delete.
+    let dir = temp_dir("stale-lookalike");
+    build_set(&dir, &[600, 512, 480], 1, false);
+    let bystander = dir.join("revtmpMovie.mkv");
+    let owned = dir.join(format!("revtmp{}-0-0", std::process::id()));
+    std::fs::write(&bystander, b"the user's file").unwrap();
+    std::fs::write(&owned, b"abandoned").unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60);
+    for p in [&bystander, &owned] {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    // Nothing is missing, so this returns false - the sweep still runs.
+    assert!(!try_rev_reconstruct(&dir));
+    assert!(
+        bystander.exists(),
+        "a stale non-owned name must survive the sweep"
+    );
+    assert!(
+        !owned.exists(),
+        "an abandoned owned temp must still be cleared"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn rev_reconstruct_does_nothing_when_the_set_is_already_whole() {
     let dir = temp_dir("whole");
     build_set(&dir, &[600, 512, 480], 1, false);

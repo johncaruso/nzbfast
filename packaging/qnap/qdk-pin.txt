@@ -1,0 +1,16 @@
+# QDK, QNAP's package build kit, pinned by commit.
+#
+# The .qpkg format is a self-extracting shell script with a control tar
+# and a data tar concatenated onto it, and the installer half - qinstall.sh
+# - is COPIED INTO EVERY PACKAGE at build time. So the QDK revision is not
+# a build-time detail: it is code that ships to users and runs as root on
+# their NAS. Tracking master would silently change that code between one
+# release and the next.
+#
+# Bump deliberately: read the diff of shared/scripts/qinstall.sh and
+# shared/bin/qbuild first, then rebuild and re-run
+# packaging/tests/qnap-install.sh.
+#
+# repo:   https://github.com/qnap-dev/QDK
+# commit: 78c77b898fecba8f860b630177248b5fa3f5baaf   (2026-07-09)
+78c77b898fecba8f860b630177248b5fa3f5baaf

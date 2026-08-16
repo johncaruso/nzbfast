@@ -171,19 +171,51 @@ pub(super) fn redact_apikey(s: &str) -> String {
 /// put it in the path. Blanking one parameter name there is a guess.
 /// The host is the only part of such a URL worth showing a user anyway -
 /// it names who failed - so everything after it goes.
+///
+/// A URL is found by its `://`, not by the two lowercase spellings we
+/// happen to write ourselves. This used to search for `http://` and
+/// `https://` literally, which meant `HTTPS://idx.example/x?apikey=SECRET`
+/// went through untouched: the rest of the URL layer compares schemes
+/// with `eq_ignore_ascii_case` (`url_host`, `failure_link_allowed`), so a
+/// mixed-case link out of an indexer's `X-DNZB-FailureLink` header, or a
+/// feed URL an autocapitalising phone keyboard saved, passes every gate
+/// and dies in `fetch_head` - whose refusal names the WHOLE url and is
+/// logged, exported and returned to the browser. The same literal search
+/// left `ftp://user:pw@host/p` unredacted, which `set_feeds` accepts.
 pub(crate) fn redact_url_creds(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
-    // Whichever scheme comes first, when both appear.
-    while let Some(p) = match (rest.find("http://"), rest.find("https://")) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    } {
+    while let Some(sep) = rest.find("://") {
+        // Walk back over the scheme. RFC 3986 spells it
+        // ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) and every one of
+        // those is ASCII, so scanning bytes can never land mid-codepoint
+        // (these strings come out of response headers and indexer XML,
+        // so that matters).
+        let bytes = rest.as_bytes();
+        let mut p = sep;
+        while p > 0
+            && matches!(bytes[p - 1],
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'+' | b'-' | b'.')
+        {
+            p -= 1;
+        }
+        // A scheme starts with a letter, so drop any leading digits or
+        // punctuation the walk-back picked up. It also stops at the
+        // first byte that cannot be in a scheme, so "failed at http://x"
+        // keeps its "failed at ".
+        while p < sep && !bytes[p].is_ascii_alphabetic() {
+            p += 1;
+        }
+        if p == sep {
+            // A bare `://` with no scheme in front of it is prose, not a
+            // URL. Copy it through and look past it.
+            out.push_str(&rest[..sep + 3]);
+            rest = &rest[sep + 3..];
+            continue;
+        }
         out.push_str(&rest[..p]);
         let url = &rest[p..];
-        let scheme_len = if url.starts_with("https://") { 8 } else { 7 };
+        let scheme_len = sep - p + 3;
         // The authority ends at the first path/query/fragment character,
         // or at whatever ends the URL inside a longer sentence.
         let after = &url[scheme_len..];
@@ -665,4 +697,133 @@ pub(super) fn resolve_nzblnk(
     json!({"status": false, "reason": "notfound", "notes": notes,
            "error": "nothing found for that link - the post may be too new to be indexed, \
                      or too old to still be on your server"})
+}
+
+#[cfg(test)]
+mod redaction_case_tests {
+    use super::{fetch_head, redact_url_creds};
+
+    /// The real error, end to end, not a hand-written imitation of it.
+    ///
+    /// `fetch_head` refuses a scheme it does not recognise by naming the
+    /// WHOLE url, and a mixed-case link gets that far because every gate
+    /// in front of it compares schemes case-insensitively. The refusal
+    /// then goes to the log ring (`failurelink`, `confirm`, feed health)
+    /// and into `indexer_grab`'s JSON response. This pins the pairing:
+    /// whatever that message contains, the scrubber takes the credential
+    /// out of it. No socket is opened - the bail is the first statement.
+    #[test]
+    fn a_refused_mixed_case_url_cannot_leak_through_its_error() {
+        let e = fetch_head(
+            "HTTPS://user:pw@idx.example/getnzb/abc?apikey=SECRET123",
+            None,
+        )
+        .expect_err("a mixed-case scheme is still refused, deliberately");
+        let msg = redact_url_creds(&e.to_string());
+        assert!(!msg.contains("SECRET123"), "{msg}");
+        assert!(!msg.contains("user:pw"), "{msg}");
+        assert!(msg.contains("idx.example"), "the host must survive: {msg}");
+    }
+
+    /// The pairing above only holds for a url the scrubber can PARSE.
+    /// It finds one by its `://`, and `fetch_head` refuses strings that
+    /// need not be well formed at all - so a single-slash
+    /// `https:/host/x?apikey=...` used to travel whole into the API
+    /// answer and the log with nothing to strip it (Fable sweep 15 Aug).
+    /// The refusal now names at most scheme and authority.
+    #[test]
+    fn a_refused_malformed_url_cannot_leak_its_query_either() {
+        let e = fetch_head("https:/idx.example/getnzb/abc?apikey=SECRET123", None)
+            .expect_err("a single-slash url is refused");
+        let msg = redact_url_creds(&e.to_string());
+        assert!(!msg.contains("SECRET123"), "{msg}");
+        assert!(!msg.contains("getnzb"), "the path is not diagnostic: {msg}");
+    }
+
+    /// The malformed-url cut has to drop USERINFO as well as the path.
+    ///
+    /// `https:user:pw@idx.example/feed` is the shape that got past both
+    /// halves: no `://`, so the refusal's authority scan started at
+    /// byte 0 and the cut at the first slash kept the whole
+    /// `https:user:pw@idx.example`, and `redact_url_creds` finds a url
+    /// by its `://` and so had nothing to strip. Feed health writes
+    /// that string to the settings row and the log ring, and
+    /// `indexer_grab` returns it to the browser. A feed url the user
+    /// mistyped one slash out of is exactly the one carrying their
+    /// account credential (sweep 2 L3).
+    #[test]
+    fn a_refused_malformed_url_cannot_leak_its_userinfo() {
+        let e = fetch_head("https:user:pw@idx.example/feed?apikey=SECRET123", None)
+            .expect_err("a url with no // is refused");
+        let msg = redact_url_creds(&e.to_string());
+        assert!(!msg.contains("SECRET123"), "{msg}");
+        assert!(!msg.contains("pw@"), "the userinfo must not survive: {msg}");
+        assert!(!msg.contains("user:pw"), "{msg}");
+        // The other direction: the refusal is still worth reading. The
+        // host names who was refused and the scheme names why.
+        assert!(msg.contains("idx.example"), "the host must survive: {msg}");
+        assert!(
+            msg.contains("https"),
+            "the rejected scheme must survive: {msg}"
+        );
+
+        // And a well-formed url loses nothing it used to say.
+        let e = fetch_head("ftp://idx.example/getnzb/abc", None).expect_err("ftp is refused");
+        assert_eq!(e.to_string(), "addurl: unsupported url ftp://idx.example");
+    }
+
+    /// The scrubber must not care how the scheme is spelled.
+    ///
+    /// Everything else in the URL layer compares schemes with
+    /// `eq_ignore_ascii_case`, so `HTTPS://...` survives every origin
+    /// and downgrade gate and only `fetch_head` refuses it - by name,
+    /// in a message that carries the whole URL. That message is logged
+    /// (`failurelink`, `confirm`, the RSS feed health row), exported
+    /// from the log pane, and returned to the browser by `indexer_grab`.
+    /// When this function only knew the two lowercase spellings, every
+    /// one of those sinks got the credential verbatim.
+    #[test]
+    fn a_mixed_case_scheme_is_redacted_like_any_other() {
+        let got =
+            redact_url_creds("addurl: unsupported url HTTPS://idx.example/getnzb/abc?r=SECRET123");
+        assert!(!got.contains("SECRET123"), "{got}");
+        assert_eq!(got, "addurl: unsupported url HTTPS://idx.example/...");
+
+        let got = redact_url_creds("Http://user:pw@idx.example/x?k=1 failed");
+        assert!(!got.contains("pw"), "{got}");
+        assert_eq!(got, "Http://idx.example/... failed");
+    }
+
+    /// Any scheme, not just the two we write.
+    ///
+    /// `set_feeds` is the one config writer with no scheme check, so an
+    /// `ftp://user:pw@host/path` feed reaches the poller, fails, and has
+    /// its error recorded in the feed health row and the log ring.
+    #[test]
+    fn a_scheme_we_never_write_is_redacted_too() {
+        let got = redact_url_creds("ftp://user:pw@h/p failed");
+        assert!(!got.contains("pw"), "{got}");
+        assert_eq!(got, "ftp://h/... failed");
+    }
+
+    /// Finding URLs by `://` must not start eating prose.
+    ///
+    /// The walk-back stops at the first byte that cannot be in a scheme,
+    /// and a `://` with nothing in front of it is left exactly as it was
+    /// rather than being treated as an empty-scheme URL.
+    #[test]
+    fn prose_around_a_url_survives_the_walk_back() {
+        assert_eq!(
+            redact_url_creds("failed at https://idx.example/x?k=1 twice"),
+            "failed at https://idx.example/... twice"
+        );
+        assert_eq!(redact_url_creds("no scheme :// here"), "no scheme :// here");
+        assert_eq!(redact_url_creds("plain error"), "plain error");
+        // Non-ASCII in the sentence: the byte walk must stay on char
+        // boundaries (these strings come out of indexer XML).
+        assert_eq!(
+            redact_url_creds("fehlgeschlagen: größer https://idx.example/x?k=1"),
+            "fehlgeschlagen: größer https://idx.example/..."
+        );
+    }
 }

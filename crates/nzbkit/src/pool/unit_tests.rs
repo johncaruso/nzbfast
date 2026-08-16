@@ -383,6 +383,56 @@ fn required_mask_counts_only_live_lower_levels() {
     assert_eq!(sh.required_mask(0), 0, "level 0 answers to nobody");
 }
 
+/// M5: the fill gate is written in 430s, and a primary that kills the
+/// same article's connection on every attempt never files one. Before
+/// this, the deeper tier stayed locked out for the whole run and the
+/// failing primary read `other_can_take` as "nobody else can have it",
+/// so it retook its own casualty until the budget was gone and the
+/// article was reported lost while a healthy server held it.
+#[test]
+fn a_spent_budget_opens_the_fill_gate_without_forging_a_refusal() {
+    let mut fill = server("fill");
+    fill.level = 1;
+    let servers = vec![
+        (server("prime"), PoolConfig::default()),
+        (fill, PoolConfig::default()),
+    ];
+    let (sh, _) = Shared::new(fresh(&["<a@x>"]), &servers);
+    sh.alive[0].store(1, Ordering::Relaxed);
+    sh.alive[1].store(1, Ordering::Relaxed);
+    let mut w = work("<a@x>");
+    w.tried_fail = server_bit(0);
+    assert!(
+        !sh.other_can_take(&w, 0),
+        "transport failures alone leave the fill server gated"
+    );
+    assert!(
+        sh.note_spent(&w, server_bit(0)),
+        "the fill server has never had a go at this article"
+    );
+    assert_eq!(sh.spent_mask("<a@x>"), server_bit(0));
+    assert!(
+        sh.other_can_take(&w, 0),
+        "a spent primary satisfies the gate, so the retry goes down a level"
+    );
+    assert_eq!(
+        w.tried_430, 0,
+        "spent is routing, never evidence - no refusal is invented"
+    );
+    assert_ne!(
+        w.tried_430 & sh.live_mask(),
+        sh.live_mask(),
+        "and no unanimous Missing is manufactured for an article a server holds"
+    );
+    assert!(
+        !sh.note_spent(&w, server_bit(0)),
+        "one re-arm per server is what bounds the ladder"
+    );
+    // A terminal article takes its routing state with it.
+    assert!(sh.claim_done("<a@x>"));
+    assert_eq!(sh.spent_mask("<a@x>"), 0);
+}
+
 #[test]
 fn wire_cap_note_marks_the_graph_once_per_window() {
     let servers = vec![(server("s"), PoolConfig::default())];
@@ -533,6 +583,65 @@ fn requeue_rolls_back_when_the_run_is_over_or_aborted() {
     assert_eq!(ctl2.requeue(&["<c@x>".to_string()]), 0);
 }
 
+/// The drained verdict vs a concurrent requeue, interleaved at the exact
+/// gap: the last completion's fetch_sub has landed `pending` on zero but
+/// the finished-send decision has not run yet (the barrier seam holds it
+/// there), and a requeue arrives inside that window. The requeue must
+/// win cleanly: it re-raises `pending`, the held completion then sees
+/// the revived count and stays silent, and the requeued article's own
+/// completion is what ends the run. Before `finish_gate`, both sides
+/// lost - the raise came after the zero-crossing, the finished check
+/// read the not-yet-sent watch, and the send then fired anyway over a
+/// queue that had just been given work no worker would ever pop.
+#[test]
+fn requeue_inside_the_drain_gap_keeps_the_run_alive() {
+    let ctl = QueueControl::default();
+    let (sh, _) = Shared::new(
+        fresh(&["<a@x>", "<b@x>"]),
+        &[(server("s"), PoolConfig::default())],
+    );
+    ctl.attach(&sh);
+    let finished = sh.finished.subscribe();
+    let mut cancel_ids = HashSet::new();
+    cancel_ids.insert("<a@x>".to_string());
+    assert_eq!(ctl.cancel(&cancel_ids), vec!["<a@x>".to_string()]);
+    // Arm the seam, then complete the last real article on a second
+    // thread: it parks between the zero-crossing and the verdict.
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let released = Arc::new(std::sync::Barrier::new(2));
+    *sh.drain_send_barrier.lock_ok() = Some((entered.clone(), released.clone()));
+    let sh2 = sh.clone();
+    let completer = std::thread::spawn(move || {
+        assert!(sh2.claim_done("<b@x>"));
+        sh2.complete_one();
+    });
+    entered.wait(); // the crossing has happened, the verdict has not
+    *sh.drain_send_barrier.lock_ok() = None; // one trip only
+    assert_eq!(
+        ctl.requeue(&["<a@x>".to_string()]),
+        1,
+        "a requeue landing inside the gap is honoured, not lost"
+    );
+    released.wait();
+    completer.join().unwrap();
+    assert!(
+        !*finished.borrow(),
+        "the held completion saw the revived count and stayed silent"
+    );
+    assert_eq!(sh.pending.load(Ordering::Acquire), 1);
+    assert!(
+        sh.queue.try_lock().unwrap().iter().any(|w| w.id == "<a@x>"),
+        "the requeued article is queued for a fleet that is still running"
+    );
+    // The requeued article's own completion now ends the run.
+    assert!(sh.claim_done("<a@x>"));
+    sh.complete_one();
+    assert!(
+        *finished.borrow(),
+        "the revived run still drains to a real end"
+    );
+}
+
 /// The on-demand pool-state dump (stall watchdog, NZBFAST_POOL_DEBUG's
 /// idle branch). The throttle static admits one dump per 5 s of a
 /// pool's lifetime and the clock is the pool's own age, so this test
@@ -559,6 +668,153 @@ fn dump_state_survives_a_held_queue_and_then_prints_it() {
     std::thread::sleep(Duration::from_millis(5_100));
     ctl.dump_state(); // queue free: the full queue + inflight listing
     ctl.dump_state(); // and the once-per-5s throttle swallows this one
+}
+
+/// A fleet that exhausted with a handed body outstanding never sends
+/// `finished`: the handed id sits in `done`, so pending never lands on
+/// zero and `seal_run` skips the send. A requeue arriving after that
+/// used to be honoured, queueing work no worker would ever pop - the run
+/// then sat until its own give-up timer. `finished` alone cannot see it
+/// and `workers_live == 0` alone is also every run before its first
+/// worker is BORN, where refusing would drop work racing fleet birth.
+/// The pair is the question (Fable sweep 15 Aug, TODO 170).
+#[test]
+fn requeue_into_an_exhausted_fleet_is_refused_but_a_newborn_one_is_not() {
+    let ctl = QueueControl::default();
+    let (sh, _) = Shared::new(
+        fresh(&["<a@x>", "<b@x>"]),
+        &[(server("s"), PoolConfig::default())],
+    );
+    ctl.attach(&sh);
+    let mut cancel_ids = HashSet::new();
+    cancel_ids.insert("<a@x>".to_string());
+    assert_eq!(ctl.cancel(&cancel_ids), vec!["<a@x>".to_string()]);
+
+    // Before any worker exists - the fleet is still arriving, and this
+    // is the interleaving the naive guard broke.
+    assert_eq!(
+        ctl.requeue(&["<a@x>".to_string()]),
+        1,
+        "a requeue racing fleet birth must be honoured, not dropped"
+    );
+
+    // Now the fleet lives and then dies out entirely.
+    assert_eq!(ctl.cancel(&cancel_ids), vec!["<a@x>".to_string()]);
+    sh.workers_born.store(4, Ordering::Release);
+    sh.workers_live.store(0, Ordering::Release);
+    assert_eq!(
+        ctl.requeue(&["<a@x>".to_string()]),
+        0,
+        "reviving into a fleet that has no workers left queues work nobody can pop"
+    );
+}
+
+/// M2 (read-only sweep 2): the fleet-dead check and the queue insert
+/// were not one critical section. `requeue` clears `finish_gate` with a
+/// worker still live, that worker then retires - `WorkerLife::retire`
+/// decrements `workers_live` under no gate at all - and the terminal
+/// seal drains a queue the insert has not reached yet. The old code
+/// then queued the article behind a fleet that was gone and returned
+/// non-zero, so the caller reversed its deferred accounting for an
+/// outcome nobody would ever send.
+///
+/// Both directions, because a fix that simply refuses more often would
+/// pass the first half alone: with the fleet still alive across the
+/// very same seam the requeue must still be honoured.
+#[test]
+fn requeue_refuses_when_the_last_worker_retires_inside_the_gate_window() {
+    // The fleet dies inside the window.
+    let ctl = Arc::new(QueueControl::default());
+    let (sh, _) = Shared::new(
+        fresh(&["<a@x>", "<b@x>"]),
+        &[(server("s"), PoolConfig::default())],
+    );
+    ctl.attach(&sh);
+    let (tx, mut rx) = mpsc::channel(8);
+    sh.workers_born.store(1, Ordering::Release);
+    sh.workers_live.store(1, Ordering::Release);
+    let mut cancel_ids = HashSet::new();
+    cancel_ids.insert("<a@x>".to_string());
+    assert_eq!(ctl.cancel(&cancel_ids), vec!["<a@x>".to_string()]);
+
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let released = Arc::new(std::sync::Barrier::new(2));
+    *sh.requeue_gate_barrier.lock_ok() = Some((entered.clone(), released.clone()));
+    let ctl2 = ctl.clone();
+    let requeuer = std::thread::spawn(move || ctl2.requeue(&["<a@x>".to_string()]));
+    entered.wait(); // past the gate check, queue lock not taken yet
+    *sh.requeue_gate_barrier.lock_ok() = None; // one trip only
+    // The last worker leaves and seals what it can see - which does not
+    // include the article still in flight through `requeue`.
+    sh.workers_live.store(0, Ordering::Release);
+    assert_eq!(
+        seal_run_blocking(&sh, &tx, "no connection worker left"),
+        1,
+        "the seal drains the queue it can see: <b@x> only"
+    );
+    released.wait();
+    assert_eq!(
+        requeuer.join().unwrap(),
+        0,
+        "resurrecting into a fleet that retired inside the window must be refused"
+    );
+    assert!(
+        sh.cancelled.lock_ok().contains_key("<a@x>"),
+        "the refusal re-stashes, so the caller keeps its deferred accounting"
+    );
+    assert!(
+        !sh.queue.try_lock().unwrap().iter().any(|w| w.id == "<a@x>"),
+        "nothing was published behind the departed fleet"
+    );
+    assert!(
+        sh.done.lock_ok().contains("<a@x>"),
+        "the article is terminal again, exactly as `cancel` left it"
+    );
+    assert_eq!(
+        sh.pending.load(Ordering::Acquire),
+        0,
+        "the probe count was undone, so the run can still reach its end"
+    );
+    let mut failed = Vec::new();
+    while let Ok(FetchOutcome::Failed { id, .. }) = rx.try_recv() {
+        failed.push(id);
+    }
+    assert_eq!(failed, vec!["<b@x>".to_string()]);
+
+    // Same seam, fleet still alive: the requeue must go through.
+    let ctl = Arc::new(QueueControl::default());
+    let (sh, _) = Shared::new(
+        fresh(&["<c@x>", "<d@x>"]),
+        &[(server("s"), PoolConfig::default())],
+    );
+    ctl.attach(&sh);
+    sh.workers_born.store(1, Ordering::Release);
+    sh.workers_live.store(1, Ordering::Release);
+    let mut cancel_ids = HashSet::new();
+    cancel_ids.insert("<c@x>".to_string());
+    assert_eq!(ctl.cancel(&cancel_ids), vec!["<c@x>".to_string()]);
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let released = Arc::new(std::sync::Barrier::new(2));
+    *sh.requeue_gate_barrier.lock_ok() = Some((entered.clone(), released.clone()));
+    let ctl2 = ctl.clone();
+    let requeuer = std::thread::spawn(move || ctl2.requeue(&["<c@x>".to_string()]));
+    entered.wait();
+    *sh.requeue_gate_barrier.lock_ok() = None;
+    released.wait();
+    assert_eq!(
+        requeuer.join().unwrap(),
+        1,
+        "a live fleet still gets its work back - the recheck is not a teardown"
+    );
+    assert!(
+        sh.queue.try_lock().unwrap().iter().any(|w| w.id == "<c@x>"),
+        "and the article really is queued for it"
+    );
+    assert_eq!(sh.pending.load(Ordering::Acquire), 2);
+    assert!(
+        !sh.done.lock_ok().contains("<c@x>"),
+        "un-terminal again, so its own outcome can still land"
+    );
 }
 
 #[test]
@@ -705,6 +961,52 @@ fn sharded_fetch_serves_everything_across_shards() {
         None,
         "the ctl holds a Weak - a finished run detaches it, it never leaks the pool"
     );
+}
+
+/// The sharded path's head-counts must be complete BEFORE any shard
+/// thread starts. Shards come up in OS-scheduler order, and births that
+/// happened inside each shard let an early shard read a partial fleet:
+/// a 430 there became a premature unanimous Missing (`live_mask`), and
+/// a fill server could take queued work against `required_mask == 0`.
+/// `deal_shard_plans` births every life at deal time; an unspawned plan
+/// releases them on drop.
+#[test]
+fn shard_plans_are_born_before_any_thread() {
+    let mut primary = server("a.example");
+    primary.connections = 3;
+    let mut fill = server("b.example");
+    fill.connections = 2;
+    fill.level = 1;
+    let servers = vec![
+        (
+            primary,
+            PoolConfig {
+                connections: 3,
+                ..Default::default()
+            },
+        ),
+        (
+            fill,
+            PoolConfig {
+                connections: 2,
+                ..Default::default()
+            },
+        ),
+    ];
+    let (shared, unservable) = Shared::new(fresh(&["<a@x>", "<b@x>"]), &servers);
+    assert!(unservable.is_empty());
+    let plans = deal_shard_plans(&shared, &servers, 2);
+    assert_eq!(plans.iter().map(|p| p.len()).sum::<usize>(), 5);
+    // Both servers are live and the fill gate sees the primary before a
+    // single shard thread (or worker task) exists.
+    assert_eq!(shared.live_mask(), server_bit(0) | server_bit(1));
+    assert_eq!(shared.required_mask(1), server_bit(0));
+    assert_eq!(shared.workers_live.load(Ordering::Acquire), 5);
+    // A plan dropped unspawned (its shard runtime failed to build)
+    // releases its lives like workers dying.
+    drop(plans);
+    assert_eq!(shared.live_mask(), 0);
+    assert_eq!(shared.workers_live.load(Ordering::Acquire), 0);
 }
 
 /// Shards degraded to zero built runtimes still owe every article a
@@ -1860,6 +2162,70 @@ async fn a_fill_server_waits_for_every_live_primary_miss() {
     let w = next_work(&sh, ctx1, &tx, Pipeline::payload(0))
         .await
         .expect("gate satisfied");
+    assert_eq!(w.id, "<a@x>");
+}
+
+/// M5: the primary resets on one article every time it is dispatched.
+/// Nothing ever 430s, so before the `spent` mask the fill server stayed
+/// gated for the whole run, the primary kept retaking its own casualty
+/// (`other_can_take` saw no eligible elsewhere), and the article was
+/// reported lost with a healthy server one level down never asked.
+#[tokio::test]
+async fn a_primary_that_spends_its_budget_hands_the_article_down() {
+    let mut fill = server("fill");
+    fill.level = 1;
+    let servers = vec![
+        (server("prime"), PoolConfig::default()),
+        (fill, PoolConfig::default()),
+    ];
+    let (sh, _) = Shared::new(fresh(&["<a@x>"]), &servers);
+    let ctx0 = ctx_for(&servers, 0);
+    let ctx1 = ctx_for(&servers, 1);
+    sh.alive[0].fetch_add(1, Ordering::AcqRel);
+    sh.alive[1].fetch_add(1, Ordering::AcqRel);
+    let cfg = PoolConfig::default();
+    let (tx, mut rx) = mpsc::channel(4);
+    // Every dispatch dies with the article at the front of a session
+    // that never answered: the charge the RST-after-AUTH guard makes.
+    for attempt in 0..=cfg.article_retries {
+        sh.scan_futile[0].store(u64::MAX, Ordering::Relaxed);
+        let w = next_work(&sh, ctx0, &tx, Pipeline::payload(0))
+            .await
+            .unwrap_or_else(|| panic!("the primary picks it on attempt {attempt}"));
+        assert_eq!(w.id, "<a@x>");
+        sh.charge_wire();
+        sh.register_inflight(&w, 0);
+        let mut inflight: VecDeque<Work> = VecDeque::new();
+        inflight.push_back(w);
+        requeue_or_fail(&sh, &tx, &cfg, ctx0, &mut inflight, "rst", true).await;
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "the article must not be declared lost while a server that never saw it is live"
+    );
+    {
+        let q = sh.queue.lock().await;
+        let w = q.front().expect("requeued, not failed");
+        assert_eq!(w.attempts, 0, "the ladder hands the next tier a budget");
+        assert_eq!(
+            w.tried_430, 0,
+            "a reset answers no question about retention"
+        );
+        assert_eq!(w.tried_fail, server_bit(0));
+    }
+    assert_eq!(sh.spent_mask("<a@x>"), server_bit(0));
+    // The primary now steps aside: someone else can finally have it.
+    sh.scan_futile[0].store(u64::MAX, Ordering::Relaxed);
+    assert!(
+        next_work(&sh, ctx0, &tx, Pipeline::payload(0))
+            .await
+            .is_none(),
+        "the server that spent its budget must not retake its own casualty"
+    );
+    sh.scan_futile[1].store(u64::MAX, Ordering::Relaxed);
+    let w = next_work(&sh, ctx1, &tx, Pipeline::payload(0))
+        .await
+        .expect("the fill server takes the article the primary could not fetch");
     assert_eq!(w.id, "<a@x>");
 }
 

@@ -30,12 +30,14 @@ pub(super) fn seal_run_blocking(
     {
         return 0;
     }
-    let mut orphans: Vec<String> = {
-        let mut q = shared
-            .queue
-            .try_lock()
-            .expect("joined shards cannot hold queue");
-        q.drain(..).map(|w| w.id).collect()
+    let mut orphans: Vec<String> = match shared.queue.try_lock() {
+        Ok(mut q) => q.drain(..).map(|w| w.id).collect(),
+        // The shards are joined, but a QueueControl holder is not a
+        // shard: the steer consumer can be inside `requeue` right now.
+        // Seal what IS reachable rather than panicking the process -
+        // the caller drops the outcome channel immediately after, which
+        // ends the run either way.
+        Err(_) => Vec::new(),
     };
     orphans.extend(shared.inflight.lock_ok().drain().map(|(id, _)| id));
     orphans.extend(shared.steer_inbox.lock_ok().drain(..).map(|w| w.id));
@@ -452,13 +454,42 @@ pub(super) async fn requeue_or_fail(
                 w.attempts += 1;
                 w.tried_fail |= ctx.bit;
                 if w.attempts > cfg.article_retries {
-                    if shared.claim_done(&w.id) {
-                        failed.push(w.id);
+                    // M5: a spent budget is this SERVER's verdict, not
+                    // the article's. Every attempt here died in
+                    // transport, so nothing ever 430'd and the fill
+                    // gate (`required_mask`) never opened - a healthy
+                    // server one level down held the article the whole
+                    // time and was never asked. `note_spent` opens that
+                    // gate and re-arms the budget when some live server
+                    // has yet to have a real go at it, once per server,
+                    // so the ladder still ends. It costs a deeper tier
+                    // (a block account, possibly) one paid article,
+                    // which beats losing the article outright.
+                    if shared.note_spent(&w, ctx.bit) {
+                        w.attempts = 0;
+                    } else {
+                        if shared.claim_done(&w.id) {
+                            failed.push(w.id);
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
-            q.push_front(w);
+            // Same books as every other reinsert (shed_pipeline above,
+            // the recheck path, the steer adopt): a promoted article
+            // going back in the queue is counted back into
+            // promoted_pending, or the next pick spends a count that
+            // belongs to a DIFFERENT promoted article and read_one's
+            // shed gate goes quiet while promoted work still waits.
+            // And a non-promoted casualty must not cut ahead of the
+            // promoted run at the front.
+            if w.promoted {
+                shared.promoted_pending.fetch_add(1, Ordering::AcqRel);
+                q.push_front(w);
+            } else {
+                let at = q.iter().take_while(|x| x.promoted).count().min(q.len());
+                q.insert(at, w);
+            }
         }
     }
     for id in failed {

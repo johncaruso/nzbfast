@@ -1822,3 +1822,178 @@ fn pw_await_probe_hit_refeeds_paged_spans() {
     assert!(!dir.join("v.rar").exists(), "one-pass: no volume on disk");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Sweep 2 L8, the re-key half. `apply_probed_password` takes the
+/// slot's whole header stash out before re-feeding it through the newly
+/// keyed mapper, so a reclaim that fails partway is the last chance to
+/// uncharge the spans it never reached. Dropping the vector frees the
+/// memory and leaves the budget - and the scratch live count - charged
+/// for them, which demotes later sets on a ceiling nothing is using and
+/// stops the scratch file ever truncating.
+///
+/// The parked slot is real (a genuinely password-awaiting encrypted-
+/// headers set); the failure is injected deterministically - a paged
+/// span at the head of the stash and a scratch whose file handle is
+/// gone, so the very first reclaim of the re-key fails with spans still
+/// behind it.
+#[test]
+fn a_failed_rekey_refeed_leaves_no_stashed_span_charged() {
+    let dir = tmpdir("pw-await-rekey-err");
+    let plain = payload(2_000_000, 52);
+    let f = fixtures::encrypt_file("late-sidecar-pw", &plain, 10);
+    let vol = fixtures::rar5_volume_enc_headers(
+        &[("obf.bin", &f, 0..f.cipher.len(), false, false)],
+        None,
+        "late-sidecar-pw",
+        14,
+    );
+    let ex = Extractor::new(&dir, 1, true);
+    // A probe hook that never hits: the await arm needs one to exist,
+    // and the slot then simply parks with a mapper that will verify the
+    // real password below.
+    ex.set_password_probe(std::sync::Arc::new(|_| None));
+    ex.write(0, "v.rar", vol.len() as u64, 0, &vol[..7000])
+        .unwrap();
+    feed(&ex, 0, "v.rar", &vol, 7000, 12);
+
+    let (a, b, c) = (vec![0xA1u8; 4096], vec![0xB2u8; 4096], vec![0xC3u8; 4096]);
+    {
+        let mut g = ex.inner.lock_ok();
+        let inner = &mut *g;
+        assert!(
+            inner.slots[0].pw_await.is_some(),
+            "the slot must be parked awaiting a password"
+        );
+        // Paged FIRST, so the failing reclaim is holding a scratch
+        // charge and leaving the whole rest of the stash behind it.
+        let off = inner.scratch.append(&a, u64::MAX).unwrap();
+        inner.slots[0]
+            .header_spans
+            .insert(0, (0, HoldSpan::Paged { off, len: a.len() }));
+        inner.budget.add(b.len());
+        inner.slots[0]
+            .header_spans
+            .push((1 << 20, HoldSpan::Ram(b)));
+        inner.budget.add(c.len());
+        inner.slots[0]
+            .header_spans
+            .push((2 << 20, HoldSpan::Ram(c)));
+        // The re-key is about to pread that span back.
+        inner.scratch.st().file = None;
+    }
+    let err = ex
+        .apply_probed_password("late-sidecar-pw")
+        .expect_err("a dead scratch must fail the re-key");
+
+    // Whatever the failure left IN the slots is legitimately charged;
+    // nothing else may be. Walk the survivors and demand the two
+    // counters agree with them exactly.
+    let g = ex.inner.lock_ok();
+    let (mut ram, mut paged) = (0usize, 0u64);
+    for s in &g.slots {
+        for (_, sp) in s.holds.iter().chain(s.header_spans.iter()) {
+            match sp {
+                HoldSpan::Ram(b) => ram += b.len(),
+                HoldSpan::Paged { len, .. } => paged += *len as u64,
+            }
+        }
+    }
+    assert_eq!(
+        g.budget.len(),
+        ram,
+        "RAM budget overstated after a failed re-key ({err})"
+    );
+    assert_eq!(
+        g.scratch.st().live,
+        paged,
+        "scratch live count overstated after a failed re-key ({err})"
+    );
+    drop(g);
+    drop(ex);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The real 3-volume split fixture through the LEGACY route
+/// (`NZBFAST_NO_INSTREAM_DECRYPT`). The whole-file CRC lives on the
+/// TAIL piece and real `rar` sets the tweaked-checksum flag there
+/// alone: the tail stores the keyed FOLD of the whole-file CRC while
+/// the head's record says "plain". A gate built from the head's record
+/// compared the bare CRC against the fold and false-failed every
+/// intact split set - this is the regression test for that.
+#[test]
+fn real_rar_split_fixture_legacy_route_verifies() {
+    let secret = include_bytes!("../../testdata/rar5/secret.bin").to_vec();
+    let vols: Vec<(&str, &[u8])> = vec![
+        (
+            "enc-vols.part1.rar",
+            include_bytes!("../../testdata/rar5/enc-vols.part1.rar"),
+        ),
+        (
+            "enc-vols.part2.rar",
+            include_bytes!("../../testdata/rar5/enc-vols.part2.rar"),
+        ),
+        (
+            "enc-vols.part3.rar",
+            include_bytes!("../../testdata/rar5/enc-vols.part3.rar"),
+        ),
+    ];
+    let dir = tmpdir("enc-legacy-split");
+    let ex = Extractor::new(&dir, vols.len(), true);
+    ex.set_password("testpw123");
+    ex.set_instream_decrypt(false);
+    for (si, (name, bytes)) in vols.iter().enumerate() {
+        feed(&ex, si, name, bytes, 1400, 60 + si as u64);
+    }
+    let rep = ex.finish().unwrap();
+    assert!(rep.fallbacks.is_empty(), "{:?}", rep.fallbacks);
+    assert_eq!(rep.decrypted, vec!["secret.bin".to_string()]);
+    assert_eq!(std::fs::read(dir.join("secret.bin")).unwrap(), secret);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Damaged SPLIT ciphertext must fail its whole-file CRC on BOTH
+/// routes. One flipped byte in the middle volume's data area survives
+/// every other check (the stored password check proves only the key),
+/// so this gate is the only thing standing between wire damage and a
+/// silently corrupt published file - and before the tail-piece CRC was
+/// wired into the in-stream route, that route published this exact
+/// input on completeness alone.
+#[test]
+fn real_rar_split_damaged_ciphertext_fails_both_routes() {
+    let mut part2 = include_bytes!("../../testdata/rar5/enc-vols.part2.rar").to_vec();
+    // Inside part2's data area (data_off 119, data_len 1790) - headers
+    // and the stored check stay intact, only ciphertext is damaged.
+    part2[119 + 800] ^= 0xff;
+    for instream in [true, false] {
+        let vols: Vec<(&str, &[u8])> = vec![
+            (
+                "enc-vols.part1.rar",
+                include_bytes!("../../testdata/rar5/enc-vols.part1.rar"),
+            ),
+            ("enc-vols.part2.rar", &part2),
+            (
+                "enc-vols.part3.rar",
+                include_bytes!("../../testdata/rar5/enc-vols.part3.rar"),
+            ),
+        ];
+        let dir = tmpdir(&format!("enc-split-damaged-{instream}"));
+        let ex = Extractor::new(&dir, vols.len(), true);
+        ex.set_password("testpw123");
+        ex.set_instream_decrypt(instream);
+        for (si, (name, bytes)) in vols.iter().enumerate() {
+            feed(&ex, si, name, bytes, 1400, 60 + si as u64);
+        }
+        let err = match ex.finish() {
+            Err(e) => e,
+            Ok(rep) => panic!(
+                "instream={instream}: damaged split ciphertext published: {:?}",
+                rep.decrypted
+            ),
+        };
+        assert!(
+            err.to_string().contains("stored CRC"),
+            "instream={instream}: {err}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

@@ -1081,11 +1081,10 @@ nyttelast for at finde ud af det.</p>
 sikkerhed væk. Ingen markering betyder, at det ser fint ud.</li>
 <li>Et <b>ryddet</b>-mærke på grupper, hvor friske poster allerede fjernes, så du kan
 skelne en døende gruppe fra en uheldig udgivelse.</li>
-<li><b>Spring udbydere over, som oraklet har dømt ude</b> (Indstillinger, <b>slået fra
-som standard, eksperimentel</b>): når kontrollen er sikker på, at én udbyders backbone
-har mistet en udgivelse, springes den direkte over for det download i stedet for at
-vente på, at den fejler. Den springer aldrig din sidste tilbageværende udbyder
-over.</li>
+<li><b>Udbydere, oraklet har dømt ude, spørges sidst</b> (Indstillinger, <b>slået fra
+som standard, eksperimentel</b>): når kontrollen er sikker på, at én udbyders backbone har mistet en udgivelse, spørges
+den udbyder sidst for det download i stedet for først. Intet fjernes, så et forkert gæt
+koster lidt tid frem for selve downloadet.</li>
 </ul>
 <p class="dim">Dommen er en forudsigelse ud fra indicier, ikke en garanti. For et
 håndfast svar om én NZB tæller <code>nzbfast check</code> (<a href="#cli">§15</a>) de
@@ -1193,6 +1192,11 @@ og genskab den med de samme volume-indstillinger - gennemgangen i Synology-guide
 dækker det klik for klik, inklusive hvordan du gør det efter et skema.</td></tr>
 <tr><td>Synology (pakke)</td><td>Installér den nye <code>.spk</code> i Package
 Center; den opgraderer på stedet.</td></tr>
+<tr><td>QNAP (pakke, beta)</td><td>Installer den nye <code>.qpkg</code> i App
+Center; den opgraderes på stedet. Dine indstillinger og downloads ligger uden
+for appens egen mappe, så hverken en opgradering eller en afinstallation tager
+dem med.</td></tr>
+<tr><td>Debian / Ubuntu (.deb)<br>Fedora / RHEL (.rpm)</td><td>Installer den nye pakke oven på den gamle: <code>sudo dpkg -i nzbfast_*.deb</code> eller <code>sudo rpm -U nzbfast-*.rpm</code>. Din indstillingsmappe er ikke en del af pakken, så en opgradering kan ikke erstatte noget i den, og dine egne ændringer i <code>/etc/nzbfast/nzbfast.env</code> bevares. Tjenesten genstartes kun, hvis den allerede kørte.</td></tr>
 <tr><td>Homebrew</td><td><code>brew upgrade nzbfast</code></td></tr>
 <tr><td>Ren binær</td><td>Udskift binæren. Din konfiguration bliver, hvor du lavede
 den (<a href="#files">§17</a>).</td></tr>
@@ -1254,6 +1258,11 @@ Denne ene mappe rummer alt, hvad der er værd at tage backup af:</p>
 som er den værtsmappe, du har mappet til den. På Unraid er det appens
 appdata-mappe.</td></tr>
 <tr><td>Synology-pakken</td><td><code>/var/packages/nzbfast/var/</code></td></tr>
+<tr><td>QNAP-pakken</td><td>Som regel
+<code>/share/Download/nzbfast/config/</code>. Mappen vælges under installationen
+og nævnes i App Center-loggen; appens egen <code>nzbfast.env</code> noterer den
+også.</td></tr>
+<tr><td>Debian-/RPM-pakke</td><td><code>/var/lib/nzbfast/</code></td></tr>
 <tr><td>Terminal</td><td>Den mappe, du kørte <code>nzbfast setup</code> i, eller
 hvor end <code>--config</code> / <code>$NZBFAST_CONFIG</code> peger hen.</td></tr>
 </table></div>

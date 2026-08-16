@@ -21,6 +21,13 @@ pub(super) struct JobTail {
     pub(super) on_disk_bytes: u64,
     pub(super) verifier: Option<Arc<nzbkit::live::LiveVerifier>>,
     pub(super) shaper: Option<Arc<nzbkit::extract::Extractor>>,
+    /// M29 oracle samples, drained here and ingested on the lane. The
+    /// DRAIN has to happen on the runner (the hub's sink belongs to
+    /// this job, and the next job installs a fresh one); the INGEST
+    /// must not, because it takes the index write mutex and this loop
+    /// is the runner - see `settle_job_tail`.
+    #[cfg(feature = "indexer")]
+    pub(super) oracle_samples: Vec<nzbkit::oracle::Sample>,
 }
 
 /// TODO §156 item 7: the no-servers guard's config read, kept off the
@@ -648,19 +655,29 @@ pub(super) fn settle_job_tail(
     // are not billed twice here.
     d.flush_run_usage();
     d.add_reliability(&per_server_rel);
-    // M29 oracle: fold this job's per-article outcomes into
-    // the availability ledger (one batched transaction).
+    // M29 oracle: take this job's per-article outcomes off the hub
+    // before the next job installs its own sink. The FOLD into the
+    // ledger rides on the ticket and happens on the lane.
+    //
+    // It used to happen right here, and that is how a slow index
+    // stopped the queue dead. `with_index` takes the index write
+    // mutex under `block_in_place`, so this loop - the runner - parked
+    // on it: on 15 Aug an unbudgeted retention reap held that mutex for
+    // six hours, and the finished job never reached `lane.submit`, so
+    // its record stayed `Downloading`, its row read "Extracting" at
+    // 100% for as long as the daemon lived, no history row was ever
+    // filed, and its `IndexJobGuard` never dropped - which left the
+    // indexer paused on a download that had ended. Everything the
+    // runner does between net-drain and the lane belongs to the same
+    // rule as the config read below: keep it off the runner.
     #[cfg(feature = "indexer")]
-    if let Some(sink) = d.hub.oracle.lock_ok().take() {
-        let samples = sink.drain();
-        if !samples.is_empty() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|t| t.as_secs() as i64)
-                .unwrap_or(0);
-            d.with_index(|ix| ix.oracle_ingest(&samples, now).ok());
-        }
-    }
+    let oracle_samples = d
+        .hub
+        .oracle
+        .lock_ok()
+        .take()
+        .map(|sink| sink.drain())
+        .unwrap_or_default();
     // The verifier is still THIS job's too - keep the Arc so
     // the tail task reads the final in-stream bad-block count
     // even after the next job swaps the hub's slot.
@@ -675,5 +692,7 @@ pub(super) fn settle_job_tail(
         on_disk_bytes,
         verifier,
         shaper,
+        #[cfg(feature = "indexer")]
+        oracle_samples,
     }
 }

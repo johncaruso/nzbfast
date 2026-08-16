@@ -91,7 +91,12 @@ impl Daemon {
     /// resolve the keys the index actually holds. It is called at most
     /// once per eviction pass.
     #[cfg(feature = "indexer")]
-    pub fn protected_set(&self) -> nzbkit::index::Protected {
+    /// `None` = the set could not be FULLY assembled (index unavailable
+    /// or a resolver query failed). The caller must treat that as "do
+    /// not evict", never as an empty set: a transient SQLITE_BUSY here
+    /// used to shrink the protected set silently, and evict_to then
+    /// deleted watchlisted releases irreversibly.
+    pub fn protected_set(&self) -> Option<nzbkit::index::Protected> {
         // §151: a synced title is watched, so the size cap must not
         // evict what it is waiting for either.
         let items = self.watch_items();
@@ -114,14 +119,18 @@ impl Daemon {
             .map(|i| i.kind.clone())
             .collect();
         if !whole_custom.is_empty() {
+            // A failed resolver query fails the WHOLE assembly: dropping
+            // just this category's keys would hand evict_to a set that
+            // no longer protects it.
             self.with_index(|ix| {
                 for kind in &whole_custom {
-                    if let Ok(keys) = ix.title_keys_for_kind(kind) {
-                        watchlisted.extend(keys);
+                    match ix.title_keys_for_kind(kind) {
+                        Ok(keys) => watchlisted.extend(keys),
+                        Err(_) => return None,
                     }
                 }
                 Some(())
-            });
+            })?;
         }
         // A film watchlisted without a year matches every year the index
         // holds under that title (that is exactly what the watcher does
@@ -158,6 +167,8 @@ impl Daemon {
                         curated: false,
                         ..Default::default()
                     };
+                    // Err fails the whole assembly, same as above - a
+                    // `continue` silently un-protected this title.
                     let Ok((cards, _)) = ix.browse_cards(
                         &q,
                         // "" parses to Latest - the sort is irrelevant,
@@ -167,7 +178,7 @@ impl Daemon {
                         false,
                         None,
                     ) else {
-                        continue;
+                        return None;
                     };
                     let prefix = if kind == "movie" {
                         format!("m:{norm}:")
@@ -181,7 +192,7 @@ impl Daemon {
                     }
                 }
                 Some(())
-            });
+            })?;
         }
 
         let now = epoch_secs() as i64;
@@ -201,7 +212,7 @@ impl Daemon {
                     .collect::<Vec<_>>(),
             )
         };
-        assemble_protected(
+        Some(assemble_protected(
             watchlisted,
             // Queue + completed history, keyed the way the index groups
             // releases. Already the daemon's notion of "the user has, or
@@ -209,7 +220,7 @@ impl Daemon {
             self.owned_title_keys().into_iter().collect(),
             opened_titles,
             opened_releases,
-        )
+        ))
     }
 
     /// Prune the index down to `target` bytes under the current policy,
@@ -223,7 +234,12 @@ impl Daemon {
     #[cfg(feature = "indexer")]
     pub(in crate::serve) fn evict_to(&self, target: u64) -> EvictOutcome {
         let policy = self.evict_policy();
-        let protected = self.protected_set();
+        // A partial protected set must never reach the engine: eviction
+        // is irreversible, so "could not fully assemble" means "do not
+        // evict this pass", not "protect what we managed to list".
+        let Some(protected) = self.protected_set() else {
+            return EvictOutcome::Unavailable;
+        };
         let n_prot = protected.title_keys.len() + protected.release_ids.len();
         // The whole set, uncapped - see EVICT_MAX_PASSES for why there is
         // no longer a ceiling here.
@@ -379,9 +395,21 @@ impl Daemon {
         }
         // One batched lookup of the enriched rows for the distinct keys.
         let keys: Vec<String> = freq.keys().cloned().collect();
-        let rows = self
-            .with_index_read(|ix| ix.titles_for_keys(&keys).ok())
-            .unwrap_or_default();
+        // Checked, not flattened: a saturated read pool answers no rows,
+        // and a profile built from no rows has no genres and no kinds.
+        // Cached, that ranks the wall by nothing for the next 60 s - so
+        // the empty answer is used once and not remembered.
+        let answered = self.index_read_checked(|ix| ix.titles_for_keys(&keys).ok());
+        // `Some(rows)` is the ONLY shape that means the index answered:
+        // `titles_for_keys` returns Ok for a total miss too, so the
+        // closure hands back Some even for an empty map. `Ok(None)` is a
+        // failed query or a declined try_lock (a missing db file during a
+        // wipe), never "no rows" - and caching it ranks the wall by
+        // nothing for 60 s (Fable sweep 15 Aug). With the database
+        // switched off there is no answer to wait for, so that stays
+        // cacheable.
+        let index_answered = matches!(answered, Ok(Some(_))) || !self.index_db_wanted();
+        let rows = answered.unwrap_or_default().unwrap_or_default();
         let mut genre_w: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
         let mut kind_w: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
         let mut year_sum = 0f64;
@@ -425,7 +453,9 @@ impl Daemon {
             decade_center: (year_wt > 0.0).then(|| (year_sum / year_wt).round() as i32),
             n_signals,
         };
-        *self.taste_cache.lock_ok() = Some((std::time::Instant::now(), tp.clone()));
+        if index_answered {
+            *self.taste_cache.lock_ok() = Some((std::time::Instant::now(), tp.clone()));
+        }
         tp
     }
 
@@ -456,6 +486,22 @@ impl Daemon {
         })
     }
 
+    /// The TVmaze show id the enricher recorded for a TV title key -
+    /// the duplicate check's alias oracle (see `Index::tv_show_id`).
+    /// Read-only path on purpose: `dupe_collision` sits on the add
+    /// path, and an add must never park behind an ingest.
+    #[cfg(feature = "indexer")]
+    pub(in crate::serve) fn tv_show_id(&self, title_key: &str) -> Option<i64> {
+        self.with_index_read(|ix| ix.tv_show_id(title_key).ok().flatten())
+    }
+
+    /// Slim builds carry no index, so no title ever has a known show id
+    /// and the alias arm of the duplicate check simply never fires.
+    #[cfg(not(feature = "indexer"))]
+    pub(in crate::serve) fn tv_show_id(&self, _title_key: &str) -> Option<i64> {
+        None
+    }
+
     /// Run `f` against the shared index, opening it lazily. Returns the
     /// closure's value, or `None` if the index can't be opened (feature
     /// effectively off) - callers treat that as "no results".
@@ -476,14 +522,42 @@ impl Daemon {
         // poll timer - had no thread to resume on for 38 s.
         crate::persist::blocking_db(|| {
             let mut guard = self.index.lock_ok();
-            if guard.is_none() {
-                *guard = nzbkit::index::Index::open(&self.index_db).ok();
-                if guard.is_some() {
-                    self.index_migrated.store(true, Ordering::Release);
-                }
-            }
+            self.open_locked(&mut guard);
             guard.as_ref().and_then(f)
         })
+    }
+
+    /// Open the shared read-write connection into a guard the caller
+    /// already holds - and only if the daemon still wants the database.
+    ///
+    /// Asking `index_db_wanted` again HERE, and not only at the caller's
+    /// gate, is the whole point. The wind-down stores `exiting`, then
+    /// takes the handle out of this mutex and checkpoints and closes it
+    /// with the mutex FREE (see `close_index_for_exit`), so a caller that
+    /// passed the gate a moment before that store and then parked on the
+    /// lock - behind a whole ingest pass, 62 s on 28 Jul - would wake onto
+    /// an empty mutex and lazily reopen the database behind the close.
+    /// That reopen is no cheap no-op: it runs the migrations, so the
+    /// process exits leaving a fresh -wal and -shm on disk and the next
+    /// start pays a recovery pass, which is exactly the residue the close
+    /// path was written to remove.
+    ///
+    /// Taking the mutex is the ordering edge, so one question under it
+    /// settles the race both ways: a caller that wins the lock first
+    /// opens a handle the close then takes and closes properly, and one
+    /// that gets it after the close sees `exiting` and declines. Only the
+    /// lazy OPEN is guarded - a closure running against a handle that is
+    /// still `Some` holds the mutex, so the close cannot be mid-checkpoint
+    /// underneath it, and there is nothing to gain by aborting it.
+    #[cfg(feature = "indexer")]
+    fn open_locked(&self, guard: &mut std::sync::MutexGuard<'_, Option<nzbkit::index::Index>>) {
+        if guard.is_some() || !self.index_db_wanted() {
+            return;
+        }
+        **guard = nzbkit::index::Index::open(&self.index_db).ok();
+        if guard.is_some() {
+            self.index_migrated.store(true, Ordering::Release);
+        }
     }
 
     /// Borrow one of the pooled read-only connections, opening another
@@ -498,6 +572,24 @@ impl Daemon {
         let deadline = std::time::Instant::now() + INDEX_READ_WAIT;
         let mut st = self.index_read.inner.lock_ok();
         loop {
+            // Rechecked on every pass round the loop, under the pool
+            // lock, for the reason `open_locked` records - and this side
+            // is not merely possible, it is invited: `drop_index_read`
+            // wakes every waiter precisely so they open fresh connections
+            // now, and the wind-down calls it as its FIRST act. A waiter
+            // admitted before `exiting` was stored would answer that wake
+            // by opening a read-only connection behind the close, and the
+            // writer's own close would then no longer be the last one, so
+            // SQLite would keep both the -wal and the -shm.
+            //
+            // `Unavailable`, not `Busy`: the caller's fallback is
+            // `try_with_index`, which declines for the same reason, and
+            // that is a quiet empty answer. `Busy` would surface
+            // "index busy" on the wall and in search during a shutdown
+            // nobody is going to see the end of.
+            if !self.index_db_wanted() {
+                return Reader::Unavailable;
+            }
             if let Some(conn) = st.idle.pop() {
                 return Reader::Got(IndexReader {
                     pool: &self.index_read,
@@ -514,6 +606,21 @@ impl Daemon {
                 drop(st);
                 match nzbkit::index::Index::open_read_only(&self.index_db) {
                     Ok(conn) => {
+                        // Ask AGAIN, now that the open is done. The gate
+                        // above was read before the lock went, and the
+                        // open itself is unbounded (a cold file on a
+                        // network volume), so the exit signal can land
+                        // in the middle of it - and a reader handed out
+                        // afterwards outlives the writer's close, which
+                        // is what leaves the WAL behind that the close
+                        // path exists to truncate (Fable sweep 15 Aug).
+                        // The same arm the Err branch below writes.
+                        if !self.index_db_wanted() {
+                            drop(conn);
+                            self.index_read.inner.lock_ok().live -= 1;
+                            self.index_read.handed_back.notify_one();
+                            return Reader::Unavailable;
+                        }
                         return Reader::Got(IndexReader {
                             pool: &self.index_read,
                             conn: Some(conn),
@@ -595,6 +702,14 @@ impl Daemon {
         self.index_read_checked(f).unwrap_or(None)
     }
 
+    /// Arm [`DEBUG_READ_BUDGET`]: `n` further pooled reads succeed, then
+    /// every read reports the pool busy. Reachable only through the
+    /// NZBFAST_DEBUG_HOOKS-gated `mode=debug_index_read_busy`.
+    #[cfg(feature = "indexer")]
+    pub(in crate::serve) fn arm_debug_read_budget(n: i64) {
+        DEBUG_READ_BUDGET.store(n.max(0), Ordering::Relaxed);
+    }
+
     /// As [`Self::with_index_read`], with saturation reported rather than
     /// flattened into "nothing found": [`IndexBusy`] means every read
     /// connection was busy. The query surfaces a user watches while it
@@ -610,6 +725,9 @@ impl Daemon {
         }
         if !self.index_migrated.load(Ordering::Acquire) {
             return Ok(self.with_index(f));
+        }
+        if debug_read_budget_spent() {
+            return Err(IndexBusy);
         }
         match self.index_read_acquire() {
             Reader::Got(ix) => Ok(f(&ix)),
@@ -644,12 +762,7 @@ impl Daemon {
             let Ok(mut guard) = self.index.try_lock() else {
                 return None;
             };
-            if guard.is_none() {
-                *guard = nzbkit::index::Index::open(&self.index_db).ok();
-                if guard.is_some() {
-                    self.index_migrated.store(true, Ordering::Release);
-                }
-            }
+            self.open_locked(&mut guard);
             guard.as_ref().and_then(f)
         })
     }
@@ -680,12 +793,7 @@ impl Daemon {
             let Ok(mut guard) = self.index.try_lock() else {
                 return None;
             };
-            if guard.is_none() {
-                *guard = nzbkit::index::Index::open(&self.index_db).ok();
-                if guard.is_some() {
-                    self.index_migrated.store(true, Ordering::Release);
-                }
-            }
+            self.open_locked(&mut guard);
             guard.as_mut().and_then(f)
         })
     }
@@ -735,12 +843,7 @@ impl Daemon {
             return Some((0, 0, 0, 0));
         }
         if let Ok(mut guard) = self.index.try_lock() {
-            if guard.is_none() {
-                *guard = nzbkit::index::Index::open(&self.index_db).ok();
-                if guard.is_some() {
-                    self.index_migrated.store(true, Ordering::Release);
-                }
-            }
+            self.open_locked(&mut guard);
             if let Some(ix) = guard.as_ref() {
                 let (total, complete) = ix.stats().unwrap_or((0, 0));
                 let snap = (
@@ -793,12 +896,7 @@ impl Daemon {
         // that actually starved the runner.
         crate::persist::blocking_db(|| {
             let mut guard = self.index.lock_ok();
-            if guard.is_none() {
-                *guard = nzbkit::index::Index::open(&self.index_db).ok();
-                if guard.is_some() {
-                    self.index_migrated.store(true, Ordering::Release);
-                }
-            }
+            self.open_locked(&mut guard);
             guard.as_mut().and_then(f)
         })
     }
@@ -1116,4 +1214,163 @@ pub fn shrink_shortfall_reason(protected_keys: usize) -> String {
              target, or remove some of those first."
         )
     }
+}
+
+/// The handle discipline around the exit, tested here rather than in
+/// daemon_tests.rs because it is about this module's lazy opens and the
+/// private read pool they share.
+#[cfg(all(test, feature = "indexer"))]
+mod exit_tests {
+    use super::*;
+
+    /// A Daemon with the indexer switched on, over a scratch directory.
+    fn indexed_daemon(name: &str) -> (Arc<Daemon>, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("nzbfast-idxexit-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let d = crate::serve::testutil::test_daemon(&dir);
+        d.index_enabled.store(true, Ordering::Relaxed);
+        (d, dir)
+    }
+
+    /// `an_exiting_daemon_does_not_reopen_the_index` (daemon_tests.rs)
+    /// pins the ENTRY gate: a caller that arrives after `exiting` is set
+    /// declines. This pins the window the gate cannot cover - a caller
+    /// admitted a moment BEFORE the store, parked on the index mutex
+    /// behind an ingest, waking up after the close has taken the handle
+    /// out of it. Before `open_locked` it reopened the database there,
+    /// ran the migrations, and the daemon exited leaving a fresh -wal and
+    /// -shm behind: the exact residue the close path exists to remove.
+    #[test]
+    fn a_caller_admitted_before_the_exit_does_not_reopen_the_index() {
+        let (d, dir) = indexed_daemon("reopen");
+        // Open it once first, so this is about the REopen rather than
+        // about a first open.
+        assert!(
+            d.with_index(|ix| ix.kv_set("probe", "1").ok()).is_some(),
+            "fixture could not open the index - the assertions below would prove nothing"
+        );
+
+        // The test thread stands in for the ingest pass this mutex is
+        // documented as being held by for whole passes (62 s on 28 Jul).
+        let mut guard = d.index.lock_ok();
+        let admitted = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let d = d.clone();
+            let admitted = admitted.clone();
+            std::thread::spawn(move || {
+                admitted.store(true, Ordering::SeqCst);
+                d.with_index(|ix| ix.kv_get("probe"))
+            })
+        };
+        while !admitted.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Between that flag and the park sits one atomic load and a
+        // `blocking_db` hop, so a beat is enough for it to be through the
+        // gate and waiting on the mutex we hold.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // The close's exact move: `exiting`, the handle out of the mutex,
+        // then the mutex released and the connection closed outside it.
+        d.exiting.store(true, Ordering::Relaxed);
+        let taken = guard.take();
+        drop(guard);
+        drop(taken);
+
+        assert!(
+            reader
+                .join()
+                .expect("the admitted caller panicked")
+                .is_none(),
+            "the admitted caller answered from an index the close had already taken"
+        );
+        assert!(
+            d.index.lock_ok().is_none(),
+            "a caller admitted before the exit reopened the index behind the close - \
+             the daemon goes on to exit leaving a fresh -wal and -shm on disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The read pool's side of the same window, and the wider one: the
+    /// close calls `drop_index_read` first, and that wakes every waiter
+    /// precisely so they open fresh connections. A woken caller that
+    /// opened one would stop the writer's close from being the last
+    /// connection, so SQLite would keep both the -wal and the -shm.
+    #[test]
+    fn the_read_pool_opens_nothing_once_the_daemon_is_exiting() {
+        let (d, dir) = indexed_daemon("readpool");
+        assert!(
+            d.with_index(|ix| ix.kv_set("probe", "1").ok()).is_some(),
+            "fixture could not open the index"
+        );
+        // One borrow and back, so the pool is warm and the path is known
+        // to work on this fixture.
+        assert!(
+            matches!(d.index_read_acquire(), Reader::Got(_)),
+            "the read pool would not open a connection at all"
+        );
+        assert_eq!(d.index_read.inner.lock_ok().live, 1);
+
+        // The wind-down, as far as its first act.
+        d.exiting.store(true, Ordering::Relaxed);
+        d.drop_index_read();
+        assert_eq!(
+            d.index_read.inner.lock_ok().live,
+            0,
+            "the retire left a read connection open"
+        );
+
+        // A query handler admitted before that store is past its own gate
+        // already, so this call is exactly what it does next.
+        assert!(
+            matches!(d.index_read_acquire(), Reader::Unavailable),
+            "the read pool served an exiting daemon (and Busy would put \
+             \"index busy\" on the wall during a shutdown, which is why this \
+             asks for Unavailable specifically)"
+        );
+        assert_eq!(
+            d.index_read.inner.lock_ok().live,
+            0,
+            "a read-only connection was opened behind the close - the writer's \
+             close is no longer the last one, so the -wal and -shm stay"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// NZBFAST_DEBUG_HOOKS fault injection for the read pool
+/// (`mode=debug_index_read_busy`): let the next N pooled reads through,
+/// then report the pool saturated from there on.
+///
+/// A handler that reads the index TWICE is the shape this exists for.
+/// Saturating the pool from outside can only make the FIRST read busy -
+/// the window between one handler's two reads is microseconds wide, so
+/// the case where an early read succeeds and a later one does not is
+/// unreachable from a test and reachable every day on a live daemon.
+/// `rar_name` answered "no such release" in exactly that window
+/// (read-only sweep 2, 15 Aug 2026, L5).
+///
+/// Off by default and process-global: -1 is "no injection", and the
+/// daemon under test is its own process, so arming it cannot reach any
+/// other daemon.
+#[cfg(feature = "indexer")]
+static DEBUG_READ_BUDGET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+/// Spend one unit of the injected budget. `false` - the only answer a
+/// daemon that never armed it can get - means "carry on".
+#[cfg(feature = "indexer")]
+fn debug_read_budget_spent() -> bool {
+    if DEBUG_READ_BUDGET.load(Ordering::Relaxed) < 0 {
+        return false;
+    }
+    if DEBUG_READ_BUDGET.fetch_sub(1, Ordering::Relaxed) > 0 {
+        return false;
+    }
+    // Pin at zero rather than letting it run negative into the
+    // "not armed" sentinel.
+    DEBUG_READ_BUDGET.store(0, Ordering::Relaxed);
+    true
 }

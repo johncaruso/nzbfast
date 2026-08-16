@@ -102,9 +102,15 @@ thread_local! {
 /// is what makes the interleaving a schedule instead of a sleep. First
 /// barrier: the commit has saved the queue and is about to tombstone;
 /// second: the test has run its interleaved work and releases it.
+///
+/// Keyed by nzo_id, like `postproc::TAIL_GEN_BARRIER`. `retry` commits
+/// through here and dozens of bin tests call `retry`, in parallel with
+/// this one - unkeyed, any of them becomes a third waiter on a
+/// two-party barrier and the whole run hangs rather than fails (the
+/// 15 Aug `PARK_GEN_BARRIER` wedge, same shape).
 #[cfg(test)]
 pub(in crate::serve) static COMMIT_TOMB_BARRIER: Mutex<
-    Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+    Option<(String, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 > = Mutex::new(None);
 
 /// Run `f` with the §158 rule in force on this thread.
@@ -251,8 +257,11 @@ impl Daemon {
         if self.save_queue() {
             #[cfg(test)]
             {
-                let pair = COMMIT_TOMB_BARRIER.lock_ok().clone();
-                if let Some((entered, released)) = pair {
+                let pair = COMMIT_TOMB_BARRIER
+                    .lock_ok()
+                    .clone()
+                    .filter(|(k, _, _)| k == nzo_id);
+                if let Some((_, entered, released)) = pair {
                     entered.wait();
                     released.wait();
                 }
@@ -287,14 +296,28 @@ impl Daemon {
     /// priority - because this play IS the download trigger.
     pub(in crate::serve) fn activate_parked(&self, job: &Arc<Mutex<Job>>) {
         let nzo = job.lock_ok().nzo_id.clone();
+        // Same claim transaction as `retry`: from the history retain
+        // below until the queue push, the record is in NEITHER store in
+        // memory, and a concurrent add picking a directory under
+        // `add_lock` would read this job's folder as free - its first
+        // decoded span then truncates the payload this play is about to
+        // serve. Held across the in-memory move only, dropped before the
+        // durable commit exactly as `retry` drops it before
+        // `commit_to_queue`.
+        let publish = self.add_lock.lock_ok();
         // Same Q2 fence as retry: between this removal and commit_to_queue's
         // save, a concurrent history compaction must carry the disk row or a
         // crash in the window loses the record from both stores.
         let _inflight = self.hist_inflight_begin(&nzo);
         self.history.lock_ok().retain(|x| !Arc::ptr_eq(x, job));
+        // The harness's window: the record has left history and not yet
+        // reached the queue.
+        #[cfg(test)]
+        super::storecut::activate_gap(self);
         stamp_move(job);
         let seq = job.lock_ok().move_seq;
         self.queue.lock_ok().push_front(job.clone());
+        drop(publish);
         self.commit_to_queue(&nzo, seq, "fetching");
     }
 }
@@ -605,6 +628,104 @@ mod harness {
         )
     }
 
+    /// The dir-claim fence: from the instant `park` drops the row from
+    /// the live queue until it files the record into `self.history`,
+    /// the job is in neither store in memory - so `dir_claim` reads its
+    /// canonical directory as free, and an add landing in the window is
+    /// handed the folder of a finished payload, whose first decoded
+    /// span truncates it. Directory decisions run under `add_lock`, so
+    /// the fence is that park holds it across the window.
+    #[test]
+    fn a_park_holds_the_add_lock_across_its_neither_store_window() {
+        let dir = tmp("park-claim");
+        let d = test_daemon(&dir);
+        let j = job(&d, "nzo_a1", JobState::Finishing);
+        let out = j.lock_ok().out_dir.clone();
+        d.queue.lock_ok().push_back(j.clone());
+        assert!(d.save_queue());
+        j.lock_ok().state = JobState::Completed;
+        let probed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = probed.clone();
+        let out2 = out.clone();
+        super::super::storecut::on_park_gap(move |d| {
+            // The window is real: the record is in neither store, so the
+            // claim scan itself answers Free here...
+            assert!(
+                matches!(d.dir_claim(&out2), DirClaim::Free),
+                "the record is in neither store, so the scan answers Free"
+            );
+            // ...which is exactly why no add may be ALLOWED to scan: the
+            // deciders all take `add_lock` first, and park must be
+            // holding it.
+            assert!(
+                d.add_lock.try_lock().is_err(),
+                "the add lock is free inside park's neither-store window - \
+                 a concurrent add could claim this job's directory"
+            );
+            flag.store(true, Ordering::Relaxed);
+        });
+        d.park(j);
+        super::super::storecut::disarm();
+        assert!(probed.load(Ordering::Relaxed), "the gap seam never fired");
+        // Released once the record is filed, and the record answers for
+        // its directory again.
+        assert!(d.add_lock.try_lock().is_ok());
+        assert!(
+            d.history
+                .lock_ok()
+                .iter()
+                .any(|x| x.lock_ok().nzo_id == "nzo_a1"),
+            "the parked record must be in history"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The same fence on the other move: `activate_parked` takes the
+    /// record out of history before it reaches the queue, and used to
+    /// take no `add_lock` at all.
+    #[test]
+    fn an_activation_holds_the_add_lock_across_its_neither_store_window() {
+        let dir = tmp("activate-claim");
+        let d = test_daemon(&dir);
+        let j = job(&d, "nzo_a2", JobState::Completed);
+        {
+            let mut g = j.lock_ok();
+            g.library = true;
+            g.fetched = false;
+        }
+        d.history.lock_ok().push(j.clone());
+        assert!(d.history_upsert(std::slice::from_ref(&j)));
+        assert!(d.save_queue());
+        {
+            let mut g = j.lock_ok();
+            g.state = JobState::Queued;
+            g.priority = 2;
+            g.paused = false;
+        }
+        let probed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = probed.clone();
+        super::super::storecut::on_activate_gap(move |d| {
+            assert!(
+                d.add_lock.try_lock().is_err(),
+                "the add lock is free inside the activation's neither-store \
+                 window - a concurrent add could claim this job's directory"
+            );
+            flag.store(true, Ordering::Relaxed);
+        });
+        d.activate_parked(&j);
+        super::super::storecut::disarm();
+        assert!(probed.load(Ordering::Relaxed), "the gap seam never fired");
+        assert!(d.add_lock.try_lock().is_ok());
+        assert!(
+            d.queue
+                .lock_ok()
+                .iter()
+                .any(|x| x.lock_ok().nzo_id == "nzo_a2"),
+            "the activated record must be in the queue"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The rule itself, without a filesystem: a tie keeps the §158
     /// answer, which is what every record written before this field
     /// existed produces.
@@ -670,7 +791,8 @@ mod harness {
 
         let entered = Arc::new(std::sync::Barrier::new(2));
         let released = Arc::new(std::sync::Barrier::new(2));
-        *COMMIT_TOMB_BARRIER.lock_ok() = Some((entered.clone(), released.clone()));
+        *COMMIT_TOMB_BARRIER.lock_ok() =
+            Some(("nzo_t1".to_string(), entered.clone(), released.clone()));
         let retry = {
             let d = d.clone();
             std::thread::spawn(move || assert!(d.retry("nzo_t1")))

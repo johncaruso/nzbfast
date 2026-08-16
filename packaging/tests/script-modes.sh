@@ -27,7 +27,22 @@ bad() { echo "  FAIL - $1"; FAIL=$((FAIL + 1)); }
 # listed here must be run some other way that sets the bit itself.
 #   docker-entrypoint.sh - never invoked from the checkout; both
 #   Dockerfiles COPY it and `RUN chmod +x` it inside the image.
+#
+#   catalogues/proxmox/{ct,install}/*.sh - the Proxmox VE helper-script
+#   convention never runs either one by path. ct/nzbfast.sh is the
+#   `bash -c "$(curl -fsSL .../ct/nzbfast.sh)"` entry point, and the
+#   engine reads the install script as TEXT and pipes it in:
+#   `lxc-attach -n "$CTID" -- bash -c "$(_cs_fetch_text install/...)"`
+#   (community-scripts/core, pve/backend.func) - a path that `cat`s the
+#   file even when a local checkout supplies it. These directories
+#   mirror community-scripts/ProxmoxVED byte for byte so a submission is
+#   a copy, and upstream ships them non-executable: 577 of 590 ct/*.sh
+#   and 569 of 577 install/*.sh in ProxmoxVE are 100644.
+# One space-separated list - the lookup below matches " $path " inside it,
+# so entries have to be separated by spaces, not newlines.
 NON_EXEC="packaging/docker-entrypoint.sh"
+NON_EXEC="$NON_EXEC packaging/catalogues/proxmox/ct/nzbfast.sh"
+NON_EXEC="$NON_EXEC packaging/catalogues/proxmox/install/nzbfast-install.sh"
 
 listing=$(git ls-files -s 'packaging/*.sh' 'packaging/**/*.sh')
 [ -n "$listing" ] || { echo "no packaging scripts found - wrong directory?"; exit 1; }

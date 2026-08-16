@@ -435,15 +435,21 @@ fn m_remote_info(
         // unlike interface auto-detection it stays correct behind
         // Docker/NAT/reverse proxies, where local_addr() would be a
         // container bridge IP (172.17.x) no other device can reach.
-        let host_only = ctx
-            .host_hdr
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(ctx.host_hdr);
-        let is_loopback = matches!(
-            host_only.trim_start_matches('[').trim_end_matches(']'),
-            "localhost" | "127.0.0.1" | "::1"
-        );
+        // An IPv6 literal is bracketed, and its own colons are not the
+        // port separator: `rsplit_once(':')` on a portless "[::1]" hands
+        // back "[:", which is neither a host nor loopback - so a daemon
+        // reached over IPv6 on 80/443 advertised its loopback URL as the
+        // LAN one. Split after the bracket; a name or an IPv4 has no
+        // colon but the port's.
+        let host_only = match ctx.host_hdr.strip_prefix('[') {
+            Some(rest) => rest.split_once(']').map(|(h, _)| h).unwrap_or(rest),
+            None => ctx
+                .host_hdr
+                .split_once(':')
+                .map(|(h, _)| h)
+                .unwrap_or(ctx.host_hdr),
+        };
+        let is_loopback = matches!(host_only, "localhost" | "127.0.0.1" | "::1");
         let containerized = std::path::Path::new("/.dockerenv").exists();
         if !ctx.host_hdr.is_empty() && !is_loopback {
             urls.push(json!({"kind": "connected",

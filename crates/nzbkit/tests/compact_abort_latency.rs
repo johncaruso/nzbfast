@@ -89,7 +89,13 @@ fn build_ballast(path: &Path, releases: usize, parts: usize) {
 fn prune(path: &Path, label: &str) {
     let ix = Index::open(path).unwrap();
     let before = ix.db_bytes().unwrap();
-    let pruned = ix.prune_age(200 * 86_400, 1_900_000_000).unwrap();
+    let (pruned, _) = ix
+        .prune_age(
+            200 * 86_400,
+            1_900_000_000,
+            std::time::Instant::now() + std::time::Duration::from_secs(3_600),
+        )
+        .unwrap();
     let live = ix.live_bytes().unwrap();
     let free = ix.freelist_pages().unwrap();
     println!(

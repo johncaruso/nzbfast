@@ -230,7 +230,8 @@ async fn a_permanent_auth_refusal_settles_the_account_for_every_worker() {
     let ctx = ctx_for(&servers, 0);
     let mut finished = sh.finished.subscribe();
     let (connects, reconnects) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-    let (mut fails, mut bounces, mut ever, mut last_end) = (0u32, 0u32, false, None);
+    let (mut fails, mut flap, mut bounces, mut ever, mut last_end) =
+        (0u32, 0u32, 0u32, false, None);
     let step = dial_session(
         &sc,
         &cfg,
@@ -240,6 +241,7 @@ async fn a_permanent_auth_refusal_settles_the_account_for_every_worker() {
         &reconnects,
         &mut finished,
         &mut fails,
+        &mut flap,
         &mut bounces,
         &mut ever,
         false,
@@ -273,6 +275,7 @@ async fn a_permanent_auth_refusal_settles_the_account_for_every_worker() {
         &reconnects,
         &mut finished,
         &mut fails,
+        &mut flap,
         &mut bounces,
         &mut ever,
         false,
@@ -320,7 +323,8 @@ async fn a_keeper_paces_capacity_bounces_instead_of_walking_to_exhaustion() {
     let ctx = ctx_for(&servers, 0);
     let mut finished = sh.finished.subscribe();
     let (connects, reconnects) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-    let (mut fails, mut bounces, mut ever, mut last_end) = (0u32, 0u32, false, None);
+    let (mut fails, mut flap, mut bounces, mut ever, mut last_end) =
+        (0u32, 0u32, 0u32, false, None);
     for expect in 1..=2u32 {
         let step = dial_session(
             &sc,
@@ -331,6 +335,7 @@ async fn a_keeper_paces_capacity_bounces_instead_of_walking_to_exhaustion() {
             &reconnects,
             &mut finished,
             &mut fails,
+            &mut flap,
             &mut bounces,
             &mut ever,
             true,
@@ -341,7 +346,12 @@ async fn a_keeper_paces_capacity_bounces_instead_of_walking_to_exhaustion() {
             matches!(step, DialStep::Retry),
             "a keeper retries a capacity bounce, paced"
         );
-        assert_eq!(bounces, expect, "bounces pace on their own counter");
+        assert_eq!(flap, expect, "bounces pace on their own counter");
+        assert_eq!(
+            bounces, 0,
+            "and NOT on the capacity-probe ladder's - sharing that counter \
+             walked a flapped keeper past the single-prober election"
+        );
         assert_eq!(
             fails, 0,
             "a bounce is not a connect failure - the keeper must never \
@@ -386,7 +396,8 @@ async fn a_dead_host_walks_its_ladder_then_becomes_the_prober() {
     let ctx = ctx_for(&servers, 0);
     let mut finished = sh.finished.subscribe();
     let (connects, reconnects) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-    let (mut fails, mut bounces, mut ever, mut last_end) = (0u32, 0u32, false, None);
+    let (mut fails, mut flap, mut bounces, mut ever, mut last_end) =
+        (0u32, 0u32, 0u32, false, None);
     let step = dial_session(
         &sc,
         &cfg,
@@ -396,6 +407,7 @@ async fn a_dead_host_walks_its_ladder_then_becomes_the_prober() {
         &reconnects,
         &mut finished,
         &mut fails,
+        &mut flap,
         &mut bounces,
         &mut ever,
         false,
@@ -414,6 +426,7 @@ async fn a_dead_host_walks_its_ladder_then_becomes_the_prober() {
         &reconnects,
         &mut finished,
         &mut fails,
+        &mut flap,
         &mut bounces,
         &mut ever,
         false,
@@ -536,6 +549,195 @@ async fn the_probers_horizon_declares_the_server_dead_and_frees_the_parked() {
         matches!(parked.await.expect("parked worker"), DialStep::Quit),
         "a Dead verdict releases the parked fleet to exit, so the run \
          can seal instead of idling forever"
+    );
+}
+
+/// M3 (read-only sweep 2): the THIRD way an episode ends. A capacity
+/// episode parks most of the fleet and elects one prober; if that
+/// prober's next dial comes back a PERMANENT refusal - a disabled
+/// account, or a provider that changed the wording of its cap - the
+/// server is settled for good, and nothing published an episode
+/// verdict. Active workers read `rejected` at the top of the dial and
+/// quit, but the parked ones are not in the dial loop at all: they wake
+/// only for a newer Reopened, a Dead, `finished` or `draining`. On a
+/// single-server run nothing else can finish the work, so `finished`
+/// never fires either - `workers_live` stayed non-zero, the run never
+/// reached its terminal seal, and a CLI invocation hung until an
+/// external cancellation.
+///
+/// Both directions, because publishing Dead too eagerly is the opposite
+/// bug: the second half drives a CAPACITY refusal through the same
+/// parked fleet and requires that the episode stays open and still
+/// reopens.
+#[tokio::test]
+async fn a_permanent_refusal_releases_the_workers_parked_on_a_capacity_episode() {
+    // Three of a four-strong fleet yield to the episode and park; the
+    // fourth is the prober. Returns the parked handles.
+    async fn park_three(
+        sh: &Arc<Shared>,
+        cfg: &PoolConfig,
+        ctx: ServerCtx,
+    ) -> Vec<tokio::task::JoinHandle<DialStep>> {
+        sh.alive[0].store(4, Ordering::SeqCst);
+        let mut parked = Vec::new();
+        for _ in 0..3 {
+            let sh2 = sh.clone();
+            let cfg2 = cfg.clone();
+            parked.push(tokio::spawn(async move {
+                let mut finished = sh2.finished.subscribe();
+                let (mut bounces, mut fails) = (0u32, 0u32);
+                park_or_probe(&cfg2, ctx, &sh2, &mut finished, &mut bounces, &mut fails).await
+            }));
+        }
+        // They must REALLY be parked before the refusal lands, or the
+        // test proves nothing about waking them.
+        for _ in 0..500 {
+            if sh.auth[0].yielded.load(Ordering::SeqCst) == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            sh.auth[0].yielded.load(Ordering::SeqCst),
+            3,
+            "three workers yielded their slots to the episode"
+        );
+        assert!(
+            parked.iter().all(|h| !h.is_finished()),
+            "and each is waiting on the prober's verdict"
+        );
+        parked
+    }
+
+    let cfg = PoolConfig {
+        connect_backoff: Duration::from_millis(1),
+        ..Default::default()
+    };
+
+    // The account is gone for good.
+    let srv = MockServer::start(
+        std::collections::HashMap::new(),
+        Chaos {
+            auth_rejected: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut sc = srv.server_config();
+    sc.username = Some("u".into());
+    sc.password = Some("p".into());
+    let servers = vec![(sc.clone(), PoolConfig::default())];
+    let (sh, _) = Shared::new(fresh(&["<a@x>"]), &servers);
+    let ctx = ctx_for(&servers, 0);
+    let parked = park_three(&sh, &cfg, ctx).await;
+
+    let mut finished = sh.finished.subscribe();
+    let (connects, reconnects) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let (mut fails, mut flap, mut bounces, mut ever, mut last_end) =
+        (0u32, 0u32, 0u32, false, None);
+    let step = dial_session(
+        &sc,
+        &cfg,
+        ctx,
+        &sh,
+        &connects,
+        &reconnects,
+        &mut finished,
+        &mut fails,
+        &mut flap,
+        &mut bounces,
+        &mut ever,
+        false,
+        &mut last_end,
+    )
+    .await;
+    assert!(
+        matches!(step, DialStep::Quit),
+        "a credential cannot be retried"
+    );
+    assert!(sh.auth[0].is_rejected(), "the server is settled for good");
+    for h in parked {
+        let step = tokio::time::timeout(Duration::from_secs(10), h)
+            .await
+            .expect(
+                "a parked worker must be released by the refusal - left waiting, \
+                 workers_live never reaches zero and the run never seals",
+            )
+            .expect("parked worker");
+        assert!(matches!(step, DialStep::Quit));
+    }
+    assert!(
+        matches!(*sh.auth[0].episode.borrow(), (CapEpisode::Dead, _)),
+        "a permanent refusal is as final as the prober's horizon, so it \
+         owes the parked fleet the same verdict"
+    );
+
+    // The other direction: the SAME shape with a capacity refusal, which
+    // is transient. Nothing may be declared final and the parked fleet
+    // must still rejoin when the cap clears.
+    let srv = MockServer::start(
+        std::collections::HashMap::new(),
+        Chaos {
+            auth_rejected: true,
+            auth_refusal_text: Some("481 max number of simultaneous IP addresses reached".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut sc = srv.server_config();
+    sc.username = Some("u".into());
+    sc.password = Some("p".into());
+    let servers = vec![(sc.clone(), PoolConfig::default())];
+    let (sh, _) = Shared::new(fresh(&["<b@x>"]), &servers);
+    let ctx = ctx_for(&servers, 0);
+    let parked = park_three(&sh, &cfg, ctx).await;
+
+    let mut finished = sh.finished.subscribe();
+    let (mut fails, mut flap, mut bounces, mut ever, mut last_end) =
+        (0u32, 0u32, 0u32, false, None);
+    let step = dial_session(
+        &sc,
+        &cfg,
+        ctx,
+        &sh,
+        &connects,
+        &reconnects,
+        &mut finished,
+        &mut fails,
+        &mut flap,
+        &mut bounces,
+        &mut ever,
+        false,
+        &mut last_end,
+    )
+    .await;
+    assert!(
+        matches!(step, DialStep::Retry),
+        "a capacity refusal is transient - the prober paces and goes again"
+    );
+    assert!(!sh.auth[0].is_rejected());
+    assert!(
+        !matches!(*sh.auth[0].episode.borrow(), (CapEpisode::Dead, _)),
+        "a cap that can still clear is never published as final"
+    );
+    assert!(
+        parked.iter().all(|h| !h.is_finished()),
+        "so the fleet stays parked instead of being torn down"
+    );
+    // The cap clears: a granted session reopens the episode and the
+    // parked fleet rejoins at full width.
+    sh.auth[0].publish_episode(CapEpisode::Reopened);
+    for h in parked {
+        let step = tokio::time::timeout(Duration::from_secs(10), h)
+            .await
+            .expect("a reopened episode must still wake the parked fleet")
+            .expect("parked worker");
+        assert!(matches!(step, DialStep::Retry));
+    }
+    assert_eq!(
+        sh.auth[0].yielded.load(Ordering::SeqCst),
+        0,
+        "and each rejoiner gave its slot back"
     );
 }
 

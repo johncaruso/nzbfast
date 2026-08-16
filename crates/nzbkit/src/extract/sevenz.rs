@@ -198,12 +198,28 @@ impl Extractor {
             return Ok(false);
         }
         inner.slots[slot].mode = SlotMode::SevenZ;
-        let holds = std::mem::take(&mut inner.slots[slot].holds);
         inner.slots[slot].pre_bytes = 0;
         let mut stored = 0usize;
-        for (off, span) in holds {
-            let bytes = Self::reclaim_span(inner, span)?;
-            stored = buf.write_span(off, &bytes);
+        // The holds are OUT of the slot now, so a reclaim that fails
+        // (a scratch read error) must uncharge what it did not read:
+        // dropping the rest of the vec frees the memory but leaves the
+        // budget - and the scratch reservation - charged for it.
+        let mut rest = std::mem::take(&mut inner.slots[slot].holds).into_iter();
+        let mut failed = None;
+        for (off, span) in rest.by_ref() {
+            match Self::reclaim_span(inner, span) {
+                Ok(bytes) => stored = buf.write_span(off, &bytes),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = failed {
+            for (_, span) in rest {
+                Self::uncharge_span(inner, &span);
+            }
+            return Err(e);
         }
         inner.budget.add(stored);
         // See the RAR attach: held spans that disagree with each other
@@ -440,7 +456,9 @@ impl Extractor {
         inner: &mut Inner,
         ctl: &Arc<SevenZCtl>,
     ) -> io::Result<()> {
-        if !inner.sevenz_trim_on || !ctl.trim_ok.load(Ordering::Relaxed) {
+        // Acquire pairs with arm_trim's Release: seeing trim_ok true must
+        // also see the watermark reset that preceded it.
+        if !inner.sevenz_trim_on || !ctl.trim_ok.load(Ordering::Acquire) {
             return Ok(());
         }
         // Every part, not just the one whose span breached the budget:
@@ -822,7 +840,15 @@ impl SevenZSet {
             return None;
         }
         let part_size = st.parts.get(&1).map(|p| p.size)?;
-        Some((part_size, st.parts.values().map(|p| p.size).sum()))
+        // Saturating: the sizes are slot sizes, and a slot is sized from
+        // the NZB's declared byte counts - untrusted arithmetic, which a
+        // debug build turns into a panic on overflow.
+        Some((
+            part_size,
+            st.parts
+                .values()
+                .fold(0u64, |a, p| a.saturating_add(p.size)),
+        ))
     }
 
     /// Which part is this slot, and what is the split size? Used to turn
@@ -944,10 +970,15 @@ impl SevenZCtl {
     ///
     /// Same thread as the reader, so the two stores cannot interleave
     /// with a read; the only other party is the routing thread, which
-    /// reads both.
+    /// reads both. Release on the enable / Acquire on its load is what
+    /// ORDERS the pair for that thread: with both Relaxed, a
+    /// weakly-ordered CPU (the arm64 targets) could observe
+    /// `trim_ok == true` beside the pre-reset watermark and release the
+    /// entire retained buffer - the exact spurious drain the reset
+    /// exists to prevent, back intermittently under memory pressure.
     pub(super) fn arm_trim(&self, needs_history: bool) {
         self.low_water.store(0, Ordering::Relaxed);
-        self.trim_ok.store(!needs_history, Ordering::Relaxed);
+        self.trim_ok.store(!needs_history, Ordering::Release);
     }
 
     /// A container opened by a continuation part, waiting for the `.001`

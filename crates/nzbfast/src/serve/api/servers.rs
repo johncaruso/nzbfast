@@ -762,12 +762,17 @@ fn m_connladder(
                 // write - it makes both readings wrong, on a probe
                 // whose entire job is measuring contention.
                 // A cancel left over from a previous run must not kill
-                // this one before it has measured anything.
-                d.ladder_cancel.store(false, Ordering::Release);
+                // this one before it has measured anything. Cleared only
+                // AFTER the permit is ours: a losing request (retry
+                // click, second tab) that cleared first would erase a
+                // cancel meant for the run still climbing, and that run
+                // would then pass the !cancelled gate and record a knee
+                // from wherever the user lost patience.
                 let Some(_permit) = crate::serve::daemon::LadderPermit::try_take(d) else {
                     return Some(json!({"status": false,
                             "error": "a connection test is already running -                                       wait for it to finish, then try again"}));
                 };
+                d.ladder_cancel.store(false, Ordering::Release);
                 tokio::runtime::Handle::current().block_on(async {
                     // Real-content articles from the user's own
                     // downloads, STAT-verified on this provider (design

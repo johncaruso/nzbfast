@@ -1120,11 +1120,11 @@ haalt daarvoor nooit payload op.</p>
 met zekerheid weg. Geen markering betekent dat het er goed uitziet.</li>
 <li>Een <b>opgeruimd</b>-badge bij groepen waar verse posts al worden weggehaald, zodat
 je een stervende groep kunt onderscheiden van een ongelukkige release.</li>
-<li><b>Sla providers over die volgens het orakel niets meer hebben</b> (Instellingen,
-<b>standaard uit, experimenteel</b>): als de controle er zeker van is dat de backbone
-van één provider een release kwijt is, wordt die voor die download meteen
-overgeslagen in plaats van te wachten tot hij faalt. Je laatst overgebleven provider
-slaat hij nooit over.</li>
+<li><b>Providers die het orakel afschrijft komen als laatste</b> (Instellingen,
+<b>standaard uit, experimenteel</b>): als de controle er zeker van is dat de backbone van één provider een release kwijt is,
+wordt die provider bij die download als laatste gevraagd in plaats van als eerste. Er
+wordt niets verwijderd, dus een verkeerde inschatting kost wat tijd in plaats van de
+download.</li>
 </ul>
 <p class="dim">Het oordeel is een voorspelling op basis van aanwijzingen, geen garantie.
 Voor een hard antwoord over één NZB telt <code>nzbfast check</code>
@@ -1237,6 +1237,11 @@ in de Synology-handleiding beschrijft het klik voor klik, inclusief hoe je het o
 een schema laat lopen.</td></tr>
 <tr><td>Synology (pakket)</td><td>Installeer de nieuwe <code>.spk</code> in Package
 Center; die wordt ter plekke bijgewerkt.</td></tr>
+<tr><td>QNAP (pakket, bèta)</td><td>Installeer de nieuwe <code>.qpkg</code>
+in App Center; die wordt ter plekke bijgewerkt. Je instellingen en downloads
+staan buiten de map van de app, dus een update of een verwijdering neemt ze niet
+mee.</td></tr>
+<tr><td>Debian / Ubuntu (.deb)<br>Fedora / RHEL (.rpm)</td><td>Installeer het nieuwe pakket over het oude heen: <code>sudo dpkg -i nzbfast_*.deb</code> of <code>sudo rpm -U nzbfast-*.rpm</code>. Je instellingenmap maakt geen deel uit van het pakket, dus een upgrade kan er niets in vervangen, en je eigen wijzigingen in <code>/etc/nzbfast/nzbfast.env</code> blijven staan. De service wordt alleen herstart als die al draaide.</td></tr>
 <tr><td>Homebrew</td><td><code>brew upgrade nzbfast</code></td></tr>
 <tr><td>Kale binary</td><td>Vervang de binary. Je config blijft staan waar je hem
 hebt gemaakt (<a href="#files">§17</a>).</td></tr>
@@ -1298,6 +1303,11 @@ map bevat alles wat een back-up waard is:</p>
 oftewel de hostmap die je eraan hebt gekoppeld. Op Unraid is dat de appdata-map van
 de app.</td></tr>
 <tr><td>Synology-pakket</td><td><code>/var/packages/nzbfast/var/</code></td></tr>
+<tr><td>QNAP-pakket</td><td>Meestal
+<code>/share/Download/nzbfast/config/</code>. De map wordt bij de installatie
+gekozen en in het App Center-log genoemd; de <code>nzbfast.env</code> van de app
+noteert hem ook.</td></tr>
+<tr><td>Debian-/RPM-pakket</td><td><code>/var/lib/nzbfast/</code></td></tr>
 <tr><td>Terminal</td><td>De map waarin je <code>nzbfast setup</code> draaide, of
 waar <code>--config</code> / <code>$NZBFAST_CONFIG</code> ook maar naar
 wijst.</td></tr>

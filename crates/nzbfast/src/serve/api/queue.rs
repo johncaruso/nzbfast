@@ -38,7 +38,27 @@ pub(in crate::serve) fn apply_pause(d: &Arc<Daemon>, g: &mut Job, pause: bool) -
     if pause && (g.state == JobState::Completed || finishing_tail(d, g)) {
         return false;
     }
+    let was = g.paused;
     g.paused = pause;
+    // A resume that puts a Queued row back under the idle predicate's
+    // "busy" arm is a real queue transition, and only the add and the
+    // runner's pick re-arm the idle latch - neither of which can happen
+    // while a global pause or a guard hold keeps `pick_job` away. So
+    // pause -> resume -> pause under a global pause announced the first
+    // idle edge and swallowed the second, which is the one thing the
+    // latch's "once per transition" contract promises not to do (Codex
+    // sweep 14 Aug L2). Both callers hold the queue lock across this,
+    // which is the same serialization the add's re-arm relies on
+    // (daemon_enqueue.rs) and what keeps a concurrent notifier's
+    // scan-to-CAS from emitting over a row this call just made runnable.
+    //
+    // `state == Queued` matches the predicate exactly and is
+    // load-bearing: re-arming for a Completed or Finishing row would
+    // make the `note_queue_idle()` the same handler calls a moment later
+    // emit a second queue.idle over a queue that never left idle.
+    if was && !pause && g.state == JobState::Queued {
+        d.queue_idle_latch.store(false, Ordering::Relaxed);
+    }
     true
 }
 
@@ -81,6 +101,16 @@ pub(in crate::serve) fn apply_priority(d: &Arc<Daemon>, g: &mut Job, prio: i32) 
     }
     if g.priority == -3 && g.paused {
         g.paused = false;
+        // The re-arm this release owes, for the same reason the resume
+        // owes one (see `apply_pause`): the row is runnable again, and
+        // only the add and the runner's pick clear the latch - neither
+        // of which can happen while a global pause keeps `pick_job`
+        // away. `state == Queued` matches the idle predicate exactly, so
+        // this can never make a later `note_queue_idle` emit over a
+        // queue that never left idle (Fable sweep 15 Aug).
+        if g.state == JobState::Queued {
+            d.queue_idle_latch.store(false, Ordering::Relaxed);
+        }
     }
     g.priority = prio;
     // Explicit priority overrides a watchdog deferral - and §77's
@@ -1388,13 +1418,22 @@ fn m_queue(
 ) -> Option<Value> {
     Some({
         let value = params.get("value").cloned().unwrap_or_default();
-        let hit_id = |id: &str| value == "all" || value.split(',').any(|v| v == id);
+        // Trimmed, like the delete path's busy guard: a comma list with
+        // spaces in it ("nzo_1, nzo_2") otherwise matched the guard and
+        // not the action, and the second id was silently ignored.
+        let hit_id = |id: &str| value == "all" || value.split(',').any(|v| v.trim() == id);
         let hit = |j: &Arc<Mutex<Job>>| hit_id(&j.lock_ok().nzo_id);
         match params.get("name").map(String::as_str) {
             Some("delete") => {
                 // A deleted job's prefetch sidecar must stop
                 // writing to its directory.
                 d.poke_sidecar(hit_id);
+                // The poke is fire-and-forget, so a job the sidecar is
+                // RUNNING still has live writers however queued its row
+                // looks - see `remove_after_sidecar_drain`. Snapshotted
+                // before the queue lock: the sidecar mutex under
+                // queue+job would be a lock edge nothing else takes.
+                let sidecar_owner = d.sidecar_owner();
                 // §129: and its post-network tail must stop pulling
                 // recovery volumes. Not covered by the hub abort below -
                 // that one is scoped to the job that OWNS the hub, and a
@@ -1421,6 +1460,14 @@ fn m_queue(
                 // that opens between the record going and the files.
                 let mut doomed: Vec<(String, std::path::PathBuf, bool, crate::smart::FiledTail)> =
                     Vec::new();
+                // The same, for the one job whose writers are the
+                // sidecar's: removed only once that has wound down.
+                let mut pending_sidecar: Vec<(
+                    String,
+                    std::path::PathBuf,
+                    bool,
+                    crate::smart::FiledTail,
+                )> = Vec::new();
                 let mut q = d.queue.lock_ok();
                 let before = q.len();
                 q.retain(|j| {
@@ -1510,6 +1557,31 @@ fn m_queue(
                                 // finally removes the whole
                                 // directory. `park()` releases it.
                                 d.reserved.lock_ok().insert(g.out_dir.clone());
+                            } else if sidecar_owner
+                                .as_ref()
+                                .is_some_and(|(id, _)| *id == g.nzo_id)
+                            {
+                                // The exception the comment above
+                                // names: a never-run Queued job has no
+                                // tail, but a PREFETCHING one has a
+                                // whole pipeline, and removing here let
+                                // the next file's first article
+                                // recreate the directory and lay a
+                                // fresh payload nothing names (M2).
+                                // park is still the wrong destination -
+                                // the abort's ordinary outcome is the
+                                // sidecar's Err arm, which never parks -
+                                // so the removal waits on the wind-down
+                                // instead, and releases the reservation
+                                // itself.
+                                let tail = delete_tail(&g, || d.job_suffix(filed_stem(&g)));
+                                d.reserved.lock_ok().insert(g.out_dir.clone());
+                                pending_sidecar.push((
+                                    filed_stem(&g).to_string(),
+                                    g.out_dir.clone(),
+                                    g.filed,
+                                    tail,
+                                ));
                             } else {
                                 let tail = delete_tail(&g, || d.job_suffix(filed_stem(&g)));
                                 d.reserved.lock_ok().insert(g.out_dir.clone());
@@ -1556,6 +1628,14 @@ fn m_queue(
                 // place the user could see this download named.
                 for (name, dir, why) in kept {
                     d.note_delete_kept(&name, &dir, &why);
+                }
+                // The sidecar's job waits for the sidecar. Its own
+                // reservation is released by the drain, not by the batch
+                // above - the removal is still ahead of it.
+                if let Some((_, target)) = sidecar_owner {
+                    for (name, dir, filed, tail) in pending_sidecar {
+                        d.remove_after_sidecar_drain(target.clone(), name, dir, filed, tail);
+                    }
                 }
                 // Only the job that OWNS the hub may fire its
                 // abort. `state == Downloading` is NOT that
@@ -1620,9 +1700,10 @@ fn m_queue(
                     d.save_queue();
                     // Pausing the last runnable job is the other way the
                     // queue goes idle without a park (M3). Resume takes
-                    // the same call deliberately: it re-arms nothing on
-                    // its own, and the latch keeps a still-idle queue
-                    // silent.
+                    // the same call deliberately: it never EMITS on its
+                    // own (the latch keeps a still-idle queue silent),
+                    // and the re-arm the resume owes lives inside
+                    // `apply_pause`, under this same queue lock.
                     d.note_queue_idle();
                 }
                 if n == 0 && finishing > 0 {
@@ -2271,5 +2352,23 @@ pub(in crate::serve) fn requeue_category(
         g.out_dir = dir;
     }
     d.register_cat(cat);
+    // A queued job can be RUNNING in the prefetch sidecar, against the
+    // directory this call has just re-pointed away from. Every further
+    // byte it fetches lands in a folder the record has left, and its
+    // result is void the moment the write above lands (the directory is
+    // part of the sidecar's ownership stamp), so the fetch is spending
+    // provider quota on nothing. Stop it - and its exit path moves what
+    // it did fetch to the new directory, so the primary run resumes
+    // from the journal instead of downloading the release twice
+    // (read-only sweep 2, M7).
+    //
+    // With `add_lock` RELEASED. `spawn_sidecar` takes the sidecar slot
+    // and then the job lock under it, so signalling from under the
+    // publish lock would put a third mutex into that order for no
+    // reason: by here the record already says where it belongs, and the
+    // signal is about the fetch, not about the decision.
+    let id = job.lock_ok().nzo_id.clone();
+    drop(_publish);
+    d.poke_sidecar(|i| i == id);
     Ok(())
 }

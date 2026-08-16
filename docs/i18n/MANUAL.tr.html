@@ -1082,10 +1082,10 @@ indirmez.</p>
 biçimde gitmiş demektir. İşaret yoksa durum iyi görünüyordur.</li>
 <li>Taze gönderilerin çoktan kaldırıldığı gruplarda bir <b>temizleniyor</b> rozeti;
 böylece ölmekte olan bir grubu şanssız bir sürümden ayırt edebilirsiniz.</li>
-<li><b>Kâhinin gözden çıkardığı sağlayıcıları atla</b> (Ayarlar, <b>öntanımlı olarak
-kapalı, deneysel</b>): denetim bir sağlayıcının omurgasının bir sürümü yitirdiğinden
-eminse, başarısız olmasını beklemek yerine o indirme için doğrudan atlanır. Kalan son
-sağlayıcınızı asla atlamaz.</li>
+<li><b>Kâhinin gözden çıkardığı sağlayıcılar en sona alınır</b> (Ayarlar, <b>öntanımlı olarak
+kapalı, deneysel</b>): denetim bir sağlayıcının omurgasının bir sürümü yitirdiğinden eminse, o indirme için bu
+sağlayıcıya ilk yerine en son sorulur. Hiçbir şey kaldırılmaz, bu yüzden yanlış bir
+karar indirme yerine biraz zamana mal olur.</li>
 </ul>
 <p class="dim">Karar, kanıttan çıkarılmış bir tahmindir, garanti değil. Tek bir NZB için
 kesin yanıtı <code>nzbfast check</code> (<a href="#cli">§15</a>) gerçek makaleleri
@@ -1191,6 +1191,10 @@ ve aynı birim ayarlarıyla yeniden oluştur - Synology kılavuzundaki anlatım 
 tık tık gösterir, bir zamanlamaya bağlamak dahil.</td></tr>
 <tr><td>Synology (paket)</td><td>Yeni <code>.spk</code>'yı Package Center'da
 kur; yerinde yükseltir.</td></tr>
+<tr><td>QNAP (paket, beta)</td><td>Yeni <code>.qpkg</code>'yı App Center'da
+kur; yerinde yükseltir. Ayarların ve indirmelerin uygulamanın kendi klasörünün
+dışında durur, yani ne yükseltme ne de kaldırma onları alıp götürür.</td></tr>
+<tr><td>Debian / Ubuntu (.deb)<br>Fedora / RHEL (.rpm)</td><td>Yeni paketi eskisinin üzerine kurun: <code>sudo dpkg -i nzbfast_*.deb</code> veya <code>sudo rpm -U nzbfast-*.rpm</code>. Ayar klasörünüz pakete dahil değildir; bu yüzden bir yükseltme içindeki hiçbir şeyi değiştiremez ve <code>/etc/nzbfast/nzbfast.env</code> dosyasındaki kendi düzenlemeleriniz korunur. Servis yalnızca zaten çalışıyorsa yeniden başlatılır.</td></tr>
 <tr><td>Homebrew</td><td><code>brew upgrade nzbfast</code></td></tr>
 <tr><td>Düz ikili dosya</td><td>İkili dosyayı değiştir. Yapılandırman onu
 yaptığın yerde kalır (<a href="#files">§17</a>).</td></tr>
@@ -1252,6 +1256,11 @@ Yedeklemeye değer her şey bu tek klasördedir:</p>
 <code>/config</code>, yani ona eşlediğin ana makine klasörü. Unraid'de bu,
 uygulamanın appdata klasörüdür.</td></tr>
 <tr><td>Synology paketi</td><td><code>/var/packages/nzbfast/var/</code></td></tr>
+<tr><td>QNAP paketi</td><td>Genellikle
+<code>/share/Download/nzbfast/config/</code>. Klasör kurulumda seçilir ve App
+Center günlüğünde belirtilir; uygulamanın kendi <code>nzbfast.env</code> dosyası
+da onu kaydeder.</td></tr>
+<tr><td>Debian / RPM paketi</td><td><code>/var/lib/nzbfast/</code></td></tr>
 <tr><td>Terminal</td><td><code>nzbfast setup</code>'ı çalıştırdığın klasör ya da
 <code>--config</code> / <code>$NZBFAST_CONFIG</code> neresini gösteriyorsa
 orası.</td></tr>

@@ -572,13 +572,22 @@ pub fn record_at(config: &Path, host: &str, t: Tuned, bucket: u8) {
     let _g = LOCK.lock_ok();
     let mut map = load(config);
     let was_shaped = map.get(host).is_some_and(|p| p.shaped.is_some());
+    // The MEASUREMENT's own verdict, captured before reconcile: the
+    // parking arm deliberately returns `suspect: false` (the applied half
+    // stays trusted while the new reading waits in `pending`), so gating
+    // the refresh below on the reconciled entry ran it for readings that
+    // were just ruled untrusted - overwriting the bucket seed and, on a
+    // shaped host, zeroing the decay reference while the flag stayed set,
+    // after which the shaping-clear quorum judged recovery against the
+    // shaped rate itself.
+    let incoming_suspect = t.suspect;
     let mut t = reconcile(map.get(host), t);
     // A trusted ladder result also refreshes the current bucket's SEED
     // (design §4, `source`): a user-run Test must never be ignored by
     // the live layer, which would otherwise keep seeding from a bucket
     // the user has just measured to be wrong. Evidence weight is left
     // alone - a ladder measures a curve, not an epoch stream.
-    if !t.suspect && t.connections > 0 {
+    if !incoming_suspect && !t.suspect && t.connections > 0 {
         let seed = t.connections;
         let (checked, limit) = (t.checked, t.limit);
         let source = if t.source == "manual" {

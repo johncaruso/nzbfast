@@ -93,13 +93,31 @@ struct WriteState {
 
 pub struct Journal {
     state: Mutex<WriteState>,
+    /// The finish decrypt's retire/publish bookkeeping. One mutex over
+    /// all three fields: the workers run concurrently and every rule in
+    /// [`Journal::record_decrypted`] reads one field against another.
+    decrypt_stash: Mutex<DecryptStash>,
+    pub path: PathBuf,
+}
+
+/// State shared by the finish decrypt's retire and publish halves.
+#[derive(Default)]
+struct DecryptStash {
     /// Placements parked by [`Journal::retire_for_decrypt`], keyed by the
     /// retired output name, waiting for [`Journal::record_decrypted`] to
     /// republish them as `D` records. An entry whose publish never comes
     /// (rename failed, job died first) just dies with the journal - the
     /// conservative refetch the bare retirement always meant.
-    decrypt_stash: Mutex<HashMap<String, Vec<StashedArticle>>>,
-    pub path: PathBuf,
+    parked: HashMap<String, Vec<StashedArticle>>,
+    /// Every name handed to [`Journal::retire_for_decrypt`] this run:
+    /// files the decrypt is about to replace with plaintext. Registered
+    /// BEFORE the `X` line is written, so any parse that can see the
+    /// retirement can also see that we are the ones who wrote it.
+    mutating: HashSet<String>,
+    /// The subset of `mutating` whose plaintext is published AND whose
+    /// crypt facts landed - the only files a `D` fragment may claim
+    /// restore-by-re-encryption for.
+    restorable: HashSet<String>,
 }
 
 /// One placement parked between retirement and decrypt-publish: enough
@@ -228,7 +246,7 @@ impl Journal {
                     files: HashMap::new(),
                     used_names: HashSet::new(),
                 }),
-                decrypt_stash: Mutex::new(HashMap::new()),
+                decrypt_stash: Mutex::new(DecryptStash::default()),
                 path,
             },
             resume,
@@ -494,15 +512,35 @@ impl Journal {
             return Ok(());
         }
         let mut st = self.state.lock_ok();
+        // Register the names BEFORE the parse and before the `X` line
+        // lands: the write below happens under this same lock, so a
+        // concurrent worker that can see our retirement in the file can
+        // always see it here too. That ordering is what makes the parse
+        // filter next deterministic rather than a race.
+        let mine: Vec<String> = files.iter().map(|f| sanitize_filename(f)).collect();
+        let mutating = {
+            let mut d = self.decrypt_stash.lock_ok();
+            d.mutating.extend(mine.iter().cloned());
+            d.mutating.clone()
+        };
         let mut resume = ResumeState::default();
         if let Ok(f) = File::open(&self.path) {
             let mut lines = std::io::BufReader::new(f).lines();
             let _ = lines.next(); // header: fingerprint already matched at open
-            parse_lines(lines.map_while(Result::ok), &mut resume);
+            // Read THROUGH this run's own decrypt retirements. A sibling
+            // worker's `X` drops every placement that names its file -
+            // including an article whose span straddles into ours, which
+            // is exactly the one we must park: our publish is what
+            // re-records it, and if we let the sibling's `X` hide it the
+            // article survives only in the sibling's snapshot, with our
+            // fragment frozen as "ordinary copy" from before we were
+            // decrypted. `record_decrypted` re-adjudicates every
+            // fragment against `restorable`, so nothing parked here can
+            // publish a claim the file cannot honour.
+            parse_lines_through(lines.map_while(Result::ok), &mut resume, &mutating);
         }
         let mut stash = Vec::new();
-        for name in files {
-            let name = sanitize_filename(name);
+        for name in mine {
             let mut arts = Vec::new();
             for (slot, sp) in &resume.slots {
                 for a in &sp.articles {
@@ -531,9 +569,23 @@ impl Journal {
         st.file.write_all(buf.as_bytes())?;
         st.file.sync_data()?;
         drop(st);
+        #[cfg(test)]
+        {
+            // Test seam: the window between the durable retirement and
+            // the parked snapshot. A sibling worker's whole retire +
+            // publish can land in here, which is the interleaving the
+            // `mutating`/`restorable` rules exist for. One-shot - the
+            // first retirement to reach it consumes the pair, so the
+            // sibling released into the window does not re-park here.
+            let pair = RETIRE_STASH_BARRIER.lock_ok().take();
+            if let Some((open, go)) = pair {
+                open.wait();
+                go.wait();
+            }
+        }
         let mut parked = self.decrypt_stash.lock_ok();
         for (name, arts) in stash {
-            parked.insert(name, arts);
+            parked.parked.insert(name, arts);
         }
         Ok(())
     }
@@ -554,19 +606,55 @@ impl Journal {
     pub fn record_decrypted(&self, name: &str, events: &[CryptoJournalEvent]) {
         self.record_crypto_events(events);
         let key = sanitize_filename(name);
-        let Some(arts) = self.decrypt_stash.lock_ok().remove(&key) else {
-            return;
+        // Snapshot the batch's state with the stash, under one lock.
+        // Reading `restorable` at EMIT time - rather than flipping the
+        // other parked stashes as each file publishes - is what makes
+        // this independent of how the concurrent workers interleaved:
+        // a stash that is still in flight when its neighbor publishes
+        // cannot be flipped, and it used to publish the pre-decrypt
+        // mask afterwards. Last R/D wins, so that stale record was the
+        // one a resume obeyed: plain-copy PUBLISHED PLAINTEXT into a
+        // volume as if it were the posted bytes, article marked
+        // restored.
+        let (arts, mutating, restorable) = {
+            let mut d = self.decrypt_stash.lock_ok();
+            // Before the early return: a file with nothing parked (its
+            // placements were all retired by a sibling first) is still
+            // published plaintext, and neighbors must see that.
+            d.restorable.insert(key.clone());
+            let Some(arts) = d.parked.remove(&key) else {
+                return;
+            };
+            (arts, d.mutating.clone(), d.restorable.clone())
         };
         for a in arts {
+            // A fragment in a sibling of this decrypt batch that has not
+            // published its facts is unadjudicable HERE: it is either
+            // still ciphertext (mask `false`) or already plaintext whose
+            // facts never landed (unrestorable), and this side cannot
+            // tell which. Park the whole article instead of guessing -
+            // it refetches, the conservative outcome the bare retirement
+            // always meant. The sibling's own publish re-emits it with
+            // both fragments adjudicated, so nothing is lost when the
+            // batch succeeds.
+            if a.frags.iter().any(|f| {
+                f.file != key && mutating.contains(&f.file) && !restorable.contains(&f.file)
+            }) {
+                continue;
+            }
             // A fragment inside the published file now restores by
-            // re-encryption; fragments in neighbors keep whatever the
-            // original record said (a neighbor published earlier in this
-            // batch already carries `true` from its own D line).
+            // re-encryption, and so does one in any sibling that has
+            // already published its facts; a genuinely plain neighbor
+            // (never in this batch) keeps the ordinary copy.
             let mask: Vec<bool> = a
                 .frags
                 .iter()
                 .enumerate()
-                .map(|(i, f)| a.mask.get(i).copied().unwrap_or(false) || f.file == key)
+                .map(|(i, f)| {
+                    a.mask.get(i).copied().unwrap_or(false)
+                        || f.file == key
+                        || restorable.contains(&f.file)
+                })
                 .collect();
             self.record_placed_crypto(
                 a.slot,
@@ -586,7 +674,30 @@ impl Journal {
     }
 }
 
+/// Test seam for [`Journal::retire_for_decrypt`]: two-stage, the house
+/// shape (first barrier says the window is open, second releases it).
+#[cfg(test)]
+static RETIRE_STASH_BARRIER: Mutex<
+    Option<(
+        std::sync::Arc<std::sync::Barrier>,
+        std::sync::Arc<std::sync::Barrier>,
+    )>,
+> = Mutex::new(None);
+
 fn parse_lines(lines: impl Iterator<Item = String>, resume: &mut ResumeState) {
+    parse_lines_through(lines, resume, &HashSet::new());
+}
+
+/// [`parse_lines`], but reading THROUGH the `X` retirements named in
+/// `through` - the ones this run's own finish decrypt wrote. Only
+/// [`Journal::retire_for_decrypt`] passes a non-empty set, and only to
+/// build a stash that `record_decrypted` re-adjudicates; the resume
+/// parse at open time always honours every `X`.
+fn parse_lines_through(
+    lines: impl Iterator<Item = String>,
+    resume: &mut ResumeState,
+    through: &HashSet<String>,
+) {
     // File table + per-id placements resolve in stream order: a later run
     // appends its own F table (reusing indexes) and its R lines must bind
     // to ITS definitions, so fidx→name is resolved per line, not at the end.
@@ -760,6 +871,9 @@ fn parse_lines(lines: impl Iterator<Item = String>, resume: &mut ResumeState) {
                 continue;
             }
             let name = sanitize_filename(name);
+            if through.contains(&name) {
+                continue;
+            }
             placed.retain(|_, (_, frags, _, _)| !frags.iter().any(|f| f.file == name));
         } else if let Some(rest) = line.strip_prefix("M ") {
             // Slot demoted to a materialized volume: everything recorded
@@ -2019,6 +2133,139 @@ mod tests {
             &vol[8..],
             &cipher[..],
             "re-encrypted posted bytes must be byte-exact"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Sweep 2 M1: the finish decrypt runs its files on concurrent
+    /// workers, and an article whose span straddles TWO encrypted
+    /// outputs is parked by both. The dangerous interleaving is a whole
+    /// retire+publish landing between a sibling's durable `X` and its
+    /// parked snapshot: the sibling has no stash to be updated in, so it
+    /// used to publish its pre-decrypt mask afterwards - "re-encrypt my
+    /// half, plain-copy the neighbour's" - and last R/D wins, so a
+    /// resume copied the neighbour's PUBLISHED PLAINTEXT into the volume
+    /// as posted bytes and marked the article restored.
+    ///
+    /// Deterministic seam, not timing: `RETIRE_STASH_BARRIER` parks the
+    /// first retirement exactly in that window.
+    #[test]
+    fn concurrent_decrypt_retirement_marks_both_straddled_fragments() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-journal-dr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let nzb = b"<nzb>decrace</nzb>";
+        let pw = "s3cret";
+        let lg2 = 4u8;
+
+        // Two encrypted outputs, one salt each. Both plaintexts are a
+        // whole number of AES blocks, so the cipher stream is the same
+        // LENGTH as the plaintext - a wrong "plain copy" then produces
+        // wrong volume BYTES rather than a short read, which is the
+        // damage the finding describes.
+        let build = |salt: [u8; 16], iv: [u8; 16], plain: Vec<u8>| {
+            let keys = crate::rarcrypt::derive_keys(pw, &salt, lg2).unwrap();
+            let mut cipher = plain.clone();
+            crate::rarcrypt::CbcEncStream::new(&keys.aes(), &iv).encrypt(&mut cipher);
+            (keys, plain, cipher)
+        };
+        let (keys_a, plain_a, cipher_a) = build([7u8; 16], [9u8; 16], (0..32u8).collect());
+        let (keys_b, plain_b, cipher_b) = build([11u8; 16], [13u8; 16], (32..80u8).collect());
+        let plain_c = b"a genuinely plain neighbour".to_vec();
+
+        let la = cipher_a.len() as u64;
+        let lb = cipher_b.len() as u64;
+        let lc = plain_c.len() as u64;
+        let vol_size = la + lb + lc;
+        std::fs::write(dir.join("plain.bin"), &plain_c).unwrap();
+
+        let (j, _) = Journal::open(&dir, nzb).unwrap();
+        let j = std::sync::Arc::new(j);
+        // One article, three fragments: the two encrypted outputs it
+        // straddles plus a plain neighbour that must STAY an ordinary
+        // copy (the fix must not over-mark).
+        j.record_placed(
+            0,
+            "<span@x>",
+            None,
+            "v.part1.rar",
+            vol_size,
+            &[
+                frag("a.bin", 0, 0, la),
+                frag("b.bin", 0, la, lb),
+                frag("plain.bin", 0, la + lb, lc),
+            ],
+        );
+
+        let facts = |name: &str,
+                     salt: [u8; 16],
+                     iv: [u8; 16],
+                     keys: &crate::rarcrypt::Rar5Keys,
+                     unp: u64| {
+            vec![
+                CryptoJournalEvent::Params {
+                    name: name.into(),
+                    salt,
+                    lg2,
+                    iv,
+                    unp,
+                    check: Some(crate::rarcrypt::make_check(keys)),
+                },
+                CryptoJournalEvent::TailPad {
+                    name: name.into(),
+                    pad: Vec::new(),
+                },
+            ]
+        };
+
+        let open = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let go = std::sync::Arc::new(std::sync::Barrier::new(2));
+        *RETIRE_STASH_BARRIER.lock_ok() = Some((open.clone(), go.clone()));
+
+        // Worker A: retires a.bin, then parks in the window until the
+        // whole of B has retired AND published.
+        let ja = j.clone();
+        let dir_a = dir.clone();
+        let facts_a = facts("a.bin", [7u8; 16], [9u8; 16], &keys_a, plain_a.len() as u64);
+        let wa = std::thread::spawn(move || {
+            ja.retire_for_decrypt(&["a.bin".to_string()]).unwrap();
+            std::fs::write(dir_a.join("a.bin"), &plain_a).unwrap();
+            ja.record_decrypted("a.bin", &facts_a);
+        });
+
+        open.wait(); // A is past its durable `X`, before its snapshot parks
+        j.retire_for_decrypt(&["b.bin".to_string()]).unwrap();
+        std::fs::write(dir.join("b.bin"), &plain_b).unwrap();
+        j.record_decrypted(
+            "b.bin",
+            &facts(
+                "b.bin",
+                [11u8; 16],
+                [13u8; 16],
+                &keys_b,
+                plain_b.len() as u64,
+            ),
+        );
+        go.wait(); // release A, which now parks and publishes last
+        wa.join().unwrap();
+        drop(j);
+
+        let (_j2, resume) = Journal::open(&dir, nzb).unwrap();
+        let restored = restore(&dir, &resume, Some(pw));
+        assert!(
+            restored.ids.contains("<span@x>"),
+            "the straddling article must still resume locally"
+        );
+        let vol = std::fs::read(dir.join("v.part1.rar")).unwrap();
+        let mut want = cipher_a.clone();
+        want.extend_from_slice(&cipher_b);
+        want.extend_from_slice(&plain_c);
+        assert_eq!(
+            vol, want,
+            "every straddled fragment must rebuild the POSTED bytes: \
+             a fragment left marked as an ordinary copy plain-copies \
+             published plaintext into the volume"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();

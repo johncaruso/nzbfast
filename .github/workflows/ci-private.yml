@@ -436,8 +436,12 @@ jobs:
     if: github.repository != 'nzbfast/nzbfast'
     runs-on: windows-latest
     # Windows compiles this workspace a good deal slower than Linux
-    # does, and a cold cache pays the whole cost.
-    timeout-minutes: 60
+    # does, and a cold cache pays the whole cost. 75 rather than 60 since
+    # the aarch64 cross-check landed at the end of this job: it compiles
+    # the dependency graph a second time, for a second target, and the 60
+    # was sized for the cold x64 path with no headroom to spare (measured
+    # 28m22s warm on 5 Aug).
+    timeout-minutes: 75
     # Its own group, separate from `check`. This leg measured 25-33
     # minutes on the windows-ci-proof branch, which is why sharing a
     # group with the Linux leg was fatal to both. On its own it lands a
@@ -621,3 +625,36 @@ jobs:
       - name: clippy (windows-gated code)
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         run: cargo clippy -p nzbkit -p nzbfast -p nzbtray --all-targets --no-deps --keep-going --features nzbkit/heavy-tests,nzbfast/heavy-tests -- -D warnings
+      # The ARM64 gate. `cargo clippy --target` runs in check mode - it
+      # never links - so an x64 runner covers aarch64-pc-windows-msvc with
+      # nothing installed but the rust target, and the ARM64 MSVC linker
+      # is only needed by the release job that actually emits exes.
+      #
+      # What it is really guarding is not lint but COMPILATION, and two
+      # specific ways this target diverges from the x64 one that shares
+      # all its `cfg(windows)` code:
+      #   - rapidyenc's C++ kernels are compiled here by cl.exe for ARM64
+      #     rather than cl.exe for x64, taking the `_M_ARM64` arms of
+      #     vendor/rapidyenc/src/common.h that no other job compiles;
+      #   - nzbkit's own aarch64 paths (gf16's NEON kernels, the
+      #     `is_aarch64_feature_detected!` probes in nntp.rs and
+      #     sysbench.rs) meet Windows runtime feature detection for the
+      #     first time - every other aarch64 build we make is macOS or
+      #     Linux.
+      # Neither is reachable from any other runner in CI, which is the
+      # same hole - `cfg` code linted nowhere - that the clippy step above
+      # exists to close, one axis over.
+      #
+      # nzbtray is in the list because the tray ships in the ARM64 package
+      # exactly as it does in the x64 one, and it is the crate where
+      # Windows-only code is ALL of the crate.
+      #
+      # Deliberately not --all-targets: the shipped artifacts are the lib
+      # and the two bins, and pulling the test targets in would compile a
+      # second copy of the dependency graph for a target we do not run
+      # tests on. Runs last, so a lint here cannot cost us the suites.
+      - name: cross-check aarch64-pc-windows-msvc (ARM64 beta target)
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: |
+          rustup target add aarch64-pc-windows-msvc
+          cargo clippy --target aarch64-pc-windows-msvc -p nzbfast -p nzbtray --no-deps -- -D warnings

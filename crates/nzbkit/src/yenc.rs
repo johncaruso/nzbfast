@@ -139,7 +139,9 @@ pub fn decode_checked(body: &[u8]) -> Result<(Decoded, bool), YencError> {
                 name = v.clone();
             }
             file_size = num(&kv, "size").unwrap_or(0);
-            part = num(&kv, "part").map(|n| n as u32);
+            part = num(&kv, "part")
+                .filter(|n| *n <= u64::from(u32::MAX))
+                .map(|n| n as u32);
             // Until/unless =ypart overrides, a single-part post spans the file.
             end = file_size;
         } else if line.starts_with(b"=ypart ") {
@@ -160,7 +162,9 @@ pub fn decode_checked(body: &[u8]) -> Result<(Decoded, bool), YencError> {
             expected_crc = hex(&kv, "pcrc32").or_else(|| hex(&kv, "crc32"));
             // The trailer's part number, kept only to check it against
             // =ybegin's below. Nothing places bytes with it.
-            yend_part = num(&kv, "part").map(|n| n as u32);
+            yend_part = num(&kv, "part")
+                .filter(|n| *n <= u64::from(u32::MAX))
+                .map(|n| n as u32);
         } else if seen_begin {
             decode_line(line, &mut data);
         }

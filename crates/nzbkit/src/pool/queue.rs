@@ -340,19 +340,58 @@ impl QueueControl {
         // and nothing would ever fetch these - roll back.
         // A rollback's fetch_sub can be the one that lands pending on
         // zero (a real completion slipped in between our add and sub, and
-        // saw an inflated count) - it must then fire `finished` exactly
-        // like complete_one, or the fleet waits forever.
+        // saw an inflated count) - it must then reach the same drained
+        // verdict as complete_one, or the fleet waits forever.
         let sub_pending = |n: usize| {
             if sh.pending.fetch_sub(n, Ordering::AcqRel) == n {
-                sh.mark_drained();
-                let _ = sh.finished.send(true);
+                sh.finish_if_drained();
             }
         };
-        sh.pending.fetch_add(works.len(), Ordering::AcqRel);
-        if *sh.finished.borrow() {
-            sub_pending(works.len());
-            put_back(works);
-            return 0;
+        {
+            // Raise and check under `finish_gate` (see the field's doc):
+            // a completion whose fetch_sub already landed pending on
+            // zero but whose finished-send is still pending re-reads the
+            // count under this same gate, so it either sends before our
+            // check (we see it and roll back) or sees our raise and
+            // stays silent (the fleet keeps running and fetches these).
+            // Without the gate, both sides could lose: raise after the
+            // crossing, check before the send - articles queued for a
+            // fleet that is already leaving. The scope ends before
+            // sub_pending, which takes the gate itself on rollback.
+            let _gate = sh.finish_gate.lock_ok();
+            sh.pending.fetch_add(works.len(), Ordering::AcqRel);
+            // `finished` alone is not the whole "is anyone left"
+            // question: a fleet that exhausted with a handed body
+            // outstanding never sends it, because the handed id sits in
+            // `done` so pending never lands on zero and seal_run skips
+            // it - and a revive into that queues work nobody will pop.
+            // `workers_live == 0` cannot answer it alone either, since
+            // that is also every run before its first worker is born,
+            // and refusing THERE drops work racing fleet birth. The two
+            // together are the question (Fable sweep 15 Aug, TODO 170).
+            let fleet_dead = sh.workers_born.load(Ordering::Acquire) > 0
+                && sh.workers_live.load(Ordering::Acquire) == 0;
+            if *sh.finished.borrow() || fleet_dead {
+                drop(_gate);
+                sub_pending(works.len());
+                put_back(works);
+                return 0;
+            }
+        }
+        // Test seam: the window between dropping `finish_gate` and
+        // taking the queue lock. `WorkerLife::retire` decrements
+        // `workers_live` under no gate at all, so the LAST worker can
+        // cross 1 -> 0 right here and both terminal seals then drain a
+        // queue this call has not written to yet. Two-stage shape as
+        // `Shared::drain_send_barrier` (first: we are inside the window;
+        // second: the test has staged the retirement and releases us).
+        #[cfg(test)]
+        {
+            let pair = sh.requeue_gate_barrier.lock_ok().clone();
+            if let Some((entered, released)) = pair {
+                entered.wait();
+                released.wait();
+            }
         }
         {
             let mut done = sh.done.lock_ok();
@@ -360,6 +399,18 @@ impl QueueControl {
                 done.remove(&w.id);
             }
         }
+        // Undo everything this call has done so far, in reverse:
+        // re-terminal, drop pending (firing finished if ours is the
+        // zeroing sub), re-stash. The caller keeps its accounting.
+        let roll_back = |ws: Vec<Work>| {
+            let mut done = sh.done.lock_ok();
+            for w in &ws {
+                done.insert(w.id.clone());
+            }
+            drop(done);
+            sub_pending(ws.len());
+            put_back(ws);
+        };
         let mut tries = 0;
         let mut q = loop {
             match sh.queue.try_lock() {
@@ -369,22 +420,49 @@ impl QueueControl {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 Err(_) => {
-                    // Roll back in reverse: re-terminal, drop pending
-                    // (firing finished if ours is the zeroing sub),
-                    // re-stash.
-                    let mut done = sh.done.lock_ok();
-                    for w in &works {
-                        done.insert(w.id.clone());
-                    }
-                    drop(done);
-                    sub_pending(works.len());
-                    put_back(works);
+                    roll_back(works);
                     return 0;
                 }
             }
         };
+        // The fleet-dead question AGAIN, now holding the queue lock.
+        // The gate above only closes the case where the fleet was
+        // already dead when we looked; it cannot serialise the later
+        // 1 -> 0, because retirement never takes `finish_gate`. Left
+        // there alone, this call could insert work after BOTH terminal
+        // seals had drained an empty queue - no worker to pop it, no
+        // outcome sender left to fail it - and still return non-zero,
+        // so the caller reversed its deferred/remaining accounting for
+        // an outcome that never came. Both seals drain under THIS lock,
+        // which is what makes re-asking here sufficient: either the
+        // fleet is already gone and we refuse, or a seal starting after
+        // us blocks on the lock and fails what we inserted.
+        // (Read-only sweep 2, M2.)
+        if sh.workers_born.load(Ordering::Acquire) > 0
+            && sh.workers_live.load(Ordering::Acquire) == 0
+        {
+            drop(q);
+            roll_back(works);
+            return 0;
+        }
         let n = works.len();
-        q.extend(works);
+        // Same books as every other reinsert (shed_pipeline, the recheck
+        // path, the steer adopt): a promoted article going back in the
+        // queue is counted back into `promoted_pending`, and never lands
+        // behind the tail it was promoted past. `cancel` already recounts
+        // on the way out; without this the counter drifted DOWN by one
+        // per requeued promotion and the seek lane read as emptier than
+        // it was (Fable sweep 15 Aug).
+        let mut at = q.iter().take_while(|w| w.promoted).count().min(q.len());
+        for w in works {
+            if w.promoted {
+                sh.promoted_pending.fetch_add(1, Ordering::AcqRel);
+                q.insert(at, w);
+                at += 1;
+            } else {
+                q.push_back(w);
+            }
+        }
         n
     }
 
@@ -626,6 +704,14 @@ impl QueueControl {
         if sh.aborted.load(Ordering::Acquire)
             || sh.draining.load(Ordering::Acquire)
             || *sh.finished.borrow()
+            // A fleet that fully exhausted while this body sat in the
+            // consumer's hands has nobody left to drain the inbox, and
+            // seal_run already ran (the handed id was in `done`, so
+            // `pending` never reached zero). Steering now would park the
+            // Work in a dead pool with no terminal outcome - the
+            // dup_copy path skips the other_can_take gate, so this guard
+            // is its only stop.
+            || sh.workers_live.load(Ordering::Acquire) == 0
         {
             if dbg {
                 eprintln!("[crc-steer] {id}: own (run over/draining)");

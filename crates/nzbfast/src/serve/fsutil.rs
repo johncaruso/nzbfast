@@ -178,7 +178,10 @@ pub(super) fn fs_roots(cur_download: &std::path::Path) -> Value {
             }
         }
     }
-    #[cfg(target_os = "linux")]
+    // FreeBSD shares this arm: /mnt is the same convention, and the
+    // desktop automounters that own /media/<user>/<label> (udisks2,
+    // via the ports tree) put it in the same place.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         roots.push(json!({"name": "Filesystem", "path": "/"}));
         // /media/<user>/<label> and /mnt/<label> are the usual mount points.

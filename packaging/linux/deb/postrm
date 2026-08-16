@@ -1,0 +1,48 @@
+#!/bin/sh
+# Removal cleanup. The rule this file exists to hold: `remove` takes away
+# the program, `purge` takes away the configuration, and NEITHER takes
+# away /var/lib/nzbfast.
+#
+# That directory holds settings.json, the API key, the queue spool and
+# every finished download. dpkg does not know about a single file in it -
+# the package ships no path under it - so it survives on its own; the
+# only way it could be lost is a line in this script, and there is not
+# one. A purge says where it is instead of deleting it.
+set -e
+
+UNIT=nzbfast.service
+DATA=/var/lib/nzbfast
+
+case "$1" in
+    remove)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+    purge)
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            deb-systemd-helper purge "$UNIT" >/dev/null 2>&1 || true
+            deb-systemd-helper unmask "$UNIT" >/dev/null 2>&1 || true
+        fi
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        # dpkg removes the conffile itself; this clears the directory
+        # only when nothing else is left in it. `rmdir`, never `rm -r`:
+        # an admin who put a TLS key or a drop-in there keeps it.
+        rmdir /etc/nzbfast 2>/dev/null || true
+        if [ -d "$DATA" ]; then
+            echo "nzbfast: your settings and downloads are still in $DATA" >&2
+            echo "nzbfast: (the 'nzbfast' account still owns them). Delete" >&2
+            echo "nzbfast: that folder by hand if you want it gone." >&2
+        fi
+        ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

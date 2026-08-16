@@ -896,7 +896,18 @@ fn ntt_default_budget(ram: Option<u64>, cgroup_limit: Option<u64>) -> usize {
     if let Some(l) = cgroup_limit {
         b = b.min(l / 4);
     }
-    b as usize
+    // `b as usize` WRAPPED TO ZERO on 32-bit hosts (armv7 Raspberry Pi
+    // OS) whenever neither probe answered: NTT_BUDGET_CEIL is exactly
+    // 2^32. A zero budget fails `n_present * block_size <= budget` for
+    // every corpus, so the NTT path was silently unreachable there -
+    // fail-safe, but for a reason nothing in the code said out loud.
+    // Saturating is only half the answer: a 32-bit process has ~3 GiB
+    // of user address space TOTAL, so the retention arenas this gate
+    // prices cannot approach the flat ceiling anyway. Hold it where it
+    // is actually spendable.
+    #[cfg(target_pointer_width = "32")]
+    let b = b.min(1 << 30);
+    usize::try_from(b).unwrap_or(usize::MAX)
 }
 
 /// The conservative shape gates, as a pure function so the tests pin

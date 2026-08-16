@@ -1,0 +1,127 @@
+# Install-time hooks, sourced by QDK's qinstall.sh on the NAS.
+#
+# Only the decisions that have to happen BEFORE the payload is unpacked
+# live here - refusing a model we do not ship a binary for, and refusing
+# to install on top of something already serving our port. Everything
+# after unpacking (which binary to keep, where the data goes) is in
+# nzbfast-setup.sh, which ships in the package and can therefore be run
+# and tested on its own; see packaging/tests/qnap-install.sh.
+#
+# qinstall.sh has already sourced its own definitions by the time these
+# run, so $CMD_*, $SYS_* and err_log() are all available. err_log prints
+# to the App Center's log and aborts the install.
+
+######################################################################
+# Refuse the models we cannot run on, and the port we cannot share.
+# Called before anything is written to disk.
+######################################################################
+pkg_check_requirement(){
+    # The package carries one binary per 64-bit architecture and no QDK
+    # platform guard (see qpkg.cfg), so a 32-bit ARM NAS - the TS-x31,
+    # TS-x31P, TS-x28A and the rest of the armv7 line - will happily
+    # install it and then fail at every start with nothing on screen
+    # saying why. Refuse here instead, while the App Center is still
+    # showing a dialog to put the reason in.
+    machine="${QNAP_TEST_UNAME:-$(/bin/uname -m 2>/dev/null || echo unknown)}"
+    case "$machine" in
+        x86_64|amd64|aarch64|arm64) : ;;
+        *)
+            err_log "[nzbfast] This NAS reports architecture '$machine'. nzbfast ships 64-bit builds only (x86_64 and aarch64); there is no build for this model. The Docker image on Container Station has the same limitation."
+            ;;
+    esac
+
+    # An upgrade reaches this point with our own daemon still listening -
+    # qinstall does not stop the service until pre_install, which runs
+    # after this - so the port check has to apply to FIRST installs only.
+    if [ -d "$SYS_QPKG_DIR" ] \
+       || [ -n "$($CMD_GETCFG "$QPKG_NAME" Name -f "$SYS_QPKG_CONFIG_FILE" 2>/dev/null)" ]; then
+        return 0
+    fi
+
+    # Refuse to install on top of something already serving this port,
+    # rather than installing a package whose service then fails to bind
+    # every time with the reason only in a log the App Center does not
+    # surface.
+    #
+    # The likely cause is nzbfast already running in Container Station,
+    # and that case deserves more than "port in use": two instances
+    # pointed at one download folder would both claim the same jobs and
+    # write over each other. Migrating means stopping the container
+    # first, on purpose.
+    if port_is_listening "@@PORT@@"; then
+        err_log "[nzbfast] Something on this NAS is already listening on port @@PORT@@. If that is nzbfast in Container Station, stop and remove that container first - running both against one download folder would have them fighting over the same jobs. Your settings and downloads are not touched by this."
+    fi
+}
+
+######################################################################
+# Is anything LISTENING on this port?
+#
+# /proc/net/tcp rather than a tool: QTS's busybox netstat, curl and wget
+# vary by firmware, and procfs is always there. State 0A is TCP_LISTEN,
+# so an established CONNECTION to the port - a browser tab open on some
+# other app's dashboard - is correctly ignored. Ports are hex and
+# uppercase in that file.
+#
+# QNAP_TEST_PROCNET points the whole thing at a fixture directory so the
+# test harness can exercise both answers off a NAS.
+######################################################################
+port_is_listening(){
+    _port_hex=$(printf '%04X' "$1")
+    _net="${QNAP_TEST_PROCNET:-/proc/net}"
+    for _f in "$_net/tcp" "$_net/tcp6"; do
+        [ -f "$_f" ] || continue
+        # Field 2 is local_address as HOST:PORT, field 4 is the state.
+        # ${CMD_AWK:-awk}: qinstall defines CMD_AWK as /bin/awk, which is
+        # where busybox puts it on QTS and nowhere near where a developer
+        # machine does. Honour its definition on the NAS, fall back to
+        # PATH off it, so the test harness can run this at all.
+        if ${CMD_AWK:-awk} -v p="$_port_hex" \
+             'NR>1 && $4=="0A" { split($2, a, ":"); if (a[2] == p) found=1 }
+              END { exit !found }' "$_f"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+######################################################################
+# Choose the architecture and the data folder, once the payload is on
+# disk. post_install has already registered the package and linked the
+# service script, so this is the last thing to run before QTS starts it.
+######################################################################
+pkg_post_install(){
+    /bin/sh "$SYS_QPKG_DIR/nzbfast-setup.sh" || \
+        err_log "[nzbfast] Setup failed after unpacking - see the App Center log above."
+}
+
+######################################################################
+# Uninstall.
+#
+# QDK's generated uninstall script rm -rf's the whole package directory,
+# which is why the data folder is normally NOT inside it: uninstalling
+# a downloader is not a request to delete the downloads, and the App
+# Center gives no undo.
+#
+# "Normally" is the whole point of the branch below. nzbfast-setup.sh has
+# a last-resort fallback to $QPKG_DIR/data, taken on a NAS where no
+# shared folder was usable, and that location IS inside the directory
+# about to be removed. This message used to say "untouched" either way,
+# which was the opposite of what happened to exactly the users who had
+# the least room to spare. Decide from the path, not from the assumption.
+######################################################################
+PKG_PRE_REMOVE="{
+    if [ -f $SYS_QPKG_DIR/nzbfast.env ]; then
+        . $SYS_QPKG_DIR/nzbfast.env
+        case \"\$NZBFAST_DATA\" in
+            $SYS_QPKG_DIR|$SYS_QPKG_DIR/*)
+                /sbin/log_tool -t0 -uSystem -p127.0.0.1 -mlocalhost -a \"[nzbfast] Removing. Your settings and downloads are in \$NZBFAST_DATA, which is INSIDE the app folder and is being deleted with it. No shared folder was usable when nzbfast was installed, so it had nowhere else to put them. Copy that folder out NOW if you want to keep it.\" 2>/dev/null
+                /bin/echo \"nzbfast: WARNING - \$NZBFAST_DATA is inside the app folder and is being DELETED with it.\"
+                /bin/echo \"nzbfast: copy it out now if you want your settings and downloads.\"
+                ;;
+            *)
+                /sbin/log_tool -t0 -uSystem -p127.0.0.1 -mlocalhost -a \"[nzbfast] Removed. Your settings and downloads are untouched in \$NZBFAST_DATA - delete that folder by hand if you want them gone.\" 2>/dev/null
+                /bin/echo \"nzbfast: settings and downloads left in \$NZBFAST_DATA\"
+                ;;
+        esac
+    fi
+}"

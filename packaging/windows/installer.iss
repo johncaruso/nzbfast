@@ -10,7 +10,7 @@
 ; signals Defender's ML heuristics weigh, especially with a Run-key
 ; pointing into it. See research/AV-false-positive-2026-07-25.md.
 ;
-; Compile:  ISCC /DAppVersion=<x.y.z> /DStageDir=<dir> installer.iss
+; Compile:  ISCC /DAppVersion=<x.y.z> /DStageDir=<dir> [/DArm64] installer.iss
 ; where <dir> holds nzbfast.exe, nzbtray.exe, MANUAL.html, LICENSE,
 ; COPYRIGHT.md (see make-installer.sh, which stages
 ; from the mingw cross-build and pulls the version from Cargo.toml -
@@ -21,6 +21,37 @@
 #endif
 #ifndef StageDir
   #define StageDir "stage"
+#endif
+
+; Which CPU family the STAGED binaries are for. This script does not build
+; anything - it packages whatever is in StageDir - so this switch only
+; states what is already there, and staging arm64 exes without passing
+; /DArm64 produces an installer that refuses to run on the one machine it
+; was built for.
+;
+; A bare `#ifdef` flag rather than a `/DTargetArch=<name>` string that
+; gets compared: the x64 branch below is the ONLY thing standing between
+; a typo here and the shipping Windows installer, and with #ifdef the
+; unflagged path expands to exactly the literals this file carried before
+; ARM64 existed. Nothing about compiling the x64 package changed, and its
+; invocation did not change either.
+#ifdef Arm64
+  ; Native ARM64 (Snapdragon X and friends). "arm64" matches ONLY real
+  ; ARM64 Windows, so this package cannot be run on an x64 machine.
+  #define ArchIdent "arm64"
+  ; BETA in the filename, deliberately: this build has never been run on
+  ; the hardware it targets, and the name is the only label a user sees
+  ; before they double-click it. Drop the suffix when a tester confirms
+  ; it - and see packaging/make-latest-json.sh for why it is not in the
+  ; signed update manifest until then.
+  #define AssetArch "windows-arm64-beta"
+#else
+  ; "x64compatible", not "x64": it also matches ARM64 Windows, where the
+  ; x64 build runs under emulation. That stays true now that a native
+  ; ARM64 package exists - the emulated build is the proven one and must
+  ; remain installable while the native one is in beta.
+  #define ArchIdent "x64compatible"
+  #define AssetArch "windows-x64"
 #endif
 
 [Setup]
@@ -62,7 +93,7 @@ PrivilegesRequiredOverridesAllowed=dialog
 CloseApplications=yes
 CloseApplicationsFilter=nzbtray.exe,nzbfast.exe
 RestartApplications=no
-OutputBaseFilename=nzbfast-{#AppVersion}-windows-x64-setup
+OutputBaseFilename=nzbfast-{#AppVersion}-{#AssetArch}-setup
 OutputDir=out
 LicenseFile={#StageDir}\LICENSE
 SetupIconFile=..\icon\nzbfast.ico
@@ -71,14 +102,27 @@ UninstallDisplayName=nzbfast
 WizardStyle=modern
 Compression=lzma2
 SolidCompression=yes
-; The tray app is 64-bit only.
-ArchitecturesAllowed=x64compatible
-ArchitecturesInstallIn64BitMode=x64compatible
+; The tray app is 64-bit only. Both identifiers come from the Arm64
+; switch at the top of this file; installing in 64-bit mode is what puts {autopf}
+; at Program Files rather than Program Files (x86), and both families
+; resolve it to the same directory - which is what lets an arm64 package
+; upgrade an x64 install in place, under the same AppId, instead of
+; leaving two nzbfast entries fighting over one Run key and one .nzb
+; association.
+ArchitecturesAllowed={#ArchIdent}
+ArchitecturesInstallIn64BitMode={#ArchIdent}
 
 [Messages]
 ; The one scare screen an unsigned build meets, narrated where the user
 ; lands right after clicking through it.
+#ifdef Arm64
+; The ARM64 build additionally says, in the first screen, that it is a
+; beta. Someone who downloaded the wrong file should find that out here
+; and not after it has installed itself.
+WelcomeLabel2=This will install [name/ver] on your computer.%n%nThis is the BETA build for Windows on ARM (Snapdragon X and similar). It is native ARM64 rather than emulated x64, and it has had far less testing than the x64 build - if anything misbehaves, the x64 installer runs fine on this machine and is the one to fall back to.%n%nnzbfast is not yet code-signed, so Windows SmartScreen may have shown "Windows protected your PC", and the elevation prompt will say the publisher is unknown. Both are expected while signing is set up.%n%nSetup installs into Program Files. If you have no administrator password, choose the per-user option when prompted and it will install just for you.
+#else
 WelcomeLabel2=This will install [name/ver] on your computer.%n%nnzbfast is a fresh release and not yet code-signed, so Windows SmartScreen may have shown "Windows protected your PC", and the elevation prompt will say the publisher is unknown. Both are expected while signing is set up.%n%nSetup installs into Program Files. If you have no administrator password, choose the per-user option when prompted and it will install just for you.
+#endif
 
 [Tasks]
 ; Off by default. Writing Run-key persistence for a brand-new unsigned

@@ -9,12 +9,9 @@ use super::*;
 struct SplitMember {
     id: i64,
     stem: String,
-    complete: bool,
     has_par2: bool,
     first_posted: i64,
     first_seen: i64,
-    have_parts: i64,
-    need_parts: i64,
     pre_named: bool,
 }
 
@@ -391,8 +388,7 @@ impl Index {
         // post-fix ingest - joins via the equality arm.
         let members: Vec<SplitMember> = {
             let mut stmt = self.db.prepare_cached(
-                "SELECT id, stem, complete, has_par2, first_posted, first_seen,
-                        have_parts, need_parts, pre_title
+                "SELECT id, stem, has_par2, first_posted, first_seen, pre_title
                    FROM releases
                   WHERE poster=?1 AND grp=?2
                     AND (stem=?3 OR (stem>=?3||'.' AND stem<?3||'/'))",
@@ -401,13 +397,10 @@ impl Index {
                 Ok(SplitMember {
                     id: r.get(0)?,
                     stem: r.get(1)?,
-                    complete: r.get(2)?,
-                    has_par2: r.get(3)?,
-                    first_posted: r.get(4)?,
-                    first_seen: r.get(5)?,
-                    have_parts: r.get(6)?,
-                    need_parts: r.get(7)?,
-                    pre_named: !r.get::<_, String>(8)?.is_empty(),
+                    has_par2: r.get(2)?,
+                    first_posted: r.get(3)?,
+                    first_seen: r.get(4)?,
+                    pre_named: !r.get::<_, String>(5)?.is_empty(),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?
@@ -476,16 +469,58 @@ impl Index {
             &format!("UPDATE OR IGNORE msgid_map SET release_id=?1 WHERE release_id IN ({list})"),
             [keep],
         )?;
-        tx.execute(&format!("DELETE FROM releases WHERE id IN ({list})"), [])?;
-        let (total, nfiles, nexe): (i64, i64, i64) = tx.query_row(
+        // The pesto counter range and session fields merge like
+        // shatter_fold_members' (whose comment calls the merge
+        // load-bearing): pesto_candidates keys on counter-range
+        // containment, so a fold that dropped a member's range left the
+        // folded set's sidecar unable to find its payload. Read BEFORE
+        // the members are deleted.
+        #[allow(clippy::type_complexity)]
+        let (pmin, pmax, pck, sidx, stot): (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = tx.query_row(
             &format!(
-                "SELECT COALESCE(SUM(bytes),0), COUNT(*),
-                        COALESCE(SUM({EXE_FILE_SQL}),0)
-                   FROM files WHERE release_id=?1"
+                "SELECT MIN(pesto_ctr_min), MAX(pesto_ctr_max), MIN(pesto_clock),
+                        MAX(sess_idx), MAX(sess_total)
+                   FROM releases WHERE id IN ({list}) OR id=?1"
             ),
             [keep],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )?;
+        tx.execute(&format!("DELETE FROM releases WHERE id IN ({list})"), [])?;
+        // Parts and completeness from the POST-merge files table (the
+        // ingest aggregate's shape), not from member sums: OR IGNORE
+        // above drops duplicate filenames, so the pre-merge sums counted
+        // the dropped copies' parts and a dropped incomplete duplicate
+        // marked a wholly-complete merged row incomplete.
+        let (total, nfiles, ncomplete, nexe, have, need): (i64, i64, i64, i64, i64, i64) = tx
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(bytes),0), COUNT(*),
+                            COALESCE(SUM(CASE WHEN nsegs > 0 THEN nsegs
+                                     ELSE json_array_length(segments) END >= total_parts),0),
+                            COALESCE(SUM({EXE_FILE_SQL}),0),
+                            COALESCE(SUM(CASE WHEN nsegs > 0 THEN nsegs
+                                              ELSE json_array_length(segments) END),0),
+                            COALESCE(SUM(total_parts),0)
+                       FROM files WHERE release_id=?1"
+                ),
+                [keep],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )?;
         let fp = members
             .iter()
             .map(|m| m.first_posted)
@@ -493,17 +528,17 @@ impl Index {
             .min()
             .unwrap_or(0);
         let fs = members.iter().map(|m| m.first_seen).min().unwrap_or(now);
-        let complete = members.iter().all(|m| m.complete);
+        let complete = nfiles > 0 && ncomplete == nfiles;
         let has_par2 = members.iter().any(|m| m.has_par2);
-        let have: i64 = members.iter().map(|m| m.have_parts).sum();
-        let need: i64 = members.iter().map(|m| m.need_parts).sum();
         let p = crate::categories::classify(base, &self.custom);
         tx.execute(
             "UPDATE releases
                 SET stem=?2, total_bytes=?3, files=?4, complete=?5, has_par2=?6,
                     first_posted=?7, first_seen=?8, have_parts=?9, need_parts=?10,
                     kind=?11, res=?12, title_key=?13, junk=?14, langs=?15,
-                    vcodec=?16, acodec=?17, hdr=?18
+                    vcodec=?16, acodec=?17, hdr=?18,
+                    pesto_ctr_min=?19, pesto_ctr_max=?20, pesto_clock=?21,
+                    sess_idx=?22, sess_total=?23
               WHERE id=?1",
             rusqlite::params![
                 keep,
@@ -523,7 +558,12 @@ impl Index {
                 p.langs.join(" "),
                 p.vcodec.as_deref().unwrap_or_default(),
                 p.acodec.as_deref().unwrap_or_default(),
-                p.hdr.as_deref().unwrap_or_default()
+                p.hdr.as_deref().unwrap_or_default(),
+                pmin,
+                pmax,
+                pck,
+                sidx,
+                stot
             ],
         )?;
         // rel_fts has no UPDATE trigger (external-content over stems),
@@ -726,19 +766,15 @@ impl Index {
                     Ok(SplitMember {
                         id: r.get(0)?,
                         stem: r.get(1)?,
-                        complete: r.get(2)?,
-                        has_par2: r.get(3)?,
-                        first_posted: r.get(4)?,
-                        first_seen: r.get(5)?,
-                        have_parts: r.get(6)?,
-                        need_parts: r.get(7)?,
-                        pre_named: !r.get::<_, String>(8)?.is_empty(),
+                        has_par2: r.get(2)?,
+                        first_posted: r.get(3)?,
+                        first_seen: r.get(4)?,
+                        pre_named: !r.get::<_, String>(5)?.is_empty(),
                     })
                 })
                 .optional()
         };
-        const COLS: &str = "SELECT id, stem, complete, has_par2, first_posted, first_seen,
-                        have_parts, need_parts, pre_title
+        const COLS: &str = "SELECT id, stem, has_par2, first_posted, first_seen, pre_title
                    FROM releases";
         // The junk>=70 scope rides on the CONTAINER: those are the
         // obfuscated rows whose size is load-bearing correlation
@@ -800,18 +836,57 @@ impl Index {
             "UPDATE OR IGNORE msgid_map SET release_id=?1 WHERE release_id=?2",
             [cont.id, twin.id],
         )?;
+        // The pesto counter range and session fields merge like
+        // shatter_fold_members' (load-bearing there): pesto_candidates
+        // keys on counter-range containment, so dropping the twin's
+        // range would leave the folded set's sidecar unable to find its
+        // payload. Read BEFORE the twin's row is deleted.
+        #[allow(clippy::type_complexity)]
+        let (pmin, pmax, pck, sidx, stot): (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = tx.query_row(
+            "SELECT MIN(pesto_ctr_min), MAX(pesto_ctr_max), MIN(pesto_clock),
+                    MAX(sess_idx), MAX(sess_total)
+               FROM releases WHERE id IN (?1, ?2)",
+            [cont.id, twin.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
         // rel_fts_ad covers this deletion; the kept stem is untouched,
         // so no manual FTS maintenance this time.
         tx.execute("DELETE FROM releases WHERE id=?1", [twin.id])?;
-        let (total, nfiles, nexe): (i64, i64, i64) = tx.query_row(
-            &format!(
-                "SELECT COALESCE(SUM(bytes),0), COUNT(*),
-                        COALESCE(SUM({EXE_FILE_SQL}),0)
-                   FROM files WHERE release_id=?1"
-            ),
-            [cont.id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
+        // Parts and completeness from the POST-merge files table (the
+        // ingest aggregate's shape), not cont+twin sums: OR IGNORE above
+        // drops duplicate filenames, so the pre-merge sums counted the
+        // dropped copies' parts and a dropped incomplete duplicate
+        // marked a wholly-complete merged row incomplete.
+        let (total, nfiles, ncomplete, nexe, have, need): (i64, i64, i64, i64, i64, i64) = tx
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(bytes),0), COUNT(*),
+                            COALESCE(SUM(CASE WHEN nsegs > 0 THEN nsegs
+                                     ELSE json_array_length(segments) END >= total_parts),0),
+                            COALESCE(SUM({EXE_FILE_SQL}),0),
+                            COALESCE(SUM(CASE WHEN nsegs > 0 THEN nsegs
+                                              ELSE json_array_length(segments) END),0),
+                            COALESCE(SUM(total_parts),0)
+                       FROM files WHERE release_id=?1"
+                ),
+                [cont.id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )?;
         let fp = [cont.first_posted, twin.first_posted]
             .into_iter()
             .filter(|v| *v > 0)
@@ -822,18 +897,25 @@ impl Index {
             "UPDATE releases
                 SET total_bytes=?2, files=?3, complete=?4, has_par2=1,
                     first_posted=?5, first_seen=?6, have_parts=?7, need_parts=?8,
-                    junk=?9
+                    junk=?9,
+                    pesto_ctr_min=?10, pesto_ctr_max=?11, pesto_clock=?12,
+                    sess_idx=?13, sess_total=?14
               WHERE id=?1",
             rusqlite::params![
                 cont.id,
                 total,
                 nfiles,
-                cont.complete && twin.complete,
+                nfiles > 0 && ncomplete == nfiles,
                 fp,
                 cont.first_seen.min(twin.first_seen),
-                cont.have_parts + twin.have_parts,
-                cont.need_parts + twin.need_parts,
+                have,
+                need,
                 junk_score(cstem, &p, total.max(0) as u64, nexe > 0),
+                pmin,
+                pmax,
+                pck,
+                sidx,
+                stot
             ],
         )?;
         tx.commit()?;
@@ -1330,15 +1412,26 @@ impl Index {
     /// keep showing them). Chunked so a big first prune never holds the
     /// write lock past the parallel scanners' 10 s busy timeout. Freed
     /// pages get reused by later scans, so the DB size plateaus even
-    /// without VACUUM. Returns rows removed.
+    /// without VACUUM. Returns (rows removed, caught up).
+    ///
+    /// `deadline` is what makes the chunking mean what the line above
+    /// claims. The batch bounds one TRANSACTION; the loop around it was
+    /// unbounded, so on a large index "chunked" bought nothing and the
+    /// write mutex stayed held for the whole reap - see
+    /// [`Self::prune_stale_partials`] for the wedge that measured it.
     ///
     /// Note: an owned release older than the window IS pruned from the
     /// INDEX - the downloaded file and history entry are untouched
     /// (have-badges compute from daemon history, not the index), and a
     /// re-scan re-adds it if it's still within the ingest gate.
-    pub fn prune_age(&self, max_age_secs: i64, now: i64) -> rusqlite::Result<usize> {
+    pub fn prune_age(
+        &self,
+        max_age_secs: i64,
+        now: i64,
+        deadline: std::time::Instant,
+    ) -> rusqlite::Result<(usize, bool)> {
         if max_age_secs <= 0 {
-            return Ok(0);
+            return Ok((0, true));
         }
         let cutoff = now - max_age_secs;
         let mut removed = 0;
@@ -1354,11 +1447,16 @@ impl Index {
                     .collect::<rusqlite::Result<_>>()?
             };
             if ids.is_empty() {
-                break;
+                return Ok((removed, true));
             }
             removed += self.prune_batch(&ids)?;
+            // AFTER the batch, never before: an entry already past the
+            // deadline still does one batch, so a budget the caller set
+            // too tight reaps slowly rather than never.
+            if std::time::Instant::now() >= deadline {
+                return Ok((removed, false));
+            }
         }
-        Ok(removed)
     }
 
     /// M31a: reap dead junk fragments regardless of max_age - the bulk
@@ -1375,8 +1473,30 @@ impl Index {
     /// hours, not days) AND still missing parts (confirmed incomplete on
     /// the server). Wall-visible old content is the opt-in age prune's
     /// job, never this one's. Same chunking + hidden protection.
-    /// Returns rows removed.
-    pub fn prune_stale_partials(&self, settle_secs: i64, now: i64) -> rusqlite::Result<usize> {
+    /// Returns (rows removed, caught up).
+    ///
+    /// BUDGETED, and the reason is a measured wedge (15 Aug, on a live
+    /// 34.6 M-row / 49.7 GB index): the loop below had no deadline, so
+    /// one entry reaped until it ran out of rows - six hours and
+    /// counting, holding the write mutex the whole time. The selection has
+    /// no index to ride (a `junk` range plus a correlated EXISTS over
+    /// `json_array_length(f.segments)`), and it restarts at the top of
+    /// the table on every batch, so the scan prefix of rows that do NOT
+    /// match grows as the ones that do are deleted: the cost per batch
+    /// climbs while the work left barely moves. Every index consumer
+    /// blocked behind it, the download runner included, which froze a
+    /// finished job in the queue reading "Extracting" for as long as the
+    /// daemon lived.
+    ///
+    /// So the caller gets its lock back on a clock. `caught up` false
+    /// means rows are still waiting: come back on the next pass rather
+    /// than on the hourly gate.
+    pub fn prune_stale_partials(
+        &self,
+        settle_secs: i64,
+        now: i64,
+        deadline: std::time::Instant,
+    ) -> rusqlite::Result<(usize, bool)> {
         let cutoff = now - settle_secs;
         let mut removed = 0;
         loop {
@@ -1401,11 +1521,16 @@ impl Index {
                     .collect::<rusqlite::Result<_>>()?
             };
             if ids.is_empty() {
-                break;
+                return Ok((removed, true));
             }
             removed += self.prune_batch(&ids)?;
+            // AFTER the batch, never before: an entry already past the
+            // deadline still does one batch, so a budget the caller set
+            // too tight reaps slowly rather than never.
+            if std::time::Instant::now() >= deadline {
+                return Ok((removed, false));
+            }
         }
-        Ok(removed)
     }
 
     /// M31a: reclaim freed pages to disk by rewriting the whole file.
@@ -1695,6 +1820,13 @@ mod tests {
     use super::*;
     use crate::index::testutil::{entry, teardown};
 
+    /// A prune budget no test can spend: the two reapers take a
+    /// deadline, and every case except the budget test itself is about
+    /// what they reap, not when they stop.
+    fn forever() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(3_600)
+    }
+
     /// The repost table: remember once, recognise later, and never let a
     /// second download rewrite what the first one taught us.
     #[test]
@@ -1803,7 +1935,11 @@ mod tests {
 
         // Keep 2 years (~730 days): the 800/900-day rows are candidates,
         // but the 900-day one is hidden and must survive.
-        let removed = ix.prune_age(730 * DAY, now).unwrap();
+        let (removed, done) = ix.prune_age(730 * DAY, now, forever()).unwrap();
+        assert!(
+            done,
+            "a prune with budget to spare reports itself caught up"
+        );
         assert_eq!(removed, 1, "only the old non-hidden row");
         assert_eq!(ix.search("ancient", 10).unwrap().len(), 0, "old reaped");
         assert_eq!(ix.search("fresh", 10).unwrap().len(), 1, "recent kept");
@@ -1886,7 +2022,11 @@ mod tests {
             .unwrap();
         ix.ingest("alt.test", &[fresh], now).unwrap();
 
-        let removed = ix.prune_stale_partials(7 * DAY, now).unwrap();
+        let (removed, done) = ix.prune_stale_partials(7 * DAY, now, forever()).unwrap();
+        assert!(
+            done,
+            "a prune with budget to spare reports itself caught up"
+        );
         assert_eq!(removed, 1, "only the old junk missing-parts row");
         assert_eq!(
             ix.search("ugpoqs3l6bthdkgbn1ktwkl2wwxju8", 10)
@@ -1914,6 +2054,59 @@ mod tests {
             1,
             "complete junk spared"
         );
+        teardown(&dir, ix);
+    }
+
+    /// A deadline the caller has already spent still buys ONE batch and
+    /// then hands the write mutex back, saying it is not caught up.
+    ///
+    /// This is the 15 Aug wedge, in the small. The reap's batching
+    /// bounded a transaction and nothing else, so an entry with more
+    /// rows than a batch simply kept going: on a live 34.6 M-row index
+    /// that was six hours holding the index write mutex, with every
+    /// other index caller parked behind it - the download runner among
+    /// them, which left a finished job frozen in the queue reading
+    /// "Extracting" for the life of the daemon. The two assertions are
+    /// the whole contract: it stops at ONE batch, and it SAYS there is
+    /// more, which is what stops the caller stamping its hourly clock
+    /// and walking away.
+    #[test]
+    fn stale_partials_stops_on_the_deadline_and_reports_more_to_do() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+        const DAY: i64 = 86_400;
+        let now = 1_000 * DAY;
+        // One batch (8000) and change, all in the reaper's sights:
+        // obfuscated stem (junk >= 50), missing parts, long settled.
+        let dead: Vec<crate::nntp::OverEntry> = (0..8_500u32)
+            .map(|i| {
+                let mut e = entry(
+                    &format!("\"ugpoqs3l6bthdkgbn1ktwkl2ww{i:04x}.part1.rar\" yEnc (1/9)"),
+                    "p@x",
+                    &format!("b{i}"),
+                    750_000,
+                );
+                e.date = now - 30 * DAY;
+                e
+            })
+            .collect();
+        ix.ingest("alt.test", &dead, now - 30 * DAY).unwrap();
+
+        let spent = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let (removed, done) = ix.prune_stale_partials(7 * DAY, now, spent).unwrap();
+        assert_eq!(
+            removed, 8_000,
+            "a spent budget buys exactly one batch, never the whole reap"
+        );
+        assert!(!done, "rows are still waiting - the caller must come back");
+
+        // ...and coming back finishes it, which is what makes the
+        // hourly stamp safe to withhold above.
+        let (rest, done) = ix.prune_stale_partials(7 * DAY, now, forever()).unwrap();
+        assert_eq!(rest, 500, "the remainder, on the next pass");
+        assert!(done, "nothing left to reap");
         teardown(&dir, ix);
     }
 

@@ -451,10 +451,17 @@ impl Index {
         let mut seen: std::collections::HashSet<i64> = Default::default();
         let span = (hi - lo) as u64;
         let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
-        let deadline = std::time::Instant::now() + budget;
+        // `checked_add`, because `budget` is whatever the caller was
+        // handed: `nzbfast oracle-backtest --sample-secs` takes any u64,
+        // and a bare `Instant::now() + Duration::from_secs(u64::MAX)`
+        // panics with "overflow when adding duration to instant" instead
+        // of returning a sample. None means "no time bound", which is
+        // the honest reading of a budget that large - the loop is still
+        // bounded by `seeks` below, so it always terminates.
+        let deadline = std::time::Instant::now().checked_add(budget);
         let seeks = want.div_ceil(PER_SEEK).saturating_mul(3).clamp(4, 64);
         for _ in 0..seeks {
-            if out.len() >= want || std::time::Instant::now() >= deadline {
+            if out.len() >= want || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                 break;
             }
             // SplitMix64 - a named, reproducible generator, so a
@@ -648,5 +655,67 @@ impl Index {
             return;
         }
         h.list.push(hit);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::{entry, teardown};
+    use super::*;
+
+    const DAY_SECS: i64 = 86_400;
+
+    /// `--sample-secs` is a bare `u64` on the CLI, so the draw budget
+    /// arrives here unbounded. Building the deadline with a plain
+    /// `Instant::now() + budget` panicked with "overflow when adding
+    /// duration to instant" on the absurd end of that range, aborting
+    /// `nzbfast oracle-backtest` instead of returning a sample. An
+    /// un-representable budget means "no time bound"; the seek count
+    /// still bounds the loop.
+    #[test]
+    fn backtest_pick_survives_an_unrepresentable_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "nzbfast-index-backtest-budget-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+        let base: i64 = 1_700_000_000;
+        ix.ingest(
+            "alt.binaries.teevee",
+            &[
+                entry(
+                    "\"Budget.Show.S01E01.1080p-A.mkv\" yEnc (1/1)",
+                    "a@a",
+                    "b1",
+                    4 << 30,
+                ),
+                entry(
+                    "\"Budget.Show.S01E02.1080p-A.mkv\" yEnc (1/1)",
+                    "a@a",
+                    "b2",
+                    4 << 30,
+                ),
+            ],
+            base,
+        )
+        .unwrap();
+
+        let got = ix
+            .oracle_backtest_pick(
+                base - DAY_SECS,
+                base + DAY_SECS,
+                None,
+                1,
+                4,
+                std::time::Duration::from_secs(u64::MAX),
+            )
+            .unwrap();
+        // Non-empty keeps this from passing vacuously if an early-out
+        // above the deadline is ever widened: the point is that the
+        // call returns at all, having actually reached the draw loop.
+        assert!(!got.is_empty(), "the draw loop never ran");
+        teardown(&dir, ix);
     }
 }

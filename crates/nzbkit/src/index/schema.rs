@@ -587,6 +587,42 @@ fn additive_migrations(db: &Connection) {
            ON releases(grp, pesto_ctr_min) WHERE pesto_ctr_min IS NOT NULL",
         [],
     );
+    // `spots.release_id` dangled across release deletion: releases.id
+    // has no AUTOINCREMENT, so the freed top rowid is reused by the
+    // next insert, and a promoted spot silently rebound to an unrelated
+    // release - wrong card links, the resolver never re-offering, and
+    // the CDATA/relabel repair passes writing onto somebody else's row.
+    // Exactly the recycled-id hazard the v1 trigger closes for
+    // name_claims/msgid_map, so it moves into the same trigger. -1, not
+    // 0: the eviction deleted the release deliberately, so the spot is
+    // "resolved, release gone", never re-offered (offers match =0) and
+    // never joined (repair passes match >0). Lives after the ALTER that
+    // guarantees the column; the partial index keeps the trigger's
+    // UPDATE off the unresolved millions.
+    let _ = db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_spots_rel ON spots(release_id) WHERE release_id>0",
+        [],
+    );
+    // predb_sweep's exact-match leg probes
+    // `WHERE pre_title='' AND LOWER(stem)=?1`. The plain idx_rel_stem is
+    // BINARY, so LOWER() disqualified it and the "cheap indexed exact
+    // match" was a full releases scan per swept feed row, held on the
+    // shared write handle. Expression index in the query's exact shape;
+    // partial on the same pre_title='' arm so already-named rows fall
+    // out of it as naming progresses.
+    let _ = db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rel_stem_lower
+           ON releases(LOWER(stem)) WHERE pre_title=''",
+        [],
+    );
+    let _ = db.execute_batch(
+        "DROP TRIGGER IF EXISTS rel_identity_ad;
+         CREATE TRIGGER IF NOT EXISTS rel_identity_ad_v2 AFTER DELETE ON releases BEGIN
+           DELETE FROM name_claims WHERE release_id=old.id;
+           DELETE FROM msgid_map WHERE release_id=old.id;
+           UPDATE spots SET release_id=-1 WHERE release_id=old.id;
+         END;",
+    );
     // The header-encryption stats group by kind over a band that is a
     // rounding error next to the whole table; partial so the millions of
     // never-classified rows cost nothing to store or maintain.

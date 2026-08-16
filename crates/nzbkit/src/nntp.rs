@@ -1046,15 +1046,20 @@ fn set_keepalive(socket: &tokio::net::TcpSocket) {
             (&raw const idle).cast(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
+        // TCP_KEEPIDLE is spelled and scaled the same on FreeBSD as on
+        // Linux (seconds until the first probe), so it shares this arm.
+        // TCP_USER_TIMEOUT below does NOT exist on FreeBSD, which is why
+        // the two options are not set together.
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPIDLE,
+            (&raw const idle).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_KEEPIDLE,
-                (&raw const idle).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
             // TCP_USER_TIMEOUT: also bound how long WRITTEN data may sit
             // unacknowledged - catches the half-open peer mid-transfer,
             // which keepalive (idle-only) cannot.
@@ -1071,7 +1076,8 @@ fn set_keepalive(socket: &tokio::net::TcpSocket) {
             target_os = "macos",
             target_os = "ios",
             target_os = "linux",
-            target_os = "android"
+            target_os = "android",
+            target_os = "freebsd"
         ))]
         {
             libc::setsockopt(
@@ -1443,7 +1449,10 @@ impl KtlsWire {
         Self {
             tcp,
             fd,
-            drained: drained.map(|d| (0, d)),
+            // An EMPTY leftover is no leftover: kept as `Some(vec![])` it
+            // would fill nothing on the first `poll_read` and return
+            // `Ready(Ok(()))`, which every reader above reads as EOF.
+            drained: drained.filter(|d| !d.is_empty()).map(|d| (0, d)),
         }
     }
 
@@ -1671,12 +1680,20 @@ async fn tls_handshake(
 /// offer, not ours (see [`tls_provider`]). No NNTP traffic, no
 /// credentials sent.
 pub async fn probe_tls(host: &str, port: u16) -> Result<(String, String), NntpError> {
-    let tcp = direct_connect_opts(host, port, None, None).await?;
+    // Bounded like every production connect: a single-candidate dial gets
+    // no per-candidate slice and the TLS peer may simply never answer, so
+    // an unbounded probe parked its caller for as long as the OS let the
+    // SYN wait.
+    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, direct_connect_opts(host, port, None, None))
+        .await
+        .map_err(|_| NntpError::Timeout)??;
     tcp.set_nodelay(true)?;
     let name = rustls::pki_types::ServerName::try_from(host.to_string())
         .map_err(|_| NntpError::TlsName)?;
     let connector = tokio_rustls::TlsConnector::from(tls_client_config(!tls_full_host(host)));
-    let stream = connector.connect(name, tcp).await?;
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(name, tcp))
+        .await
+        .map_err(|_| NntpError::Timeout)??;
     let (_, conn) = stream.get_ref();
     let proto = conn
         .protocol_version()
@@ -2240,7 +2257,9 @@ where
                     let n = buf.len();
                     out.extend_from_slice(buf);
                     reader.consume(n);
-                    if out.len() > MAX_MULTILINE_BYTES {
+                    // What THIS response appended, not what the caller's
+                    // buffer already held - same as the compressed path.
+                    if out.len() - start > MAX_MULTILINE_BYTES {
                         // Terminator never came - protocol fault; the pool
                         // requeues elsewhere instead of buffering unboundedly.
                         return Err(NntpError::TooLarge(MAX_MULTILINE_BYTES));

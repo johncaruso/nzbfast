@@ -110,14 +110,22 @@ pub fn archive_crc(crc: u32) -> Option<SrrHit> {
     if let Some(cached) = cache().lock_ok().get(&crc) {
         return cached.clone();
     }
-    let hit = fetch(crc);
-    cache().lock_ok().insert(crc, hit.clone());
+    let (hit, answered) = fetch(crc);
+    // Only what the SERVICE said is worth remembering. A refusal to call
+    // out, a transport error and a 429 say nothing about this CRC, and
+    // caching them for the process lifetime left every later retry of the
+    // job nameless long after the network came back.
+    if answered {
+        cache().lock_ok().insert(crc, hit.clone());
+    }
     hit
 }
 
-fn fetch(crc: u32) -> Option<SrrHit> {
+/// `(answer, answered)` - see [`archive_crc`] for why the second half
+/// exists. `answered` is false whenever we never got a body to read.
+fn fetch(crc: u32) -> (Option<SrrHit>, bool) {
     if !crate::identity::may_call_out() {
-        return None;
+        return (None, false);
     }
     // Upper hex, no separator, as the endpoint's own examples write it.
     let url = format!("https://api.srrdb.com/v1/search/archive-crc:{crc:08X}");
@@ -127,7 +135,10 @@ fn fetch(crc: u32) -> Option<SrrHit> {
         .timeout(std::time::Duration::from_secs(10))
         .call();
     match resp {
-        Ok(r) => parse_archive_crc(&r.into_string().ok()?),
+        Ok(r) => match r.into_string() {
+            Ok(body) => (parse_archive_crc(&body), true),
+            Err(_) => (None, false),
+        },
         Err(e) => {
             // Back off the whole lane on an explicit "slow down", so the
             // next finished download does not walk into the same wall.
@@ -138,7 +149,7 @@ fn fetch(crc: u32) -> Option<SrrHit> {
                     .unwrap_or(if *code == 429 { 30 } else { 5 });
                 ratelimit::penalise(Provider::Srrdb, wait);
             }
-            None
+            (None, false)
         }
     }
 }

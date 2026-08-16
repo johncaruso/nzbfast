@@ -476,9 +476,17 @@ fn m_pre_candidates(
 ) -> Option<Value> {
     Some({
         let id = params.get("id").and_then(|v| v.parse::<i64>().ok())?;
-        let cands = d
-            .with_index_read(|ix| ix.pre_candidates(id, 8).ok())
-            .unwrap_or_default();
+        // index_read_checked, not with_index_read: a busy pool must not
+        // answer an empty candidates list as success.
+        let cands = match d.index_read_checked(|ix| ix.pre_candidates(id, 8).ok()) {
+            Err(_) => {
+                return Some(json!({
+                    "status": false, "busy": true,
+                    "error": "the index is busy - try again in a moment",
+                }));
+            }
+            Ok(cands) => cands.unwrap_or_default(),
+        };
         json!({"candidates": cands.into_iter().map(
                 |(pid, name, score, delta, ratio, nuked, source)| json!({
                     "predb_id": pid, "name": name, "score": score,
@@ -609,6 +617,30 @@ fn m_debug_hold_index_read(
             Ok(held) => json!({"held": held.unwrap_or(false), "secs": secs}),
             Err(_) => json!({"held": false, "busy": true, "secs": secs}),
         }
+    })
+}
+
+/// Arm the read-pool fault injector: the next `value` pooled index
+/// reads succeed, every read after that reports the pool busy.
+///
+/// The sibling of `debug_hold_index_read`, for the case holding
+/// connections cannot reach: a handler whose FIRST index read succeeds
+/// and whose SECOND is refused. Holding the pool from another request
+/// can only ever make the first one busy.
+fn m_debug_index_read_busy(
+    _d: &Arc<Daemon>,
+    _req: &mut tiny_http::Request,
+    params: &std::collections::HashMap<String, String>,
+    _ctx: &ApiCtx<'_>,
+    _api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    Some({
+        let n = params
+            .get("value")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        Daemon::arm_debug_read_budget(n);
+        json!({"status": true, "armed": n})
     })
 }
 
@@ -1688,7 +1720,18 @@ fn m_index_dupe(
         // release older than that window answered "release not found",
         // and every call held one of the four read connections for a
         // full-table sort.
-        let stem = d.with_index_read(|ix| ix.stem_by_id(id).ok().flatten());
+        // index_read_checked, not with_index_read: a saturated read pool
+        // must answer "busy", never "release not found" for a release
+        // that exists.
+        let stem = match d.index_read_checked(|ix| ix.stem_by_id(id).ok().flatten()) {
+            Err(_) => {
+                return Some(json!({
+                    "status": false, "busy": true,
+                    "error": "the index is busy - try again in a moment",
+                }));
+            }
+            Ok(stem) => stem,
+        };
         match stem {
             Some(stem) => match d.dupe_collision(&stem) {
                 Some(c) => json!({"status": true, "dupe": true,
@@ -1710,7 +1753,10 @@ fn m_index_get(
     Some({
         // Enqueue an indexed release for download by id.
         let id: i64 = params.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1);
-        let r = d.with_index_read(|ix| {
+        // index_read_checked, not with_index_read: a wall Download/Play
+        // click during a scan batch must hear "busy", not an error
+        // claiming the release is gone.
+        let r = match d.index_read_checked(|ix| {
             // Read the name by id. Scanning the newest rows
             // for it instead missed anything the index had
             // since buried, and the "release-<id>" fallback
@@ -1725,7 +1771,15 @@ fn m_index_get(
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| format!("release-{id}"));
             Some((ix.make_nzb(id).ok()?, name))
-        });
+        }) {
+            Err(_) => {
+                return Some(json!({
+                    "status": false, "busy": true,
+                    "error": "the index is busy - try again in a moment",
+                }));
+            }
+            Ok(r) => r,
+        };
         // M30: optional SAB priority (2 Force / 1 High / …) -
         // the wall passes High for Download and Force for
         // Play so a hand-picked grab never waits behind
@@ -2030,10 +2084,16 @@ fn m_spot_search(
             offset: get("offset").parse().unwrap_or(0),
         };
         let now = unix_now();
-        match d.with_index_read(|ix| ix.spot_browse(&q).ok()) {
-            None => json!({"status": true, "results": [], "total": 0,
+        // index_read_checked, not with_index_read: a busy read pool must
+        // not answer "no spots match" as a plain success.
+        match d.index_read_checked(|ix| ix.spot_browse(&q).ok()) {
+            Err(_) => json!({
+                "status": false, "busy": true,
+                "error": "the index is busy - try again in a moment",
+            }),
+            Ok(None) => json!({"status": true, "results": [], "total": 0,
                             "on": d.spot_enabled.load(Ordering::Relaxed)}),
-            Some((hits, total)) => {
+            Ok(Some((hits, total))) => {
                 let rows: Vec<Value> = hits
                     .iter()
                     .map(|s| {
@@ -2103,7 +2163,19 @@ fn m_rar_name(
             .unwrap_or(0);
         // Already known locked: answer from the classification, spend
         // nothing. This is the line the whole rung exists to draw.
-        if d.with_index_read(|ix| Some(ix.header_encrypted(id))) == Some(true) {
+        // index_read_checked: a busy pool answered None here, which read
+        // as "not encrypted" and re-spent a connection and up to three
+        // articles on a row already terminally classified.
+        let known_locked = match d.index_read_checked(|ix| Some(ix.header_encrypted(id))) {
+            Err(_) => {
+                return Some(json!({
+                    "status": false, "busy": true,
+                    "error": "the index is busy - try again in a moment",
+                }));
+            }
+            Ok(known) => known == Some(true),
+        };
+        if known_locked {
             return Some(json!({
                 "status": false,
                 "outcome": "encrypted",
@@ -2116,9 +2188,21 @@ fn m_rar_name(
         // scan batch first is how the 28 Jul all-workers wedge started.
         // (The file rows are the 7z lane's accessor - the segment
         // decode and bracket normalisation are container-agnostic.)
-        let files = d
-            .with_index_read(|ix| ix.probe7z_files(id).ok())
-            .unwrap_or_default();
+        // index_read_checked, not with_index_read: the pool can be free
+        // for the classification read above and saturated by the time
+        // this one asks, and `with_index_read` maps that to None -
+        // `unwrap_or_default` then answers "no such release" about a
+        // release that exists. Same honesty as the first read, which
+        // has reported busy since it was written.
+        let files = match d.index_read_checked(|ix| ix.probe7z_files(id).ok()) {
+            Err(_) => {
+                return Some(json!({
+                    "status": false, "busy": true,
+                    "error": "the index is busy - try again in a moment",
+                }));
+            }
+            Ok(files) => files.unwrap_or_default(),
+        };
         if files.is_empty() {
             return Some(json!({"status": false, "error": "no such release"}));
         }
@@ -2426,6 +2510,9 @@ pub(in crate::serve) fn dispatch(
         // than there are connections must NOT queue - past
         // INDEX_READ_CONNS they answer `busy` immediately, which is what
         // keeps HTTP workers available for everything else.
+        "debug_index_read_busy" if std::env::var_os("NZBFAST_DEBUG_HOOKS").is_some() => {
+            return m_debug_index_read_busy(d, _req, params, ctx, _api_body);
+        }
         "debug_hold_index_read" if std::env::var_os("NZBFAST_DEBUG_HOOKS").is_some() => {
             return m_debug_hold_index_read(d, _req, params, ctx, _api_body);
         }

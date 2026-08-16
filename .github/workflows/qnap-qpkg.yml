@@ -1,0 +1,184 @@
+# Build the QNAP package (.qpkg) for a published release.
+#
+# WHY THIS IS A WORKFLOW AND NOT A LOCAL SCRIPT. The .qpkg is built by
+# QDK, QNAP's own kit, and qbuild does not run on macOS: it finishes by
+# rewriting the generated self-extractor with `sed -i "s/SCRIPT_LEN/..."`,
+# and BSD sed reads the next argument as a backup suffix, so the length
+# patch never lands and the package cannot unpack itself. Hand-assembling
+# the layout instead would mean shipping a format we had guessed at, to
+# run as root on somebody's NAS. So it is built where QDK works.
+#
+# The payload is not compiled here. make-qpkg.sh downloads the release's
+# own static musl linux binaries and checks them against SHA256SUMS.txt,
+# the same as the Synology .spk - the package ships the exact bits that
+# were released, and this runner needs no Rust at all.
+#
+# WHAT IT DOES NOT DO: upload. Release assets go up through
+# packaging/upload-release-assets.sh from a maintainer's machine, under
+# the release account, and only for files carrying a local scan stamp
+# (TODO 63f - nothing uploads while unscanned). This job leaves the
+# package as a workflow artifact and prints the two commands to finish
+# the job by hand.
+#
+# BETA. Nobody on the team owns a QNAP. Everything here is verified by
+# taking the built package apart again and by the off-box install tests;
+# none of it is proof that QTS installs it. See packaging/qnap/README.md.
+name: qnap-qpkg
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build the .qpkg from (default: the latest release)"
+        required: false
+      port:
+        description: "Port to bake in (default 6789; anything else marks a test build)"
+        required: false
+        default: "6789"
+  # Also on any change to the packaging itself. qbuild does not run on a
+  # maintainer's Mac, so without this the only thing that ever exercises
+  # a qpkg.cfg edit is a release - and the first sign of a mistake would
+  # be a package somebody could not install. The smoke build uses the
+  # latest published release's binaries; nothing is uploaded.
+  pull_request:
+    paths:
+      - "packaging/qnap/**"
+      - "packaging/tests/qnap-install.sh"
+      - ".github/workflows/qnap-qpkg.yml"
+
+permissions: {}
+
+jobs:
+  qpkg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      # Deliberately not called TAG: a job-level env var wins over one
+      # written to $GITHUB_ENV by a step, so reusing the name would make
+      # the resolved tag below invisible to every later step.
+      INPUT_TAG: ${{ inputs.tag }}
+      PORT: ${{ inputs.port }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install what QDK needs
+        run: |
+          set -euo pipefail
+          # rsync is what qbuild stages shared/ with, and it is not on
+          # the runner image. Nothing else is needed: the payload is
+          # downloaded, not compiled.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rsync file
+
+      # Pinned by commit, not by tag or branch: qinstall.sh is COPIED
+      # INTO the package and runs as root on the user's NAS, so the QDK
+      # revision is code we ship. packaging/qnap/qdk-pin.txt says so and
+      # holds the sha.
+      - name: Fetch the pinned QDK
+        run: |
+          set -euo pipefail
+          commit=$(grep -v '^#' packaging/qnap/qdk-pin.txt | grep -m1 .)
+          echo "QDK pinned at $commit"
+          git clone --quiet https://github.com/qnap-dev/QDK.git "$RUNNER_TEMP/qdk"
+          git -C "$RUNNER_TEMP/qdk" checkout --quiet --detach "$commit"
+          chmod 755 "$RUNNER_TEMP/qdk/shared/bin/qbuild"
+          # qpkg_encrypt stamps the checksum into the package trailer and
+          # is a C program QDK ships as source. Without it qbuild prints
+          # one "command not found" line among its progress messages and
+          # still exits 0, leaving App Center to find the blank field.
+          make -C "$RUNNER_TEMP/qdk/src"
+          echo "$RUNNER_TEMP/qdk/shared/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/qdk/src/bin" >> "$GITHUB_PATH"
+
+      # The install-time decisions - where the data goes, which binary to
+      # keep, what an upgrade must not touch - are the part of a NAS
+      # package that cannot be tried out before a NAS installs it. They
+      # run here so a red build is the thing that stops the package,
+      # rather than a user's first upgrade.
+      - name: Off-box install tests
+        run: packaging/tests/qnap-install.sh
+
+      # A dispatch names the tag; a pull request has none, so it builds
+      # against whatever is currently released. Either way the payload is
+      # the published static musl binaries, checked against the release's
+      # own SHA256SUMS.txt by make-qpkg.sh.
+      - name: Resolve the release to package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-}"
+          if [ -z "$tag" ]; then
+            tag=$(gh release view --repo nzbfast/nzbfast --json tagName -q .tagName)
+            echo "no tag given - packaging the latest release, $tag"
+          fi
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "tag must look like vX.Y.Z, got: $tag" >&2; exit 1 ;;
+          esac
+          echo "VER=${tag#v}" >> "$GITHUB_ENV"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Build the .qpkg
+        run: |
+          set -euo pipefail
+          packaging/qnap/make-qpkg.sh "$VER" dist "${PORT:-6789}"
+          ls -l dist/
+
+      # The release builds it a second way: `qnap-beta` in release.yml
+      # hands make-qpkg.sh binaries that were just cross-compiled, rather
+      # than downloading a published release's own tarballs, because
+      # while a release workflow is running there is nothing on the
+      # release page to download yet. That path ships, so it is exercised
+      # here rather than first meeting reality during a release. Same
+      # script, same verification; the binaries come out of the tarballs
+      # this job already fetched.
+      - name: The --binaries path release.yml uses still works
+        run: |
+          set -euo pipefail
+          mkdir -p smoke/bin
+          for pair in "linux-x64 x86_64" "linux-arm64 aarch64"; do
+            set -- $pair
+            tar xzf "$RUNNER_TEMP/rel-$1.tar.gz" -C "$RUNNER_TEMP" \
+              "nzbfast-$VER-$1/nzbfast" 2>/dev/null \
+              || curl -fsSL "https://github.com/nzbfast/nzbfast/releases/download/v$VER/nzbfast-$VER-$1.tar.gz" \
+                 | tar xz -C "$RUNNER_TEMP" "nzbfast-$VER-$1/nzbfast"
+            cp "$RUNNER_TEMP/nzbfast-$VER-$1/nzbfast" "smoke/bin/nzbfast-$2"
+          done
+          chmod 755 smoke/bin/*
+          packaging/qnap/make-qpkg.sh --binaries "$PWD/smoke/bin" "$VER" smoke-out
+          ls -l smoke-out/
+
+      # No identity leak scan here on purpose. That scanner is one of the
+      # few things .github ships without - it contains the private
+      # vocabulary it greps for, so publish-public.sh strips it - and a
+      # workflow step that shells out to a file the public repo does not
+      # have is a red check on somebody else's PR. It is not skipped, it
+      # is moved: nothing reaches a release without it, because
+      # upload-release-assets.sh refuses any asset whose current sha256
+      # has no scan stamp. The two commands below are in that order for
+      # that reason.
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qnap-qpkg-${{ env.VER }}
+          path: dist/*.qpkg
+          if-no-files-found: error
+
+      - name: How to finish the job
+        run: |
+          f=$(ls dist/*.qpkg)
+          cat <<EOF
+          Built $(basename "$f").
+
+          It is NOT uploaded. Download the artifact, then from the repo:
+
+            packaging/scan-release-assets.sh <path>/$(basename "$f")
+            packaging/upload-release-assets.sh $TAG <path>/$(basename "$f")
+
+          Do NOT add it to latest.json: the update manifest is signed and
+          carries an anti-rollback serial, and this package has never run
+          on real hardware. packaging/qnap/README.md has the checklist for
+          promoting it once a QNAP owner confirms it works.
+          EOF

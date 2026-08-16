@@ -856,8 +856,17 @@ impl LiveVerifier {
             for (bi, os, oe, crc) in crc_frags {
                 if s.blocks[bi] != BlockState::Pending {
                     // Raced: another span (one containing the whole block)
-                    // already settled it - drop the stale partial.
-                    s.partials.remove(&bi);
+                    // already settled it - drop the stale partial. It can
+                    // be a BYTE partial by now (a mixed-trust span drops
+                    // the CRC parts and the next fragment allocates bytes
+                    // for the same block), and those carry a budget
+                    // charge: dropping one without returning it holds
+                    // headroom for memory that is gone until the slot
+                    // finishes, which is a spill nobody needed.
+                    if let Some(PartialBuf::Bytes(p)) = s.partials.remove(&bi) {
+                        s.partial_bytes -= p.buf.len();
+                        self.partials_used.fetch_sub(p.buf.len(), Ordering::Relaxed);
+                    }
                     continue;
                 }
                 let Some(PartialBuf::Crc(parts)) = s.partials.get_mut(&bi) else {

@@ -192,9 +192,10 @@ pub struct ParSidecar {
 pub fn par_sidecar(dir: &std::path::Path) -> Option<ParSidecar> {
     // A main index is small (tens of KB); a `.vol000+50.par2` is not,
     // and reading a 700 MB recovery volume to learn what its first
-    // packet already said would stall the tail. Read the smallest few
-    // candidates and stop as soon as one set parses.
+    // packet already said would stall the tail. Skip the big ones and
+    // read the rest smallest-first, under a budget on TOTAL bytes.
     const MAX_READ: u64 = 8 << 20;
+    const MAX_TOTAL: u64 = 32 << 20;
     let rd = std::fs::read_dir(dir).ok()?;
     let mut cands: Vec<(u64, std::path::PathBuf)> = rd
         .flatten()
@@ -208,21 +209,60 @@ pub fn par_sidecar(dir: &std::path::Path) -> Option<ParSidecar> {
         .filter(|(len, _)| *len <= MAX_READ)
         .collect();
     cands.sort();
-    for (_, path) in cands.iter().take(4) {
+    // One directory can hold more than one SET: a release's own, plus a
+    // sample's or a subtitle pack's. Taking the first that parses means
+    // taking the SMALLEST file, which is as likely to be the ancillary
+    // set as the release's - and its fingerprint would then be filed as
+    // this download's identity.
+    //
+    // So census EVERY candidate the budget affords rather than a fixed
+    // count of them. A subtitle pack's index and three of its own
+    // volumes all sort ahead of the release's index on size, so a count
+    // window discarded the one set this function exists to find. The
+    // budget is on bytes, which is what reading and parsing actually
+    // cost, and the sort is ascending, so what it drops is the largest
+    // volumes - which repeat packets the index already stated.
+    let mut sets: std::collections::HashMap<String, Vec<(String, String)>> = Default::default();
+    let mut spent = 0u64;
+    for (len, path) in &cands {
+        if spent + len > MAX_TOTAL {
+            break;
+        }
+        spent += len;
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
-        if let Ok(set) = nzbkit::par2::Par2Set::parse(&[&bytes]) {
-            let pairs = set.member_hash16k();
-            if !pairs.is_empty() {
-                return Some(ParSidecar {
-                    set_id: nzbkit::par2::hex16(&set.recovery_set_id),
-                    pairs,
-                });
-            }
+        let Ok(set) = nzbkit::par2::Par2Set::parse(&[&bytes]) else {
+            continue;
+        };
+        let pairs = set.member_hash16k();
+        if pairs.is_empty() {
+            continue;
+        }
+        // The same set again (a main index and its own volumes): keep
+        // whichever copy described the most members.
+        let have = sets
+            .entry(nzbkit::par2::hex16(&set.recovery_set_id))
+            .or_default();
+        if pairs.len() > have.len() {
+            *have = pairs;
         }
     }
-    None
+    // The set describing the release is the one covering the most
+    // members; a tie between two DIFFERENT sets is genuinely ambiguous,
+    // and a wrong identity is worse than none.
+    //
+    // Decided over the FINISHED census, not carried along it: a `tied`
+    // flag raised mid-scan outlived the tie, because a later fuller copy
+    // of one of the two sets improved that set's count without clearing
+    // it. The function then declined with a unique winner in hand.
+    let most = sets.values().map(Vec::len).max()?;
+    let mut winners = sets.into_iter().filter(|(_, pairs)| pairs.len() == most);
+    let (set_id, pairs) = winners.next()?;
+    if winners.next().is_some() {
+        return None;
+    }
+    Some(ParSidecar { set_id, pairs })
 }
 
 /// The Matroska Title of a finished download's main video, with the
@@ -422,6 +462,135 @@ mod tests {
         assert!(sc.set_id.chars().all(|c| c.is_ascii_hexdigit()));
         // A directory that does not exist is not an error worth having.
         assert!(par_sidecar(&d.join("gone")).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A minimal but well-formed PAR2 index: a Main packet listing one
+    /// id per member, a FileDesc for each (declared past
+    /// `member_hash16k`'s 16 KiB floor, so every one of them counts),
+    /// and a Creator packet of `pad` bytes. The pad is what sets the
+    /// FILE size independently of how many members the set describes,
+    /// which is how these fixtures choose their sort order.
+    #[cfg(feature = "indexer")]
+    fn par2_index(set: u8, members: &[&str], pad: usize) -> Vec<u8> {
+        use md5::{Digest, Md5};
+        let pkt = |ptype: &[u8; 16], body: &[u8]| -> Vec<u8> {
+            let mut p = Vec::new();
+            p.extend_from_slice(nzbkit::par2::MAGIC);
+            p.extend_from_slice(&(64 + body.len() as u64).to_le_bytes());
+            p.extend_from_slice(&[0u8; 16]); // packet MD5, patched below
+            p.extend_from_slice(&[set; 16]); // recovery set id
+            p.extend_from_slice(ptype);
+            p.extend_from_slice(body);
+            let md5: [u8; 16] = Md5::digest(&p[32..]).into();
+            p[16..32].copy_from_slice(&md5);
+            p
+        };
+        let fid = |i: usize| -> [u8; 16] { [set.wrapping_add(i as u8).wrapping_add(1); 16] };
+        let mut main = Vec::new();
+        main.extend_from_slice(&4096u64.to_le_bytes());
+        main.extend_from_slice(&(members.len() as u32).to_le_bytes());
+        for i in 0..members.len() {
+            main.extend_from_slice(&fid(i));
+        }
+        let mut out = pkt(b"PAR 2.0\0Main\0\0\0\0", &main);
+        for (i, name) in members.iter().enumerate() {
+            let mut d = Vec::new();
+            d.extend_from_slice(&fid(i));
+            d.extend_from_slice(&[set ^ (i as u8) ^ 0x40; 16]); // whole-file md5
+            d.extend_from_slice(&[set ^ (i as u8) ^ 0x80; 16]); // md5_16k
+            d.extend_from_slice(&(64u64 << 10).to_le_bytes());
+            d.extend_from_slice(name.as_bytes());
+            while !d.len().is_multiple_of(4) {
+                d.push(0);
+            }
+            out.extend(pkt(b"PAR 2.0\0FileDesc", &d));
+        }
+        out.extend(pkt(
+            b"PAR 2.0\0Creator\0",
+            &vec![b'x'; pad.next_multiple_of(4)],
+        ));
+        out
+    }
+
+    /// The candidates are sorted by size, and a subtitle pack's index
+    /// plus three of its own volumes are all smaller than the release's
+    /// index. A fixed window over the first few therefore excluded the
+    /// only set worth having and answered with the ancillary one - whose
+    /// fingerprint would then be filed as this download's identity.
+    #[cfg(feature = "indexer")]
+    #[test]
+    fn ancillary_sidecars_cannot_crowd_out_the_release_set() {
+        let d = tmpdir("parcap");
+        // Four small ancillary files, one set, one member each.
+        for (i, n) in [
+            "subs.par2",
+            "subs.vol0+1.par2",
+            "subs.vol1+2.par2",
+            "subs.vol3+4.par2",
+        ]
+        .iter()
+        .enumerate()
+        {
+            std::fs::write(d.join(n), par2_index(0x11, &["Subs.srt"], 64 + i * 16)).unwrap();
+        }
+        // The release's own index: more members, and bigger on disk.
+        std::fs::write(
+            d.join("release.par2"),
+            par2_index(0x22, &["r.rar", "r.r00", "r.r01", "r.r02", "r.r03"], 4096),
+        )
+        .unwrap();
+        let sc = par_sidecar(&d).expect("the release set is present and unique");
+        assert_eq!(sc.pairs.len(), 5, "{:?}", sc.pairs);
+        assert!(
+            sc.pairs.iter().any(|(_, n)| n == "r.rar"),
+            "picked the ancillary set: {:?}",
+            sc.pairs
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Two sets tie, then a later copy of one of them describes more
+    /// members. That is a unique winner, not an ambiguity - the tie the
+    /// earlier copy raised no longer stands.
+    #[cfg(feature = "indexer")]
+    #[test]
+    fn a_tie_broken_by_a_fuller_copy_still_answers() {
+        let d = tmpdir("partie");
+        // A and B tie at two members each...
+        std::fs::write(d.join("a.par2"), par2_index(0x31, &["a.rar", "a.r00"], 8)).unwrap();
+        std::fs::write(d.join("b.par2"), par2_index(0x41, &["b.rar", "b.r00"], 64)).unwrap();
+        // ...until a fuller copy of A turns up describing four.
+        std::fs::write(
+            d.join("a.vol0+2.par2"),
+            par2_index(0x31, &["a.rar", "a.r00", "a.r01", "a.r02"], 512),
+        )
+        .unwrap();
+        let sc = par_sidecar(&d).expect("A covers four members and B two");
+        assert_eq!(sc.pairs.len(), 4, "{:?}", sc.pairs);
+        assert!(
+            sc.pairs.iter().all(|(_, n)| n.starts_with("a.")),
+            "{:?}",
+            sc.pairs
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The other direction: a genuine tie between two DIFFERENT sets is
+    /// still ambiguous, and a wrong identity is worse than none.
+    #[cfg(feature = "indexer")]
+    #[test]
+    fn a_real_tie_between_two_sets_is_still_declined() {
+        let d = tmpdir("parambig");
+        std::fs::write(d.join("a.par2"), par2_index(0x51, &["a.rar", "a.r00"], 8)).unwrap();
+        std::fs::write(d.join("b.par2"), par2_index(0x61, &["b.rar", "b.r00"], 64)).unwrap();
+        // A second copy of A that adds nothing does not break the tie.
+        std::fs::write(
+            d.join("a.vol0+2.par2"),
+            par2_index(0x51, &["a.rar", "a.r00"], 512),
+        )
+        .unwrap();
+        assert!(par_sidecar(&d).is_none(), "two sets at two members each");
         let _ = std::fs::remove_dir_all(&d);
     }
 

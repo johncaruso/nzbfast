@@ -13,6 +13,30 @@
 use super::*;
 
 impl Daemon {
+    /// The lock every `queue.json` write serializes on, held from outside
+    /// [`Daemon::save_queue`] by a caller that must not let ANY save land
+    /// in the middle of what it is doing.
+    ///
+    /// The one such caller is a delete verb removing an ACTIVE job. The row
+    /// leaves the queue under the queue lock, and the durable history
+    /// placeholder that replaces it (`delete_prewrite`, and the immediate
+    /// filing for the non-active arm) is a file write, which has no
+    /// business under that mutex - so it happens after the lock drops. A
+    /// save landing in that gap publishes a queue.json the record has
+    /// already left while nothing in history names it yet, and a stop right
+    /// there loses it from BOTH stores: no DELETED row for the dupe check
+    /// or the retry button, and under `GroupParkDelete` - whose whole
+    /// contract is "files KEPT" - a full payload on disk that nothing names
+    /// (read-only sweep 2, M8).
+    ///
+    /// Holding this across the two is what orders them durably without
+    /// putting a file write under the queue lock. Order is IO then queue,
+    /// the same order `save_queue` itself takes them in.
+    pub(in crate::serve) fn hold_queue_writes() -> std::sync::MutexGuard<'static, ()> {
+        static IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        IO.lock_ok()
+    }
+
     /// Persist queue + history to `.spool/queue.json` so a daemon restart
     /// doesn't forget the job list. Only the record is at stake: the NZB
     /// itself already lives in the spool, and each out_dir's article
@@ -39,8 +63,7 @@ impl Daemon {
         // already wrote its fresher snapshot, then overwrite it with stale
         // state and lose T2's change across restart. Snapshotting under the
         // lock makes the last writer also the one holding the newest state.
-        static IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = IO.lock_ok();
+        let _g = Self::hold_queue_writes();
         // Snapshot the queue's MEMBERSHIP under the queue lock (Arc
         // clones, O(N) pointer bumps), then serialize each job after it
         // is released. Serializing under the queue lock held it across

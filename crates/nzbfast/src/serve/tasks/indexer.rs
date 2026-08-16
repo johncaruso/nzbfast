@@ -908,6 +908,17 @@ pub(in crate::serve) fn spawn_oracle_sampler(daemon: &Arc<Daemon>, config: &std:
                     }
                 }
             }
+            // One release, probed once per enabled server, is ONE
+            // observation of that release - not one per server. Eweka,
+            // UsenetServer and Newshosting are all Omicron, so without
+            // this fold a single missing posting arrived as three
+            // independent (0,5) samples that summed to (0,15), crossed
+            // MIN_SAMPLES, and marked the whole backbone gone off one
+            // posting. The fold also caps the per-tick budget at
+            // JOB_SAMPLE_WEIGHT, which matters once oracle_sample is
+            // raised above the 300/h default that made the two equal.
+            let samples =
+                nzbkit::oracle::fold_by_backbone(&samples, nzbkit::oracle::JOB_SAMPLE_WEIGHT);
             if !samples.is_empty() {
                 d.with_index(|ix| ix.oracle_ingest(&samples, now).ok());
             }
@@ -2294,37 +2305,87 @@ pub(in crate::serve) async fn retention_and_statistics(
     if now - last >= 3_600 {
         let max_age = daemon2.index_max_age_secs.load(Ordering::Relaxed) as i64;
         let retention = daemon2.index_retention.load(Ordering::Relaxed);
-        let (aged, stale) = daemon2
-            .with_index(|ix| {
+        let (mut aged, mut stale) = (0usize, 0usize);
+        // One slice = one hold of the index write mutex. The reap used
+        // to run to exhaustion inside a single `with_index`, which on a
+        // large index is hours with every other index consumer - the
+        // download runner's oracle ingest included - parked on the
+        // mutex behind it. Slicing is the whole fix: the work is the
+        // same, the LOCK is handed back between batches.
+        const PRUNE_SLICE: std::time::Duration = std::time::Duration::from_secs(1);
+        // ...and the pass gives up its turn well before the scan
+        // interval, so a reap with millions of rows to go never starves
+        // the scan it shares this loop with. It resumes next pass.
+        const PRUNE_PASS: std::time::Duration = std::time::Duration::from_secs(30);
+        let pass_end = std::time::Instant::now() + PRUNE_PASS;
+        let mut caught_up = false;
+        while !caught_up {
+            // The same stand-down every other maintenance slice takes:
+            // a download that starts mid-reap gets the mutex at the
+            // next slice boundary rather than at the end of the reap.
+            if std::time::Instant::now() >= pass_end || !daemon2.index_maintenance_ok() {
+                break;
+            }
+            let slice = std::time::Instant::now() + PRUNE_SLICE;
+            let Some((a, s, done)) = daemon2.with_index(|ix| {
                 // Age prune (wall-visible content) is
                 // opt-in via the retention setting + a
                 // window; the stale-partial junk reaper
                 // is always on (touches only junk-hidden
                 // dead fragments).
-                let aged = if retention && max_age > 0 {
-                    ix.prune_age(max_age, now).unwrap_or(0)
+                let (a, a_done) = if retention && max_age > 0 {
+                    ix.prune_age(max_age, now, slice).unwrap_or((0, true))
                 } else {
-                    0
+                    (0, true)
                 };
-                let stale = ix.prune_stale_partials(7 * 86_400, now).unwrap_or(0);
-                // §131 D3 search-miss log, both caps. Not counted in
-                // the pruned totals below: these are derived rows
-                // about queries, not catalogue content, and folding
-                // them into "retention pruned N old rows" would make
-                // that line lie about what left the index.
-                let _ = ix.search_log_prune(
-                    crate::serve::SEARCH_LOG_DAYS * 86_400,
-                    crate::serve::SEARCH_LOG_ROWS,
-                    now,
-                );
+                // Only if the age prune left budget: both share the one
+                // slice, and starting the second reap past the deadline
+                // would double this hold of the mutex.
+                let (s, s_done) = if a_done {
+                    ix.prune_stale_partials(7 * 86_400, now, slice)
+                        .unwrap_or((0, true))
+                } else {
+                    (0, false)
+                };
+                Some((a, s, a_done && s_done))
+            }) else {
+                break;
+            };
+            aged += a;
+            stale += s;
+            caught_up = done;
+            // Yield the runtime as well as the mutex. A waiting index
+            // caller has to be RUNNABLE to take the lock we just
+            // dropped, and this task would otherwise re-acquire it
+            // without ever going back to the scheduler.
+            tokio::task::yield_now().await;
+        }
+        daemon2.with_index(|ix| {
+            // §131 D3 search-miss log, both caps. Not counted in
+            // the pruned totals below: these are derived rows
+            // about queries, not catalogue content, and folding
+            // them into "retention pruned N old rows" would make
+            // that line lie about what left the index.
+            let _ = ix.search_log_prune(
+                crate::serve::SEARCH_LOG_DAYS * 86_400,
+                crate::serve::SEARCH_LOG_ROWS,
+                now,
+            );
+            // The hourly clock is stamped only by a reap that ran out
+            // of rows. A pass that spent its budget has more to take
+            // and must come back on the NEXT scan pass - an hour's wait
+            // per slice is how a bounded reap turns into one that never
+            // finishes.
+            if caught_up {
                 let _ = ix.kv_set("retention_at", &now.to_string());
-                Some((aged, stale))
-            })
-            .unwrap_or((0, 0));
+            }
+            Some(())
+        });
         if aged + stale > 0 {
             info!(
                 target: "index",
-                "retention pruned {aged} old + {stale} stale-partial rows"
+                "retention pruned {aged} old + {stale} stale-partial rows{}",
+                if caught_up { "" } else { " (more to reap next pass)" }
             );
             // Republish so queries see the smaller db.
             let era = daemon2.index_era();

@@ -194,26 +194,18 @@ impl OracleSink {
         c.entry((si, age_bucket(age_days))).or_insert((0, 0)).1 += 1;
     }
 
-    /// Empty the accumulator into ingest-ready samples, each clamped to
+    /// Empty the accumulator into ingest-ready samples, one per LEDGER
+    /// cell (backbone × bucket) and each clamped to
     /// [`JOB_SAMPLE_WEIGHT`]. Counts recorded for a server index the
     /// context never named are dropped (can't attribute them).
     pub fn drain(&self) -> Vec<Sample> {
         let servers = self.servers.lock_ok().clone();
         let family = self.family.lock_ok().clone();
         let counts = std::mem::take(&mut *self.counts.lock_ok());
-        let mut out: Vec<Sample> = counts
+        let raw: Vec<Sample> = counts
             .into_iter()
             .filter_map(|((si, bucket), (hits, misses))| {
                 let host = servers.get(si)?.clone();
-                // ONE job contributes one bounded observation per cell,
-                // not one per article. A release's articles are not
-                // independent trials - they live or die together - so
-                // feeding 15,000 raw 430s into a Wilson interval that
-                // assumes independence is a category error, and it is
-                // what let two doomed postings drive (omicron, hdtv,
-                // 7-30d) to a 0.05 upper bound while 12 other releases
-                // in that same cell were 36/36 available.
-                let (hits, misses) = clamp_weight(hits, misses, JOB_SAMPLE_WEIGHT);
                 Some(Sample {
                     host,
                     family: family.clone(),
@@ -223,8 +215,17 @@ impl OracleSink {
                 })
             })
             .collect();
-        out.sort_by(|a, b| (&a.host, a.bucket).cmp(&(&b.host, b.bucket)));
-        out
+        // ONE job contributes one bounded observation per LEDGER cell,
+        // not one per article and not one per configured server. A
+        // release's articles are not independent trials - they live or
+        // die together - so feeding 15,000 raw 430s into a Wilson
+        // interval that assumes independence is a category error, and it
+        // is what let two doomed postings drive (omicron, hdtv, 7-30d)
+        // to a 0.05 upper bound while 12 other releases in that same
+        // cell were 36/36 available. The fold by backbone is the same
+        // argument one level up: three Omicron resellers refusing the
+        // same article is one refusal, not three.
+        fold_by_backbone(&raw, JOB_SAMPLE_WEIGHT)
     }
 }
 
@@ -257,6 +258,58 @@ fn clamp_weight(hits: u64, misses: u64, weight: u64) -> (u64, u64) {
     (h, weight - h)
 }
 
+/// Fold ONE release's (or one job's) samples by BACKBONE, then apply
+/// `weight` once per backbone cell.
+///
+/// Evidence is produced per configured SERVER, but the ledger is keyed
+/// by backbone, and a user can have three configured servers that are
+/// all the same backbone (Eweka, UsenetServer and Newshosting are all
+/// Omicron). The idle sampler STATs the same article ids against every
+/// enabled server in one tick, and a doomed download takes a real 430
+/// from each of them - so one release used to arrive as three
+/// independent `(0, 5)` samples that ingest summed into `(0, 15)`,
+/// crossing [`MIN_SAMPLES`] and marking the whole backbone gone off a
+/// single posting. That is the same category error [`clamp_weight`]
+/// exists to prevent, just at 3x instead of 3,000x: the three probes are
+/// one observation of one release, not three trials.
+///
+/// The host of the folded sample is the alphabetically first raw host of
+/// the group, never a synthesized backbone key - `ingest` still does the
+/// host → backbone mapping, and nothing here has to assume
+/// `backbone_of` is idempotent on its own output.
+///
+/// Only WITHIN a batch. Two aliases sampled in separate ingest calls are
+/// two different releases and must still merge additively.
+pub fn fold_by_backbone(samples: &[Sample], weight: u64) -> Vec<Sample> {
+    let mut by: HashMap<(String, String, u8), Sample> = HashMap::new();
+    for s in samples {
+        let key = (backbone_of(&s.host), s.family.clone(), s.bucket);
+        match by.get_mut(&key) {
+            Some(e) => {
+                e.hits = e.hits.saturating_add(s.hits);
+                e.misses = e.misses.saturating_add(s.misses);
+                if s.host < e.host {
+                    e.host = s.host.clone();
+                }
+            }
+            None => {
+                by.insert(key, s.clone());
+            }
+        }
+    }
+    let mut out: Vec<Sample> = by
+        .into_values()
+        .map(|mut s| {
+            let (h, m) = clamp_weight(s.hits, s.misses, weight);
+            s.hits = h;
+            s.misses = m;
+            s
+        })
+        .collect();
+    out.sort_by(|a, b| (&a.host, a.bucket).cmp(&(&b.host, b.bucket)));
+    out
+}
+
 /// Create the ledger table and run its one-shot rescale (idempotent;
 /// called from `Index::open`).
 #[cfg(feature = "indexer")]
@@ -269,6 +322,7 @@ pub fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
             hits INTEGER NOT NULL DEFAULT 0,
             misses INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0,
+            legacy INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(backbone, family, bucket));
          -- The index's own schema creates this first on every real
          -- open; repeated here (same definition, IF NOT EXISTS, so a
@@ -278,6 +332,14 @@ pub fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
             k TEXT PRIMARY KEY,
             v TEXT NOT NULL);",
     )?;
+    // `legacy` on a ledger that predates it. Non-fatal by design: on a
+    // database that already has the column this fails with "duplicate
+    // column name" every open, and that error is the expected answer,
+    // not a reason to refuse the index.
+    let _ = db.execute(
+        "ALTER TABLE oracle ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     rescale_article_counts(db);
     Ok(())
 }
@@ -292,24 +354,50 @@ pub fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
 /// wiping the table would throw away real signal too.
 ///
 /// So scale every cell proportionally down to [`MIN_SAMPLES`] - 1,
-/// ratio preserved. Every cell lands just under the evidence bar, which
-/// means `backbone_gone` and `carry_rate` stop consulting them the
-/// moment this runs, while the ledger keeps its lean for the wall's
-/// amber. A dozen fresh release-weighted samples then confirm or refute
-/// each cell - at the sampler's one release a minute, days for the
-/// cells that matter, not the 11 days of pure sampler budget it would
-/// have taken to out-vote 57,000 articles.
+/// ratio preserved, and record how much of what survives is that
+/// migrated lean in the `legacy` column. Every cell lands just under
+/// the evidence bar, which means `backbone_gone` and `carry_rate` stop
+/// consulting them the moment this runs, while the ledger keeps its
+/// lean for the wall's amber. A dozen fresh release-weighted samples
+/// then confirm or refute each cell - at the sampler's one release a
+/// minute, days for the cells that matter, not the 11 days of pure
+/// sampler budget it would have taken to out-vote 57,000 articles.
+///
+/// `legacy` is what makes "a dozen fresh samples" true rather than
+/// aspirational. Scaling alone left `(0, 15263)` as `(0, 11)`, one
+/// sample under the bar - so the very first healthy release, worth
+/// [`JOB_SAMPLE_WEIGHT`], made it `(5, 11)`, which is 16 samples with a
+/// Wilson upper bound of 0.556 and therefore CONFIDENTLY GONE. Evidence
+/// that the backbone serves the family perfectly re-armed a verdict
+/// built from 15,263 correlated article misses. Counting only
+/// `hits + misses - legacy` toward [`MIN_SAMPLES`] means the migrated
+/// lean still shapes the interval but can never license a verdict on
+/// its own.
 ///
 /// Non-fatal and self-healing like the index's other migrations: if the
 /// flag write is lost the UPDATE re-runs, and its `WHERE` skips every
-/// cell already at or under the target.
+/// cell already at or under the target. The `legacy` stamp is
+/// re-entrant for the same reason - `MIN(hits + misses, target)` on an
+/// already-migrated cell writes back the value it already held, and
+/// where it does not, it can only over-state the legacy share, which
+/// makes the gate stricter and never looser.
+///
+/// The stamp runs behind a flag of its own. The rescale shipped a
+/// release before the `legacy` column existed, so on every ledger that
+/// already took it the lean is present and unmarked - the exact
+/// population this gate is for. One shared flag would have declared
+/// those ledgers migrated and skipped them permanently.
 #[cfg(feature = "indexer")]
 fn rescale_article_counts(db: &Connection) {
     const FLAG: &str = "oracle_release_weight_v1";
-    let done = db
-        .query_row("SELECT 1 FROM kv WHERE k=?1", [FLAG], |_| Ok(()))
-        .is_ok();
-    if done {
+    const STAMP_FLAG: &str = "oracle_legacy_stamp_v1";
+    let flagged = |k: &str| {
+        db.query_row("SELECT 1 FROM kv WHERE k=?1", [k], |_| Ok(()))
+            .is_ok()
+    };
+    let stamped = flagged(STAMP_FLAG);
+    let already_rescaled = flagged(FLAG);
+    if stamped && already_rescaled {
         return;
     }
     // `target` is at least 1 and the WHERE keeps the divisor above it,
@@ -317,6 +405,36 @@ fn rescale_article_counts(db: &Connection) {
     // expression against the row's ORIGINAL values, so `misses` reads
     // the pre-update `hits`.
     let target = (MIN_SAMPLES - 1) as i64;
+    // Stamp BEFORE the rescale, while the counts are still the article
+    // ones: every sample present at this instant is article-counted, and
+    // what survives the rescale is `MIN(n, target)` of it. Cells already
+    // under the target keep all of their count as legacy - 11 correlated
+    // article misses are no more a dozen releases than 15,263 are.
+    //
+    // The stamp carries its OWN flag because the rescale shipped first:
+    // every ledger that already ran it holds the article-derived lean
+    // with `legacy` at zero, and those are precisely the ledgers this
+    // gate exists to protect. Sharing FLAG would have skipped them for
+    // good and left the defect live everywhere it had already been
+    // reached. On such a ledger the counts are post-rescale, so samples
+    // taken since it ran are stamped as legacy too: that over-states the
+    // lean, which asks for more fresh evidence before a verdict and can
+    // never license one.
+    if !stamped {
+        let stamp = db.execute(
+            "UPDATE oracle SET legacy = MIN(hits + misses, ?1)",
+            [target],
+        );
+        if stamp.is_ok() {
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO kv(k, v) VALUES(?1, '1')",
+                [STAMP_FLAG],
+            );
+        }
+    }
+    if already_rescaled {
+        return;
+    }
     let rescaled = db.execute(
         "UPDATE oracle
             SET hits   = (hits * ?1 + (hits + misses) / 2) / (hits + misses),
@@ -368,21 +486,63 @@ pub fn ingest(db: &Connection, samples: &[Sample], now: i64) -> rusqlite::Result
 pub struct Snapshot {
     /// (backbone, family, bucket) → (hits, misses).
     cells: HashMap<(String, String, u8), (u64, u64)>,
+    /// How much of a cell's count is migrated ARTICLE evidence rather
+    /// than release-weighted samples. A parallel map rather than a third
+    /// count in `cells`, so `insert`/`cell`/`iter_cells` and every
+    /// scoreboard call site keep their two-count shape. Absent = 0.
+    legacy: HashMap<(String, String, u8), u64>,
 }
 
 impl Snapshot {
     #[cfg(feature = "indexer")]
     pub fn load(db: &Connection) -> rusqlite::Result<Snapshot> {
-        let mut stmt = db.prepare("SELECT backbone, family, bucket, hits, misses FROM oracle")?;
-        let cells = stmt
+        // `legacy` arrives with `ensure_schema`'s ALTER, which a
+        // read-only open cannot run. A scoreboard pointed at an archived
+        // copy of an old index must still print, so a missing column
+        // reads as evidence rather than failing - but it reads as ALL
+        // legacy, never as none.
+        //
+        // No column means no ledger this build ever opened for writing,
+        // so nothing in it was ever release-weighted: every count in it
+        // is the article-counted lean `rescale_article_counts` exists to
+        // disarm, and the stamp it would have written is exactly
+        // `MIN(hits + misses, target)` of it. Reading the absent column
+        // as zero said the opposite - that every historical article
+        // outcome was a fresh release sample - so an archived pre-column
+        // ledger cleared `MIN_SAMPLES` on its first row and handed
+        // `oracle-backtest` (which opens READ-ONLY by design, so it can
+        // never take the ALTER) verdicts, reaps, carry rates and skip
+        // counts computed from the very evidence the migration retired.
+        // Over-stating the legacy share can only ask for more fresh
+        // evidence, never license a verdict, which is the safe direction
+        // here for the same reason it is in the stamp.
+        let cols = if db
+            .prepare("SELECT legacy FROM oracle LIMIT 0")
+            .map(|_| ())
+            .is_ok()
+        {
+            "SELECT backbone, family, bucket, hits, misses, legacy FROM oracle"
+        } else {
+            "SELECT backbone, family, bucket, hits, misses, hits + misses FROM oracle"
+        };
+        let mut stmt = db.prepare(cols)?;
+        let rows: Vec<((String, String, u8), (u64, u64), u64)> = stmt
             .query_map([], |r| {
                 Ok((
                     (r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u8),
                     (r.get::<_, i64>(3)? as u64, r.get::<_, i64>(4)? as u64),
+                    r.get::<_, i64>(5)?.max(0) as u64,
                 ))
             })?
             .collect::<rusqlite::Result<_>>()?;
-        Ok(Snapshot { cells })
+        let mut snap = Snapshot::default();
+        for (key, counts, legacy) in rows {
+            if legacy > 0 {
+                snap.legacy.insert(key.clone(), legacy);
+            }
+            snap.cells.insert(key, counts);
+        }
+        Ok(snap)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -395,28 +555,46 @@ impl Snapshot {
             .insert((backbone.into(), family.into(), bucket), (hits, misses));
     }
 
+    /// Samples in one cell that are NOT migrated article evidence - what
+    /// [`MIN_SAMPLES`] counts. See `rescale_article_counts`: the
+    /// migrated lean shapes the Wilson interval but must never be what
+    /// carries a cell over the evidence bar, or one fresh release
+    /// re-arms a verdict built from tens of thousands of correlated
+    /// article outcomes.
+    fn fresh(&self, key: &(String, String, u8)) -> u64 {
+        let n = self.cells.get(key).map(|(h, m)| h + m).unwrap_or(0);
+        n.saturating_sub(self.legacy.get(key).copied().unwrap_or(0))
+    }
+
     /// (hits, misses) evidence for one backbone × release: the exact
     /// (family, bucket) cell when it holds enough samples, else the
     /// backbone's whole-bucket aggregate across families (retention and
     /// takedown waves are mostly family-agnostic; the fallback keeps
     /// verdicts usable while family cells are thin).
-    fn evidence(&self, backbone: &str, family: &str, bucket: u8) -> (u64, u64) {
-        let exact = self
-            .cells
-            .get(&(backbone.to_string(), family.to_string(), bucket))
-            .copied()
-            .unwrap_or((0, 0));
-        if exact.0 + exact.1 >= MIN_SAMPLES {
-            return exact;
+    /// Returns (hits, misses, fresh samples): the third is what the
+    /// caller must test against [`MIN_SAMPLES`], because a cell can be
+    /// wide and still be nothing but migrated article lean.
+    fn evidence(&self, backbone: &str, family: &str, bucket: u8) -> (u64, u64, u64) {
+        let key = (backbone.to_string(), family.to_string(), bucket);
+        let exact = self.cells.get(&key).copied().unwrap_or((0, 0));
+        let exact_fresh = self.fresh(&key);
+        if exact_fresh >= MIN_SAMPLES {
+            return (exact.0, exact.1, exact_fresh);
         }
         let mut agg = (0u64, 0u64);
-        for ((b, _f, k), (h, m)) in &self.cells {
+        let mut agg_legacy = 0u64;
+        for ((b, f, k), (h, m)) in &self.cells {
             if b == backbone && *k == bucket {
                 agg.0 += h;
                 agg.1 += m;
+                agg_legacy += self
+                    .legacy
+                    .get(&(b.clone(), f.clone(), *k))
+                    .copied()
+                    .unwrap_or(0);
             }
         }
-        agg
+        (agg.0, agg.1, (agg.0 + agg.1).saturating_sub(agg_legacy))
     }
 
     /// M29 3d takedown fingerprint: content families whose FRESH posts
@@ -447,14 +625,22 @@ impl Snapshot {
             let mut best: Option<Reaped> = None;
             for b in [0u8, 1u8] {
                 let (mut h, mut m) = (0u64, 0u64);
+                let mut legacy = 0u64;
                 for bb in backbones {
-                    if let Some((hh, mm)) = self.cells.get(&(bb.clone(), fam.to_string(), b)) {
+                    let key = (bb.clone(), fam.to_string(), b);
+                    if let Some((hh, mm)) = self.cells.get(&key) {
                         h += *hh;
                         m += *mm;
+                        legacy += self.legacy.get(&key).copied().unwrap_or(0);
                     }
                 }
                 let n = h + m;
-                if n < MIN_SAMPLES {
+                // Fresh samples only. Summing across backbones is what
+                // makes this the widest of the four gates: two migrated
+                // all-miss cells alone reach 22 article-counted samples
+                // and would have named a family reaped with no fresh
+                // evidence at all.
+                if n.saturating_sub(legacy) < MIN_SAMPLES {
                     continue; // too thin to call a reap
                 }
                 let (_lo, hi) = wilson(h, n);
@@ -501,16 +687,17 @@ impl Snapshot {
             let f = family.trim();
             if f.is_empty() { "misc" } else { f }
         };
-        let (h, m) = self
-            .cells
-            .get(&(backbone.to_string(), fam.to_string(), bucket))
-            .copied()
-            .unwrap_or((0, 0));
-        let n = h + m;
-        if n < MIN_SAMPLES {
+        let key = (backbone.to_string(), fam.to_string(), bucket);
+        let (h, m) = self.cells.get(&key).copied().unwrap_or((0, 0));
+        // FRESH samples, not the raw count: migrated article evidence
+        // was scaled to one under the bar precisely so it could not
+        // steer routing, and counting it here let a single all-hit
+        // release push a legacy cell back over the line and be read as
+        // proof the backbone was gone.
+        if self.fresh(&key) < MIN_SAMPLES {
             return false; // blind spot - never skip on no evidence
         }
-        let (_lo, hi) = wilson(h, n);
+        let (_lo, hi) = wilson(h, h + m);
         hi <= RED_HIGH
     }
 
@@ -520,16 +707,12 @@ impl Snapshot {
     /// ledger measures BODY availability (STAT), while indexing needs
     /// headers, so this may only ever RANK candidates, not skip them.
     pub fn carry_rate(&self, backbone: &str, family: &str, bucket: u8) -> Option<f64> {
-        let (h, m) = self
-            .cells
-            .get(&(backbone.to_string(), family.to_string(), bucket))
-            .copied()
-            .unwrap_or((0, 0));
-        let n = h + m;
-        if n < MIN_SAMPLES {
+        let key = (backbone.to_string(), family.to_string(), bucket);
+        let (h, m) = self.cells.get(&key).copied().unwrap_or((0, 0));
+        if self.fresh(&key) < MIN_SAMPLES {
             return None;
         }
-        Some(h as f64 / n as f64)
+        Some(h as f64 / (h + m) as f64)
     }
 
     /// Raw (hits, misses) of one EXACT cell, no thresholds applied.
@@ -566,9 +749,9 @@ impl Snapshot {
         let mut best_low = 0.0f64;
         let mut best_high = 0.0f64;
         for b in backbones {
-            let (h, m) = self.evidence(b, fam, bucket);
+            let (h, m, fresh) = self.evidence(b, fam, bucket);
             let n = h + m;
-            if n < MIN_SAMPLES {
+            if fresh < MIN_SAMPLES {
                 continue; // this backbone is a blind spot
             }
             informed += 1;
@@ -847,10 +1030,15 @@ mod tests {
     fn rescale_drops_legacy_cells_under_the_evidence_bar() {
         let db = Connection::open_in_memory().unwrap();
         ensure_schema(&db).unwrap();
-        // Seed AROUND the migration flag ensure_schema just set, as an
-        // upgrade from the article-counted era would have on disk.
-        db.execute("DELETE FROM kv WHERE k='oracle_release_weight_v1'", [])
-            .unwrap();
+        // Seed AROUND both migration flags ensure_schema just set, as
+        // an upgrade from the article-counted era would have on disk: a
+        // ledger from that era has taken neither the rescale nor the
+        // legacy stamp.
+        db.execute(
+            "DELETE FROM kv WHERE k IN ('oracle_release_weight_v1', 'oracle_legacy_stamp_v1')",
+            [],
+        )
+        .unwrap();
         let seed = |bb: &str, fam: &str, bucket: u8, h: i64, m: i64| {
             db.execute(
                 "INSERT INTO oracle(backbone, family, bucket, hits, misses, updated_at)
@@ -919,6 +1107,318 @@ mod tests {
             h + m,
             11 + 20,
             "the migration must not re-run over new release-weighted evidence"
+        );
+    }
+
+    /// The migration scaled a legacy cell to one sample UNDER the bar,
+    /// and one healthy release is worth five - so the first fresh
+    /// evidence that a backbone serves a family perfectly used to carry
+    /// the cell back over [`MIN_SAMPLES`] at `(5, 11)`, whose Wilson
+    /// upper bound of 0.556 reads as "confidently gone". Positive
+    /// evidence must never re-arm a verdict, and the dozen fresh samples
+    /// the migration promises must actually be a dozen.
+    #[cfg(feature = "indexer")]
+    #[test]
+    fn one_healthy_release_does_not_reanimate_a_legacy_all_miss_cell() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+        // Seed AROUND both flags, as an upgrade from the
+        // article-counted era would have on disk: 15,263 correlated
+        // article misses, and neither migration taken.
+        db.execute(
+            "DELETE FROM kv WHERE k IN ('oracle_release_weight_v1', 'oracle_legacy_stamp_v1')",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO oracle(backbone, family, bucket, hits, misses, updated_at)
+             VALUES('giganews', 'hdtv', 2, 0, 15263, 1)",
+            [],
+        )
+        .unwrap();
+        ensure_schema(&db).unwrap();
+
+        let snap = Snapshot::load(&db).unwrap();
+        assert_eq!(snap.cell("giganews", "hdtv", 2), Some((0, 11)));
+        assert!(!snap.backbone_gone("giganews", "hdtv", 20));
+
+        // ONE fully healthy release - the idle sampler's entire per-tick
+        // budget at the default 300/h, or one clean download.
+        let probe = |hits, misses| Sample {
+            host: "news.giganews.com".into(),
+            family: "hdtv".into(),
+            bucket: 2,
+            hits,
+            misses,
+        };
+        ingest(&db, &[probe(JOB_SAMPLE_WEIGHT, 0)], 300).unwrap();
+        let snap = Snapshot::load(&db).unwrap();
+        assert_eq!(snap.cell("giganews", "hdtv", 2), Some((5, 11)));
+        // The arithmetic that made this a defect rather than a rounding
+        // quibble: the interval itself really is red at (5, 16).
+        assert!(wilson(5, 16).1 <= RED_HIGH);
+        assert!(
+            !snap.backbone_gone("giganews", "hdtv", 20),
+            "one all-hit release must not re-arm 15,263 legacy article misses"
+        );
+        assert_eq!(snap.carry_rate("giganews", "hdtv", 2), None);
+
+        // A dozen fresh samples DO license a verdict again - the gate is
+        // "count only fresh evidence", not "never speak of this cell".
+        for _ in 0..3 {
+            ingest(&db, &[probe(0, JOB_SAMPLE_WEIGHT)], 400).unwrap();
+        }
+        let snap = Snapshot::load(&db).unwrap();
+        assert_eq!(snap.cell("giganews", "hdtv", 2), Some((5, 26)));
+        assert!(
+            snap.backbone_gone("giganews", "hdtv", 20),
+            "20 fresh samples are the evidence the migration asked for"
+        );
+    }
+
+    /// The rescale shipped a release before the `legacy` column did, so
+    /// the ledgers that matter most - the ones already carrying migrated
+    /// lean - reach this code with the v1 flag set and nothing marked.
+    /// One shared flag declared them migrated and skipped the stamp for
+    /// good, leaving the reanimation above live on exactly the daemons
+    /// that had already upgraded once.
+    #[cfg(feature = "indexer")]
+    #[test]
+    fn a_ledger_that_already_rescaled_still_gets_its_legacy_stamp() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+        // The on-disk shape after the first migration and before this
+        // one: counts already scaled to the target, `legacy` never
+        // written, the rescale's flag set.
+        db.execute(
+            "INSERT INTO oracle(backbone, family, bucket, hits, misses, updated_at, legacy)
+             VALUES('giganews', 'hdtv', 2, 0, 11, 1, 0)",
+            [],
+        )
+        .unwrap();
+        db.execute("DELETE FROM kv WHERE k='oracle_legacy_stamp_v1'", [])
+            .unwrap();
+        db.execute(
+            "INSERT OR REPLACE INTO kv(k, v) VALUES('oracle_release_weight_v1', '1')",
+            [],
+        )
+        .unwrap();
+        ensure_schema(&db).unwrap();
+
+        // Stamped, and NOT rescaled a second time.
+        let snap = Snapshot::load(&db).unwrap();
+        assert_eq!(snap.cell("giganews", "hdtv", 2), Some((0, 11)));
+        let probe = |hits, misses| Sample {
+            host: "news.giganews.com".into(),
+            family: "hdtv".into(),
+            bucket: 2,
+            hits,
+            misses,
+        };
+        ingest(&db, &[probe(JOB_SAMPLE_WEIGHT, 0)], 300).unwrap();
+        let snap = Snapshot::load(&db).unwrap();
+        assert_eq!(snap.cell("giganews", "hdtv", 2), Some((5, 11)));
+        assert!(
+            !snap.backbone_gone("giganews", "hdtv", 20),
+            "an already-rescaled ledger must get the same protection as a fresh one"
+        );
+    }
+
+    /// A ledger opened READ-ONLY cannot take `ensure_schema`'s ALTER,
+    /// so an archive predating the `legacy` column reaches the read path
+    /// with the column absent and its counts still article-scaled.
+    /// `oracle-backtest` opens the index that way on purpose, and its
+    /// whole job is to score the ledger's own verdicts - so reading the
+    /// missing column as "no legacy lean" handed it the article-counted
+    /// evidence back as fresh release samples, and every verdict, reap,
+    /// carry rate and skip count it printed came from evidence the
+    /// migration had retired. Absent means ALL legacy.
+    #[cfg(feature = "indexer")]
+    #[test]
+    fn a_pre_column_ledger_read_only_is_all_legacy_not_all_fresh() {
+        let db = Connection::open_in_memory().unwrap();
+        // The pre-column shape, by hand: `ensure_schema` would add the
+        // column and stamp it, which is precisely what a read-only open
+        // cannot do.
+        db.execute_batch(
+            "CREATE TABLE oracle(
+                backbone TEXT NOT NULL,
+                family TEXT NOT NULL,
+                bucket INTEGER NOT NULL,
+                hits INTEGER NOT NULL DEFAULT 0,
+                misses INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(backbone, family, bucket));",
+        )
+        .unwrap();
+        // The measured live cell from the M29 postmortem, unmigrated:
+        // two correlated releases, 57k article misses.
+        db.execute(
+            "INSERT INTO oracle(backbone, family, bucket, hits, misses, updated_at)
+             VALUES('omicron', 'hdtv', 2, 2871, 57071, 1)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO oracle(backbone, family, bucket, hits, misses, updated_at)
+             VALUES('giganews', 'hdtv', 2, 0, 15263, 1)",
+            [],
+        )
+        .unwrap();
+
+        let snap = Snapshot::load(&db).unwrap();
+        // The lean is still there for the wall's amber...
+        assert_eq!(snap.cell("omicron", "hdtv", 2), Some((2871, 57071)));
+        // ...but none of it is evidence a verdict may rest on.
+        assert!(
+            !snap.backbone_gone("omicron", "hdtv", 20),
+            "57k unmigrated article misses are not a dozen releases"
+        );
+        assert_eq!(snap.carry_rate("omicron", "hdtv", 2), None);
+        assert!(
+            snap.reaped_families(&["omicron".to_string(), "giganews".to_string()])
+                .is_empty(),
+            "an unmigrated ledger must not name a reaped family"
+        );
+    }
+
+    /// `reaped_families` sums the exact cell across every enabled
+    /// backbone before applying the evidence bar, so it reached a dozen
+    /// samples soonest of all: two migrated all-miss cells alone were 22
+    /// "samples" and named a family reaped with nothing fresh at all.
+    #[cfg(feature = "indexer")]
+    #[test]
+    fn migrated_cells_alone_never_name_a_reaped_family() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+        db.execute(
+            "DELETE FROM kv WHERE k IN ('oracle_release_weight_v1', 'oracle_legacy_stamp_v1')",
+            [],
+        )
+        .unwrap();
+        for bb in ["giganews", "omicron"] {
+            db.execute(
+                "INSERT INTO oracle(backbone, family, bucket, hits, misses, updated_at)
+                 VALUES(?1, 'warez', 1, 0, 9000, 1)",
+                [bb],
+            )
+            .unwrap();
+        }
+        ensure_schema(&db).unwrap();
+        let snap = Snapshot::load(&db).unwrap();
+        let bbs = vec!["giganews".to_string(), "omicron".to_string()];
+        assert!(
+            snap.reaped_families(&bbs).is_empty(),
+            "22 migrated article misses are not two dozen releases"
+        );
+
+        // Fresh evidence agreeing with the lean does license the call.
+        for bb in ["news.giganews.com", "news.eweka.nl"] {
+            for _ in 0..2 {
+                ingest(
+                    &db,
+                    &[Sample {
+                        host: bb.into(),
+                        family: "warez".into(),
+                        bucket: 1,
+                        hits: 0,
+                        misses: JOB_SAMPLE_WEIGHT,
+                    }],
+                    500,
+                )
+                .unwrap();
+            }
+        }
+        let snap = Snapshot::load(&db).unwrap();
+        assert_eq!(
+            snap.reaped_families(&bbs).first().map(|r| r.family.clone()),
+            Some("warez".to_string())
+        );
+    }
+
+    /// One release probed against three resellers of ONE backbone is one
+    /// observation of that release, not three. Eweka, UsenetServer and
+    /// Newshosting are all Omicron: unfolded, a single missing posting
+    /// arrived as three `(0, 5)` samples that ingest summed to `(0, 15)`,
+    /// crossing [`MIN_SAMPLES`] and marking the whole backbone gone off
+    /// one posting.
+    #[cfg(feature = "indexer")]
+    #[test]
+    fn one_release_across_aliases_is_one_backbone_sample() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+        let s = |host: &str| Sample {
+            host: host.into(),
+            family: "teevee".into(),
+            bucket: 1,
+            hits: 0,
+            misses: JOB_SAMPLE_WEIGHT,
+        };
+        // ONE sampler tick: the same article ids against three Omicron
+        // resellers plus an unrelated backbone.
+        let tick = fold_by_backbone(
+            &[
+                s("news.usenetserver.com"),
+                s("news.eweka.nl"),
+                s("news.newshosting.com"),
+                s("news.blocknews.net"),
+            ],
+            JOB_SAMPLE_WEIGHT,
+        );
+        assert_eq!(tick.len(), 2, "omicron collapses, blocknews stands alone");
+        ingest(&db, &tick, 100).unwrap();
+        let snap = Snapshot::load(&db).unwrap();
+        assert_eq!(snap.cell("omicron", "teevee", 1), Some((0, 5)));
+        assert_eq!(snap.cell("blocknews", "teevee", 1), Some((0, 5)));
+        assert!(!snap.backbone_gone("omicron", "teevee", 3));
+
+        // Different buckets are different cells and never fold together.
+        let two_buckets = fold_by_backbone(
+            &[
+                Sample {
+                    bucket: 1,
+                    ..s("news.eweka.nl")
+                },
+                Sample {
+                    bucket: 5,
+                    ..s("news.newshosting.com")
+                },
+            ],
+            JOB_SAMPLE_WEIGHT,
+        );
+        assert_eq!(two_buckets.len(), 2);
+    }
+
+    /// The download path's twin: a doomed job takes a real 430 from
+    /// every configured server, and each one is recorded against its own
+    /// server index. The sink must hand the ledger one sample per cell.
+    #[test]
+    fn sink_folds_alias_servers_into_one_backbone_sample() {
+        let sink = OracleSink::default();
+        sink.set_context(
+            vec![
+                "news.eweka.nl".into(),
+                "news.newshosting.com".into(),
+                "news.usenetserver.com".into(),
+                "news.blocknews.net".into(),
+            ],
+            "hdtv".into(),
+        );
+        for _ in 0..200 {
+            for si in 0..4 {
+                sink.miss(si, 20);
+            }
+        }
+        let s = sink.drain();
+        assert_eq!(s.len(), 2, "three Omicron resellers are one cell: {s:?}");
+        // Sorted by (host, bucket); the folded sample keeps the
+        // alphabetically first raw host of its group.
+        assert_eq!(s[0].host, "news.blocknews.net");
+        assert_eq!(s[1].host, "news.eweka.nl");
+        assert!(
+            s.iter()
+                .all(|x| (x.hits, x.misses) == (0, JOB_SAMPLE_WEIGHT)),
+            "one job is one release-weighted sample per cell: {s:?}"
         );
     }
 

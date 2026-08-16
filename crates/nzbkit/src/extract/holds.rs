@@ -586,7 +586,8 @@ impl Extractor {
     /// Take one held span's bytes back into RAM, releasing whichever
     /// store held them (budget for RAM, scratch live-count for paged -
     /// read BEFORE release, so an idle truncate can never beat the
-    /// pread). The caller feeds them onward; a re-hold re-charges as a
+    /// pread, and released on BOTH outcomes since the span is consumed
+    /// either way). The caller feeds them onward; a re-hold re-charges as a
     /// fresh RAM span. Routing lock held.
     pub(super) fn reclaim_span(inner: &Inner, span: HoldSpan) -> io::Result<Vec<u8>> {
         match span {
@@ -596,9 +597,15 @@ impl Extractor {
             }
             HoldSpan::Paged { off, len } => {
                 let mut b = vec![0u8; len];
-                inner.scratch.read(off, &mut b)?;
+                let r = inner.scratch.read(off, &mut b);
+                // The span is consumed either way, so its live charge
+                // goes either way. Still AFTER the read (an idle
+                // truncate must not beat the pread), just no longer
+                // only on success: every caller drops the span on Err,
+                // so a `?` here leaked the reservation for the life of
+                // the run (Fable sweep 15 Aug).
                 inner.scratch.release(len);
-                Ok(b)
+                r.map(|()| b)
             }
         }
     }
@@ -628,9 +635,18 @@ impl Extractor {
     }
 
     fn drain_holds_feed(&self, inner: &mut Inner, slot: usize) -> io::Result<()> {
-        let holds = std::mem::take(&mut inner.slots[slot].holds);
+        // The holds are OUT of the slot the moment this takes them, so
+        // every early exit below has to put the accounting back: a span
+        // the loop never reaches, and the in-hand span the loop failed
+        // on, are both charged to the budget (RAM) or the scratch live
+        // count (paged) and nothing else will ever uncharge them. A
+        // leaked charge is not just a number - it makes the extractor
+        // demote on a ceiling it is no longer using, and keeps the
+        // scratch file from truncating for the rest of the run.
+        let mut rest = std::mem::take(&mut inner.slots[slot].holds).into_iter();
         inner.slots[slot].pre_bytes = 0;
-        for (off, span) in holds {
+        let mut failed = None;
+        for (off, span) in rest.by_ref() {
             // A paged span reads back but is NOT released until after the
             // feed: whatever the feed re-holds is a subrange of these very
             // bytes, and rebinding those to the still-valid scratch region
@@ -644,27 +660,48 @@ impl Extractor {
                 }
                 HoldSpan::Paged { off: po, len } => {
                     let mut b = vec![0u8; len];
-                    inner.scratch.read(po, &mut b)?;
+                    if let Err(e) = inner.scratch.read(po, &mut b) {
+                        // Consumed either way, so the live charge goes
+                        // either way - the same rule `reclaim_span`
+                        // already follows for its own failed pread.
+                        inner.scratch.release(len);
+                        failed = Some(e);
+                        break;
+                    }
                     (b, Some((po, len)))
                 }
             };
             let held_before = inner.slots[slot].holds.len();
             let stash_before = inner.slots[slot].header_spans.len();
-            match inner.slots[slot].mode {
+            let fed = match inner.slots[slot].mode {
                 // No article CRC: a held span is a SUBSET of some earlier
                 // article's bytes, re-fed later, so that article's CRC does
                 // not describe it.
-                SlotMode::Rar => self.rar_span(inner, slot, off, &bytes, None, false, None)?,
-                SlotMode::RarChase | SlotMode::SevenZ => {
-                    self.chase_span(inner, slot, off, &bytes)?
+                SlotMode::Rar => self.rar_span(inner, slot, off, &bytes, None, false, None),
+                SlotMode::RarChase | SlotMode::SevenZ => self.chase_span(inner, slot, off, &bytes),
+                SlotMode::Discard => Ok(()),
+                _ => self.plain_span(inner, slot, off, &bytes),
+            };
+            if let Err(e) = fed {
+                // Release WITHOUT rebinding: a partial feed's re-holds
+                // are charged as fresh RAM spans of their own, so once
+                // this region is released nothing references it.
+                if let Some((_, len)) = paged_at {
+                    inner.scratch.release(len);
                 }
-                SlotMode::Discard => {}
-                _ => self.plain_span(inner, slot, off, &bytes)?,
+                failed = Some(e);
+                break;
             }
             if let Some((po, len)) = paged_at {
                 Self::rebind_subranges(inner, slot, held_before, stash_before, off, po, &bytes);
                 inner.scratch.release(len);
             }
+        }
+        if let Some(e) = failed {
+            for (_, span) in rest {
+                Self::uncharge_span(inner, &span);
+            }
+            return Err(e);
         }
         Ok(())
     }
@@ -772,6 +809,115 @@ mod tests {
     use crate::rar::fixtures;
 
     use crate::extract::testutil::*;
+
+    /// Sweep 2 L8, the RAM half. `drain_holds_feed` takes the whole
+    /// retained pile OUT of the slot before it feeds anything, so an
+    /// error partway is the only thing that will ever see the rest of
+    /// it: dropping the vector frees the memory but leaves every
+    /// unvisited span charged to the budget, and the in-hand paged span
+    /// charged to the scratch live count. An overstated budget demotes
+    /// later sets on a ceiling nothing is using, and a live count that
+    /// never reaches zero keeps the scratch file from truncating for the
+    /// rest of the run.
+    ///
+    /// Both injected errors are deterministic: a directory sitting on
+    /// the plain writer's output name, and a scratch whose file handle
+    /// is gone.
+    #[test]
+    fn a_failed_refeed_leaves_no_retained_span_charged() {
+        // (label, kill the scratch handle before draining?)
+        for (tag, kill_scratch) in [("feed", false), ("pread", true)] {
+            let dir = tmpdir(&format!("holds-refeed-err-{tag}"));
+            let ex = Extractor::new(&dir, 1, true);
+            ex.set_holds_scratch_cap(1 << 20);
+            // The feed itself cannot succeed: a DIRECTORY on the plain
+            // writer's output name fails `ensure_plain_writer`.
+            std::fs::create_dir(dir.join("v.rar")).unwrap();
+            let (a, b, c) = (vec![0xA1u8; 4096], vec![0xB2u8; 4096], vec![0xC3u8; 4096]);
+            {
+                let mut g = ex.inner.lock_ok();
+                let inner = &mut *g;
+                inner.slots[0].mode = SlotMode::Plain;
+                inner.slots[0].name = "v.rar".to_string();
+                inner.slots[0].size = 12_288;
+                // Paged FIRST, so the failing iteration is holding a
+                // scratch charge as well as leaving two behind.
+                let off = inner.scratch.append(&a, 1 << 20).unwrap();
+                inner.slots[0]
+                    .holds
+                    .push((0, HoldSpan::Paged { off, len: a.len() }));
+                inner.budget.add(b.len());
+                inner.slots[0].holds.push((4096, HoldSpan::Ram(b)));
+                inner.budget.add(c.len());
+                inner.slots[0].holds.push((8192, HoldSpan::Ram(c)));
+            }
+            assert_eq!(ex.holds_paged_live(), 4096, "{tag}: setup");
+            assert_eq!(ex.inner.lock_ok().budget.len(), 8192, "{tag}: setup");
+            if kill_scratch {
+                // The pread now fails instead of the feed - the other
+                // early exit out of the same loop.
+                ex.inner.lock_ok().scratch.st().file = None;
+            }
+            let err = {
+                let mut g = ex.inner.lock_ok();
+                let inner = &mut *g;
+                ex.drain_holds(inner, 0).unwrap_err()
+            };
+            assert_eq!(
+                ex.holds_paged_live(),
+                0,
+                "{tag}: a failed refeed left the scratch charged ({err})"
+            );
+            assert_eq!(
+                ex.inner.lock_ok().budget.len(),
+                0,
+                "{tag}: a failed refeed left the RAM budget charged ({err})"
+            );
+            drop(ex);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// The other direction: a refeed that SUCCEEDS still charges and
+    /// uncharges exactly as before - every span released, the bytes
+    /// written where they were held, and no double-uncharge (which the
+    /// budget would report as a wrapped, enormous length).
+    #[test]
+    fn a_clean_refeed_still_releases_exactly_once() {
+        let dir = tmpdir("holds-refeed-ok");
+        let ex = Extractor::new(&dir, 1, true);
+        ex.set_holds_scratch_cap(1 << 20);
+        let (a, b) = (vec![0xA1u8; 4096], vec![0xB2u8; 4096]);
+        {
+            let mut g = ex.inner.lock_ok();
+            let inner = &mut *g;
+            inner.slots[0].mode = SlotMode::Plain;
+            inner.slots[0].name = "v.rar".to_string();
+            inner.slots[0].size = 8192;
+            let off = inner.scratch.append(&a, 1 << 20).unwrap();
+            inner.slots[0]
+                .holds
+                .push((0, HoldSpan::Paged { off, len: a.len() }));
+            inner.budget.add(b.len());
+            inner.slots[0].holds.push((4096, HoldSpan::Ram(b.clone())));
+        }
+        {
+            let mut g = ex.inner.lock_ok();
+            let inner = &mut *g;
+            ex.drain_holds(inner, 0).unwrap();
+        }
+        assert_eq!(ex.holds_paged_live(), 0, "paged span still charged");
+        assert_eq!(ex.inner.lock_ok().budget.len(), 0, "RAM span still charged");
+        drop(ex);
+        let mut want = a.clone();
+        want.extend_from_slice(&b);
+        assert_eq!(
+            std::fs::read(dir.join("v.rar")).unwrap(),
+            want,
+            "a clean refeed must still land every held byte"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Holds paging (the budget-breach relief valve, default ON): the
     /// same neither-end-parsed window that demotes with paging off pages
@@ -1178,8 +1324,18 @@ mod tests {
         assert_eq!(unclassified_spill(256 << 20), 64 << 20);
         assert_eq!(unclassified_spill(1 << 30), 256 << 20); // past the old flat ceiling
         // The field shape: 45% of a 16 GiB budget held a 64 MB window.
-        let field_holds = (16u64 << 30) as usize / 100 * 45;
-        assert!(unclassified_spill(field_holds) > 1 << 30);
+        // A `holds_cap` that large is a 64-bit-only quantity - it does not
+        // fit a 32-bit `usize`, and `MemBudget` caps the budget below it
+        // there anyway - so writing it as `(16u64 << 30) as usize` on
+        // armv7 silently yields ZERO and pins nothing.
+        #[cfg(not(target_pointer_width = "32"))]
+        {
+            let field_holds = (16u64 << 30) as usize / 100 * 45;
+            assert!(unclassified_spill(field_holds) > 1 << 30);
+        }
+        // The 32-bit field shape: the largest holds_cap the budget ceiling
+        // permits still scales rather than sitting on the floor.
+        assert_eq!(unclassified_spill((1 << 30) / 100 * 45), 120_795_952);
     }
 
     /// The stalled-chase window's shape, pinned directly: floored for
@@ -1190,7 +1346,13 @@ mod tests {
     fn chase_stall_spill_window_shape() {
         assert_eq!(chase_stall_spill(8 << 20), 4 << 20); // floor
         assert_eq!(chase_stall_spill(256 << 20), 64 << 20);
+        // The ceiling holds however large the slice gets. Spelled with a
+        // `usize` argument, so the 16 GiB case is 64-bit only: on armv7
+        // `16 << 30` is 0, which would assert the FLOOR while reading
+        // like the ceiling.
+        #[cfg(not(target_pointer_width = "32"))]
         assert_eq!(chase_stall_spill(16 << 30), 64 << 20); // the field shape
+        assert_eq!(chase_stall_spill((1 << 30) / 100 * 45), 64 << 20);
     }
 
     /// TODO 100 follow-up: an article that arrives before the offset-0

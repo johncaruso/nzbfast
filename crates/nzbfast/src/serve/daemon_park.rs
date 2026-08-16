@@ -22,10 +22,54 @@ use super::*;
 /// M3 interleaving needed open. First barrier: the scan has run and the
 /// CAS has not; second: the test has staged its interleaved work and
 /// releases it. Same two-stage shape as `moveseq::COMMIT_TOMB_BARRIER`.
+///
+/// Keyed by the owning daemon's spool path, which is what one test
+/// fixture has and another does not. The bin tests run in parallel and
+/// `note_queue_idle` is on every queue-emptying path there is, so an
+/// unkeyed seam is a two-party barrier that any of them can walk into
+/// as a third waiter - which does not fail the run, it HANGS it (seen
+/// twice, 15 Aug). Same reason `postproc::TAIL_GEN_BARRIER` carries an
+/// nzo_id.
 #[cfg(test)]
 pub(in crate::serve) static IDLE_CAS_BARRIER: Mutex<
-    Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+    Option<(String, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 > = Mutex::new(None);
+
+/// Test seam: `park_gen` trips it after its first generation check has
+/// passed and its file removal is done, which is the window a retry
+/// lands in. The guard is dropped across `remove_job_files` - a whole
+/// recursive delete, unbounded on a hung NAS - so this is a wide window
+/// in practice and a zero-width one in a test without a seam. Same
+/// two-stage shape as `IDLE_CAS_BARRIER`: first barrier says the window
+/// is open, second says the test has staged its retry and releases it.
+///
+/// Keyed by nzo_id, like `postproc::TAIL_GEN_BARRIER`, so a park
+/// belonging to some other test can never wander into a two-party
+/// barrier that is not its own. Unkeyed it hung the whole `--bin
+/// nzbfast` run twice on 15 Aug: every park reaches this seam, the bin
+/// tests run in parallel, and a third waiter on a `Barrier::new(2)`
+/// blocks forever instead of failing.
+#[cfg(test)]
+pub(in crate::serve) static PARK_GEN_BARRIER: Mutex<
+    Option<(String, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+> = Mutex::new(None);
+
+/// Keeps a finished prefetch's detached completion tail registered as
+/// an owner of its directory for as long as that tail runs. See
+/// [`Daemon::sidecar_tail_begin`].
+pub(in crate::serve) struct SidecarTailGuard {
+    d: Arc<Daemon>,
+    target: Arc<AtomicBool>,
+}
+
+impl Drop for SidecarTailGuard {
+    fn drop(&mut self) {
+        self.d
+            .sidecar_tails
+            .lock_ok()
+            .retain(|t| !Arc::ptr_eq(t, &self.target));
+    }
+}
 
 impl Daemon {
     /// Will [`park`](Daemon::park) arm an M32 automatic retry for this
@@ -191,17 +235,17 @@ impl Daemon {
     pub(in crate::serve) fn poke_sidecar(self: &Arc<Self>, hit: impl Fn(&str) -> bool) {
         // Inline first, so the transfer is already stopping by the time the
         // delete/pause API call returns.
-        let Some(id) = self.fire_sidecar_abort(&hit) else {
+        let Some(target) = self.fire_sidecar_abort(&hit) else {
             return;
         };
         let d = self.clone();
         std::thread::spawn(move || {
             // Bounded like the pause re-fire: 60 s is far longer than the
             // handles take to attach, and the loop exits the moment the
-            // sidecar slot is empty or holds a different job.
+            // sidecar slot is empty or holds a different sidecar.
             for _ in 0..240 {
                 std::thread::sleep(std::time::Duration::from_millis(250));
-                if d.fire_sidecar_abort(&|s: &str| s == id).is_none() {
+                if !d.refire_sidecar_abort(&target) {
                     return;
                 }
             }
@@ -209,11 +253,165 @@ impl Daemon {
     }
 
     /// One abort signal at the current sidecar, if `hit` accepts it.
-    /// Returns the nzo_id it fired at, or None when there is nothing to
-    /// fire at - which is how the re-fire loop above knows to stop.
-    fn fire_sidecar_abort(&self, hit: &impl Fn(&str) -> bool) -> Option<String> {
+    /// Returns the sidecar it fired at (see [`Self::refire_sidecar_abort`]
+    /// for why that is the cancel flag rather than the id), or None when
+    /// there is nothing to fire at.
+    fn fire_sidecar_abort(&self, hit: &impl Fn(&str) -> bool) -> Option<Arc<AtomicBool>> {
         let sc = self.sidecar.lock_ok();
         let sc = sc.as_ref().filter(|s| hit(&s.nzo_id))?;
+        Self::signal_sidecar(sc);
+        Some(sc.cancelled.clone())
+    }
+
+    /// Re-fire at the SAME sidecar `fire_sidecar_abort` picked. False =
+    /// it is gone (or something else holds the slot) and the loop stops.
+    ///
+    /// Identity is the cancel flag's allocation, not the nzo_id: a retry
+    /// keeps its id, so a job re-queued inside the 60 s window started a
+    /// fresh prefetch that the previous delete's loop then aborted. The
+    /// Arc is held for the whole loop, so the address cannot be recycled
+    /// under it.
+    fn refire_sidecar_abort(&self, target: &Arc<AtomicBool>) -> bool {
+        let sc = self.sidecar.lock_ok();
+        let Some(sc) = sc.as_ref().filter(|s| Arc::ptr_eq(&s.cancelled, target)) else {
+            return false;
+        };
+        Self::signal_sidecar(sc);
+        true
+    }
+
+    /// Who the prefetch sidecar is serving right now, as `(nzo_id,
+    /// cancel flag)`. Snapshot this BEFORE taking the queue lock: the
+    /// sidecar mutex under queue+job would be a new lock edge, and this
+    /// is the only thing either delete arm needs from it.
+    pub(in crate::serve) fn sidecar_owner(&self) -> Option<(String, Arc<AtomicBool>)> {
+        self.sidecar
+            .lock_ok()
+            .as_ref()
+            .map(|s| (s.nzo_id.clone(), s.cancelled.clone()))
+    }
+
+    /// Delete-with-files for a job the prefetch sidecar is RUNNING:
+    /// wait for the sidecar to wind down, then remove.
+    ///
+    /// A prefetching job reads `Queued` and not `finalizing`, so both
+    /// delete arms took it for a record with no live writer and removed
+    /// its directory on the request thread, microseconds after a
+    /// fire-and-forget `poke_sidecar`. The pipeline was still draining,
+    /// and `ensure_plain_writer` opens a slot's writer LAZILY - on that
+    /// file's first article - so the next file of any multi-file release
+    /// ran `create_dir_all` and laid a fresh payload in the directory
+    /// the user had just deleted, named by no record at all (Codex sweep
+    /// 14 Aug M2).
+    ///
+    /// NOT deferred to `park` instead: the abort's ordinary outcome is
+    /// the sidecar's Err arm, which never parks, so park-deferral would
+    /// leave the payload on disk forever AND leave the directory
+    /// reserved forever with it.
+    ///
+    /// Off the request thread, because the wind-down is the sidecar's
+    /// to finish and an HTTP handler must not hold for it - the same
+    /// reason the plain removal moved out from under the queue lock.
+    pub(in crate::serve) fn remove_after_sidecar_drain(
+        self: &Arc<Self>,
+        target: Arc<AtomicBool>,
+        name: String,
+        dir: std::path::PathBuf,
+        filed: bool,
+        tail: crate::smart::FiledTail,
+    ) {
+        let d = self.clone();
+        std::thread::spawn(move || {
+            // Until the last owner lets go, and no sooner. This was
+            // bounded at 60 s "exactly like `poke_sidecar`'s re-fire
+            // loop", and the two are not the same wait at all: the
+            // re-fire is waiting for handles to ATTACH, which takes
+            // milliseconds, while this is waiting for a whole pipeline
+            // to let go of a directory. The abort does not even reach
+            // the disk tail - the cancel flag is read once, right after
+            // the network phase - so verify, repair and unpack run to
+            // their end afterwards, and on a big damaged set that is
+            // routinely longer than a minute. Past the bound, this
+            // removed the directory under those writers and handed the
+            // reservation back while the old owner was still in there:
+            // the next positioned write then recreated a payload
+            // nothing named, which is the very orphan the drain exists
+            // to prevent (read-only sweep 2, M6).
+            //
+            // The unbounded wait it was written to avoid is a sidecar
+            // that never clears its slot, and that is not a directory
+            // to strand quietly - it is a bug to say out loud. So the
+            // wait says so, once a minute, and keeps waiting.
+            let started = std::time::Instant::now();
+            let mut said = 0u64;
+            while d.sidecar_still_holds(&target) {
+                let mins = started.elapsed().as_secs() / 60;
+                if mins > said {
+                    said = mins;
+                    info!(
+                        target: "prefetch",
+                        "{name}: still waiting for the early start to let go of {} \
+                         before removing it ({mins} min)",
+                        dir.display()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            // The request answered long ago, so a refusal here has no
+            // response left to ride back on - same as park's deferred
+            // removal, and the notice is how it reaches the user.
+            if let FilesGone::Kept(why) = remove_job_files(&dir, &name, filed, &tail) {
+                d.note_delete_kept(&name, &dir, &why);
+            }
+            d.reserved.lock_ok().remove(&dir);
+        });
+    }
+
+    /// Is anything from the run this delete aborted still holding its
+    /// directory - the download, or the tail the download handed off to?
+    ///
+    /// By the cancel flag's allocation, not the nzo_id, for the reason
+    /// [`Self::refire_sidecar_abort`] spells out: a retry keeps its id,
+    /// so a re-queued job's FRESH prefetch would answer yes and this
+    /// wait would sit through a download it has nothing to do with.
+    ///
+    /// BOTH registers, because the slot answers for the download only.
+    /// A prefetch that finishes hands its completion tail to a task of
+    /// its own and then clears the slot on its way out, so between
+    /// those two the slot says "nobody is here" while the tail is about
+    /// to unlock, sweep, rename and move inside that very directory -
+    /// and `finalizing`, which the delete arms test instead, is not
+    /// raised until part-way through it (read-only sweep 2, M6).
+    fn sidecar_still_holds(&self, target: &Arc<AtomicBool>) -> bool {
+        self.sidecar
+            .lock_ok()
+            .as_ref()
+            .is_some_and(|s| Arc::ptr_eq(&s.cancelled, target))
+            || self
+                .sidecar_tails
+                .lock_ok()
+                .iter()
+                .any(|t| Arc::ptr_eq(t, target))
+    }
+
+    /// Register a finished prefetch's detached completion tail as an
+    /// owner of its directory, and hand a guard back that deregisters
+    /// it however that tail ends - normally, by panic, or by being
+    /// dropped at shutdown.
+    pub(in crate::serve) fn sidecar_tail_begin(
+        self: &Arc<Self>,
+        target: Arc<AtomicBool>,
+    ) -> SidecarTailGuard {
+        self.sidecar_tails.lock_ok().push(target.clone());
+        SidecarTailGuard {
+            d: self.clone(),
+            target,
+        }
+    }
+
+    /// The signal itself: the pre-armed flag, plus whichever pipeline
+    /// handles have attached by now.
+    fn signal_sidecar(sc: &crate::serve::sidecar::Sidecar) {
         sc.cancelled.store(true, Ordering::Relaxed);
         if let Some(f) = sc.hub.abort.lock_ok().as_ref() {
             f.store(true, Ordering::Relaxed);
@@ -221,7 +419,6 @@ impl Daemon {
         if let Some(c) = sc.hub.queue_ctl.lock_ok().as_ref() {
             c.abort();
         }
-        Some(sc.nzo_id.clone())
     }
 
     /// Record a delete that removed the RECORD but not the FILES, for the
@@ -291,6 +488,41 @@ impl Daemon {
     /// not lost - mode=retry sends them back through the queue and the
     /// journal resumes from what already landed).
     pub(in crate::serve) fn park(&self, job: Arc<Mutex<Job>>) {
+        self.park_gen(job, None)
+    }
+
+    /// Which round of a record's life a long-running caller started on:
+    /// `(retries, move_seq)`, bumped by [`Daemon::retry`] and
+    /// `moveseq::stamp_move` respectively.
+    pub(in crate::serve) fn record_generation(g: &Job) -> (u32, u64) {
+        (g.retries, g.move_seq)
+    }
+
+    /// Is a record still on the round `gen0` names? `None` is a caller
+    /// that asked for no fence at all, and everything is theirs.
+    ///
+    /// Ask it under the SAME hold as the write it guards wherever the
+    /// two can be brought together - the whole reason `park_gen` grew a
+    /// second check is that a test separated from its write by an
+    /// unlocked interval is not a guard, and every caller of this one
+    /// is a long-running tail with exactly such intervals in it.
+    pub(in crate::serve) fn same_generation(g: &Job, gen0: Option<(u32, u64)>) -> bool {
+        gen0.is_none_or(|g0| Self::record_generation(g) == g0)
+    }
+
+    /// [`Daemon::park`], with the generation the caller started on.
+    ///
+    /// `park` itself needs no guard: its fifteen callers park a job they
+    /// are holding across a short window. The post-processing lane tail
+    /// is the exception - it can run for minutes, and one of the NZBGet
+    /// delete verbs will file a Finishing job into history from under it,
+    /// after which a RETRY (retryable by design) clears the tombstone and
+    /// re-queues the same Arc. The tail then parked the freshly queued
+    /// row straight back into history, consuming the button the user had
+    /// just pressed: the same shape the sidecar's late Ok had, and the
+    /// same answer (Fable sweep 15 Aug). `None` keeps the old behaviour
+    /// exactly.
+    pub(in crate::serve) fn park_gen(&self, job: Arc<Mutex<Job>>, gen0: Option<(u32, u64)>) {
         /// Was this held row held against the job that just failed?
         ///
         /// The `dupe_key` filter alone asks "same title", which is what
@@ -299,19 +531,40 @@ impl Daemon {
         /// different release of the same episode is admitted and runs,
         /// so its failure promoted rows held against a still-completed
         /// original (Codex sweep K). An empty `held_for` is a row from
-        /// before the field existed and keeps the old behaviour.
-        fn held_against(g: &Job, failed_id: &str) -> bool {
-            g.held_for.is_empty() || g.held_for == failed_id
+        /// before the field existed and keeps the old behaviour: for
+        /// those rows only, the caller's `dupe_key` filter is the whole
+        /// gate. A row that NAMES the failed job outranks the key
+        /// comparison - the alias arm of the duplicate check holds a
+        /// job whose key spells the show differently, and requiring
+        /// the keys to also match would park that row forever.
+        fn held_against(g: &Job, failed_id: &str, failed_key: &str) -> bool {
+            if g.held_for.is_empty() {
+                return g.dupe_key.as_deref() == Some(failed_key);
+            }
+            g.held_for == failed_id
         }
-        let (id, failed, key, demote) = {
+        let (id, failed, key, demote, stale) = {
             let g = job.lock_ok();
             (
                 g.nzo_id.clone(),
                 g.state == JobState::Failed,
                 g.dupe_key.clone(),
                 g.demote,
+                // Read under the SAME hold as the rest: a test separated
+                // from the first write it guards is not a guard.
+                gen0.is_some_and(|g0| Self::record_generation(&g) != g0),
             )
         };
+        if stale {
+            // Not ours any more. Do NOT retain the queue, prewrite,
+            // file history or stamp a move - the record belongs to
+            // whoever re-queued it. The two custody maps are keyed by id
+            // and the new run re-registers them, so hand those back and
+            // leave.
+            self.hub.activity.lock_ok().remove(&id);
+            self.hub.tail_cancel.lock_ok().remove(&id);
+            return;
+        }
         // The active-download delete deferred its file removal to here: by
         // now the fetch has drained and no writer can recreate the dir. A
         // tombstoned job is dropped (not filed to history), so its spooled
@@ -326,7 +579,7 @@ impl Daemon {
             // its fetch has drained, so nothing rewrites these fields
             // between the snapshot and the removal.
             let (del, gone_nzb) = {
-                let g = job.lock_ok();
+                let mut g = job.lock_ok();
                 let del = g.del_on_drop.then(|| {
                     (
                         delete_tail(&g, || self.job_suffix(filed_stem(&g))),
@@ -335,6 +588,19 @@ impl Daemon {
                         g.filed,
                     )
                 });
+                // One request, one deletion: the flag is spent here.
+                // M5 lets a deleted record LIVE ON as a retryable
+                // history row, and this is the same Arc that gets filed
+                // and later re-queued - so a flag left set carried the
+                // user's old delete forward into the RETRY's own park,
+                // which removed a freshly completed release just before
+                // filing its Completed row (Codex sweep 14 Aug H1).
+                // Cleared unconditionally, not only when the removal
+                // reported the files gone: a Trash refusal already
+                // reaches the user through `note_delete_kept` below, and
+                // re-arming a later park would be this same bug with an
+                // extra step.
+                g.del_on_drop = false;
                 // M5: a delete verb that files a history row keeps the
                 // spooled .nzb - the row is retryable and retry reads
                 // the spool. Only the history-less delete drops it.
@@ -373,6 +639,45 @@ impl Daemon {
         // `tombstone == false`, so the deleted job was requeued (demote arm),
         // filed into history, or had an alternative promoted for a cancel the
         // user had just made. Every terminal branch below re-reads it.
+        //
+        // The GENERATION needs the same treatment and did not have it. The
+        // check at the top of this function is the only one there was, and
+        // between it and here the guard is dropped for `remove_job_files`,
+        // which walks a whole release and is unbounded on a hung NAS. A
+        // retry landing in THAT window bumps the generation after the test
+        // has already passed, so the rest of this function then ran against
+        // a record it no longer owns: it removed the live retry's activity
+        // and tail-cancel entries, and went on to requeue or file it. Same
+        // stale-read class as the tombstone above, same fix - re-read it.
+        //
+        // It returns WITHOUT touching the two custody maps, which is the one
+        // way it differs from the check at the top. Both maps are keyed by
+        // job id, not by generation, and the new run registers its own
+        // entries under that same key. At the top of this function the retry
+        // has only just landed and has not registered yet, so removing is
+        // handing custody back. Here it is the opposite: we have been away
+        // for the length of a recursive delete, the new generation is
+        // running and its entries are in those maps, and a remove() would
+        // take the live retry's activity row out of the queue - the exact
+        // damage this guard exists to prevent.
+        #[cfg(test)]
+        {
+            // The id is read BEFORE the seam lock is taken: a job lock
+            // under the seam guard would order the two the other way
+            // round from every other reader of this record.
+            let id = job.lock_ok().nzo_id.clone();
+            let seam = PARK_GEN_BARRIER
+                .lock_ok()
+                .clone()
+                .filter(|(k, _, _)| *k == id);
+            if let Some((_, open, release)) = seam {
+                open.wait();
+                release.wait();
+            }
+        }
+        if gen0.is_some_and(|g0| Self::record_generation(&job.lock_ok()) != g0) {
+            return;
+        }
         let tombstone = job.lock_ok().tombstone;
         // Watchdog demotion: back into the queue (deferred, at the end)
         // instead of history - the abort was ours, not a failure. The
@@ -447,7 +752,27 @@ impl Daemon {
         // §158.7: the DESTINATION store FIRST, before the row leaves the
         // live queue - `park_prewrite` carries the why, and the demote arm
         // above is why it has to know about the tombstone.
-        let filed_early = self.park_prewrite(&job, tombstone);
+        // A tombstone that OWES a history row (M5: an NZBGet delete verb
+        // on an active job, filed a hundred lines below) is bound for
+        // history like any other park, so it gets the same prewrite -
+        // without it the record sits in NEITHER store from the queue
+        // removal on the next line until that arm files it, which is the
+        // window §158.7 closed for every other park.
+        let dropping = tombstone && job.lock_ok().delete_status.is_empty();
+        let filed_early = self.park_prewrite(&job, dropping);
+        // From the retain below until an arm files the record into
+        // `self.history`, the job is in NEITHER store in memory - and
+        // `dir_claim` scans exactly those two stores, so a concurrent
+        // add (or retry) picking a directory inside the window reads
+        // this job's canonical folder as free and hands it out; the new
+        // job's first decoded span then truncates the finished payload.
+        // Every directory decision runs under `add_lock` (enqueue,
+        // retry, recategorize), so holding it across the window locks
+        // the deciders out until the record is visible again. Taken
+        // AFTER the prewrite - the row is still in the queue until the
+        // retain, and a durable write has no business under this lock -
+        // and released by each arm the moment it files the record.
+        let mut publish = Some(self.add_lock.lock_ok());
         self.queue.lock_ok().retain(|j| j.lock_ok().nzo_id != id);
         // The harness's window: the row has just left the queue and every
         // store write park still owes is ahead of it.
@@ -528,6 +853,10 @@ impl Daemon {
             // behind it) never waits on a NAS copy.
             let owes_move = job.lock_ok().move_pending;
             self.history.lock_ok().push(job.clone());
+            // In history: `dir_claim` sees the record again, so the
+            // directory deciders waiting on the lock may look now -
+            // ahead of the durable upsert, which they need not wait for.
+            publish.take();
             // §129 1a/1b: the record reaches its own store the moment it
             // reaches history, and the lifecycle event replaces the
             // dashboard's snapshot-diff toast inference. Then retention,
@@ -556,6 +885,14 @@ impl Daemon {
                     "deleted from the queue".into()
                 };
                 g.fail_detail.clear();
+                // The auto-retry stamp too: `will_auto_retry` read the
+                // tombstone BEFORE this arm's delete verb landed, so a
+                // transient failure parking concurrently with the delete
+                // can arrive here armed - and run_due_auto_retries checks
+                // nothing but Failed + due, which would re-download a
+                // title the user explicitly deleted.
+                g.auto_retry_at = None;
+                g.auto_retry_why = None;
                 // The record is done with its abort; clearing the
                 // tombstone here makes it an ordinary history row, so a
                 // later retry re-queues something pick_job will run.
@@ -579,17 +916,28 @@ impl Daemon {
                 }
                 already
             };
+            // Filed (or already present): the record is visible to
+            // `dir_claim` again.
+            publish.take();
             if !already {
                 let _ = self.history_upsert(std::slice::from_ref(&job));
                 self.history_enforce_retention();
             }
         } else if filed_early {
+            // A tombstoned job files into no store at all: its payload
+            // was removed above, so the directory really is free and the
+            // deciders need not wait for the burial below.
+            publish.take();
             // §158.7: a delete landed INSIDE this park, after
             // `park_prewrite`. The job is dropped rather than filed, so
             // bury the row it already wrote or the next boot replays a
             // history record for the job the user cancelled.
             self.history_tombstone(std::slice::from_ref(&id));
         }
+        // The remaining arm (a tombstone with nothing prewritten) files
+        // nothing either; make the release explicit before the promotion
+        // scan below.
+        drop(publish);
         // The original failed → promote its best held ALTERNATIVE (M14f).
         // Not while an automatic retry is armed: the original is coming
         // back through the queue in minutes, and starting the alternative
@@ -619,11 +967,8 @@ impl Daemon {
                 .iter()
                 .filter_map(|j| {
                     let g = j.lock_ok();
-                    (g.priority == -3
-                        && g.dupe_key.as_ref() == Some(&key)
-                        && g.paused
-                        && held_against(&g, &id))
-                    .then(|| (j.clone(), g.name.clone()))
+                    (g.priority == -3 && g.paused && held_against(&g, &id, &key))
+                        .then(|| (j.clone(), g.name.clone()))
                 })
                 .collect();
             let mut best: Option<(u32, &Arc<Mutex<Job>>)> = None;
@@ -642,12 +987,7 @@ impl Daemon {
                 // tombstone, and promoting a just-deleted alternative
                 // would start downloading the very title the user
                 // cancelled.
-                if g.priority == -3
-                    && g.dupe_key.as_ref() == Some(&key)
-                    && g.paused
-                    && !g.tombstone
-                    && held_against(&g, &id)
-                {
+                if g.priority == -3 && g.paused && !g.tombstone && held_against(&g, &id, &key) {
                     g.paused = false;
                     g.priority = 0;
                     info!(
@@ -708,8 +1048,12 @@ impl Daemon {
         });
         #[cfg(test)]
         {
-            let pair = IDLE_CAS_BARRIER.lock_ok().clone();
-            if let Some((entered, released)) = pair {
+            let spool = self.spool.display().to_string();
+            let pair = IDLE_CAS_BARRIER
+                .lock_ok()
+                .clone()
+                .filter(|(k, _, _)| *k == spool);
+            if let Some((_, entered, released)) = pair {
                 entered.wait();
                 released.wait();
             }

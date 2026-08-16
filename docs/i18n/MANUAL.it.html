@@ -1130,10 +1130,10 @@ mai durante un download) per tenerlo aggiornato. Per farlo non scarica mai paylo
 sicuramente perso. Nessun segno significa che sembra a posto.</li>
 <li>Un distintivo <b>ripulito</b> sui gruppi in cui i post recenti vengono già
 rimossi, così distingui un gruppo che muore da una release sfortunata.</li>
-<li><b>Salta i provider che l'oracolo dà per persi</b> (Impostazioni, <b>spenta per
-impostazione predefinita, sperimentale</b>): quando il controllo è sicuro che il
-backbone di un provider ha perso una release, lo salta subito per quel download invece
-di aspettarne il fallimento. Non salterà mai il tuo ultimo provider rimasto.</li>
+<li><b>I provider che l'oracolo dà per persi vanno per ultimi</b> (Impostazioni, <b>spenta per
+impostazione predefinita, sperimentale</b>): quando il controllo è sicuro che il backbone di un provider ha perso una release, quel
+provider viene interpellato per ultimo in quel download invece che per primo. Non viene
+rimosso nulla, quindi un giudizio sbagliato costa un po' di tempo anziché il download.</li>
 </ul>
 <p class="dim">Il verdetto è una previsione basata su indizi, non una garanzia. Per una
 risposta netta su un NZB, <code>nzbfast check</code> (<a href="#cli">§15</a>) conta gli
@@ -1250,6 +1250,11 @@ lo spiega clic per clic, compreso come farlo a intervalli
 pianificati.</td></tr>
 <tr><td>Synology (pacchetto)</td><td>Installa il nuovo <code>.spk</code> in
 Package Center; si aggiorna sul posto.</td></tr>
+<tr><td>QNAP (pacchetto, beta)</td><td>Installa il nuovo
+<code>.qpkg</code> in App Center; si aggiorna sul posto. Le tue impostazioni e i
+tuoi download stanno fuori dalla cartella dell'app, quindi né un aggiornamento
+né una rimozione se li porta via.</td></tr>
+<tr><td>Debian / Ubuntu (.deb)<br>Fedora / RHEL (.rpm)</td><td>Installa il nuovo pacchetto sopra quello vecchio: <code>sudo dpkg -i nzbfast_*.deb</code> oppure <code>sudo rpm -U nzbfast-*.rpm</code>. La cartella delle impostazioni non fa parte del pacchetto, quindi un aggiornamento non può sostituire nulla al suo interno, e le tue modifiche a <code>/etc/nzbfast/nzbfast.env</code> vengono mantenute. Il servizio viene riavviato solo se era già in esecuzione.</td></tr>
 <tr><td>Homebrew</td><td><code>brew upgrade nzbfast</code></td></tr>
 <tr><td>Binario semplice</td><td>Sostituisci il binario. La tua config resta
 dove l'hai creata (<a href="#files">§17</a>).</td></tr>
@@ -1312,6 +1317,11 @@ installato. Questa sola cartella contiene tutto ciò che merita un backup:</p>
 cioè la cartella dell'host che ci hai mappato sopra. Su Unraid è la cartella
 appdata dell'app.</td></tr>
 <tr><td>Pacchetto Synology</td><td><code>/var/packages/nzbfast/var/</code></td></tr>
+<tr><td>Pacchetto QNAP</td><td>Di solito
+<code>/share/Download/nzbfast/config/</code>. La cartella viene scelta durante
+l'installazione e indicata nel log di App Center; anche il file
+<code>nzbfast.env</code> dell'app la registra.</td></tr>
+<tr><td>Pacchetto Debian / RPM</td><td><code>/var/lib/nzbfast/</code></td></tr>
 <tr><td>Terminale</td><td>La cartella in cui hai eseguito
 <code>nzbfast setup</code>, o dove puntano <code>--config</code> /
 <code>$NZBFAST_CONFIG</code>.</td></tr>

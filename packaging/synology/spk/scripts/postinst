@@ -99,7 +99,10 @@ for v in "${SPK_TEST_ROOT:-}"/volume1 "${SPK_TEST_ROOT:-}"/volume2 \
          "${SPK_TEST_ROOT:-}"/volume5 "${SPK_TEST_ROOT:-}"/volume6 \
          "${SPK_TEST_ROOT:-}"/volume7 "${SPK_TEST_ROOT:-}"/volume8; do
     [ -d "$v" ] || continue
-    free=$(df -k "$v" 2>/dev/null | awk 'NR==2 {print $4}')
+    # -P: POSIX output, one row per filesystem. Without it a long
+    # device name can wrap onto a second line and NR==2 reads a device
+    # name where the numbers should be.
+    free=$(df -Pk "$v" 2>/dev/null | awk 'NR==2 {print $4}')
     case "$free" in ''|*[!0-9]*) free=0 ;; esac
 
     # Roomiest volume overall, used only if nothing has a usable share.
@@ -111,7 +114,13 @@ for v in "${SPK_TEST_ROOT:-}"/volume1 "${SPK_TEST_ROOT:-}"/volume2 \
     # DSM filesystems are case-sensitive and the stock share is
     # capitalised ("Downloads"), so both spellings have to be listed.
     for share in downloads Downloads download Download media Media video Video; do
-        if [ -d "$v/$share" ] && [ "$free" -gt "$best_free" ]; then
+        # Free space is the tie-break between volumes that HAVE a
+        # share, never a condition for taking one. df can report nothing
+        # for reasons that say nothing about the volume, and requiring
+        # free > 0 turned that into "no share anywhere" and sent the
+        # downloads to package storage, invisible in File Station.
+        if [ -d "$v/$share" ] \
+           && { [ -z "$best_share" ] || [ "$free" -gt "$best_free" ]; }; then
             best_free="$free"
             best_vol="$v"
             best_share="$share"
