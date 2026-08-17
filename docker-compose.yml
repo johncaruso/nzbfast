@@ -101,7 +101,9 @@ services:
   # version tag such as :1.0.3 never moves: both Watchtower and a manual
   # re-pull fetch the tag the container was created with.
   watchtower:
-    image: containrrr/watchtower
+    # The maintained fork. The original containrrr/watchtower was
+    # archived, and its image has not been rebuilt since 2023.
+    image: nickfedor/watchtower
     container_name: nzbfast-watchtower
     restart: unless-stopped
     environment:
