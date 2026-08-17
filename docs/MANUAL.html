@@ -143,8 +143,7 @@ extraction are all inside one executable. There is nothing else to install.</p>
   <li><b>Pipelined NNTP</b>: many article requests ride each connection back-to-back,
   keeping every connection at full speed instead of waiting out round-trips.</li>
   <li><b>A one-pass pipeline</b>: downloading, verification, and extraction overlap.
-  Archive volumes are extracted <em>in the stream</em>; on a typical store-mode post the
-  RAR files never touch your disk, so the job needs 1× the release size, not 2×,
+  Archive volumes are extracted <em>in the stream</em>; on almost any post - RAR, 7z or zip, stored or compressed - the archive files never touch your disk, so the job needs 1× the release size, not 2×,
   and finishes when the download finishes.</li>
   <li><b>Multi-provider union</b>: every configured server contributes; an article
   missing on one backbone is fetched from another. Slow or dead servers never stall
@@ -262,9 +261,7 @@ This is what you feed nzbfast.</td></tr>
 <tr><td><b>PAR2</b></td><td>Recovery data posted alongside a release. nzbfast verifies
 against it <em>during</em> the download and repairs automatically when articles are
 damaged or missing.</td></tr>
-<tr><td><b>Store-mode RAR</b></td><td>Most releases are packed into RAR volumes without
-compression. nzbfast recognizes this and writes the <em>inner file</em> directly to its
-final location while downloading, with no unpack step afterwards.</td></tr>
+<tr><td><b>Store-mode RAR</b></td><td>Most releases are packed into RAR volumes without compression, which makes them the cheapest case: nzbfast writes the <em>inner file</em> directly to its final location while downloading, with no unpack step afterwards. Compressed and encrypted archives, and 7z and zip, are handled the same way; they just cost more CPU on the way through.</td></tr>
 </table></div>
 <p>The pipeline runs download → decode → verify → extract <em>concurrently</em>. The
 Pipeline card on the dashboard shows all three lanes moving at once. When the last

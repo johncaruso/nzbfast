@@ -50,16 +50,66 @@ jobs:
       # their PAR2 sets with the external `par2` and skip without it.
       - name: test deps (par2 for repair e2e)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq par2
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Cargo.lock moves on EVERY release (packaging/bump-version.sh
+      # rewrites it), and this key used to be `hashFiles('Cargo.lock')` -
+      # so the first nightly after a release ran cold on every job.
+      # Measured 17 Aug 2026 on run 32014400559: all four cache restores
+      # took 0-1s, every one a miss, and `long-suites` spent 4m08s
+      # building where the one warm run in the same sample took 1m32s.
+      # tools/dep-cache-key.py hashes the lockfile with the workspace
+      # members' own version lines normalised out, so our own version
+      # bumps stop throwing away ~600 compiled crates. Same tool, same
+      # rationale, same `-v2`-style suffix discipline as ci-private.yml.
+      - name: dependency cache key
+        id: depkey
+        run: |
+          py=python3; command -v $py >/dev/null 2>&1 || py=python
+          echo "hash=$($py tools/dep-cache-key.py)" >> "$GITHUB_OUTPUT"
+      # restore + save as SEPARATE steps, not the combined actions/cache:
+      # its post step does NOT save when the job FAILED, so one red night
+      # left the next night cold as well. That is not hypothetical here -
+      # on run 32014400559 `armv7-cross` failed and its
+      # `Post Run actions/cache` reads `skipped`. The save below is
+      # `if: always()` and sits immediately after the build, so the
+      # dependency artifacts are banked whatever the suites then do.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: nightly-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: nightly-v2-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
+      # nextest, not libtest, and the reason is diagnostic rather than
+      # speed: with `retries = 1` in .config/nextest.toml a flake is
+      # reported as a NAMED FLAKY test with both attempts' output, where
+      # bare `cargo test` gave an anonymous pass/fail tally. These are
+      # the flakiest suites in the repo, so they are the ones that most
+      # needed it - and they were the last place in CI still on libtest.
+      # Prebuilt, pinned by version, checked by SHA256 rather than
+      # trusted: same pattern as the armv7 job below and ci-private.yml.
+      - name: install cargo-nextest
+        run: |
+          set -euo pipefail
+          ver="0.9.140"
+          curl -sSfL --retry 5 --retry-delay 3 --retry-all-errors \
+            --connect-timeout 20 -o cargo-nextest.tar.gz \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${ver}/cargo-nextest-${ver}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "4ee9aaa0d0171a985a5d0eb735b87355894c1c455972e9674fb9fdbd1387c9a3  cargo-nextest.tar.gz" | sha256sum -c -
+          tar -xzf cargo-nextest.tar.gz
+          sudo mv cargo-nextest /usr/local/bin/
+          rm cargo-nextest.tar.gz
       - name: build
         id: build
         run: cargo build -p nzbfast --locked
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ always() && steps.cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: nightly-v2-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
       # EVERY suite step below carries the same `if`, and that is the
       # point: a red suite must not hide the ones after it.
       #
@@ -94,13 +144,13 @@ jobs:
         env:
           NZBFAST_NO_ENRICH: "1"
           NZBFAST_REQUIRE_PAR2: "1"
-        run: cargo test -p nzbfast --locked --features heavy-tests --test daemon -- --test-threads=1
+        run: cargo nextest run --profile ci -p nzbfast --locked --features heavy-tests --test daemon
       - name: e2e suite
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           NZBFAST_NO_ENRICH: "1"
           NZBFAST_REQUIRE_PAR2: "1"
-        run: cargo test -p nzbfast --locked --features heavy-tests --test e2e -- --test-threads=1
+        run: cargo nextest run --profile ci -p nzbfast --locked --features heavy-tests --test e2e
       # The other half of ci-private's exclusion list. That job runs
       # `--workspace` minus seven names; three of them (daemon, e2e,
       # leak_soak) already had a home here, and these four did not have
@@ -134,25 +184,25 @@ jobs:
         env:
           NZBFAST_NO_ENRICH: "1"
           NZBFAST_REQUIRE_PAR2: "1"
-        run: cargo test -p nzbkit --locked --features heavy-tests --test conn_tuner
+        run: cargo nextest run --profile ci -p nzbkit --locked --features heavy-tests --test conn_tuner
       - name: elapsed-time suite - index_size_cap
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           NZBFAST_NO_ENRICH: "1"
           NZBFAST_REQUIRE_PAR2: "1"
-        run: cargo test -p nzbfast --locked --features heavy-tests --test index_size_cap -- --test-threads=1
+        run: cargo nextest run --profile ci -p nzbfast --locked --features heavy-tests --test index_size_cap
       - name: elapsed-time suite - http_wedge
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           NZBFAST_NO_ENRICH: "1"
           NZBFAST_REQUIRE_PAR2: "1"
-        run: cargo test -p nzbfast --locked --features heavy-tests --test http_wedge -- --test-threads=1
+        run: cargo nextest run --profile ci -p nzbfast --locked --features heavy-tests --test http_wedge
       - name: elapsed-time suite - queue_soak
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           NZBFAST_NO_ENRICH: "1"
           NZBFAST_REQUIRE_PAR2: "1"
-        run: cargo test -p nzbfast --locked --features heavy-tests --test queue_soak -- --test-threads=1
+        run: cargo nextest run --profile ci -p nzbfast --locked --features heavy-tests --test queue_soak
 
   # Windows leg for the PRIVATE repo. The test suite had NEVER run on
   # Windows until a Windows-on-ARM build probe added the public-repo
@@ -188,7 +238,31 @@ jobs:
       #
       # No par2 fetch, unlike pr-check's Windows job: par2 there is a
       # fixture tool for the e2e repair tests, which do not run here.
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Cargo.lock moves on EVERY release (packaging/bump-version.sh
+      # rewrites it), and this key used to be `hashFiles('Cargo.lock')` -
+      # so the first nightly after a release ran cold on every job.
+      # Measured 17 Aug 2026 on run 32014400559: all four cache restores
+      # took 0-1s, every one a miss, and `long-suites` spent 4m08s
+      # building where the one warm run in the same sample took 1m32s.
+      # tools/dep-cache-key.py hashes the lockfile with the workspace
+      # members' own version lines normalised out, so our own version
+      # bumps stop throwing away ~600 compiled crates. Same tool, same
+      # rationale, same `-v2`-style suffix discipline as ci-private.yml.
+      - name: dependency cache key
+        id: depkey
+        shell: bash
+        run: |
+          py=python3; command -v $py >/dev/null 2>&1 || py=python
+          echo "hash=$($py tools/dep-cache-key.py)" >> "$GITHUB_OUTPUT"
+      # restore + save as SEPARATE steps, not the combined actions/cache:
+      # its post step does NOT save when the job FAILED, so one red night
+      # left the next night cold as well. That is not hypothetical here -
+      # on run 32014400559 `armv7-cross` failed and its
+      # `Post Run actions/cache` reads `skipped`. The save below is
+      # `if: always()` and sits immediately after the build, so the
+      # dependency artifacts are banked whatever the suites then do.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
         with:
           path: |
             ~/.cargo/registry
@@ -196,9 +270,50 @@ jobs:
             target
           # runner.os is in the key, so this cannot collide with the
           # Linux job's cache.
-          key: nightly-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: nightly-v2-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
+      # nextest, not libtest, and the reason is diagnostic rather than
+      # speed: with `retries = 1` in .config/nextest.toml a flake is
+      # reported as a NAMED FLAKY test with both attempts' output, where
+      # bare `cargo test` gave an anonymous pass/fail tally. These are
+      # the flakiest suites in the repo, so they are the ones that most
+      # needed it - and they were the last place in CI still on libtest.
+      # Prebuilt, pinned by version, checked by SHA256 rather than
+      # trusted: same pattern as the armv7 job below and ci-private.yml.
+      - name: install cargo-nextest
+        shell: pwsh
+        run: |
+          $ver = "0.9.140"
+          $url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$ver/cargo-nextest-$ver-x86_64-pc-windows-msvc.zip"
+          $want = "ec39698dfe5bcfffb7d5da037f226bc1670584ba247123f4e684a0f224fe828d"
+          # Explicit loop, not -MaximumRetryCount: what this dies of is
+          # `The response ended prematurely`, a transport truncation that
+          # parameter does not cover. Hash checked INSIDE the loop so a
+          # short read retries rather than failing the job.
+          $ok = $false
+          foreach ($i in 1..5) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile cargo-nextest.zip
+              $got = (Get-FileHash cargo-nextest.zip -Algorithm SHA256).Hash.ToLower()
+              if ($got -eq $want) { $ok = $true; break }
+              Write-Host "attempt ${i}: sha256 mismatch (expected $want)"
+            } catch { Write-Host "attempt ${i}: $($_.Exception.Message)" }
+            Start-Sleep -Seconds (5 * $i)
+          }
+          if (-not $ok) { throw "cargo-nextest download failed after 5 attempts" }
+          New-Item -ItemType Directory -Force -Path C:\nextest | Out-Null
+          Expand-Archive cargo-nextest.zip -DestinationPath C:\nextest -Force
+          Remove-Item cargo-nextest.zip
+          "C:\nextest" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: build
         run: cargo build -p nzbfast --locked
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ always() && steps.cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: nightly-v2-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
       # --test-threads=1 is a hard requirement for the daemon suite
       # (CLAUDE.md invariant 4), same as the Linux leg above.
       #
@@ -212,7 +327,7 @@ jobs:
       - name: daemon suite
         env:
           NZBFAST_NO_ENRICH: "1"
-        run: cargo test -p nzbfast --locked --features heavy-tests --test daemon -- --test-threads=1
+        run: cargo nextest run --profile ci -p nzbfast --locked --features heavy-tests --test daemon
 
   # TODO 82: the long-run soak. One daemon, a mixed queue (store RAR5,
   # compressed RAR5, 7z, PAR2 repair, password) driven round and round
@@ -251,15 +366,65 @@ jobs:
       # that quietly covers one shape fewer.
       - name: test deps (par2 for the repair shape)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq par2
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Cargo.lock moves on EVERY release (packaging/bump-version.sh
+      # rewrites it), and this key used to be `hashFiles('Cargo.lock')` -
+      # so the first nightly after a release ran cold on every job.
+      # Measured 17 Aug 2026 on run 32014400559: all four cache restores
+      # took 0-1s, every one a miss, and `long-suites` spent 4m08s
+      # building where the one warm run in the same sample took 1m32s.
+      # tools/dep-cache-key.py hashes the lockfile with the workspace
+      # members' own version lines normalised out, so our own version
+      # bumps stop throwing away ~600 compiled crates. Same tool, same
+      # rationale, same `-v2`-style suffix discipline as ci-private.yml.
+      - name: dependency cache key
+        id: depkey
+        run: |
+          py=python3; command -v $py >/dev/null 2>&1 || py=python
+          echo "hash=$($py tools/dep-cache-key.py)" >> "$GITHUB_OUTPUT"
+      # restore + save as SEPARATE steps, not the combined actions/cache:
+      # its post step does NOT save when the job FAILED, so one red night
+      # left the next night cold as well. That is not hypothetical here -
+      # on run 32014400559 `armv7-cross` failed and its
+      # `Post Run actions/cache` reads `skipped`. The save below is
+      # `if: always()` and sits immediately after the build, so the
+      # dependency artifacts are banked whatever the suites then do.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: nightly-soak-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: nightly-soak-v2-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
+      # nextest, not libtest, and the reason is diagnostic rather than
+      # speed: with `retries = 1` in .config/nextest.toml a flake is
+      # reported as a NAMED FLAKY test with both attempts' output, where
+      # bare `cargo test` gave an anonymous pass/fail tally. These are
+      # the flakiest suites in the repo, so they are the ones that most
+      # needed it - and they were the last place in CI still on libtest.
+      # Prebuilt, pinned by version, checked by SHA256 rather than
+      # trusted: same pattern as the armv7 job below and ci-private.yml.
+      - name: install cargo-nextest
+        run: |
+          set -euo pipefail
+          ver="0.9.140"
+          curl -sSfL --retry 5 --retry-delay 3 --retry-all-errors \
+            --connect-timeout 20 -o cargo-nextest.tar.gz \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${ver}/cargo-nextest-${ver}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "4ee9aaa0d0171a985a5d0eb735b87355894c1c455972e9674fb9fdbd1387c9a3  cargo-nextest.tar.gz" | sha256sum -c -
+          tar -xzf cargo-nextest.tar.gz
+          sudo mv cargo-nextest /usr/local/bin/
+          rm cargo-nextest.tar.gz
       - name: build (release)
         run: cargo build --release -p nzbfast --locked
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ always() && steps.cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: nightly-soak-v2-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
       - name: soak
         env:
           NZBFAST_NO_ENRICH: "1"
@@ -271,7 +436,7 @@ jobs:
         # --nocapture so the per-cycle lines stream into the log: a job
         # that prints nothing for two and a half hours is indistinguishable
         # from a hung one.
-        run: cargo test --release -p nzbfast --locked --features heavy-tests --test leak_soak -- --ignored --nocapture
+        run: cargo nextest run --profile ci --release -p nzbfast --locked --features heavy-tests --test leak_soak --run-ignored only --no-capture
       # Uploaded on failure TOO - a red soak's sample series is the whole
       # diagnosis, and it is also what a legitimate new baseline gets
       # re-recorded from.
@@ -425,18 +590,49 @@ jobs:
           tar -xzf cargo-nextest.tar.gz
           sudo mv cargo-nextest /usr/local/bin/
           rm cargo-nextest.tar.gz
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Cargo.lock moves on EVERY release (packaging/bump-version.sh
+      # rewrites it), and this key used to be `hashFiles('Cargo.lock')` -
+      # so the first nightly after a release ran cold on every job.
+      # Measured 17 Aug 2026 on run 32014400559: all four cache restores
+      # took 0-1s, every one a miss, and `long-suites` spent 4m08s
+      # building where the one warm run in the same sample took 1m32s.
+      # tools/dep-cache-key.py hashes the lockfile with the workspace
+      # members' own version lines normalised out, so our own version
+      # bumps stop throwing away ~600 compiled crates. Same tool, same
+      # rationale, same `-v2`-style suffix discipline as ci-private.yml.
+      - name: dependency cache key
+        id: depkey
+        run: |
+          py=python3; command -v $py >/dev/null 2>&1 || py=python
+          echo "hash=$($py tools/dep-cache-key.py)" >> "$GITHUB_OUTPUT"
+      # restore + save as SEPARATE steps, not the combined actions/cache:
+      # its post step does NOT save when the job FAILED, so one red night
+      # left the next night cold as well. That is not hypothetical here -
+      # on run 32014400559 `armv7-cross` failed and its
+      # `Post Run actions/cache` reads `skipped`. The save below is
+      # `if: always()` and sits immediately after the build, so the
+      # dependency artifacts are banked whatever the suites then do.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: nightly-armv7-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: nightly-armv7-v2-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
       # Release binary first: it is the shipped artifact, and a link
       # failure here is a different (and cheaper) verdict than a test
       # failure below.
       - name: build the release binary
         run: cargo zigbuild --release --locked -p nzbfast --target armv7-unknown-linux-musleabihf
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ always() && steps.cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: nightly-armv7-v2-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
       - name: it is a 32-bit ARM static binary
         run: |
           set -euo pipefail

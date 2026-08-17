@@ -1,5 +1,11 @@
 # User-definable categories (TODO 24D)
 
+> **Path note.** This document was written when the daemon was one
+> `crates/nzbfast/src/serve.rs`. It is a module tree under
+> `crates/nzbfast/src/serve/` now (`mod.rs`, `http.rs`, `job.rs`,
+> `settings.rs`, `assets.rs`, `api/`, ...). The function and mode
+> names below are unchanged; only the file they live in moved.
+
 The parser only knew `Movie | Tv | Software | Other`, so sport,
 motorsport, wrestling, podcasts, audiobooks and comics all landed in
 Movie or Other. That is the same root cause as the F1 dupe bug fixed in

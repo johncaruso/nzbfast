@@ -1,5 +1,11 @@
 # Opt-in indexing
 
+> **Path note.** This document was written when the daemon was one
+> `crates/nzbfast/src/serve.rs`. It is a module tree under
+> `crates/nzbfast/src/serve/` now (`mod.rs`, `http.rs`, `job.rs`,
+> `settings.rs`, `assets.rs`, `api/`, ...). The function and mode
+> names below are unchanged; only the file they live in moved.
+
 ## The problem
 
 nzbfast's indexer never indexed anything on its own: `index_groups`

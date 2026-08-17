@@ -134,8 +134,7 @@ gömülü bir dizinleyici, gerçek zamanlı önizleme, yerel PAR2 onarımı ve y
   <li><b>İşlem hattı NNTP</b> - her bağlantı üzerinden birçok makale isteği art arda gider,
   gidiş-dönüşleri beklemek yerine her bağlantıyı tam hızda tutar.</li>
   <li><b>Tek geçişli bir işlem hattı</b> - indirme, doğrulama ve çıkarma örtüşür.
-  Arşiv birimleri <em>akış içinde</em> çıkarılır; tipik bir depolama modu gönderisinde
-  RAR dosyaları diskine hiç dokunmaz, böylece iş sürüm boyutunun 2 katına değil 1 katına
+  Arşiv birimleri <em>akış içinde</em> çıkarılır; hemen hemen her gönderide - RAR, 7z ya da zip, depolama modu ya da sıkıştırılmış - arşiv dosyaları diskine hiç dokunmaz, böylece iş sürüm boyutunun 2 katına değil 1 katına
   ihtiyaç duyar ve indirme bittiğinde biter.</li>
   <li><b>Çoklu sağlayıcı birleşimi</b> - yapılandırılmış her sunucu katkı sağlar; bir
   backbone'da eksik olan bir makale bir diğerinden getirilir. Yavaş ya da ölü sunucular
@@ -254,9 +253,7 @@ nzbfast'e verdiğin şey budur.</td></tr>
 <tr><td><b>PAR2</b></td><td>Bir sürümle birlikte gönderilen kurtarma verisi. nzbfast, indirme
 <em>sırasında</em> ona karşı doğrulama yapar ve makaleler hasarlı ya da eksik olduğunda
 otomatik onarır.</td></tr>
-<tr><td><b>Depolama modu RAR</b></td><td>Çoğu sürüm sıkıştırma olmadan RAR birimlerine
-paketlenir. nzbfast bunu tanır ve indirirken <em>iç dosyayı</em> doğrudan son konumuna
-yazar - sonrasında bir açma adımı yoktur.</td></tr>
+<tr><td><b>Depolama modu RAR</b></td><td>Çoğu sürüm sıkıştırma olmadan RAR birimlerine paketlenir; bu da onları en ucuz durum yapar: nzbfast indirirken <em>iç dosyayı</em> doğrudan son konumuna yazar - sonrasında bir açma adımı yoktur. Sıkıştırılmış ve şifreli arşivler ile 7z ve zip de aynı yoldan geçer; yalnızca yol boyunca daha fazla CPU harcarlar.</td></tr>
 </table></div>
 <p>İşlem hattı, indirme → kod çözme → doğrulama → çıkarma adımlarını <em>eşzamanlı</em>
 çalıştırır. Paneldeki İşlem hattı kartı üç şeridin de aynı anda hareket ettiğini gösterir.

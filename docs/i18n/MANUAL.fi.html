@@ -134,8 +134,7 @@ sisäänrakennettu indeksoija, reaaliaikainen esikatselu, natiivi PAR2-korjaus j
   <li><b>Liukuhihnoitettu NNTP</b> - useita artikkelipyyntöjä kulkee jokaisella yhteydellä peräkkäin,
   mikä pitää jokaisen yhteyden täydessä nopeudessa sen sijaan, että odotettaisiin edestakaisia kierroksia.</li>
   <li><b>Yhden läpimenon liukuhihna</b> - lataus, varmistus ja purku limittyvät.
-  Arkisto-osat puretaan <em>virrassa</em>; tyypillisessä store-tilan julkaisussa
-  RAR-tiedostot eivät koskaan kosketa levyäsi, joten työ tarvitsee 1× julkaisun koon verran tilaa, ei 2×,
+  Arkisto-osat puretaan <em>virrassa</em>; lähes missä tahansa julkaisussa - RAR, 7z tai zip, store-tilassa tai pakattuna - arkistotiedostot eivät koskaan kosketa levyäsi, joten työ tarvitsee 1× julkaisun koon verran tilaa, ei 2×,
   ja valmistuu, kun lataus valmistuu.</li>
   <li><b>Monen palveluntarjoajan yhdistelmä</b> - jokainen määritetty palvelin osallistuu; artikkeli,
   joka puuttuu yhdeltä backbonelta, haetaan toiselta. Hitaat tai kuolleet palvelimet eivät koskaan jumita
@@ -253,9 +252,7 @@ Tämän syötät nzbfastille.</td></tr>
 <tr><td><b>PAR2</b></td><td>Julkaisun ohella lähetetty palautusdata. nzbfast varmistaa
 sitä vasten <em>latauksen aikana</em> ja korjaa automaattisesti, kun artikkelit ovat
 vioittuneet tai puuttuvat.</td></tr>
-<tr><td><b>Store-tilan RAR</b></td><td>Useimmat julkaisut on pakattu RAR-osiin ilman
-pakkausta. nzbfast tunnistaa tämän ja kirjoittaa <em>sisätiedoston</em> suoraan sen
-lopulliseen sijaintiin latauksen aikana - ei erillistä purkuvaihetta jälkeenpäin.</td></tr>
+<tr><td><b>Store-tilan RAR</b></td><td>Useimmat julkaisut on pakattu RAR-osiin ilman pakkausta, mikä tekee niistä halvimman tapauksen: nzbfast kirjoittaa <em>sisätiedoston</em> suoraan sen lopulliseen sijaintiin latauksen aikana - ei erillistä purkuvaihetta jälkeenpäin. Pakatut ja salatut arkistot, samoin 7z ja zip, käsitellään samalla tavalla; ne vain maksavat matkalla enemmän suoritinaikaa.</td></tr>
 </table></div>
 <p>Liukuhihna ajaa lataus → dekoodaus → varmistus → purku <em>samanaikaisesti</em>.
 Koontinäytön Liukuhihna-kortti näyttää kaikki kolme kaistaa liikkumassa yhtä aikaa. Kun viimeinen

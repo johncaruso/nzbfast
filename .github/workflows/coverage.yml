@@ -75,7 +75,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: toolchain
         run: rustup toolchain install stable --profile minimal --component llvm-tools && rustup default stable
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Cargo.lock moves on EVERY release (packaging/bump-version.sh
+      # rewrites it), so `hashFiles('Cargo.lock')` sent this job cold on
+      # every release for the sake of two changed lines. Measured on
+      # ci-private's twin of this bug, 17 Aug 2026: the whole gate went
+      # from 49 min to 19. tools/dep-cache-key.py normalises the
+      # workspace members' own version lines out of the hash; its
+      # --selftest asserts that a third-party change still moves the key.
+      - name: dependency cache key
+        id: depkey
+        run: |
+          py=python3; command -v $py >/dev/null 2>&1 || py=python
+          echo "hash=$($py tools/dep-cache-key.py)" >> "$GITHUB_OUTPUT"
+      # restore + save as SEPARATE steps: the combined actions/cache does
+      # NOT save when the job FAILED, so one red run left the next run
+      # cold too - worst exactly while someone iterates on a fix.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
         with:
           path: |
             ~/.cargo/registry
@@ -83,7 +99,7 @@ jobs:
             target
           # Its own key: instrumented artifacts must never poison the
           # plain debug caches the other workflows share.
-          key: coverage-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: coverage-v2-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
       # Prebuilt binary pinned by version and checked by SHA256 rather
       # than trusted - same pattern (and rationale) as nextest and
       # cargo-deny in ci-private.yml.
@@ -152,6 +168,17 @@ jobs:
         run: >
           cargo llvm-cov --locked -p nzbkit --lib --fail-under-lines 87
           --ignore-filename-regex 'nzbkit/src/(mock|mock_tls|sysbench|benchserve)\.rs$'
+      # Banked here rather than at the end of the job: this is the step
+      # that compiles the dependency graph, and a coverage FLOOR failure
+      # below must not cost the next run those artifacts.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ always() && steps.cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: coverage-v2-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
       # Must run HERE, before the bins step: `report` globs every
       # binary in the llvm-cov target dir, and after the -p nzbfast
       # --bins run it would charge nzbfast's monomorphized generics to

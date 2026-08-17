@@ -137,8 +137,7 @@ eseguibile. Non c'è nient'altro da installare.</p>
   l'altra su ciascuna connessione, tenendo ogni connessione a piena velocità invece
   di aspettare i round-trip.</li>
   <li><b>Una pipeline a passata unica</b> - download, verifica ed estrazione si
-  sovrappongono. I volumi degli archivi vengono estratti <em>nel flusso</em>; in un
-  tipico post in store-mode i file RAR non toccano mai il disco, quindi il job
+  sovrappongono. I volumi degli archivi vengono estratti <em>nel flusso</em>; in quasi qualsiasi post - RAR, 7z o zip, in store-mode o compresso - i file d'archivio non toccano mai il disco, quindi il job
   richiede 1× la dimensione della release, non 2×, e termina quando termina il
   download.</li>
   <li><b>Unione multi-provider</b> - ogni server configurato contribuisce; un
@@ -260,10 +259,7 @@ mancano degli <em>stessi</em> articoli. Vedi <a href="#performance">Diversità d
 <tr><td><b>PAR2</b></td><td>Dati di recupero pubblicati insieme a una release. nzbfast
 verifica su di essi <em>durante</em> il download e ripara automaticamente quando gli
 articoli sono danneggiati o mancanti.</td></tr>
-<tr><td><b>RAR in store-mode</b></td><td>La maggior parte delle release è impacchettata in
-volumi RAR senza compressione. nzbfast lo riconosce e scrive il <em>file interno</em>
-direttamente nella sua posizione finale mentre scarica - nessuna fase di scompattamento
-dopo.</td></tr>
+<tr><td><b>RAR in store-mode</b></td><td>La maggior parte delle release è impacchettata in volumi RAR senza compressione, il che ne fa il caso meno costoso: nzbfast scrive il <em>file interno</em> direttamente nella sua posizione finale mentre scarica - nessuna fase di scompattamento dopo. Gli archivi compressi e cifrati, e anche 7z e zip, sono trattati allo stesso modo; costano soltanto più CPU lungo il percorso.</td></tr>
 </table></div>
 <p>La pipeline esegue download → decodifica → verifica → estrazione <em>in
 parallelo</em>. La scheda Pipeline sulla dashboard mostra le tre corsie muoversi

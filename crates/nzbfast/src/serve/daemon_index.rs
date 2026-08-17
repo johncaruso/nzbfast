@@ -1012,6 +1012,75 @@ impl Daemon {
     #[cfg(feature = "indexer")]
     pub(in crate::serve) fn publish_index(&self, era: u64, fresh: nzbkit::index::Index) {
         let mut guard = self.index.lock_ok();
+        self.publish_locked(&mut guard, era, fresh);
+    }
+
+    /// §74: republish the shared connection AND stage this pass's
+    /// arrivals in one hold of the `index` mutex, so the two cannot be
+    /// observed apart. Returns whether the hint was staged - the caller
+    /// wakes `watch_now` on true, once it has finished invalidating.
+    ///
+    /// Atomic because the two halves raced. `publish_index` then
+    /// `instant_kick` leaves a window where the arriving release is
+    /// already visible to `watchlist_pass` (which reads this same
+    /// handle through `with_index`) while `instant_hint` is still
+    /// empty: a pass that starts in that window takes an empty hint,
+    /// grabs the release anyway, and never records it as an instant
+    /// grab - so the badge under-reports and the kick that follows
+    /// spends one of the hour's allowance waking a pass that finds the
+    /// slot already filled.
+    ///
+    /// **This narrows the race, it does not close it, and the stronger
+    /// claim is false.** "No pass can see the fresh index without also
+    /// seeing the hint" does NOT follow from this, for two reasons that
+    /// are plain in the code (see
+    /// `nzbfast-scan-leg-swallows-arrivals`): `watchlist_pass` takes
+    /// the hint once at the top and searches per item much later, so
+    /// its own two reads are not atomic with each other; and the
+    /// release is visible well before anything here runs, because
+    /// `Index::ingest` commits internally and journals its watch hits
+    /// after the commit. A pass can grab the arrival before this
+    /// function is even called. What is bought is that a pass can no
+    /// longer slip between the republish and the hint - pinned by the
+    /// two ordering tests in `daemon_tests/instant_tests.rs`, which is
+    /// the only level this is observable at: `watchlist_instant`'s
+    /// scan-leg case cannot see the difference either way.
+    ///
+    /// Staging is still never moved EARLIER than the republish, but
+    /// that ordering is defensive rather than load-bearing - the
+    /// "searched the stale snapshot" story §74 told for it does not
+    /// survive a read of `Index::ingest`.
+    ///
+    /// Staged even when the publish is declined (index wiped or
+    /// switched off mid-pass), which is what the unconditional
+    /// `instant_arrivals` call this replaced did. There is nothing left
+    /// to grab in that case, but deciding that is the pass's job.
+    ///
+    /// Lock order: `index` -> `instant_kicks` / `instant_hint`. Safe
+    /// because both of those are only ever held in leaf scopes that
+    /// never reach back for `index`.
+    #[cfg(feature = "indexer")]
+    pub(in crate::serve) fn publish_index_with_arrivals(
+        &self,
+        era: u64,
+        fresh: nzbkit::index::Index,
+        arrivals: &[String],
+        now: i64,
+    ) -> bool {
+        let mut guard = self.index.lock_ok();
+        self.publish_locked(&mut guard, era, fresh);
+        self.stage_instant_hint(arrivals, now)
+    }
+
+    /// The body of [`Self::publish_index`], for callers that are already
+    /// holding the mutex because they have more to do under it.
+    #[cfg(feature = "indexer")]
+    fn publish_locked(
+        &self,
+        guard: &mut std::sync::MutexGuard<'_, Option<nzbkit::index::Index>>,
+        era: u64,
+        fresh: nzbkit::index::Index,
+    ) {
         // `index_db_wanted`, not `index_enabled`: a spot pass republishes
         // the same shared connection, and on a spots-only install the
         // indexer switch is off by definition. Asking the narrower
@@ -1019,7 +1088,7 @@ impl Daemon {
         if !may_publish_index(self.index_era(), era, self.index_db_wanted()) {
             return;
         }
-        *guard = Some(fresh);
+        **guard = Some(fresh);
         // `fresh` came from a read-write `Index::open`, so the migrations
         // HAVE run - which is the whole question `index_migrated` answers.
         //

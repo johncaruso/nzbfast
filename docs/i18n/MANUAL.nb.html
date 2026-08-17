@@ -135,8 +135,7 @@ innebygd indekserer, forhåndsvisning i sanntid, native PAR2-reparasjon og nativ
   etter hverandre, og holder hver tilkobling på full fart i stedet for å vente ut
   rundturene.</li>
   <li><b>En pipeline i én omgang</b> - nedlasting, verifisering og utpakking overlapper.
-  Arkivvolumer pakkes ut <em>i strømmen</em>; på en typisk store-mode-post rører
-  RAR-filene aldri disken din, så jobben trenger 1× utgivelsesstørrelsen, ikke 2×, og
+  Arkivvolumer pakkes ut <em>i strømmen</em>; på nesten enhver post - RAR, 7z eller zip, store-mode eller komprimert - rører arkivfilene aldri disken din, så jobben trenger 1× utgivelsesstørrelsen, ikke 2×, og
   blir ferdig når nedlastingen blir ferdig.</li>
   <li><b>Fler-leverandørunion</b> - hver konfigurerte server bidrar; en artikkel som
   mangler på én backbone, hentes fra en annen. Trege eller døde servere stopper aldri
@@ -256,9 +255,7 @@ Det er dette du mater nzbfast.</td></tr>
 <tr><td><b>PAR2</b></td><td>Gjenopprettingsdata som postes sammen med en utgivelse. nzbfast
 verifiserer mot den <em>underveis</em> i nedlastingen og reparerer automatisk når artikler er
 skadet eller mangler.</td></tr>
-<tr><td><b>Store-mode-RAR</b></td><td>De fleste utgivelser pakkes i RAR-volumer uten
-komprimering. nzbfast gjenkjenner dette og skriver <em>den indre filen</em> rett til sin
-endelige plassering mens den laster ned - ingen utpakking i etterkant.</td></tr>
+<tr><td><b>Store-mode-RAR</b></td><td>De fleste utgivelser pakkes i RAR-volumer uten komprimering, noe som gjør dem til det billigste tilfellet: nzbfast skriver <em>den indre filen</em> rett til sin endelige plassering mens den laster ned - ingen utpakking i etterkant. Komprimerte og krypterte arkiver, og også 7z og zip, håndteres på samme måte; de koster bare mer CPU underveis.</td></tr>
 </table></div>
 <p>Pipelinen kjører nedlasting → dekoding → verifisering → utpakking <em>samtidig</em>.
 Pipeline-kortet på dashbordet viser alle tre banene i bevegelse på én gang. Når den siste

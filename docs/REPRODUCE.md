@@ -113,6 +113,16 @@ supports, strictest first:
 
 ## Measured ledger
 
+### Status as of v1.1.4 (17 Aug 2026)
+
+The follow-up measurement this document calls for below - a rebuild of a
+real released asset cut by the revised workflow, compared at level 1 or
+2 - **has not been run.** Tags v1.0.11 through v1.1.4 shipped under the
+revised workflow, so the candidate exists; nobody has raced it. The
+v1.0.10 ledger below therefore remains the only measured result here,
+and the standing rule at the end of this file still applies in full: no
+nzbfast copy anywhere may claim rebuilds match.
+
 ### v1.0.10 (tested 28 Jul 2026): does NOT rebuild to the same digest
 
 Target `aarch64-apple-darwin`, released asset from run 30325908707

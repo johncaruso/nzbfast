@@ -94,19 +94,6 @@ fn http_once(port: u16, msg: &str) -> std::io::Result<(u16, String)> {
     ))
 }
 
-fn pct(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 struct KillOnDrop(Child);
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
@@ -293,17 +280,32 @@ async fn watching_tip(dir: &Path, mock: &MockServer, items: &str, tip_secs: u64)
     // waiting rather than the 20 s default. The periodic watchlist pass
     // is 60 s and is NOT configurable - which is exactly what makes
     // these assertions about the instant path and not about it.
+    //
+    // The watchlist goes in the SETTINGS FILE, not through
+    // `mode=config&name=watchlist` after startup, and that is
+    // load-bearing rather than tidier. An edit WAKES A PASS
+    // (`set_watchlist` -> `watch_now.notify_one()`), and that pass runs
+    // concurrently with everything these cases then do - so a release
+    // published into the index while it is still running is grabbed BY
+    // IT, with the arrival hint still unpublished, and the grab is
+    // recorded as an ordinary periodic one. That is not hypothetical:
+    // it is the nightly armv7-cross red of 17 Aug 2026, where the
+    // emulator stretched the setup pass into exactly that window on
+    // every attempt. `spawn_watchlist_watcher` loads this key at
+    // startup and its loop sleeps FIRST, so with the list here the only
+    // thing that can run a pass inside a test's 40-45 s budget is an
+    // arrival kick - which is the whole claim.
     std::fs::write(
         cfg.with_file_name("settings.json"),
         format!(
             "{{\"index_enabled\": true, \"index_tip_secs\": {tip_secs}, \
-              \"index_groups\": [\"{GROUP}\"], \"watchlist_instant\": true}}"
+              \"index_groups\": [\"{GROUP}\"], \"watchlist_instant\": true, \
+              \"watchlist\": {items}}}"
         ),
     )
     .unwrap();
     let d = serve(dir, |port| daemon_cmd(dir, &cfg, &db, port)).await;
     let port = d.port;
-    let items = items.to_string();
     tokio::task::spawn_blocking(move || {
         // Pause the queue BEFORE anything can be grabbed. These mocks
         // serve overview rows but no article bodies, so an unpaused job
@@ -312,14 +314,16 @@ async fn watching_tip(dir: &Path, mock: &MockServer, items: &str, tip_secs: u64)
         // another release, which would quietly undo the very state these
         // tests are about. Paused, a grab stays a grab.
         http_get(port, "/api?mode=pause&output=json");
-        let (_, r) = http_get(
-            port,
-            &format!(
-                "/api?mode=config&name=watchlist&value={}&output=json",
-                pct(&items)
-            ),
+        // The list loaded, and loaded as a LIST: a settings key the
+        // daemon could not parse is a warning in its log and an empty
+        // watchlist here, which would otherwise read as "the instant
+        // path never fired". This endpoint only reports state - unlike
+        // the config setter it replaces, it wakes nothing.
+        let st = status(port);
+        assert!(
+            st.contains("\"id\":1"),
+            "the watchlist in settings.json was not loaded: {st}"
         );
-        assert!(r.contains("true"), "watchlist not accepted: {r}");
     })
     .await
     .unwrap();
@@ -602,11 +606,13 @@ async fn an_arrival_the_full_scan_pass_ingests_still_reaches_the_instant_path() 
     let mock = std::sync::Arc::new(mock);
     let m2 = mock.clone();
     tokio::task::spawn_blocking(move || {
-        // The startup pass has to be BEHIND us before anything is
-        // posted, and so does the watchlist pass that setting the list
-        // woke. Otherwise either of them could be what grabbed the
-        // release, and this case would be reading its own setup back.
-        // The pass says so itself - waited for rather than slept at.
+        // The startup scan pass has to be BEHIND us before anything is
+        // posted - otherwise IT could be what ingested the release, and
+        // this case would be reading its own setup back. The pass says
+        // so itself, so it is waited for rather than slept at. (The
+        // other setup pass this used to race, the watchlist pass an
+        // edit wakes, no longer exists: `watching_tip` puts the list in
+        // settings.json.)
         assert!(
             wait_log(
                 &dir2,

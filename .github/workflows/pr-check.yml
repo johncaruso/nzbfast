@@ -19,16 +19,40 @@ jobs:
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: test deps (par2 for repair e2e)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq par2
+      # Cargo.lock moves on EVERY release (packaging/bump-version.sh
+      # rewrites it), so `hashFiles('Cargo.lock')` sent this job cold on
+      # every release for the sake of two changed lines. Measured on
+      # ci-private's twin of this bug, 17 Aug 2026: the whole gate went
+      # from 49 min to 19. tools/dep-cache-key.py normalises the
+      # workspace members' own version lines out of the hash; its
+      # --selftest asserts that a third-party change still moves the key.
+      - name: dependency cache key
+        id: depkey
+        run: |
+          py=python3; command -v $py >/dev/null 2>&1 || py=python
+          echo "hash=$($py tools/dep-cache-key.py)" >> "$GITHUB_OUTPUT"
+      # restore + save as SEPARATE steps: the combined actions/cache does
+      # NOT save when the job FAILED, so one red run left the next run
+      # cold too - worst exactly while someone iterates on a fix.
       - name: cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: pr-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: pr-cargo-v2-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
       - name: build
         run: cargo build --workspace --locked
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ always() && steps.cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: pr-cargo-v2-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
       # The suite runs as TWO passes, split on the nzbfast package. The
       # daemon suite is single-threaded by invariant (CLAUDE.md invariant
       # 4), and under a plain parallel `cargo test --workspace` it flaked
@@ -165,8 +189,25 @@ jobs:
       # installs it for the msvc host on the first cargo invocation. An
       # explicit `rustup default stable` would be overridden by that pin
       # anyway - which is already what happens on the Linux job.
+      # Cargo.lock moves on EVERY release (packaging/bump-version.sh
+      # rewrites it), so `hashFiles('Cargo.lock')` sent this job cold on
+      # every release for the sake of two changed lines. Measured on
+      # ci-private's twin of this bug, 17 Aug 2026: the whole gate went
+      # from 49 min to 19. tools/dep-cache-key.py normalises the
+      # workspace members' own version lines out of the hash; its
+      # --selftest asserts that a third-party change still moves the key.
+      - name: dependency cache key
+        id: depkey
+        shell: bash
+        run: |
+          py=python3; command -v $py >/dev/null 2>&1 || py=python
+          echo "hash=$($py tools/dep-cache-key.py)" >> "$GITHUB_OUTPUT"
+      # restore + save as SEPARATE steps: the combined actions/cache does
+      # NOT save when the job FAILED, so one red run left the next run
+      # cold too - worst exactly while someone iterates on a fix.
       - name: cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
         with:
           path: |
             ~/.cargo/registry
@@ -174,9 +215,17 @@ jobs:
             target
           # runner.os is in the key, so this cannot collide with the Linux
           # job's cache.
-          key: pr-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: pr-cargo-v2-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
       - name: build
         run: cargo build --workspace --locked
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ always() && steps.cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: pr-cargo-v2-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
       # Same two-pass split as the Linux leg, for the same reason: the
       # daemon suite is single-threaded by invariant (CLAUDE.md invariant
       # 4) and flakes under a parallel workspace pass, and cargo cannot

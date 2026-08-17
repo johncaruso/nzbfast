@@ -135,8 +135,7 @@ un indexador integrado, vista previa en tiempo real, reparación PAR2 nativa y e
   conexión, manteniendo todas las conexiones a plena velocidad en lugar de esperar
   los viajes de ida y vuelta.</li>
   <li><b>Un pipeline de una sola pasada</b> - descarga, verificación y extracción se solapan.
-  Los volúmenes de archivo se extraen <em>en el propio flujo</em>; en una publicación típica en
-  modo store los archivos RAR nunca tocan tu disco, así que el trabajo necesita 1× el tamaño
+  Los volúmenes de archivo se extraen <em>en el propio flujo</em>; en casi cualquier publicación - RAR, 7z o zip, en modo store o comprimida - los archivos de archivo nunca tocan tu disco, así que el trabajo necesita 1× el tamaño
   del lanzamiento, no 2×, y termina cuando termina la descarga.</li>
   <li><b>Unión multiproveedor</b> - todos los servidores configurados contribuyen; un artículo
   que falta en un backbone se obtiene de otro. Los servidores lentos o caídos nunca atascan
@@ -255,9 +254,7 @@ Es lo que le das a nzbfast.</td></tr>
 <tr><td><b>PAR2</b></td><td>Datos de recuperación publicados junto a un lanzamiento. nzbfast verifica
 contra ellos <em>durante</em> la descarga y repara automáticamente cuando hay artículos
 dañados o ausentes.</td></tr>
-<tr><td><b>RAR en modo store</b></td><td>La mayoría de los lanzamientos van empaquetados en volúmenes RAR
-sin compresión. nzbfast lo reconoce y escribe el <em>archivo interior</em> directamente en su
-ubicación final mientras descarga - sin paso de desempaquetado posterior.</td></tr>
+<tr><td><b>RAR en modo store</b></td><td>La mayoría de los lanzamientos van empaquetados en volúmenes RAR sin compresión, lo que los convierte en el caso más barato: nzbfast escribe el <em>archivo interior</em> directamente en su ubicación final mientras descarga - sin paso de desempaquetado posterior. Los archivos comprimidos y cifrados, y también 7z y zip, se tratan igual; solo cuestan más CPU por el camino.</td></tr>
 </table></div>
 <p>El pipeline ejecuta descarga → decodificación → verificación → extracción <em>de forma concurrente</em>. La
 tarjeta Pipeline del panel muestra los tres carriles avanzando a la vez. Cuando llega el último

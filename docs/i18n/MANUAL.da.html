@@ -134,8 +134,7 @@ en indbygget indexer, realtids-forhåndsvisning, native PAR2-reparation og nativ
   <li><b>Pipelinet NNTP</b> - mange artikelforespørgsler rider på hver forbindelse ryg mod ryg
   og holder hver forbindelse på fuld hastighed i stedet for at vente rundrejser af.</li>
   <li><b>En one-pass-pipeline</b> - download, verificering og udpakning overlapper.
-  Arkivvolumener udpakkes <em>i strømmen</em>; på en typisk store-mode-post rører
-  RAR-filerne aldrig din disk, så jobbet kræver 1× release-størrelsen, ikke 2×,
+  Arkivvolumener udpakkes <em>i strømmen</em>; på næsten enhver post - RAR, 7z eller zip, store-mode eller komprimeret - rører arkivfilerne aldrig din disk, så jobbet kræver 1× release-størrelsen, ikke 2×,
   og bliver færdigt, når downloaden bliver færdig.</li>
   <li><b>Union på tværs af udbydere</b> - hver konfigureret server bidrager; en artikel,
   der mangler på én backbone, hentes fra en anden. Langsomme eller døde servere sætter aldrig
@@ -255,9 +254,7 @@ Det er den, du fodrer nzbfast med.</td></tr>
 <tr><td><b>PAR2</b></td><td>Genoprettelsesdata, der postes sammen med en release. nzbfast verificerer
 mod den <em>under</em> downloaden og reparerer automatisk, når artikler er
 beskadigede eller mangler.</td></tr>
-<tr><td><b>Store-mode-RAR</b></td><td>De fleste releases er pakket i RAR-volumener uden
-komprimering. nzbfast genkender dette og skriver den <em>indre fil</em> direkte til dens
-endelige placering, mens den henter - ingen udpakningsfase bagefter.</td></tr>
+<tr><td><b>Store-mode-RAR</b></td><td>De fleste releases er pakket i RAR-volumener uden komprimering, hvilket gør dem til det billigste tilfælde: nzbfast skriver den <em>indre fil</em> direkte til dens endelige placering, mens den henter - ingen udpakningsfase bagefter. Komprimerede og krypterede arkiver, samt 7z og zip, håndteres på samme måde; de koster bare mere CPU undervejs.</td></tr>
 </table></div>
 <p>Pipelinen kører download → afkod → verificér → udpak <em>samtidig</em>. Pipeline-kortet
 på dashboardet viser alle tre baner bevæge sig på én gang. Når den sidste

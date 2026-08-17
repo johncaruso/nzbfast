@@ -137,8 +137,7 @@ ausführbaren Datei. Es gibt nichts weiter zu installieren.</p>
   jede Verbindung und halten sie auf voller Geschwindigkeit, statt Round-Trips
   auszusitzen.</li>
   <li><b>Eine One-Pass-Pipeline</b> - Download, Prüfung und Entpacken überlappen sich.
-  Archiv-Volumes werden <em>im Datenstrom</em> entpackt; bei einem typischen
-  Store-Mode-Post berühren die RAR-Dateien deine Festplatte nie - der Job braucht
+  Archiv-Volumes werden <em>im Datenstrom</em> entpackt; bei fast jedem Post - RAR, 7z oder zip, gespeichert oder komprimiert - berühren die Archivdateien deine Festplatte nie - der Job braucht
   1× die Release-Größe statt 2× und ist fertig, sobald der Download fertig ist.</li>
   <li><b>Multi-Provider-Verbund</b> - jeder konfigurierte Server trägt bei; ein
   Artikel, der auf einem Backbone fehlt, wird von einem anderen geholt. Langsame
@@ -265,9 +264,7 @@ Das ist das, was du nzbfast fütterst.</td></tr>
 <tr><td><b>PAR2</b></td><td>Reparaturdaten, die neben einem Release gepostet werden.
 nzbfast verifiziert <em>während</em> des Downloads dagegen und repariert automatisch,
 wenn Artikel beschädigt sind oder fehlen.</td></tr>
-<tr><td><b>Store-Mode-RAR</b></td><td>Die meisten Releases sind ohne Kompression in
-RAR-Volumes gepackt. nzbfast erkennt das und schreibt die <em>innere Datei</em> schon
-beim Download direkt an ihren endgültigen Ort - kein Entpack-Schritt danach.</td></tr>
+<tr><td><b>Store-Mode-RAR</b></td><td>Die meisten Releases sind ohne Kompression in RAR-Volumes gepackt, was sie zum günstigsten Fall macht: nzbfast schreibt die <em>innere Datei</em> schon beim Download direkt an ihren endgültigen Ort - kein Entpack-Schritt danach. Komprimierte und verschlüsselte Archive sowie 7z und zip werden genauso behandelt; sie kosten unterwegs nur mehr CPU.</td></tr>
 </table></div>
 <p>Die Pipeline fährt Download → Dekodieren → Prüfen → Entpacken <em>gleichzeitig</em>.
 Die Pipeline-Karte im Dashboard zeigt alle drei Spuren gleichzeitig in Bewegung. Wenn

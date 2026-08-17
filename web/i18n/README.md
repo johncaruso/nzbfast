@@ -8,9 +8,11 @@ call-site defaults) - it ships no catalogue.
 - `en.reference.json` - the extracted English key→string reference
   (regenerated; do not hand-edit).
 - `<lang>.json` - translated UI catalogues, embedded in the binary via
-  `include_str!` and served at `/i18n/<lang>.json`. Shipped locales:
-  fr de it es nl pt sv da nb fi tr ro ru pl cs uk el ja hu sk hr sr bg sl
-  (+ en inline).
+  `include_str!` and served at `/i18n/<lang>.json`. Shipped locales (27,
+  + en inline): ar bg cs da de el es fa fi fr he hr hu it ja nb nl pl pt
+  ro ru sk sl sr sv tr uk. Three are RTL (ar fa he). `check.py`
+  auto-discovers this set from `web/i18n/*.json`, so it is the list that
+  cannot go stale - re-derive from there rather than trusting this line.
 
 ## Key order (the trap)
 
@@ -80,8 +82,10 @@ you are not duplicating an in-flight session's work.
 
 ## Adding a locale (Latin / simple plural)
 1. `web/i18n/<tag>.json` - translate from `en.reference.json`.
-2. serve.rs: add the tag to `UI_LOCALES` + a `i18n_catalog()` arm (and a
-   `manual_i18n()` arm once a manual exists, else it falls back to English).
+2. `crates/nzbfast/src/serve/assets.rs`: add the tag to `UI_LOCALES` + an
+   `i18n_catalog()` arm (and a `manual_i18n()` arm once a manual exists,
+   else it falls back to English). This used to be one `serve.rs`; the
+   daemon is a module tree under `src/serve/` now.
 3. `web/dashboard.html` + `web/wall.html`: add to the `LOCALES` array, plus
    one `LOCALE_NAMES` line in dashboard.html (`[native, English]` - both
    Settings selects are generated from it at boot).

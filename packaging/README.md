@@ -12,13 +12,15 @@ Everything here is deployment glue - no code. The engine is `crates/`.
 
 ```sh
 docker compose up -d          # pulls ghcr.io/nzbfast/nzbfast (or `build: .`)
-$EDITOR config/config.json    # add your Usenet server(s)
-docker compose restart
 ```
 
-UI + API at `http://<host>:6789`. Volumes: `./config`, `./downloads`,
-`./watch` (drop `.nzb` files there to auto-queue). `PUID`/`PGID` set the
-owner of downloaded files (linuxserver convention).
+UI + API at `http://<host>:6789`; add your Usenet server in the Welcome
+panel there. There is no config file to write by hand any more - the
+wizard writes it - though `config.example.json` still documents the
+shape for anyone provisioning one from configuration management.
+Volumes: `./config`, `./downloads`, `./watch` (drop `.nzb` files there to
+auto-queue). `PUID`/`PGID` set the owner of downloaded files
+(linuxserver convention).
 
 On the first start nzbfast generates an API key, prints it in the
 container log, and stores it as `apikey` in the `config` volume - that is
@@ -75,7 +77,8 @@ should talk to it).
 
 ## macOS
 
-**Homebrew** (once the tap is published):
+**Homebrew** (`nzbfast/homebrew-tap`, published; `packaging/homebrew/bump-tap.sh`
+pushes each release's formula to it):
 ```sh
 brew install nzbfast/tap/nzbfast
 brew services start nzbfast
@@ -99,6 +102,26 @@ from the union, so a post missing on one completes from another.
 | `host`/`port`/`tls` | server address; 563 = NNTPS |
 | `username`/`password` | credentials |
 | `connections` | max simultaneous connections for this server |
+
+## Everything else under packaging/
+
+This file covers the three paths most people take. The rest each carry
+their own README, and this is the index so they are findable:
+
+| Path | What it is | Status |
+|---|---|---|
+| `linux/` | `.deb` / `.rpm` builder, maintainer scripts, apt repo | beta |
+| `flatpak/` | Flatpak manifest and cargo-sources generator | beta |
+| `freebsd/` | rc.d script and smoke test; built in a VM each release | beta, untested on real hardware |
+| `qnap/` | native App Center `.qpkg` | beta |
+| `synology/` | `.spk` package and the Container Manager compose | shipped |
+| `windows/` | Inno Setup installer and the portable zip layout | shipped |
+| `mac/` | DMG build, background art, install page | shipped |
+| `docker/` | release image and push script | shipped |
+| `homebrew/` | formula and the tap bump script | shipped |
+| `scoop/`, `winget/` | generated manifests (`make-pkg-manifests.sh`) | manifests generated; catalogue submission not complete |
+| `catalogues/` | source of truth for third-party app catalogue listings (Unraid, CasaOS, TrueNAS, Umbrel, Proxmox) | per-catalogue |
+| `android/`, `ios/` | mobile shells and test kits | experimental |
 
 ## Building the image locally
 

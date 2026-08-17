@@ -136,8 +136,7 @@ para instalar.</p>
   uma atrás da outra, mantendo toda conexão em velocidade máxima em vez de esperar as
   idas e voltas.</li>
   <li><b>Um pipeline de passagem única</b> - download, verificação e extração se sobrepõem.
-  Os volumes de arquivo são extraídos <em>no fluxo</em>; em uma publicação típica em modo
-  armazenamento, os arquivos RAR nunca tocam seu disco, então o trabalho precisa de 1× o
+  Os volumes de arquivo são extraídos <em>no fluxo</em>; em quase qualquer publicação - RAR, 7z ou zip, em modo armazenamento ou comprimida - os arquivos de arquivo nunca tocam seu disco, então o trabalho precisa de 1× o
   tamanho do lançamento, não 2×, e termina quando o download termina.</li>
   <li><b>União multiprovedor</b> - cada servidor configurado contribui; um artigo
   ausente em um backbone é buscado em outro. Servidores lentos ou mortos nunca travam
@@ -254,9 +253,7 @@ não têm os <em>mesmos</em> artigos. Veja <a href="#performance">Diversidade de
 <tr><td><b>PAR2</b></td><td>Dados de recuperação publicados junto com um lançamento. O nzbfast verifica
 contra eles <em>durante</em> o download e repara automaticamente quando os artigos estão
 danificados ou ausentes.</td></tr>
-<tr><td><b>RAR em modo armazenamento</b></td><td>A maioria dos lançamentos é empacotada em volumes RAR sem
-compressão. O nzbfast reconhece isso e escreve o <em>arquivo interno</em> diretamente em seu
-local final durante o download - sem etapa de extração depois.</td></tr>
+<tr><td><b>RAR em modo armazenamento</b></td><td>A maioria dos lançamentos é empacotada em volumes RAR sem compressão, o que os torna o caso mais barato: o nzbfast escreve o <em>arquivo interno</em> diretamente em seu local final durante o download - sem etapa de extração depois. Arquivos comprimidos e criptografados, e também 7z e zip, seguem o mesmo caminho; apenas custam mais CPU na passagem.</td></tr>
 </table></div>
 <p>O pipeline executa download → decodificação → verificação → extração <em>de forma concorrente</em>. O
 cartão Pipeline do painel mostra as três faixas se movendo ao mesmo tempo. Quando chega o último

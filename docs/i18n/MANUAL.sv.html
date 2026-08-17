@@ -134,8 +134,7 @@ en inbyggd indexerare, förhandsgranskning i realtid, native PAR2-reparation och
   <li><b>Pipelinead NNTP</b> - många artikelförfrågningar rider på varje anslutning rygg mot rygg,
   så att varje anslutning hålls i full fart i stället för att vänta ut tur-och-retur-tider.</li>
   <li><b>En enpassrörledning</b> - nedladdning, verifiering och uppackning överlappar.
-  Arkivvolymer packas upp <em>i strömmen</em>; på ett typiskt store-mode-inlägg rör
-  RAR-filerna aldrig din disk, så jobbet behöver 1× releasens storlek, inte 2×,
+  Arkivvolymer packas upp <em>i strömmen</em>; på så gott som varje inlägg - RAR, 7z eller zip, store-mode eller komprimerat - rör arkivfilerna aldrig din disk, så jobbet behöver 1× releasens storlek, inte 2×,
   och blir klart när nedladdningen blir klar.</li>
   <li><b>Union över flera providers</b> - varje konfigurerad server bidrar; en artikel
   som saknas på en backbone hämtas från en annan. Långsamma eller döda servrar stoppar
@@ -255,9 +254,7 @@ Det är detta du matar nzbfast med.</td></tr>
 <tr><td><b>PAR2</b></td><td>Återställningsdata som postas vid sidan av en release. nzbfast verifierar
 mot den <em>under</em> nedladdningen och reparerar automatiskt när artiklar är
 skadade eller saknas.</td></tr>
-<tr><td><b>Store-mode-RAR</b></td><td>De flesta releaser packas i RAR-volymer utan
-komprimering. nzbfast känner igen detta och skriver <em>innerfilen</em> direkt till dess
-slutliga plats under nedladdningen - inget uppackningssteg efteråt.</td></tr>
+<tr><td><b>Store-mode-RAR</b></td><td>De flesta releaser packas i RAR-volymer utan komprimering, vilket gör dem till det billigaste fallet: nzbfast skriver <em>innerfilen</em> direkt till dess slutliga plats under nedladdningen - inget uppackningssteg efteråt. Komprimerade och krypterade arkiv, liksom 7z och zip, hanteras på samma sätt; de kostar bara mer CPU på vägen.</td></tr>
 </table></div>
 <p>Rörledningen kör nedladdning → avkodning → verifiering → uppackning <em>samtidigt</em>.
 Pipeline-kortet på instrumentpanelen visar alla tre banor röra sig på en gång. När den sista

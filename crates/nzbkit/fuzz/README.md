@@ -75,8 +75,11 @@ starts from valid inputs and reaches the decode paths fast:
 ## Status
 
 23 Jul 2026 smoke pass (cold-start, ~60-120s each): ~5.8M+ total
-executions across all four targets, ZERO crashes. Longer campaigns with
-the seed corpora are the next step for deeper coverage.
+executions across the four targets that existed then (`yenc_decode`,
+`nzb_parse`, `par2_parse`, `rar_extract`), ZERO crashes. Longer campaigns
+with the seed corpora are the next step for deeper coverage. The targets
+added since have their own entries below; a green smoke run is evidence
+about that run, not a standing property of the target.
 
 25 Jul 2026 - `yenc_decode`'s corpus was found to contain ZERO inputs with
 `=y` in them: it had only ever exercised the header-absent early return,

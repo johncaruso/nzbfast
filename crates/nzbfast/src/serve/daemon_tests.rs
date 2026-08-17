@@ -25,6 +25,12 @@ mod notice_tests;
 #[path = "daemon_tests/index_read_tests.rs"]
 mod index_read_tests;
 
+// §74's instant kick and its lock ordering, moved out for the ceiling
+// and carrying the same #[path] requirement.
+#[cfg(feature = "indexer")]
+#[path = "daemon_tests/instant_tests.rs"]
+mod instant_tests;
+
 fn with_daemon(name: &str, f: impl FnOnce(&Arc<Daemon>)) {
     let dir = std::env::temp_dir().join(format!("nzbfast-dmn-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -711,47 +717,6 @@ fn job_by(d: &Arc<Daemon>, id: &str) -> Arc<Mutex<Job>> {
         .find(|j| j.lock_ok().nzo_id == id)
         .cloned()
         .unwrap()
-}
-
-// -- instant kick -----------------------------------------------------------
-
-#[cfg(feature = "indexer")]
-#[test]
-fn instant_kick_dedupes_hints_and_caps_from_the_front() {
-    with_daemon("kickhint", |d| {
-        // max 0 = unmetered, so this test is about the hint list alone.
-        d.watchlist_instant_max.store(0, Ordering::Relaxed);
-        assert!(!d.instant_kick(&[], 1000), "empty names never wake");
-
-        let names: Vec<String> = vec!["a".into(), "b".into()];
-        assert!(d.instant_kick(&names, 1000));
-        let again: Vec<String> = vec!["b".into(), "c".into()];
-        assert!(d.instant_kick(&again, 1001));
-        assert_eq!(*d.instant_hint.lock_ok(), vec!["a", "b", "c"], "dedupe");
-
-        d.instant_hint.lock_ok().clear();
-        let flood: Vec<String> = (0..300).map(|i| format!("n{i}")).collect();
-        assert!(d.instant_kick(&flood, 1002));
-        let hint = d.instant_hint.lock_ok();
-        assert_eq!(hint.len(), 256, "HINT_CAP");
-        assert_eq!(hint[0], "n44", "drained from the front (oldest)");
-        assert_eq!(hint[255], "n299");
-    });
-}
-
-#[cfg(feature = "indexer")]
-#[test]
-fn instant_kick_rate_limit_refuses_without_touching_hints() {
-    with_daemon("kicklimit", |d| {
-        d.watchlist_instant_max.store(1, Ordering::Relaxed);
-        let a: Vec<String> = vec!["a".into()];
-        let b: Vec<String> = vec!["b".into()];
-        assert!(d.instant_kick(&a, 5000));
-        assert!(!d.instant_kick(&b, 5001), "allowance for the hour is spent");
-        assert_eq!(*d.instant_hint.lock_ok(), vec!["a"], "refusal adds no hint");
-        // A new hour restores the allowance.
-        assert!(d.instant_kick(&b, 5000 + 3_600));
-    });
 }
 
 // -- event ring / speed ceiling ---------------------------------------------

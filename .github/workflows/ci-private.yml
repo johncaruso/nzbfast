@@ -5,6 +5,56 @@
 # + lint gates and the fast unit suites, on Linux and on Windows. The
 # long daemon/e2e suites stay nightly (nightly.yml) plus a local
 # pre-push discipline.
+#
+# ---------------------------------------------------------------------
+# SHAPE (rewritten 17 Aug 2026 - "the slow path IS the release path")
+#
+# This file used to be two big serial jobs. On a RELEASE commit that was
+# ~49 min of Windows and 22 min of Linux, and a release is exactly when
+# nobody can afford to wait: `packaging/bump-version.sh` rewrites
+# Cargo.lock, both caches keyed on `hashFiles('Cargo.lock')`, so every
+# release started both jobs cold. Measured on run 31980160964 (the
+# v1.1.4 bump) and 31986322369 (the push after it).
+#
+# The measurement that decided the shape - taken from those two runs'
+# logs, step start to nextest's `Starting N tests` line versus its
+# `Summary [Ns]` line:
+#
+#            windows-unit (cold)          check (warm)
+#   build    21m16s  (53%)                 5m11s  (28%)
+#   execute  19m13s  (47%)                13m11s  (72%)
+#
+# So this was NOT compile-bound, which is what everyone assumed from the
+# 68-second local suite. Caching alone could never have hit the targets:
+# even with a perfect cache, Windows still owed 19 minutes of test
+# execution in one serial lump. Both halves had to be attacked:
+#
+#   BUILD ONCE, TEST SHARDED. `cargo nextest archive` builds every test
+#   binary once; N shard jobs run `--partition count:i/N` against the
+#   archive. Note this is NOT the matrix that TODO 116c priced NO in
+#   August - that one duplicated the BUILD across shards, which is the
+#   dominant cost. A shard here compiles nothing: `cargo-nextest` runs
+#   the archived binaries with no cargo, no rustup and no target/ at
+#   all (verified - the archive carries the standard library), so a
+#   shard is a checkout, a 3 MB binary and a download.
+#
+#   DEPENDENCY CACHE, NOT LOCKFILE CACHE. The key is now the hash of
+#   Cargo.lock with the workspace members' own version lines normalised
+#   out (tools/dep-cache-key.py), so a version bump cannot cost us ~600
+#   compiled crates in order to rebuild 3.
+#
+#   PARALLEL, NOT SERIAL. windows-unit's three steps - suite, clippy,
+#   ARM64 cross-check - were mutually independent and ran back to back
+#   for ~8.5 min of pure serialisation. They are separate jobs now.
+#
+# Read verdicts PER JOB, not per run: a run whose Windows job was
+# superseded while queued is `cancelled` at run level even when its
+# Linux job passed, so
+#   gh api repos/:owner/:repo/actions/runs/<id>/jobs \
+#     -q '.jobs[] | "\(.name) \(.conclusion)"'
+# is the honest query, and `gh run list` alone is not. There are more
+# job names now, and the sharded ones carry a matrix suffix -
+# `windows-unit (1)` through `windows-unit (4)`.
 name: ci
 on:
   push:
@@ -33,32 +83,104 @@ permissions:
 #
 # So the group moves down to the jobs, which is exactly the escape hatch
 # the old note named. Each leg now queues on its own and neither starves
-# the other. Read verdicts PER JOB, not per run: a run whose Windows job
-# was superseded while queued is `cancelled` at run level even when its
-# Linux job passed, so
-#   gh api repos/:owner/:repo/actions/runs/<id>/jobs \
-#     -q '.jobs[] | "\(.name) \(.conclusion)"'
-# is the honest query, and `gh run list` alone is not.
+# the other.
+#
+# ONE RULE FOR THE MATRIX JOBS, and it is easy to get wrong: a matrix
+# leg evaluates its `concurrency` group per leg, so if the group string
+# does not mention `matrix.shard` every shard of a run lands in ONE
+# group and they SERIALISE - which would undo this whole file. The
+# shard groups below all carry the shard number.
+env:
+  # Both legs, one value, and that is deliberate. CLAUDE.md's disk note
+  # is explicit that a per-directory setting must be UNIFORM or the
+  # directory carries two complete artifact sets; the same is true of a
+  # cache archive shared by the build job and the lint jobs.
+  #
+  # CARGO_INCREMENTAL: the `check` job died four times on 5 Aug 2026
+  # (77e0b1c0, 7ea59bf4, 520248ac, febb6a26) with `No space left on
+  # device (os error 28)`, one of them naming
+  # `target/debug/incremental/.../query-cache.bin` outright. Measured on
+  # the dev checkout, `target/debug/incremental` is 94 GB against 95 GB
+  # of `deps` - about a byte of incremental state per byte of artifact -
+  # and CI never spends it, because no cached target/ is ever resumed
+  # from mid-edit.
+  CARGO_INCREMENTAL: "0"
+  # `line-tables-only` keeps file:line in panic backtraces - the whole
+  # diagnostic value of debuginfo in a test job - and drops the variable
+  # and type DWARF that is the bulk of the bytes and of the LINK time.
+  #
+  # NEW ON WINDOWS as of this commit, and it is the single biggest lever
+  # on that leg's build. Timestamps from run 31986322369's `workspace
+  # suite` log: the last `Compiling` line lands at +643s and nextest's
+  # `Starting 5116 tests` at +1276s, so 633s - ten and a half minutes,
+  # half the entire build phase - is pure LINKING of 54 statically
+  # linked test executables with full debuginfo. No dependency cache can
+  # touch that; only making the linker write less can. Linux has carried
+  # this since TODO 116 and warm-builds the same 54 binaries in 5m11s.
+  #
+  # The old note here said adopting it on Windows was the "wrong trade
+  # today" because it costs one cold rebuild on a 2x-billed runner and
+  # there was no timeout pressure. It then named the reopen trigger:
+  # "if this leg starts crowding 60 the lever is the same one, and so is
+  # the rule". At 49 minutes against a 75-minute cap, crowding is what
+  # happened.
+  #
+  # THE RULE, which is the load-bearing half: this flag moves every
+  # fingerprint in the cached archive, so the cache-key suffix bump to
+  # `-v3` below rides in the SAME COMMIT. Land one without the other and
+  # CI restores an archive built under the old flag, rebuilds cold under
+  # the new one, and never replaces it - cold forever, silently, behind
+  # a green cache-hit line. Bump the suffix again for any future change
+  # that moves rustc's fingerprint inputs (profile flags, RUSTFLAGS,
+  # toolchain pin) without moving Cargo.lock.
+  #
+  # Workflow-level, not job-level, and that is load-bearing too: clippy
+  # `--all-targets` builds the test targets as well, so a job that
+  # differed here would give clippy and nextest different fingerprints
+  # for the same units and each would rebuild what the other just built.
+  # This applies to `profile.test`, so dependencies (built with `dev`)
+  # keep full debuginfo - the intended half, since the test executables
+  # are what there are fifty-four of.
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # The seven build-gated heavy targets (TODO 116b) are excluded by
+  # `required-features` at BUILD time, so they never enter the archive -
+  # verified by listing the archive's binaries. This expression is the
+  # run-stage belt if they are ever built here again, and it is where a
+  # reader learns the seven names. nextest accepts binary() predicates
+  # that match nothing.
+  NT_EXCLUDE: >-
+    not binary(conn_tuner) and not binary(index_size_cap) and
+    not binary(http_wedge) and not binary(queue_soak) and
+    not binary(daemon) and not binary(e2e) and not binary(leak_soak)
+  # CLAUDE.md invariant 5. The bin suite runs product code that consults
+  # this at the network boundary (identity.rs `may_call_out`), so
+  # without it a push can put live xREL / TMDB requests on the wire from
+  # a CI runner.
+  NZBFAST_NO_ENRICH: "1"
+  # Pinned once, consumed by six jobs. Both the version and the two
+  # SHA256s move together.
+  NT_VERSION: "0.9.140"
+  NT_SHA_LINUX: "4ee9aaa0d0171a985a5d0eb735b87355894c1c455972e9674fb9fdbd1387c9a3"
+  NT_SHA_WINDOWS: "ec39698dfe5bcfffb7d5da037f226bc1670584ba247123f4e684a0f224fe828d"
+
 jobs:
+  # ===================================================================
+  # LINUX: gates + lint + the one build, then four shards.
+  # ===================================================================
   check:
     if: github.repository != 'nzbfast/nzbfast'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Warm cache: measured at eight minutes (restore 1m01s, fmt 23s,
-    # clippy 36s, unit suites 5m31s, deny 1s) when this job ran four
-    # named test targets. ac3f4a04 widened it to the whole workspace and
-    # that figure is now WRONG - the last green run before this edit
-    # (d7d1bd43, 5 Aug 2026) was 18m31s against the 30-minute cap. TODO
-    # 116; the note that said "call it eight minutes" is corrected here
-    # rather than left to rot further. Never cancelled on main, so at
-    # the push rate above main gets a real Linux verdict roughly every
-    # twenty minutes instead of none at all; GitHub keeps at most one
-    # queued job per group, so this cannot back up - a newer push
-    # supersedes the WAITING job, never the running one.
+    # WAS 22 minutes on the release commit (run 31980160964: 25m14s
+    # cold, 22m28s warm), of which the unit-test step alone was 18-20.
+    # The tests are gone from this job - they run in `linux-tests`
+    # below, four ways, off the archive this job produces - so what is
+    # left is the gates, clippy, cargo deny and one build.
     #
     # The cap stays at 30. TODO 116 is explicit that raising it only
     # hides the growth (2556 -> 3224 tests inside one hour of main
-    # activity on 5 Aug); the lever is the debuginfo env below.
+    # activity on 5 Aug); the levers are the debuginfo env above and the
+    # shard count below.
     #
     # cancel-in-progress stays on for anything that is not main, because
     # `workflow_dispatch` on a topic branch is how a session gets a real
@@ -67,49 +189,29 @@ jobs:
     concurrency:
       group: ci-check-${{ github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-    env:
-      # This job died four times on 5 Aug 2026 (77e0b1c0, 7ea59bf4,
-      # 520248ac, febb6a26) with `No space left on device (os error 28)`
-      # in the unit-tests step, one of them naming
-      # `target/debug/incremental/.../query-cache.bin` outright. Every
-      # gate above it passed; the suite never ran at all.
-      #
-      # Incremental is pure cost here and roughly a 2x one. Measured on
-      # the dev checkout, `target/debug/incremental` is 94 GB against 95
-      # GB of `deps` - about a byte of incremental state per byte of
-      # artifact - and CI never spends it: the cache below is keyed on
-      # Cargo.lock alone, so the restored `target` is frozen at whatever
-      # the day's first build left, and every push after it recompiles
-      # the changed crates from cold anyway. Turning it off halves the
-      # peak and skips the work of writing state nothing reads.
-      CARGO_INCREMENTAL: "0"
-      # TODO 116, the named lever for the SUCCESSOR to that bug: this
-      # job is growing toward its timeout, and debuginfo dominates the
-      # cost of statically linking forty-odd test binaries on a runner
-      # whose linker copies DWARF INTO each executable (see the reclaim
-      # step). `line-tables-only` rather than `0` on purpose - it keeps
-      # file:line in panic backtraces, which is the whole diagnostic
-      # value of debuginfo in a test job, and drops the variable and
-      # type DWARF that is the bulk of the bytes and the link time.
-      #
-      # Job-level env, not step-level, and that is load-bearing: clippy
-      # `--all-targets` builds the test targets too, so a step-level
-      # setting would give clippy and nextest different fingerprints for
-      # the same units and each would rebuild what the other just built.
-      #
-      # This applies to `profile.test`, so dependencies (built with
-      # `dev`) keep full debuginfo. That is the intended half - the test
-      # executables are what there are forty of.
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    outputs:
+      # The REAL precondition for the shard jobs, and it is not the job's
+      # own conclusion. This job also runs clippy, cargo deny and five
+      # gates; if any of those is red the job is red, but the archive is
+      # still built and still valid, and the suites must still report.
+      # `needs: check` alone would let a one-line clippy error skip 5,175
+      # tests - which is precisely the masking TODO 116.4 spent three
+      # multi-day incidents learning to refuse, one level up from the
+      # steps it fixed. Gate on the archive, which is the only thing a
+      # shard actually needs.
+      archive: ${{ steps.archive.outcome }}
+      # The path the archive's binaries were built at. The shards
+      # compare it to their own - see the guard in those jobs.
+      workspace: ${{ github.workspace }}
     steps:
       # ac3f4a04 widened this job from four named test targets to the
       # whole workspace, which is the right call (see the long note on
-      # the unit-tests step) but it is what put the runner over. It is
-      # 37 integration targets plus the lib and bin suites, and on Linux
+      # the archive step) but it is what put the runner over. It is 37
+      # integration targets plus the lib and bin suites, and on Linux
       # the linker copies DWARF INTO each executable rather than leaving
       # it in the object files the way macOS does, so a local `ls -la`
       # on a Mac reads 8-15 MB per test binary and badly understates
-      # what ubuntu writes. Forty-odd of those, each statically linking
+      # what ubuntu writes. Fifty-odd of those, each statically linking
       # the full crate graph, is several GB before `deps` is counted.
       #
       # A GitHub-hosted ubuntu runner ships ~14 GB free on `/`, most of
@@ -120,8 +222,8 @@ jobs:
       # and audited, and none of this is worth a new supply-chain edge.
       #
       # `hostedtoolcache/CodeQL` only, never the whole hostedtoolcache -
-      # python3 lives under it on some images and the three gate scripts
-      # below are `#!/usr/bin/env python3`.
+      # python3 lives under it on some images and the gate scripts below
+      # are `#!/usr/bin/env python3`.
       - name: reclaim disk
         run: |
           df -h / | tail -1
@@ -140,40 +242,89 @@ jobs:
       - name: toolchain
         id: toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
+      # ---------------------------------------------------------------
+      # THE CACHE KEY. Read this before touching it; it has bitten twice.
+      #
+      # The key used to be `hashFiles('Cargo.lock')`. Every release runs
+      # packaging/bump-version.sh, which rewrites Cargo.lock, so EVERY
+      # RELEASE started cold on both legs - and the release is the one
+      # push nobody can afford to wait on. That is not a hypothetical:
+      # the v1.1.4 bump (d7c08c8d, run 31980160964) missed on both jobs
+      # and spent 21m16s rebuilding Windows from scratch.
+      #
+      # What the bump actually changes is two lines. Diffed: `nzbfast`
+      # and `nzbtray` version = "1.1.3" -> "1.1.4", and nothing else in
+      # a 1,700-package lockfile. The old key threw away ~600 compiled
+      # crates in order to rebuild 3.
+      #
+      # So the key is now a hash of Cargo.lock with the WORKSPACE
+      # MEMBERS' own version lines normalised out. tools/dep-cache-key.py
+      # carries the derivation and a --selftest that asserts both
+      # directions: a release bump does not move the key, while a
+      # third-party version change, a checksum change, a crate added or
+      # removed, and a workspace member gaining a dependency all do.
+      # Positive control on real data - the v1.1.3 and v1.1.4 lockfiles
+      # hash the same normalised and differently raw.
+      #
+      # WHY NOT Swatinem/rust-cache, which does this and prunes workspace
+      # artifacts too: it would be a new third-party action in the most
+      # load-bearing gate in the repo, and the reclaim-disk note above
+      # states the standing position on that. Every action used here is
+      # already pinned by SHA and already in use in this repo. The
+      # normalisation is thirty lines with a selftest, and it is
+      # auditable in a way a vendored action is not.
+      #
+      # WHY NOT `${{ github.run_id }}` + restore-keys, which is the
+      # standard escape from the staleness trap: that trap does not
+      # apply to a key that is a pure function of the DEPENDENCIES.
+      # actions/cache saves only on an exact-key miss and never
+      # refreshes a key it hit - which is a bug when the key is a proxy
+      # for "the tree", because the archive then freezes at whatever the
+      # day's first build left. Here the key changes exactly when the
+      # dependency graph changes, and on that push the archive is
+      # rewritten. The workspace crates' own artifacts are stale in it
+      # by construction and always were; they are rebuilt every push
+      # regardless. Meanwhile a run-unique key writes a NEW multi-GB
+      # archive every single run, and this repo is already at 11.85 GB
+      # against GitHub's 10 GB per-repo limit with LRU eviction active -
+      # it would evict the nightly caches within the hour and then
+      # itself. Deterministic key, one archive per leg per dependency
+      # graph.
+      # ---------------------------------------------------------------
+      - name: dependency cache key
+        id: depkey
+        run: |
+          py=python3; command -v $py >/dev/null 2>&1 || py=python
+          echo "hash=$($py tools/dep-cache-key.py)" >> "$GITHUB_OUTPUT"
+          $py tools/dep-cache-key.py --selftest
+      # restore + save as SEPARATE steps, not the combined `actions/cache`.
+      # This is the fix for the failure mode that kept the cache coldest
+      # exactly when someone was iterating on a fix:
+      #
+      #   actions/cache's post step DOES NOT SAVE IF THE JOB FAILED.
+      #   Observed directly - run 31980160964's windows-unit failed and
+      #   its `Post Run actions/cache` reads `skipped`, so the NEXT run
+      #   on the same lockfile (31986322369) missed too and paid another
+      #   full cold build. A red gate made the next attempt slower, and
+      #   the one after that, until something went green.
+      #
+      # The save below is `if: always()` and sits immediately after the
+      # build, so the dependency artifacts are banked whatever the tests
+      # then do. Guarded on cache-hit != true only because saving over a
+      # key that already exists is a warning and a wasted upload, never
+      # a refresh.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
         with:
           path: |
             ~/.cargo/registry
             target
-          # `-v2` is not decoration and it MUST NOT be dropped: it rides
-          # with the CARGO_PROFILE_TEST_DEBUG change above, in the same
-          # commit, because that flag invalidates every fingerprint in
-          # the archive this key would otherwise hit. The key has no
-          # restore-keys, and actions/cache saves ONLY on an exact-key
-          # miss - it never refreshes a key it hit - so an archive built
-          # under the old flag would be restored on every push, rebuilt
-          # from cold under the new one, and never replaced. Cold
-          # forever, silently, with a green cache-hit line in the log.
-          # Bump the suffix again for any future change that moves
-          # rustc's fingerprint inputs (profile flags, RUSTFLAGS,
-          # toolchain pin) without moving Cargo.lock.
-          #
-          # Contrast the incremental-eviction step below, which fixes a
-          # dirtier archive with no cache-key bump at all: eviction is
-          # self-healing because nothing downstream reads what it
-          # deletes. A stale fingerprint is not - only a new key clears
-          # it. That is the whole difference between the two fixes.
-          key: ci-private-v2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: ci-private-v3-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
       # CARGO_INCREMENTAL above stops us WRITING incremental state; this
-      # evicts what the cache hands us. The key has no restore-keys, so
-      # actions/cache saves only on an exact-key miss and never updates
-      # a key it hit: the archive restored on every push today was
-      # written at 02:21 by the first build after Cargo.lock last
-      # changed, incremental dirs and all, and it will keep being
-      # restored unchanged until the lockfile moves. Deleting them costs
-      # nothing (nothing downstream reads them) and it is self-healing -
-      # the next lockfile bump saves a clean archive, because by then
-      # there are no incremental dirs left to put in it.
+      # evicts what a cache written before that flag existed hands us.
+      # Deleting them costs nothing - nothing downstream reads them -
+      # and it is self-healing, because the next archive saved has none
+      # left to put in it.
       - name: drop restored incremental state
         run: |
           du -sh target/*/incremental 2>/dev/null || true
@@ -183,7 +334,7 @@ jobs:
       # nightly.yml's, which got it in e7df7bf3 (TODO 143) - `!cancelled()`
       # plus a REAL precondition per step.
       #
-      # Until this edit these twelve gate steps carried zero `if:` between
+      # Until TODO 116.4 these gate steps carried zero `if:` between
       # them, so a red `fmt` skipped the lock gate, the size gate, the
       # overflow gate, clippy, the whole unit suite AND cargo deny: one
       # line of output standing in for six unknown verdicts, which reads
@@ -192,8 +343,7 @@ jobs:
       # early size gate hid clippy, deny and the unit tests for four
       # days), four nights of nightly red hiding http_wedge,
       # index_size_cap and queue_soak (TODO 143), and TODO 116.2's four
-      # Windows failures surviving two commits. One shape, three scopes;
-      # this file was the last place it lived (TODO 116.4).
+      # Windows failures surviving two commits.
       #
       # `!cancelled()` rather than `always()`, for the reason nightly
       # gives: a genuinely cancelled run - superseded by the concurrency
@@ -201,26 +351,20 @@ jobs:
       #
       # NOT a blanket guard, and that is the half that takes the thought.
       # A step whose PRECONDITION failed must still skip, or a failed
-      # checkout reports six identical reds instead of one honest one -
-      # which is what nightly's `steps.build.outcome == 'success'` half is
-      # doing. Here the three python gates need only the tree
-      # (`checkout`), the cargo gates need a compiler (`toolchain`), and
-      # `unit tests` / `cargo deny` additionally need their own installer
-      # step. The dependency chains without being restated: `toolchain` is
-      # unguarded, so a failed checkout skips it, and everything gated on
-      # it skips in turn. fmt / lock / size / overflow / clippy / tests /
-      # deny are genuinely independent of EACH OTHER and all report.
+      # checkout reports six identical reds instead of one honest one.
+      # Here the python gates need only the tree (`checkout`) and the
+      # cargo gates need a compiler (`toolchain`). The dependency chains
+      # without being restated: `toolchain` is unguarded, so a failed
+      # checkout skips it, and everything gated on it skips in turn.
       #
       # This does not soften the verdict. `if:` decides whether a step
       # RUNS, never whether its failure counts, and nothing here carries
-      # continue-on-error - so any red gate still fails the job. A run
-      # that reported everything and exited green would be worse than the
-      # masking it replaced.
+      # continue-on-error - so any red gate still fails the job.
       #
-      # The price is wall clock on a red push: the job now spends its full
-      # ~15-19 min before reporting a one-character fmt error instead of
-      # ~2. That is the trade the three incidents above already paid for
-      # in days.
+      # One thing the job split BUYS here, for free: clippy, the tests
+      # and the ARM64 check are separate JOBS now, and a job cannot skip
+      # a job. The guards below still matter within this job, but the
+      # cross-job half of that failure mode is gone by construction.
       - name: fmt
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo fmt -p nzbkit -p nzbfast -p nzbtray --check
@@ -258,11 +402,7 @@ jobs:
       # unstaged while Cargo.toml was committed, and the site went live
       # naming 1.1.2. This is what makes that state red at the commit that
       # creates it rather than on release day. `--selftest` first, same
-      # reason as the overflow gate above: it rebuilds both incidents and
-      # asserts the gate still refuses them, so a refactor cannot turn it
-      # into a no-op that passes everything. Private-only - website/ is
-      # deliberately not in PUBLIC_MANIFEST, so there is nothing to check
-      # in the public snapshot. Pure shell and python, about two seconds.
+      # reason as the overflow gate above.
       - name: download page version gate
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         run: tools/check-site-version.sh --selftest && tools/check-site-version.sh --tree
@@ -280,6 +420,11 @@ jobs:
         # the link time the gate saves - and without it those files would
         # grow silent clippy debt, the exact class that held main red
         # 7-10 Aug when a skipped gate came back on.
+        #
+        # Runs BEFORE the archive build deliberately, and in the same
+        # job: clippy compiles the dependency graph to rlib/rmeta exactly
+        # as the test build needs it, so the build below reuses that work
+        # rather than paying for it twice in two jobs.
         run: cargo clippy -p nzbkit -p nzbfast -p nzbtray --all-targets --no-deps --features nzbkit/heavy-tests,nzbfast/heavy-tests -- -D warnings
       # Prebuilt binary pinned by version and checked by SHA256 rather
       # than trusted, same pattern (and rationale) as the cargo-deny
@@ -288,7 +433,6 @@ jobs:
         id: nextest
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
-          ver="0.9.140"
           # --retry-all-errors, not bare --retry: a mid-transfer drop is
           # not one of the "transient" conditions plain --retry covers,
           # and a truncated tarball is what actually happens (12 Aug 2026,
@@ -297,112 +441,64 @@ jobs:
           # single-packet-drop failure mode, it never accepts a bad file.
           curl -sSfL --retry 5 --retry-delay 3 --retry-all-errors \
             --connect-timeout 20 -o cargo-nextest.tar.gz \
-            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${ver}/cargo-nextest-${ver}-x86_64-unknown-linux-gnu.tar.gz"
-          echo "4ee9aaa0d0171a985a5d0eb735b87355894c1c455972e9674fb9fdbd1387c9a3  cargo-nextest.tar.gz" | sha256sum -c -
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NT_VERSION}/cargo-nextest-${NT_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${NT_SHA_LINUX}  cargo-nextest.tar.gz" | sha256sum -c -
           tar -xzf cargo-nextest.tar.gz
           sudo mv cargo-nextest /usr/local/bin/
           rm cargo-nextest.tar.gz
-      # nextest instead of libtest, and the reason is diagnostic: a flake
-      # must never again appear as an anonymous 505/506 tally - nextest
-      # names the failing test and the retry outcome. The retry policy in
-      # .config/nextest.toml (retries = 1, fail-fast off) CAPTURES flakes
-      # as named FLAKY results instead of hiding them; the ci profile
-      # also writes a JUnit report naming every test.
-      - name: unit tests
-        # Two preconditions, both real: the compiler and the runner this
-        # step invokes. Everything above it is a peer gate, not an input.
+      # THE ONE BUILD. Everything the shards run comes out of here.
+      #
+      # `--workspace` with no exclusions and no `--features`, and both
+      # halves are deliberate:
+      #
+      #   `--workspace` is the direction that matters - a test target
+      #   added tomorrow is archived and run automatically, and the only
+      #   names anyone maintains are the few that must NOT be. It
+      #   replaced three steps naming `-p nzbkit --lib`, `-p nzbfast
+      #   --bin nzbfast` and two integration targets; everything else was
+      #   reachable only through pr-check.yml, which triggers on
+      #   `pull_request` while this repo pushes straight to main. 27
+      #   integration targets plus vendor/rars (728 tests, the RAR
+      #   engine, under active work), vendor/tiny_http and nzbtray were
+      #   covered by a workflow nobody fires. That is how a conn_tuner
+      #   assertion stayed red for a day with main green.
+      #
+      #   No `--features heavy-tests`, so cargo never BUILDS the seven
+      #   heavy targets (TODO 116b) and they never enter the archive.
+      #   Verified by listing the archive's binaries: none of the seven
+      #   is present. Auto-enrolment survives - a target added tomorrow
+      #   carries no required-features and is archived and run here
+      #   automatically.
+      #
+      # Cost, measured on an M-series box with `--retries 0`: 5175 tests
+      # in 68s once built. Both sessions that costed this first estimated
+      # 5-8 MINUTES, from serialised `cargo test` timings - `cargo test`
+      # runs test BINARIES sequentially while nextest schedules across
+      # them. Never cost a nextest job from cargo-test numbers.
+      - name: build test archive
+        id: archive
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && steps.nextest.outcome == 'success' }}
-        env:
-          # CLAUDE.md invariant 5. The bin suite runs product code that
-          # consults this at the network boundary (identity.rs
-          # `may_call_out`), so without it a push can put live xREL /
-          # TMDB requests on the wire from a CI runner. Both other
-          # workflows already set it; this job was the one that did not.
-          NZBFAST_NO_ENRICH: "1"
-        # `--workspace` minus a named exclusion list, NOT a list of the
-        # packages and targets to include. That direction is the whole
-        # point: a test target added tomorrow runs on push automatically,
-        # and the only names anyone maintains are the few that must not.
-        #
-        # It replaces three steps that between them named `-p nzbkit
-        # --lib`, `-p nzbfast --bin nzbfast` and two nzbfast integration
-        # targets. Everything else in the workspace was reachable ONLY
-        # through pr-check.yml - which triggers on `pull_request`, and
-        # this repo pushes straight to main, so it effectively never
-        # ran. 27 integration targets plus vendor/rars (728 tests, the
-        # RAR engine, under active work), vendor/tiny_http and nzbtray
-        # were covered by a workflow nobody fires. That is how a
-        # conn_tuner assertion stayed red for a day with main green.
-        #
-        # Nobody DEFERRED those - they were wired to a branch model this
-        # project does not use, and the header's "long suites stay
-        # nightly plus a local pre-push discipline" was a decision made
-        # about daemon/e2e, not about them. The local discipline does not
-        # reach them either: CLAUDE.md documents the unit suites and the
-        # daemon suite.
-        #
-        # Cost, measured on an M-series box with `--retries 0` on this
-        # profile: 2522 tests in 37.9s. Both sessions that costed this
-        # first estimated 5-8 MINUTES, from serialised `cargo test`
-        # timings - `cargo test` runs test BINARIES sequentially while
-        # nextest schedules across them, so ~500s of sequential work is
-        # ~38s of wall clock. Never cost a nextest job from cargo-test
-        # numbers.
-        #
-        # The seven exclusions are the targets with a real home in
-        # nightly.yml, which names all of them: daemon/e2e/leak_soak were
-        # already there by an actual decision, and conn_tuner,
-        # index_size_cap, http_wedge and queue_soak are ~80% of the total
-        # runtime because they MEASURE ELAPSED TIME - a different kind of
-        # test, not merely a dearer one.
-        #
-        # Since TODO 116b the seven are also gated out of the BUILD.
-        # `-E 'not binary(x)'` filters RUNNING only, so each still paid
-        # full link time and disk here on every push - on this runner the
-        # linker copies DWARF INTO every statically linked executable.
-        # The gate is `required-features = ["heavy-tests"]` on the seven
-        # [[test]] entries in nzbkit's and nzbfast's Cargo.toml; this
-        # step deliberately does not pass the feature, so cargo never
-        # builds them. That shape keeps the auto-enrolment default this
-        # note insists on: a target added tomorrow carries no
-        # required-features and builds AND runs here automatically - the
-        # only names anyone maintains are in Cargo.toml, beside the
-        # targets themselves. An EMPTY feature moves no fingerprint any
-        # cached unit depends on and Cargo.lock does not record features,
-        # so no cache-key bump rides with it (contrast the -v2 note
-        # above). The -E list below stays: nextest accepts binary()
-        # predicates that match nothing, it is the run-stage belt if the
-        # targets are ever built here again, and it is where a reader
-        # learns the seven names.
-        #
-        # The gate's PRICE, measured before landing (11 Aug, dispatch
-        # 31489960984 vs control 31491653304 - same tree, both workspace
-        # crates fully dirtied, warm caches): build here 4m09s vs 4m26s,
-        # because line-tables-only above had already collapsed the Linux
-        # DWARF bill, and 14m51s vs 17m03s on windows-unit, which kept
-        # full debuginfo and bills at 2x - that leg is where the minutes
-        # are. Plus seven fewer statically linked executables written per
-        # run on both legs, which is headroom against the ENOSPC class
-        # this TODO item was born from.
-        #
-        # windows-unit gets the BUILD saving automatically from the same
-        # Cargo.toml gate with its step untouched, and its clippy briefly
-        # lost the seven targets for not passing the feature - a
-        # documented sliver (one cfg(windows) site across those files;
-        # the Linux clippy above lints everything else in them), closed
-        # on 11 Aug as TODO 116 item f when that job was next edited, for
-        # the step guards. Its clippy now passes the same flag.
-        #
-        # Note what does NOT need saying here: `binary(daemon)` is pinned
-        # to a max-threads-1 test group in .config/nextest.toml, so
-        # CLAUDE.md invariant 4 holds by configuration rather than by
-        # everyone remembering `-- --test-threads=1`. If an exclusion is
-        # ever dropped, the serialisation arrives with the target.
-        run: |
-          cargo nextest run --profile ci --workspace -E '
-            not binary(conn_tuner) and not binary(index_size_cap) and
-            not binary(http_wedge) and not binary(queue_soak) and
-            not binary(daemon) and not binary(e2e) and not binary(leak_soak)'
+        run: cargo nextest archive --workspace --archive-file nextest-archive.tar.zst
+      # `always()`, and immediately after the build - see the restore
+      # note above. A failed suite must not cost the next run its
+      # dependency artifacts.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ always() && steps.cache.outputs.cache-hit != 'true' && steps.archive.outcome != 'skipped' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ci-private-v3-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
+      # compression-level 0: the archive is already zstd, and re-zipping
+      # 250 MB of incompressible data costs a minute and saves nothing.
+      # retention 1 day - nothing outside this run ever reads it.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() && steps.archive.outcome == 'success' }}
+        with:
+          name: nextest-archive-linux
+          path: nextest-archive.tar.zst
+          retention-days: 1
+          compression-level: 0
       # Advisory / license / source gate against deny.toml. Prebuilt
       # binary pinned by tag and checked by SHA256 rather than trusted
       # (same pattern as the par2 fetch in pr-check.yml); a cargo
@@ -427,96 +523,233 @@ jobs:
       - name: cargo deny
         # The gate this job lost for four days in the 7-10 Aug outage,
         # for being last in the file.
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && steps.deny.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.deny.outcome == 'success' }}
         run: cargo deny check
 
-  # The same fast unit suites, on Windows, on every push. The workspace
-  # suite had NEVER run on Windows on any architecture until a
-  # Windows-on-ARM probe added the public pr-check job, and that first
-  # run exposed four real product bugs - `copy_tree`'s fsync alone broke
-  # every cross-device move and the spool migration on the x64 binary we
-  # ship, and a download folder and a library on two different drives is
-  # the ordinary Windows setup. Development happens in THIS repo and
-  # pr-check never runs here, so a Windows regression merged to main had
-  # nothing to catch it until the next nightly at best, or a public-repo
-  # PR at worst. This job names the commit.
+  # The Linux suite, four ways, off `check`'s archive. This job compiles
+  # NOTHING: no toolchain step, no cache, no target/ - `cargo-nextest`
+  # is invoked directly rather than through the `cargo` shim, which is
+  # what lets a shard skip rustup's toolchain resolution entirely
+  # (verified locally with cargo and rustup removed from PATH: the
+  # archive carries its own standard library). A shard is a checkout, a
+  # 3 MB binary and a download.
+  #
+  # The checkout IS required and is not decoration: the source-scanning
+  # reflection tests (tests/settings_catalogue.rs) read crates/ at
+  # RUNTIME - CLAUDE.md's "compiling is not passing" note - and the
+  # fixture-backed RAR and PAR2 tests read files from the tree.
+  # `--workspace-remap` is what points the archived binaries' baked-in
+  # manifest paths at this checkout.
+  #
+  # Shard count 4 was chosen from the measurement, not from taste: 13m11s
+  # of Linux execution over 4 is ~3m20s, against ~60-90s of fixed
+  # per-shard overhead. Past about 4 the overhead dominates and the
+  # billed minutes buy nothing.
+  #
+  # `count:i/N` not `hash:i/N`: count assigns round-robin over the
+  # ordered test list, which balances the long tail (the chase and
+  # crypto tests are 15-50s each and cluster in one binary) far better
+  # than hashing does. Verified: the four partitions sum to exactly the
+  # 5175 tests the unpartitioned list reports, so nothing is dropped and
+  # nothing is run twice.
+  linux-tests:
+    # `!cancelled()` plus a REAL precondition, the TODO 116.4 form. NOT
+    # `needs: check` on its own - see the `archive` output above.
+    if: ${{ !cancelled() && github.repository != 'nzbfast/nzbfast' && needs.check.outputs.archive == 'success' }}
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    concurrency:
+      group: ci-linux-tests-${{ github.ref }}-${{ matrix.shard }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: install cargo-nextest
+        run: |
+          curl -sSfL --retry 5 --retry-delay 3 --retry-all-errors \
+            --connect-timeout 20 -o cargo-nextest.tar.gz \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NT_VERSION}/cargo-nextest-${NT_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${NT_SHA_LINUX}  cargo-nextest.tar.gz" | sha256sum -c -
+          tar -xzf cargo-nextest.tar.gz
+          sudo mv cargo-nextest /usr/local/bin/
+          rm cargo-nextest.tar.gz
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nextest-archive-linux
+      # nextest instead of libtest, and the reason is diagnostic: a flake
+      # must never again appear as an anonymous 505/506 tally - nextest
+      # names the failing test and the retry outcome. The retry policy in
+      # .config/nextest.toml (retries = 1, fail-fast off) CAPTURES flakes
+      # as named FLAKY results instead of hiding them.
+      #
+      # Note what does NOT need saying here: `binary(daemon)` and
+      # `binary(fault_contract)` are pinned to max-threads-1 test groups
+      # in .config/nextest.toml, so CLAUDE.md invariant 4 holds by
+      # configuration rather than by everyone remembering
+      # `--test-threads=1`, and it holds INSIDE a partition too - a
+      # shard that draws those tests still serialises them.
+      # ---------------------------------------------------------------
+      # EXTRACT TO THE WORKSPACE ROOT, and this is not a detail.
+      #
+      # ~30 of this repo's test files (161 sites) locate the daemon with
+      # `env!("CARGO_BIN_EXE_nzbfast")`. `env!` is resolved at COMPILE
+      # time, so what the archived test binaries carry is an ABSOLUTE
+      # path to `<build runner's workspace>/target/debug/nzbfast` - and
+      # nothing at runtime can remap it. `--workspace-remap` fixes
+      # CARGO_MANIFEST_DIR; it cannot touch this.
+      #
+      # Left to itself nextest extracts to a fresh temp dir, that path
+      # does not exist, and every daemon-spawning test dies instantly on
+      # `Os { code: 2, kind: NotFound }`. Measured, not guessed: run
+      # 31990300316 failed exactly this way on all four Linux shards.
+      #
+      # The escape is that GitHub gives every runner of an OS the SAME
+      # workspace path (`/home/runner/work/<repo>/<repo>`,
+      # `D:\a\<repo>\<repo>`), so the build job's baked
+      # `$GITHUB_WORKSPACE/target/debug/nzbfast` is a valid path on a
+      # shard too - as long as the archive is unpacked there. The
+      # archive stores its members at RELATIVE `target/debug/...`, so
+      # `--extract-to $GITHUB_WORKSPACE` puts every binary back exactly
+      # where it was built.
+      #
+      # That makes a path assumption load-bearing, so the step below
+      # ASSERTS it rather than trusting it: the build job publishes the
+      # workspace it built in, and if that ever stops matching this
+      # runner the job says so in one line instead of failing ~1,300
+      # tests with a NotFound apiece.
+      #
+      # It compares job outputs rather than reading the archive, and
+      # that is not a style choice: the first version of this guard
+      # shelled out to `tar --use-compress-program=unzstd`, which does
+      # not exist in Git Bash on windows-latest, so it failed on its own
+      # tooling instead of on the thing it was checking (run
+      # 31991506018). A guard that needs a tool the runner lacks is a
+      # second failure mode, not a safety net.
+      # ---------------------------------------------------------------
+      - name: assert this runner's workspace matches the build's
+        shell: bash
+        run: |
+          want='${{ needs.check.outputs.workspace }}'
+          got='${{ github.workspace }}'
+          if [ "$want" != "$got" ]; then
+            echo "::error::this runner's workspace is '$got' but the archive was built in '$want'."
+            echo "::error::env!(\"CARGO_BIN_EXE_*\") bakes an absolute path at compile time, so every"
+            echo "::error::daemon-spawning test would fail NotFound. See the note above this step."
+            exit 1
+          fi
+          echo "workspace matches the build job: $got"
+      - name: workspace suite (shard ${{ matrix.shard }}/4)
+        run: |
+          cargo-nextest nextest run --profile ci \
+            --archive-file nextest-archive.tar.zst \
+            --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
+            --workspace-remap "$GITHUB_WORKSPACE" \
+            --partition count:${{ matrix.shard }}/4 \
+            -E "$NT_EXCLUDE"
+
+  # ===================================================================
+  # WINDOWS. The same fast unit suites, on every push.
+  #
+  # The workspace suite had NEVER run on Windows on any architecture
+  # until a Windows-on-ARM probe added the public pr-check job, and that
+  # first run exposed four real product bugs - `copy_tree`'s fsync alone
+  # broke every cross-device move and the spool migration on the x64
+  # binary we ship, and a download folder and a library on two different
+  # drives is the ordinary Windows setup. Development happens in THIS
+  # repo and pr-check never runs here, so a Windows regression merged to
+  # main had nothing to catch it until the next nightly at best. This
+  # leg names the commit. It earned its keep again on 17 Aug 2026,
+  # catching a Windows-only bug every other gate passed.
   #
   # Unit suites only, and that is the cost call: Windows runners bill at
   # 2x on a private repo, the daemon and e2e targets are the slow ones,
-  # and they already run on Windows nightly (nightly.yml). Per-push
-  # coverage buys the most where regressions are cheapest to attribute -
-  # the platform-divergent code (paths, file handles, fsync, memory
-  # probing) lives in nzbkit's lib and the nzbfast bin, which is exactly
-  # what runs here.
-  windows-unit:
+  # and they already run on Windows nightly (nightly.yml).
+  #
+  # THE BILLING NOTE, because this now spawns seven Windows jobs where
+  # there was one. Billed minutes are roughly FLAT, not 7x: the old job
+  # spent ~19 minutes running tests one lump at a time on one 4-vCPU
+  # runner, and four shards do the same total work concurrently. What is
+  # genuinely new is per-job fixed cost (~1 min of runner setup each)
+  # and the 2.4 GB cache restored by three jobs instead of one. That is
+  # the trade for a ~35 minute wall-clock saving on the release path.
+  # This is NOT the matrix TODO 116c priced NO in August: that one
+  # duplicated the BUILD, which is the dominant cost. These shards
+  # compile nothing.
+  # ===================================================================
+  windows-build:
     if: github.repository != 'nzbfast/nzbfast'
     runs-on: windows-latest
-    # Windows compiles this workspace a good deal slower than Linux
-    # does, and a cold cache pays the whole cost. 75 rather than 60 since
-    # the aarch64 cross-check landed at the end of this job: it compiles
-    # the dependency graph a second time, for a second target, and the 60
-    # was sized for the cold x64 path with no headroom to spare (measured
-    # 28m22s warm on 5 Aug).
-    timeout-minutes: 75
-    # Its own group, separate from `check`. This leg measured 25-33
-    # minutes on the windows-ci-proof branch, which is why sharing a
-    # group with the Linux leg was fatal to both. On its own it lands a
-    # Windows verdict every half hour or so rather than never, and it no
-    # longer decides whether the fast Linux gate gets to finish.
-    #
-    # Half-hourly is the right cadence to buy here and not more: this
-    # runner bills at 2x on a private repo, so one at a time is also the
-    # cost ceiling. Batched coverage is the trade - a verdict names the
-    # tip it ran, and every commit under it is an ancestor.
+    timeout-minutes: 45
     concurrency:
-      group: ci-windows-${{ github.ref }}
+      group: ci-windows-build-${{ github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-    env:
-      # Same rationale as the `check` job's copy. This leg has not run
-      # out of disk - a windows-latest runner starts with more headroom
-      # than an ubuntu one - but it compiles the same forty-odd test
-      # binaries from the same workspace-wide expression, so it sits on
-      # the same trap, and at 2x private-repo billing the minutes saved
-      # not writing incremental state it never reads are the dearest
-      # minutes in this file. No reclaim step to match: nothing here is
-      # short of space, and `rm` on a 2x runner is not free.
-      CARGO_INCREMENTAL: "0"
+    outputs:
+      # Same rationale as `check`'s: the shards need the ARCHIVE, not a
+      # green job. This job's cache-save step can fail transiently on a
+      # 2x-billed runner, and that must not cost us the Windows suites.
+      archive: ${{ steps.archive.outcome }}
+      # The path the archive's binaries were built at. The shards
+      # compare it to their own - see the guard in those jobs.
+      workspace: ${{ github.workspace }}
     steps:
-      # `id:` because the two gate steps below guard on it - the same
-      # treatment the `check` job's gates get, and the note above its
-      # `fmt` step carries the reasoning for both jobs. This leg is where
-      # the masking was observed most recently: on run 31501154210
-      # (11 Aug, main) `workspace suite` failed and `clippy
-      # (windows-gated code)` reads `skipped`, which is TODO 116.2's
-      # finding happening again while its fix was being written.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         id: checkout
+      # windows-latest is I/O bound and Defender scans every object file
+      # and every one of the 54 statically linked test executables as
+      # the linker writes them. Excluding the two directories that see
+      # all of that write traffic is the known large win on this runner
+      # class, and it costs one second.
+      #
+      # Wrapped in try/catch and never fatal: this is a performance
+      # measure, not a gate, and a hosted image that declines the call
+      # (or has Defender disabled already) must not turn the build red.
+      # `-ErrorAction Stop` inside the try so a non-terminating error
+      # still reaches the catch.
+      - name: exclude the build tree from Defender
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Add-MpPreference -ErrorAction Stop -ExclusionPath `
+              "$env:GITHUB_WORKSPACE", "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup", "$env:RUNNER_TEMP"
+            Add-MpPreference -ErrorAction Stop -ExclusionProcess `
+              "cargo.exe", "rustc.exe", "link.exe", "cl.exe", "lib.exe", "cargo-nextest.exe"
+            Write-Host "Defender exclusions added"
+          } catch {
+            Write-Host "Defender exclusions unavailable, continuing: $($_.Exception.Message)"
+          }
       # No toolchain step: rust-toolchain.toml pins the version and
       # rustup installs it for the msvc host on the first cargo
       # invocation. Same as the Windows jobs in pr-check.yml and
       # nightly.yml; an explicit `rustup default stable` would be
       # overridden by that pin anyway.
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
+      #
+      # shell: bash for the key step so the one script runs identically
+      # on both legs - Git Bash is on every windows-latest image, and a
+      # second implementation of the same hash is a second thing to keep
+      # in step.
+      - name: dependency cache key
+        id: depkey
+        shell: bash
+        run: |
+          py=python3; command -v $py >/dev/null 2>&1 || py=python
+          echo "hash=$($py tools/dep-cache-key.py)" >> "$GITHUB_OUTPUT"
+      # runner.os is in the key, so this cannot collide with the Linux
+      # job's cache. The `-v3` suffix rides with the
+      # CARGO_PROFILE_TEST_DEBUG change at the top of this file, in this
+      # same commit, for the reason spelled out there: that flag moves
+      # every fingerprint in the archive this key would otherwise hit.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
         with:
           path: |
             ~/.cargo/registry
             target
-          # runner.os is in the key, so this cannot collide with the
-          # Linux job's cache - which is also why this key deliberately
-          # does NOT carry the `-v2` the Linux one grew: the two are
-          # already separate archives, and this job does not set
-          # CARGO_PROFILE_TEST_DEBUG, so its fingerprints are unchanged
-          # and bumping would buy one cold rebuild for nothing.
-          #
-          # Why this leg does not get the flag (TODO 116 named the Linux
-          # job): there is no timeout pressure here - measured 28m22s
-          # against a 60-minute cap on 5 Aug - and adopting it costs an
-          # unavoidable cold rebuild on a runner that bills at 2x and
-          # whose cold path is the one the 60-minute cap was sized for.
-          # Wrong trade today. If this leg starts crowding 60 the lever
-          # is the same one, and so is the rule: flag and key bump in
-          # ONE commit, or it rebuilds cold forever.
-          key: ci-private-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: ci-private-v3-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
       # The Linux twin of this step carries the reasoning. pwsh, and
       # -ErrorAction SilentlyContinue, because Remove-Item throws on a
       # missing path where `rm -rf` does not, and a cold cache is
@@ -525,19 +758,14 @@ jobs:
         shell: pwsh
         run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target\*\incremental
       # Same nextest, same pinned version and same trust model as the
-      # Linux job above: prebuilt, fetched by version, checked by SHA256
-      # rather than trusted. Using nextest on both legs is not tidiness -
-      # it is what makes a Windows flake report as a named FLAKY test
-      # (retries = 1 in .config/nextest.toml) instead of turning main red
-      # on a rerun-and-it-passes failure, and Windows is where a new
-      # flake is most likely to appear first.
+      # Linux job: prebuilt, fetched by version, checked by SHA256
+      # rather than trusted.
       - name: install cargo-nextest
         id: nextest
         shell: pwsh
         run: |
-          $ver = "0.9.140"
-          $url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$ver/cargo-nextest-$ver-x86_64-pc-windows-msvc.zip"
-          $want = "ec39698dfe5bcfffb7d5da037f226bc1670584ba247123f4e684a0f224fe828d"
+          $url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$env:NT_VERSION/cargo-nextest-$env:NT_VERSION-x86_64-pc-windows-msvc.zip"
+          $want = $env:NT_SHA_WINDOWS
           # An EXPLICIT loop, not -MaximumRetryCount: that parameter only
           # retries HTTP 304/4xx/5xx, and what this step actually dies of
           # is `The response ended prematurely. (ResponseEnded)` - a
@@ -567,110 +795,282 @@ jobs:
           Expand-Archive cargo-nextest.zip -DestinationPath C:\nextest -Force
           Remove-Item cargo-nextest.zip
           "C:\nextest" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-      # Three steps, not one `run:` block with three lines: under the
-      # default pwsh shell a multi-line block only propagates the LAST
-      # exit code, so a red first suite followed by a green third one
-      # would read as a green step. The Linux job can use one block
-      # because bash runs with `set -e`.
-      #
-      # NZBFAST_NO_ENRICH keeps the metadata workers off the real
-      # internet (CLAUDE.md invariant 5). NZBFAST_LAN_TESTS is
-      # deliberately NOT set: it opens an all-interfaces listener, which
-      # on Windows raises the Defender Firewall dialog, and a hosted
-      # runner has nobody to click it.
-      # Same exclusion-list form as the `check` job above, and for the
-      # same reason - see the long note there. Windows had the identical
-      # hole: three steps naming a handful of targets, everything else
-      # reachable only through a workflow that never fires.
-      #
-      # Worth knowing that this half is UNMEASURED. The 37.9s figure is
-      # from an M-series mac; this broadens a Windows runner's test set
-      # for the first time, and vendor/rars, vendor/tiny_http and the 27
-      # integration targets have not run on Windows before. If it turns
-      # this job red, the finding is a real Windows gap rather than a
-      # broken workflow - that class has bitten here before (four bugs
-      # hidden by exactly this absence) - but the honest response is to
-      # fix what it names, not to narrow the expression back.
-      - name: workspace suite
+      # The Windows half of "build once". Identical expression to the
+      # Linux archive step - same `--workspace`, same absent
+      # heavy-tests feature - because the two legs must archive the same
+      # test set or one of them is quietly narrower.
+      - name: build test archive
+        id: archive
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.nextest.outcome == 'success' }}
-        env:
-          NZBFAST_NO_ENRICH: "1"
+        run: cargo nextest archive --workspace --archive-file nextest-archive.tar.zst
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ always() && steps.cache.outputs.cache-hit != 'true' && steps.archive.outcome != 'skipped' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ci-private-v3-${{ runner.os }}-${{ steps.depkey.outputs.hash }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() && steps.archive.outcome == 'success' }}
+        with:
+          name: nextest-archive-windows
+          path: nextest-archive.tar.zst
+          retention-days: 1
+          compression-level: 0
+
+  # The name `windows-unit` is kept, because every handoff doc, memory
+  # note and `gh api .../jobs` recipe in this project names it, and the
+  # step people are told to confirm - `workspace suite` - is still the
+  # step that decides it. It is four jobs now, so the rows read
+  # `windows-unit (1)` .. `windows-unit (4)`; a filter on the prefix
+  # still finds them. Confirm ALL FOUR reached success before claiming
+  # Windows coverage - `skipped` and `failure` mean opposite things and
+  # the first one reads at a glance like Windows is fine.
+  #
+  # Compiles nothing, same as linux-tests: no toolchain, no cache, no
+  # target/. NZBFAST_LAN_TESTS is deliberately NOT set - it opens an
+  # all-interfaces listener, which on Windows raises the Defender
+  # Firewall dialog, and a hosted runner has nobody to click it.
+  windows-unit:
+    if: ${{ !cancelled() && github.repository != 'nzbfast/nzbfast' && needs.windows-build.outputs.archive == 'success' }}
+    needs: windows-build
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    concurrency:
+      group: ci-windows-unit-${{ github.ref }}-${{ matrix.shard }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: install cargo-nextest
+        shell: pwsh
         run: |
-          cargo nextest run --profile ci --workspace -E '
-            not binary(conn_tuner) and not binary(index_size_cap) and
-            not binary(http_wedge) and not binary(queue_soak) and
-            not binary(daemon) and not binary(e2e) and not binary(leak_soak)'
-      # The clippy gate that CANNOT run on Linux. Until this step, clippy
-      # ran in exactly two jobs - `check` above and pr-check's
-      # `build-and-test` - and BOTH are ubuntu-latest. clippy only lints
-      # what compiles for the host, so every `#[cfg(windows)]` block in
-      # the tree was linted on no runner anywhere. That is the exact
-      # mirror of the trap that held main red for six pushes over one
-      # `unused_unsafe` behind `cfg(target_os = "linux")` that no macOS
-      # session could reproduce; macOS arms are covered in practice
-      # because development happens on Macs, so Windows was the one real
-      # hole. First run found nine, including a needless_return in
-      # mem.rs's cfg(windows) arm of exactly the shape that trap ended on.
+          $url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$env:NT_VERSION/cargo-nextest-$env:NT_VERSION-x86_64-pc-windows-msvc.zip"
+          $want = $env:NT_SHA_WINDOWS
+          $ok = $false
+          foreach ($i in 1..5) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile cargo-nextest.zip
+              $got = (Get-FileHash cargo-nextest.zip -Algorithm SHA256).Hash.ToLower()
+              if ($got -eq $want) { $ok = $true; break }
+              Write-Host "attempt ${i}: sha256 mismatch (expected $want)"
+            } catch {
+              Write-Host "attempt ${i}: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds (5 * $i)
+          }
+          if (-not $ok) { throw "cargo-nextest download failed after 5 attempts (expected sha256 $want)" }
+          New-Item -ItemType Directory -Force -Path C:\nextest | Out-Null
+          Expand-Archive cargo-nextest.zip -DestinationPath C:\nextest -Force
+          Remove-Item cargo-nextest.zip
+          "C:\nextest" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nextest-archive-windows
+      # shell: bash so the invocation is the Linux one character for
+      # character. Under the default pwsh a multi-line block only
+      # propagates the LAST exit code, which has manufactured a green
+      # step here before.
+      # ---------------------------------------------------------------
+      # EXTRACT TO THE WORKSPACE ROOT, and this is not a detail.
       #
-      # Here and not nightly, for the same reason the unit suites moved
-      # here in TODO 81: per-push names the commit that broke it. The
-      # 2x Windows billing bought little - measured on an i7-1280P, this
-      # step is 1m26s with all three workspace crates dirty and deps
-      # cached, which is the normal case since the cache above is keyed
-      # on Cargo.lock.
+      # ~30 of this repo's test files (161 sites) locate the daemon with
+      # `env!("CARGO_BIN_EXE_nzbfast")`. `env!` is resolved at COMPILE
+      # time, so what the archived test binaries carry is an ABSOLUTE
+      # path to `<build runner's workspace>/target/debug/nzbfast` - and
+      # nothing at runtime can remap it. `--workspace-remap` fixes
+      # CARGO_MANIFEST_DIR; it cannot touch this.
       #
-      # Runs AFTER the suites deliberately: the tests are the signal this
-      # job exists for, and a lint failure must not cost us them. Since
-      # the guard below, that ordering no longer costs us the LINT when
-      # the suites are the red half - which it did on every red run from
-      # 7 Aug to 11 Aug, so the only place cfg(windows) code is linted
-      # anywhere in CI had no verdict for as long as the suite was
-      # broken (TODO 116.2, and 116.4 which this is).
-      # --keep-going because clippy stops at the first failing crate -
-      # without it nzbtray's errors masked nzbkit's, which masked
-      # nzbfast's, and each round surfaced only one crate's worth.
+      # Left to itself nextest extracts to a fresh temp dir, that path
+      # does not exist, and every daemon-spawning test dies instantly on
+      # `Os { code: 2, kind: NotFound }`. Measured, not guessed: run
+      # 31990300316 failed exactly this way on all four Linux shards.
       #
-      # TODO 116 item f, folded in here because this is that job's "next
-      # edit for its own reasons": the heavy-tests features enrol the
-      # seven build-gated targets (TODO 116b) so this step lints them
-      # again. Without it they stopped compiling here at all, leaving one
-      # cfg(windows) site across the seven files linted on no runner
-      # anywhere - the same hole in miniature that this whole step exists
-      # to close. Identical flag to the Linux clippy above; check-mode
-      # links nothing, so it costs none of the link time the gate saves.
+      # The escape is that GitHub gives every runner of an OS the SAME
+      # workspace path (`/home/runner/work/<repo>/<repo>`,
+      # `D:\a\<repo>\<repo>`), so the build job's baked
+      # `$GITHUB_WORKSPACE/target/debug/nzbfast` is a valid path on a
+      # shard too - as long as the archive is unpacked there. The
+      # archive stores its members at RELATIVE `target/debug/...`, so
+      # `--extract-to $GITHUB_WORKSPACE` puts every binary back exactly
+      # where it was built.
+      #
+      # That makes a path assumption load-bearing, so the step below
+      # ASSERTS it rather than trusting it: the build job publishes the
+      # workspace it built in, and if that ever stops matching this
+      # runner the job says so in one line instead of failing ~1,300
+      # tests with a NotFound apiece.
+      #
+      # It compares job outputs rather than reading the archive, and
+      # that is not a style choice: the first version of this guard
+      # shelled out to `tar --use-compress-program=unzstd`, which does
+      # not exist in Git Bash on windows-latest, so it failed on its own
+      # tooling instead of on the thing it was checking (run
+      # 31991506018). A guard that needs a tool the runner lacks is a
+      # second failure mode, not a safety net.
+      # ---------------------------------------------------------------
+      - name: assert this runner's workspace matches the build's
+        shell: bash
+        run: |
+          want='${{ needs.windows-build.outputs.workspace }}'
+          got='${{ github.workspace }}'
+          if [ "$want" != "$got" ]; then
+            echo "::error::this runner's workspace is '$got' but the archive was built in '$want'."
+            echo "::error::env!(\"CARGO_BIN_EXE_*\") bakes an absolute path at compile time, so every"
+            echo "::error::daemon-spawning test would fail NotFound. See the note above this step."
+            exit 1
+          fi
+          echo "workspace matches the build job: $got"
+      - name: workspace suite (shard ${{ matrix.shard }}/4)
+        shell: bash
+        run: |
+          cargo-nextest nextest run --profile ci \
+            --archive-file nextest-archive.tar.zst \
+            --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
+            --workspace-remap "$GITHUB_WORKSPACE" \
+            --partition count:${{ matrix.shard }}/4 \
+            -E "$NT_EXCLUDE"
+
+  # The clippy gate that CANNOT run on Linux. Until this step existed,
+  # clippy ran in exactly two jobs - `check` above and pr-check's
+  # `build-and-test` - and BOTH are ubuntu-latest. clippy only lints what
+  # compiles for the host, so every `#[cfg(windows)]` block in the tree
+  # was linted on no runner anywhere. That is the exact mirror of the
+  # trap that held main red for six pushes over one `unused_unsafe`
+  # behind `cfg(target_os = "linux")` that no macOS session could
+  # reproduce; macOS arms are covered in practice because development
+  # happens on Macs, so Windows was the one real hole. The first run
+  # found nine, including a needless_return in mem.rs's cfg(windows) arm
+  # of exactly the shape that trap ended on.
+  #
+  # ITS OWN JOB as of this commit. It used to run third in windows-unit,
+  # after the suites, with a comment explaining that the ordering was
+  # deliberate - "the tests are the signal this job exists for, and a
+  # lint failure must not cost us them" - and a §116.4 step guard to stop
+  # a red suite skipping it. A separate job gets both properties for
+  # free and costs no serialisation: this was ~4.5 min of the old job's
+  # 49, spent waiting for tests it has nothing to do with.
+  #
+  # --keep-going because clippy stops at the first failing crate -
+  # without it nzbtray's errors masked nzbkit's, which masked
+  # nzbfast's, and each round surfaced only one crate's worth.
+  #
+  # The heavy-tests features enrol the seven build-gated targets (TODO
+  # 116b/116f) so this step lints them. Without it they stop compiling
+  # here at all, leaving one cfg(windows) site across the seven files
+  # linted on no runner anywhere - the same hole in miniature that this
+  # whole job exists to close. Check-mode links nothing, so it costs
+  # none of the link time the gate saves.
+  #
+  # A PASSING Windows clippy log shows NO `Checking nzbkit` lines: cargo
+  # prints `Compiling nzbkit` instead when that package's build.rs is
+  # compiled in the same invocation, and all three workspace crates have
+  # one. That has read as a green-that-scanned-nothing twice. Never read
+  # an exit-0 lint run as proof until a positive control has shown the
+  # harness can fail.
+  windows-clippy:
+    if: github.repository != 'nzbfast/nzbfast'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    concurrency:
+      group: ci-windows-clippy-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: exclude the build tree from Defender
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Add-MpPreference -ErrorAction Stop -ExclusionPath `
+              "$env:GITHUB_WORKSPACE", "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup", "$env:RUNNER_TEMP"
+            Add-MpPreference -ErrorAction Stop -ExclusionProcess `
+              "cargo.exe", "rustc.exe", "link.exe", "cl.exe", "lib.exe"
+            Write-Host "Defender exclusions added"
+          } catch {
+            Write-Host "Defender exclusions unavailable, continuing: $($_.Exception.Message)"
+          }
+      # NO CACHE HERE, and that is measured rather than an oversight.
+      # This job restored the same ~1.1 GB archive windows-build uses,
+      # and it made the job SLOWER. Four runs, 17 Aug 2026:
+      #
+      #   cache MISS: 436s (31990300316), 387s (31993500642)
+      #   cache HIT : 487s (31991506018), 467s (31992357759)
+      #
+      # The restore costs 64-115s and buys about 25s of compile, because
+      # this step passes `--features heavy-tests` for lint scope and
+      # check-mode metadata - so its units do not share fingerprints
+      # with the archive build that wrote the cache, and almost nothing
+      # in it is reusable here. Restoring a gigabyte to reuse a
+      # rounding error is a straight loss on a runner that bills at 2x.
+      #
+      # If you are tempted to add it back: measure the JOB, not the
+      # clippy step. The step does get slightly faster; the job does
+      # not, because the restore is on the clock too.
       - name: clippy (windows-gated code)
-        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         run: cargo clippy -p nzbkit -p nzbfast -p nzbtray --all-targets --no-deps --keep-going --features nzbkit/heavy-tests,nzbfast/heavy-tests -- -D warnings
-      # The ARM64 gate. `cargo clippy --target` runs in check mode - it
-      # never links - so an x64 runner covers aarch64-pc-windows-msvc with
-      # nothing installed but the rust target, and the ARM64 MSVC linker
-      # is only needed by the release job that actually emits exes.
-      #
-      # What it is really guarding is not lint but COMPILATION, and two
-      # specific ways this target diverges from the x64 one that shares
-      # all its `cfg(windows)` code:
-      #   - rapidyenc's C++ kernels are compiled here by cl.exe for ARM64
-      #     rather than cl.exe for x64, taking the `_M_ARM64` arms of
-      #     vendor/rapidyenc/src/common.h that no other job compiles;
-      #   - nzbkit's own aarch64 paths (gf16's NEON kernels, the
-      #     `is_aarch64_feature_detected!` probes in nntp.rs and
-      #     sysbench.rs) meet Windows runtime feature detection for the
-      #     first time - every other aarch64 build we make is macOS or
-      #     Linux.
-      # Neither is reachable from any other runner in CI, which is the
-      # same hole - `cfg` code linted nowhere - that the clippy step above
-      # exists to close, one axis over.
-      #
-      # nzbtray is in the list because the tray ships in the ARM64 package
-      # exactly as it does in the x64 one, and it is the crate where
-      # Windows-only code is ALL of the crate.
-      #
-      # Deliberately not --all-targets: the shipped artifacts are the lib
-      # and the two bins, and pulling the test targets in would compile a
-      # second copy of the dependency graph for a target we do not run
-      # tests on. Runs last, so a lint here cannot cost us the suites.
+
+  # The ARM64 gate. `cargo clippy --target` runs in check mode - it
+  # never links - so an x64 runner covers aarch64-pc-windows-msvc with
+  # nothing installed but the rust target, and the ARM64 MSVC linker
+  # is only needed by the release job that actually emits exes.
+  #
+  # What it is really guarding is not lint but COMPILATION, and two
+  # specific ways this target diverges from the x64 one that shares
+  # all its `cfg(windows)` code:
+  #   - rapidyenc's C++ kernels are compiled here by cl.exe for ARM64
+  #     rather than cl.exe for x64, taking the `_M_ARM64` arms of
+  #     vendor/rapidyenc/src/common.h that no other job compiles;
+  #   - nzbkit's own aarch64 paths (gf16's NEON kernels, the
+  #     `is_aarch64_feature_detected!` probes in nntp.rs and
+  #     sysbench.rs) meet Windows runtime feature detection for the
+  #     first time - every other aarch64 build we make is macOS or
+  #     Linux.
+  # Neither is reachable from any other runner in CI, which is the
+  # same hole - `cfg` code linted nowhere - that windows-clippy exists
+  # to close, one axis over.
+  #
+  # nzbtray is in the list because the tray ships in the ARM64 package
+  # exactly as it does in the x64 one, and it is the crate where
+  # Windows-only code is ALL of the crate.
+  #
+  # Deliberately not --all-targets: the shipped artifacts are the lib
+  # and the two bins, and pulling the test targets in would compile a
+  # second copy of the dependency graph for a target we do not run
+  # tests on.
+  #
+  # Its own job as of this commit - it was ~4 min at the very end of the
+  # old serial windows-unit, and it shares nothing with the suites but a
+  # dependency graph. It does NOT share the x64 cache usefully (a
+  # different target triple is a different artifact tree), so it does
+  # not restore one; what it pays is a dependency compile for aarch64 in
+  # check mode, which is what it always paid.
+  windows-arm64:
+    if: github.repository != 'nzbfast/nzbfast'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    concurrency:
+      group: ci-windows-arm64-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: exclude the build tree from Defender
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Add-MpPreference -ErrorAction Stop -ExclusionPath `
+              "$env:GITHUB_WORKSPACE", "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup", "$env:RUNNER_TEMP"
+            Add-MpPreference -ErrorAction Stop -ExclusionProcess `
+              "cargo.exe", "rustc.exe", "cl.exe"
+            Write-Host "Defender exclusions added"
+          } catch {
+            Write-Host "Defender exclusions unavailable, continuing: $($_.Exception.Message)"
+          }
       - name: cross-check aarch64-pc-windows-msvc (ARM64 beta target)
-        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         run: |
           rustup target add aarch64-pc-windows-msvc
           cargo clippy --target aarch64-pc-windows-msvc -p nzbfast -p nzbtray --no-deps -- -D warnings

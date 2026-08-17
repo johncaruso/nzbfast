@@ -52,20 +52,47 @@ the last article and clean sets never pay a post-download verify pass. `par2.rs`
 packets and drives minimum-download logic: exactly enough recovery volumes are fetched
 when blocks are bad. `par2repair.rs` reconstructs missing blocks with Reed-Solomon over
 GF(2^16) (`gf16.rs`, par2cmdline-compatible field) and patches damaged files in place.
-`par2ntt.rs` is an output-pruned 65535-point NTT for syndrome computation, reachable
-only through a disabled-by-default dispatch gate with the streaming fold as fallback.
+`par2ntt.rs` is an output-pruned 65535-point NTT for syndrome computation. It has
+been the default dispatch since 31 Jul 2026 (`FAST_PAR_DEFAULT`), with the fold as
+the fallback: a repair whose whole-file verify fails is retried on the fold and
+trips a process-wide breaker, and small machines are gated onto the fold up front by
+a RAM- and cgroup-scaled retention budget, so the fast path can never be the reason
+output is wrong.
 
-## 6. Extraction (`nzbkit/src/extract.rs`, `vendor/rars`)
+## 6. Extraction (`nzbkit/src/extract/`, `vendor/rars`)
 
-The extractor owns all data-file writing. A slot is sniffed at its offset-0 article:
-RAR signature means mapping mode, anything else means a plain file. In mapping mode a
-`VolumeMapper` parses volume headers as bytes arrive and store-mode spans `pwrite`
-directly into the inner extracted file, so RAR volumes never touch disk on the happy
-path. Spans ahead of the parsed headers are held in memory under the `mem.rs` budget.
-Compressed and encrypted entries decode through the vendored `rars` library
-(`rars::rar50`), which reads volumes through a `BlockingRangeSource` frontier buffer
-while the download is still running. External unrar exists only behind the
-`prefer_external_unrar` setting; obfuscated sets always use the native path.
+The extractor owns all data-file writing. A slot is sniffed at its offset-0 article
+and routed by what it turns out to be: RAR, 7z or zip go to a mapper, anything else
+is a plain file. No container format is disk-only. In mapping mode a `VolumeMapper`
+parses volume headers as bytes arrive and stored spans `pwrite` directly into the
+inner extracted file, so volumes never touch disk on the happy path. Spans ahead of
+the parsed headers are held in memory under the `mem.rs` budget.
+
+Compressed and encrypted entries decode through the vendored `rars` library while
+the download is still running, reading volumes through a `BlockingRangeSource`
+frontier buffer: `rars::rar50` for the RAR5/RAR7 family, `rars::rar15_40` for RAR
+1.5 through 4 (so compressed RAR4 chases in-stream too, and is not a
+materialize-then-unpack case). `extract/sevenz.rs` and `extract/zip.rs` do the same
+job for those containers; `extract/crypto.rs` decrypts
+at write time so an encrypted set yields plaintext once rather than assembling
+ciphertext for a finish pass, and it walks password chains where a layer's password
+is packed in the layer above it. Nested archives are unwrapped in place to a
+configurable depth (`extract/shape.rs` tallies how often that fires).
+
+What still finishes after the last article: RAR 1.3/1.4, which has no chase and is
+read only by the blocking `rars::ArchiveReader` on the disk side; self-extracting
+archives (the archive does not begin at offset 0), spanned zip (`.z01`) and rarer
+zip variants, plain `.001` split runs with no archive header
+(`nzbfast/src/splitjoin.rs`), any job
+resumed after a restart, and any set that demoted mid-flight because it breached
+the held-bytes budget or hit a bad CRC. Those go to the disk unpack ladder in
+`crates/nzbfast`, which unpacks **every** archive family present in a directory
+rather than stopping at the first one that claims it. `extract::ArchiveShape` is
+the live account of which of these happened, published mid-download and rendered
+by the dashboard ("RAR5 · stored · one-pass", "zip · compressed · partly on disk").
+
+External unrar exists only behind the `prefer_external_unrar` setting; obfuscated
+sets always use the native path.
 
 ## 7. Journal and resume (`nzbkit/src/journal.rs`)
 
@@ -89,13 +116,15 @@ All stages overlap; the pipeline is one pass over the bytes.
        v                              v                         v
   download ─────────────────────────────────────────────────────────────>
   verify (live)      ─────────────────────────────────────────────>
-  extract (store)        ──────────────────────────────────────────────>
-  repair + rar chase                                        ──────────>
+  extract (map + chase)  ──────────────────────────────────────────────>
+  repair                                                    ──────────>
 ```
 
-Download, in-stream verify, and store-mode extraction run concurrently on the same
-article flow; only repair of damaged blocks and compressed-RAR decode extend past the
-last article.
+Download, in-stream verify and extraction run concurrently on the same article flow,
+for stored and compressed content alike: the chase decoder consumes volumes through
+the frontier buffer as they arrive rather than waiting for the set. What extends past
+the last article is repair of damaged blocks, and the disk unpack ladder for the
+shapes listed in section 6.
 
 ## Daemon layer (`nzbfast/src/serve/`)
 

@@ -137,8 +137,7 @@ dans un seul exécutable. Il n'y a rien d'autre à installer.</p>
   sur chaque connexion, qui reste ainsi à pleine vitesse au lieu d'attendre les
   allers-retours.</li>
   <li><b>Un pipeline en une passe</b> - téléchargement, vérification et extraction se
-  chevauchent. Les volumes d'archive sont extraits <em>dans le flux</em> ; sur un post
-  typique en mode « store », les fichiers RAR ne touchent jamais votre disque : la
+  chevauchent. Les volumes d'archive sont extraits <em>dans le flux</em> ; sur presque n'importe quel post - RAR, 7z ou zip, en mode « store » ou compressé - les fichiers d'archive ne touchent jamais votre disque : la
   tâche n'a besoin que de 1× la taille de la release, pas 2×, et se termine quand le
   téléchargement se termine.</li>
   <li><b>Union multi-fournisseurs</b> - chaque serveur configuré contribue ; un
@@ -266,10 +265,7 @@ post. C'est ce que vous donnez à nzbfast.</td></tr>
 <tr><td><b>PAR2</b></td><td>Des données de récupération postées avec la release.
 nzbfast vérifie contre elles <em>pendant</em> le téléchargement et répare
 automatiquement quand des articles sont endommagés ou manquants.</td></tr>
-<tr><td><b>RAR en mode « store »</b></td><td>La plupart des releases sont empaquetées
-en volumes RAR sans compression. nzbfast le détecte et écrit le <em>fichier
-interne</em> directement à son emplacement final pendant le téléchargement - aucune
-étape de décompression ensuite.</td></tr>
+<tr><td><b>RAR en mode « store »</b></td><td>La plupart des releases sont empaquetées en volumes RAR sans compression, ce qui en fait le cas le moins coûteux : nzbfast écrit le <em>fichier interne</em> directement à son emplacement final pendant le téléchargement - aucune étape de décompression ensuite. Les archives compressées et chiffrées, ainsi que 7z et zip, sont traitées de la même façon ; elles coûtent simplement plus de CPU en chemin.</td></tr>
 </table></div>
 <p>Le pipeline enchaîne téléchargement → décodage → vérification → extraction
 <em>en parallèle</em>. La carte Pipeline du tableau de bord montre les trois voies

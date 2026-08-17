@@ -105,8 +105,13 @@ unpacked. Nothing in `qpkg.cfg` changes, because the package is
 architecture-less. QDK's own table maps QNAP's model families to
 `uname -m`: `arm-x31` and `arm-x41` are both `armv7l`, so one armv7
 binary would cover both; `arm-x19` and `arm-x09` are `armv5tel` and
-`armv5tejl`. See TODO 176 for why armv7 is not in yet - it is a
-correctness question about 32-bit builds, not a packaging one.
+`armv5tejl`. armv7 is not in this package yet, but the reason has
+changed: TODO 178 settled the correctness question and a static-musl
+`armv7-unknown-linux-musleabihf` build now ships as a beta tarball
+beside x64/arm64. What is left is the packaging decision above - one
+architecture-less package for every model - so adding it is the
+three-place change described here, not a build problem. `armv5` stays
+refused; there is no build for it.
 
 One package covers both architectures. The reasoning is in `qpkg.cfg`;
 the short version is that App Center's Install Manually dialog does no

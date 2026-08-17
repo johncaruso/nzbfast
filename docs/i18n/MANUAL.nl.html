@@ -135,8 +135,7 @@ een ingebouwde indexer, realtime voorvertoning, native PAR2-herstel en native RA
   verbinding, zodat elke verbinding op volle snelheid blijft in plaats van
   round-trips uit te zitten.</li>
   <li><b>Een one-pass-pipeline</b> - downloaden, verificatie en uitpakken overlappen.
-  Archiefvolumes worden <em>in de stream</em> uitgepakt; bij een typische store-mode-post
-  raken de RAR-bestanden je schijf nooit aan, dus de taak heeft 1× de releasegrootte
+  Archiefvolumes worden <em>in de stream</em> uitgepakt; bij vrijwel elke post - RAR, 7z of zip, store-mode of gecomprimeerd - raken de archiefbestanden je schijf nooit aan, dus de taak heeft 1× de releasegrootte
   nodig in plaats van 2×, en is klaar zodra de download klaar is.</li>
   <li><b>Multi-provider-unie</b> - elke ingestelde server draagt bij; een artikel
   dat op de ene backbone ontbreekt wordt van een andere opgehaald. Trage of dode
@@ -258,10 +257,7 @@ bestaat. Dit is wat je aan nzbfast voert.</td></tr>
 <tr><td><b>PAR2</b></td><td>Hersteldata die naast een release wordt gepost. nzbfast
 verifieert ertegen <em>tijdens</em> de download en repareert automatisch wanneer
 artikelen beschadigd zijn of ontbreken.</td></tr>
-<tr><td><b>Store-mode RAR</b></td><td>De meeste releases zijn zonder compressie in
-RAR-volumes verpakt. nzbfast herkent dat en schrijft het <em>binnenste bestand</em>
-tijdens het downloaden rechtstreeks naar zijn definitieve plek - geen uitpakstap
-achteraf.</td></tr>
+<tr><td><b>Store-mode RAR</b></td><td>De meeste releases zijn zonder compressie in RAR-volumes verpakt, wat ze het goedkoopste geval maakt: nzbfast schrijft het <em>binnenste bestand</em> tijdens het downloaden rechtstreeks naar zijn definitieve plek - geen uitpakstap achteraf. Gecomprimeerde en versleutelde archieven, en ook 7z en zip, gaan dezelfde weg; ze kosten onderweg alleen meer CPU.</td></tr>
 </table></div>
 <p>De pipeline draait download → decode → verificatie → uitpakken <em>gelijktijdig</em>.
 De Pipeline-kaart op het dashboard laat alle drie de banen tegelijk bewegen. Als de

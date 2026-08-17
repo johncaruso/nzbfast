@@ -134,8 +134,7 @@ perete de postere, un indexer integrat, previzualizare în timp real, reparare P
   <li><b>NNTP cu pipelining</b> - multe cereri de articole circulă pe fiecare conexiune una după alta,
   menținând fiecare conexiune la viteză maximă în loc să aștepte dus-întorsurile.</li>
   <li><b>Un pipeline într-o singură trecere</b> - descărcarea, verificarea și extragerea se suprapun.
-  Volumele de arhivă sunt extrase <em>în flux</em>; la o postare tipică în mod store,
-  fișierele RAR nu ating niciodată discul, deci jobul are nevoie de 1× dimensiunea release-ului, nu 2×,
+  Volumele de arhivă sunt extrase <em>în flux</em>; la aproape orice postare - RAR, 7z sau zip, în mod store sau comprimată - fișierele de arhivă nu ating niciodată discul, deci jobul are nevoie de 1× dimensiunea release-ului, nu 2×,
   și se termină când se termină descărcarea.</li>
   <li><b>Uniune multi-provider</b> - fiecare server configurat contribuie; un articol
   care lipsește pe un backbone este preluat de pe altul. Serverele lente sau moarte nu blochează
@@ -254,9 +253,7 @@ Asta îi dai lui nzbfast.</td></tr>
 <tr><td><b>PAR2</b></td><td>Date de recuperare postate alături de un release. nzbfast verifică
 în raport cu ele <em>în timpul</em> descărcării și repară automat când articolele sunt
 deteriorate sau lipsesc.</td></tr>
-<tr><td><b>RAR în mod store</b></td><td>Majoritatea release-urilor sunt împachetate în volume RAR fără
-compresie. nzbfast recunoaște acest lucru și scrie <em>fișierul interior</em> direct în locația sa
-finală în timpul descărcării - fără pas de dezarhivare ulterior.</td></tr>
+<tr><td><b>RAR în mod store</b></td><td>Majoritatea release-urilor sunt împachetate în volume RAR fără compresie, ceea ce le face cazul cel mai ieftin: nzbfast scrie <em>fișierul interior</em> direct în locația sa finală în timpul descărcării - fără pas de dezarhivare ulterior. Arhivele comprimate și criptate, precum și 7z și zip, sunt tratate la fel; doar costă mai mult CPU pe drum.</td></tr>
 </table></div>
 <p>Pipeline-ul rulează descărcare → decodare → verificare → extragere <em>concurent</em>. Cardul
 Pipeline din panou arată toate cele trei benzi mișcându-se simultan. Când sosește ultimul

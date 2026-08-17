@@ -18,11 +18,18 @@ there - response may take a few days; pinging after a week is fine.
 ## What's especially welcome
 
 - **Typos, wording, UI polish** - dashboard text lives in
-  `web/dashboard.html`, the user manual in `docs/MANUAL.html`.
+  `web/dashboard.html` (and `web/wall.html`), the user manual in
+  `docs/MANUAL.html`. Both are compiled into the binary with
+  `include_str!`, so a rebuild is what makes an edit visible.
 - **Docs** - anything that confused you is a bug in the docs.
-- **Translations** - the dashboard has no string/locale layer yet, so
-  translations aren't practical *yet*. Building that layer is a wanted
-  contribution in itself; open an issue to coordinate before starting.
+- **Translations** - the dashboard, poster wall and user manual all have
+  a locale layer now: 27 UI catalogues in `web/i18n/<lang>.json` beside
+  the inline English, and 15 translated manuals in
+  `docs/i18n/MANUAL.<lang>.html`.
+  Corrections to an existing language are the easiest PR here; a new
+  language is very welcome too - `web/i18n/README.md` has the checklist,
+  and `python3 web/i18n/check.py` tells you whether a catalogue is
+  complete before you open the PR.
 - **Bug reports with an .nzb-shaped repro** - even without a fix.
 - **Code** - fixes and features. For anything larger than a small fix,
   open an issue first so we can agree direction before you invest time.
@@ -31,16 +38,35 @@ there - response may take a few days; pinging after a week is fine.
 
 ```sh
 cargo build --release        # single static-ish binary
-cargo test                   # unit + end-to-end tests
+
+# The two test commands CI runs, in the same shape. The nzbfast suites
+# bind real ports and share spool state, so they run single-threaded;
+# everything else runs in parallel.
+cargo test --workspace --exclude nzbfast --features nzbkit/heavy-tests --no-fail-fast
+cargo test -p nzbfast --features heavy-tests --no-fail-fast -- --test-threads=1
 ```
 
-Rust stable, no nightly features. The e2e tests spin up a local mock
-NNTP server; some repair tests skip unless `par2` is installed
-(`brew install par2` / `apt install par2`). Set `NZBFAST_NO_ENRICH=1`
-to keep tests off the network.
+Rust stable, no nightly features (the exact version is pinned by
+`rust-toolchain.toml`, so rustup picks it up for you). The `heavy-tests`
+feature is what links the seven slower end-to-end suites; without it
+cargo builds a shorter suite than CI does, and it does so quietly. The
+e2e tests spin up a local mock NNTP server; some repair tests skip
+unless `par2` is installed (`brew install par2` / `apt install par2`).
+Set `NZBFAST_NO_ENRICH=1` to keep tests off the network.
 
-Match the style around you; `cargo fmt` before committing. Comments
-explain *why*, not *what*.
+The PR check is more than the tests, and each of these fails a PR on its
+own, so they are worth running before you push:
+
+```sh
+cargo fmt -p nzbkit -p nzbfast -p nzbtray --check
+cargo clippy -p nzbkit -p nzbfast -p nzbtray --all-targets --no-deps -- -D warnings
+tools/size-gate.py           # per-file and per-function size ceilings
+```
+
+`--no-deps` on the clippy line matters: without it you lint the vendored
+crates under `vendor/` and get a page of errors that are not yours.
+
+Match the style around you. Comments explain *why*, not *what*.
 
 ## Developer Certificate of Origin (DCO)
 

@@ -53,8 +53,14 @@ Manager step by step, no SSH. Both run the same image as the compose file.
   round-trip latency never idles a socket. Line-rate on 10 GbE has been
   measured and sustained.
 - **One-pass pipeline** - download, PAR2 verification, and extraction overlap.
-  Store-mode RAR volumes are extracted *in the stream* and never touch disk:
-  a job needs 1× the release size, not 2×, and post-processing time is ~zero.
+  Archive volumes are unpacked *in the stream* and never touch disk: a job
+  needs 1× the release size, not 2×, and post-processing time is ~zero.
+  This is not a stored-RAR-only fast path. RAR (1.5, 3, 4 and 5), 7z and zip
+  all go through it, compressed and encrypted contents included, with nested
+  archives unwrapped as they arrive and repair happening at each layer. The
+  shapes that still finish with a conventional unpack after the download are
+  self-extracting archives, spanned zip (`.z01`), and any job resumed after a
+  restart.
 - **Multi-provider union availability** - every server contributes; articles
   missing on one backbone are fetched from another. Dead servers never stall
   the queue.
@@ -76,8 +82,12 @@ Manager step by step, no SSH. Both run the same image as the compose file.
 - SABnzbd-compatible API and NZBGet JSON-RPC: Sonarr/Radarr, nzb360,
   LunaSea etc. work out of the box
 - Crash-safe resume from an article journal; automatic PAR2 repair;
-  encrypted-archive handling
-- Single static-ish binary for macOS (universal) and Windows; Docker image
+  encrypted-archive handling, including password chains
+- Dashboard and poster wall in 28 languages; the user manual in 16
+- One self-contained executable per platform: macOS (universal), Windows
+  (x64, plus an ARM64 beta), Linux (x86_64 and arm64, glibc or musl, with
+  beta `.deb`/`.rpm` and an armv7 build for the Pi), FreeBSD (beta), and a
+  multi-arch Docker image
 
 Full documentation: [**User Manual**](https://nzbfast.github.io/nzbfast/MANUAL.html)
 - also served by the app itself at `/manual`.

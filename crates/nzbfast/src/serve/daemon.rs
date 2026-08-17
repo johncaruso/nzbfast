@@ -2676,6 +2676,24 @@ impl Daemon {
     /// "instant" part.
     #[cfg(feature = "indexer")]
     pub(super) fn instant_kick(&self, names: &[String], now: i64) -> bool {
+        let staged = self.stage_instant_hint(names, now);
+        if staged {
+            self.watch_now.notify_one();
+        }
+        staged
+    }
+
+    /// §74: the hint half of [`Self::instant_kick`], without the wake-up.
+    ///
+    /// Split out so the scan leg can stage its arrivals while it still
+    /// holds the `index` mutex it is republishing under - see
+    /// [`Daemon::publish_index_with_arrivals`]. Everything else wants the
+    /// two together and calls `instant_kick`.
+    ///
+    /// Returns whether the names were staged; false means this hour's
+    /// allowance is spent and there is nothing to wake anyone for.
+    #[cfg(feature = "indexer")]
+    pub(in crate::serve) fn stage_instant_hint(&self, names: &[String], now: i64) -> bool {
         if names.is_empty() {
             return false;
         }
@@ -2706,7 +2724,6 @@ impl Daemon {
                 hint.drain(..excess);
             }
         }
-        self.watch_now.notify_one();
         true
     }
 

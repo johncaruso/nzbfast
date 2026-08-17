@@ -337,6 +337,31 @@ pub(in crate::serve) fn instant_arrivals(
     dropped: u32,
     now: i64,
 ) {
+    let ready = instant_ready(d, hits, dropped, now);
+    if !ready.is_empty() {
+        let names = ready.join(", ");
+        if d.instant_kick(&ready, now) {
+            info!(target: "watch", "arrived: {names} - checking the watchlist now");
+        }
+    }
+}
+
+/// §74: the triage half of [`instant_arrivals`] - which of this batch's
+/// hits are complete enough to be worth a look right now.
+///
+/// Split out for the scan leg, which cannot kick here: its arrivals have
+/// to be staged under the same `index` mutex hold that republishes the
+/// connection they live on, or a pass slipping between the two sees the
+/// release without the hint (see `publish_index_with_arrivals`). Every
+/// other caller drains hits from the ALREADY-shared handle, where there
+/// is no republish to be atomic with, and uses `instant_arrivals`.
+#[cfg(feature = "indexer")]
+pub(in crate::serve) fn instant_ready(
+    d: &Arc<Daemon>,
+    hits: Vec<nzbkit::index::WatchHit>,
+    dropped: u32,
+    now: i64,
+) -> Vec<String> {
     if dropped > 0 {
         // Said out loud rather than swallowed: this is the one place
         // instant coverage is knowingly given up, and it must not look
@@ -348,7 +373,7 @@ pub(in crate::serve) fn instant_arrivals(
         );
     }
     if hits.is_empty() {
-        return;
+        return Vec::new();
     }
     let mut ready: Vec<String> = Vec::new();
     {
@@ -366,12 +391,7 @@ pub(in crate::serve) fn instant_arrivals(
             }
         }
     }
-    if !ready.is_empty() {
-        let names = ready.join(", ");
-        if d.instant_kick(&ready, now) {
-            info!(target: "watch", "arrived: {names} - checking the watchlist now");
-        }
-    }
+    ready
 }
 
 /// TODO 110: how long a background sampler stands down from a host

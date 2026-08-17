@@ -705,32 +705,60 @@ pub(super) fn spawn_index_scan(
                     // silence this exists to end.
                     let (hits, dropped) = scratch.take_watch_hits();
                     drop(scratch);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    // Arrivals triaged first, staged WITH the republish
+                    // below, announced after. The staging shares the
+                    // republish's hold of `index` so the two cannot be
+                    // observed apart: between them the release is
+                    // visible while `instant_hint` is still empty, and a
+                    // pass already in flight grabs it and never records
+                    // it as an instant grab.
+                    //
+                    // The hint is still never staged BEFORE the
+                    // republish, but do NOT trust the reason §74
+                    // originally gave for that - "the shared handle
+                    // cannot see a word `scratch` wrote until the
+                    // republish". Read `Index::ingest`: it commits each
+                    // of its passes internally and journals the watch
+                    // hits AFTER the commit (hence its
+                    // `debug_assert!(hits.is_empty())`), so the rows are
+                    // visible to every connection before
+                    // `take_watch_hits` is even called. A pass can grab
+                    // the release before anything here has staged a
+                    // thing. This ordering is cheap and defensively
+                    // right; it is not what makes the arrival visible,
+                    // and it does not close the race on its own. See
+                    // `nzbfast-scan-leg-swallows-arrivals`.
+                    let ready = instant_ready(&daemon3, hits, dropped, now);
+                    let names = ready.join(", ");
                     // Re-open the shared connection so it sees this
                     // task's now-committed writes (fresh read snapshot)
                     // - unless the index was switched off or wiped
                     // while we ran, in which case there is nothing to
                     // publish to.
-                    if daemon3.index_era() == era
+                    let staged = if daemon3.index_era() == era
                         && let Ok(fresh) = nzbkit::index::Index::open(&db)
                     {
-                        daemon3.publish_index(era, fresh);
-                    }
+                        daemon3.publish_index_with_arrivals(era, fresh, &ready, now)
+                    } else {
+                        // Nothing to be atomic with - the index was
+                        // wiped or switched off while this pass ran.
+                        daemon3.stage_instant_hint(&ready, now)
+                    };
                     daemon3.drop_index_read();
-                    // ...and only NOW are the arrivals offered to the
-                    // watchlist. Ordering, not tidiness: this wakes a
-                    // pass that reads the SHARED handle, and the shared
-                    // handle cannot see a word of what `scratch` just
-                    // wrote until the republish above. Reported before
-                    // it, the woken pass searched the old snapshot,
-                    // found nothing, and took the arrival hint with it -
-                    // so the release was grabbed a minute later by the
-                    // periodic pass and never recorded as an arrival at
-                    // all, which is the exact silence being fixed.
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    instant_arrivals(&daemon3, hits, dropped, now);
+                    // Last, so the woken pass finds both invalidations
+                    // done. `notify_one` parks a permit when nobody is
+                    // waiting, so nothing is lost by waking late.
+                    if staged {
+                        info!(
+                            target: "watch",
+                            "arrived: {names} - checking the watchlist now"
+                        );
+                        daemon3.watch_now.notify_one();
+                    }
                 });
             }
             while set.join_next().await.is_some() {}
