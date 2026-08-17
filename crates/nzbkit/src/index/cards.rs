@@ -172,7 +172,7 @@ impl Index {
     /// and returns (cards, total groups) - the wall no longer
     /// materializes the whole index per load. `matched_only` keeps only
     /// cards whose enrichment landed art (the wall's default toggle).
-    pub fn browse_cards(
+    pub(super) fn browse_cards_once(
         &self,
         q: &BrowseQuery,
         sort: CardSort,

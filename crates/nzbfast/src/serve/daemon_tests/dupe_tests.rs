@@ -324,7 +324,7 @@ fn an_exact_mode_failure_does_not_release_another_releases_hold() {
             let mut g = jb.lock_ok();
             g.state = JobState::Failed;
         }
-        d.park(jb);
+        d.park_gen(jb, None);
         assert!(
             d.held_as_duplicate(&c),
             "C was held against a COMPLETED original, not against B"

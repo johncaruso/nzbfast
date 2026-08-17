@@ -257,8 +257,10 @@ pub(crate) fn recovery_candidates(
         }
         let name = f.filename_hint().unwrap_or(&f.subject);
         // Blocks are block_size + ~100 bytes of packet overhead each,
-        // yEnc ~2% inflation.
-        let est = (f.bytes() as f64 * 0.98 / (set.block_size as f64 + 100.0)) as usize;
+        // yEnc ~2% inflation. Shared with pre-flight, which needs the
+        // identical arithmetic to size a `.vol-NN.par2` budget and must
+        // not grow a second answer to it (nzbkit::par2).
+        let est = nzbkit::par2::est_recovery_blocks(f.bytes(), set.block_size);
         let count = vol_count_from_name(name).unwrap_or(est.max(1));
         vols.push((fi, count, f.bytes()));
     }

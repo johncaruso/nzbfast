@@ -211,6 +211,30 @@ if [ $owner_fail -ne 0 ]; then
   exit 1
 fi
 
+# The two gates above cover .tar.gz/.tgz/.zip/.spk and leave a documented
+# hole: a .qpkg is a self-extracting shell script rather than an archive,
+# so opening it as one would refuse every release that carries one, and
+# .deb/.rpm are not archive types either gate names. Cutting 1.1.3 the
+# .qpkg went out with `uid=1001 gid=1001 uname='runner' gname='runner'`
+# on every member of BOTH its inner tars, through both gates, because
+# neither looks at it.
+#
+# check-archive-identity.py is the splitter that closes it: it takes a
+# .qpkg apart the way packaging/qnap/unpack-qpkg.sh documents and reads
+# the tar headers WITHOUT extracting (extraction as a non-root user drops
+# the very uid/gid at issue), parses a .deb's `ar` members, and reads
+# FILEUSERNAME/FILEGROUPNAME straight out of an .rpm header. It is also
+# what the release.yml jobs run on their own output, so a CI-built asset
+# meets the same rule where it is produced and again here.
+#
+# Additive on purpose: it re-checks the tar and zip assets the gates above
+# already judged rather than replacing either. A third opinion that can
+# only ever refuse is the right shape for the last mile.
+python3 "$(dirname "$0")/check-archive-identity.py" "$@" || {
+  echo "REFUSING to upload: an asset names the account that built it." >&2
+  exit 1
+}
+
 # Linux release binaries must be STATICALLY linked (musl). Cutting 1.1.2 the
 # linux tarballs were built for *-unknown-linux-gnu and published dynamically
 # linked before anyone noticed. The names are the trap: the release carries

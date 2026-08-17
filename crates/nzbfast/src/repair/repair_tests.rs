@@ -423,6 +423,50 @@ fn outer_hold_never_deletes_a_volume_it_could_not_put_back() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// ...and it never REPLACES a file that took the name while the volume
+/// was parked.
+///
+/// The nested pass runs with the hold live, and it publishes through
+/// `lift_scratch_into`, whose collision test is existence only - so a
+/// nested member legitimately named like one of the outer volumes finds
+/// the name free (the volume is in the hold) and lands on it. `restore`
+/// then renamed the volume straight over it: POSIX rename replaces a
+/// regular file, so the produced deliverable was destroyed and the job
+/// still completed green. Both files survive now, which is the same rule
+/// `ExtractStaging` documents for the identical collision.
+#[test]
+fn outer_hold_restore_never_replaces_a_file_that_took_the_name() {
+    let dir = reex_dir("holdcollide");
+    let hold = dir.join(".nzbfast-hold");
+    std::fs::create_dir_all(&hold).unwrap();
+    std::fs::write(hold.join("parked.rar"), b"the parked volume").unwrap();
+    // The nested pass produced a member of exactly that name while the
+    // volume was out of the way.
+    std::fs::write(dir.join("parked.rar"), b"the produced payload").unwrap();
+
+    drop(super::OuterHold {
+        dir: dir.clone(),
+        hold: hold.clone(),
+    });
+
+    assert_eq!(
+        std::fs::read(dir.join("parked.rar")).unwrap(),
+        b"the parked volume",
+        "the volume must be restored under the name its set depends on"
+    );
+    let aside = dir.join("extracted-1-parked.rar");
+    assert!(
+        aside.exists(),
+        "the produced file was replaced instead of being moved aside"
+    );
+    assert_eq!(
+        std::fs::read(&aside).unwrap(),
+        b"the produced payload",
+        "the produced file survived under the wrong bytes"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `park`'s SELECTION had no direct coverage: it was exercised only
 /// through the three `compressed_*` e2e tests, and Part B of the
 /// one-pass spec deletes spent volumes BEFORE the nested pass, so

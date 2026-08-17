@@ -1,16 +1,35 @@
 name: release
 
-# Manual or tag-triggered. Builds cross-platform binaries + a multi-arch
-# container image, attaches everything to a GitHub release.
+# Manual or tag-triggered. Builds cross-platform binaries and the beta
+# packages, and attaches them to a GitHub release.
+#
+# It deliberately does NOT build the container image. That used to be an
+# `image` job here, and it was both broken and wrong:
+#   - Broken: it tagged `ghcr.io/${{ github.repository }}`. A registry
+#     requires a lowercase repository name, and the upstream repo this
+#     workflow is developed in has an uppercase letter in its owner, so
+#     buildx refused the tag outright on EVERY release from v1.0.22 to
+#     v1.1.3. Because `release` needed it, `release` was skipped every
+#     one of those times and no CI job had ever attached an asset.
+#   - Wrong: it built the repo-root Dockerfile, which COMPILES from
+#     source. The shipped image is packaging/docker/Dockerfile.release,
+#     which COPYs the released static musl binaries, pushed and attested
+#     by provenance-release.yml's opt-in `image` job on the public repo.
+#     Had the casing been the only problem, fixing it would have pushed
+#     an unattested source build over `:latest`.
+# So the image is provenance-release.yml's job, the symbol-bearing
+# diagnostic image is debug-image.yml's, and this workflow only ships
+# binaries. Do not add an `image` job back here.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
 
-# Read-only by default; the two jobs that publish escalate for themselves.
-# A workflow-wide `contents: write, packages: write` handed the same
-# push-anything token to the four binary build runners, which only ever
-# check out and compile.
+# Read-only by default; the one job that publishes (`release`) escalates
+# for itself. A workflow-wide `contents: write, packages: write` handed
+# the same push-anything token to the four binary build runners, which
+# only ever check out and compile. No job here needs `packages: write`
+# any more - the only one that did was the deleted `image` job.
 permissions:
   contents: read
 
@@ -48,10 +67,39 @@ jobs:
       - name: Build
         # --locked: build the committed dependency graph, or fail.
         run: cargo build --release --locked -p nzbfast --target ${{ matrix.target }}
+      # A plain `tar czf` records the BUILDING ACCOUNT's uid/gid and user
+      # and group names in every member header - `runner`/`runner` on these
+      # runners - and this project is anonymous in public. bsdtar on the two
+      # mac legs additionally stores an AppleDouble `._name` member beside
+      # every file carrying an xattr, and macOS 15+ stamps
+      # com.apple.provenance on anything it has built, which yields a SECOND
+      # top-level entry and breaks every unpacker that collapses a lone
+      # wrapper directory (v1.1.2 shipped both Linux tarballs that way).
+      #
+      # provenance-release.yml, which builds the `nzbfast-<triple>.tar.gz`
+      # assets that actually reach the release page, has passed these flags
+      # since it was written. This job, its sibling, never did. GNU tar
+      # rejects the bsd spellings outright ("unrecognized option '--uid'"),
+      # so the flavour has to be asked rather than assumed.
       - name: Package
         run: |
+          set -euo pipefail
           BIN=target/${{ matrix.target }}/release/nzbfast
-          tar czf nzbfast-${{ matrix.target }}.tar.gz -C "$(dirname "$BIN")" nzbfast
+          ART=nzbfast-${{ matrix.target }}.tar.gz
+          if tar --version | grep -q GNU; then
+            tar --owner=0 --group=0 --numeric-owner \
+                -czf "$ART" -C "$(dirname "$BIN")" nzbfast
+          else
+            COPYFILE_DISABLE=1 tar --uid 0 --gid 0 --uname "" --gname "" \
+                -czf "$ART" -C "$(dirname "$BIN")" nzbfast
+          fi
+      # On the bytes, not on the yaml above. Do NOT swap this for
+      # `tar tzvf`: on the mac legs bsdtar CONSUMES AppleDouble members on
+      # read, so a broken tarball lists clean - which is exactly how v1.1.2
+      # shipped five junk members in each Linux tarball. This reads the
+      # headers as stored.
+      - name: No builder identity in the archive
+        run: python3 packaging/check-archive-identity.py nzbfast-${{ matrix.target }}.tar.gz
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nzbfast-${{ matrix.target }}
@@ -125,11 +173,18 @@ jobs:
           echo "$out" | grep -q "ELF 32-bit"
           echo "$out" | grep -q "ARM"
           echo "$out" | grep -q "statically linked"
+      # --owner/--group/--numeric-owner: without them every member header
+      # names the account that ran the build (`runner`/`runner` here), and
+      # this project is anonymous in public. GNU tar on this runner; see the
+      # `binaries` job above for the flavour branch and the full reasoning.
       - name: Package
         run: |
+          set -euo pipefail
           NAME=nzbfast-armv7-unknown-linux-musleabihf-beta
-          tar czf "$NAME.tar.gz" \
+          tar --owner=0 --group=0 --numeric-owner -czf "$NAME.tar.gz" \
             -C target/armv7-unknown-linux-musleabihf/release nzbfast
+      - name: No builder identity in the archive
+        run: python3 packaging/check-archive-identity.py nzbfast-armv7-unknown-linux-musleabihf-beta.tar.gz
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nzbfast-armv7-unknown-linux-musleabihf-beta
@@ -206,28 +261,19 @@ jobs:
           ls -l dist
           for f in dist/*.deb; do dpkg-deb -I "$f" | sed -n '2,12p'; done
           for f in dist/*.rpm; do rpm -qip "$f" | head -12; done
+      # Both formats reach root:root today - dpkg-deb via --root-owner-group
+      # and rpm via its own default - but neither is asserted anywhere, and
+      # rpm in particular takes its FILEUSERNAME straight from the files in
+      # the buildroot, so a change in how the stage is assembled would put
+      # the CI account's name in the header of every path with nothing to
+      # notice. Measured clean on the shipped 1.1.3 packages; this is what
+      # keeps it that way.
+      - name: No builder identity in the packages
+        run: python3 packaging/check-archive-identity.py dist/*.deb dist/*.rpm
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nzbfast-linux-packages
           path: dist/*
-      # The same two static musl binaries, raw, for the QNAP job below.
-      # Cross-compiling them costs this job several minutes (zig, both
-      # targets, the C in rapidyenc and aws-lc-rs), and the .qpkg wants
-      # exactly these bits - so they are handed over rather than built
-      # twice. A SEPARATE artifact, because the `release` job downloads
-      # every artifact flat into dist/ and these must not land among the
-      # things it globs.
-      - name: Hand the musl binaries to the QNAP job
-        run: |
-          set -euo pipefail
-          mkdir -p muslbin
-          cp target/x86_64-unknown-linux-musl/release/nzbfast muslbin/nzbfast-x86_64
-          cp target/aarch64-unknown-linux-musl/release/nzbfast muslbin/nzbfast-aarch64
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: nzbfast-musl-binaries
-          path: muslbin/*
-          if-no-files-found: error
   # Windows on ARM (Snapdragon X and friends), BETA.
   #
   # Its own job rather than a row in the `binaries` matrix above, because
@@ -352,6 +398,18 @@ jobs:
       - name: Collect assets
         shell: bash
         run: mv packaging/windows/out/nzbfast-*-windows-arm64-beta-setup.exe .
+      # Zip has no uid/gid/uname/gname fields, so there is no owner to leak
+      # here and nothing on a Windows runner makes AppleDouble members. The
+      # check runs anyway: "the format cannot carry it" is an inference, and
+      # the point of this gate is that every archive asset is measured. The
+      # runner image ships python under both names depending on the release,
+      # so take whichever is there rather than guessing.
+      - name: No builder identity in the archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=$(command -v python3 || command -v python)
+          "$PY" packaging/check-archive-identity.py nzbfast-*-windows-arm64-beta.zip
       # if-no-files-found: error, because both names are computed from a
       # version string and an .iss #define, and a silently empty artifact
       # is exactly how a rename goes unnoticed until someone downloads the
@@ -364,73 +422,10 @@ jobs:
             nzbfast-*-windows-arm64-beta-setup.exe
           if-no-files-found: error
 
-  qnap-beta:
-    # The QNAP App Center package, BETA. Same tier as the Linux packages
-    # and the Windows ARM64 build: attached to the release, absent from
-    # the signed update manifest, and its failure cannot withhold a
-    # release.
-    #
-    # It builds from the musl binaries the `packages` job already made,
-    # which is what lets it run DURING the release rather than after it.
-    # (make-qpkg.sh can also download a published release's own tarballs,
-    # and that is still how you rebuild a package for a release that has
-    # already shipped - but nothing on the release page exists yet while
-    # this workflow is running.)
-    #
-    # It is here rather than in the qnap-qpkg workflow because that one
-    # is for on-demand and pull-request builds; this is the one that
-    # ships. Both call the same script.
-    needs: [packages]
-    if: ${{ !cancelled() && needs.packages.result == 'success' }}
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with: { name: nzbfast-musl-binaries, path: muslbin }
-      - name: Install what QDK needs
-        # rsync is what qbuild stages shared/ with and is not on the
-        # runner image. Nothing is compiled here but QDK's own
-        # qpkg_encrypt.
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rsync
-      - name: Fetch the pinned QDK
-        # Pinned by commit: qinstall.sh is COPIED INTO the package and
-        # runs as root on the user's NAS, so the QDK revision is code we
-        # ship. qpkg_encrypt stamps the package's checksum and is C
-        # source - without it qbuild prints one "command not found" and
-        # still exits 0.
-        run: |
-          set -euo pipefail
-          commit=$(grep -v '^#' packaging/qnap/qdk-pin.txt | grep -m1 .)
-          git clone --quiet https://github.com/qnap-dev/QDK.git "$RUNNER_TEMP/qdk"
-          git -C "$RUNNER_TEMP/qdk" checkout --quiet --detach "$commit"
-          chmod 755 "$RUNNER_TEMP/qdk/shared/bin/qbuild"
-          make -C "$RUNNER_TEMP/qdk/src"
-          echo "$RUNNER_TEMP/qdk/shared/bin" >> "$GITHUB_PATH"
-          echo "$RUNNER_TEMP/qdk/src/bin" >> "$GITHUB_PATH"
-      - name: Off-box install tests
-        run: packaging/tests/qnap-install.sh
-      - name: Read version from Cargo.toml
-        id: ver
-        run: echo "v=$(grep '^version' crates/nzbfast/Cargo.toml | head -1 | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
-      - name: Build the .qpkg
-        run: |
-          set -euo pipefail
-          chmod 755 muslbin/*
-          packaging/qnap/make-qpkg.sh --binaries "$PWD/muslbin" \
-            "${{ steps.ver.outputs.v }}" dist
-          ls -l dist/
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: nzbfast-qnap-beta
-          path: dist/*.qpkg
-          if-no-files-found: error
-
   freebsd-beta:
-    # FreeBSD x86_64, BETA. Same tier as the Windows ARM64, Linux
-    # package and QNAP jobs: attached to the release, absent from the
-    # signed update manifest, and its failure cannot withhold a release.
+    # FreeBSD x86_64, BETA. Same tier as the Windows ARM64 and Linux
+    # package jobs: attached to the release, absent from the signed
+    # update manifest, and its failure cannot withhold a release.
     #
     # WHY A VM AND NOT A CROSS-BUILD. x86_64-unknown-freebsd is a Rust
     # tier-2 target with no GitHub-hosted runner, so the two roads are a
@@ -539,63 +534,70 @@ jobs:
             cp packaging/freebsd/README.md dist/nzbfast-freebsd/README.md
             cp packaging/config.example.json dist/nzbfast-freebsd/
             chmod 755 dist/nzbfast-freebsd/nzbfast dist/nzbfast-freebsd/rc.d/nzbfast
-            tar czf "dist/nzbfast-$VERSION-freebsd-x64-beta.tar.gz" \
-              -C dist nzbfast-freebsd
+            # Owner metadata. A plain `tar czf` writes the building
+            # account's uid/gid and user/group names into every member
+            # header, and this project is anonymous in public. Building as
+            # root in a VM does not make that harmless: the 1.1.3 tarball
+            # came out of here with `uid=0 gid=1001 uname='root' gname=''`
+            # on every entry and upload-release-assets.sh refused the whole
+            # batch. FreeBSD's base tar is bsdtar, but ask rather than
+            # assume - a wrong flag is a hard error mid-release and a
+            # missing one is a silent leak. The two spellings cannot share
+            # one variable in POSIX sh either: --uname "" --gname "" are
+            # EMPTY STRING arguments, which no word splitting can carry.
+            if tar --version 2>&1 | head -1 | grep -qi bsdtar; then
+              tar --uid 0 --gid 0 --uname "" --gname "" \
+                -czf "dist/nzbfast-$VERSION-freebsd-x64-beta.tar.gz" \
+                -C dist nzbfast-freebsd
+            else
+              tar --owner=0 --group=0 --numeric-owner \
+                -czf "dist/nzbfast-$VERSION-freebsd-x64-beta.tar.gz" \
+                -C dist nzbfast-freebsd
+            fi
             rm -rf dist/nzbfast-freebsd
             ls -l dist/
+      # OUTSIDE the VM, on the runner: FreeBSD's base system has no
+      # python3 and this job installs nothing from ports on purpose. The
+      # action rsyncs the work directory back when the step ends, so dist/
+      # is here - and these are the same bytes upload-artifact takes.
+      - name: No builder identity in the archive
+        run: python3 packaging/check-archive-identity.py dist/*.tar.gz
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nzbfast-freebsd-beta
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  image:
-    # Tags only - the same guard `release` carries. Without it a
-    # workflow_dispatch from ANY branch pushed that branch's build to
-    # `:latest`, and every `docker pull nzbfast:latest` got it. The
-    # `:${{ github.ref_name }}` tag was just as wrong (a branch name).
-    # workflow_dispatch still builds the binaries for a smoke test; it
-    # just no longer publishes.
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read # checkout
-      packages: write # ghcr push
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-
   release:
-    needs: [binaries, image, windows-arm64-beta, packages, qnap-beta, linux-armv7-beta, freebsd-beta]
-    # `needs` waits for the five BETA jobs (Windows ARM64, Linux
-    # packages, QNAP, 32-bit ARM, FreeBSD) so their artifacts are
+    needs: [binaries, windows-arm64-beta, packages, linux-armv7-beta, freebsd-beta]
+    # `needs` waits for the four BETA jobs (Windows ARM64, Linux
+    # packages, 32-bit ARM, FreeBSD) so their artifacts are
     # downloadable here, and this `if` then ignores whether they PASSED.
+    #
+    # The QNAP .qpkg is NOT among them and its absence is deliberate:
+    # its payload is the release's own published linux tarballs, checked
+    # against the release's SHA256SUMS.txt, so it cannot be built until
+    # this job has put those files on the page. It is built afterwards by
+    # the `qnap-qpkg` workflow and uploaded by hand, exactly like the
+    # Synology .spk - see step 4c of the publish-release skill. Until
+    # 16 Aug 2026 it was built here instead, from a separate cross-build
+    # of the same source, which shipped a package whose binaries matched
+    # no checksum on the release page (measured on 1.1.3).
     # A job-level
     # continue-on-error stops a failure sinking the workflow run, but
     # `needs` still reads the result and would skip this job, which would
     # mean an unproven beta build could withhold the whole release - the
-    # opposite of what shipping it as a beta is for. So the two jobs that
-    # must be green (binaries, image) are named explicitly, and
-    # !cancelled() keeps a genuine cancellation from publishing a
-    # partial set.
+    # opposite of what shipping it as a beta is for. So the one job that
+    # must be green (binaries) is named explicitly, and !cancelled()
+    # keeps a genuine cancellation from publishing a partial set.
+    #
+    # Nothing about publishing a container image belongs in this
+    # condition. Coupling them is what cost v1.0.22-v1.1.3 their assets:
+    # a registry outcome silently withheld every binary. Anything added
+    # to this `if` later must be something that makes the BINARIES wrong.
     if: >-
       ${{ !cancelled() && startsWith(github.ref, 'refs/tags/')
-          && needs.binaries.result == 'success'
-          && needs.image.result == 'success' }}
+          && needs.binaries.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the GitHub release
@@ -621,5 +623,4 @@ jobs:
             dist/*-setup.exe
             dist/*.deb
             dist/*.rpm
-            dist/*.qpkg
           generate_release_notes: true

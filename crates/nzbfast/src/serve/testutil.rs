@@ -277,6 +277,7 @@ pub(crate) fn test_daemon(dir: &Path) -> Arc<Daemon> {
         giveup_tripped: Mutex::new(std::collections::VecDeque::new()),
         watch_upgraded: Mutex::new(std::collections::VecDeque::new()),
         delete_kept: Mutex::new(std::collections::VecDeque::new()),
+        deleted_recent: Mutex::new(std::collections::VecDeque::new()),
         auth_fails: Mutex::new(std::collections::HashMap::new()),
         #[cfg(feature = "indexer")]
         enrich_hot: Mutex::new(std::collections::VecDeque::new()),

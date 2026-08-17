@@ -91,12 +91,20 @@ pub const INTERESTS: &[Interest] = &[
     },
     Interest {
         key: "books",
+        // The last two were missing until 16 Aug and are among the
+        // biggest the interest can offer: on a live provider's own group
+        // list `alt.binaries.mp3.abooks` carries 132M articles and
+        // `alt.binaries.e-book.magazines` 76M, against 127M for the
+        // headline `alt.binaries.e-book`. Named, not keyword-matched,
+        // like every other line here.
         groups: &[
             "alt.binaries.e-book",
             "alt.binaries.ebook",
             "alt.binaries.e-book.technical",
+            "alt.binaries.e-book.magazines",
             "alt.binaries.audiobooks",
             "alt.binaries.mp3.audiobooks",
+            "alt.binaries.mp3.abooks",
         ],
     },
     Interest {

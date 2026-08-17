@@ -113,10 +113,10 @@ fn m_wall_fix(
         let old = if manual && !key.is_empty() && !title.is_empty() {
             match d.index_read_checked(|ix| ix.title_get(&key).ok().flatten()) {
                 Ok(old) => old,
-                Err(_) => {
+                Err(why) => {
                     return Some(json!({
                         "status": false,
-                        "error": "the index is busy - try again in a moment",
+                        "error": why.message(),
                     }));
                 }
             }
@@ -299,9 +299,9 @@ fn m_wall_art(
                 // running, and send them off to fix the wrong
                 // thing - after they already uploaded the file.
                 Some(b) => match d.index_read_checked(|ix| ix.title_get(&key).ok().flatten()) {
-                    Err(_) => json!({
+                    Err(why) => json!({
                         "status": false,
-                        "error": "the index is busy - try again in a moment",
+                        "error": why.message(),
                     }),
                     Ok(None) => json!({"status": false, "error": "unknown title key"}),
                     Ok(Some(t)) => {
@@ -638,9 +638,21 @@ fn m_people_search(
 ) -> Option<Value> {
     Some({
         let q = params.get("q").cloned().unwrap_or_default();
-        let rows = d
-            .with_index_read(|ix| ix.people_search(&q, 12).ok())
-            .unwrap_or_default();
+        // index_read_checked, not with_index_read: the flattening
+        // wrapper turns a saturated read pool or a twice-failed
+        // SQLITE_SCHEMA into an empty list, and an empty list here reads
+        // as "no such person" - a working index reported as one that has
+        // never heard of the name the user is typing (read-only sweep 3,
+        // 16 Aug 2026, L2). Both causes are transient, so say so and let
+        // the next keystroke get the real answer.
+        let rows = match d.index_read_checked(|ix| ix.people_search(&q, 12).ok()) {
+            Err(why) => {
+                return Some(json!({
+                    "status": false, "busy": true, "error": why.message(),
+                }));
+            }
+            Ok(rows) => rows.unwrap_or_default(),
+        };
         let art_dir = d.spool.join("art");
         json!({"people": rows.iter().map(|p| json!({
                         "id": p.id, "name": p.name, "n": p.n_titles,

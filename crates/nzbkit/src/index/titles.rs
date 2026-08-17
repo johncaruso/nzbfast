@@ -739,7 +739,11 @@ impl Index {
     /// Tom Cruise mid-type; the LIKE arm keeps a non-FTS build working.
     /// Only people with at least one visible credit are returned - a
     /// crew name from a title the user has hidden is not a search hit.
-    pub fn people_search(&self, q: &str, limit: u32) -> rusqlite::Result<Vec<PersonHit>> {
+    pub(super) fn people_search_once(
+        &self,
+        q: &str,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<PersonHit>> {
         let q = q.trim();
         if q.is_empty() {
             return Ok(Vec::new());

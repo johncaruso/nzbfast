@@ -66,6 +66,24 @@ const BLOCKED_BAR: f64 = 0.40;
 /// case. All cores, not one: decode and verify are parallel.
 const CPU_BAR: f64 = 85.0;
 
+/// Fraction of the articles asked for that came back missing, above
+/// which the POST is the shortfall rather than any layer of the stack.
+///
+/// A miss costs a full request round-trip and yields no bytes, so a
+/// post full of holes reads on every other instrument exactly like a
+/// slow provider: connections sit under budget with nothing fetchable
+/// to put in them, and per-connection rates collapse fleet-wide.
+/// Gary's 16 Aug job had 1,965 of 4,506 segments missing (44%) and ran
+/// at 7 MB/s against a link that had done 61 the night before - and
+/// the verdict named a host as "the limit", which was false. A fifth
+/// is well clear of the handful of holes a healthy post carries and
+/// well under any regime where this is arguable.
+const MISSING_BAR: f64 = 0.20;
+
+/// Articles the fleet must have asked for before the rate above means
+/// anything. Three misses out of four early requests is noise.
+const MISSING_MIN_TRIED: u64 = 200;
+
 /// A server persistently holding under this fraction of its
 /// connection budget is being capped by the provider (the 481
 /// max-simultaneous-IP shape), if it isn't refusing outright.
@@ -108,6 +126,10 @@ pub(super) enum Layer {
     /// churn, or plain flat delivery. Detail names a host when one
     /// host owns the evidence.
     Provider,
+    /// Neither: most of what the run is asking for is not on the
+    /// servers. The wire time goes on requests that return nothing,
+    /// and no layer of the stack is at fault. See `MISSING_BAR`.
+    Missing,
     /// Not enough, or conflicting, evidence. The default.
     #[default]
     Unknown,
@@ -122,6 +144,7 @@ impl Layer {
             Layer::Cpu => "cpu",
             Layer::Client => "client",
             Layer::Provider => "provider",
+            Layer::Missing => "missing",
             Layer::Unknown => "unknown",
         }
     }
@@ -375,8 +398,22 @@ impl Core {
             }
             return (Layer::Client, String::new());
         }
-        // Upstream: the sockets could not fill the pipe. Name a host
-        // when one host owns the evidence.
+        // Upstream: the sockets could not fill the pipe. But FIRST ask
+        // whether there was anything to put in it. A post full of holes
+        // starves the pool - connections idle for want of fetchable
+        // work - and every downstream instrument then reports the shape
+        // of a capped or shaped provider: budgets unfilled, per-
+        // connection rates flat and low across the whole fleet. So this
+        // is checked ahead of `worst_refusal`, which would otherwise
+        // convict a host for a shortfall the post caused, and ahead of
+        // `shaped_host`, whose comparison is between rates the misses
+        // are themselves holding down.
+        if let Some(rate) = self.fleet_missing()
+            && rate >= MISSING_BAR
+        {
+            return (Layer::Missing, String::new());
+        }
+        // Name a host when one host owns the evidence.
         let refusal = self.worst_refusal();
         if !refusal.is_empty() {
             return (Layer::Provider, refusal);
@@ -387,6 +424,20 @@ impl Core {
             return (Layer::Provider, String::new());
         }
         (Layer::Provider, self.shaped_host())
+    }
+
+    /// Fraction of the articles the whole fleet asked for that came
+    /// back missing, or None until the sample is worth reading.
+    ///
+    /// Fleet-wide and not per-host on purpose: a missing article is
+    /// missing everywhere the post is, so one host's rate is a sample
+    /// of the post, not a fact about that host. The per-server column
+    /// in the panel shows the same counters split out, which is where
+    /// a genuine single-host anomaly would be visible.
+    fn fleet_missing(&self) -> Option<f64> {
+        let tried: u64 = self.servers.values().map(|s| s.tried).sum();
+        let missing: u64 = self.servers.values().map(|s| s.missing).sum();
+        (tried >= MISSING_MIN_TRIED).then(|| missing as f64 / tried as f64)
     }
 
     /// A host refusing outright, or persistently capped under its
@@ -751,6 +802,11 @@ mod tests {
         /// already at the clippy limit, and every existing case wants
         /// the default (no diagnostic verdict).
         suspect: bool,
+        /// Per-server (tried, missing) for the article census, when a
+        /// case is about the post rather than the link. Same reasoning
+        /// as `suspect`: every other case wants `srv`'s default of 100
+        /// tried and none missing.
+        miss: Option<(u64, u64)>,
     }
 
     impl Rig {
@@ -762,6 +818,7 @@ mod tests {
                 blocked: HashMap::new(),
                 recon: HashMap::new(),
                 suspect: false,
+                miss: None,
             }
         }
 
@@ -788,9 +845,12 @@ mod tests {
                         *blocked += dbl;
                         let recon = self.recon.entry(h.into()).or_default();
                         *recon += dr;
+                        let (tried, missing) = self.miss.unwrap_or((100, 0));
                         ServerTick {
                             refused,
                             reconnects: *recon,
+                            tried,
+                            missing,
                             ..srv(h, c, b, *bytes, *blocked)
                         }
                     })
@@ -875,6 +935,75 @@ mod tests {
             &[("a", 8, 8, 500_000_000, 100, 0, false)],
         );
         assert_eq!(r.core.verdict().0, Layer::Provider);
+    }
+
+    /// Gary's 16 Aug regime: 44% of the articles are not on the
+    /// servers, so the pool spends its wire time on requests that
+    /// return nothing and the fleet delivers a fraction of the anchor.
+    /// Every other instrument reads this as a shaped or capped
+    /// provider - the sockets ARE idle - and the verdict used to name
+    /// a host that was behaving perfectly.
+    #[test]
+    fn a_post_full_of_holes_is_not_the_provider() {
+        let mut r = Rig::new();
+        r.miss = Some((2253, 982)); // 4506 tried, 1965 missing across two
+        r.run(
+            WINDOW,
+            70e6,
+            0,
+            1_000_000_000,
+            30.0,
+            false,
+            &[
+                ("a", 8, 8, 35_000_000, 100, 0, false),
+                ("b", 8, 8, 35_000_000, 100, 0, false),
+            ],
+        );
+        assert_eq!(r.core.verdict().0, Layer::Missing);
+    }
+
+    /// ...and the same shortfall with an intact post still convicts
+    /// the provider. The layer above must not swallow the case it was
+    /// inserted in front of.
+    #[test]
+    fn a_shortfall_on_an_intact_post_is_still_the_provider() {
+        let mut r = Rig::new();
+        r.miss = Some((2253, 20)); // under 1%
+        r.run(
+            WINDOW,
+            70e6,
+            0,
+            1_000_000_000,
+            30.0,
+            false,
+            &[
+                ("a", 8, 8, 35_000_000, 100, 0, false),
+                ("b", 8, 8, 35_000_000, 100, 0, false),
+            ],
+        );
+        assert_eq!(r.core.verdict().0, Layer::Provider);
+    }
+
+    /// A handful of misses in the first seconds of a run is not a
+    /// verdict about the post: under `MISSING_MIN_TRIED` the rate is
+    /// not read at all, however bad it looks.
+    #[test]
+    fn a_tiny_sample_of_misses_convicts_nothing() {
+        let mut r = Rig::new();
+        r.miss = Some((20, 19)); // 95% missing, 40 articles fleet-wide
+        r.run(
+            WINDOW,
+            70e6,
+            0,
+            1_000_000_000,
+            30.0,
+            false,
+            &[
+                ("a", 8, 8, 35_000_000, 100, 0, false),
+                ("b", 8, 8, 35_000_000, 100, 0, false),
+            ],
+        );
+        assert_ne!(r.core.verdict().0, Layer::Missing);
     }
 
     #[test]

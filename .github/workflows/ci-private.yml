@@ -250,6 +250,22 @@ jobs:
       - name: overflow gate
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         run: tools/overflow-gate.py --selftest && tools/overflow-gate.py
+      # The download page is version-pinned: every button is
+      # `releases/latest/download/nzbfast-<VERSION>-*`, so the instant a new
+      # release becomes `latest` every filename from the old one 404s - all
+      # six buttons, all sixteen locales, at once, with no grace period.
+      # bump-version.sh rewrites those pages, but for v1.1.3 they were left
+      # unstaged while Cargo.toml was committed, and the site went live
+      # naming 1.1.2. This is what makes that state red at the commit that
+      # creates it rather than on release day. `--selftest` first, same
+      # reason as the overflow gate above: it rebuilds both incidents and
+      # asserts the gate still refuses them, so a refactor cannot turn it
+      # into a no-op that passes everything. Private-only - website/ is
+      # deliberately not in PUBLIC_MANIFEST, so there is nothing to check
+      # in the public snapshot. Pure shell and python, about two seconds.
+      - name: download page version gate
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: tools/check-site-version.sh --selftest && tools/check-site-version.sh --tree
       - name: clippy
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         # No escapes: every warning blocks. The categories still allowed

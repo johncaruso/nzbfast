@@ -39,6 +39,19 @@ pub(in crate::serve) static TAIL_GEN_BARRIER: Mutex<
     Option<(String, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 > = Mutex::new(None);
 
+/// Test seam: the lane supervisor trips it after `submit` has marked the
+/// job `Finishing` and sampled the generation, and BEFORE it waits for a
+/// lane slot - the interval `TAIL_GEN_BARRIER` cannot reach, because
+/// that one opens inside `run_tail`, long after the two unbounded waits
+/// this seam covers (the run permit at width 2, and the oracle fold on
+/// the index write mutex). Same two-stage shape and the same nzo_id key
+/// as `TAIL_GEN_BARRIER`: an unkeyed global barrier does not fail the
+/// parallel bin run, it HANGS it (15 Aug, twice).
+#[cfg(test)]
+pub(in crate::serve) static SUBMIT_GEN_BARRIER: Mutex<
+    Option<(String, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+> = Mutex::new(None);
+
 /// Everything the old inline tail closure captured, as a named ticket.
 /// The worker builds it between `net_rx` and lane submission, after the
 /// per-job accounting that must read the hub singletons before the next
@@ -123,7 +136,22 @@ impl PostprocLane {
     /// immediately - unless the inline kill-switch is set, in which
     /// case this awaits the whole tail like the old scheduler did.
     pub(super) async fn submit(&self, t: PostprocTicket) {
-        {
+        // The round of this record's life the whole tail belongs to,
+        // sampled under the SAME hold that marks it Finishing - i.e. at
+        // the instant the lane takes custody.
+        //
+        // It used to be sampled inside `run_tail`, after two unbounded
+        // waits: the run permit (width 2 by default, so a third finished
+        // job parks here behind two unpacks) and the M29 oracle fold,
+        // which takes the index write mutex - the same mutex a retention
+        // reap has held for hours. A delete verb files a `Finishing` job
+        // into history and a retry of that row re-queues the SAME Arc one
+        // generation on; landing in either wait made gen0 the RETRY's
+        // generation, so every fence below it - the verdict, the stats,
+        // finalize, the hooks, park - passed happily and did to the live
+        // retry exactly what read-only sweep 2's H1 fence exists to stop
+        // (Codex sweep 3, H1). The fence was at the wrong end of the wait.
+        let gen0 = {
             let mut j = t.job.lock_ok();
             j.state = JobState::Finishing;
             // §129 4a: the per-stage transition the schema promises -
@@ -137,7 +165,8 @@ impl PostprocLane {
                     "category": j.category,
                 }),
             );
-        }
+            Daemon::record_generation(&j)
+        };
         // Coalesced: a crash before the debounced write lands restores
         // the job from an OLDER snapshot, which the wildcard state arm
         // reads as Queued either way, and the journal replays the
@@ -167,16 +196,119 @@ impl PostprocLane {
             // park, and cap() leaks left saturated() true over an idle
             // daemon until restart.
             let _ticket = ticket;
+            #[cfg(test)]
+            {
+                // The id is read BEFORE the seam lock, like
+                // `daemon_park`'s: a job lock taken under the seam guard
+                // orders the two the other way round from every other
+                // reader of this record.
+                let id = job.lock_ok().nzo_id.clone();
+                let seam = SUBMIT_GEN_BARRIER
+                    .lock_ok()
+                    .clone()
+                    .filter(|(k, _, _)| *k == id);
+                if let Some((_, open, release)) = seam {
+                    open.wait();
+                    release.wait();
+                }
+            }
             let _slot = slots
                 .acquire_owned()
                 .await
                 .expect("the lane semaphore is never closed");
-            let tail = tokio::spawn(run_tail(d.clone(), t));
+            let tail = tokio::spawn(run_tail(d.clone(), t, gen0));
             if let Err(e) = tail.await {
-                file_crashed_tail(&job, &e);
-                d.run_post_job_hooks(&job);
-                d.park(job);
+                // Fenced like every other write this tail owns: the
+                // crash arm files Failed onto the record, and if the
+                // record was deleted and retried while the tail ran that
+                // record now belongs to a live download.
+                if file_crashed_tail(&job, &e, Some(gen0)) {
+                    d.run_post_job_hooks_gen(&job, Some(gen0));
+                }
+                d.park_gen(job, Some(gen0));
             }
+        });
+        if self.inline {
+            let _ = supervisor.await;
+        }
+    }
+
+    /// Hand the lane a job that finished WITHOUT a download: the
+    /// post-job hooks in the order `park` needs them, then `park`,
+    /// off the caller's thread. Returns as soon as the tail is
+    /// queued.
+    ///
+    /// The queue runner has three arms that end a job before the
+    /// pipeline ever starts - the metadata-only library pick, the
+    /// §138 give-up on a post no server carries, and the opt-in
+    /// pre-flight Impossible verdict - and they owe history the same
+    /// ordering every other completion owes: the post-processing
+    /// script has to be FINISHED before the row appears, because the
+    /// word in that row (`Completed`, and `Failed` just as much) is
+    /// what a SAB client acts on. See
+    /// [`Daemon::run_post_job_hooks_before_park`] for why that word is
+    /// a contract rather than a status line.
+    ///
+    /// What the runner cannot do is await it in place: those arms run
+    /// on the picker's own loop, so a user script would stall every
+    /// other job in the queue for its whole run - up to
+    /// `script_timeout_secs`, an hour by default. This is where the
+    /// difference is paid instead. A tail here costs exactly what a
+    /// download's tail costs: one lane slot, one unit of backlog, and
+    /// therefore the lane's own backpressure once the tails outnumber
+    /// the width - so a slow script spends POST-PROCESSING capacity,
+    /// with the runner stating the reason, rather than queue capacity
+    /// with no reason stated at all. That is the whole point of the
+    /// lane existing.
+    ///
+    /// Two things it deliberately does NOT do that [`Self::submit`]
+    /// does. It does not mark the job `Finishing`: the terminal state
+    /// is already decided and set, `resolve_script` and the SAB_*
+    /// environment are read FROM it, and a job that reads Finishing
+    /// while its script runs would hand that script the wrong answer.
+    /// And it emits no `job.finishing` lifecycle event, because no
+    /// download stage ended here - there was none.
+    ///
+    /// A crash inside this window is already answered: the queue row
+    /// is terminal, and `restore_records` routes a terminal queue row
+    /// into history on the next start (losing the hooks, which it
+    /// says).
+    pub(super) async fn submit_hooks_only(&self, job: Arc<Mutex<Job>>) {
+        // The fence, taken at the handoff. These arms used to park on
+        // the very next statement, where nothing could get between
+        // them and no fence was needed; a tail that can now run for an
+        // hour is exactly the long-running caller `park_gen` grew its
+        // generation check for - a delete verb files the row from
+        // under it, a retry re-queues the same Arc, and an unfenced
+        // park would consume the button the user just pressed.
+        let gen0 = Some(Daemon::record_generation(&job.lock_ok()));
+        self.backlog.fetch_add(1, Ordering::Relaxed);
+        let d = self.d.clone();
+        let slots = self.slots.clone();
+        let ticket = BacklogTicket {
+            backlog: self.backlog.clone(),
+            cap: self.cap(),
+            d: self.d.clone(),
+        };
+        let supervisor = tokio::spawn(async move {
+            let _ticket = ticket;
+            let _slot = slots
+                .acquire_owned()
+                .await
+                .expect("the lane semaphore is never closed");
+            // Same supervisor shape as a download's tail, for the same
+            // reason: only `park` takes the record off the queue list,
+            // so a panicked hook run must not be allowed to leave it
+            // there. The inner task is what makes the park below
+            // unconditional.
+            let hooks = tokio::spawn({
+                let (d, job) = (d.clone(), job.clone());
+                async move { d.run_post_job_hooks_before_park(&job, gen0).await }
+            });
+            if let Err(e) = hooks.await {
+                file_crashed_tail(&job, &e, gen0);
+            }
+            d.park_gen(job, gen0);
         });
         if self.inline {
             let _ = supervisor.await;
@@ -256,22 +388,41 @@ impl Daemon {
 /// the job Failed with the journal untouched, so a user retry re-runs
 /// the tail from what is on disk. Same contract `finalize_completed`
 /// already keeps for its inner `spawn_blocking`.
-fn file_crashed_tail(job: &Arc<Mutex<Job>>, e: &tokio::task::JoinError) {
+///
+/// Fenced to the round the lane took custody of, and the check shares
+/// the write's hold: a delete verb plus a retry can hand this record to
+/// a new generation while the tail runs, and stamping Failed then does
+/// not file a dead job - it fails a download that is at that moment
+/// queued to run. Returns whether the filing happened, which is what
+/// decides if the hooks are owed.
+fn file_crashed_tail(
+    job: &Arc<Mutex<Job>>,
+    e: &tokio::task::JoinError,
+    gen0: Option<(u32, u64)>,
+) -> bool {
     warn!(target: "lane", "post-processing task died: {e}");
     let mut j = job.lock_ok();
+    if !Daemon::same_generation(&j, gen0) {
+        return false;
+    }
     j.state = JobState::Failed;
     j.fail_message = crate::with_build(
         "post-processing crashed (internal error) - retry the job to re-run it".to_string(),
     );
     j.finished_at = Some(Instant::now());
     j.finished_unix = Some(unix_now());
+    true
 }
 
 /// The tail itself: a verbatim move of the worker's old inline closure
 /// (tasks.rs `run_worker`), with the captured state read off the ticket.
 /// Runs settle-result filing, the suspended/park-on-full-disk arms,
 /// verdict + stats onto the record, `finalize_completed`, hooks, `park`.
-pub(super) async fn run_tail(d2: Arc<Daemon>, t: PostprocTicket) {
+///
+/// `gen0` is the round of the record's life the LANE took custody of,
+/// sampled by `submit` under the same hold that wrote `Finishing`. It is
+/// a parameter and not a local sample on purpose - see the note there.
+pub(super) async fn run_tail(d2: Arc<Daemon>, t: PostprocTicket, gen0: (u32, u64)) {
     let PostprocTicket {
         job: job2,
         fetch,
@@ -306,11 +457,6 @@ pub(super) async fn run_tail(d2: Arc<Daemon>, t: PostprocTicket) {
         })
         .await;
     }
-    // The round of this record's life the lane is working on. Sampled
-    // BEFORE the await, because everything that can take the record away
-    // (a delete verb filing it to history, then a retry re-queueing the
-    // same Arc) happens while this tail runs.
-    let gen0 = Daemon::record_generation(&job2.lock_ok());
     let res = match fetch.await {
         Ok(r) => r,
         Err(e) => Err(anyhow::anyhow!("download task panicked: {e}")),
@@ -553,8 +699,23 @@ pub(super) async fn run_tail(d2: Arc<Daemon>, t: PostprocTicket) {
     // A watchdog demotion is not a completion - no
     // script and no notification; park() requeues it
     // deferred.
+    //
+    // Awaited, and awaited HERE: the next statement files this job into
+    // history, and history saying "Completed" is what a SAB client
+    // imports on. The post-processing script is the step most likely to
+    // still be moving the payload, so it has to be finished before the
+    // *arr is told where to find it. Only the script is waited for -
+    // see `run_post_job_hooks_before_park`.
+    //
+    // What it costs, so nobody has to rediscover it: a slow script now
+    // holds this lane slot for its whole run (bounded by
+    // `script_timeout_secs`, an hour by default) instead of being cut
+    // loose onto the blocking pool, so a script that takes minutes is
+    // post-processing capacity spent - which is what a post-processing
+    // step IS, and what the lane's width and its backpressure hold
+    // exist to express.
     if !demoted {
-        d2.run_post_job_hooks_gen(&job2, Some(gen0));
+        d2.run_post_job_hooks_before_park(&job2, Some(gen0)).await;
     }
     // With the generation this lane started on: a delete verb can file
     // this job into history mid-tail, and a retry of that row re-queues
@@ -701,8 +862,13 @@ mod tests {
             }))
             .expect("job"),
         ));
-        // What the lane submission does before it hands the ticket over.
-        job.lock_ok().state = JobState::Finishing;
+        // What the lane submission does before it hands the ticket over,
+        // including the generation sample that goes with the ticket.
+        let gen0 = {
+            let mut j = job.lock_ok();
+            j.state = JobState::Finishing;
+            Daemon::record_generation(&j)
+        };
         d.queue.lock_ok().push_back(job.clone());
 
         let open = Arc::new(std::sync::Barrier::new(2));
@@ -711,7 +877,7 @@ mod tests {
             Some(("nzo-tailgen-1".to_string(), open.clone(), release.clone()));
 
         let ticket = done_ticket(&d, &job);
-        let tail = tokio::spawn(run_tail(d.clone(), ticket));
+        let tail = tokio::spawn(run_tail(d.clone(), ticket, gen0));
 
         // The download has resolved and the tail has written nothing
         // yet. This is the window.
@@ -791,9 +957,13 @@ mod tests {
             }))
             .expect("job"),
         ));
-        job2.lock_ok().state = JobState::Finishing;
+        let gen2 = {
+            let mut j = job2.lock_ok();
+            j.state = JobState::Finishing;
+            Daemon::record_generation(&j)
+        };
         d.queue.lock_ok().push_back(job2.clone());
-        run_tail(d.clone(), done_ticket(&d, &job2)).await;
+        run_tail(d.clone(), done_ticket(&d, &job2), gen2).await;
         {
             let g = job2.lock_ok();
             assert_eq!(
@@ -811,6 +981,167 @@ mod tests {
                 .count(),
             1,
             "and the tail still files it into history"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A width-1 lane whose `submit` waits for its own supervisor, so a
+    /// test can drive one ticket end to end. Byte-for-byte what
+    /// `NZBFAST_POSTPROC_INLINE=1` builds, without touching the process
+    /// environment (which every other test in this binary shares).
+    fn inline_lane(d: &Arc<Daemon>) -> PostprocLane {
+        PostprocLane {
+            d: d.clone(),
+            width: 1,
+            inline: true,
+            slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            backlog: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// The generation the tail is fenced to must be the one the LANE
+    /// took custody of, not one sampled after its waits.
+    ///
+    /// `submit` marks the job `Finishing` and returns; the supervisor
+    /// then waits for a run permit (width 2 by default, so a third
+    /// finished job really does park there behind two unpacks) and
+    /// `run_tail` then waits on the M29 oracle fold, which takes the
+    /// index write mutex - a wait a retention reap has held for hours.
+    /// gen0 was sampled after BOTH. A delete verb files the `Finishing`
+    /// row into history and a retry of it re-queues the same Arc one
+    /// generation on, so a delete+retry landing in either wait made gen0
+    /// the RETRY's own generation and every fence downstream waved the
+    /// stale tail through: Completed and the old run's statistics onto
+    /// the queued record, finalization over the retry's directory, the
+    /// pp-script and every notification target fired, and park consuming
+    /// the retry (Codex sweep 3, H1).
+    ///
+    /// Driven through `SUBMIT_GEN_BARRIER`, which opens in exactly that
+    /// interval - `TAIL_GEN_BARRIER` cannot reach it, because it sits on
+    /// the far side of both waits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_lane_fences_on_the_generation_it_took_custody_of() {
+        let dir =
+            std::env::temp_dir().join(format!("nzbfast-lane-submitgen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let d = crate::serve::testutil::test_daemon(&dir);
+
+        let out = d.out_dir().join("Waiting.Release");
+        std::fs::create_dir_all(&out).expect("payload dir");
+        let job = Arc::new(Mutex::new(
+            job_from_json(&json!({
+                "nzo_id": "nzo-submitgen-1",
+                "name": "Waiting.Release",
+                "nzb_path": dir.join("waiting.nzb").to_string_lossy(),
+                "out_dir": out.to_string_lossy(),
+                "state": "Downloading",
+            }))
+            .expect("job"),
+        ));
+        d.queue.lock_ok().push_back(job.clone());
+
+        let open = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *SUBMIT_GEN_BARRIER.lock_ok() =
+            Some(("nzo-submitgen-1".to_string(), open.clone(), release.clone()));
+
+        let lane = inline_lane(&d);
+        let ticket = done_ticket(&d, &job);
+        let submitted = tokio::spawn(async move { lane.submit(ticket).await });
+
+        // The job is Finishing, the ticket is in the lane, and the tail
+        // has not started: this is the window the semaphore and the
+        // oracle fold hold open in production.
+        let o2 = open.clone();
+        tokio::task::spawn_blocking(move || o2.wait())
+            .await
+            .unwrap();
+        // The delete verb: a Finishing row leaves the queue tombstoned
+        // and is filed into history.
+        d.queue.lock_ok().retain(|j| !Arc::ptr_eq(j, &job));
+        {
+            let mut g = job.lock_ok();
+            g.state = JobState::Failed;
+            g.tombstone = true;
+            g.delete_status = "MANUAL".into();
+            g.fail_message = "deleted from the queue".into();
+            g.finished_unix = Some(1);
+        }
+        d.history.lock_ok().push(job.clone());
+        assert!(
+            d.retry("nzo-submitgen-1"),
+            "the filed delete row is retryable"
+        );
+        let r2 = release.clone();
+        tokio::task::spawn_blocking(move || r2.wait())
+            .await
+            .unwrap();
+        submitted.await.expect("lane submission");
+        *SUBMIT_GEN_BARRIER.lock_ok() = None;
+
+        {
+            let g = job.lock_ok();
+            assert_eq!(
+                g.state,
+                JobState::Queued,
+                "the stale tail stamped its verdict onto the record the retry queued"
+            );
+            assert!(!g.fetched, "and reported the retry as already downloaded");
+            assert!(
+                !g.finalizing,
+                "and left the retry carrying a finalize marker"
+            );
+        }
+        assert!(
+            d.queue
+                .lock_ok()
+                .iter()
+                .any(|j| j.lock_ok().nzo_id == "nzo-submitgen-1"),
+            "the stale tail pulled the freshly retried row out of the queue"
+        );
+        assert_eq!(
+            d.history
+                .lock_ok()
+                .iter()
+                .filter(|j| j.lock_ok().nzo_id == "nzo-submitgen-1")
+                .count(),
+            0,
+            "and filed it into history, consuming the retry the user pressed"
+        );
+
+        // The live direction, through the same seam-less path: a lane
+        // submission nobody touched still completes and files its job. A
+        // fence that declined everything would pass the half above and
+        // break every download.
+        let out2 = d.out_dir().join("Untouched.Release");
+        std::fs::create_dir_all(&out2).expect("payload dir");
+        let job2 = Arc::new(Mutex::new(
+            job_from_json(&json!({
+                "nzo_id": "nzo-submitgen-2",
+                "name": "Untouched.Release",
+                "nzb_path": dir.join("untouched.nzb").to_string_lossy(),
+                "out_dir": out2.to_string_lossy(),
+                "state": "Downloading",
+            }))
+            .expect("job"),
+        ));
+        d.queue.lock_ok().push_back(job2.clone());
+        inline_lane(&d).submit(done_ticket(&d, &job2)).await;
+        assert_eq!(
+            job2.lock_ok().state,
+            JobState::Completed,
+            "an untouched submission still completes"
+        );
+        assert_eq!(
+            d.history
+                .lock_ok()
+                .iter()
+                .filter(|j| j.lock_ok().nzo_id == "nzo-submitgen-2")
+                .count(),
+            1,
+            "and the lane still files it into history"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -15,7 +15,7 @@
 | QNAP, **beta - still in testing** | `nzbfast-@VERSION@-qnap-beta.qpkg`, or the Docker image |
 | TrueNAS SCALE | the Docker image, or the Linux `tar.gz` for your CPU |
 | FreeBSD (x86-64), **beta - still in testing** | `nzbfast-@VERSION@-freebsd-x64-beta.tar.gz` |
-| Docker | `docker pull nzbfast/nzbfast:@VERSION@` |
+| Docker | `docker pull nzbfast/nzbfast:@VERSION@`, or [`docker-compose.yml`](https://github.com/nzbfast/nzbfast/blob/main/docker-compose.yml) from the repo (`docker compose up -d`) |
 
 On Unraid there is nothing on this page to download. The Community Applications template fills in port 6789, the three paths and the Unraid user IDs, so there is nothing to write by hand.
 

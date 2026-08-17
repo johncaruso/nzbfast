@@ -675,7 +675,13 @@ fn queue_notices(d: &Daemon) -> QueueNotices {
         .delete_kept
         .lock_ok()
         .iter()
-        .map(|(name, path, why, at)| json!({"name": name, "path": path, "why": why, "at": at}))
+        .map(|n| {
+            // `retry` rather than the path itself: what the page needs
+            // to know is whether the button can be offered at all, and
+            // a spool path is not a thing to put in front of a person.
+            json!({"name": n.name, "path": n.path, "why": n.why, "at": n.at,
+                   "retry": !n.nzb.is_empty()})
+        })
         .collect();
     QueueNotices {
         watch_failed,
@@ -1495,7 +1501,7 @@ pub(super) fn queue_json(d: &Daemon, params: &std::collections::HashMap<String, 
         // The window this body answered for, echoed back as SAB does.
         "start": win_start,
         "limit": win_limit,
-        "finish": win_start + win_limit,
+        "finish": win_start.saturating_add(win_limit),
     }})
 }
 
@@ -2088,6 +2094,9 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                 // owner, and a job in the lane is not that.
                 d.cancel_tail_fetches(hit_id);
                 let mut stopped_active = false;
+                // Which job was on the wire: the stop signal is aimed by
+                // nzo_id, same as the REST arm.
+                let mut stopped_ids: Vec<String> = Vec::new();
                 // Slow work is collected under the queue lock and done
                 // after it, exactly like the SAB delete arm and for the
                 // reasons written there: file removal can hold locks for
@@ -2107,6 +2116,13 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                 // drops - park() pushes to history without the queue
                 // lock held, and this path keeps that order.
                 let mut to_history: Vec<Arc<Mutex<Job>>> = Vec::new();
+                // The releases this verb removes (the *arr's cancel is
+                // the same statement), and the spool copies a refused
+                // removal may still owe the notice. Both are settled
+                // after the lock - see the REST arm, which carries the
+                // rationale for each.
+                let mut deleted_names: Vec<String> = Vec::new();
+                let mut nzb_by_dir = std::collections::HashMap::new();
                 // Active jobs owed a history row park cannot file until
                 // its pipeline drains: they get a durable placeholder
                 // row instead, written before the save_queue at the end
@@ -2130,6 +2146,11 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                 q.retain(|j| {
                     let mut g = j.lock_ok();
                     if ids.contains(&nzo_int(&g.nzo_id)) {
+                        // ...but not the backup copy: see
+                        // `is_held_alternative`.
+                        if !is_held_alternative(&g) {
+                            deleted_names.push(g.name.clone());
+                        }
                         let active = g.state == JobState::Downloading;
                         let lane = g.state == JobState::Finishing;
                         g.delete_status = hist_status.to_string();
@@ -2142,6 +2163,7 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                             // it, the pre-M5 shape, when it is empty).
                             g.tombstone = true;
                             stopped_active = true;
+                            stopped_ids.push(g.nzo_id.clone());
                             // ...but park is a long way off - the fetch
                             // has to drain and the deferred file removal
                             // has to run (unbounded on a hung NAS)
@@ -2168,10 +2190,14 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                             g.tombstone = true;
                             if hist_status.is_empty() {
                                 // FinalDelete: no history row, so the
-                                // spooled NZB is dead weight. The other
-                                // verbs keep it - their history row is
-                                // retryable, and retry reads the spool.
-                                let _ = std::fs::remove_file(&g.nzb_path);
+                                // spooled NZB is dead weight - unless a
+                                // refused removal needs it back.
+                                hold_or_drop_spool(
+                                    del_files,
+                                    &g.out_dir,
+                                    &g.nzb_path,
+                                    &mut nzb_by_dir,
+                                );
                             } else {
                                 // The record becomes a history row now.
                                 // Stamped here, not rendered on the fly:
@@ -2289,9 +2315,8 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                 }
                 // A refused removal with the queue row already gone is
                 // invisible unless the notice names it.
-                for (name, dir, why) in kept {
-                    d.note_delete_kept(&name, &dir, &why);
-                }
+                note_kept_files(d, kept, &mut nzb_by_dir);
+                d.note_releases_deleted(&deleted_names);
                 // The sidecar's job waits for the sidecar. Its own
                 // reservation is released by the drain, not by the batch
                 // above - the removal is still ahead of it.
@@ -2317,14 +2342,11 @@ fn jr_editqueue(d: &Arc<Daemon>, params: &[Value], rpc_error: &mut Option<String
                 // client type the user configured in Sonarr decided
                 // whether the bug was reachable - the same shape the
                 // shared queue primitives were extracted to end.
-                if stopped_active && d.owns_hub(hit_id) {
-                    if let Some(f) = d.hub.abort.lock_ok().as_ref() {
-                        f.store(true, Ordering::Relaxed);
-                    }
-                    if let Some(c) = d.hub.queue_ctl.lock_ok().as_ref() {
-                        c.abort();
-                    }
-                }
+                //
+                // Shared with the REST arm now rather than hand-copied a
+                // fourth time, which is also how it inherits the re-fire
+                // the single shot needed - see `stop_deleted_transfer`.
+                super::api::queue::stop_deleted_transfer(d, stopped_ids);
                 // Shared with the REST delete rather than hand-copied a
                 // third time - the rationale (and the active-deletion
                 // exception) lives on the helper.

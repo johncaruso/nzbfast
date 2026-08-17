@@ -1298,7 +1298,52 @@ impl OuterHold {
                     stranded += 1;
                     continue;
                 };
-                if let Err(err) = std::fs::rename(&p, dir.join(name)) {
+                // NEVER replace. While the volumes were parked their
+                // names were free, and the nested pass publishes through
+                // `lift_scratch_into`, whose collision test is existence
+                // only - so a nested member legitimately named like one
+                // of the outer volumes lands at exactly this path. A bare
+                // rename then destroys it (POSIX rename, and Windows
+                // MoveFileEx with MOVEFILE_REPLACE_EXISTING, both replace
+                // a regular file) and the job still completes green. The
+                // same rename runs over a STALE hold in `park`, where the
+                // older parked copy would eat the current run's volume.
+                //
+                // Move the occupant aside under `lift_scratch_into`'s own
+                // scheme so both survive and the volume keeps the name its
+                // set depends on. If even that fails, leave the volume in
+                // the hold rather than replace: Drop keeps a non-empty
+                // hold and says so, which is the module's standing rule.
+                // A DIRECTORY in the way is left alone: rename refuses it
+                // outright, which is already the loud, non-destructive
+                // answer, and Drop then keeps the hold. Only the silent
+                // replacement is ours to prevent.
+                let dest = dir.join(name);
+                if dest.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
+                    let mut n = 1usize;
+                    let aside = loop {
+                        let cand = dir.join(format!("extracted-{n}-{}", name.to_string_lossy()));
+                        if cand.symlink_metadata().is_err() {
+                            break cand;
+                        }
+                        n += 1;
+                    };
+                    if let Err(err) = std::fs::rename(&dest, &aside) {
+                        warn!(
+                            target: "hold",
+                            "{} is occupied and the occupant could not be moved                              aside ({err}) - leaving the volume in the hold rather                              than overwriting",
+                            name.to_string_lossy()
+                        );
+                        stranded += 1;
+                        continue;
+                    }
+                    println!(
+                        "⚠ {} was produced while the outer volume of that name was                          parked - kept as {}",
+                        name.to_string_lossy(),
+                        aside.file_name().unwrap_or(name).to_string_lossy()
+                    );
+                }
+                if let Err(err) = std::fs::rename(&p, &dest) {
                     warn!(
                         target: "hold",
                         "could not put {} back: {err}",

@@ -41,6 +41,7 @@ mod daemon_idle;
 // whole (TODO 106).
 #[path = "daemon_park.rs"]
 mod daemon_park;
+pub(in crate::serve) use daemon_park::SidecarTailGuard;
 
 // How the daemon stops - the graceful wind-down under mode=shutdown and
 // SIGTERM/SIGINT - and the pause timer that stops it temporarily, with
@@ -147,12 +148,6 @@ impl Drop for IndexReader<'_> {
         self.pool.handed_back.notify_one();
     }
 }
-
-/// Every read connection is in use. Not an error in the database sense -
-/// nothing failed, the answer just is not available cheaply right now.
-#[cfg(feature = "indexer")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct IndexBusy;
 
 /// What [`Daemon::index_read_acquire`] could do for the caller.
 #[cfg(feature = "indexer")]
@@ -1547,7 +1542,11 @@ pub struct Daemon {
     /// The dashboard keeps it on screen until the user dismisses it,
     /// because the path IS the handle: the history row they would have
     /// found the download by is exactly what the delete removed.
-    pub(super) delete_kept: Mutex<std::collections::VecDeque<(String, String, String, i64)>>,
+    pub(super) delete_kept: Mutex<std::collections::VecDeque<KeptNote>>,
+    /// Releases the user has DELETED lately, newest last - the duplicate
+    /// check reads it and declines to hold a re-add of any of them. See
+    /// `Daemon::note_releases_deleted`.
+    pub(super) deleted_recent: Mutex<std::collections::VecDeque<dupe::DeleteMark>>,
     /// Failed API-key attempts per source address: (count, window start).
     ///
     /// The key comparison is constant-time, but nothing recorded a wrong one

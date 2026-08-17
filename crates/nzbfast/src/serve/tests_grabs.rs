@@ -190,6 +190,94 @@ fn a_failure_awaiting_its_automatic_retry_is_not_reported_dead() {
     assert_eq!(post_job_plan(&gone, "regrab", cooldown), None);
 }
 
+/// BUG: every dead post was downloaded TWICE. `MissingArticles` is
+/// transient at any age, so the one automatic retry armed on a post
+/// seven days old with 1965 of 4506 segments confirmed missing by four
+/// backbones - and labelled the cooldown "propagation", for a post
+/// whose propagation had finished six days earlier (job
+/// SABnzbd_nzo_nzbfast1786807567, 15 Aug 2026: two ~150 s runs,
+/// identical verdicts).
+///
+/// The asymmetry is the whole design: unknown age retries, and only the
+/// missing-articles class is gated at all.
+#[test]
+fn a_post_too_old_for_propagation_does_not_retry_itself() {
+    let cooldown = 900;
+    let census = "download incomplete: 1 file(s) with missing segments, 0 decode/write \
+                  errors; 1965 of 4506 segment(s) never arrived (1879 MB did)";
+    let aged = |days: u32| {
+        format!(
+            "{census}; the post is {days} day(s) old, well past the minutes-to-hours \
+             that propagation takes"
+        )
+    };
+    let with_msg = |msg: String| {
+        let mut j = job(json!({
+            "nzo_id": "SABnzbd_nzo_nzbfast1786807567",
+            "name": "Johnny.Vegas.Little.Shop.of.Antiques.S02E03",
+            "nzb_path": "/spool/x.nzb",
+            "out_dir": "/downloads/x",
+            "state": "Failed",
+        }));
+        j.fail_message = msg;
+        j
+    };
+
+    // Old enough that propagation cannot be the explanation: no second
+    // download, and the failure is FINAL - which is what lets the
+    // report, the re-grab and the M14f promotion run.
+    let old = with_msg(aged(7));
+    assert!(matches!(
+        fail_kind(&old.fail_message),
+        FailKind::MissingArticles
+    ));
+    assert!(
+        !auto_retry_eligible(&old, cooldown),
+        "a 7-day-old post is not waiting on propagation"
+    );
+    assert_eq!(post_job_plan(&old, "regrab", cooldown), Some(true));
+
+    // The boundary, both sides of it. GONE_MIN_AGE_DAYS is the line the
+    // project already draws; this must not invent a second one.
+    let last_young = crate::diag::GONE_MIN_AGE_DAYS - 1;
+    assert!(auto_retry_eligible(&with_msg(aged(last_young)), cooldown));
+    assert!(!auto_retry_eligible(
+        &with_msg(aged(crate::diag::GONE_MIN_AGE_DAYS)),
+        cooldown
+    ));
+
+    // Unknown age keeps today's behaviour: a dateless NZB reads as age
+    // 0 and writes no clause at all, and unknown is not old.
+    assert!(auto_retry_eligible(&with_msg(census.to_string()), cooldown));
+
+    // A stalled pool on THIS machine says nothing about the post, so
+    // the transport retry is right at any age. Its message carries no
+    // age clause either - the gate is belt and braces.
+    let transport = with_msg(format!(
+        "download failed on connection errors: 1 file(s) lost segments to transport \
+         failures (40 in all - no server said any article was missing), 0 \
+         decode/write errors{}",
+        "; the post is 9 day(s) old, well past the minutes-to-hours that propagation takes"
+    ));
+    assert!(matches!(
+        fail_kind(&transport.fail_message),
+        FailKind::Transport
+    ));
+    assert!(
+        auto_retry_eligible(&transport, cooldown),
+        "transport is ours, not the post's"
+    );
+
+    // A repair verdict is not the missing-articles class: its retry
+    // re-fetches gaps and can pull more recovery volumes.
+    let unrepairable = with_msg(
+        "verification failed and PAR2 repair could not complete: 1669 recovery \
+         block(s) needed but the NZB only carries 40"
+            .into(),
+    );
+    assert!(auto_retry_eligible(&unrepairable, cooldown));
+}
+
 /// BUG (MEDIUM): the config write logged the raw value with a
 /// three-name deny-list, so every notification token and every feed
 /// url (which carries the indexer apikey) went to stdout - which

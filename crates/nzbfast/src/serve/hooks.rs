@@ -47,6 +47,54 @@
 use super::*;
 use std::time::Duration;
 
+/// Has this record been handed to a NEW round since `gen0` was taken?
+///
+/// The RETRY half of `Daemon::record_generation` only, and this is the
+/// one caller that may not ask the whole question. Every other fence
+/// runs before `park`; the hook worker is detached and its caller parks
+/// the instant it has spawned it - and `park` stamps a queue -> history
+/// move of its own (§158 item 1), which bumps `move_seq`. Comparing the
+/// pair therefore raced the park and dropped the pp-script and every
+/// notification of an ORDINARY completion, at random (the daemon
+/// suite's `sonarr_style_cycle` caught it within the hour). Filing a
+/// finished job into history is not a change of custody; `retry`
+/// bumping `retries` is exactly that, and it is what re-queues the
+/// record this worker would otherwise be talking about.
+fn retried_since(j: &Job, gen0: Option<(u32, u64)>) -> bool {
+    gen0.is_some_and(|(retries, _)| j.retries != retries)
+}
+
+/// Test seam: the post-job hook worker trips it as its first act, once
+/// it is on the blocking pool and before it has checked anything - the
+/// window between the fenced PLAN and the unfenced side effects. First
+/// barrier says the worker is in that window; second releases it, and is
+/// waited a SECOND time by both sides once the fan-out is over, so a
+/// test can assert what did and did not happen without polling.
+///
+/// Keyed by nzo_id, like `postproc::TAIL_GEN_BARRIER`: every completion
+/// in this binary reaches this worker, the bin tests run in parallel,
+/// and an unkeyed two-party barrier does not fail such a run, it HANGS
+/// it (15 Aug, twice).
+#[cfg(test)]
+pub(in crate::serve) static HOOKS_GEN_BARRIER: Mutex<
+    Option<(String, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+> = Mutex::new(None);
+
+/// What a finished job still owes the outside world, decided once and
+/// then discharged - the post-processing script, the notification
+/// targets, and whether a failure report is due on top.
+struct PostJobOwed {
+    script: Option<PathBuf>,
+    targets: Vec<crate::notify::Target>,
+    failing: bool,
+    /// Snapshotted beside the plan, never re-read in the worker - see
+    /// the note at the snapshot site.
+    cx: crate::notify::Ctx,
+    /// The round the plan was decided on, so the detached worker can
+    /// re-ask custody before each side effect ([`retried_since`]).
+    gen0: Option<(u32, u64)>,
+}
+
 impl Daemon {
     /// §129 2e: fire the notification targets routed onto a warning
     /// event ("disk", "quota"). Cheap no-op unless a target actually
@@ -70,21 +118,6 @@ impl Daemon {
             }
         });
     }
-
-    /// Everything a finished job owes the outside world: the
-    /// post-processing script, then the notification targets. One entry
-    /// point because a job ends in three different places (runner tail,
-    /// idle-server sidecar, library metadata-only pick) and each of them
-    /// used to grow its own copy of the script call.
-    ///
-    /// Order matters: the script may still be moving or renaming files,
-    /// and a library scan that runs first indexes the state before it.
-    /// Both go on the blocking pool, together, so a slow script delays
-    /// the scan rather than the queue.
-    pub(in crate::serve) fn run_post_job_hooks(self: &Arc<Self>, job: &Arc<Mutex<Job>>) {
-        self.run_post_job_hooks_gen(job, None)
-    }
-
     /// [`Self::run_post_job_hooks`], fenced to the round of the record's
     /// life the caller started on.
     ///
@@ -101,44 +134,182 @@ impl Daemon {
         job: &Arc<Mutex<Job>>,
         gen0: Option<(u32, u64)>,
     ) {
+        let Some(owed) = self.post_job_owed(job, gen0) else {
+            return;
+        };
+        self.spawn_post_job(owed, job);
+    }
+
+    /// [`Self::run_post_job_hooks_gen`] with the post-processing SCRIPT
+    /// finished before this returns, for the one caller whose very next
+    /// statement is `park`.
+    ///
+    /// `park` is what files the job into history, and history is where
+    /// a SAB client reads "Completed" - Sonarr imports on that word.
+    /// The script is the step of post-processing most likely to still
+    /// be MOVING the payload (a sorter, a renamer, a library filer),
+    /// which is precisely what the *arr is about to walk. Firing it
+    /// beside `park` rather than before it made the whole contract a
+    /// race: measured over 80 runs of `sonarr_style_cycle` at 20-way
+    /// parallelism the script landed 105-313 ms AFTER the history row,
+    /// and nothing whatever ordered the two -
+    /// the hook is dispatched to the blocking pool and `park` runs on
+    /// regardless, so a loaded box can widen that gap without limit.
+    /// That race is also the `sonarr_style_cycle` intermittent (a
+    /// "hook never ran" that goes green on a rerun): the suite asserts
+    /// the contract, and the product satisfied it by luck.
+    ///
+    /// Only the script is awaited, and the rest is left exactly as it
+    /// was: `report_failure` can re-grab a replacement for the title
+    /// that just failed, and waiting for THAT before `park` would put
+    /// the replacement in the queue while the row it replaces is still
+    /// sitting in it - which is the ordering `park_gen`'s
+    /// promote-the-held-duplicate arm is written against. The
+    /// notifications ride along with it for the same reason: nothing
+    /// asked for them to move.
+    pub(in crate::serve) async fn run_post_job_hooks_before_park(
+        self: &Arc<Self>,
+        job: &Arc<Mutex<Job>>,
+        gen0: Option<(u32, u64)>,
+    ) {
+        let Some(mut owed) = self.post_job_owed(job, gen0) else {
+            return;
+        };
+        if let Some(script) = owed.script.take() {
+            let (d, j) = (self.clone(), job.clone());
+            if let Err(e) = tokio::task::spawn_blocking(move || d.run_script(&script, &j)).await {
+                // A panicking script runner must not take the tail (and
+                // with it `park`) down: the job is finished either way,
+                // and a record stuck outside both stores is the worse
+                // failure. Say so - this is the one place that knows.
+                warn!(target: "script", "the post-processing hook did not finish: {e}");
+            }
+        }
+        self.spawn_post_job(owed, job);
+    }
+
+    /// What this finished job still owes, decided on the caller's
+    /// thread and under one hold of the record.
+    ///
+    /// `None` is "nothing at all", and it is deliberately noisy about
+    /// the one case that is not obvious from the outside: a record that
+    /// left the round the caller started on. A pp-script that never ran
+    /// is otherwise indistinguishable in a log from one that failed to
+    /// spawn, and telling those two apart is the whole of the diagnosis
+    /// when someone reports "my script did not run".
+    fn post_job_owed(
+        &self,
+        job: &Arc<Mutex<Job>>,
+        gen0: Option<(u32, u64)>,
+    ) -> Option<PostJobOwed> {
         let script = self.resolve_script(job);
         let targets = self.notify_targets.lock_ok().clone();
         let mode = self.failure_link.lock_ok().clone();
         let secs = self.auto_retry_secs.load(Ordering::Relaxed);
-        let plan = {
-            let g = job.lock_ok();
-            Daemon::same_generation(&g, gen0)
-                .then(|| post_job_plan(&g, &mode, secs))
-                .flatten()
-        };
-        let Some(failing) = plan else {
-            return;
-        };
+        let g = job.lock_ok();
+        if !Daemon::same_generation(&g, gen0) {
+            info!(
+                target: "script",
+                "{}: no post-job hooks - the record left the round this tail started on",
+                g.nzo_id
+            );
+            return None;
+        }
+        let failing = post_job_plan(&g, &mode, secs)?;
+        // The notification context comes off the record HERE, under the
+        // same hold as the plan, and rides into the worker as owned
+        // data. It used to be read inside the worker, AFTER the
+        // pp-script returned - so for a job deleted and retried while
+        // that script ran (the documented case: "the script may still be
+        // moving or renaming files"), the send described the RETRY
+        // instead: an empty error and the retry's output directory,
+        // routed to the targets that subscribe to the wrong outcome
+        // (sweep 3, H3).
+        let cx = crate::notify::Ctx::from_locked(&g);
+        Some(PostJobOwed {
+            script,
+            targets,
+            failing,
+            cx,
+            gen0,
+        })
+    }
+
+    /// Everything in [`PostJobOwed`] that is left, on the blocking
+    /// pool. Cheap no-op when nothing is owed.
+    fn spawn_post_job(self: &Arc<Self>, owed: PostJobOwed, job: &Arc<Mutex<Job>>) {
+        let PostJobOwed {
+            script,
+            targets,
+            failing,
+            cx,
+            gen0,
+        } = owed;
         if script.is_none() && targets.is_empty() && !failing {
             return;
         }
         let d = self.clone();
         let job = job.clone();
         tokio::task::spawn_blocking(move || {
-            if let Some(script) = script {
-                d.run_script(&script, &job);
+            #[cfg(test)]
+            let seam = {
+                // The id is read BEFORE the seam lock (see
+                // `daemon_park`): a job lock taken under the seam guard
+                // would order the two the other way round from every
+                // other reader of this record.
+                let id = job.lock_ok().nzo_id.clone();
+                HOOKS_GEN_BARRIER
+                    .lock_ok()
+                    .clone()
+                    .filter(|(k, _, _)| *k == id)
+            };
+            #[cfg(test)]
+            if let Some((_, open, release)) = &seam {
+                open.wait();
+                release.wait();
             }
-            if !targets.is_empty() {
-                // §G: keep what each delivery did, so the settings row
-                // can say "last send failed: HTTP 401". The map is keyed
-                // by kind+url+name and only ever grows to the number of
-                // targets the user has configured.
-                let out =
-                    crate::notify::fire(&targets, &crate::notify::Ctx::from_job(&job), unix_now());
-                let mut health = d.notify_health.lock_ok();
-                for (k, o) in out {
-                    health.insert(k, o);
+            // A closure so the seam's completion rendezvous below is
+            // reached on every early return, not just the last one.
+            let fan_out = move || {
+                // The plan was fenced; the SIDE EFFECTS were not. This
+                // worker is detached and the caller parks straight after
+                // it, so a delete verb plus a Retry can land between the
+                // two - and then the script runs inside a live
+                // download's folder, and the targets are told that a
+                // release which is at that moment queued has finished.
+                // Asked again below, because the script in between can
+                // run for minutes.
+                if retried_since(&job.lock_ok(), gen0) {
+                    return;
                 }
-            }
-            // Last: a webhook that reports failures should say so before
-            // a replacement for the same title appears in the queue.
-            if failing {
-                d.report_failure(&job);
+                if let Some(script) = script {
+                    d.run_script(&script, &job);
+                }
+                if !targets.is_empty() && !retried_since(&job.lock_ok(), gen0) {
+                    // §G: keep what each delivery did, so the settings
+                    // row can say "last send failed: HTTP 401". The map
+                    // is keyed by kind+url+name and only ever grows to
+                    // the number of targets the user has configured.
+                    let out = crate::notify::fire(&targets, &cx, unix_now());
+                    let mut health = d.notify_health.lock_ok();
+                    for (k, o) in out {
+                        health.insert(k, o);
+                    }
+                }
+                // Last: a webhook that reports failures should say so
+                // before a replacement for the same title appears in the
+                // queue.
+                if failing {
+                    d.report_failure(&job);
+                }
+            };
+            fan_out();
+            #[cfg(test)]
+            if let Some((_, _, done)) = &seam {
+                // Second rendezvous on the SAME barrier: the test has
+                // released the worker, and this says the fan-out is
+                // over. Both sides wait twice, so the pairing holds.
+                done.wait();
             }
         });
     }
@@ -923,5 +1094,125 @@ mod tests {
         let o = h.get(&key).expect("outcome recorded");
         assert_eq!(o.code, 404);
         assert!(o.error.contains("HTTP 404"), "{}", o.error);
+    }
+
+    /// The hook fan-out must belong to the round the caller planned it
+    /// from - and must describe THAT round, not whatever the record has
+    /// become by the time a slow pp-script returns.
+    ///
+    /// The generation was checked while the plan was built and then the
+    /// worker was detached: the caller parks immediately, so a delete
+    /// verb plus a Retry lands between the two and the script then runs
+    /// inside a live download's folder while the targets are told a
+    /// queued release has finished. And the notify context was read
+    /// LIVE, after the script - which for the documented slow script
+    /// ("it may still be moving or renaming files") described the record
+    /// as it was minutes later: status "Failed", an empty error, and a
+    /// directory the plan never saw (Codex sweep 3, H3).
+    ///
+    /// Both halves in one test on purpose: a fence that declined
+    /// everything would pass the first assert and silence every real
+    /// completion notification.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_hook_fan_out_is_fenced_and_describes_the_round_it_was_planned_from() {
+        let dir = scratch("hookgen");
+        let d = testutil::test_daemon(&dir);
+        // The stale half's target is a REFUSED port on purpose: a
+        // regression there must fail this test in milliseconds, not
+        // block the worker on a socket nobody is accepting.
+        let refused = target("http://127.0.0.1:1/hook", &["completed"], "");
+        let refused_key = crate::notify::target_key(&refused);
+        *d.notify_targets.lock_ok() = vec![refused];
+
+        // A two-party seam is only ever entered by the job it names.
+        let stage = |id: &str| {
+            let open = Arc::new(std::sync::Barrier::new(2));
+            let release = Arc::new(std::sync::Barrier::new(2));
+            *HOOKS_GEN_BARRIER.lock_ok() = Some((id.into(), open.clone(), release.clone()));
+            (open, release)
+        };
+        let wait = |b: Arc<std::sync::Barrier>| async move {
+            tokio::task::spawn_blocking(move || b.wait()).await.unwrap();
+        };
+        let completed_job = |id: &str, out: &std::path::Path| {
+            Arc::new(Mutex::new(
+                job_from_json(&json!({
+                    "nzo_id": id,
+                    "name": id,
+                    "nzb_path": dir.join("hooked.nzb").to_string_lossy(),
+                    "out_dir": out.to_string_lossy(),
+                    "state": "Completed",
+                }))
+                .expect("job"),
+            ))
+        };
+
+        // --- the stale direction: deleted and retried mid-fan-out -----
+        let out = dir.join("Hooked.Release");
+        let job = completed_job("nzo-hookgen-1", &out);
+        let gen0 = Daemon::record_generation(&job.lock_ok());
+        let (open, release) = stage("nzo-hookgen-1");
+        d.run_post_job_hooks_gen(&job, Some(gen0));
+        wait(open).await;
+        {
+            // What a delete verb plus the Retry it enables leaves: the
+            // same Arc, queued to run again, one generation on.
+            let mut g = job.lock_ok();
+            g.retries += 1;
+            g.state = JobState::Queued;
+        }
+        wait(release.clone()).await;
+        wait(release).await;
+        assert!(
+            !d.notify_health.lock_ok().contains_key(&refused_key),
+            "the stale worker announced a completion for a release that is queued to download"
+        );
+
+        // --- the content direction: the plan's round, not the live row -
+        // A delete that files the row bumps no generation, so the fence
+        // waves this one through and the SNAPSHOT is what keeps the send
+        // honest.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        *d.notify_targets.lock_ok() = vec![target(&url, &["completed"], "")];
+        let key = crate::notify::target_key(&d.notify_targets.lock_ok()[0]);
+        let out2 = dir.join("Second.Release");
+        let job2 = completed_job("nzo-hookgen-2", &out2);
+        let gen2 = Daemon::record_generation(&job2.lock_ok());
+        let (open2, release2) = stage("nzo-hookgen-2");
+        d.run_post_job_hooks_gen(&job2, Some(gen2));
+        wait(open2).await;
+        {
+            let mut g = job2.lock_ok();
+            g.state = JobState::Failed;
+            g.fail_message = "deleted from the queue".into();
+            g.out_dir = dir.join("Somewhere.Else");
+        }
+        let addr = l.local_addr().unwrap();
+        let accept = std::thread::spawn(move || accept_one(&l, "200 OK"));
+        wait(release2.clone()).await;
+        wait(release2).await;
+        // The fan-out is over. If it delivered nothing, this probe is
+        // what the accept above takes instead - it closes at once, so
+        // the thread panics and this test FAILS rather than hanging on a
+        // socket nobody will ever connect to.
+        let _ = std::net::TcpStream::connect(addr);
+        let (_head, body) = accept.join().expect(
+            "no notification was delivered: the send read the record live, after the script",
+        );
+        *HOOKS_GEN_BARRIER.lock_ok() = None;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["status"], "Completed",
+            "the send described the record as it was minutes later: {v}"
+        );
+        assert_eq!(v["dir"], out2.to_string_lossy().to_string(), "{v}");
+        assert_eq!(v["error"], "", "{v}");
+        assert!(
+            d.notify_health.lock_ok().contains_key(&key),
+            "and the live half still records its outcome"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

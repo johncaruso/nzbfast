@@ -130,7 +130,13 @@ pub(super) fn serve_file_range(req: tiny_http::Request, path: &std::path::Path) 
     } else {
         b"video/x-matroska"
     };
-    let len = end - start;
+    // ONE clamped value behind the header, the reader and data_length,
+    // so a 32-bit target cannot disagree with itself. `Some(len as usize)`
+    // truncates on armv7, and tiny_http then DROPS the textual
+    // Content-Length (its add_header parses it into usize and gives up on
+    // Err) while `io::copy` ships the full body - a 5 GB file behind a
+    // 705 MB header. A no-op on 64-bit.
+    let len = (end - start).min(usize::MAX as u64);
     let mut resp = tiny_http::Response::new(
         tiny_http::StatusCode(status),
         vec![
@@ -1316,6 +1322,10 @@ pub(super) fn serve_range(
     };
     // tiny_http chunks any body over ~1 MB even with a known length -
     // players want identity + exact Content-Length for seeking.
+    //
+    // Clamped once, for the header and data_length together: see the
+    // note in `serve_file`. A no-op on 64-bit.
+    let span_len = (end - start).min(usize::MAX as u64);
     let mut resp = tiny_http::Response::new(
         tiny_http::StatusCode(status),
         vec![
@@ -1323,12 +1333,12 @@ pub(super) fn serve_range(
             tiny_http::Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap(),
             tiny_http::Header::from_bytes(
                 &b"Content-Length"[..],
-                (end - start).to_string().into_bytes(),
+                span_len.to_string().into_bytes(),
             )
             .unwrap(),
         ],
         reader,
-        Some((end - start) as usize),
+        Some(span_len as usize),
         None,
     )
     .with_chunked_threshold(usize::MAX);

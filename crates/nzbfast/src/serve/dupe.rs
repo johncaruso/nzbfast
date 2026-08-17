@@ -31,6 +31,24 @@ impl Daemon {
         if is_proper(stem) {
             return None;
         }
+        // The user deleted this release and is asking for it again. That
+        // is not a duplicate, it is the same instruction twice, and the
+        // hold used to answer it by parking the re-add paused behind
+        // whatever else still carried the identity - a leftover twin
+        // record, an *arr's own re-grab, an older copy of the episode -
+        // with no way out but a control they had to go and find. A
+        // deleted record is one the user has said they do not have,
+        // whatever is still sitting on disk; see `note_releases_deleted`
+        // for what stamps the mark and `clear_delete_mark` for what
+        // spends it.
+        if let Some(was) = self.deleted_recently(stem) {
+            info!(
+                target: "queue",
+                "{stem:?} is not held as a duplicate - you deleted {was:?} \
+                 recently, so this add is the re-download you asked for"
+            );
+            return None;
+        }
         // dupe_scope = "exact" (#41): only a re-add of the same release
         // name is a duplicate, compared through `exact_dupe_key` so
         // separator styles still meet. The smart key stays on the job
@@ -208,4 +226,135 @@ impl Daemon {
             g.nzo_id == nzo_id && g.paused && g.priority == DUPE_PRIORITY
         })
     }
+}
+
+/// One release the USER deleted, kept just long enough to stop the
+/// duplicate machinery arguing with them about it.
+///
+/// Both keys, because both are what a hold is decided by: `exact` is the
+/// same-release-again comparison (`dupe_scope = "exact"`), `smart` the
+/// same-episode/film identity. A mark matches an add when EITHER meets
+/// it - the mark only ever releases a hold, never creates one, so the
+/// generous side is the safe side.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(in crate::serve) struct DeleteMark {
+    /// What the deleted record was called. Not used for matching - it is
+    /// what the log line says, and a key alone names nothing a person
+    /// would recognise.
+    pub name: String,
+    pub exact: String,
+    pub smart: Option<String>,
+    pub at: i64,
+}
+
+/// How long the user's delete speaks for them. Long enough to cover
+/// "delete, restart the machine to shake the file lock loose, add it
+/// again" - the exact loop a refused Trash sends people round - and
+/// short enough that a mark cannot sit there for a week releasing holds
+/// nobody remembers asking for.
+const DELETE_MARK_SECS: i64 = 24 * 3600;
+
+impl Daemon {
+    /// Remember that the user deleted these releases.
+    ///
+    /// One call per delete REQUEST, not per record: a bulk history sweep
+    /// is one save, not five hundred.
+    pub(in crate::serve) fn note_releases_deleted(&self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        {
+            let now = unix_now();
+            let mut m = self.deleted_recent.lock_ok();
+            m.retain(|d| now - d.at < DELETE_MARK_SECS);
+            for name in names {
+                let exact = exact_dupe_key(name);
+                let smart = dupe_key(name);
+                // A release deleted twice is one mark, re-stamped: the
+                // second delete is the fresher statement of intent.
+                m.retain(|d| !mark_meets(d, &exact, &smart));
+                m.push_back(DeleteMark {
+                    name: name.clone(),
+                    exact,
+                    smart,
+                    at: now,
+                });
+            }
+            while m.len() > 64 {
+                m.pop_front();
+            }
+        }
+        self.save_deleted_recent();
+    }
+
+    /// Did the user delete this release recently? A peek - see
+    /// `clear_delete_mark` for the half that spends it.
+    ///
+    /// Read by `dupe_collision`, so every caller of the duplicate check
+    /// agrees: the queue hold, the wall's "you already have this"
+    /// question and the *arr-facing add reply all stop claiming a
+    /// release the user has just told us they no longer have.
+    pub(in crate::serve) fn deleted_recently(&self, stem: &str) -> Option<String> {
+        let (exact, smart) = (exact_dupe_key(stem), dupe_key(stem));
+        let now = unix_now();
+        self.deleted_recent
+            .lock_ok()
+            .iter()
+            .find(|d| now - d.at < DELETE_MARK_SECS && mark_meets(d, &exact, &smart))
+            .map(|d| d.name.clone())
+    }
+
+    /// Spend the mark: this release has now been re-added, so the user's
+    /// delete has been honoured and the NEXT copy is an ordinary
+    /// duplicate of the one just queued.
+    ///
+    /// Without this the window would leave the identity unprotected for
+    /// a whole day - two adds of one release would both queue and both
+    /// download, which is the thing the hold exists to stop.
+    pub(in crate::serve) fn clear_delete_mark(&self, stem: &str) {
+        let (exact, smart) = (exact_dupe_key(stem), dupe_key(stem));
+        let spent = {
+            let mut m = self.deleted_recent.lock_ok();
+            let before = m.len();
+            m.retain(|d| !mark_meets(d, &exact, &smart));
+            m.len() < before
+        };
+        if spent {
+            self.save_deleted_recent();
+        }
+    }
+
+    /// Persist the marks to `.spool/deleted-recent.json`.
+    ///
+    /// They outlive the process for the same reason the kept-files
+    /// notice does, and in the same story: the advice for a delete the
+    /// Trash refused is to try again in a few minutes, and restarting
+    /// the daemon (or the machine) is what people actually do in
+    /// between. A mark lost at that restart is a hold the user then has
+    /// to force their way past - which is exactly the round trip this
+    /// exists to end.
+    ///
+    /// Lock held across the write, like `save_delete_kept`, so two
+    /// writers cannot land in the opposite order to the states they
+    /// carry. It is a leaf: no queue or history lock is held by any
+    /// caller of `note_releases_deleted`.
+    fn save_deleted_recent(&self) {
+        let path = self.spool.join("deleted-recent.json");
+        let m = self.deleted_recent.lock_ok();
+        if let Ok(text) = serde_json::to_string_pretty(&*m) {
+            let _ = crate::persist::write_atomic(&path, text.as_bytes());
+        }
+    }
+}
+
+/// Does this mark speak for the release these keys describe?
+///
+/// An empty `exact` never matches (a name that normalises to nothing
+/// would otherwise meet every other one), and a `None` smart key never
+/// matches for the same reason - `dupe_key` returns None when the name
+/// carries no episode or year to be identified by, and two unidentified
+/// releases are not the same release.
+fn mark_meets(mark: &DeleteMark, exact: &str, smart: &Option<String>) -> bool {
+    (!exact.is_empty() && mark.exact == *exact)
+        || (smart.is_some() && mark.smart.is_some() && mark.smart == *smart)
 }

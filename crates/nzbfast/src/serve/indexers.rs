@@ -468,13 +468,23 @@ pub(super) fn resolve_nzblnk(
             r.total_bytes,
         )
     };
-    // with_index_read on both index calls: this is an interactive
-    // handler, and rung 3 of find_by_header is a table scan. On the
-    // read-write connection a catch-up ingest or maintenance pass would
-    // park the paste for as long as it holds the mutex (measured at 62s
-    // for wall2 before the read-only connection existed).
+    // A read-only connection on both index calls: this is an
+    // interactive handler, and rung 3 of find_by_header is a table scan.
+    // On the read-write connection a catch-up ingest or maintenance pass
+    // would park the paste for as long as it holds the mutex (measured
+    // at 62s for wall2 before the read-only connection existed).
+    //
+    // index_read_checked, not with_index_read: the flattening wrapper
+    // reports a saturated read pool or a twice-failed SQLITE_SCHEMA as
+    // None, which this ladder cannot tell from "we do not have that
+    // post" - so it would fall through to rung 2 and send the user's
+    // header to third-party indexers, spending their API quota and
+    // re-downloading a post the index already holds (read-only sweep 3,
+    // 16 Aug 2026, L2). Both causes are transient: say so and let the
+    // user paste again rather than escalating on a read that never
+    // happened.
     #[cfg(feature = "indexer")]
-    let local = d.with_index_read(|ix| {
+    let local = match d.index_read_checked(|ix| {
         let mut best: Option<nzbkit::index::Release> = None;
         for r in ix.find_by_header(&l.header, 8).ok()? {
             if best.as_ref().is_none_or(|b| rank(&r) > rank(b)) {
@@ -482,7 +492,12 @@ pub(super) fn resolve_nzblnk(
             }
         }
         best
-    });
+    }) {
+        Err(why) => {
+            return json!({"status": false, "busy": true, "error": why.message()});
+        }
+        Ok(best) => best,
+    };
     #[cfg(feature = "indexer")]
     let queue_local = |r: &nzbkit::index::Release,
                        partial: bool,
@@ -697,6 +712,74 @@ pub(super) fn resolve_nzblnk(
     json!({"status": false, "reason": "notfound", "notes": notes,
            "error": "nothing found for that link - the post may be too new to be indexed, \
                      or too old to still be on your server"})
+}
+
+#[cfg(all(test, feature = "indexer"))]
+mod nzblnk_local_read_tests {
+    use super::*;
+
+    /// A local index read that FAILED must not be spent as "we do not
+    /// have that post".
+    ///
+    /// `with_index_read` flattens a saturated read pool and a
+    /// twice-failed SQLITE_SCHEMA into `None`, and this ladder read that
+    /// as a clean local miss: it walked on to rung 2 and sent the user's
+    /// header to every configured third-party indexer, spending their
+    /// API quota and re-downloading a post the index already held
+    /// (read-only sweep 3, 16 Aug 2026, L2). Both causes are transient,
+    /// so the honest answer is "not right now" and the user pastes
+    /// again.
+    #[test]
+    fn a_failed_local_read_is_not_a_local_miss() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-nzblnk-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = crate::serve::testutil::test_daemon(&dir);
+        d.index_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // A read-write open runs the migrations and publishing it sets
+        // `index_migrated`, which is what routes the lookup below to the
+        // read POOL rather than to the startup fallback on the write
+        // mutex (the same setup the seam's own tests use).
+        let era = d.index_era();
+        let fresh = nzbkit::index::Index::open(&d.index_db).expect("open the index");
+        d.publish_index(era, fresh);
+
+        // Arm the pooled connection and hand it straight back: the idle
+        // list is a stack, so the very next read pops the connection
+        // just released. Two injected faults is one more than the retry
+        // absorbs, so the header lookup stamps the fault the seam reads
+        // - the real race (a writer changing the schema between prepare
+        // and step, twice) is what this stands in for.
+        assert!(
+            matches!(
+                d.index_read_checked(|ix| {
+                    ix.debug_fail_next_queries(2);
+                    Some(())
+                }),
+                Ok(Some(()))
+            ),
+            "arming must not itself look like a fault"
+        );
+
+        let l = nzbkit::nzblnk::NzbLnk {
+            header: "some.obfuscated.header".into(),
+            ..Default::default()
+        };
+        let j = resolve_nzblnk(&d, &l, "", 0, None, false);
+        assert_eq!(
+            j["busy"],
+            json!(true),
+            "a read that FAILED must be reported as transient, not escalated: {j}"
+        );
+        assert_ne!(
+            j["reason"],
+            json!("notfound"),
+            "the ladder must not have run to the bottom on a read that never happened: {j}"
+        );
+        drop(d);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

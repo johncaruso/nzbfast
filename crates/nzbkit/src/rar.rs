@@ -1145,7 +1145,20 @@ fn parse_v5_body(hdr: &[u8], base: u64, envelope: u64) -> BlockResult {
         data_size = v;
         p += n;
     }
-    let next = base + envelope + data_size;
+    // CHECKED, exactly as the RAR4 twin below is and for the same
+    // reason: `data_size` is an attacker-declared vint and `vint` will
+    // return values within a few bytes of `u64::MAX`, so the plain sum
+    // panics in debug and WRAPS in release. A wrapped `next` is small
+    // but still greater than `cursor`, so it slips past both of
+    // `advance_to`'s tests - defeating the very volume bound whose job
+    // is to refuse a data area running off the end. The header CRC is
+    // no defence: a poster stamps it over any fields at all.
+    let Some(next) = base
+        .checked_add(envelope)
+        .and_then(|v| v.checked_add(data_size))
+    else {
+        return BlockResult::Corrupt("v5 block runs past the end of addressable space");
+    };
 
     match btype {
         4 => {

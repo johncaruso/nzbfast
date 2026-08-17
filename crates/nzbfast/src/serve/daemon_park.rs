@@ -232,11 +232,17 @@ impl Daemon {
     /// `jsonrpc_delete_stops_a_prefetching_job`, which failed on
     /// "the delete did not stop the prefetch" roughly 1 run in 40 in
     /// release - the whole reason that assertion exists.
-    pub(in crate::serve) fn poke_sidecar(self: &Arc<Self>, hit: impl Fn(&str) -> bool) {
+    ///
+    /// Returns whether it found a sidecar to fire at. Most callers only
+    /// want the signal sent and ignore it; `requeue_category` needs the
+    /// answer, because the sidecar's exit path is what moves a
+    /// re-pointed job's part-downloaded files - and with no sidecar
+    /// live, nobody else does (Codex sweep 3, M12).
+    pub(in crate::serve) fn poke_sidecar(self: &Arc<Self>, hit: impl Fn(&str) -> bool) -> bool {
         // Inline first, so the transfer is already stopping by the time the
         // delete/pause API call returns.
         let Some(target) = self.fire_sidecar_abort(&hit) else {
-            return;
+            return false;
         };
         let d = self.clone();
         std::thread::spawn(move || {
@@ -250,6 +256,7 @@ impl Daemon {
                 }
             }
         });
+        true
     }
 
     /// One abort signal at the current sidecar, if `hit` accepts it.
@@ -361,7 +368,10 @@ impl Daemon {
             // response left to ride back on - same as park's deferred
             // removal, and the notice is how it reaches the user.
             if let FilesGone::Kept(why) = remove_job_files(&dir, &name, filed, &tail) {
-                d.note_delete_kept(&name, &dir, &why);
+                // No NZB to offer: the delete handler removed this job's
+                // spool copy when it took the row out of the queue, long
+                // before the sidecar had finished with the directory.
+                d.note_delete_kept(&name, &dir, &why, None);
             }
             d.reserved.lock_ok().remove(&dir);
         });
@@ -436,22 +446,73 @@ impl Daemon {
     /// The path is the replacement handle, which is why it is stored
     /// rather than the id: they cannot open a record that no longer
     /// exists, but they can go and look at the folder.
-    pub(in crate::serve) fn note_delete_kept(&self, name: &str, path: &std::path::Path, why: &str) {
+    /// `nzb` is the spooled NZB this delete did NOT throw away, so the
+    /// notice can offer the download again in place. None where there is
+    /// nothing to offer - a job with no spool copy left, or a caller
+    /// (the watchlist's upgrade sweep) whose refusal is not a download
+    /// the user was asking to repeat.
+    ///
+    /// Never a copy some OTHER record still names. The M5 arm of
+    /// `park_gen` files a deleted-but-retryable history row that keeps
+    /// `nzb_path` and reads it back on retry, and the refusal in that
+    /// same park used to hand the notice that very path: one file, two
+    /// owners, neither aware of the other. Dismissing the strip - or
+    /// pressing "download it again", or letting the notice age off the
+    /// 12-entry ring - then removed the NZB the history row's retry
+    /// button needs, and the retry failed with a raw ENOENT out of the
+    /// NZB read (Codex sweep 3, M11; reachable from JSON-RPC
+    /// GroupDelete / GroupDupeDelete on an ACTIVE job). A notice with
+    /// no NZB is an ordinary one - it keeps the folder handle and loses
+    /// only the button, which the surviving history row provides.
+    ///
+    /// Returns whether a notice was actually filed, which is the only
+    /// answer to "does anything name that NZB now?". The dedupe below
+    /// drops the whole entry, `nzb` included, so a caller that handed
+    /// its spool copy over on faith kept a file nothing can reach - the
+    /// exact litter this notice exists to complain about.
+    pub(in crate::serve) fn note_delete_kept(
+        &self,
+        name: &str,
+        path: &std::path::Path,
+        why: &str,
+        nzb: Option<&std::path::Path>,
+    ) -> bool {
         {
             let mut k = self.delete_kept.lock_ok();
             let path = path.display().to_string();
             // One entry per path. A bulk history sweep over a shared season
             // folder refuses once per record, and a dozen identical rows
             // would bury the one thing the notice has to say.
-            if k.iter().any(|(_, p, _, _)| *p == path) {
-                return;
+            if k.iter().any(|n| n.path == path) {
+                return false;
             }
-            k.push_back((name.to_string(), path, why.to_string(), unix_now()));
+            // The dropped entry's kept NZB goes with it: nothing can
+            // reach it once the notice naming it is off the ring, and
+            // spool files nobody names are what the delete was trying
+            // to avoid leaving behind in the first place.
+            k.push_back(KeptNote {
+                name: name.to_string(),
+                path,
+                why: why.to_string(),
+                at: unix_now(),
+                nzb: nzb.map(|p| p.display().to_string()).unwrap_or_default(),
+            });
             while k.len() > 12 {
-                k.pop_front();
+                if let Some(gone) = k.pop_front() {
+                    drop_kept_nzb(&gone);
+                }
             }
         }
+        // The strip rides the revisioned queue payload, so raising a
+        // notice has to move the revision too - on an idle daemon
+        // nothing else will, and the strip would not appear until
+        // something unrelated did. `spend_kept_notice` is the other
+        // door and carries the same bump; neither bumps on its no-op
+        // arm (the dedupe above, an absent path there), or every
+        // refusal would re-send the payload to every idle tab.
+        self.queue_rev.fetch_add(1, Ordering::Relaxed);
         self.save_delete_kept();
+        true
     }
 
     /// Persist the kept-files notices to `.spool/delete-kept.json`.
@@ -484,13 +545,6 @@ impl Daemon {
         }
     }
 
-    /// Park a finished job in history (NZBGet-style: failures are parked,
-    /// not lost - mode=retry sends them back through the queue and the
-    /// journal resumes from what already landed).
-    pub(in crate::serve) fn park(&self, job: Arc<Mutex<Job>>) {
-        self.park_gen(job, None)
-    }
-
     /// Which round of a record's life a long-running caller started on:
     /// `(retries, move_seq)`, bumped by [`Daemon::retry`] and
     /// `moveseq::stamp_move` respectively.
@@ -510,7 +564,16 @@ impl Daemon {
         gen0.is_none_or(|g0| Self::record_generation(g) == g0)
     }
 
-    /// [`Daemon::park`], with the generation the caller started on.
+    /// Park a finished job in history (NZBGet-style: failures are parked,
+    /// not lost - mode=retry sends them back through the queue and the
+    /// journal resumes from what already landed), on the generation the
+    /// caller started on.
+    ///
+    /// There is no unfenced `park` any more: sweep 3 H1 fenced the last
+    /// two callers that had one (the lane's crashed-tail arm and the
+    /// hooks-only submit), and a spelling that silently accepts ANY
+    /// round is the footgun that finding was about. `None` still means
+    /// "no fence" for the callers that genuinely have no round to name.
     ///
     /// `park` itself needs no guard: its fifteen callers park a job they
     /// are holding across a short window. The post-processing lane tail
@@ -570,6 +633,10 @@ impl Daemon {
         // tombstoned job is dropped (not filed to history), so its spooled
         // .nzb is dead weight too - remove it (history retry keeps its own).
         {
+            // Set when a refused removal handed this job's spooled NZB
+            // to a kept-files notice: the drop below must then leave it
+            // where it is - see `note_delete_kept`.
+            let mut kept_nzb: Option<std::path::PathBuf> = None;
             // Snapshot what the removal needs, then RELEASE the guard
             // before touching the filesystem. Recursive deletion of a
             // whole release is slow (and on a hung NAS, unbounded), and
@@ -616,14 +683,24 @@ impl Daemon {
                 // left to ride back on, and the notice is the only way it
                 // reaches them at all.
                 if let FilesGone::Kept(why) = remove_job_files(&out_dir, &stem, filed, &tail) {
-                    self.note_delete_kept(&stem, &out_dir, &why);
+                    // ...and the spool copy becomes the notice's offer to
+                    // run it again - but ONLY where `gone_nzb` already
+                    // says this park is the last thing naming that file.
+                    // The M5 arm below files a RETRYABLE history row that
+                    // reads the same copy, so sharing it let a dismiss
+                    // break the retry: see `note_delete_kept` (M11).
+                    if self.note_delete_kept(&stem, &out_dir, &why, gone_nzb.as_deref()) {
+                        kept_nzb = gone_nzb.clone();
+                    }
                 }
                 // The other end of the reservation the delete took when
                 // it set this flag: the directory is only safe to hand
                 // out once its files are actually gone.
                 self.reserved.lock_ok().remove(&out_dir);
             }
-            if let Some(nzb) = gone_nzb {
+            if let Some(nzb) = gone_nzb
+                && kept_nzb.as_ref() != Some(&nzb)
+            {
                 let _ = std::fs::remove_file(&nzb);
             }
         }
@@ -789,7 +866,8 @@ impl Daemon {
         // automatic retry after a cooldown - propagation lag is a real
         // cause of missing articles that clears on its own, and the
         // journal makes the rerun fetch only what's still missing. Only
-        // transient shapes qualify: password and takedown verdicts don't.
+        // transient shapes qualify: password and takedown verdicts don't,
+        // and nor does a post too old for propagation to explain it.
         //
         // The predicate itself is `will_auto_retry`, shared with
         // `run_post_job_hooks` so the report/re-grab side and the
@@ -814,6 +892,9 @@ impl Daemon {
                     "connection trouble, not missing articles - retrying shortly",
                     RETRY_WHY_TRANSPORT,
                 ),
+                // Everything left is missing articles on a post young
+                // enough for propagation to be a live explanation -
+                // `retry_may_still_help` refused the rest.
                 _ => (
                     secs,
                     "articles missing - propagation may fill them",
@@ -1087,5 +1168,112 @@ impl Daemon {
         if let Ok(text) = serde_json::to_string_pretty(&*st) {
             let _ = crate::persist::write_atomic(&path, text.as_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod park_custody_tests {
+    use super::*;
+    use crate::serve::testutil::test_daemon;
+
+    /// The smallest NZB that parses and enqueues, so "the retry can
+    /// still use it" is a claim about real bytes rather than a stat().
+    const NZB: &[u8] = br#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file poster="x" date="0" subject="&quot;a.bin&quot; yEnc (1/1)"><groups><group>g</group></groups><segments><segment bytes="1000" number="1">one@x</segment></segments></file></nzb>"#;
+
+    /// A delete verb that owes a HISTORY row keeps the spooled NZB - the
+    /// row is retryable and the retry reads that copy - so the
+    /// kept-files notice raised by the same refusal must NOT also claim
+    /// it.
+    ///
+    /// Both records named one file and neither knew about the other, so
+    /// whichever was spent first silently broke the other. Dismissing
+    /// the strip (or letting it age off the 12-entry ring, or pressing
+    /// "download it again") ran `drop_kept_nzb` and removed the spool
+    /// copy while the history row still pointed at it, and the
+    /// advertised retry then failed with a raw ENOENT out of the NZB
+    /// read (Codex sweep 3, M11).
+    #[test]
+    fn a_history_owed_delete_keeps_its_nzb_out_of_the_kept_notice() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-parkcust-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let d = test_daemon(&dir);
+
+        let spool_nzb = d.spool.join("Kept.Release.nzb");
+        std::fs::write(&spool_nzb, NZB).expect("spool copy");
+        // The removal has to be REFUSED, and the cheapest honest refusal
+        // is a path that is not a directory: `remove_user_dir` passes
+        // the error straight through as `FilesGone::Kept`, exactly as a
+        // Trash that will not take the folder does.
+        let out = dir.join("Kept.Release");
+        std::fs::write(&out, b"not a directory").expect("blocker");
+
+        let job = Arc::new(Mutex::new(
+            job_from_json(&serde_json::json!({
+                "nzo_id": "nzo-parkcust-1",
+                "name": "Kept.Release",
+                "nzb_path": spool_nzb.to_string_lossy(),
+                "out_dir": out.to_string_lossy(),
+                "state": "Failed",
+            }))
+            .expect("job"),
+        ));
+        // Exactly what JSON-RPC `GroupDelete` leaves behind for a job it
+        // caught DOWNLOADING: tombstoned, stamped for a history row, its
+        // file removal deferred to park.
+        {
+            let mut g = job.lock_ok();
+            g.fail_message = "deleted from the queue".into();
+            g.finished_unix = Some(1);
+            g.tombstone = true;
+            g.delete_status = "MANUAL".into();
+            g.del_on_drop = true;
+        }
+        d.queue.lock_ok().push_back(job.clone());
+        d.park_gen(job.clone(), None);
+
+        let note = d
+            .delete_kept
+            .lock_ok()
+            .front()
+            .cloned()
+            .expect("the refused removal must raise a kept-files notice");
+        assert!(
+            note.nzb.is_empty(),
+            "the notice claimed the spool copy the history row still owns"
+        );
+        assert!(
+            d.history
+                .lock_ok()
+                .iter()
+                .any(|j| j.lock_ok().nzo_id == "nzo-parkcust-1"),
+            "M5: a delete verb with a status files a retryable row"
+        );
+
+        // The user dismisses the strip. That spends the notice - and
+        // with it, before the fix, the NZB the row's retry needs.
+        assert!(
+            crate::serve::api::queue::spend_kept_notice(&d, &note.path),
+            "the notice is the one being dismissed"
+        );
+        assert!(
+            spool_nzb.exists(),
+            "dismissing the notice deleted the spooled NZB the history retry reads"
+        );
+        assert!(
+            d.retry("nzo-parkcust-1"),
+            "the filed delete row is retryable"
+        );
+        let named = job.lock_ok().nzb_path.clone();
+        assert_eq!(
+            named, spool_nzb,
+            "the re-queued row still names its spool copy"
+        );
+        let bytes = std::fs::read(&named).expect("the retry's NZB read");
+        d.enqueue(&bytes, "Kept.Release", "", -100, None, None, "test", true)
+            .expect("the kept spool copy must still parse and enqueue");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

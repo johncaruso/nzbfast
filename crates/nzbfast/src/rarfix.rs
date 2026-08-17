@@ -1720,9 +1720,26 @@ pub(crate) fn extract_one_zip(
     // outcome, rather than rejecting: archives that legitimately carry a
     // duplicate name extracted fine before and must keep doing so. The
     // race is what goes away.
+    //
+    // Keyed by filesystem IDENTITY, not spelling. `sanitize_filename_for`
+    // is case-preserving by construction and the zip central directory is
+    // not deduped, so `notes.txt` and `NOTES.TXT` are two distinct keys
+    // here and ONE inode on a case-insensitive volume (default APFS,
+    // NTFS) - the guard below then sees no collision at all and hands
+    // both to the pool, which is precisely the race above. Probe the
+    // volume rather than guessing from the build target, the way
+    // `par2repair`'s path identity already does.
+    let fold = nzbkit::disk::case_insensitive_dir(out);
+    let ident = |p: &std::path::Path| -> PathBuf {
+        if fold {
+            PathBuf::from(p.to_string_lossy().to_lowercase())
+        } else {
+            p.to_path_buf()
+        }
+    };
     let mut seen: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
     for (i, (_, target)) in files.iter().enumerate() {
-        seen.insert(target.clone(), i);
+        seen.insert(ident(target), i);
     }
     if seen.len() != files.len() {
         let dropped = files.len() - seen.len();

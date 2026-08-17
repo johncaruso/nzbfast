@@ -79,6 +79,98 @@ pub(in crate::serve) fn note_queue_idle_unless_active(d: &Daemon, stopped_active
     }
 }
 
+/// Stop the transfer a delete just took the record away from - and keep
+/// asking until the pipeline is actually listening.
+///
+/// `hub.abort` / `hub.queue_ctl` are published by `install_seek` partway
+/// into the fetch, and the QueueControl stays INERT after that until the
+/// pool run attaches its shared state to it (`QueueControl::abort`
+/// answers false while its weak reference has nothing to upgrade). A
+/// single shot aimed at either window is silently swallowed: the record
+/// vanishes from the queue and the download it named runs its whole
+/// ladder anyway. Measured 16 Aug 2026 on a delete issued the instant the
+/// row read Downloading - "active download stopped by user" in the log,
+/// then `sharding 200 connections` AFTER it, then a full minute of
+/// `connect failed: Connection refused` against a host nothing was
+/// waiting for. The pause path has re-fired for this exact reason since
+/// M23e; delete never did, and it also DISARMS pause's loop, whose
+/// wind-down check ("still in the queue, still suspended") a delete makes
+/// false on the next pass.
+///
+/// So: fire, and if the pool did not take it, keep firing on the same
+/// 250 ms cadence `suspend_matching` uses until it does. Bounded at the
+/// same 60 s, which is far past any launch: a job that never attaches a
+/// pool has already failed on its own by then.
+///
+/// Only ever aimed at `active_stream` - the owner test, never
+/// `state == Downloading` (see `owns_hub`): job N stays Downloading
+/// through its whole disk tail while N+1 is on the wire holding these
+/// handles, and this loop firing at the wrong one is the "deleted a
+/// finished job, killed a healthy unrelated download" bug. While the hub
+/// names anyone else the loop only WAITS - it never fires blind - so the
+/// launch window (the record is Downloading, the pipeline has not
+/// published yet) is covered without ever pointing the abort at a
+/// stranger.
+///
+/// Shared so the SAB/API delete arm and the NZBGet JSON-RPC delete
+/// variants cannot drift, like the two helpers above it.
+pub(in crate::serve) fn stop_deleted_transfer(d: &Arc<Daemon>, stopped: Vec<String>) {
+    if stopped.is_empty() {
+        return;
+    }
+    if fire_delete_abort(d, &stopped) {
+        return;
+    }
+    let d = d.clone();
+    std::thread::spawn(move || {
+        // Whether the hub has ever named one of these jobs. Before it
+        // does, another job's name means "ours has not launched yet" and
+        // we wait; after it has, another name means the transfer we were
+        // aiming at is over and there is nothing left to stop.
+        let mut was_ours = false;
+        for _ in 0..240 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            if d.owns_hub(|id| stopped.iter().any(|s| s == id)) {
+                was_ours = true;
+                if fire_delete_abort(&d, &stopped) {
+                    return;
+                }
+            } else if was_ours {
+                return;
+            }
+        }
+        warn!(
+            target: "queue",
+            "{} was deleted mid-download but its pipeline never took the stop \
+             signal - it will run to its own end",
+            stopped.join(", ")
+        );
+    });
+}
+
+/// One shot of the delete abort, aimed only if the hub is still this
+/// job's. Returns whether the POOL took it: the flag half is read after
+/// the network phase and stops nothing by itself, so "delivered" can
+/// only mean the QueueControl found a live run to abort.
+fn fire_delete_abort(d: &Arc<Daemon>, stopped: &[String]) -> bool {
+    if !d.owns_hub(|id| stopped.iter().any(|s| s == id)) {
+        return false;
+    }
+    if let Some(f) = d.hub.abort.lock_ok().as_ref() {
+        f.store(true, Ordering::Relaxed);
+    }
+    let landed = d
+        .hub
+        .queue_ctl
+        .lock_ok()
+        .as_ref()
+        .is_some_and(|c| c.abort());
+    if landed {
+        info!(target: "queue", "active download stopped by user");
+    }
+    landed
+}
+
 /// Write one job's priority, releasing the states an explicit priority
 /// is an instruction to release. Returns whether the job took it.
 ///
@@ -1359,21 +1451,187 @@ fn m_delete_kept_dismiss(
     _ctx: &ApiCtx<'_>,
     _api_body: &mut Option<Vec<u8>>,
 ) -> Option<Value> {
-    Some({
-        let path = params.get("value").cloned().unwrap_or_default();
-        let dismissed = {
-            let mut k = d.delete_kept.lock_ok();
-            let before = k.len();
-            k.retain(|(_, p, _, _)| *p != path);
-            k.len() < before
-        };
-        // Persist the dismissal too, or the notice the user just
-        // cleared comes back at the next restart.
-        if dismissed {
-            d.save_delete_kept();
+    Some(json!({"status": spend_kept_notice(d, &params.get("value").cloned().unwrap_or_default())}))
+}
+
+/// Take one kept-files notice off the ring, and with it the spooled NZB
+/// it was holding for its "download it again" button.
+///
+/// Both ends of that notice's life go through here - dismissed by the
+/// user, or spent by the retry - because the file is reachable through
+/// nothing else once the notice is gone, and a delete that leaves an
+/// unnamed file in the spool is the shape this whole notice exists to
+/// complain about.
+///
+/// Being the one door is also why the `queue_rev` bump lives here. The
+/// strip rides the revisioned queue payload (§129 1b), and `m_dashboard`
+/// answers `queue: null` while `client_q == qrev` - so a page re-renders
+/// the notice from the payload it already holds, and a removal that does
+/// not move the revision clears the ring on the daemon and NOWHERE else.
+/// The dismiss button fired, the daemon answered `{"status":true}`, and
+/// the notice sat there until an unrelated queue mutation or a reload
+/// (reported by a Windows tester, 16 Aug 2026). Only an IDLE daemon can
+/// show it: `m_dashboard` re-sends the payload every second whenever
+/// anything is transferring, which is why it never showed up in
+/// development. Fifth instance of the payload-rider trap after the
+/// update banner, `set_limit`, `watch_failed_*` and `publish_hold`.
+///
+/// `pub(in crate::serve)` for the daemon-side test that pins the bump -
+/// the ring and its revision are serve-wide state, not this module's.
+pub(in crate::serve) fn spend_kept_notice(d: &Arc<Daemon>, path: &str) -> bool {
+    let gone = {
+        let mut k = d.delete_kept.lock_ok();
+        let before = k.len();
+        for note in k.iter().filter(|n| n.path == path) {
+            drop_kept_nzb(note);
         }
-        json!({"status": dismissed})
-    })
+        k.retain(|n| n.path != path);
+        k.len() < before
+    };
+    // Persist it, or the notice the user just cleared comes back at the
+    // next restart. The bump rides with it, and only on the arm that
+    // actually removed something - bumping on a no-op would re-send the
+    // whole queue payload to every idle tab.
+    if gone {
+        d.queue_rev.fetch_add(1, Ordering::Relaxed);
+        d.save_delete_kept();
+    }
+    gone
+}
+
+/// "Download it again" on a kept-files notice: re-add the very release
+/// whose delete half-failed, from the spool copy that delete held back.
+///
+/// The point is where the user is standing. The notice already names the
+/// release and the folder, on screen, at the moment they find out the
+/// files are still there - and until now the only way to act on it was
+/// to leave, find the NZB or the indexer entry again, add it by hand,
+/// and then get past a duplicate hold. Every step of that is a chance to
+/// give up on a download they had already asked for twice.
+///
+/// `allow_dupe`, deliberately: this add IS the answer to a delete, and
+/// nothing about it should be parked behind an older copy of the same
+/// identity. The recent-delete mark says the same thing for a re-add
+/// made any other way; this path does not need to consult it, because a
+/// user pressing the button on the notice is as explicit as it gets.
+///
+/// The notice goes when the add succeeds - it has been acted on, and a
+/// row in the queue is a better handle on the download than a warning
+/// strip. It stays on a failure, with the reason, because the folder is
+/// still there either way.
+fn m_delete_kept_retry(
+    d: &Arc<Daemon>,
+    _req: &mut tiny_http::Request,
+    params: &std::collections::HashMap<String, String>,
+    _ctx: &ApiCtx<'_>,
+    _api_body: &mut Option<Vec<u8>>,
+) -> Option<Value> {
+    Some(retry_kept_notice(
+        d,
+        &params.get("value").cloned().unwrap_or_default(),
+    ))
+}
+
+/// Test seam for [`retry_kept_notice`]: milliseconds to sit on a
+/// claimed notice before admitting it. Read by nothing else, so only
+/// the test that sets it can be delayed by it - and a sleep, not a
+/// barrier, because a stray waiter on a two-party barrier HANGS the
+/// parallel bin run rather than failing it.
+#[cfg(test)]
+pub(in crate::serve) static KEPT_RETRY_STALL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The body of [`m_delete_kept_retry`], out of the handler so the suite
+/// can run two of them at once - the race it guards against is the
+/// whole reason the notice is CLAIMED rather than cloned.
+pub(in crate::serve) fn retry_kept_notice(d: &Arc<Daemon>, path: &str) -> Value {
+    // The notice is the ONLY source for the spool path. Taking one from
+    // the request would let any caller hand us an arbitrary file to
+    // read and enqueue.
+    //
+    // Taken OFF the ring here, in the same critical section that finds
+    // it, and put back below if the add fails. Finding-then-cloning let
+    // two calls both pass this test: http.rs runs eight worker threads
+    // over the one listener, so two dashboard tabs (or a tab and a
+    // scripted call, or a retried request) genuinely overlap, and the
+    // notice was only removed AFTER a successful admission - a window
+    // spanning a file read, a whole NZB parse and a directory claim.
+    // Both adds carry allow_dupe, so nothing held the second one, and
+    // `choose_out_dir` gave it its own suffixed folder: one press, two
+    // complete downloads of the same release (Codex sweep 3, L3). The
+    // loser now gets the ordinary "that notice is gone" answer.
+    let claimed = {
+        let mut k = d.delete_kept.lock_ok();
+        let at = k.iter().position(|n| n.path == path && !n.nzb.is_empty());
+        at.and_then(|at| k.remove(at).map(|note| (at, note)))
+    };
+    let Some((at, note)) = claimed else {
+        return json!({"status": false,
+                      "error": "that notice is gone, or it has no copy of the NZB to \
+                                add again - find the release and add it as usual"});
+    };
+    // An unspent notice goes back where it was: the folder is still
+    // sitting there, so the strip and its button have to survive a
+    // failure. The revision bump rides with it for the same reason
+    // `note_delete_kept` carries one - a tab that refreshed inside the
+    // claim would otherwise never see the notice again.
+    let restore = |note: KeptNote| {
+        {
+            let mut k = d.delete_kept.lock_ok();
+            let at = at.min(k.len());
+            k.insert(at, note);
+        }
+        d.queue_rev.fetch_add(1, Ordering::Relaxed);
+        d.save_delete_kept();
+    };
+    let bytes = match std::fs::read(&note.nzb) {
+        Ok(b) => b,
+        Err(e) => {
+            restore(note);
+            return json!({"status": false, "error": e.to_string()});
+        }
+    };
+    // Test seam: hold the window between reading the spool copy and
+    // admitting it open, so the suite can run a second retry of the
+    // same notice inside it. In production that window is a full NZB
+    // parse plus a directory claim wide; in a test it is zero.
+    #[cfg(test)]
+    {
+        let ms = KEPT_RETRY_STALL_MS.load(Ordering::Relaxed);
+        if ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    match d.enqueue(
+        &bytes,
+        &note.name,
+        "",
+        SAB_DEFAULT_PRIORITY,
+        None,
+        None,
+        "dashboard",
+        true,
+    ) {
+        Err(e) => {
+            restore(note);
+            json!({"status": false, "error": e.to_string()})
+        }
+        Ok(nzo_id) => {
+            // Spent: the notice has done its job, and the spool copy it
+            // was holding is now `enqueue`'s problem (it writes its
+            // own). Same three steps `spend_kept_notice` takes - the
+            // notice is already off the ring, so only the file and the
+            // two persistence duties are left.
+            drop_kept_nzb(&note);
+            d.queue_rev.fetch_add(1, Ordering::Relaxed);
+            d.save_delete_kept();
+            info!(
+                target: "queue",
+                "{nzo_id}: {:?} added again from its kept-files notice",
+                note.name
+            );
+            json!({"status": true, "nzo_id": nzo_id, "name": note.name})
+        }
+    }
 }
 
 fn m_queue_save(
@@ -1441,6 +1699,11 @@ fn m_queue(
                 d.cancel_tail_fetches(hit_id);
                 let del_files = params.get("del_files").map(String::as_str) == Some("1");
                 let mut stopped_active = false;
+                // Which job was on the wire, not just that one was: the
+                // stop signal is aimed by nzo_id (see
+                // `stop_deleted_transfer`), and a batch delete of a
+                // whole category names every row in the queue.
+                let mut stopped_ids: Vec<String> = Vec::new();
                 // Collected under the queue lock, recorded after it -
                 // the notice's own lock is a leaf and must stay one.
                 let mut kept: Vec<(String, std::path::PathBuf, String)> = Vec::new();
@@ -1468,11 +1731,27 @@ fn m_queue(
                     bool,
                     crate::smart::FiledTail,
                 )> = Vec::new();
+                // The releases this request removes: stamped after the
+                // lock as the user's own statement that they no longer
+                // have them, so a re-add is not held as a duplicate of
+                // something that is not there. It is what the stop
+                // button already promises in as many words - "adding the
+                // same NZB again picks up from it" - and a hold made
+                // that promise false.
+                let mut deleted_names: Vec<String> = Vec::new();
+                // See the history arm: spool copies whose fate waits on
+                // the file removal.
+                let mut nzb_by_dir = std::collections::HashMap::new();
                 let mut q = d.queue.lock_ok();
                 let before = q.len();
                 q.retain(|j| {
                     if hit(j) {
                         let mut g = j.lock_ok();
+                        // ...but not the backup copy: see
+                        // `is_held_alternative`.
+                        if !is_held_alternative(&g) {
+                            deleted_names.push(g.name.clone());
+                        }
                         let active = g.state == JobState::Downloading;
                         // §129: a Finishing job's tail is running in the
                         // lane - its writers are live like `finalizing`,
@@ -1488,6 +1767,7 @@ fn m_queue(
                             // its spooled .nzb.
                             g.tombstone = true;
                             stopped_active = true;
+                            stopped_ids.push(g.nzo_id.clone());
                         } else {
                             // Non-active: the record is gone for
                             // good, so its spooled NZB is dead
@@ -1506,7 +1786,11 @@ fn m_queue(
                             // the deleted job into history. The
                             // flag makes that tail a no-op.
                             g.tombstone = true;
-                            let _ = std::fs::remove_file(&g.nzb_path);
+                            // ...and its spool copy with it, unless the
+                            // files half is about to be attempted: the
+                            // notice's "download it again" needs that
+                            // NZB when the removal is refused.
+                            hold_or_drop_spool(del_files, &g.out_dir, &g.nzb_path, &mut nzb_by_dir);
                         }
                         if del_files {
                             if active || lane || g.finalizing {
@@ -1626,9 +1910,7 @@ fn m_queue(
                 // what was asked for and it worked. What did NOT work
                 // was the files half, and with the row went the only
                 // place the user could see this download named.
-                for (name, dir, why) in kept {
-                    d.note_delete_kept(&name, &dir, &why);
-                }
+                note_kept_files(d, kept, &mut nzb_by_dir);
                 // The sidecar's job waits for the sidecar. Its own
                 // reservation is released by the drain, not by the batch
                 // above - the removal is still ahead of it.
@@ -1654,16 +1936,13 @@ fn m_queue(
                 // `active_stream` is the owner - the watchdog
                 // was already fixed to steer by it, for exactly
                 // this hazard.
-                if stopped_active && d.owns_hub(hit_id) {
-                    if let Some(f) = d.hub.abort.lock_ok().as_ref() {
-                        f.store(true, Ordering::Relaxed);
-                    }
-                    if let Some(c) = d.hub.queue_ctl.lock_ok().as_ref() {
-                        c.abort();
-                    }
-                    info!(target: "queue", "active download stopped by user");
-                }
+                //
+                // Fire-and-keep-firing rather than fire-once: the
+                // helper's doc has the window that swallowed the single
+                // shot.
+                stop_deleted_transfer(d, stopped_ids);
                 if count > 0 {
+                    d.note_releases_deleted(&deleted_names);
                     d.save_queue();
                     // The rationale lives on the helper, which the
                     // JSON-RPC delete variants share.
@@ -1967,6 +2246,10 @@ fn m_history(
                 }
                 // Recorded after the history lock is dropped, below.
                 let mut kept: Vec<(String, std::path::PathBuf, String)> = Vec::new();
+                // Spooled NZBs whose fate waits on the removal: kept for
+                // the notice's "download it again" when the files stay,
+                // removed with the record when they go.
+                let mut nzb_by_dir = std::collections::HashMap::new();
                 // And so is the removal itself - see the queue-delete
                 // arm above for why a bounded Trash call must not run
                 // under a global lock, and why the directory is
@@ -1982,10 +2265,20 @@ fn m_history(
                         continue;
                     }
                     let g = j.lock_ok();
-                    // The record is being deleted for good -
-                    // its spooled .nzb (kept until now for
-                    // retry) is now dead weight.
-                    let _ = std::fs::remove_file(&g.nzb_path);
+                    // The record is being deleted for good - its spooled
+                    // .nzb (kept until now for retry) is now dead
+                    // weight. Unless the files half is about to be
+                    // attempted: a REFUSED removal leaves the user
+                    // holding a folder and a notice, and that NZB is the
+                    // only thing that can offer them the download again
+                    // from where they are standing. Held back and
+                    // decided after the outcome is known, below.
+                    hold_or_drop_spool(
+                        del_files && p.may_remove_files,
+                        &g.out_dir,
+                        &g.nzb_path,
+                        &mut nzb_by_dir,
+                    );
                     if del_files {
                         if p.may_remove_files {
                             let tail = delete_tail(&g, || d.job_suffix(filed_stem(&g)));
@@ -2055,6 +2348,17 @@ fn m_history(
                         }
                     }
                 }
+                // What the user just told us they no longer have. Taken
+                // from the plan rather than from `value`, so the bulk
+                // words (`all`, `failed`, `completed`) and an id list
+                // stamp exactly the records that are leaving - see
+                // `Daemon::note_releases_deleted`.
+                let deleted_names: Vec<String> = h
+                    .iter()
+                    .zip(&plan)
+                    .filter(|(_, p)| p.doomed)
+                    .map(|(j, _)| j.lock_ok().name.clone())
+                    .collect();
                 // By id, not by position: nzo_ids are unique,
                 // and a positional retain would be one refactor
                 // away from deleting the wrong record.
@@ -2102,10 +2406,9 @@ fn m_history(
                 // taking it up, is the case this exists for: the row
                 // was their handle on that folder and it has just
                 // gone, so the path has to be handed back.
-                for (name, dir, why) in kept {
-                    d.note_delete_kept(&name, &dir, &why);
-                }
+                note_kept_files(d, kept, &mut nzb_by_dir);
                 if count > 0 {
+                    d.note_releases_deleted(&deleted_names);
                     d.history_tombstone(&doomed_ids);
                     d.save_queue();
                 }
@@ -2287,6 +2590,11 @@ pub(in crate::serve) fn dispatch(
         // step. The way to get a permanent delete is still to turn
         // "Deleted files go to the Trash" off and mean it.
         "delete_kept_dismiss" => return m_delete_kept_dismiss(d, req, params, ctx, api_body),
+        // ...and the other half of that notice: add this release again,
+        // from the spool copy the refused delete kept. The one action
+        // the notice can offer that is not a permanent delete - it adds
+        // a download, and touches nothing that is already on disk.
+        "delete_kept_retry" => return m_delete_kept_retry(d, req, params, ctx, api_body),
         // Re-attempt the queue write. For the watch-folder state where a
         // release IS live in the queue but `queue.json` could not be
         // written - so the user's .nzb was deliberately kept as the only
@@ -2343,14 +2651,14 @@ pub(in crate::serve) fn requeue_category(
     let (dir, _) = refile_out_dir(&d.out_root.read_ok().clone(), cat, name, &|p| {
         d.dir_claim(p)
     });
-    {
+    let old_dir = {
         let mut g = job.lock_ok();
         if g.state != JobState::Queued {
             return Err("job already started");
         }
         g.category = cat.to_string();
-        g.out_dir = dir;
-    }
+        std::mem::replace(&mut g.out_dir, dir.clone())
+    };
     d.register_cat(cat);
     // A queued job can be RUNNING in the prefetch sidecar, against the
     // directory this call has just re-pointed away from. Every further
@@ -2369,6 +2677,191 @@ pub(in crate::serve) fn requeue_category(
     // signal is about the fetch, not about the decision.
     let id = job.lock_ok().nzo_id.clone();
     drop(_publish);
-    d.poke_sidecar(|i| i == id);
+    // ...and when there is no sidecar to poke, THIS call owes the move.
+    // The adoption above only ever runs on a prefetch task's exit path,
+    // so a job that was prefetched and then stopped - an error, a pause,
+    // an earlier poke - leaves its journal and part-files in the old
+    // directory with the slot already empty. The recategorize then
+    // pointed the record somewhere else and pokes nothing, so the
+    // primary run started at the new directory from zero and refetched
+    // the whole release, and the old folder was named by no record at
+    // all (Codex sweep 3, M12). Both halves are guarded by
+    // `from.exists()`, so the live case and this one cannot double-move.
+    if !d.poke_sidecar(|i| i == id) && old_dir != dir && old_dir.exists() {
+        match crate::smart::move_tree(&old_dir, &dir) {
+            Ok(()) => info!(
+                target: "queue",
+                "{id}: moved the earlier progress from {} to {} - the release was \
+                 re-filed while it was queued, so nothing has to be fetched twice",
+                old_dir.display(),
+                dir.display()
+            ),
+            // Not fatal to anything: the record is correct and the job
+            // simply downloads again. Say where the abandoned bytes are,
+            // because nothing else will.
+            Err(e) => warn!(
+                target: "queue",
+                "{id}: could not move the earlier progress from {} to {}: {e} - \
+                 the release will be downloaded again, and those files are not \
+                 named by any record",
+                old_dir.display(),
+                dir.display()
+            ),
+        }
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod queue_custody_tests {
+    use super::*;
+    use crate::serve::testutil::test_daemon;
+
+    const NZB: &[u8] = br#"<?xml version="1.0"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file poster="x" date="0" subject="&quot;a.bin&quot; yEnc (1/1)"><groups><group>g</group></groups><segments><segment bytes="1000" number="1">one@x</segment></segments></file></nzb>"#;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("nzbfast-qcust-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        d
+    }
+
+    /// "Download it again" pressed twice at once adds the release ONCE.
+    ///
+    /// http.rs runs eight worker threads over the one listener, so two
+    /// dashboard tabs (or a tab and a scripted call) genuinely overlap.
+    /// The notice used to be cloned and only removed after a successful
+    /// admission, so both calls passed the find, both read the spool
+    /// copy and both enqueued - with `allow_dupe` set, so nothing held
+    /// the second, and `choose_out_dir` gave it a suffixed folder of its
+    /// own: one press, two complete downloads (Codex sweep 3, L3).
+    #[test]
+    fn two_overlapping_retries_of_one_notice_add_the_release_once() {
+        let dir = tmp("keptrace");
+        let d = test_daemon(&dir);
+        let nzb = d.spool.join("Raced.Release.nzb");
+        std::fs::write(&nzb, NZB).expect("spool copy");
+        let out = d.out_dir().join("Raced.Release");
+        d.note_delete_kept("Raced.Release", &out, "the Trash refused it", Some(&nzb));
+        let path = out.display().to_string();
+
+        KEPT_RETRY_STALL_MS.store(600, Ordering::Relaxed);
+        let d2 = d.clone();
+        let p2 = path.clone();
+        let first = std::thread::spawn(move || retry_kept_notice(&d2, &p2));
+        // Well inside the stall: the second call lands while the first
+        // is holding the notice and has already read its bytes.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let second = retry_kept_notice(&d, &path);
+        let first = first.join().expect("first retry");
+        KEPT_RETRY_STALL_MS.store(0, Ordering::Relaxed);
+
+        let admitted = [&first, &second]
+            .iter()
+            .filter(|v| v["status"] == serde_json::Value::Bool(true))
+            .count();
+        assert_eq!(
+            admitted, 1,
+            "both presses were admitted: {first} / {second}"
+        );
+        assert_eq!(
+            d.queue.lock_ok().len(),
+            1,
+            "one press on the notice, one download"
+        );
+        assert!(
+            d.delete_kept.lock_ok().is_empty(),
+            "the spent notice must not come back"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed add puts the notice BACK: the folder is still there, so
+    /// the strip and its button have to survive it.
+    #[test]
+    fn a_failed_retry_leaves_the_notice_where_it_was() {
+        let dir = tmp("keptback");
+        let d = test_daemon(&dir);
+        // Two notices, so the restore has to land in the right slot.
+        let first = d.out_dir().join("First.Release");
+        let nzb1 = d.spool.join("First.Release.nzb");
+        std::fs::write(&nzb1, NZB).expect("spool copy");
+        d.note_delete_kept("First.Release", &first, "refused", Some(&nzb1));
+        let second = d.out_dir().join("Second.Release");
+        let nzb2 = d.spool.join("Second.Release.nzb");
+        // Not an NZB at all, so `enqueue` refuses it.
+        std::fs::write(&nzb2, b"not xml").expect("spool copy");
+        d.note_delete_kept("Second.Release", &second, "refused", Some(&nzb2));
+
+        let answer = retry_kept_notice(&d, &second.display().to_string());
+        assert_eq!(
+            answer["status"],
+            serde_json::Value::Bool(false),
+            "a spool copy that does not parse cannot be admitted"
+        );
+        let ring = d.delete_kept.lock_ok().clone();
+        assert_eq!(ring.len(), 2, "the unspent notice was dropped");
+        assert_eq!(
+            ring[1].path,
+            second.display().to_string(),
+            "restored out of order"
+        );
+        assert!(nzb2.exists(), "an unspent notice keeps its spool copy");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A recategorize with NO sidecar live still takes the job's
+    /// part-downloaded files with it.
+    ///
+    /// The adoption that moves them runs on the prefetch task's exit
+    /// path and nowhere else, so a job that was prefetched and then
+    /// stopped - an error, a pause, an earlier poke - has its journal
+    /// and part-files sitting in the old directory with the slot already
+    /// empty. The recategorize then re-pointed the record and poked
+    /// nothing, so the primary run started at the new directory from
+    /// zero and refetched the whole release over the same provider
+    /// quota, and the old folder was named by no record at all (Codex
+    /// sweep 3, M12).
+    #[test]
+    fn a_recategorize_with_no_sidecar_moves_the_partial_files() {
+        let dir = tmp("recat");
+        let d = test_daemon(&dir);
+        let old = d.out_dir().join("Repointed.Release");
+        std::fs::create_dir_all(&old).expect("old dir");
+        std::fs::write(old.join(".nzbfast.journal"), b"journal").expect("journal");
+        std::fs::write(old.join("part01.rar"), b"landed bytes").expect("part file");
+
+        let job = Arc::new(Mutex::new(
+            job_from_json(&serde_json::json!({
+                "nzo_id": "nzo-recat-1",
+                "name": "Repointed.Release",
+                "nzb_path": "/tmp/x.nzb",
+                "out_dir": old.to_string_lossy(),
+                "state": "Queued",
+            }))
+            .expect("job"),
+        ));
+        d.queue.lock_ok().push_back(job.clone());
+        assert!(
+            d.sidecar.lock_ok().is_none(),
+            "the shape under test is the one with no sidecar live"
+        );
+
+        requeue_category(&d, &job, "Repointed.Release", "movies").expect("recategorize");
+        let now = job.lock_ok().out_dir.clone();
+        assert_ne!(now, old, "the whole point of the call is a new directory");
+        assert!(
+            now.join("part01.rar").exists() && now.join(".nzbfast.journal").exists(),
+            "the part-downloaded release stayed behind, so the job refetches it all"
+        );
+        assert!(
+            !old.exists(),
+            "the old directory is named by no record now and must not survive"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

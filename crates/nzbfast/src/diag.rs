@@ -330,6 +330,35 @@ pub(crate) fn incomplete_reason(incomplete: usize, derrs: u64, causes: &LossCaus
                 causes.bytes_arrived as f64 / 1e6
             ));
         }
+        // How old the post is, when that is knowable and old enough to
+        // settle the question the next two surfaces both raise. Both the
+        // armed-retry line and the "what to do" line told Gary (16 Aug)
+        // that "posts often finish propagating within the hour" about a
+        // post several days old - true in general, and plainly wrong
+        // about the post in front of him. The age lived only in the
+        // `post_gone` gate above, so the page could not know it.
+        //
+        // Whole days, floored: a same-day post says nothing here, and a
+        // dateless NZB reads as age 0 and is likewise silent, so the
+        // classic transient wording stands wherever propagation really
+        // could still be the answer. Deliberately a statement of fact
+        // and not a verdict - a late backfill can still fill a gap, and
+        // the automatic retry stays armed either way (this appends, and
+        // `fail_kind` keys on the OPENING). `fail_hint` keys on it
+        // verbatim.
+        //
+        // Only on the plain missing-articles opening. A short post's age
+        // says nothing (the bytes were never posted, so no amount of
+        // waiting was ever going to help) and a transport failure is
+        // ours, not the post's - and both already own a `fail_hint` this
+        // clause would otherwise take from them.
+        if causes.post_age_days >= 1 && !post_gone && !size_header_lies && !all_transport {
+            msg.push_str(&format!(
+                "; the post is {} day(s) old, well past the minutes-to-hours \
+                 that propagation takes",
+                causes.post_age_days
+            ));
+        }
         // No parity in the post: a confirmed-missing segment cannot be
         // rebuilt, so say so plainly. Deliberately a CLAUSE and not its
         // own verdict - an earlier cut made this final and stopped the
@@ -421,6 +450,61 @@ pub(crate) fn incomplete_reason(incomplete: usize, derrs: u64, causes: &LossCaus
         }
         msg
     }
+}
+
+/// The post's age in days, read back off the clause `incomplete_reason`
+/// wrote - `None` when the message carries no age at all.
+///
+/// The census computes the age, spends it on one clause of one sentence
+/// and then throws it away: the terminal failure reaches the daemon as
+/// that sentence and nothing else (the same reason `fail_kind` is
+/// derived from the message rather than stored on the job). The one
+/// automatic retry has to know how old the post is BEFORE it spends a
+/// second full download proving the same articles absent, so it reads
+/// the figure back out rather than threading a number through the whole
+/// pipeline for one predicate.
+///
+/// `None` for every message that has no such clause - a dateless NZB, a
+/// post younger than a day, a transport failure, a repair verdict - and
+/// `None` is the retry-anyway direction, which is the safe one: the cost
+/// of a wrong suppression is a job that needed one more try, the cost of
+/// a wrong retry is only a duplicate download.
+///
+/// Prose gets rewritten, so the round trip against the producer is a
+/// test (`the_age_clause_reads_back`) and not a hope. Should the wording
+/// ever drift out from under this, the gate stands down to today's
+/// behaviour instead of misfiring.
+pub(crate) fn post_age_from_message(msg: &str) -> Option<u32> {
+    msg.split_once("; the post is ")?
+        .1
+        .split_once(" day(s) old, well past the minutes-to-hours")?
+        .0
+        .parse()
+        .ok()
+}
+
+/// Is a missing-articles failure's loss PROVEN stale - the post old
+/// enough that propagation cannot be the answer, with nothing left in
+/// the census that a retry could heal?
+///
+/// The automatic-retry gate used to ask only the age, and the age clause
+/// stands down only for `all_transport`, which one confirmed 430 makes
+/// false. So a run that lost most of its segments to timeouts, resets or
+/// a server that never connected AND happened to collect one genuine
+/// takedown was called an aged dead post: the single automatic retry was
+/// suppressed, and a suppressed retry also makes the failure FINAL - the
+/// release is reported to the indexer as dead, the FailureLink re-grab
+/// runs and a held duplicate is promoted. By this module's own words a
+/// transport loss is "a fault on THIS machine or its link", and a
+/// journal-resume retry is exactly what heals it (Codex sweep 3, M8).
+///
+/// Read back off the message because that is all a job record carries.
+/// Both clauses are emitted a few hundred lines above and the round trip
+/// is pinned by `an_ambiguous_loss_is_never_proven_stale`.
+pub(crate) fn missing_articles_proven_stale(msg: &str) -> bool {
+    post_age_from_message(msg).is_some_and(|days| days >= GONE_MIN_AGE_DAYS)
+        && !msg.contains("lost to transport/connection errors, not takedowns")
+        && !msg.contains("no usable connection")
 }
 
 /// A zip an extraction pass reported and could not produce, with the
@@ -1035,6 +1119,184 @@ mod main_tests {
             },
         );
         assert!(!local.contains("a.example"), "{local}");
+    }
+
+    /// Gary, 16 Aug: the drawer told him "posts often finish
+    /// propagating within the hour" about a post days old. The age was
+    /// computed and then thrown away, so the page had no way to know.
+    /// The clause is what `fail_hint` keys on, so its wording is a
+    /// contract - and it must stay OFF the openings that own a better
+    /// hint of their own.
+    #[test]
+    fn an_old_post_says_so_and_a_fresh_one_stays_quiet() {
+        let missing = |age| {
+            super::incomplete_reason(
+                1,
+                0,
+                &LossCauses {
+                    missing_430: 1965,
+                    missing_segments: 1965,
+                    total_segments: 4506,
+                    bytes_arrived: 1_879_000_000,
+                    post_age_days: age,
+                    ..no_causes()
+                },
+            )
+        };
+        let old = missing(4);
+        assert!(
+            old.contains("the post is 4 day(s) old, well past the minutes-to-hours"),
+            "{old}"
+        );
+        // Appended, never prepended: `fail_kind` keys on the opening and
+        // an automatic retry hangs off that classification.
+        assert!(old.starts_with("download incomplete"), "{old}");
+
+        // Same day, and a dateless NZB (which reads as age 0): silent,
+        // because propagation really could still be the answer.
+        for age in [0, 0] {
+            let fresh = missing(age);
+            assert!(!fresh.contains("well past the minutes-to-hours"), "{fresh}");
+        }
+
+        // A transport failure is OURS - the post's age says nothing
+        // about it, and the clause would take `fail_kind`'s Transport
+        // classification nowhere useful.
+        let transport = super::incomplete_reason(
+            1,
+            0,
+            &LossCauses {
+                transport_failed: 40,
+                missing_segments: 40,
+                total_segments: 4506,
+                post_age_days: 9,
+                ..no_causes()
+            },
+        );
+        assert!(
+            !transport.contains("well past the minutes-to-hours"),
+            "{transport}"
+        );
+
+        // A short post was never fully posted, so waiting was never the
+        // question - and `shortpost` is the hint that must survive.
+        let short = super::incomplete_reason(
+            1,
+            0,
+            &LossCauses {
+                missing_segments: 0,
+                total_segments: 4506,
+                post_age_days: 9,
+                ..no_causes()
+            },
+        );
+        assert!(short.starts_with("post size header disagrees"), "{short}");
+        assert!(!short.contains("well past the minutes-to-hours"), "{short}");
+    }
+
+    /// The age clause is written here and read back by the automatic
+    /// retry, which suppresses itself on a post older than
+    /// `GONE_MIN_AGE_DAYS` (a 7-day-old dead post was downloaded twice,
+    /// 15 Aug). Producer and parser are a round trip across two files,
+    /// so this test IS the contract - and it covers the two openings
+    /// that carry no age, where "unknown" has to keep the retry.
+    #[test]
+    fn the_age_clause_reads_back() {
+        let missing = |age| {
+            super::incomplete_reason(
+                1,
+                0,
+                &LossCauses {
+                    missing_430: 1965,
+                    missing_segments: 1965,
+                    total_segments: 4506,
+                    bytes_arrived: 1_879_000_000,
+                    post_age_days: age,
+                    ..no_causes()
+                },
+            )
+        };
+        for age in [1, 2, super::GONE_MIN_AGE_DAYS, 7, 41, 4000] {
+            let msg = missing(age);
+            assert_eq!(
+                super::post_age_from_message(&msg),
+                Some(age),
+                "the retry gate has to read its own sentence back: {msg}"
+            );
+        }
+        // No clause, no age - and no age means retry, so every one of
+        // these keeps today's behaviour.
+        assert_eq!(super::post_age_from_message(&missing(0)), None);
+        assert_eq!(super::post_age_from_message(""), None);
+        assert_eq!(
+            super::post_age_from_message("download incomplete: 3 articles missing"),
+            None
+        );
+        assert_eq!(
+            super::post_age_from_message("verification failed and PAR2 repair could not complete"),
+            None
+        );
+    }
+
+    /// The retry gate reads the age clause, and the age clause is
+    /// suppressed only when EVERY loss was transport. One confirmed 430
+    /// alongside a hundred timeouts therefore produced the aged-post
+    /// sentence, and the gate turned that into "nothing is coming":
+    /// the single automatic retry was suppressed and the failure went
+    /// final, so a release that a journal-resume retry would have
+    /// finished was reported to the indexer as dead (Codex sweep 3, M8).
+    ///
+    /// The census still SAYS the post is old - that is honest and Gary
+    /// asked for it. What changed is that the gate now reads the whole
+    /// message: an age plus an unexplained loss is not proof.
+    #[test]
+    fn an_ambiguous_loss_is_never_proven_stale() {
+        fn causes(transport: u64, dead: &[String]) -> LossCauses<'_> {
+            LossCauses {
+                missing_430: 12,
+                missing_segments: 1965,
+                total_segments: 4506,
+                bytes_arrived: 1_879_000_000,
+                post_age_days: 9,
+                transport_failed: transport,
+                dead_servers: dead,
+                ..no_causes()
+            }
+        }
+        let dead: Vec<String> = vec!["news.example.net".to_string()];
+        let mixed = super::incomplete_reason(1, 0, &causes(1900, &[]));
+        assert!(
+            mixed.contains("well past the minutes-to-hours"),
+            "the age is still stated: {mixed}"
+        );
+        assert!(
+            !super::missing_articles_proven_stale(&mixed),
+            "a transport-dominant loss is ours to heal, not a dead post: {mixed}"
+        );
+
+        let starved = super::incomplete_reason(1, 0, &causes(0, &dead));
+        assert!(
+            !super::missing_articles_proven_stale(&starved),
+            "segments only a never-connected server carries say nothing about the post: {starved}"
+        );
+
+        // The case the suppression exists for is untouched: every loss a
+        // 430, every server answering, the post long past propagation.
+        let stale = super::incomplete_reason(1, 0, &causes(0, &[]));
+        assert!(
+            super::missing_articles_proven_stale(&stale),
+            "a proven-stale post must still suppress its retry: {stale}"
+        );
+        // ...and a fresh post of the same shape never is.
+        let fresh = super::incomplete_reason(
+            1,
+            0,
+            &LossCauses {
+                post_age_days: 0,
+                ..causes(0, &[])
+            },
+        );
+        assert!(!super::missing_articles_proven_stale(&fresh), "{fresh}");
     }
 
     /// Field report, 31 Jul: "94 file(s) with missing segments" for a post that

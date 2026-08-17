@@ -245,3 +245,392 @@ async fn pre_queue_settings_survive_a_restart() {
     );
     assert_eq!(m["pre_queue_timeout_secs"], 7, "{m}");
 }
+
+/// The post-processing script has FINISHED by the time the job appears
+/// in history as Completed.
+///
+/// That word is a contract, not a status line: Sonarr's SABnzbd client
+/// imports a release the moment history reports it, and the pp-script
+/// is the step of post-processing most likely to still be moving the
+/// payload - a sorter, a renamer, a library filer. The hook used to be
+/// dispatched to the blocking pool while `park` filed the row anyway,
+/// with nothing ordering the two: on this machine the script landed
+/// 105-313 ms after the row, which is the *arr importing a directory
+/// that is still being rewritten, and on a loaded box the gap has no
+/// ceiling at all.
+///
+/// It is also where `sonarr_style_cycle`'s "hook never ran"
+/// intermittent came from - the suite asserted this contract and the
+/// product met it by luck. Pinned with a script that takes two seconds
+/// so the race is not a race: pre-fix this reads an absent hook file at
+/// the first Completed, every time.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_post_processing_script_finishes_before_history_says_completed() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-postjob-order-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let data = payload(120_000, 7);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("episode.bin", &data, 40_000, "pj", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"&quot;episode.bin&quot; yEnc (1/4)\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+    );
+    for (id, bytes, num) in &segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+
+    // Two seconds of work, then the marker. The sleep is the whole
+    // instrument: it turns "did park wait for the script" into a
+    // question a single poll can answer.
+    let hook = {
+        use std::os::unix::fs::PermissionsExt;
+        let hook = dir.join("postjob.sh");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nsleep 2\nprintf 'ran:%s\\n' \"$SAB_FINAL_NAME\" \
+             > \"$(dirname \"$0\")/postjob.out\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        hook
+    };
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--script")
+            .arg(&hook)
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    let marker = dir.join("postjob.out");
+    tokio::task::spawn_blocking(move || {
+        let r = upload_named(port, "episode", &xml, "&cat=tv");
+        assert!(r.contains("\"status\":true"), "{r}");
+
+        // Polled tightly, because the claim is about the FIRST sighting
+        // of the word: a lazy poll would let the script finish inside
+        // the gap and report green against the very code this pins.
+        let mut seen = None;
+        for _ in 0..600 {
+            let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+            if h.contains("\"Completed\"") {
+                seen = Some(std::fs::read_to_string(&marker).unwrap_or_default());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let at_completed = seen.expect("the job never reached history as Completed");
+        assert!(
+            at_completed.contains("ran:episode"),
+            "history said Completed while the post-processing script was still running \
+             (marker at that moment: {at_completed:?}) - a SAB client imports on that word, \
+             and the script is what moves the payload"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Build the `<nzb>` for one multi-segment file.
+fn seg_nzb(name: &str, segs: &[(String, u64, u32)], date: i64) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"{date}\" subject=\"&quot;{name}&quot; yEnc (1/{})\">\n    <groups><group>g</group></groups>\n    <segments>\n",
+        segs.len()
+    );
+    for (id, bytes, num) in segs {
+        xml.push_str(&format!(
+            "      <segment bytes=\"{bytes}\" number=\"{num}\">{id}</segment>\n"
+        ));
+    }
+    xml.push_str("    </segments>\n  </file>\n</nzb>\n");
+    xml
+}
+
+/// A hook that takes two seconds and then leaves a marker. The sleep is
+/// the instrument: it turns "did park wait for the script" into a
+/// question a single read can answer.
+fn slow_marker_hook(dir: &Path, stem: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let hook = dir.join(format!("{stem}.sh"));
+    let marker = dir.join(format!("{stem}.out"));
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nsleep 2\nprintf 'ran:%s\\n' \"$SAB_FINAL_NAME\" > \"{}\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (hook, marker)
+}
+
+/// Poll history tightly for `status` and read `marker` at the FIRST
+/// sighting of it.
+///
+/// Tightly on purpose: the claim is about the first moment the word is
+/// visible, and a lazy poll would let a two-second script finish inside
+/// the gap and report green against the very code this pins.
+fn marker_at_first(port: u16, status: &str, marker: &Path) -> String {
+    for _ in 0..600 {
+        let h = http(port, "/api?mode=history&apikey=sekrit&output=json", None);
+        if h.contains(&format!("\"{status}\"")) {
+            return std::fs::read_to_string(marker).unwrap_or_default();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("the job never reached history as {status}");
+}
+
+/// The same contract as
+/// [`the_post_processing_script_finishes_before_history_says_completed`],
+/// on the completion that never downloads: the M14i metadata-only
+/// library pick.
+///
+/// It is a separate case because it is a separate code path with a
+/// separate answer. That one is the post-processing lane's own tail,
+/// which can simply await the script; this one is decided on the queue
+/// RUNNER's loop, where awaiting a user script would stall the picker
+/// for every other job in the queue - which is exactly why the arm was
+/// left unordered when the lane tail was fixed. The runner hands the
+/// tail to the lane instead (`PostprocLane::submit_hooks_only`), so the
+/// wait is paid in post-processing capacity, where it belongs.
+///
+/// The contract is the same because the word is the same: this arm
+/// reaches `Completed` and writes a `.strm` pointer, Sonarr imports on
+/// that word, and the pp-script is what may still be moving the file it
+/// names.
+///
+/// The zero-bodies assertion is load-bearing, not colour: it is what
+/// proves the job went through the metadata-only arm at all rather than
+/// down the ordinary pipeline, whose tail was already ordered and would
+/// pass this test for the wrong reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_metadata_only_job_finishes_its_script_before_history_says_completed() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-libpostjob-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let data = payload(120_000, 9);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("episode.bin", &data, 40_000, "mo", &mut articles);
+    let srv = MockServer::start(articles, Chaos::default()).await;
+    let xml = seg_nzb("episode.bin", &segs, 0);
+
+    let (hook, marker) = slow_marker_hook(&dir, "metaonly");
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--script")
+            .arg(&hook)
+            .arg("--library-cats")
+            .arg("library")
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+    let served = srv.served.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let r = upload_named(port, "episode", &xml, "&cat=library");
+        assert!(r.contains("\"status\":true"), "{r}");
+
+        let at_completed = marker_at_first(port, "Completed", &marker);
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "this job downloaded article bodies, so it did not take the \
+             metadata-only arm - the test is not pinning what it claims to"
+        );
+        assert!(
+            at_completed.starts_with("ran:"),
+            "history said Completed while the post-processing script was still running \
+             (marker at that moment: {at_completed:?}) - a SAB client imports on that word, \
+             and the script is what moves what it points at"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same ordering on the word `Failed`, through the second of the
+/// three runner arms: the §138 give-up on a post no configured server
+/// can supply.
+///
+/// `Failed` is acted on as surely as `Completed` is - an *arr blocklists
+/// the release and searches again - and a user's failure script runs
+/// here exactly as it does on a download that failed the long way
+/// round, where the lane has ordered it since 16 Aug. Pinning it stops
+/// the three arms drifting back apart: they share one call, and this is
+/// the leg that would notice if the failing half of it were quietly
+/// dropped. (The third arm, the opt-in pre-flight Impossible verdict,
+/// is the same statement on the same line and is left to these two.)
+///
+/// The queue is paused while the health verdict is gathered, because
+/// the runner is the seam that decides: unpaused, this post would be
+/// picked and fail the ordinary way, down the already-ordered lane tail,
+/// and the test would pass without touching the arm it names.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_health_giveup_finishes_its_script_before_history_says_failed() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-giveuppostjob-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let data = payload(60_000, 13);
+    let mut articles = HashMap::new();
+    let segs = make_file_articles("dead.bin", &data, 20_000, "gv", &mut articles);
+    // Gone everywhere, to STAT and BODY alike: one server, and it says
+    // so, which is what makes the fleet unanimous.
+    let missing: std::collections::HashSet<String> =
+        segs.iter().map(|(id, _, _)| format!("<{id}>")).collect();
+    let srv = MockServer::start(
+        articles,
+        Chaos {
+            missing,
+            ..Default::default()
+        },
+    )
+    .await;
+    // 30 days old: past GONE_MIN_AGE_DAYS, so propagation is no longer
+    // an explanation and the verdict may reach red at all.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let xml = seg_nzb("dead.bin", &segs, now - 30 * 86_400);
+
+    let (hook, marker) = slow_marker_hook(&dir, "giveup");
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!(
+            "{{\"servers\":[{{\"host\":\"{}\",\"port\":{},\"tls\":false}}]}}",
+            srv.addr.ip(),
+            srv.addr.port()
+        ),
+    )
+    .unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .env("NZBFAST_HEALTH_TICK_SECS", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--script")
+            .arg(&hook)
+            .arg("--connections")
+            .arg("2");
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        set_cfg(port, "post_health_fail", "1");
+        http(port, "/api?mode=pause&apikey=sekrit&output=json", None);
+        let r = upload_named(port, "dead", &xml, "");
+        assert!(r.contains("\"status\":true"), "{r}");
+
+        // Wait for the evidence the give-up is decided from: every
+        // configured server asked, and every one of them answered.
+        let mut scored = false;
+        for _ in 0..300 {
+            let q = http(port, "/api?mode=queue&apikey=sekrit&output=json", None);
+            let v: serde_json::Value = serde_json::from_str(&q).unwrap_or_default();
+            let slot = v["queue"]["slots"]
+                .as_array()
+                .and_then(|a| a.first().cloned())
+                .unwrap_or_default();
+            if slot["health"]["bucket"] == "red"
+                && slot["health"]["answered"] == 1
+                && slot["health"]["servers"] == 1
+            {
+                scored = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(
+            scored,
+            "the post never scored red with every server agreeing"
+        );
+
+        http(port, "/api?mode=resume&apikey=sekrit&output=json", None);
+        let at_failed = marker_at_first(port, "Failed", &marker);
+        assert!(
+            at_failed.starts_with("ran:"),
+            "history said Failed while the post-processing script was still running \
+             (marker at that moment: {at_failed:?}) - an *arr blocklists and re-searches \
+             on that word"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

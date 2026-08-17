@@ -708,6 +708,47 @@ fn data_area_past_the_volume_end_is_corrupt() {
     assert_eq!(m.mapped_through(), m.cursor);
 }
 
+/// ...and a data area declared so large that the cursor arithmetic
+/// WRAPS must be refused by the same bound.
+///
+/// `data_size` is an attacker-declared vint and `vint` reads values
+/// within a few bytes of `u64::MAX`, so `base + envelope + data_size`
+/// overflowed: in release it wrapped to a SMALL `next`, which is still
+/// greater than `cursor` and no longer greater than `volume_size` - so
+/// it slipped past both of `advance_to`'s tests and defeated the very
+/// bound the test above installs. In debug (and under `cargo test`,
+/// where overflow checks are on) the same line panicked outright. The
+/// RAR4 twin has used `checked_add` for this since the M5 CRC gate; the
+/// RAR5 half now matches. A poster stamps the header CRC over whatever
+/// fields it likes, so the CRC gate is no defence here.
+#[test]
+fn a_v5_data_area_that_wraps_the_cursor_is_corrupt() {
+    let data = payload(4_000, 3);
+    // Chosen so `base + envelope + data_size` exceeds u64::MAX: the
+    // plain sum wraps to a small value that passes the volume bound.
+    let vol = fixtures::rar5_volume_oversized("movie.mkv", 8 << 20, &data, u64::MAX - 16);
+    let mut m = VolumeMapper::new(vol.len() as u64);
+    feed_shuffled(&mut m, &vol, 700, 5);
+    assert!(
+        matches!(m.blocker, Some(MapBlocker::Corrupt(_))),
+        "expected a Corrupt blocker, got {:?}",
+        m.blocker
+    );
+    assert!(
+        !m.complete,
+        "a volume whose cursor arithmetic wraps must never read complete"
+    );
+    // The wrapped cursor is the real damage: an entry surviving with
+    // `data_off + data_len` wrapped is what `map_span_into` then
+    // computes destinations from.
+    assert!(
+        m.entries
+            .iter()
+            .all(|e| e.data_off.checked_add(e.data_len).is_some()),
+        "no surviving entry may carry a wrapped data area"
+    );
+}
+
 /// The bound must not fire on a legitimate split set, where every
 /// piece's `data_len` is the PER-VOLUME portion and lands exactly on
 /// the volume end - the same invariant the EOF rule already assumes.

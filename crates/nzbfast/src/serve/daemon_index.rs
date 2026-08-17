@@ -13,6 +13,40 @@
 
 use super::*;
 
+/// Why a pooled read could not produce a trustworthy answer. The name is
+/// about the CALLER's options rather than the cause: either way the
+/// honest reply is "not right now, ask again", and every endpoint
+/// handles both the same - keep what is on screen and let the next poll
+/// get the real answer. Drawing either as an empty result is how a
+/// working index comes to be reported as a broken one.
+#[cfg(feature = "indexer")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::serve) enum IndexBusy {
+    /// Every read connection is in use. Nothing failed in the database
+    /// sense - the answer just is not available cheaply right now.
+    Saturated,
+    /// The query failed with SQLITE_SCHEMA and was still failing after
+    /// re-preparing: a writer changed the schema under this reader and
+    /// the fts5 constructor lost the race twice. Something DID fail,
+    /// which is exactly why it must not be flattened into "no rows" -
+    /// see `nzbkit::index::Index::schema_faults`.
+    SchemaChanged,
+}
+
+#[cfg(feature = "indexer")]
+impl IndexBusy {
+    /// What to tell the user. Both are transient and both ask for the
+    /// same thing, so they differ only in naming the cause - which is
+    /// what makes a schema fault greppable in a support report rather
+    /// than indistinguishable from a busy pool.
+    pub(in crate::serve) fn message(self) -> &'static str {
+        match self {
+            Self::Saturated => "the index is busy - try again in a moment",
+            Self::SchemaChanged => "the index schema changed mid-query - try again in a moment",
+        }
+    }
+}
+
 impl Daemon {
     // -- M34 index size cap ------------------------------------------------
 
@@ -710,11 +744,19 @@ impl Daemon {
         DEBUG_READ_BUDGET.store(n.max(0), Ordering::Relaxed);
     }
 
-    /// As [`Self::with_index_read`], with saturation reported rather than
-    /// flattened into "nothing found": [`IndexBusy`] means every read
-    /// connection was busy. The query surfaces a user watches while it
-    /// runs (the wall, search) say so instead of blanking, which is the
-    /// honest answer and stops a busy index reading as an empty one.
+    /// As [`Self::with_index_read`], with a read that could not produce a
+    /// trustworthy answer reported rather than flattened into "nothing
+    /// found". [`IndexBusy::Saturated`] means every read connection was
+    /// busy; [`IndexBusy::SchemaChanged`] means the query itself failed
+    /// with SQLITE_SCHEMA and was still failing after nzbkit re-prepared
+    /// it - a writer changed the schema under this reader (the first
+    /// `ANALYZE` creating sqlite_stat1, a version upgrade's migrations)
+    /// and the fts5 constructor lost the race twice.
+    ///
+    /// The query surfaces a user watches while they run (the wall,
+    /// search) and the *arr-facing newznab facade say so instead of
+    /// blanking, which is the honest answer and stops a working index
+    /// reading as an empty one.
     #[cfg(feature = "indexer")]
     pub(in crate::serve) fn index_read_checked<T>(
         &self,
@@ -727,11 +769,33 @@ impl Daemon {
             return Ok(self.with_index(f));
         }
         if debug_read_budget_spent() {
-            return Err(IndexBusy);
+            return Err(IndexBusy::Saturated);
         }
         match self.index_read_acquire() {
-            Reader::Got(ix) => Ok(f(&ix)),
-            Reader::Busy => Err(IndexBusy),
+            // The fault stamp, read either side of the closure. `f`
+            // returns an Option, so every caller's `.ok()` has already
+            // thrown the error away by the time it gets here and a real
+            // failure is indistinguishable from a query that legitimately
+            // matched nothing - retrying on `None` would be wrong AND
+            // would double the work of every miss. nzbkit counts the
+            // queries that failed with SQLITE_SCHEMA even after
+            // re-preparing, on THIS connection, which survives the
+            // flattening. Exact rather than approximate: the pool lends
+            // this connection to nobody else while `f` runs, so a move in
+            // the counter is this closure's own.
+            Reader::Got(ix) => {
+                let before = ix.schema_faults();
+                let out = f(&ix);
+                if ix.schema_faults() == before {
+                    Ok(out)
+                } else {
+                    Err(IndexBusy::SchemaChanged)
+                }
+            }
+            Reader::Busy => Err(IndexBusy::Saturated),
+            // The fallbacks run on the read-WRITE connection, which is
+            // the one doing the changing - its own statements are never
+            // stale under it - so there is nothing to check there.
             Reader::Unavailable => Ok(self.try_with_index(f)),
         }
     }

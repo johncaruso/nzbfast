@@ -825,6 +825,84 @@ fn tagged_music_and_books_parse() {
 }
 
 #[test]
+fn magazines_and_pdfs_are_books_not_films() {
+    // A magazine is posted as its own PDF and carries no other book
+    // evidence at all, so every one of them parsed as a MOVIE with a
+    // year and sat in the film lane (measured on a live index,
+    // 16 Aug 2026).
+    let m = p("PC_Games_Hardware_Magazin_September_No_09_2026.pdf");
+    assert_eq!(m.kind, Kind::Book);
+    assert_eq!(m.title, "PC Games Hardware Magazin September No 09");
+    // The marker closes the title region, so ".pdf" cannot land in it.
+    assert_eq!(
+        p("Some Author - A Title.pdf").title,
+        "Some Author - A Title"
+    );
+    // ...and the safety margin is the same one FLAC rides: any video
+    // evidence and the file is a film that happens to name a PDF.
+    assert_eq!(p("Some.Doc.2019.1080p.WEB.x264-GRP.pdf").kind, Kind::Movie);
+}
+
+#[test]
+fn a_fed_name_that_dropped_its_format_marker_recovers_the_lane() {
+    // Spotnet's signed title names the WORK; the posted file names the
+    // FORMAT. Classification reads the fed title, so the ".epub" went
+    // missing and the parse fell through to Movie - which the junk
+    // scorer then hid as evidence-free media.
+    let mut fed = p("Hetty Luiten - Op eigen benen");
+    assert_eq!(fed.kind, Kind::Movie, "the fed name alone says nothing");
+    recover_media_kind(
+        &mut fed,
+        "Hetty Luiten - Op eigen benen",
+        "Luiten, Hetty - Op eigen benen.epub",
+    );
+    assert_eq!(fed.kind, Kind::Book);
+    assert_eq!(fed.key, "bk:hetty luiten op eigen benen");
+    // The title stays the FED one - only the lane moved.
+    assert_eq!(fed.title, "Hetty Luiten - Op eigen benen");
+    // Music rides the same seam.
+    let mut alb = p("Pink Floyd - The Dark Side of the Moon");
+    recover_media_kind(
+        &mut alb,
+        "Pink Floyd - The Dark Side of the Moon",
+        "Pink_Floyd-The_Dark_Side_Of_The_Moon-1973-EOS",
+    );
+    assert_eq!(alb.kind, Kind::Music);
+
+    // What it must NOT do. A fed name that classified on its own
+    // evidence is not ours to overrule...
+    let mut film = p("Some.Film.2019.1080p.BluRay.x264-GRP");
+    recover_media_kind(
+        &mut film,
+        "Some.Film.2019.1080p.BluRay.x264-GRP",
+        "some.film.epub",
+    );
+    assert_eq!(film.kind, Kind::Movie, "video evidence stands");
+    let mut ep = p("Some.Show.S01E01.WEB-GRP");
+    recover_media_kind(&mut ep, "Some.Show.S01E01.WEB-GRP", "some.show.epub");
+    assert_eq!(ep.kind, Kind::Tv);
+    // ...and a stem that says nothing changes nothing.
+    let mut plain = p("Hetty Luiten - Op eigen benen");
+    let was = plain.key.clone();
+    recover_media_kind(
+        &mut plain,
+        "Hetty Luiten - Op eigen benen",
+        "0a1b2c3d4e5f6071.rar",
+    );
+    assert_eq!(plain.kind, Kind::Movie);
+    assert_eq!(plain.key, was);
+    // ...and a row that was never fed a name at all skips the second
+    // parse entirely: fed IS the stem, so there is nothing to recover.
+    let mut unfed = p("Frank Herbert - Dune (1965) [epub]");
+    recover_media_kind(
+        &mut unfed,
+        "Frank Herbert - Dune (1965) [epub]",
+        "Frank Herbert - Dune (1965) [epub]",
+    );
+    assert_eq!(unfed.kind, Kind::Book, "the stem already said it");
+}
+
+#[test]
 fn music_keys_ignore_the_edition_year() {
     // A remaster, a vinyl rip and the original are one album, so
     // they have to land on one card - unlike movies, whose year is

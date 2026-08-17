@@ -536,6 +536,35 @@ impl Nzb {
             .map(NzbFile::bytes)
             .fold(0u64, u64::saturating_add)
     }
+
+    /// The cheapest file in this NZB whose head carries the recovery
+    /// set's critical packets: the smallest `.par2` index if the post
+    /// ships one, else the smallest recovery volume.
+    ///
+    /// Two callers, one question. The download path asks it because an
+    /// obfuscated post often ships volumes and no plain index, and the
+    /// critical packets (Main/FileDesc/IFSC) are duplicated into every
+    /// volume, so the smallest volume bootstraps the set for a few tens
+    /// of KB (`get::plan`). Pre-flight asks it because the Main packet
+    /// is the only place the set's BLOCK SIZE is written down, and
+    /// without that figure a `.vol-NN.par2` budget cannot be sized at
+    /// all (`nzbfast check`). Answering it twice is how the two paths
+    /// would drift.
+    ///
+    /// Smallest by encoded bytes on purpose: for an index that is the
+    /// whole file, and for a volume it is the one with the fewest
+    /// recovery slices in front of the packets we came for.
+    pub fn par2_seed_file(&self) -> Option<usize> {
+        let pick = |kind: FileKind| {
+            self.files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.kind() == kind && !f.segments.is_empty())
+                .min_by_key(|(_, f)| f.bytes())
+                .map(|(i, _)| i)
+        };
+        pick(FileKind::Par2Main).or_else(|| pick(FileKind::Par2Volume))
+    }
 }
 
 impl NzbFile {
@@ -1208,6 +1237,67 @@ POST]]></segment>
         assert_eq!(
             file("Rel [3/3] - \"rel.vol-10.par2.bak\" yEnc (1/1)").kind(),
             FileKind::Data
+        );
+    }
+
+    /// One answer to "which par2 file do I fetch to get the critical
+    /// packets", shared by the download path and pre-flight.
+    ///
+    /// The download path needs it because an obfuscated post ships
+    /// volumes and no index, and it bootstraps the set from the smallest
+    /// one. Pre-flight needs it because the Main packet is the only
+    /// place the block size is written down, and a `.vol-NN.par2` budget
+    /// cannot be sized without it. The 15 Aug post was both cases at
+    /// once: seven `.vol-NN` volumes, no index, and the smallest of them
+    /// a 41,901-byte file that turned out to hold Main + FileDesc + IFSC
+    /// and not one recovery slice.
+    #[test]
+    fn the_par2_seed_is_the_cheapest_file_carrying_the_critical_packets() {
+        let file = |subject: &str, bytes: u64| NzbFile {
+            subject: subject.to_string(),
+            segments: vec![Segment {
+                number: 1,
+                bytes,
+                message_id: format!("{bytes}@x"),
+            }],
+            ..Default::default()
+        };
+        let nzb = |files: Vec<NzbFile>| Nzb {
+            files,
+            meta: Vec::new(),
+        };
+
+        // An index beats every volume, however small the volumes are.
+        let with_index = nzb(vec![
+            file("\"rel.mkv\" yEnc (1/1)", 3_000_000),
+            file("\"rel.vol000+02.par2\" yEnc (1/1)", 900),
+            file("\"rel.par2\" yEnc (1/1)", 40_000),
+        ]);
+        assert_eq!(with_index.par2_seed_file(), Some(2));
+
+        // No index: the smallest volume, which is the 15 Aug shape.
+        let obfuscated = nzb(vec![
+            file("\"rel.mkv\" yEnc (1/1)", 3_332_350_599),
+            file("\"rel.vol-05.par2\" yEnc (1/1)", 26_869_479),
+            file("\"rel.vol-01.par2\" yEnc (1/1)", 41_901),
+            file("\"rel.vol-02.par2\" yEnc (1/1)", 1_708_175),
+        ]);
+        assert_eq!(obfuscated.par2_seed_file(), Some(2));
+
+        // A par2 file with no segments cannot be fetched, so it is not
+        // the seed however small it looks.
+        let mut empty_index = file("\"rel.par2\" yEnc (1/1)", 0);
+        empty_index.segments.clear();
+        let holed = nzb(vec![
+            empty_index,
+            file("\"rel.vol-01.par2\" yEnc (1/1)", 41_901),
+        ]);
+        assert_eq!(holed.par2_seed_file(), Some(1));
+
+        // A post with no par2 at all has no seed and no budget to size.
+        assert_eq!(
+            nzb(vec![file("\"rel.mkv\" yEnc (1/1)", 3_000_000)]).par2_seed_file(),
+            None
         );
     }
 

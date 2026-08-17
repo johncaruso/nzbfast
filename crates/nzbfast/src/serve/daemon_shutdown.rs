@@ -126,6 +126,16 @@ pub(in crate::serve) fn wind_down(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, 
     // Sync context (a signal thread with no reactor of its own), so
     // this is `poke_sidecar` rather than the async `stop_sidecar` -
     // same signal, and the gauge below is what actually waits.
+    //
+    // The hub is RETAINED before the signal, not re-read from the slot
+    // afterwards. The signalled task clears `d.sidecar` on its way out,
+    // so every later read - the connection gauge below, and the
+    // warm-pool sweep after it - found None and lost the route to the
+    // very hub this signal was aimed at: the gauge then stopped
+    // counting sessions that were still saying goodbye, and the sweep
+    // had nothing to clear (Codex sweep 3, M13). `stop_sidecar` takes
+    // the hub out of the slot for exactly this reason.
+    let sidecar_hub = d.sidecar.lock_ok().as_ref().map(|s| s.hub.clone());
     d.poke_sidecar(|_| true);
     d.save_queue();
     // Off to its own thread NOW, to run alongside the connection drain
@@ -163,12 +173,7 @@ pub(in crate::serve) fn wind_down(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, 
             .unwrap_or(0)
     };
     let connected = || -> usize {
-        hub_connected(&d.hub)
-            + d.sidecar
-                .lock_ok()
-                .as_ref()
-                .map(|s| hub_connected(&s.hub))
-                .unwrap_or(0)
+        hub_connected(&d.hub) + sidecar_hub.as_deref().map(hub_connected).unwrap_or(0)
     };
     let open_at_signal = connected();
     while started.elapsed() < WIND_DOWN_BUDGET && connected() > 0 {
@@ -207,12 +212,7 @@ pub(in crate::serve) fn wind_down(d: &Arc<Daemon>, rt: &tokio::runtime::Handle, 
         .get()
         .into_iter()
         .cloned()
-        .chain(
-            d.sidecar
-                .lock_ok()
-                .as_ref()
-                .and_then(|s| s.hub.warm.get().cloned()),
-        )
+        .chain(sidecar_hub.as_ref().and_then(|h| h.warm.get().cloned()))
         .collect();
     for warm in warms {
         let left = WIND_DOWN_BUDGET.saturating_sub(started.elapsed());
@@ -789,6 +789,72 @@ mod shutdown_sidecar_tests {
             waited < WIND_DOWN_BUDGET,
             "the wind-down spent its entire budget instead of leaving when the \
              connections had gone ({waited:?})"
+        );
+
+        *d.sidecar.lock_ok() = None;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ...and it keeps watching that hub after the sidecar task has
+    /// CLEARED THE SLOT, which is what the signal makes it do.
+    ///
+    /// The gauge and the warm-pool sweep both re-read `d.sidecar` after
+    /// the poke, and the signalled task empties that slot on its way
+    /// out - so the route to the hub the signal was aimed at was
+    /// normally gone by the time either looked. The wind-down then saw
+    /// zero connections and left while the prefetch's sessions were
+    /// still saying goodbye, which is the same provider-occupancy
+    /// symptom the sidecar leg above exists to prevent (Codex sweep 3,
+    /// M13). Retaining the hub before signalling is what `stop_sidecar`
+    /// already does.
+    #[test]
+    fn the_wind_down_keeps_watching_a_sidecar_that_clears_its_own_slot() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-winddown2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let d = crate::serve::testutil::test_daemon(&dir);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        let hub = Arc::new(crate::StreamHub::default());
+        let live = live_one("news.example");
+        live.servers[0].connected.store(1, Ordering::Relaxed);
+        *hub.pool_live.lock_ok() = Some(live.clone());
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The real task's exit path: it takes the abort, then empties
+        // the slot - well before its sessions have finished quitting.
+        let d2 = d.clone();
+        let c2 = cancelled.clone();
+        let task = rt.spawn(async move {
+            while !c2.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            *d2.sidecar.lock_ok() = None;
+        });
+        *d.sidecar.lock_ok() = Some(Sidecar {
+            nzo_id: "nzo-winddown-2".into(),
+            hub: hub.clone(),
+            progress: Arc::new(AtomicU64::new(0)),
+            cancelled: cancelled.clone(),
+            task,
+            borrowed: false,
+        });
+
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r2 = released.clone();
+        let quitter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1_200));
+            live.servers[0].connected.store(0, Ordering::Relaxed);
+            r2.store(true, Ordering::Relaxed);
+        });
+
+        wind_down(&d, rt.handle(), "test stop");
+        let left_before_the_quit = !released.load(Ordering::Relaxed);
+        quitter.join().expect("quitter");
+
+        assert!(
+            !left_before_the_quit,
+            "the wind-down lost the route to the sidecar's hub when the task \
+             cleared the slot, and exited with those sessions still open"
         );
 
         *d.sidecar.lock_ok() = None;

@@ -479,10 +479,10 @@ fn m_pre_candidates(
         // index_read_checked, not with_index_read: a busy pool must not
         // answer an empty candidates list as success.
         let cands = match d.index_read_checked(|ix| ix.pre_candidates(id, 8).ok()) {
-            Err(_) => {
+            Err(why) => {
                 return Some(json!({
                     "status": false, "busy": true,
-                    "error": "the index is busy - try again in a moment",
+                    "error": why.message(),
                 }));
             }
             Ok(cands) => cands.unwrap_or_default(),
@@ -1157,10 +1157,10 @@ fn m_index_search(
         // difference (Codex sweep 5 Aug M10). The UI keeps its list
         // on `status:false` and the next poll gets the real answer.
         let hits = match d.index_read_checked(|ix| ix.search(&q, 60).ok()) {
-            Err(_) => {
+            Err(why) => {
                 return Some(json!({
                     "status": false, "busy": true,
-                    "error": "the index is busy - try again in a moment",
+                    "error": why.message(),
                 }));
             }
             Ok(hits) => hits.unwrap_or_default(),
@@ -1307,9 +1307,9 @@ fn m_wall2(
             ix.browse_cards(&bq, sort, matched_only, catgroup, aff_ctx.as_ref())
                 .ok()
         }) {
-            Err(_) => json!({
+            Err(why) => json!({
                 "status": false, "busy": true,
-                "error": "the index is busy - try again in a moment",
+                "error": why.message(),
             }),
             Ok(Some((cards, total))) => {
                 // The honest count is `total`, not the page: a search
@@ -1674,7 +1674,7 @@ fn m_index_browse(
                             // What separates two encodes of one
                             // film. Taken from the fresh parse
                             // rather than the stored columns so
-                            // rows the quality_v8 pass has not
+                            // rows the quality_v9 pass has not
                             // reached yet still show their tags.
                             "vcodec": p.vcodec, "acodec": p.acodec,
                             "hdr": p.hdr,
@@ -1724,10 +1724,10 @@ fn m_index_dupe(
         // must answer "busy", never "release not found" for a release
         // that exists.
         let stem = match d.index_read_checked(|ix| ix.stem_by_id(id).ok().flatten()) {
-            Err(_) => {
+            Err(why) => {
                 return Some(json!({
                     "status": false, "busy": true,
-                    "error": "the index is busy - try again in a moment",
+                    "error": why.message(),
                 }));
             }
             Ok(stem) => stem,
@@ -1772,10 +1772,10 @@ fn m_index_get(
                 .unwrap_or_else(|| format!("release-{id}"));
             Some((ix.make_nzb(id).ok()?, name))
         }) {
-            Err(_) => {
+            Err(why) => {
                 return Some(json!({
                     "status": false, "busy": true,
-                    "error": "the index is busy - try again in a moment",
+                    "error": why.message(),
                 }));
             }
             Ok(r) => r,
@@ -2087,9 +2087,9 @@ fn m_spot_search(
         // index_read_checked, not with_index_read: a busy read pool must
         // not answer "no spots match" as a plain success.
         match d.index_read_checked(|ix| ix.spot_browse(&q).ok()) {
-            Err(_) => json!({
+            Err(why) => json!({
                 "status": false, "busy": true,
-                "error": "the index is busy - try again in a moment",
+                "error": why.message(),
             }),
             Ok(None) => json!({"status": true, "results": [], "total": 0,
                             "on": d.spot_enabled.load(Ordering::Relaxed)}),
@@ -2167,10 +2167,10 @@ fn m_rar_name(
         // as "not encrypted" and re-spent a connection and up to three
         // articles on a row already terminally classified.
         let known_locked = match d.index_read_checked(|ix| Some(ix.header_encrypted(id))) {
-            Err(_) => {
+            Err(why) => {
                 return Some(json!({
                     "status": false, "busy": true,
-                    "error": "the index is busy - try again in a moment",
+                    "error": why.message(),
                 }));
             }
             Ok(known) => known == Some(true),
@@ -2195,10 +2195,10 @@ fn m_rar_name(
         // release that exists. Same honesty as the first read, which
         // has reported busy since it was written.
         let files = match d.index_read_checked(|ix| ix.probe7z_files(id).ok()) {
-            Err(_) => {
+            Err(why) => {
                 return Some(json!({
                     "status": false, "busy": true,
-                    "error": "the index is busy - try again in a moment",
+                    "error": why.message(),
                 }));
             }
             Ok(files) => files.unwrap_or_default(),

@@ -225,7 +225,7 @@ impl Index {
     /// M25 browse view: filtered, sorted, paginated release listing -
     /// what the wall's list mode and the Newznab facade page through.
     /// Returns (rows, total matching rows) so the UI can paginate.
-    pub fn browse(&self, q: &BrowseQuery) -> rusqlite::Result<(Vec<Release>, u64)> {
+    pub(super) fn browse_once(&self, q: &BrowseQuery) -> rusqlite::Result<(Vec<Release>, u64)> {
         // Every predicate is written with `{}` where the table alias
         // goes: the page filters `releases` unqualified, and the
         // representative-copy subquery at the bottom has to apply the
@@ -1312,7 +1312,7 @@ mod tests {
     }
 
     /// Codec / audio / dynamic range land on ingest, and rows indexed
-    /// before those columns existed get them from the quality_v8 re-parse
+    /// before those columns existed get them from the quality_v9 re-parse
     /// on the next open - the whole point of bumping the version key.
     #[test]
     fn codec_audio_hdr_stored_and_backfilled() {
@@ -1349,12 +1349,12 @@ mod tests {
             ix.db
                 .execute_batch(
                     "UPDATE releases SET vcodec='', acodec='', hdr='';
-                     DELETE FROM kv WHERE k='quality_v8';",
+                     DELETE FROM kv WHERE k='quality_v9';",
                 )
                 .unwrap();
         }
         let ix = Index::open(&db).unwrap();
-        assert_eq!(ix.kv_get("quality_v8").as_deref(), Some("1"));
+        assert_eq!(ix.kv_get("quality_v9").as_deref(), Some("1"));
         let r = &ix.search("", 10).unwrap()[0];
         assert_eq!(
             (r.vcodec.as_str(), r.acodec.as_str(), r.hdr.as_str()),

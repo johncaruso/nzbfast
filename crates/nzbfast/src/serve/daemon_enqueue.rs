@@ -237,6 +237,14 @@ impl Daemon {
         } else {
             self.dupe_collision(&stem)
         };
+        // The user's delete has now been answered: this release is back.
+        // Spending the mark here, rather than letting it sit out its
+        // window, is what keeps the identity protected afterwards - a
+        // SECOND copy added behind this one is an ordinary duplicate of
+        // the row we are about to publish, and must be held like one.
+        // Unconditional: a delete followed by an add that was never
+        // going to be held has still been answered.
+        self.clear_delete_mark(&stem);
         #[cfg(test)]
         if collision.is_some() {
             let seam = DUPE_ADMIT_BARRIER.lock_ok().clone();

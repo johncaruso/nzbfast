@@ -1,4 +1,15 @@
-# Build the QNAP package (.qpkg) for a published release.
+# Build the QNAP package (.qpkg) for a published release. This is the
+# workflow that ships it: dispatch it with the tag once the release page
+# is up, then scan and upload the artifact by hand, exactly as the
+# Synology .spk is done. Step 4c of the publish-release skill is the
+# checklist.
+#
+# It USED to be the on-demand path only, with release.yml building the
+# shipped package during the release run from a separate cross-build of
+# the same source. That was dropped on 16 Aug 2026: the two builds are
+# not the same bytes, and nothing on the release page published a
+# checksum for the ones inside the package. Measured on 1.1.3 - packaged
+# 72cad10c / 71d12ee9, released 9cc8c994 / a11ce1ac.
 #
 # WHY THIS IS A WORKFLOW AND NOT A LOCAL SCRIPT. The .qpkg is built by
 # QDK, QNAP's own kit, and qbuild does not run on macOS: it finishes by
@@ -62,14 +73,54 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # ONLY the payload is tag-selected. Everything else in the package -
+      # qpkg.cfg, package_routines, qdk-pin.txt, and through that pin the
+      # QDK-supplied qinstall.sh that runs as ROOT on the user's NAS -
+      # comes from whatever this run checked out. A dispatch at the default
+      # branch therefore ships main's packaging code wrapped around a tag's
+      # binaries, and in this repo main moves under concurrent sessions
+      # daily, so "main happens to equal the tag" is the exception rather
+      # than the rule. The publish-release skill already states this rule
+      # for provenance-release.yml at 4b: `--ref` is not optional and is
+      # not the same statement as `-f tag=`. Assert it here so a dispatch
+      # that forgot it fails in ten seconds rather than producing a package
+      # nobody can trace to a commit.
+      #
+      # Only for a tag-bearing dispatch: a pull_request run is a packaging
+      # smoke against the latest release and is SUPPOSED to be the PR's
+      # code, and a dispatch with no tag is explicitly "package whatever is
+      # latest" from this ref.
+      - name: The checkout must be the tag being packaged
+        if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
+        run: |
+          set -euo pipefail
+          want=$(git rev-parse -q --verify "refs/tags/$INPUT_TAG^{commit}" || true)
+          have=$(git rev-parse HEAD)
+          if [ -z "$want" ] || [ "$want" != "$have" ]; then
+            echo "This run checked out $have, which is not $INPUT_TAG." >&2
+            echo "The .qpkg would ship this ref's packaging code - qpkg.cfg," >&2
+            echo "package_routines and the pinned qinstall.sh that runs as" >&2
+            echo "root on the NAS - around $INPUT_TAG's binaries, and nothing" >&2
+            echo "downstream records which commit built it. Re-dispatch AT" >&2
+            echo "the tag:" >&2
+            echo "  gh workflow run qnap-qpkg.yml --ref $INPUT_TAG -f tag=$INPUT_TAG" >&2
+            exit 1
+          fi
+          echo "packaging $INPUT_TAG from $have"
+
       - name: Install what QDK needs
         run: |
           set -euo pipefail
           # rsync is what qbuild stages shared/ with, and it is not on
-          # the runner image. Nothing else is needed: the payload is
-          # downloaded, not compiled.
+          # the runner image. Nothing else is compiled: the payload is
+          # downloaded.
+          #
+          # fakeroot is what stops qbuild writing this runner's account
+          # into every member of the package's two inner tars - the 1.1.3
+          # package shipped `uname='runner'` throughout. make-qpkg.sh
+          # refuses to build without it rather than leak again silently.
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends rsync file
+          sudo apt-get install -y --no-install-recommends rsync file fakeroot
 
       # Pinned by commit, not by tag or branch: qinstall.sh is COPIED
       # INTO the package and runs as root on the user's NAS, so the QDK
@@ -99,8 +150,9 @@ jobs:
       - name: Off-box install tests
         run: packaging/tests/qnap-install.sh
 
-      # A dispatch names the tag; a pull request has none, so it builds
-      # against whatever is currently released. Either way the payload is
+      # A dispatch names the tag - which is what a release does. A pull
+      # request has none, so it builds against whatever is currently
+      # released. Either way the payload is
       # the published static musl binaries, checked against the release's
       # own SHA256SUMS.txt by make-qpkg.sh.
       - name: Resolve the release to package
@@ -125,30 +177,14 @@ jobs:
           set -euo pipefail
           packaging/qnap/make-qpkg.sh "$VER" dist "${PORT:-6789}"
           ls -l dist/
-
-      # The release builds it a second way: `qnap-beta` in release.yml
-      # hands make-qpkg.sh binaries that were just cross-compiled, rather
-      # than downloading a published release's own tarballs, because
-      # while a release workflow is running there is nothing on the
-      # release page to download yet. That path ships, so it is exercised
-      # here rather than first meeting reality during a release. Same
-      # script, same verification; the binaries come out of the tarballs
-      # this job already fetched.
-      - name: The --binaries path release.yml uses still works
-        run: |
-          set -euo pipefail
-          mkdir -p smoke/bin
-          for pair in "linux-x64 x86_64" "linux-arm64 aarch64"; do
-            set -- $pair
-            tar xzf "$RUNNER_TEMP/rel-$1.tar.gz" -C "$RUNNER_TEMP" \
-              "nzbfast-$VER-$1/nzbfast" 2>/dev/null \
-              || curl -fsSL "https://github.com/nzbfast/nzbfast/releases/download/v$VER/nzbfast-$VER-$1.tar.gz" \
-                 | tar xz -C "$RUNNER_TEMP" "nzbfast-$VER-$1/nzbfast"
-            cp "$RUNNER_TEMP/nzbfast-$VER-$1/nzbfast" "smoke/bin/nzbfast-$2"
-          done
-          chmod 755 smoke/bin/*
-          packaging/qnap/make-qpkg.sh --binaries "$PWD/smoke/bin" "$VER" smoke-out
-          ls -l smoke-out/
+      # Unlike the identity SCANNER, this one ships in the public tree
+      # (it holds no private vocabulary - it reads tar/ar/rpm headers),
+      # so a public PR can run it and this step is not a red check on
+      # somebody else's branch. It splits the .qpkg the way
+      # packaging/qnap/unpack-qpkg.sh documents and reads the owner
+      # fields of both inner tars without extracting.
+      - name: No builder identity in the package
+        run: python3 packaging/check-archive-identity.py dist/*.qpkg
 
       # No identity leak scan here on purpose. That scanner is one of the
       # few things .github ships without - it contains the private
@@ -160,9 +196,18 @@ jobs:
       # has no scan stamp. The two commands below are in that order for
       # that reason.
 
+      # A pull_request run resolves the SAME version (it has no tag input,
+      # so it packages the latest release) and so used to produce an
+      # artifact with the SAME name as the release dispatch's. Step 4c
+      # downloads by name, so a PR that touched packaging/qnap/** and
+      # finished between the dispatch and the download could substitute an
+      # unmerged installer into a release asset, silently - the scan gate
+      # certifies contents, not which run produced them. Naming PR
+      # artifacts apart makes that impossible: `-n qnap-qpkg-X.Y.Z` can
+      # only ever match a dispatch.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: qnap-qpkg-${{ env.VER }}
+          name: "qnap-qpkg-${{ env.VER }}${{ github.event_name == 'pull_request' && format('-pr{0}', github.event.number) || '' }}"
           path: dist/*.qpkg
           if-no-files-found: error
 

@@ -1821,6 +1821,9 @@ fn a_completed_row_with_a_deleted_folder_presents_failed_unless_the_volume_is_do
             "nzb_path": dir.join("some.nzb").to_string_lossy(),
             "out_dir": out.to_string_lossy(),
             "state": "Completed",
+            // Load-bearing: the flip is for jobs NOBODY imports. The
+            // *arr-grabbed shape is the sibling test below.
+            "origin": "dashboard",
         }))
         .unwrap(),
     ));
@@ -1882,4 +1885,156 @@ fn a_completed_row_with_a_deleted_folder_presents_failed_unless_the_volume_is_do
     assert_eq!(r["fail_message"], "", "{r}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ...and an *arr-grabbed job in that same shape stays Completed, because
+/// for that job the shape IS success.
+///
+/// Sonarr/Radarr import the payload and then remove the leftover download
+/// folder, leaving the completed-downloads root in place - the exact five
+/// conditions `storage_deleted` tested for. So every imported row read
+/// "Failed: the downloaded files are no longer on disk", which is both
+/// false and, by the flip's own stated purpose, an instruction to the
+/// *arr to grab another release. No filesystem evidence separates that
+/// from a folder deleted before import, so the *arr owns the question.
+/// Both origin spellings answer yes: the bare `arr` fallback and the
+/// `arr:<client>` shape `api_origin` writes off the User-Agent.
+#[test]
+fn an_arr_grabbed_row_stays_completed_when_the_arr_cleaned_up_its_folder() {
+    use crate::serve::job::job_from_json;
+    use crate::serve::testutil::test_daemon;
+    let dir = std::env::temp_dir().join(format!("nzbfast-histarr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = test_daemon(&dir);
+    let vol = dir.join("complete");
+    let out = vol.join("Some.Show.S01E01");
+    std::fs::create_dir_all(&out).unwrap();
+    let job = Arc::new(Mutex::new(
+        job_from_json(&json!({
+            "nzo_id": "SABnzbd_nzo_histarr",
+            "name": "Some.Show.S01E01",
+            "nzb_path": dir.join("some.nzb").to_string_lossy(),
+            "out_dir": out.to_string_lossy(),
+            "state": "Completed",
+            "origin": "arr:sonarr",
+        }))
+        .unwrap(),
+    ));
+    d.history.lock_ok().push(job.clone());
+    let facade_row = |d: &Daemon| {
+        history_json(d, &std::collections::HashMap::new())["history"]["slots"][0].clone()
+    };
+    let summary_row = |d: &Daemon| {
+        let q = HistQuery {
+            failed_only: false,
+            category: None,
+            ids: None,
+            search: None,
+            bucket: None,
+            start: 0,
+            limit: 0,
+        };
+        history_page(d, &q, true).0[0].clone()
+    };
+
+    // The *arr has imported and cleaned up: folder gone, parent present.
+    std::fs::remove_dir_all(&out).unwrap();
+    for origin in ["arr:sonarr", "arr", "arr:nzb360"] {
+        job.lock_ok().origin = origin.to_string();
+        let r = facade_row(&d);
+        assert_eq!(r["status"], "Completed", "{origin}: {r}");
+        assert_eq!(r["fail_message"], "", "{origin}: {r}");
+        assert_eq!(r["fail_kind"], "", "{origin}: {r}");
+        assert_eq!(r["fail_hint"], "", "{origin}: {r}");
+        // The compact dashboard row agrees - one record, one story.
+        let s = summary_row(&d);
+        assert_eq!(s["status"], "Completed", "{origin}: {s}");
+        assert_eq!(s["fail_message"], "", "{origin}: {s}");
+    }
+
+    // ...and the row now AGREES with the history card's chips, which are
+    // computed off `j.state` and so always counted this record as done.
+    // The flip left the two telling different stories about one record:
+    // a red Failed row sitting inside a "Completed" chip count.
+    let counts = history_json(&d, &std::collections::HashMap::new())["history"]["counts"].clone();
+    assert_eq!(counts["done"], 1, "{counts}");
+    assert_eq!(counts["failed"], 0, "{counts}");
+    assert_eq!(counts["clearable"], 1, "{counts}");
+
+    // A near-miss origin is NOT an *arr - the prefix test is exact, so a
+    // user category or a future origin word starting "arr" cannot mute
+    // the flip by accident.
+    job.lock_ok().origin = "arrival".into();
+    let r = facade_row(&d);
+    assert_eq!(r["status"], "Failed", "{r}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A delete issued while the runner is still bringing the pipeline up
+/// must still stop it. `hub.abort` and `hub.queue_ctl` are published
+/// partway INTO the fetch (get/vrig.rs `install_seek`), so a delete that
+/// wins that race finds both slots empty - and a single shot at an empty
+/// slot is a stop signal that never happened. Measured 16 Aug 2026: the
+/// daemon logged "active download stopped by user" and then spun up its
+/// connections and ran the whole doomed download anyway.
+///
+/// So the signal is re-fired until the pipeline is there to take it.
+/// Standing in for the pipeline here: install the flag AFTER the call
+/// returns, exactly as the real publish does, and require it to arrive.
+#[test]
+fn a_delete_that_beats_the_pipelines_publish_still_stops_it() {
+    use crate::serve::testutil::test_daemon;
+
+    let dir = std::env::temp_dir().join(format!("nzbfast-delabort-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = test_daemon(&dir);
+    // The runner has published the owner (reset_hub_for_job) but the
+    // fetch has not reached install_seek: both handles are still empty.
+    *d.active_stream.lock_ok() = Some("SABnzbd_nzo_gone".into());
+    assert!(d.hub.abort.lock_ok().is_none());
+
+    crate::serve::api::queue::stop_deleted_transfer(&d, vec!["SABnzbd_nzo_gone".into()]);
+
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    *d.hub.abort.lock_ok() = Some(flag.clone());
+    let t = std::time::Instant::now();
+    while !flag.load(Ordering::Relaxed) && t.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        flag.load(Ordering::Relaxed),
+        "the stop signal was fired once into an empty slot and lost - a \
+         deleted job's download runs its whole ladder after the row is gone"
+    );
+}
+
+/// ...and never at anyone else. The re-fire waits for the hub to name
+/// the DELETED job; while it names another, it must not fire. This is
+/// the bug the owner test exists for - job N stays Downloading through
+/// its whole disk tail while N+1 is on the wire holding these handles,
+/// and deleting N once aborted N+1, a healthy unrelated download that
+/// then failed permanently and fired its failure hooks.
+#[test]
+fn the_delete_stop_signal_is_never_aimed_at_another_job() {
+    use crate::serve::testutil::test_daemon;
+
+    let dir = std::env::temp_dir().join(format!("nzbfast-delabort2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = test_daemon(&dir);
+    *d.active_stream.lock_ok() = Some("SABnzbd_nzo_innocent".into());
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    *d.hub.abort.lock_ok() = Some(flag.clone());
+
+    crate::serve::api::queue::stop_deleted_transfer(&d, vec!["SABnzbd_nzo_gone".into()]);
+
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(
+        !flag.load(Ordering::Relaxed),
+        "a delete aimed its abort at the job that owns the wire, not at \
+         the one it deleted"
+    );
 }

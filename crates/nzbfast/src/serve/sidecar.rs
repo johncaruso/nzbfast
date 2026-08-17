@@ -167,15 +167,22 @@ pub(super) async fn completion_tail(
     d: Arc<Daemon>,
     job: Arc<Mutex<Job>>,
     fence: Option<(u32, u64)>,
-    owner: Option<Arc<std::sync::atomic::AtomicBool>>,
+    owner: Option<SidecarTailGuard>,
 ) {
-    // Registered for the whole tail, so a delete-with-files that landed
-    // on this record waits for THIS - not just for the download task,
-    // which cleared the sidecar slot on its way to spawning us. The
-    // guard deregisters however this ends, panic included.
-    let _owner = owner.map(|t| d.sidecar_tail_begin(t));
+    // Held for the whole tail, so a delete-with-files that landed on
+    // this record waits for THIS - not just for the download task,
+    // which cleared the sidecar slot on its way to spawning us. Taken
+    // by the SPAWNER (see the spawn site) so there is no gap between
+    // the slot going and this ownership being on the books; the guard
+    // deregisters however this ends, panic included.
+    let _owner = owner;
     finalize_completed_gen(&d, &job, fence).await;
-    d.run_post_job_hooks_gen(&job, fence);
+    // "then the hooks, then history" above is an ordering, not a
+    // sequence of statements: `park_gen` is what a SAB client reads
+    // Completed from, and the post-processing script is what may still
+    // be moving the payload it is about to import. Same await, same
+    // reason, as the runner's own lane tail.
+    d.run_post_job_hooks_before_park(&job, fence).await;
     d.park_gen(job, fence);
 }
 
@@ -590,11 +597,26 @@ pub(super) fn spawn_sidecar(
                         // from here the directory cannot move without
                         // one of those two counters moving with it.
                         let d2 = d.clone();
+                        // Registered HERE, synchronously, not on the
+                        // spawned task. `tokio::spawn` only queues it,
+                        // and the slot is cleared a few lines below on
+                        // this thread - so a tail that registered itself
+                        // would leave a window in which the slot says
+                        // "gone" and the tail has not yet said "mine".
+                        // A `remove_after_sidecar_drain` poll landing in
+                        // there reads `sidecar_still_holds` false and
+                        // removes the directory, hands the reservation
+                        // back, and the tail then unlocks, sweeps,
+                        // renames and moves inside it - the exact orphan
+                        // shape M6 closed for the download half. The
+                        // guard moves into the tail and deregisters
+                        // however it ends, panic included.
+                        let owner = d.sidecar_tail_begin(cancelled.clone());
                         tokio::spawn(completion_tail(
                             d2,
                             job,
                             Some((gen0.0, gen0.1)),
-                            Some(cancelled.clone()),
+                            Some(owner),
                         ));
                     }
                 }
@@ -621,6 +643,24 @@ pub(super) fn spawn_sidecar(
             // runner off this job: everything this touches must be
             // settled while `stop_sidecar` is still awaiting us.
             adopt_reparented_directory(&job2, &gen0);
+            // And the parked sessions go with the hub they are parked
+            // in. This hub is FRESH per prefetch (see above) and has no
+            // second owner, so once the slot is cleared the last Arc
+            // drops - and `WarmPool` has no Drop impl, its keepalive
+            // holding only a Weak. A successful prefetch on a
+            // warm-pool server therefore dropped every session it had
+            // parked without a QUIT, and the provider went on counting
+            // them against the account's connection cap until its own
+            // idle timeout - the same occupancy the wind-down clears
+            // for the main hub (read-only sweep 2 M9, re-found by
+            // Codex sweep 3 M13). `.get()`, NOT `warm()`: the accessor
+            // CONSTRUCTS the pool and spawns a keepalive tick, so
+            // asking for it here would create the very thing we are
+            // emptying. Bounded - each `quit()` carries its own
+            // timeout - so `stop_sidecar` cannot park on a mute peer.
+            if let Some(warm) = hub.warm.get() {
+                warm.clear().await;
+            }
             let mut g = d.sidecar.lock_ok();
             if g.as_ref().is_some_and(|s| s.nzo_id == nzo_id) {
                 *g = None;

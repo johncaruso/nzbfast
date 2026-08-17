@@ -134,6 +134,15 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
         let out = std::fs::File::create(&logfile).unwrap();
         let err = out.try_clone().unwrap();
         let mut cmd = build(port);
+        // The `min_free` floor (2 GB by default) is measured against the
+        // HOST's free disk, not against anything this soak writes, so a
+        // CI box run down near full holds every job before it starts and
+        // the soak reports "queue never drained" - a download bug's
+        // symptom with a housekeeping cause (nightly, 15 Aug 2026). The
+        // fixtures here are kilobytes; the floor is not this target's
+        // subject. `crates/nzbfast/tests/daemon.rs` carries the same
+        // default for the same reason.
+        cmd.arg("--min-free").arg("0");
         cmd.stdout(Stdio::from(out)).stderr(Stdio::from(err));
         let child = KillOnDrop(cmd.spawn().unwrap());
         let log = logfile.clone();

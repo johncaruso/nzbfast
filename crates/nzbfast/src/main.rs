@@ -259,6 +259,18 @@ enum Command {
         /// Pipelined STATs in flight per connection.
         #[arg(long, default_value_t = 50)]
         window: usize,
+        /// Answer only the daemon's question - "must this job be
+        /// abandoned?" - and take its shortcuts to get there: stop
+        /// asking other servers about an article once one has it, and
+        /// stop the sweep outright once the deficit outweighs the
+        /// recovery budget. When volume names leave that budget
+        /// unsizable it buys the block size first - one article - so
+        /// there is a budget to stop against at all. Much faster and
+        /// much less to report: the per-server availability lines are a
+        /// claim about each server individually, which a sweep that
+        /// skips questions cannot make.
+        #[arg(long)]
+        fast: bool,
     },
     /// Verify files in a directory against the PAR2 set found there.
     Verify { dir: PathBuf },
@@ -944,17 +956,17 @@ async fn run() -> Result<()> {
             #[cfg(target_os = "linux")]
             nzbkit::disk::set_drop_cache_default(true);
             if preflight {
-                let verdict = check(&cli.config, &nzb, 10, 4, 50).await?;
+                let verdict = check(&cli.config, &nzb, 10, 4, 50, true).await?;
                 if let Verdict::Impossible {
                     est_missing,
                     recovery,
+                    measured,
                     ..
                 } = verdict
                 {
                     anyhow::bail!(
-                        "aborting: pre-flight says this post cannot complete - an \
-                         estimated {est_missing} payload segment(s) are unavailable on \
-                         every server against {recovery} recovery block(s) in the NZB"
+                        "aborting: pre-flight says this post cannot complete - {}",
+                        crate::check::impossible_reason(est_missing, recovery, &measured)
                     );
                 }
             }
@@ -1296,10 +1308,8 @@ async fn run() -> Result<()> {
             sample,
             connections,
             window,
-        } => {
-            check(&cli.config, &nzb, sample, connections, window).await?;
-            Ok(())
-        }
+            fast,
+        } => run_check(&cli.config, &nzb, sample, connections, window, fast).await,
         Command::Verify { dir } => {
             verify_dir(&dir)?;
             Ok(())

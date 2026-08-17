@@ -137,6 +137,23 @@ fn settle_pending_upgrades(d: &Arc<Daemon>, state: &mut crate::watchlist::WatchS
             state.pending.push(p);
             continue;
         }
+        // A record mid-move between the two stores is in NEITHER, and
+        // that window holds real work for exactly this job class -
+        // `park` drops the queue row, then runs `giveup_note_outcome`
+        // (which for a watchlist Completed job records the success and
+        // can synchronously write the give-up file) before pushing to
+        // history. This pass takes neither lock, so landing in there
+        // read "not queued, not in history" and fell into the `None`
+        // arm below - the user-deleted verdict - reverting the slot and
+        // blacklisting the replacement stem for a job that had just
+        // COMPLETED. `hist_inflight` is registered by park, retry and
+        // activate_parked and deregistered by their guards on every
+        // exit, so it names precisely the neither-store windows; a
+        // genuinely deleted job has no guard and still takes `None`.
+        if d.hist_inflight.lock_ok().contains(&p.new_nzo) {
+            state.pending.push(p);
+            continue;
+        }
         let hist = d
             .history
             .lock()
@@ -213,7 +230,7 @@ fn settle_pending_upgrades(d: &Arc<Daemon>, state: &mut crate::watchlist::WatchS
                         )
                     };
                     if let FilesGone::Kept(why) = remove_job_files(&dir, &name, filed, &tail) {
-                        d.note_delete_kept(&name, &dir, &why);
+                        d.note_delete_kept(&name, &dir, &why, None);
                     }
                     let _ = std::fs::remove_file(&nzb);
                     d.save_queue();
@@ -260,7 +277,7 @@ fn settle_pending_upgrades(d: &Arc<Daemon>, state: &mut crate::watchlist::WatchS
                     };
                     let outcome = remove_job_files(&dir, &name, filed, &tail);
                     if let FilesGone::Kept(why) = &outcome {
-                        d.note_delete_kept(&name, &dir, why);
+                        d.note_delete_kept(&name, &dir, why, None);
                     }
                     let _ = std::fs::remove_file(&nzb);
                     d.history
@@ -476,7 +493,23 @@ pub(super) fn watchlist_pass(d: &Arc<Daemon>) {
     // watchlist's "unmonitor", and it keeps the one-grab-path invariant:
     // nothing new decides, the pass just declines dead content.
     let giveup_threshold = d.arr_giveup_threshold.load(Ordering::Relaxed).min(1000) as u32;
-    let giveup = d.giveup.lock_ok().clone();
+    // Expire stale evidence before reading it. This timer pass is the
+    // one place that reads the give-up state on a schedule, and a
+    // tripped target never calls `record_failure` again - so without
+    // this the 45-day window never opened for exactly the targets it
+    // was written for (see `GiveupState::prune`).
+    let giveup = {
+        let mut g = d.giveup.lock_ok();
+        let before = g.targets.len();
+        g.prune(unix_now());
+        let shrank = g.targets.len() != before;
+        let snap = g.clone();
+        drop(g);
+        if shrank {
+            d.save_giveup();
+        }
+        snap
+    };
 
     // 2. Match the index against each enabled item.
     for item in items.iter().filter(|i| i.enabled) {

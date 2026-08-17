@@ -297,11 +297,13 @@ fn create_base_schema(db: &Connection) -> rusqlite::Result<()> {
          -- would then attach someone else's identity to a brand-new
          -- release. A trigger catches every delete path (retention
          -- prune, size-cap evict, twin dedupe, wall fix-up) including
-         -- ones added later; both deletes are indexed.
-         CREATE TRIGGER IF NOT EXISTS rel_identity_ad AFTER DELETE ON releases BEGIN
-           DELETE FROM name_claims WHERE release_id=old.id;
-           DELETE FROM msgid_map WHERE release_id=old.id;
-         END;
+         -- ones added later; both deletes are indexed. The trigger
+         -- ITSELF is created by `additive_migrations` (as
+         -- `rel_identity_ad_v2`, which also unbinds `spots`) and
+         -- deliberately NOT here: this batch used to re-create the v1
+         -- name that the migration then drops, so every single
+         -- `Index::open` wrote sqlite_master twice on an
+         -- already-migrated database. See the schema-churn note there.
          -- Pesto tiny-PAR2 rung (TODO 131, red-team 5a): one row per
          -- PAR2 Recovery Set parsed out of the family's tiny sidecar
          -- objects. Keyed on the set id because dedupe is mandatory -
@@ -458,7 +460,7 @@ fn additive_migrations(db: &Connection) {
         // ties: the release name already carries these, and the parser
         // already read them, but until now they were parsed and thrown
         // away. '' = the name said nothing (or the row predates the
-        // columns and the quality_v8 pass hasn't reached it).
+        // columns and the quality_v9 pass hasn't reached it).
         "ALTER TABLE releases ADD COLUMN vcodec TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE releases ADD COLUMN acodec TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE releases ADD COLUMN hdr TEXT NOT NULL DEFAULT ''",
@@ -615,6 +617,21 @@ fn additive_migrations(db: &Connection) {
            ON releases(LOWER(stem)) WHERE pre_title=''",
         [],
     );
+    // The DROP is the one-time retirement of the v1 trigger, and it has
+    // to STAY a no-op afterwards: `create_base_schema` used to re-create
+    // `rel_identity_ad` on every open, so this pair wrote sqlite_master
+    // twice per `Index::open` forever. That is not cosmetic. The daemon
+    // opens a fresh read-write connection between passes (spot scan,
+    // spot resolve, the retention republish, reclassify), so every one
+    // of those opens bumped the schema cookie under the pooled READ-ONLY
+    // connections that answer the wall, search and the newznab facade.
+    // A reader then has to re-prepare, re-preparing reconnects the fts5
+    // vtables, and a vtable constructor that loses that race fails the
+    // whole statement with SQLITE_SCHEMA ("vtable constructor failed:
+    // rel_fts") - which every query endpoint renders as an EMPTY answer,
+    // i.e. a Sonarr search that silently finds nothing. Measured 9 times
+    // in 160 runs of `newznab_honours_the_arr_search_parameters`, which
+    // is the flake nextest's retry was hiding.
     let _ = db.execute_batch(
         "DROP TRIGGER IF EXISTS rel_identity_ad;
          CREATE TRIGGER IF NOT EXISTS rel_identity_ad_v2 AFTER DELETE ON releases BEGIN
@@ -910,7 +927,7 @@ fn ensure_people(db: &Connection) -> rusqlite::Result<bool> {
 }
 
 /// The one-shot, kv-stamped retroactive backfills (completeness rule,
-/// nsegs, M25 kind/res, M28 FTS + title_key/junk, quality_v8).
+/// nsegs, M25 kind/res, M28 FTS + title_key/junk, quality_v9).
 fn retroactive_backfills(db: &mut Connection, fts: bool) {
     // One-time retroactive recompute after the completeness-rule
     // change (nfiles >= 2 → >= 1): existing rows only re-evaluate
@@ -1117,7 +1134,16 @@ fn retroactive_backfills(db: &mut Connection, fts: bool) {
     // existed - same chunked, time-bounded, cursor-resumed shape, for
     // the same reasons.
     super::pesto::pesto_backfill(db);
-    // quality_v8 (26 Jul, was junk_v7): junk_v6's rules plus a full
+    // quality_v9 (16 Aug, was quality_v8, before that junk_v7): the
+    // bump re-files the book lane. `pdf` became a book marker and a fed
+    // name that dropped its format marker now recovers the kind from
+    // the stem (`release::recover_media_kind`), and NOTHING would have
+    // healed the rows already stored: an e-book named by a Spotnet spot
+    // carries `kind=movie, junk=60`, the naming seam refuses a row whose
+    // pre_title is set, and the custom-category sweep only runs when the
+    // category config changes. Without the bump the fix would apply to
+    // new posts only and every book already indexed would stay hidden.
+    // junk_v6's rules plus a full
     // re-parse - title_key/kind/res so ROT13 rescues that the parser
     // newly decodes regroup under their real titles, and now
     // vcodec/acodec/hdr, which rows indexed before those columns
@@ -1132,12 +1158,12 @@ fn retroactive_backfills(db: &mut Connection, fts: bool) {
     // scan ingest; a partial pass resumes from the cursor on the
     // next open.
     let done: Option<String> = db
-        .query_row("SELECT v FROM kv WHERE k='quality_v8'", [], |r| r.get(0))
+        .query_row("SELECT v FROM kv WHERE k='quality_v9'", [], |r| r.get(0))
         .ok();
     if done.as_deref() != Some("1") {
         let _ = (|| -> rusqlite::Result<()> {
             let mut cursor: i64 = db
-                .query_row("SELECT v FROM kv WHERE k='quality_v8_cursor'", [], |r| {
+                .query_row("SELECT v FROM kv WHERE k='quality_v9_cursor'", [], |r| {
                     r.get::<_, String>(0)
                 })
                 .ok()
@@ -1163,22 +1189,23 @@ fn retroactive_backfills(db: &mut Connection, fts: bool) {
                 // would ever heal it - the naming seam refuses rows
                 // whose pre_title is already set. Same COALESCE the
                 // ingest and card paths use.
-                let rows: Vec<(i64, String, i64, bool)> = {
+                let rows: Vec<(i64, String, i64, bool, String)> = {
                     let mut sel = tx.prepare_cached(&format!(
                         "SELECT id, COALESCE(NULLIF(pre_title,''), stem),
                                 total_bytes,
                                 EXISTS(SELECT 1 FROM files
-                                       WHERE release_id=releases.id AND {EXE_FILE_SQL})
+                                       WHERE release_id=releases.id AND {EXE_FILE_SQL}),
+                                stem
                          FROM releases WHERE id > ?1 ORDER BY id LIMIT 10000"
                     ))?;
                     sel.query_map([cursor], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                     })?
                     .collect::<rusqlite::Result<_>>()?
                 };
                 if rows.is_empty() {
                     tx.execute(
-                        "INSERT INTO kv(k, v) VALUES('quality_v8','1')
+                        "INSERT INTO kv(k, v) VALUES('quality_v9','1')
                          ON CONFLICT(k) DO UPDATE SET v='1'",
                         [],
                     )?;
@@ -1222,8 +1249,11 @@ fn retroactive_backfills(db: &mut Connection, fts: bool) {
                                         'software','other','')
                            AND (junk<>?2 OR title_key<>?3 OR kind<>?4)",
                     )?;
-                    for (id, name, bytes, has_exe) in &rows {
-                        let p = crate::release::parse_release(name);
+                    for (id, name, bytes, has_exe, stem) in &rows {
+                        let mut p = crate::release::parse_release(name);
+                        // A fed name names the work; the stem names the
+                        // file. Only the file says "book".
+                        crate::release::recover_media_kind(&mut p, name, stem);
                         upd.execute(rusqlite::params![
                             id,
                             p.langs.join(" "),
@@ -1242,7 +1272,7 @@ fn retroactive_backfills(db: &mut Connection, fts: bool) {
                 }
                 cursor = rows.last().unwrap().0;
                 tx.execute(
-                    "INSERT INTO kv(k, v) VALUES('quality_v8_cursor', ?1)
+                    "INSERT INTO kv(k, v) VALUES('quality_v9_cursor', ?1)
                      ON CONFLICT(k) DO UPDATE SET v=?1",
                     [cursor.to_string()],
                 )?;
@@ -1309,6 +1339,7 @@ impl Index {
             predb,
             watch: None,
             hits: Default::default(),
+            retry: Default::default(),
         })
     }
 
@@ -1385,6 +1416,7 @@ impl Index {
             predb,
             watch: None,
             hits: Default::default(),
+            retry: Default::default(),
         })
     }
 }
@@ -1440,6 +1472,101 @@ mod tests {
         assert!(ro.kv_set("k", "v").is_err());
         // And it must never be the open that CREATES a database.
         assert!(Index::open_read_only(&dir.join("absent.db")).is_err());
+    }
+
+    /// `Index::open` must leave the schema cookie ALONE on a database it
+    /// has already migrated.
+    ///
+    /// The daemon opens a fresh read-write connection between passes
+    /// while pooled read-only connections are answering the wall, search
+    /// and the newznab facade. A bumped cookie invalidates every one of
+    /// those readers' prepared statements; re-preparing reconnects the
+    /// fts5 virtual tables, and a constructor that loses that race fails
+    /// the statement outright with SQLITE_SCHEMA ("vtable constructor
+    /// failed: rel_fts"). Every query endpoint turns that into an EMPTY
+    /// answer, so a Sonarr search silently finds nothing - which is what
+    /// `newznab_honours_the_arr_search_parameters` was intermittently
+    /// catching (9 hits in 160 runs) before `rel_identity_ad` stopped
+    /// being created here and dropped again one migration later.
+    ///
+    /// So this asserts the PROPERTY, not the one statement: any future
+    /// DDL that re-creates something on every open reddens it.
+    #[test]
+    fn repeat_opens_do_not_churn_the_schema() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-schema-churn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+        let cookie = |ix: &Index| -> i64 {
+            ix.db
+                .query_row("PRAGMA schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        let mut first = Index::open(&db).unwrap();
+        // With content, so the fts triggers and every content-gated
+        // migration have run: an empty database can be stable for the
+        // uninteresting reason that half of open() short-circuits.
+        first
+            .ingest(
+                "alt.binaries.test",
+                &[entry(
+                    r#""Churn.Probe.S01E01.720p-GRP.rar" yEnc (1/1)"#,
+                    "p@x",
+                    "churn1",
+                    900,
+                )],
+                1000,
+            )
+            .unwrap();
+        let baseline = cookie(&first);
+
+        for round in 0..3 {
+            let again = Index::open(&db).unwrap();
+            assert_eq!(
+                cookie(&again),
+                baseline,
+                "open #{} rewrote sqlite_master on an already-migrated database -                  some DDL in open() is not idempotent, and every pooled reader's                  statements have just been invalidated",
+                round + 2
+            );
+        }
+
+        // The retirement itself still has to work: a database carrying
+        // the v1 trigger loses it and gains v2, and is stable from the
+        // NEXT open on rather than churning forever.
+        let named = |ix: &Index, name: &str| -> i64 {
+            ix.db
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(named(&first, "rel_identity_ad_v2"), 1);
+        assert_eq!(named(&first, "rel_identity_ad"), 0);
+        first
+            .db
+            .execute_batch(
+                "CREATE TRIGGER rel_identity_ad AFTER DELETE ON releases BEGIN
+                   DELETE FROM name_claims WHERE release_id=old.id;
+                 END;",
+            )
+            .unwrap();
+        let migrated = Index::open(&db).unwrap();
+        assert_eq!(named(&migrated, "rel_identity_ad"), 0, "v1 was not retired");
+        assert_eq!(named(&migrated, "rel_identity_ad_v2"), 1);
+        let after_retire = cookie(&migrated);
+        let settled = Index::open(&db).unwrap();
+        assert_eq!(
+            cookie(&settled),
+            after_retire,
+            "the v1 retirement is not a one-time migration - it churns"
+        );
+
+        drop(migrated);
+        drop(settled);
+        teardown(&dir, first);
     }
 
     fn wal_len(db: &Path) -> u64 {

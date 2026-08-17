@@ -868,9 +868,28 @@ impl Index {
     /// The release rows a posted name resolves to (same derivation the
     /// ingest clustering used), capped at 3 - callers only need to
     /// distinguish none / exactly one / ambiguous. Exact match first
-    /// (indexed); the case-folded fallback is a scan, but only runs on
-    /// the rare case-mangled miss and only on the download tail, which
-    /// already pays the same scan in `pre_corr_verdict`.
+    /// (indexed), then the case-folded fallback for a case-mangled
+    /// name, split into two BOUNDED arms.
+    ///
+    /// The fallback used to be one `WHERE LOWER(stem)=?1`, described
+    /// here as an acceptable scan because it "only runs on the rare
+    /// case-mangled miss and only on the download tail, which already
+    /// pays the same scan in `pre_corr_verdict`". Both halves of that
+    /// were wrong. `pre_corr_verdict` drives its join from `pre_corr`
+    /// (967 rows on a long-running install), so it pays nothing of that
+    /// kind; and
+    /// `LOWER()` disqualifies the BINARY `idx_rel_stem`, so this was
+    /// `SCAN releases` over 38 M rows of a 55.9 GB database - taken
+    /// under `with_index_mut`, the write mutex, on the tail of every
+    /// finished obfuscated download. The exact same trap, in the exact
+    /// same shape, that `idx_rel_stem_lower` was created to close for
+    /// the predb sweep (see `schema.rs`).
+    ///
+    /// So the fallback asks that partial index for the unnamed rows it
+    /// covers, and asks `idx_rel_pre_named` for the already-named
+    /// remainder - 13 k rows there against 38 M here, measured at 27 ms
+    /// on a total miss. Two indexed questions, same answer set as the
+    /// one scan: nothing is given up but the wedge.
     pub fn release_ids_by_stem(&self, posted: &str) -> rusqlite::Result<Vec<i64>> {
         let stem = crate::extract::release_stem(posted);
         if stem.is_empty() {
@@ -885,12 +904,23 @@ impl Index {
         };
         if ids.is_empty() {
             let lower = stem.to_ascii_lowercase();
-            let mut sel = self
-                .db
-                .prepare_cached("SELECT id FROM releases WHERE LOWER(stem)=?1 LIMIT 3")?;
-            ids = sel
-                .query_map([lower], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
+            // The `pre_title` arms are what make each query indexable,
+            // and between them they cover every row: keep them exactly
+            // complementary, or a stem stops resolving.
+            for sql in [
+                "SELECT id FROM releases WHERE pre_title='' AND LOWER(stem)=?1 LIMIT 3",
+                "SELECT id FROM releases WHERE pre_title<>'' AND LOWER(stem)=?1 LIMIT 3",
+            ] {
+                let mut sel = self.db.prepare_cached(sql)?;
+                ids.extend(
+                    sel.query_map([&lower], |r| r.get::<_, i64>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?,
+                );
+                if ids.len() >= 3 {
+                    ids.truncate(3);
+                    break;
+                }
+            }
         }
         Ok(ids)
     }

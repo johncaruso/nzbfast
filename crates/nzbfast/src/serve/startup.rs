@@ -333,9 +333,23 @@ fn restore_job_settings(
     // pointing at it. See `Daemon::save_delete_kept`.
     let kept_path = daemon.spool.join("delete-kept.json");
     if let Some(v) = crate::persist::load_json_with_backup(&kept_path) {
+        // Either shape: the file written before the notice grew its
+        // retry offer is an array of 4-arrays, and it names folders
+        // still sitting on the user's disk. See `kept_notes_from_json`.
+        match kept_notes_from_json(&v) {
+            Some(k) => *daemon.delete_kept.lock_ok() = k,
+            None => warn!(target: "queue", "ignoring {}", kept_path.display()),
+        }
+    }
+    // And the deletes themselves, for the same reason one step earlier:
+    // the advice for a refused delete is to try again in a few minutes,
+    // and a restart is what people do in between. See
+    // `Daemon::note_releases_deleted`.
+    let marks_path = daemon.spool.join("deleted-recent.json");
+    if let Some(v) = crate::persist::load_json_with_backup(&marks_path) {
         match serde_json::from_value(v) {
-            Ok(k) => *daemon.delete_kept.lock_ok() = k,
-            Err(e) => warn!(target: "queue", "ignoring {}: {e}", kept_path.display()),
+            Ok(m) => *daemon.deleted_recent.lock_ok() = m,
+            Err(e) => warn!(target: "queue", "ignoring {}: {e}", marks_path.display()),
         }
     }
 }
@@ -2231,6 +2245,7 @@ fn build_daemon(
         giveup_tripped: Mutex::new(std::collections::VecDeque::new()),
         watch_upgraded: Mutex::new(std::collections::VecDeque::new()),
         delete_kept: Mutex::new(std::collections::VecDeque::new()),
+        deleted_recent: Mutex::new(std::collections::VecDeque::new()),
         auth_fails: Mutex::new(std::collections::HashMap::new()),
         #[cfg(feature = "indexer")]
         enrich_hot: Mutex::new(std::collections::VecDeque::new()),

@@ -657,6 +657,10 @@ pub(super) fn spawn_index_scan(
                         par,
                         turbo,
                         coverage,
+                        // §74: sampled per group, like the gates above -
+                        // an item added while a long pass runs is armed
+                        // for the groups still to come.
+                        daemon3.instant_matcher(),
                     );
                     // Carries the reason out, not just the fact: this
                     // future fires for every stand-down cause, and the
@@ -691,6 +695,15 @@ pub(super) fn spawn_index_scan(
                         .lock()
                         .unwrap()
                         .retain(|p| p.group != g);
+                    // §74: what this pass's FORWARD legs read. TAKEN
+                    // here because the journal lives on `scratch` - the
+                    // dedicated connection this task scanned into - and
+                    // this is the last point it is still in hand.
+                    // Unconditional on the outcome above: a pass stood
+                    // down halfway still INGESTED what it read, and
+                    // dropping those on the floor would be the very
+                    // silence this exists to end.
+                    let (hits, dropped) = scratch.take_watch_hits();
                     drop(scratch);
                     // Re-open the shared connection so it sees this
                     // task's now-committed writes (fresh read snapshot)
@@ -703,6 +716,21 @@ pub(super) fn spawn_index_scan(
                         daemon3.publish_index(era, fresh);
                     }
                     daemon3.drop_index_read();
+                    // ...and only NOW are the arrivals offered to the
+                    // watchlist. Ordering, not tidiness: this wakes a
+                    // pass that reads the SHARED handle, and the shared
+                    // handle cannot see a word of what `scratch` just
+                    // wrote until the republish above. Reported before
+                    // it, the woken pass searched the old snapshot,
+                    // found nothing, and took the arrival hint with it -
+                    // so the release was grabbed a minute later by the
+                    // periodic pass and never recorded as an arrival at
+                    // all, which is the exact silence being fixed.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    instant_arrivals(&daemon3, hits, dropped, now);
                 });
             }
             while set.join_next().await.is_some() {}
@@ -722,13 +750,33 @@ pub(super) fn spawn_index_scan(
             // gate. Skip every post-pass SQLite task and release it
             // immediately; indexing resumes from its marks later.
             //
+            // Asked BETWEEN the stages below, not just once ahead of
+            // them, because the gate is held for the whole section and
+            // the section is where the time goes. Every stage already
+            // hands back the write MUTEX promptly - the reap slices at
+            // one second, the fold is budgeted at one - but none of
+            // them hands back the GATE, and the runner rendezvouses on
+            // the gate. So a reap working through its 30 s pass budget
+            // was, correctly and by design, holding a job the user had
+            // just added: measured 16 Aug 2026, a watch-folder drop
+            // landing in this section waited out the runner's whole
+            // bound with nothing actually blocked. One check cannot
+            // cover a section that runs for tens of seconds.
+            //
+            // Safe at every one of these points because each stage is
+            // resumable by construction: the reap only stamps its
+            // hourly clock when it runs out of rows, the fold and the
+            // gapfill carry cursors, the title seeding is idempotent,
+            // and eviction is a no-op unless it is switched on.
+            //
             // `scan_groups &&` matters on a spots-only install: with
             // the indexer switched off this reason is permanently
             // "off", and short-circuiting on it would skip the
             // interval sleep at the bottom of the loop and re-scan
             // free.pt as fast as the server would answer. Every
             // post-pass task below is already a no-op with no groups.
-            if scan_groups && daemon2.indexing_pause_reason().is_some() {
+            let waiting = || scan_groups && daemon2.indexing_pause_reason().is_some();
+            if waiting() {
                 drop(index_pass);
                 continue;
             }
@@ -742,6 +790,10 @@ pub(super) fn spawn_index_scan(
                 if seeded > 0 {
                     info!(target: "wall", "seeded {seeded} new titles for enrichment");
                 }
+            }
+            if waiting() {
+                drop(index_pass);
+                continue;
             }
             // A8: targeted gap-fill - re-hunt a few incomplete
             // releases' posting windows on the OTHER backbones.
@@ -815,14 +867,26 @@ pub(super) fn spawn_index_scan(
                     Err(e) => warn!(target: "gapfill", "open {}: {e}", db.display()),
                 }
             }
+            if waiting() {
+                drop(index_pass);
+                continue;
+            }
             // M31a retention prune + the planner-statistics refresh,
             // both on their own clocks inside.
             if !groups.is_empty() && daemon2.index_maintenance_ok() {
                 retention_and_statistics(&daemon2, &index_db).await;
+                if waiting() {
+                    drop(index_pass);
+                    continue;
+                }
                 // One budgeted shatter-fold slice per pass, same
                 // stand-down gate: it takes the write lock, so it
                 // yields to anything the user is actually doing.
                 shatter_fold_pass(&daemon2);
+            }
+            if waiting() {
+                drop(index_pass);
+                continue;
             }
             evict_pass_and_republish(&daemon2, &index_db).await;
             drop(index_pass);
@@ -1716,11 +1780,22 @@ fn server_verdict(config: &std::path::Path) -> (ServerVerdict, Option<nzbkit::co
 /// visible, so a wait past a few seconds means one of them is stuck in
 /// I/O against a peer that has gone mute. Waiting that out forever is
 /// issue #38's silent-wedge shape wearing the runner's face: the job
-/// sits in Downloading, HTTP answers, nothing is logged. Sixty seconds
-/// is an eternity next to the lanes' 100 ms preemption polls and their
-/// NNTP per-command bounds, so this only ever trips a wedged lane -
-/// and then the worst the fallback costs is brief SQLite/bandwidth
-/// contention with a lane that is already standing down.
+/// sits in Downloading, HTTP answers, nothing is logged.
+///
+/// FIVE seconds, not the sixty this shipped with. The bound was set on
+/// the reasoning that a lane stands down inside its 100 ms preemption
+/// poll, so only a wedged one could ever reach it and the wait would
+/// therefore never be paid in practice. Measured on a live daemon on 16
+/// Aug 2026, it was paid in full on the very first add of a batch: a
+/// sampler tick holding the index write mutex (`Index::oracle_pick`)
+/// stalled the scan pass, which could not hand the gate back, and the
+/// user's download sat for a silent minute before starting. A lane
+/// that has not answered in five seconds is not about to - the gate is
+/// confirmation, not permission, and every holder also stands down on
+/// its own once the guard is visible - so the whole cost of being
+/// wrong here is brief SQLite/bandwidth contention with a lane that is
+/// already leaving. That is a far smaller price than a minute of a
+/// user's time, paid on every add.
 /// `NZBFAST_INDEX_GATE_WAIT_SECS` overrides for the tests.
 fn index_gate_bound() -> std::time::Duration {
     static SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1729,7 +1804,7 @@ fn index_gate_bound() -> std::time::Duration {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&s| s > 0)
-            .unwrap_or(60)
+            .unwrap_or(5)
     }))
 }
 
@@ -1933,22 +2008,22 @@ pub(super) fn spawn_download_worker(
                 // downloading. Pass → Completed + .strm pointer; the real
                 // fetch happens on first /stream/<id> playback.
                 d.hub.activity.lock_ok().insert(nzo_id.clone(), "preflight");
-                let verdict = crate::check(&config, &nzb_path, 10, 4, 50).await;
+                let verdict = crate::check(&config, &nzb_path, 10, 4, 50, true).await;
                 {
                     let mut j = job.lock_ok();
                     match verdict {
                         Ok(crate::Verdict::Impossible {
                             est_missing,
                             recovery,
+                            measured,
                             ..
                         }) => {
                             j.state = JobState::Failed;
                             // The counts make the verdict checkable;
                             // append-only, the prefix is classified on.
                             j.fail_message = crate::with_build(format!(
-                                "pre-flight: articles missing beyond repair - an \
-                                 estimated {est_missing} payload segment(s) \
-                                 unavailable vs {recovery} recovery block(s) in the NZB"
+                                "pre-flight: articles missing beyond repair - {}",
+                                crate::check::impossible_reason(est_missing, recovery, &measured)
                             ));
                         }
                         Ok(_) => {
@@ -1974,8 +2049,17 @@ pub(super) fn spawn_download_worker(
                 }
                 *d.started_at.lock_ok() = None;
                 *d.last_download_end.lock_ok() = Instant::now();
-                d.run_post_job_hooks(&job);
-                d.park(job);
+                // The hooks and the park go to the post-processing
+                // lane, not to the next two statements. This arm
+                // reaches `Completed` without downloading a byte, and
+                // Completed is the word Sonarr imports on - so the
+                // pp-script, which may be moving or renaming the .strm
+                // this arm just wrote, has to be finished before the
+                // history row exists. Awaiting that here would stall
+                // the picker for the script's whole run; the lane is
+                // where the wait is affordable. See
+                // `PostprocLane::submit_hooks_only`.
+                lane.submit_hooks_only(job).await;
                 continue;
             }
 
@@ -2041,8 +2125,24 @@ pub(super) fn spawn_download_worker(
                 // this stamp, and a give-up as the last pick of the day
                 // otherwise left it unarmed for good (§156 item 8a).
                 *d.last_download_end.lock_ok() = Instant::now();
-                d.run_post_job_hooks(&job);
-                d.park(job);
+                // Off the picker's loop and into the lane, same as the
+                // metadata-only arm above. `Failed` is a word an *arr
+                // acts on too - it blocklists this release and
+                // re-searches - and a user's failure script runs on
+                // this path exactly as it does on a download that
+                // failed the long way round, where the lane already
+                // finishes it before the row is filed. One ordering
+                // for every ending, not one per arm.
+                //
+                // The give-up's own selling point survives it: what
+                // this feature buys is not having to spend a doomed
+                // download to reach the verdict, and none of that is
+                // given back by the script taking the time the user
+                // configured it to take. The failure REPORT still
+                // lands after the park by construction - only the
+                // script is awaited - so a re-grab can never enter the
+                // queue while the row it replaces is still in it.
+                lane.submit_hooks_only(job).await;
                 continue;
             }
 
@@ -2057,19 +2157,19 @@ pub(super) fn spawn_download_worker(
             // download itself might well complete.
             if d.preflight.load(Ordering::Relaxed) {
                 d.hub.activity.lock_ok().insert(nzo_id.clone(), "preflight");
-                match crate::check(&config, &nzb_path, 10, 4, 50).await {
+                match crate::check(&config, &nzb_path, 10, 4, 50, true).await {
                     Ok(crate::Verdict::Impossible {
                         est_missing,
                         recovery,
+                        measured,
                         ..
                     }) => {
                         {
                             let mut j = job.lock_ok();
                             j.state = JobState::Failed;
                             j.fail_message = crate::with_build(format!(
-                                "pre-flight: articles missing beyond repair - an \
-                                 estimated {est_missing} payload segment(s) \
-                                 unavailable vs {recovery} recovery block(s) in the NZB"
+                                "pre-flight: articles missing beyond repair - {}",
+                                crate::check::impossible_reason(est_missing, recovery, &measured)
                             ));
                             j.fail_detail = crate::fail_detail_snapshot(log_mark);
                             j.finished_at = Some(Instant::now());
@@ -2080,8 +2180,11 @@ pub(super) fn spawn_download_worker(
                         // exit; the STAT sample above is the network
                         // phase this job had (§156 item 8a).
                         *d.last_download_end.lock_ok() = Instant::now();
-                        d.run_post_job_hooks(&job);
-                        d.park(job);
+                        // Third of the three runner arms that end a job
+                        // before the pipeline starts, and the lane
+                        // takes its tail for the same reason as the
+                        // other two.
+                        lane.submit_hooks_only(job).await;
                         continue;
                     }
                     Ok(_) => {}
@@ -2224,7 +2327,7 @@ pub(super) fn spawn_library_recheck(daemon: &Arc<Daemon>, config: &std::path::Pa
             for job in jobs {
                 let nzb_path = job.lock_ok().nzb_path.clone();
                 if let Ok(crate::Verdict::Impossible { .. }) =
-                    crate::check(&config, &nzb_path, 10, 4, 50).await
+                    crate::check(&config, &nzb_path, 10, 4, 50, true).await
                 {
                     {
                         let mut j = job.lock_ok();

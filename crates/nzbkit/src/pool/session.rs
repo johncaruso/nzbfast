@@ -1263,6 +1263,21 @@ pub(super) async fn handle_missing(
     // `bare_refuser` is set) still takes the slow road, and a provider
     // that never answers a fence has it retired by `note_fence_dud`,
     // which puts every article here back on the double pass.
+    // Every exit below either requeues this article or drives it
+    // terminal, and neither is ours to do if something else already
+    // owns the outcome: a dup that won the race, or a `give_up_covered`
+    // / `cancel` that claimed the id while this refusal was in flight.
+    // Requeuing a terminal id puts a zombie entry in front of
+    // `next_work`, which has no `done` filter - so a real BODY is
+    // issued, ~800 KB is fetched, `handle_body`'s `claim_done` then
+    // fails and the whole thing is discarded by `charge_dup_loss`,
+    // which can additionally push an innocent session into its
+    // repeated-race redial. Both siblings in `runlife` ask exactly this
+    // before reinserting; the inflight entry is already deregistered
+    // above, so returning here strands nothing.
+    if shared.done.lock_ok().contains(&w.id) {
+        return;
+    }
     if !echoed && !w.fenced && w.soft_430 & ctx.group_bits != ctx.group_bits {
         w.soft_430 |= ctx.group_bits;
         // A wholly dead post takes this branch for EVERY article before

@@ -137,6 +137,8 @@ button.dimbtn:hover,button.dimbtn:focus-visible{opacity:1}
 #ctxmenu button{display:block;width:100%;text-align:start;background:none;color:var(--fg);
   border:none;padding:7px 12px;border-radius:7px;font-size:12.5px;cursor:pointer;margin:0}
 #ctxmenu button:hover{background:var(--surface-2)}
+#ctxmenu button[disabled]{opacity:.4;cursor:default}
+#ctxmenu button[disabled]:hover{background:none}
 #ctxmenu button.danger{color:var(--bad)}
 button.danger{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 45%,transparent)}
 button.danger:hover{background:color-mix(in srgb,var(--bad) 12%,transparent)}
@@ -216,10 +218,27 @@ button.warn:hover{background:color-mix(in srgb,var(--warn) 12%,transparent)}
 .chartwrap{position:relative;overflow:hidden;min-height:34px;max-height:70vh}
 .chgrip{position:absolute;inset-inline:0;bottom:0;height:11px;cursor:ns-resize;
   display:flex;align-items:flex-end;justify-content:center;padding-bottom:2px;
-  opacity:.3;transition:opacity .14s;touch-action:none}
+  opacity:.55;transition:opacity .14s;touch-action:none}
 .chgrip::before{content:"";width:32px;height:3px;border-radius:2px;background:var(--dim)}
+/* Corner ridges (bottom trailing corner): people reach for the corner to
+   resize, so the corner shows something to grab. Purely visual - the grip
+   strip already spans the full width, so the corner was always draggable;
+   it just looked like nothing. Drawn inside the labelled grip element, so
+   screen readers see one control, not two. */
+.chgrip::after{content:"";position:absolute;inset-inline-end:3px;bottom:1px;width:10px;height:10px;
+  background:repeating-linear-gradient(135deg,var(--dim) 0 1.5px,transparent 1.5px 4px);
+  clip-path:polygon(100% 0,100% 100%,0 100%)}
+[dir=rtl] .chgrip::after{transform:scaleX(-1)}
 .chartwrap:hover .chgrip,.chgrip:focus-visible,.chgrip.on{opacity:1}
-.chgrip.on::before,.chgrip:focus-visible::before{background:var(--acc);width:52px}
+/* On hover (and while dragging - .on outlives :hover under pointer
+   capture) the centre dash stretches into a full-width hairline: the
+   whole bottom edge reads as draggable, which it is. Keyboard focus
+   keeps the 52px dash; a hairline is a poor focus target. */
+.chartwrap:hover .chgrip::before,.chgrip.on::before{width:100%;height:2px}
+.chgrip.on::before,.chgrip:focus-visible::before{background:var(--acc)}
+.chgrip:focus-visible::before{width:52px}
+.chgrip.on::after,.chgrip:focus-visible::after{
+  background:repeating-linear-gradient(135deg,var(--acc) 0 1.5px,transparent 1.5px 4px)}
 .chgrip:focus-visible{outline:1px solid var(--acc);outline-offset:-2px;border-radius:4px}
 /* Resizing stays a fine-pointer affordance, as it always has been: on a
    touch screen a drag handle inside a scrolling page fights the scroll. */
@@ -249,7 +268,102 @@ button.warn:hover{background:color-mix(in srgb,var(--warn) 12%,transparent)}
 .cardtools>*:hover{color:var(--fg);background:var(--surface-2)}
 .cardtools>*:focus-visible{outline:1px solid var(--acc);outline-offset:1px}
 .draghandle{cursor:grab;user-select:none}
+/* The whole card heading is the grab area, not just that 24px glyph. On a
+   full-width card the glyph parks at the far end, up to 1200px from the
+   title it belongs to, so dragging the word "Queue" - the first thing
+   anyone tries - did nothing, and nothing on the heading said otherwise.
+   Stamped by initLayout on movable cards only: settings sections share
+   .card h3 and do not move, so they must not advertise a grab.
+   Children keep their own cursor. `auto` over a text span resolves to the
+   I-beam, which is honest: only a press on the heading ITSELF arms the
+   drag, so the .dim subtitles and the end-floated hints stay selectable. */
+.draghead{cursor:grab}
+.draghead:active{cursor:grabbing}
+.draghead>*{cursor:auto}
+.draghead>a,.draghead>button{cursor:pointer}
 .card.dragging{opacity:.45}
+/* §6d "Customise layout" - one named door onto controls that are quiet
+   furniture by design. Testers never reported that the handles do not
+   work; they reported not knowing they were there. Every affordance is
+   discovered separately, by whoever happens to hover the right 24 px, so
+   the drag handle gets found and the resize bar does not. This mode
+   lights the whole set at once and puts a word next to each icon, which
+   makes it learnable in one look and, more importantly, findable BY NAME
+   from Settings instead of by noticing three grey pixels.
+   It is a UI STATE and nothing else - never written to layoutPrefs.
+   Storing it there would make layoutTipDue() read "already arranged" and
+   hand Reset layout a mode to forget. */
+#layoutBar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;justify-content:flex-end;
+  margin:0 4px 2px;font-size:12.5px}
+/* At rest: one dim right-aligned link, quieter than a card heading. */
+#layoutOpen{background:none;border:0;color:var(--dim);font-size:12px;cursor:pointer;
+  display:inline-flex;align-items:center;gap:5px;padding:2px 5px;border-radius:6px;
+  opacity:.8;transition:opacity .15s,color .15s,background .15s}
+#layoutOpen:hover{color:var(--fg);opacity:1;background:var(--surface-2)}
+#layoutOpen:focus-visible{outline:1px solid var(--acc);outline-offset:1px;opacity:1;color:var(--fg)}
+#layoutPanel{display:none}
+body.layoutedit #layoutOpen{display:none}
+/* Both onboarding states quieten this strip: each asks for one specific
+   next action (add a server, start a download) and arranging cards is not
+   it. But `:not(.layoutedit)` is load-bearing, not tidiness. #layoutDone
+   lives INSIDE this bar, so suppressing it while the mode is ON left a
+   mode with no visible way out - Escape still worked, but nothing on
+   screen said so, and the state it happened in is the NEW INSTALL, which
+   is exactly the user this mode exists for. An affordance may be quiet at
+   rest; the way out of a mode may never be. */
+body.firstrun:not(.layoutedit) #layoutBar,
+body.nojobs:not(.layoutedit) #layoutBar{display:none}
+body.layoutedit #layoutBar{justify-content:stretch}
+body.layoutedit #layoutPanel{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;flex:1;
+  background:var(--surface-2);border:1px solid var(--acc);border-radius:10px;padding:8px 12px;
+  font-size:12.5px;color:var(--dim)}
+#layoutPanel b{color:var(--fg);font-weight:600}
+#layoutPanel .lehint{flex:1 1 280px;min-width:0}
+/* Every movable card outlined, so "which blocks can I move?" is answered
+   before anything is touched. `:not(#welcomeCard)` is exactly
+   movableCards(): the hero lives inside #heroTiles, so it is not a direct
+   child here. outline, not border - a border relays every card out and
+   the page would jump on entering the mode. */
+body.layoutedit #dashview>.card:not(#welcomeCard){outline:1px dashed var(--acc);outline-offset:2px}
+/* The tools stop being quiet furniture: full opacity, a real bordered hit
+   target, and the word beside the icon rather than hidden in a tooltip. */
+body.layoutedit .cardtools{opacity:1}
+body.layoutedit .cardtools>*{width:auto;grid-auto-flow:column;gap:4px;padding:0 7px;
+  color:var(--fg);background:var(--surface-2);border:1px solid var(--line)}
+body.layoutedit .cardtools>*:hover{border-color:var(--acc)}
+.ctlbl{display:none}
+/* nowrap, not word-break: the dense preset squeezes these rows, and a
+   two-line "Compact" inside a 24px-tall button is worse than a wider one. */
+body.layoutedit .ctlbl{display:inline;font-size:11px;line-height:1;white-space:nowrap}
+/* Both kinds of resize bar drawn as a control rather than a hint. A card
+   with no .cardgrip gets NOTHING here on purpose: an inert bar that
+   resizes nothing is a worse lie than no bar at all, and this way the
+   mode tells the truth about whichever cards actually carry one.
+   What the mode shows is the HOVER look the grips already have (a
+   full-width hairline plus the corner ridges), promoted to the resting
+   state and tinted accent. Not a third appearance invented for the mode:
+   that hairline is the house signal for "this edge drags", so the mode's
+   job is to stop making you hover to see it.
+   `:not(:focus-visible)` is what makes that reliable, and it is doing two
+   jobs. It lifts these rules above the equal-specificity hover rules
+   further down the sheet (which would otherwise win on .cardgrip by
+   source order and lose on .chgrip, so the two grips would disagree), and
+   it leaves the keyboard focus ring's deliberate 52px dash alone - a
+   full-width hairline is a poor focus target. */
+body.layoutedit .cardgrip,body.layoutedit .chgrip{opacity:1}
+body.layoutedit .cardgrip:not(:focus-visible)::before,
+body.layoutedit .chgrip:not(:focus-visible)::before{background:var(--acc);width:100%;height:2px}
+body.layoutedit .cardgrip::after,body.layoutedit .chgrip::after{
+  background:repeating-linear-gradient(135deg,var(--acc) 0 1.5px,transparent 1.5px 4px)}
+/* And where there is no bar to light, the mode says why instead. The
+   sentence is cardFixedReason()'s, from the data-fixedh the markup
+   already carries - "no handle" and "a handle I cannot find" look
+   identical from the outside, and this is the one surface that tells the
+   difference (the card structure work deliberately paints nothing, so
+   there is exactly one explanation on screen and not two). */
+.cardfixed{display:none}
+body.layoutedit .cardfixed{display:block;margin:8px 0 0;padding-top:6px;
+  border-top:1px dashed var(--line);font-size:11.5px;color:var(--dim)}
 /* §Stage3 first run. With no server configured the dashboard was twelve
    cards of nothing: a hero reading 0 MB/s beside a blank chart, four zeroed
    tiles, and Queue / Browse / Watchlist / History / Usage / Benchmark all
@@ -259,7 +373,8 @@ button.warn:hover{background:color-mix(in srgb,var(--warn) 12%,transparent)}
    them through .userhidden would have written a first-run state into the
    user's saved card layout and left it there forever. */
 body.firstrun #dashview>.card:not(#welcomeCard),
-body.firstrun #tiles,body.firstrun #layoutTip,body.firstrun #hiddenBar{display:none}
+body.firstrun #tiles,body.firstrun #layoutTip,
+body.firstrun #hiddenBar{display:none}
 /* §129 4c: the SECOND empty state. A configured server is not a working
    install - between "no server" and "downloading" sits a dashboard whose
    cards can only read zero, with the one question the user actually has
@@ -375,11 +490,49 @@ body:not(.noidx) .idxoff{display:none!important}
 #showAll{background:none;border:0;color:var(--dim);font-size:12.5px;cursor:pointer;
   padding:0;margin-top:14px;text-decoration:underline dotted}
 #showAll:hover{color:var(--fg)}
-/* One-time layout tip: card-coloured but deliberately not a .card. */
+/* One-time layout nudge: card-coloured but deliberately not a .card.
+   The banner this replaces was retired on the argument that icon buttons
+   at opacity .5 explain themselves. They do explain what they DO, once
+   you look at one - what nothing on the page ever said is that the cards
+   were arrangeable at all, so nobody looked. This says that once, in one
+   sentence, and then hands the question to Customise layout, which is a
+   permanent door with its own in-mode explanation. Nothing here names a
+   control, draws a glyph, or teaches an operation: the caret and the
+   ring point at the link, and the link is what the user still has
+   tomorrow. */
 #layoutTip{display:flex;flex-wrap:wrap;align-items:center;gap:10px;background:var(--surface-2);
-  border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-size:12.5px;color:var(--dim)}
+  border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-size:12.5px;color:var(--dim);
+  position:relative}
 #layoutTip b{color:var(--fg);font-weight:600}
+#layoutTip .lead{flex:1 1 220px;min-width:0;color:var(--fg)}
+#layoutTip .ok{flex:0 0 auto;font-size:12px;line-height:1.6;padding:2px 12px;cursor:pointer;
+  border:1px solid var(--line);border-radius:99px;background:none;color:var(--dim)}
+#layoutTip .ok:hover{color:var(--fg);border-color:var(--acc)}
+/* The caret sits under the link in the #layoutBar directly below, so the
+   sentence and the door read as one gesture instead of as a notice
+   floating above unrelated furniture. Its offset is MEASURED off that
+   link (aimLayoutCaret) rather than assumed: the bar is another
+   session's markup, and a caret pinned to a guessed x is a caret that
+   points at empty space the first time the bar is laid out differently.
+   The fallback only has to survive the frame before the measurement. */
+#layoutTip::after{content:"";position:absolute;inset-inline-end:var(--caret-end,26px);
+  bottom:-6px;width:10px;height:10px;
+  background:var(--surface-2);border-inline-end:1px solid var(--line);
+  border-bottom:1px solid var(--line);transform:rotate(45deg)}
+/* The ring is the whole pointing mechanism, so it goes on the link
+   itself and comes off with the nudge. Deliberately NOT a change to
+   .cardtools or the grips: body.layoutedit is the one switch that pins
+   those open, and a second mechanism doing it is how one of them ends up
+   stuck on. */
+#layoutOpen.coachtarget{outline:1px solid var(--acc);outline-offset:3px;border-radius:6px;
+  color:var(--fg)}
 #hiddenBar a{cursor:pointer;text-decoration:underline dotted}
+/* One-time wash when the first card ever lands in the bar - the card
+   vanished from the grid, this says where it went. */
+#hiddenBar.flash{animation:hbFlash 1.6s ease-out 1;border-radius:6px}
+@keyframes hbFlash{0%{background:var(--surface-2);box-shadow:0 0 0 1px var(--acc)}
+  100%{background:transparent;box-shadow:none}}
+@media (prefers-reduced-motion:reduce){#hiddenBar.flash{animation:none}}
 /* §12a density: ONE `compact` class, set globally (body.compact, from
    Settings → Interface) or per card (the ▤ card tool). Compact keeps
    every figure and drops the padding, the secondary hints and the
@@ -440,7 +593,8 @@ body.dense #dashview{display:grid;grid-template-columns:repeat(auto-fill,minmax(
 body.dense #dashview>*{margin:0 0 10px}
 body.dense #dashview>#welcomeCard,body.dense #dashview>#heroTiles,
 body.dense #dashview>#queueCard,
-body.dense #dashview>#layoutTip,body.dense #dashview>#hiddenBar{grid-column:1/-1}
+body.dense #dashview>#layoutTip,body.dense #dashview>#layoutBar,
+body.dense #dashview>#hiddenBar{grid-column:1/-1}
 /* The headline: hero left half, tiles right half, one strip. The shell
    is display:contents everywhere else - only dense makes it a row. */
 body.dense #heroTiles{display:flex;gap:10px;align-items:stretch}
@@ -457,6 +611,13 @@ body.dense #dashview .cardscroll{overflow-x:auto}
    columns, so it keeps its natural layout. */
 body.dense #histCard table,body.dense #browseCard table,body.dense #usageCard table{table-layout:fixed;width:100%}
 body.dense #histCard td,body.dense #browseCard td,body.dense #usageCard td{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* ...but a drawer is a detail panel, not a row. The one-line rule above
+   inherits into it, and `white-space:nowrap` beats the `word-break` on
+   .histdet dd - so dense clipped the failure Reason at 188px of a
+   1450px sentence, with no wrap, no ellipsis and no scroll to reach the
+   rest (Gary, 16 Aug: the drawer "bleeding out of bounds"). The row
+   summaries still hold their single line; only the panel opens up. */
+body.dense #histCard tr.drawer td,body.dense #browseCard tr.drawer td,body.dense #usageCard tr.drawer td{overflow:visible;text-overflow:clip;white-space:normal}
 body.dense #idx th:first-child{width:52%}
 body.dense #usageTbl th:first-child{width:40%}
 /* History: fixed layout splits leftover width evenly, which starved the
@@ -703,11 +864,16 @@ button.hlp{background:transparent;padding:0;font-weight:600;transition:filter .1
   background:var(--surface-2);color:var(--fg);border:1px solid var(--line);border-radius:9px;
   padding:10px 16px;font-size:13px;opacity:0;transition:opacity .25s;z-index:60;pointer-events:none}
 #toast.on{opacity:1}
+/* Error toasts take a red border by CLASS, never an inline style: an
+   inline border-color outranks every rule below it, so the hover rule
+   would lose the cascade and the clickable affordance would never
+   light up. */
+#toast.toastbad{border-color:var(--bad)}
 /* The box is click-through by default (it must never swallow a click on
    whatever it is floating over). A toast that HAS somewhere to go takes
    its clicks back for the few seconds it is up. */
 #toast.on.clickable{pointer-events:auto;cursor:pointer}
-#toast.on.clickable:hover,#toast.on.clickable:focus-visible{border-color:var(--accent)}
+#toast.on.clickable:hover,#toast.on.clickable:focus-visible{border-color:var(--acc)}
 /* Chip C: in-page manual drawer (slides from the right). */
 .helpdrawer{position:fixed;inset:0;z-index:80;display:none}
 .helpdrawer.open{display:block}
@@ -774,6 +940,37 @@ button.hlp{background:transparent;padding:0;font-weight:600;transition:filter .1
 #cumodal .fsfoot{flex-wrap:wrap}
 #fswrite.ok{color:var(--ok)}#fswrite.warn{color:var(--warn)}
 @media(max-width:560px){.fsbody{grid-template-columns:1fr}.fsroots{display:none}}
+/* Add-NZB options (TODO §181). The same modal shell as the directory
+   browser; the body is a plain stacked form, so it carries its own few
+   rules rather than bending .fsbody's two-pane grid. Deliberately BELOW
+   #fsov and #keyov: an expired key mid-add puts the key modal on top of
+   this one, and answering it is the way out. */
+#adov{position:fixed;inset:0;z-index:68;display:none;place-items:center;
+  background:color-mix(in srgb,#000 55%,transparent);backdrop-filter:blur(2px);padding:16px}
+#adov.on{display:grid}
+#admodal{background:var(--surface);border:1px solid var(--line);border-radius:14px;
+  width:min(520px,96vw);max-height:88vh;display:flex;flex-direction:column;
+  box-shadow:0 24px 70px rgba(0,0,0,.5);overflow:hidden}
+.adbody{padding:14px 16px;display:flex;flex-direction:column;gap:13px;overflow-y:auto}
+/* The names being added. Capped rather than unbounded: a folder drop can
+   be forty files, and the controls must stay on screen. */
+.adfiles{max-height:124px;overflow-y:auto;background:var(--surface-2);border-radius:8px;
+  padding:8px 10px;font-size:12.5px;color:var(--dim);display:flex;flex-direction:column;gap:3px}
+.adfiles div{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.adfield{display:flex;flex-direction:column;gap:5px}
+.adfield>label{font-size:12.5px;color:var(--dim)}
+.adfield>select,.adfield>input{width:100%}
+/* Where the pick actually lands. The request behind this dialog was
+   about the FOLDER, and a category name alone does not answer it - so
+   the resolved destination is spelled out and updates with the select. */
+.addest{font-size:12px;color:var(--dim);min-height:1.35em;line-height:1.35}
+.addest b{color:var(--fg);font-weight:600;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
+/* A path is an LTR token even in an RTL UI, like the fs bar's. */
+[dir=rtl] .addest b{direction:ltr;display:inline-block}
+.adfoot{display:flex;align-items:center;gap:10px;padding:12px 16px;
+  border-top:1px solid var(--line);flex-wrap:wrap}
+.adskip{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--dim);cursor:pointer}
 /* Container update recipe (fs modal skeleton, scrolling prose body).
    The Flatpak recipe (#fuov/#fumodal) is a second, much shorter panel of
    the same shape, so it rides these rules rather than copying them. */
@@ -886,11 +1083,22 @@ body.histcolor #hist tbody tr.fail .nmtxt{color:var(--bad)}
 /* Drag the bottom edge to cap the card's height; past that it scrolls.
    Same idea as the chart grip, and the same reason it is a visible bar
    rather than a hit zone you have to know about. */
-.cardgrip{height:11px;margin:2px -12px -9px;cursor:ns-resize;display:flex;align-items:flex-end;
-  justify-content:center;padding-bottom:2px;opacity:.3;transition:opacity .14s;touch-action:none}
+.cardgrip{position:relative;height:11px;margin:2px -12px -9px;cursor:ns-resize;display:flex;align-items:flex-end;
+  justify-content:center;padding-bottom:2px;opacity:.55;transition:opacity .14s;touch-action:none}
 .cardgrip::before{content:"";width:32px;height:3px;border-radius:2px;background:var(--dim)}
+/* Corner ridges + hover hairline: same affordance treatment as .chgrip
+   above (see the comment there). The strip already covers the corner;
+   this only makes it visible. */
+.cardgrip::after{content:"";position:absolute;inset-inline-end:3px;bottom:1px;width:10px;height:10px;
+  background:repeating-linear-gradient(135deg,var(--dim) 0 1.5px,transparent 1.5px 4px);
+  clip-path:polygon(100% 0,100% 100%,0 100%)}
+[dir=rtl] .cardgrip::after{transform:scaleX(-1)}
 .card:hover .cardgrip,.cardgrip:focus-visible,.cardgrip.on{opacity:1}
-.cardgrip.on::before,.cardgrip:focus-visible::before{background:var(--acc);width:52px}
+.card:hover .cardgrip::before,.cardgrip.on::before{width:100%;height:2px}
+.cardgrip.on::before,.cardgrip:focus-visible::before{background:var(--acc)}
+.cardgrip:focus-visible::before{width:52px}
+.cardgrip.on::after,.cardgrip:focus-visible::after{
+  background:repeating-linear-gradient(135deg,var(--acc) 0 1.5px,transparent 1.5px 4px)}
 @media not (pointer:fine){.cardgrip{display:none}}
 /* Card resize, for any card that grows with the number of things in it.
    The scroll goes on a WRAPPER, never on the table, and the card is a
@@ -905,6 +1113,22 @@ body.histcolor #hist tbody tr.fail .nmtxt{color:var(--bad)}
    table's columns and got the header and the body out of step when only
    half of them were declared. A normal table inside a scrolling wrapper
    has none of that: auto layout keeps working and columns do not move. */
+/* Which cards get a grip, and why the rest do not have one.
+   A grip is honest only where there is something to scroll: the card has
+   to be able to hold MORE than fits it. That is every card built from a
+   list whose length is not ours to choose - the queue, the search
+   results, the watchlist, the history, one block per provider, one usage
+   row per provider, the benchmark's past runs.
+   The three that never carry one say so in the markup rather than just
+   quietly lacking a handle, because "no handle" and "a handle I cannot
+   find" look identical, and a user who found the queue's grip and then
+   hunted for Providers' concluded the whole feature was broken. That is
+   what data-fixedh is for: `1` = its content is a fixed set (Pipeline is
+   at most three lanes, Setup is a fact grid), `chart` = it IS resizable,
+   by the chart grip inside it, so pointing at the bottom edge would be
+   the wrong instruction. The layout mode reads the attribute and does
+   the telling; nothing here paints anything, so there is exactly one
+   explanation of this on screen and not two. */
 .card.capped{display:flex;flex-direction:column}
 .card.capped .cardscroll{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden}
 /* Sticky works against the scrolling ancestor, so the header stays
@@ -1308,6 +1532,31 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
 /* The webhook body template only applies to one kind, so it gets its own
    full-width line rather than a column every other kind leaves blank. */
 .notifyrow .nbody{grid-column:1/-1;margin:-2px 0 4px}
+/* §6b card manager (Settings -> Interface). The §6 card tools - the drag
+   handle, the density button, the hide button - are all behind
+   LAYOUT_EDIT, which is off for every coarse pointer and every viewport
+   at or under 640px. That is not "harder to find" on a phone or tablet,
+   it is absent, so the same three operations live here as plain
+   checkboxes and buttons: reachable by touch, by keyboard and by a
+   screen reader, writing the same layoutPrefs the drag path writes.
+   One flex row per card, controls carrying their own visible labels
+   rather than a header row, so it stays readable when it wraps at
+   320px - the width where a column table would have to become a
+   different design. */
+.cardmgr{margin:2px 0 6px}
+.cmrow{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;padding:4px 6px;border-radius:8px}
+.cmrow+.cmrow{border-top:1px solid var(--line)}
+.cmname{flex:1 1 150px;min-width:0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* A hidden card still lists, dimmed: it is the row you tick to get it
+   back, so removing it would take the restore away with it. */
+.cmrow.cmoff .cmname{color:var(--dim)}
+.cmctl{display:flex;gap:6px 12px;align-items:center;flex-wrap:wrap}
+.cmctl label{display:inline-flex;gap:5px;align-items:center;font-size:12px;color:var(--dim);cursor:pointer;white-space:nowrap}
+.cardmgr button.mini{margin-inline-start:0}
+/* There is no i-arrow-up in the shared sprite and adding one would edit
+   a file the wall shares; the down arrow turned over IS the up arrow. */
+.cardmgr .cmup .ic{transform:rotate(180deg)}
+.cardmgr button[disabled]{opacity:.35;cursor:default}
 /* Phone: one column, so the control drops below its own explanation
    rather than hunting for a right-hand gutter that is no longer there. */
 @media(max-width:720px){.lsrcrow{grid-template-columns:1fr 1fr}.set .row{grid-template-columns:1fr}.set .row>label,.set .row>.hint{grid-area:auto;max-width:none}.set .row>*:not(label):not(.hint){grid-area:auto;justify-self:start;margin-top:3px}.schedrow{grid-template-columns:1fr 1fr}.feedrow{grid-template-columns:1fr 1fr}.smartrow{grid-template-columns:1fr 1fr}.wlrow{grid-template-columns:1fr 1fr}.notifyrow{grid-template-columns:1fr 1fr}.arrrow{grid-template-columns:1fr 1fr}.catrow{grid-template-columns:1fr 1fr}.catfilerow{grid-template-columns:1fr 1fr}.idxrow{grid-template-columns:1fr 1fr}}
@@ -1315,9 +1564,17 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
 /* ================= phone + touch layer - purely additive ================= */
 /* Tap targets ≥44px on touch screens (and in any phone-width window). */
 @media(pointer:coarse),(max-width:640px){
-  /* §6 resize/rearrange/hide are desktop affordances - phones keep the
-     stacked single column untouched. */
+  /* §6 drag-to-move, drag-to-resize and the icon buttons beside them are
+     fine-pointer affordances - phones keep the stacked single column
+     untouched. The OPERATIONS are not desktop-only any more: §6b puts
+     show/hide, compact and move in Settings -> Interface, and the
+     #hiddenBar line below carries the link to it. */
   .cardtools{display:none}
+  /* That link is now the dashboard's only card control on touch, so it
+     has to be a real tap target rather than a 15px line of 12.5px text.
+     The restore names beside it get the same treatment - they are the
+     way back for a hidden card. */
+  #hiddenBar a{display:inline-flex;align-items:center;min-height:44px;padding:0 2px}
   button,select.ctl,select.sel,input.search,input.txt{min-height:44px}
   button.mini{min-height:44px;min-width:44px;padding:6px 12px;font-size:12.5px}
   a.pill{min-height:44px;display:inline-flex;align-items:center}
@@ -1545,13 +1802,39 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
      #hiddenBar, so re-ordering leaves it where it is. -->
 <div id="layoutTip" style="display:none"></div>
 
-<div class="card half" id="rescard" style="display:none">
+<!-- §6d Customise layout. The same structural slot as #layoutTip and for
+     the same reasons: NOT a .card, so it can never become movable or
+     hideable itself, and it sits between the tiles and the cards, which
+     initLayout re-inserts before #hiddenBar - so re-ordering the
+     dashboard leaves this strip exactly here.
+     Placement: directly above the first movable card, which is where
+     someone who wants to rearrange cards is already looking, and far
+     enough from the header that it adds no global chrome for what is a
+     dashboard-only mode. At rest it is one dim right-aligned link; while
+     the mode is on the panel replaces it in place.
+     Built in markup rather than by JS so applyI18n reaches every string
+     on a locale switch with no restamp entry needed. -->
+<div id="layoutBar" style="display:none">
+  <button id="layoutOpen" onclick="setLayoutEdit(true)" aria-pressed="false"
+    data-i18n-title="layout.mode.open.title"
+    title="Show the controls for moving, resizing, compacting and hiding dashboard cards"
+    aria-label="Show the controls for moving, resizing, compacting and hiding dashboard cards"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-grid"/></svg>
+    <span data-i18n="layout.mode.open">Customise layout</span></button>
+  <div id="layoutPanel" role="group" aria-labelledby="layoutPanelTitle">
+    <span class="lehint"><b id="layoutPanelTitle" data-i18n="layout.mode.on">Customising layout</b><br>
+      <span data-i18n="layout.mode.help">Every card you can rearrange is outlined. Drag one by its Move handle, or focus that handle and press the up and down arrow keys. Cards that hold a list have a bar on the bottom edge that changes their height, and any card that cannot be resized that way says why. Compact fits a card into less space, and Hide sends it to the Hidden bar at the foot of the page.</span></span>
+    <button class="ghost mini" onclick="resetLayout()" data-i18n="set.ui.layout.btn">Reset layout</button>
+    <button class="mini" id="layoutDone" onclick="setLayoutEdit(false)" data-i18n="layout.mode.done">Done</button>
+  </div>
+</div>
+
+<div class="card half" id="rescard" style="display:none" data-fixedh="chart">
   <h3 data-i18n="res.title">Resources</h3>
   <div class="legend" id="resLegend"></div>
   <div class="chartwrap" style="height:110px"><canvas id="resChart"></canvas></div>
 </div>
 
-<div class="card half" id="pipecard" style="display:none">
+<div class="card half" id="pipecard" style="display:none" data-fixedh="1">
   <h3 data-i18n="pipe.title">Pipeline <span class="dim" style="text-transform:none;letter-spacing:0;font-weight:400" data-i18n="pipe.sub">· stages overlap</span></h3>
   <div id="lanes"></div>
 </div>
@@ -1559,7 +1842,12 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
   <h3 data-i18n="prov.title">Providers <span class="dim" id="provsum" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h3>
   <div class="legend" id="provLegend"></div>
   <div class="chartwrap" id="provChartWrap" style="height:60px;margin-bottom:8px"><canvas id="provChart"></canvas></div>
-  <div id="servers"></div>
+<!-- The provider blocks are the growable part: one per configured
+     server, and a refused one grows a .srvwhy paragraph under it. The
+     legend and the chart stay outside the scroller - the chart has its
+     own grip and resizing it is a different gesture. -->
+  <div class="cardscroll"><div id="servers"></div></div>
+  <div class="cardgrip" data-card="provcard" tabindex="0" role="separator" aria-orientation="horizontal"></div>
 </div>
 
 <div class="card" id="queueCard">
@@ -1632,6 +1920,20 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
        Inside the watchlist card on purpose - a source is a way of adding
        to THIS list, not a second list, and a Plex watchlist feed is not
        an NZB feed, so it must not read as belonging in the RSS card. -->
+<!-- Everything from the list sources down is the variable part of this
+     card, so it all scrolls together: the sources panel grows a row per
+     source, the watchlist grows a row per title, and the three settings
+     below them are as tall as their wrapped labels. They used to sit
+     OUTSIDE the scroller, which meant a card dragged small could not
+     shrink them - the fixed chrome alone came to 228px against a 220px
+     card, so the toggles AND the grip itself spilled out of the bottom
+     edge and painted over the next card, while the row list they should
+     have been shrinking was already at zero height.
+     #wlCal and #wlGiveup deliberately stay OUTSIDE, as direct children:
+     the nowatch/hasgu rule in the stylesheet is a direct-child selector
+     (`#watchCard.hasgu>*:not(#wlGiveup)`), so reparenting the give-up
+     list would hide the one thing that mode exists to show. -->
+  <div class="cardscroll">
   <div id="wlSrc" style="margin-bottom:12px">
     <!-- The standing paragraph this heading used to carry lives in its
          tooltip now: read-once copy, one hover away instead of always-on
@@ -1645,7 +1947,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
       <button onclick="saveListSrc(this)" data-i18n="lsrc.apply">Apply sources</button>
     </div>
   </div>
-  <div class="cardscroll"><div id="wlrows"></div></div>
+  <div id="wlrows"></div>
   <div style="display:flex;gap:9px;margin-top:10px">
     <button class="ghost" onclick="addWatchRow('tv')" data-i18n="watch.addtv">+ TV show</button>
     <button class="ghost" onclick="addWatchRow('movie')" data-i18n="watch.addmovie">+ movie</button>
@@ -1664,6 +1966,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <span data-i18n="watch.instantmax">At most</span>
     <input class="txt sm" type="number" min="0" max="3600" id="s_watchlist_instant_max" style="width:74px;max-width:74px" onchange="setCfg('watchlist_instant_max',this.value)">
     <span data-i18n="watch.instantmax.unit">of those checks an hour (0 = no cap)</span></label>
+  </div>
   <div class="cardgrip" data-card="watchCard" tabindex="0" role="separator" aria-orientation="horizontal"></div>
 </div>
 
@@ -1701,11 +2004,15 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
 <div class="card" id="usageCard">
   <h3 data-i18n="usage.title">Data usage <span class="dim" style="text-transform:none;letter-spacing:0;font-weight:400" data-i18n="usage.sub">· per provider</span></h3>
   <div class="chartwrap" style="height:64px;margin:2px 0 10px;display:none"><canvas id="usageChart"></canvas></div>
-  <table id="usageTbl"><thead><tr><th data-i18n="usage.provider">Provider</th><th data-i18n="usage.today">Today</th><th data-i18n="usage.7d">7 days</th><th data-i18n="usage.30d">30 days</th></tr></thead>
-    <tbody><tr><td colspan="4" class="dim" data-i18n="usage.none">no downloads recorded yet</td></tr></tbody></table>
+<!-- One row per provider plus a total, so this card is as tall as the
+     number of accounts you have configured. The chart keeps its own grip
+     and stays out of the scroller. -->
+  <div class="cardscroll"><table id="usageTbl"><thead><tr><th data-i18n="usage.provider">Provider</th><th data-i18n="usage.today">Today</th><th data-i18n="usage.7d">7 days</th><th data-i18n="usage.30d">30 days</th></tr></thead>
+    <tbody><tr><td colspan="4" class="dim" data-i18n="usage.none">no downloads recorded yet</td></tr></tbody></table></div>
+  <div class="cardgrip" data-card="usageCard" tabindex="0" role="separator" aria-orientation="horizontal"></div>
 </div>
 
-<div class="card" id="setupCard">
+<div class="card" id="setupCard" data-fixedh="1">
   <h3 data-i18n="setup.title">Setup <span class="dim" style="text-transform:none;letter-spacing:0;font-weight:400" data-i18n="setup.sub">· at a glance</span><button class="ghost" style="float:inline-end;margin-top:-4px" onclick="return showSettings()" data-i18n="setup.edit">Edit in Settings</button></h3>
   <div id="setupGrid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px 22px;font-size:13.5px;margin-top:8px"></div>
 </div>
@@ -1724,11 +2031,18 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
       </select>
       <button class="ghost" onclick="runBench(this)" data-i18n="bench.run">Run</button>
     </span></h3>
+<!-- Everything below the heading scrolls together: a finished run
+     replaces the blurb with a verdict and three bars, and under that
+     sits up to ten past runs. The schedule control and Run button live
+     in the heading, so they stay reachable at any height. -->
+  <div class="cardscroll">
   <div id="benchOut" class="dim" style="font-size:13px" data-i18n="bench.blurb">Measures your network, CPU, and disk to report the fastest
     download speed you can expect - and what to upgrade. Schedule it to run automatically (only while idle) and
     build a history.</div>
   <div id="benchHist"></div>
   <table id="benchTbl" style="margin-top:8px;display:none"><tbody></tbody></table>
+  </div>
+  <div class="cardgrip" data-card="benchCard" tabindex="0" role="separator" aria-orientation="horizontal"></div>
 </div>
 
 <div id="hiddenBar" class="dim" style="display:none;font-size:12.5px;margin:2px 4px"></div>
@@ -2562,6 +2876,11 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input type="checkbox" id="ui_notify" onchange="setNotify(this)"></div>
   <div class="row" data-adv="1"><label data-i18n="set.ui.provsort">Provider re-sort interval<span class="hint" data-i18n="set.ui.provsort.hint">seconds between re-ordering the Providers list by live speed (rows slide to their new spot); default 10, 0 keeps the configured order; stored in this browser</span></label>
     <input class="txt sm" id="ui_prov_sort" onchange="localStorage.provSortSecs=this.value; lastProvSort=0; toast(t('toast.savedBrowser','Saved for this browser.'))"></div>
+  <!-- §181. Per-browser, like the drop-zone layout beneath it: the
+       dialog is a habit of the machine you add from, and one person
+       wanting it must not force it on the household's other screens. -->
+  <div class="row"><label data-i18n="set.ui.addask">Ask where each download goes<span class="hint" data-i18n="set.ui.addask.hint">adding an .nzb from this page opens a small panel first: which category it belongs to (that is the folder it ends up in), what priority, and the archive password if you already know it needs one. Off adds straight away with the usual settings, the way it always did. Downloads sent by Sonarr, Radarr, an RSS feed or the watch folder are never asked about. Stored in this browser</span></label>
+    <input type="checkbox" id="ui_addask" onchange="localStorage.nzbfastAddAsk=this.checked?'1':'0'; toast(t('toast.savedBrowser','Saved for this browser.'))"></div>
   <div class="row"><label data-i18n="set.ui.drop">Drop zones<span class="hint" data-i18n="set.ui.drop.hint">where the two targets sit when you drag a file onto the page, and which of them gets the room. Stored in this browser</span></label>
     <span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <select class="sel" id="ui_droplayout" style="max-width:180px"
@@ -2581,8 +2900,31 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <input type="checkbox" id="ui_herohist" onchange="setHeroHist(this.checked)"></div>
   <div class="row"><label data-i18n="set.ui.compact">Compact mode<span class="hint" data-i18n="set.ui.compact.hint">tighten every dashboard card so all the figures fit in a small window: same numbers, less padding. Individual cards can be compacted on their own with the density button in the card header; stored in this browser</span></label>
     <input type="checkbox" id="uiCompact" onchange="setUiCompact(this.checked)"></div>
-  <div class="row"><label data-i18n="set.ui.layout">Dashboard layout<span class="hint" data-i18n="set.ui.layout.hint">forget this browser's hidden cards, card order and chart sizes: back to the default layout</span></label>
-    <button class="ghost" onclick="resetLayout()" data-i18n="set.ui.layout.btn">Reset layout</button></div>
+  <!-- §6b: the card manager. Every operation here already existed -
+       hideCard, toggleCardDensity, moveCard - but only ever behind a
+       drag handle and two icon buttons that LAYOUT_EDIT switches off on
+       any coarse pointer or any window at or under 640px, so on a phone
+       or a tablet the dashboard could not be arranged at all. This is
+       the same three operations as buttons and checkboxes, writing the
+       same layoutPrefs, so an arrangement made on a phone is the one
+       the desktop shows. It sits above Reset layout because Reset is
+       the undo for everything in it. The list is built in JS from the
+       cards themselves, so a card added later appears here by existing -
+       the same rule the first-run look chooser follows. -->
+  <div class="row" style="grid-template-columns:1fr" id="rowCardMgr"><label data-i18n="set.ui.cards">Dashboard cards<span class="hint" data-i18n="set.ui.cards.hint">which cards the dashboard shows, how tightly each one is packed, and the order they run in. Works the same by touch, mouse or keyboard, and is stored in this browser. On a desktop the same three things are on each card itself: drag its handle to move it, and the two buttons beside the handle compact or hide it</span></label></div>
+  <div id="cardMgr" class="cardmgr"></div>
+  <!-- §6d: the named door, deliberately in the row a user already opens
+       when the dashboard is not laid out how they want it. Reset layout
+       was the only entry point here, which meant the one discoverable
+       layout control was the one that throws your layout away. The mode
+       toggle goes FIRST for that reason. Its label is stamped by
+       layoutModeSync() rather than data-i18n because it swaps with the
+       state; the row is hidden outright where the card tools do not exist
+       (touch pointer or a phone-width window). -->
+  <div class="row"><label data-i18n="set.ui.layout">Dashboard layout<span class="hint" data-i18n="set.ui.layout.hint">the mode that labels every card's move, resize, compact and hide controls, and the button that forgets this browser's hidden cards, card order and chart sizes</span></label>
+    <span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class="ghost" id="setLayoutMode" onclick="toggleLayoutEdit(true)" aria-pressed="false">Customise layout</button>
+      <button class="ghost" onclick="resetLayout()" data-i18n="set.ui.layout.btn">Reset layout</button></span></div>
   <!-- Issue #31. There is nothing to switch on here: the feature IS the
        file, so the row's job is to say the name, show where it goes, and
        get out of the way. The path is filled in from get_config, because
@@ -2726,6 +3068,43 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <button id="fschoose" onclick="fsChoose()" data-i18n="fs.choose">Choose this folder</button>
   </div>
 </div></div>
+<!-- Add-NZB options (TODO §181, a reddit request: "i would like a pop
+     up like sab so that i can direct the files to any folder i wish").
+     Shown only for adds made FROM this page - the picker, a drop on
+     "Add to queue", the idle card. Sonarr, Radarr, RSS and the watch
+     folder go straight to the API and never reach it, so nothing
+     automated waits on a dialog with nobody there to answer it. The
+     "Test file" drop zone skips it too: that path hands off to the
+     player at Force priority, which is not the user's to pick. -->
+<div id="adov" onclick="if(event.target===this)adCancel()"><div id="admodal" role="dialog" aria-modal="true" aria-labelledby="adtitle">
+  <div class="fshead"><b id="adtitle" data-i18n="add.title">Where should this go?</b><span class="grow"></span>
+    <button class="ghost mini" onclick="adCancel()" data-i18n-title="btn.close.title"
+      title="Close this panel" aria-label="Close this panel">✕</button></div>
+  <div class="adbody">
+    <div class="adfiles" id="adfiles"></div>
+    <div class="adfield">
+      <label for="adcat" data-i18n="add.cat">Category</label>
+      <select class="sel" id="adcat" onchange="adDest()"></select>
+      <div class="addest" id="addest"></div>
+    </div>
+    <div class="adfield">
+      <label for="adprio" data-i18n="add.prio">Priority</label>
+      <select class="sel" id="adprio"></select>
+    </div>
+    <div class="adfield">
+      <label for="adpw" data-i18n="add.pw">Password, if the archive needs one</label>
+      <input class="txt" id="adpw" type="password" autocomplete="off" spellcheck="false"
+        data-i18n-placeholder="add.pw.ph" placeholder="leave empty unless you know it needs one"
+        onkeydown="if(event.key==='Enter'){event.preventDefault();adOk()}">
+    </div>
+  </div>
+  <div class="adfoot">
+    <label class="adskip"><input type="checkbox" id="adskip"><span data-i18n="add.skip">Stop asking</span></label>
+    <span class="grow"></span>
+    <button class="ghost" onclick="adCancel()" data-i18n="btn.cancel">Cancel</button>
+    <button id="adok" onclick="adOk()" data-i18n="add.ok">Add</button>
+  </div>
+</div></div>
 <!-- API-key entry (TODO §129 phase 0b). This used to be a bare
      window.prompt(), which embedded webviews and kiosk browsers refuse
      outright - the page then sat on "connecting" with twelve empty
@@ -2784,6 +3163,9 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     <tr><td><kbd>Shift</kbd>+<span data-i18n="sh.clickword">click</span></td><td data-i18n="sh.shift">Select a whole range of checkboxes</td></tr>
     <tr><td><kbd>/</kbd></td><td data-i18n="sh.search">Jump to the search box</td></tr>
     <tr><td><kbd>Enter</kbd></td><td data-i18n="sh.enter">Open or close the focused row's details</td></tr>
+    <tr><td><kbd>↑</kbd> / <kbd>↓</kbd></td><td data-i18n="sh.cardmove">Move a card up or down (Tab to the handle in its title first)</td></tr>
+    <tr><td><kbd>↑</kbd> / <kbd>↓</kbd></td><td data-i18n="sh.cardsize">Resize a card or chart (on its bottom grip; Shift for bigger steps)</td></tr>
+    <tr><td><kbd>←</kbd> / <kbd>→</kbd></td><td data-i18n="sh.colmove">Move a table column (on its heading; Shift resizes it instead)</td></tr>
     <tr><td><kbd>Esc</kbd></td><td data-i18n="sh.esc">Close menus and panels like this one</td></tr>
     <tr><td><kbd>?</kbd></td><td data-i18n="sh.help">Show or hide this sheet</td></tr>
   </table></div>
@@ -2820,7 +3202,7 @@ input.txt.patbad{border-color:var(--warn);background:color-mix(in srgb,var(--war
     Community Applications adds an <b>Auto Update Applications</b> page under Settings that can keep
     nzbfast current on its own.</div>
     <pre class="cuyaml" id="cuyaml">  watchtower:
-    image: containrrr/watchtower
+    image: nickfedor/watchtower
     container_name: nzbfast-watchtower
     restart: unless-stopped
     environment:
@@ -6227,8 +6609,15 @@ async function toggleHistRow(tr){
   const armed=failed&&s.auto_retry_at&&s.auto_retry_at*1000>Date.now();
   if(armed){
     const m=Math.max(1,Math.ceil((s.auto_retry_at*1000-Date.now())/60000));
+    // `stale` is the daemon saying the post is at least a day old (see
+    // `fail_hint`). The propagation line below is true of posts in
+    // general and was plainly wrong about the one in front of Gary on
+    // 16 Aug, whose Reason line said days. The retry still runs - a gap
+    // can be backfilled later - it just stops being sold as the answer.
     const why=s.auto_retry_why==='transport'
       ? t('hist.autoretry.transport','This was the connection, not the post. nzbfast tries again in {m} min - the journal means only the gaps are fetched.',{m})
+      : s.fail_hint==='stale'
+      ? t('hist.autoretry.stale','Pieces were missing, and this post is more than a day old: propagation finishes in minutes to hours, so waiting is unlikely to be what fixes it. nzbfast tries again in {m} min anyway, and the journal means only the gaps are fetched.',{m})
       : t('hist.autoretry.propagation','Pieces were missing. Posts often finish landing on the servers within the hour, so nzbfast tries again in {m} min - the journal means only the gaps are fetched.',{m});
     rows.push([t('hist.autoretry.head','Automatic retry'),
       esc(why)
@@ -6260,7 +6649,11 @@ async function toggleHistRow(tr){
       retention:t('hist.fix.retention','Some pieces were never even requested: they are older than the retention you have set for every server. Raise it (0 = unlimited) and try again.'),
       nopar2:t('hist.fix.nopar2','Pieces are missing and this post carries no repair data at all, so nothing can rebuild them. Another release is the only answer.'),
       servers:t('hist.fix.servers','No server was available to download from - every one you have set up is switched off, busy, or out of block data.'),
-      deleted:t('hist.fix.deleted','This download finished, but its folder has since been deleted from disk. Retry downloads it again from the start.')
+      deleted:t('hist.fix.deleted','This download finished, but its folder has since been deleted from disk. Retry downloads it again from the start.'),
+      // The age-aware twin of hist.fix.missing. Same failure, but the
+      // post is old enough that "it may still be arriving" is not the
+      // explanation, so the advice cannot rest on waiting.
+      stale:t('hist.fix.stale','Pieces are missing, and this post is more than a day old: propagation finishes in minutes to hours, so these gaps are unlikely to fill on their own. A retry re-fetches only them, but another release is the more reliable answer.')
     };
     // A library row never wrote a byte: the entry came out of the index
     // and the post has since gone. The generic "gone" copy talks about a
@@ -6915,7 +7308,7 @@ function actSub(s){
   // speed needs no caveat, and a verdict still forming is not news.
   const w=lastQ&&lastQ.whyslow;
   const why=(s.status==='Downloading'&&w&&w.nzo_id===s.nzo_id
-    &&['provider','cpu','client','disk','limit'].includes(w.layer))
+    &&['provider','cpu','client','disk','limit','missing'].includes(w.layer))
     ?`<span class="dim"> · ${whyPhrase(w)}</span>`:'';
   return (txt||why)?`<div class="dim actline" title="${escA(txt)}">${txt}${why}</div>`:'';
 }
@@ -6933,6 +7326,11 @@ function whyPhrase(w){
     case 'client':return t('diag.layer.client','held up inside nzbfast (decode, verify or disk writes)');
     case 'provider':return d?t('diag.layer.provider.host','{s} is the limit',{s:d})
       :t('diag.layer.provider','your providers are the limit');
+    // Not a layer of the stack at all: the run is asking for articles
+    // that are not there, and a miss costs a round trip and returns no
+    // bytes. Without this the same evidence read as a shaped provider,
+    // and the verdict named a host that was doing nothing wrong.
+    case 'missing':return t('diag.layer.missing','much of this post is missing, so the requests come back empty');
   }
   return t('diag.layer.unknown','still gathering evidence');
 }
@@ -7146,7 +7544,15 @@ function renderQueue(){
       : tail
       ? `<button class="ghost mini" title="${escA(t('queue.remove.finishing.title','Remove this job. It has already downloaded - this stops the work it is finishing and drops it from the queue.'))}" aria-label="${escA(t('queue.remove.title','Remove from the queue'))}" onclick="qOp('delete','${s.nzo_id}')">✕</button>`
       : `<button class="ghost mini" title="${escA(pz?t('queue.resume.title','Resume this item'):t('queue.pause.title','Pause this item'))}" aria-label="${escA(pz?t('queue.resume.title','Resume this item'):t('queue.pause.title','Pause this item'))}" onclick="qOp('${pz?'resume':'pause'}','${s.nzo_id}')">${pz?'▶':'⏸'}</button>`+
-        `<button class="ghost mini" title="${escA(t('queue.force.title','Download this next (force: starts even while paused)'))}" aria-label="${escA(t('queue.force.title','Download this next (force: starts even while paused)'))}" onclick="forceJob('${s.nzo_id}')">⏫</button>`+
+        // A held duplicate gets the same button with its NAME on it.
+        // "⏫" is the whole escape hatch from a hold, and a user looking
+        // at a row that says "held (duplicate)" and will not start has
+        // no way to know that - one reported hunting for "that blue
+        // icon". The label costs a little width on the rows that are
+        // stuck and says nothing on the rows that are not.
+        (s.priority==='Duplicate'
+          ? `<button class="ghost mini" title="${escA(t('queue.dup.force.title','Download this copy anyway: it releases the duplicate hold and starts this job next.'))}" onclick="forceJob('${s.nzo_id}')">⏫ ${esc(t('queue.dup.force','download anyway'))}</button>`
+          : `<button class="ghost mini" title="${escA(t('queue.force.title','Download this next (force: starts even while paused)'))}" aria-label="${escA(t('queue.force.title','Download this next (force: starts even while paused)'))}" onclick="forceJob('${s.nzo_id}')">⏫</button>`)+
         // Buttoned reorder beside the drag: drag does not exist on touch,
         // and the only hint for it lives in a hover tooltip.
         `<button class="ghost mini" title="${escA(t('queue.up.title','Move up the queue'))}" aria-label="${escA(t('queue.up.title','Move up the queue'))}" onclick="qMove('${s.nzo_id}',-1)">↑</button>`+
@@ -7523,6 +7929,9 @@ function initAppearanceControls(){
   const fs=document.getElementById('s_fontscale'); if(fs) fs.value=f;
   const fp=document.getElementById('fontPct'); if(fp) fp.textContent=f+'%';
   updateContrastReport();
+  // Opening Settings is the manager's cue to redraw: a card may have
+  // been hidden or compacted from the dashboard since it was last built.
+  renderCardMgr();
 }
 // How the clients that name themselves are spelt. Display only - the
 // daemon classifies off the User-Agent's leading token, so a client
@@ -8580,10 +8989,19 @@ function watchFailRow(f){
 // this has to hand back is where to find it. <bdi> because a path is not
 // the paragraph's direction (RTL locales).
 //
-// Dismiss only. There is no "delete it anyway" button on purpose: that is
-// the permanent delete the daemon deliberately stopped making on the
-// user's behalf, and offering it as the obvious way to clear a warning
-// would walk it straight back in. The reason text says what to change if
+// Dismiss, and - when the daemon still has the NZB - "download it again".
+//
+// That second button is the whole point of the row now. The refused
+// delete is usually followed by the user wanting the release once more
+// (they deleted it to re-download it, or to reclaim the space and try
+// again), and the loop for that was: read this notice, leave, find the
+// release, add it by hand, then get past a duplicate hold. It closes
+// here instead, on the notice that named the release in the first place.
+//
+// There is still no "delete it anyway" button, on purpose: that is the
+// permanent delete the daemon deliberately stopped making on the user's
+// behalf, and offering it as the obvious way to clear a warning would
+// walk it straight back in. The reason text says what to change if
 // permanent deletes are what they want.
 function deleteKeptRow(f){
   // "look in", not "they are still in": a REFUSED Trash is one atomic
@@ -8598,11 +9016,25 @@ function deleteKeptRow(f){
   // above says.
   const why=f.why?` <span class="dim">${esc(f.why)}</span>`:'';
   const btn=`<button class="ghost mini" title="${escA(t('hist.kept.dismiss.title','Stop showing this note. The files are not touched either way'))}" data-p="${escA(f.path)}" onclick="dismissDeleteKept(this.dataset.p)">✕ ${esc(t('hist.kept.dismiss','dismiss'))}</button>`;
-  return `<div style="margin:2px 0">⚠ ${msg}${why} ${btn}</div>`;
+  // Only when the daemon kept a copy of the NZB. Offered first, because
+  // it is the thing the user is most likely to want next - and it is
+  // additive (it adds a download), where dismiss ends the row.
+  const again=f.retry?`<button class="ghost mini" title="${escA(t('hist.kept.again.title','Add this release to the queue again, from the copy of the NZB kept when the delete could not remove the files. Nothing already on disk is touched.'))}" data-p="${escA(f.path)}" onclick="retryDeleteKept(this,this.dataset.p)">⬇ ${esc(t('hist.kept.again','download it again'))}</button> `:'';
+  return `<div style="margin:2px 0">⚠ ${msg}${why} ${again}${btn}</div>`;
 }
 async function dismissDeleteKept(path){
   await api('delete_kept_dismiss','&value='+encodeURIComponent(path));
   tick();
+}
+// The notice's own re-add. The daemon holds the NZB and the release
+// name; the page sends the path, which is the notice's identity.
+async function retryDeleteKept(btn,path){
+  await busy(btn, t('busy.adding','Adding…'), async()=>{
+    const j=await api('delete_kept_retry','&value='+encodeURIComponent(path));
+    if(j && j.status) toast(t('toast.keptRetried','{name} is back in the queue.',{name:j.name||''}));
+    else toast(tErr(j&&j.error)||t('toast.keptRetryFail','It could not be added again - find the release and add it as usual.'), true);
+    tick();
+  });
 }
 // Re-attempt the queue write for the `unsaved` state above.
 async function saveQueueNow(btn){
@@ -8919,7 +9351,7 @@ addEventListener('keydown', e=>{
   }
   const hd=document.getElementById('helpDrawer');
   if(inSettings
-    ||document.querySelector('#fsov.on,#keyov.on,#gbov.on,#cuov.on,#fuov.on,#stopped.on')
+    ||document.querySelector('#fsov.on,#adov.on,#keyov.on,#gbov.on,#cuov.on,#fuov.on,#stopped.on')
     ||(hd&&hd.classList.contains('open'))
     ||document.getElementById('ctxmenu')) return;
   switch(e.key){
@@ -9448,11 +9880,14 @@ function closeMenu(restore){
   if(o && (restore===true || inside) && document.contains(o)) o.focus();
 }
 addEventListener('click', ()=>closeMenu());
-addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeMenu(true); fsClose(); gbClose(); cuClose(); fuClose(); keyCancel(); shClose(); pvClose(); } });
+addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeMenu(true); fsClose(); adCancel(); gbClose(); cuClose(); fuClose(); keyCancel(); shClose(); pvClose(); } });
 // Arrow-walk the open menu. Wraps at both ends, the way a menu should.
 function menuKey(e){
   const m=document.getElementById('ctxmenu'); if(!m) return;
-  const items=[...m.querySelectorAll('button')];
+  // :not([disabled]) - the card menu greys out Move up on the first card
+  // and Move down on the last, and focus() on a disabled button does
+  // nothing at all, so walking onto one is a dead arrow key.
+  const items=[...m.querySelectorAll('button:not([disabled])')];
   if(!items.length) return;
   const i=items.indexOf(document.activeElement);
   if(e.key==='ArrowDown'||e.key==='ArrowUp'){
@@ -9530,19 +9965,128 @@ function histMenu(e, id, failed){
     it(`class="danger" onclick="delHistFiles('${id}')"`,`🗑&nbsp; ${t('menu.removefiles','Remove and delete files…')}`);
   document.body.appendChild(m);
   m.addEventListener('keydown', menuKey);
-  // A keyboard-fired click carries no pointer position: clientX/clientY
-  // are 0, which used to pin the menu to the top-left corner of the
-  // window, nowhere near the row it belongs to. Anchor it under the
-  // button instead, which is also where a mouse user expects it.
   const btn=e.detail===0 ? (e.target.closest&&e.target.closest('button')) : null;
-  const r=btn && btn.getBoundingClientRect();
+  placeMenu(m, e, btn);
+  // Only take focus when the keyboard opened it - a right-click should
+  // not move the caret out from under a mouse user.
+  if(btn){ menuOpener=btn; m.querySelector('button:not([disabled])').focus(); }
+  return false;
+}
+
+// Where a menu lands. A keyboard-fired open carries no pointer position:
+// clientX/clientY are 0, which used to pin the menu to the top-left
+// corner of the window, nowhere near the control it belongs to. Given an
+// anchor element it sits under that instead, which is also where a mouse
+// user expects it. Always kept inside the viewport.
+function placeMenu(m, e, anchor){
+  const r=anchor && anchor.getBoundingClientRect();
   const x=r?r.left:e.clientX, y=r?r.bottom+4:e.clientY;
   m.style.left=Math.max(8,Math.min(x, innerWidth-m.offsetWidth-8))+'px';
   m.style.top=Math.max(8,Math.min(y, innerHeight-m.offsetHeight-8))+'px';
-  // Only take focus when the keyboard opened it - a right-click should
-  // not move the caret out from under a mouse user.
-  if(btn){ menuOpener=btn; m.querySelector('button').focus(); }
+}
+
+// Right-click menu on a card's heading (§6). Testers kept reporting that
+// there is no obvious way to move, compact, resize or hide a card - the
+// tools live in the heading at low opacity and the resize grip is on the
+// bottom edge. A context menu is found instantly by everyone who
+// right-clicks, and it is a non-drag path to reordering as well.
+// Same machinery as the history rows: one #ctxmenu, closeMenu owns its
+// lifetime, menuKey walks it.
+function cardMenu(e, id, anchor){
+  const c=document.getElementById(id); if(!c) return true;
+  // Never take a right-click that already means something. A link or a
+  // field in the heading keeps the browser's own menu; the queue and
+  // history ROWS have menus of their own and are not in a heading at all.
+  if(e.target.closest && e.target.closest('a,input,select,textarea')) return true;
+  const h=c.querySelector('h3');
+  e.preventDefault(); e.stopPropagation();
+  closeMenu();
+  dismissLayoutTip();          // they found the controls; stop explaining them
+  // Same sequence moveCard steps through, so first/last here means what
+  // the arrow keys will actually refuse to do.
+  const seq=movableCards().filter(x=>!x.classList.contains('userhidden'));
+  const i=seq.indexOf(c);
+  const noUp=i<=0, noDown=i<0||i>=seq.length-1;
+  // A card is resizable exactly when it has an OPERABLE grip - see
+  // cardGrip(). Same opt-in addCardGrips() reads, so a card that gains a
+  // grip later gets the menu item for free, and one that cannot actually
+  // be sized never offers a control that does nothing.
+  const grip=cardGrip(id);
+  const m=document.createElement('div'); m.id='ctxmenu';
+  m.setAttribute('role','menu');
+  // Names the CARD, not the operations. A right-click menu has no visible
+  // anchor, so which card it will act on is the one thing a screen reader
+  // cannot infer - and listing the operations here promised Resize on the
+  // six cards that have no grip.
+  m.setAttribute('aria-label', t('layout.menu.label','Layout options for {card}',{card:cardLabel(c)}));
+  const it=(attrs,body)=>`<button type="button" role="menuitem" ${attrs}>${body}</button>`;
+  m.innerHTML=
+    it(`${noUp?'disabled ':''}onclick="cardMove('${id}',-1)"`,`↑&nbsp; ${t('layout.menu.up','Move up')}`)+
+    it(`${noDown?'disabled ':''}onclick="cardMove('${id}',1)"`,`↓&nbsp; ${t('layout.menu.down','Move down')}`)+
+    it(`onclick="toggleCardDensity('${id}')"`,`▤&nbsp; ${t('layout.menu.dense','Compact')}`)+
+    (grip?it(`onclick="cardResize('${id}')"`,`↕&nbsp; ${t('layout.menu.resize','Resize')}`):'')+
+    `<hr>`+it(`onclick="hideCard('${id}',true)"`,`✕&nbsp; ${t('layout.menu.hide','Hide')}`)+
+    // The way out to §6c's mode, last and in its own group: the four
+    // items above are what someone who right-clicked came for, and
+    // leading with a mode switch would push Move up out of the default
+    // keyboard focus. Omitted while the mode is already on - it would be
+    // an item that does nothing, the same rule cardGrip() applies to
+    // Resize. setLayoutEdit is a no-op when LAYOUT_EDIT is false, but
+    // this menu only exists under LAYOUT_EDIT anyway.
+    (LAYOUT_MODE?'':`<hr>`+it(`onclick="setLayoutEdit(true)"`,`⊞&nbsp; ${t('layout.mode.open','Customise layout')}`));
+  document.body.appendChild(m);
+  m.addEventListener('keydown', menuKey);
+  // The context-menu KEY fires a contextmenu event of its own, and some
+  // browsers give it 0,0 - treat a cornered event as keyboard-opened and
+  // hang the menu off the heading rather than the corner of the window.
+  placeMenu(m, e, anchor || ((!e.clientX && !e.clientY) ? h : null));
+  // Focus only on the keyboard path, and only onto something that can
+  // take it back afterwards: a right-click must not move the caret out
+  // from under a mouse user, and a heading is not focusable.
+  if(anchor){ menuOpener=anchor; m.querySelector('button:not([disabled])').focus(); }
   return false;
+}
+function cardMove(id, dir){
+  const c=document.getElementById(id);
+  if(c) moveCard(c, dir);      // persists the order and announces the new one
+}
+// "Resize" hands the keyboard the grip the mouse would drag: the arrows
+// size the card from there, Shift for a bigger step. Lit while it holds
+// focus, because the grip is invisible until the card is hovered and a
+// menu item that appeared to do nothing would be worse than no item.
+// The grip for a card, but only when it can actually be driven. Present
+// in the markup is not enough on two counts, and both are reachable with
+// LAYOUT_EDIT true:
+//   - `@media not (pointer:fine){.cardgrip{display:none}}` is NOT the
+//     complement of the `(pointer:coarse)` that LAYOUT_EDIT excludes, so
+//     a pointer:none environment (keyboard-only, some embedded webviews)
+//     keeps the menu while hiding every grip. focus() on a display:none
+//     element is a no-op, so Resize would light nothing, move focus
+//     nowhere, and still announce that the arrows now size the card.
+//   - addCardGrips() runs inside initLayout(), so an unwired grip has no
+//     arrow handler to reach even once focused.
+// Checked at menu-build time AND at action time, from one place, so the
+// item offered and the action taken can never disagree.
+function cardGrip(id){
+  const g=document.querySelector('.cardgrip[data-card="'+id+'"]');
+  return (g && g.dataset.wired && g.offsetParent) ? g : null;
+}
+function cardResize(id){
+  const g=cardGrip(id);
+  if(!g) return;
+  // Clear every other grip first rather than trusting the blur alone to
+  // do it. A window that never had focus when the grip lost it (a
+  // background tab, an embedded webview) fires no blur event at all, and
+  // a lit grip that nothing turns off would accumulate until two cards
+  // both looked like the one being sized.
+  document.querySelectorAll('.cardgrip.on').forEach(o=>o.classList.remove('on'));
+  g.scrollIntoView({block:'nearest'});
+  g.classList.add('on');
+  g.addEventListener('blur', ()=>g.classList.remove('on'), {once:true});
+  try{ g.focus(); }catch(_){}
+  const c=document.getElementById(id);
+  announce(t('layout.menu.resizing','{card}: press the up and down arrow keys to resize it',
+    {card:c?cardLabel(c):id}));
 }
 
 // In-UI log viewer (stdout/stderr ring captured daemon-side).
@@ -10624,7 +11168,7 @@ function toast(msg, bad, go){
     el.classList.add('clickable'); el.setAttribute('role','button'); el.setAttribute('tabindex','0');
     el.onclick=()=>{ el.classList.remove('on'); go(); };
   }
-  el.style.borderColor=bad?'var(--bad)':'var(--line)';
+  el.classList.toggle('toastbad', !!bad);
   el.classList.add('on'); clearTimeout(toastH); toastH=setTimeout(()=>el.classList.remove('on'),3500);
 }
 // Open a history row's drawer from anywhere - the toast click-through,
@@ -10638,9 +11182,155 @@ function openHistDrawer(id){
   tr.scrollIntoView({block:'center',behavior:'smooth'});
   return true;
 }
+// ---- Add-NZB options (TODO §181) --------------------------------------
+// The ask was "a pop up like sab so that i can direct the files to any
+// folder i wish". The folder IS the category here: `move_dest_root`
+// resolves a destination from the category and from nothing else, and
+// there is no per-job destination field to send. So this picks the
+// category - and NAMES the folder that category resolves to, because a
+// bare category select would not have answered the question that was
+// asked.
+//
+// Everything it collects is a parameter `m_addfile` already accepted and
+// this page simply never sent: cat, priority, password.
+let adResolve=null, adCfg=null;
+function adEnabled(){ return localStorage.nzbfastAddAsk!=='0'; }
+
+// The destination map, read once per page load. Only the dialog needs
+// it, so it is fetched on first open rather than on every poll.
+async function adLoadCfg(){
+  if(adCfg) return adCfg;
+  const empty={dests:new Map(), move:'', out:''};
+  try{
+    const c=((await api('get_config')).config||{}).nzbfast||{};
+    // `move_completed_cats` is a `name=path` list, split on , and ; -
+    // the same separators parse_cat_dests uses, which is why catFileCheck
+    // refuses either character inside a folder.
+    const dests=new Map();
+    String(c.move_completed_cats||'').split(/[,;]/).forEach(pair=>{
+      const i=pair.indexOf('=');
+      if(i<0) return;
+      const n=pair.slice(0,i).trim(), v=pair.slice(i+1).trim();
+      if(n&&v) dests.set(n, v);
+    });
+    adCfg={dests, move:c.move_completed||'', out:c.out_dir||''};
+  }catch(_){ adCfg=empty; }
+  return adCfg;
+}
+// The same five-way resolution `history.rs` does for a completed job.
+// Kept in that order deliberately: a per-category override IS that
+// category's root, so the category component is NOT repeated inside it.
+function adDestPath(cat){
+  const c=adCfg||{dests:new Map(), move:'', out:''};
+  const over=cat?c.dests.get(cat):null;
+  if(over) return over;
+  if(c.move) return cat?adJoin(c.move,cat):c.move;
+  if(c.out) return cat?adJoin(c.out,cat):c.out;
+  return '';
+}
+// fsJoin's rule, on a path we did not navigate to: infer the separator
+// from the path itself so a Windows destination stays backslashed.
+function adJoin(dir,name){
+  const sep=dir.includes('\\')&&!dir.includes('/')?'\\':'/';
+  return dir.endsWith(sep)?dir+name:dir+sep+name;
+}
+function adDest(){
+  const el=document.getElementById('addest');
+  if(!el) return;
+  const path=adDestPath(document.getElementById('adcat').value);
+  // No download folder configured yet is a real state on a fresh
+  // install: say nothing rather than pointing at an empty string.
+  el.innerHTML = path
+    ? t('add.dest','Finished files land in {path}',{path:`<b>${esc(path)}</b>`})
+    : '';
+}
+// Opens the dialog and resolves to {cat, prio, pw}, or to null if the
+// user backed out - a cancel adds NOTHING, which is the only reading of
+// Cancel that is safe when the whole point was choosing a destination.
+function adAsk(nzbs){
+  const cat=document.getElementById('adcat'), prio=document.getElementById('adprio');
+  document.getElementById('adfiles').innerHTML=
+    nzbs.map(f=>`<div title="${escA(f.name)}">${esc(f.name)}</div>`).join('');
+  // The last pick is offered again: someone filing a run of episodes
+  // should not re-choose "tv" twenty times. Safe to remember because the
+  // dialog SHOWS it and waits - nothing is filed without a confirmation.
+  const want=localStorage.nzbfastAddCat||'';
+  cat.innerHTML=`<option value="">${esc(t('drawer.nocat','none'))}</option>`
+    +(selCats||[]).map(c=>`<option value="${escA(c)}"${c===want?' selected':''}>${esc(c)}</option>`).join('');
+  prio.innerHTML=[['',t('add.prio.def','Default')],['2',t('prio.force','Force')],
+      ['1',t('prio.high','High')],['0',t('prio.normal','Normal')],['-1',t('prio.low','Low')],
+      ['-2',t('set.disk.cats.prio.paused','add paused')]]
+    .map(([v,l])=>`<option value="${v}">${esc(l)}</option>`).join('');
+  document.getElementById('adpw').value='';
+  document.getElementById('adskip').checked=false;
+  document.getElementById('adtitle').textContent=
+    nzbs.length>1 ? tn('add.title.n',nzbs.length,'Where should this download go?',
+                       'Where should these {n} downloads go?')
+                  : t('add.title','Where should this go?');
+  document.getElementById('addest').textContent='';
+  document.getElementById('adov').classList.add('on');
+  modalOpen(document.getElementById('admodal'), cat);
+  // The category list and the destination map both arrive late; the
+  // dialog is usable from the first frame and fills in behind.
+  if(selCats===null){
+    selCats=[];
+    api('get_cats').then(j=>{
+      selCats=(j.categories||[]).filter(c=>c!=='*');
+      if(adResolve) adAskRefill(want);
+    }).catch(()=>{ selCats=null; });
+  }
+  adLoadCfg().then(()=>{ if(adResolve) adDest(); });
+  return new Promise(res=>{ adResolve=res; });
+}
+// The category list landed after the dialog opened: re-render the select
+// without disturbing a choice the user has already made in it.
+function adAskRefill(want){
+  const cat=document.getElementById('adcat');
+  const cur=cat.value||want;
+  cat.innerHTML=`<option value="">${esc(t('drawer.nocat','none'))}</option>`
+    +(selCats||[]).map(c=>`<option value="${escA(c)}"${c===cur?' selected':''}>${esc(c)}</option>`).join('');
+  adDest();
+}
+function adFinish(val){
+  const r=adResolve; adResolve=null;
+  document.getElementById('adov').classList.remove('on');
+  modalClose(document.getElementById('admodal'));
+  if(r) r(val);
+}
+function adCancel(){ adFinish(null); }
+function adOk(){
+  const cat=document.getElementById('adcat').value;
+  const prio=document.getElementById('adprio').value;
+  const pw=document.getElementById('adpw').value;
+  localStorage.nzbfastAddCat=cat;
+  // "Stop asking" is per-browser, like the drop-zone layout, and the
+  // Settings row that turns it back on is kept in step here so the two
+  // can never disagree.
+  if(document.getElementById('adskip').checked){
+    localStorage.nzbfastAddAsk='0';
+    const sw=document.getElementById('ui_addask');
+    if(sw) sw.checked=false;
+    toast(t('toast.addask.off','Downloads will go to their usual folder from now on. Settings › Interface turns the question back on.'));
+  }
+  adFinish({cat, prio, pw});
+}
+
 async function uploadNzbs(files, stream){
   const nzbs=[...files].filter(f=>/\.nzb$/i.test(f.name));
   if(!nzbs.length){ toast(t('toast.onlynzb','Only .nzb files can be added.'), true); return; }
+  // §181: ask before adding. Not for the player hand-off - that drop is
+  // a "watch this now" gesture whose priority is already decided.
+  let opt={cat:'',prio:'',pw:''};
+  if(!stream && adEnabled()){
+    const got=await adAsk(nzbs);
+    if(!got) return;
+    opt=got;
+  }
+  return uploadNzbsWith(nzbs, stream, opt);
+}
+// Split out of uploadNzbs so the key-expired retry below re-sends the
+// SAME choices instead of re-opening the dialog over them.
+async function uploadNzbsWith(nzbs, stream, opt){
   let ok=0, held=0;
   for(const f of nzbs){
     try{
@@ -10652,10 +11342,17 @@ async function uploadNzbs(files, stream){
       const wantStream = stream && ok===0;
       toast(wantStream?t('toast.streaming','Testing {name}…',{name:f.name}):t('toast.uploading','Uploading {name}…',{name:f.name}));
       const sent=key;
-      const r=await fetch(`/api?mode=addfile${wantStream?'&stream=1':''}`,
+      // Only what the user actually chose is sent: an omitted
+      // `priority` is -100 daemon-side, which is "not specified" and
+      // lets the category's own default priority stand.
+      const q=`mode=addfile${wantStream?'&stream=1':''}`
+        +(opt.cat?`&cat=${encodeURIComponent(opt.cat)}`:'')
+        +(opt.prio!==''?`&priority=${encodeURIComponent(opt.prio)}`:'')
+        +(opt.pw?`&password=${encodeURIComponent(opt.pw)}`:'');
+      const r=await fetch(`/api?${q}`,
         {method:'POST',body:fd,headers: sent?{'X-Api-Key': sent}:{}});
       const j=await r.json().catch(()=>({}));
-      if(authFail(j)){ if(await ensureKey(sent)) return uploadNzbs(files, stream); return; }
+      if(authFail(j)){ if(await ensureKey(sent)) return uploadNzbsWith(nzbs, stream, opt); return; }
       if(j.status){
         ok++;
         // Truth-audit I: a job the daemon parked as a held ALTERNATIVE
@@ -13396,6 +14093,7 @@ document.getElementById('ui_prov_sort').value=provSortSecs();
 document.getElementById('uiCompact').checked=uiCompact();
 document.getElementById('ui_herohist').checked=heroHist();
 loadLookControls();
+document.getElementById('ui_addask').checked=adEnabled();
 document.getElementById('ui_droplayout').value=localStorage.nzbfastDropLayout||'lr';
 document.getElementById('ui_dropem').value=localStorage.nzbfastDropEmphasis||'eq';
 document.getElementById('ui_lang').value=LOCALES.includes(localStorage.nzbfastLocale)?localStorage.nzbfastLocale:'auto';
@@ -13870,6 +14568,11 @@ async function checkWelcome(){
       wd.style.display=c.watch?'':'none';
     }
   }catch(_){}
+  // The layout coach is gated on the two onboarding states this function
+  // owns, so it cannot render until this has answered once - including
+  // when the answer is "the fetch failed", which is not a first run.
+  checkWelcome.settled=true;
+  renderLayoutTip();
 }
 // #settings deep link: the wall's Settings pill points here, and it also
 // makes "the settings screen" a URL you can bookmark or send to someone.
@@ -14092,6 +14795,7 @@ function toggleCardDensity(id){
   if(p.density[id]==='compact') delete p.density[id]; else p.density[id]='compact';
   saveLayoutPrefs(p);
   applyDensity();
+  renderCardMgr();
   dismissLayoutTip();          // they found it; stop explaining it
 }
 // One-time pointer at the card controls. Shown only to someone who has
@@ -14108,20 +14812,211 @@ function layoutTipDue(){
 function dismissLayoutTip(){
   localStorage.layoutTipSeen='1';
   const el=document.getElementById('layoutTip');
-  if(el) el.style.display='none';
+  if(el){ el.style.display='none'; el.replaceChildren(); delete el.dataset.on; }
+  // The ring lives on someone else's element, so dismissing has to reach
+  // it there: a link still wearing an accent outline after the notice
+  // explaining it has gone is the nudge refusing to stop.
+  const open=document.getElementById('layoutOpen');
+  if(open) open.classList.remove('coachtarget');
+  if(el) el.style.removeProperty('--caret-end');
 }
-// §Stage5: retired. This banner existed to explain three controls nobody
-// could see - emoji at opacity .3 with no hit target beyond the glyph -
-// and it named them by those emoji, which no longer exist. The card tools
-// are icon buttons at opacity .5 that light on hover and carry
-// aria-labels, and charts have a visible grip on the bottom edge, so the
-// affordances explain themselves. Explaining an invisible control was
-// always treating the symptom.
+// §Stage5 retired the banner, and the reasoning was half right: it
+// explained three controls nobody could see, by the emoji they were drawn
+// with, and both halves of that are gone. Where it went wrong was
+// concluding that visible controls need no introduction. Being able to
+// see a × on a heading is not the same as knowing the dashboard is yours
+// to rearrange, and the second is the thing nobody was ever told - which
+// is what the reports say. So this is not the banner again:
 //
-// layoutTipDue()/dismissLayoutTip() stay: several call sites mark the tip
-// as seen when the user finds a control on their own, and they cost
-// nothing now that nothing renders.
-function renderLayoutTip(){}
+//   - it names no control and describes no glyph. One sentence says what
+//     a card can do, and every operation is taught by Customise layout,
+//     which carries its own in-mode help.
+//   - it points at a REAL control that is still there tomorrow: the
+//     caret and the ring land on #layoutOpen, the permanent door in the
+//     #layoutBar immediately below. Teaching a one-time affordance would
+//     have been the same mistake in a new coat.
+//   - it goes for good on Got it, on opening the mode by either route,
+//     or the moment the user moves, compacts, hides, resizes or
+//     re-columns anything without help.
+//
+// Put the caret under the middle of the link, measured, and keep it
+// there. Clamped inside the tip so a bar laid out somewhere unexpected
+// (or a viewport too narrow to hold both on one row) parks the caret at
+// the edge rather than off the box. Cheap enough to run on resize: two
+// getBoundingClientRect calls, and only while the tip is actually up.
+function aimLayoutCaret(){
+  const el=document.getElementById('layoutTip');
+  if(!el || !el.dataset.on) return;
+  const open=document.getElementById('layoutOpen');
+  if(!open) return;
+  const r=el.getBoundingClientRect(), l=open.getBoundingClientRect();
+  if(!l.width || !r.width) return;
+  const mid=l.left+l.width/2;
+  // Measured from the INLINE end, so the same arithmetic serves RTL.
+  const end=getComputedStyle(el).direction==='rtl' ? mid-r.left : r.right-mid;
+  el.style.setProperty('--caret-end', Math.max(12, Math.min(r.width-22, end-5))+'px');
+}
+addEventListener('resize', aimLayoutCaret);
+// With no door to point at there is nothing honest to say, so a page
+// without #layoutOpen renders nothing rather than reverting to prose.
+function renderLayoutTip(){
+  const el=document.getElementById('layoutTip');
+  if(!el || el.dataset.on) return;      // already up; every caller re-enters
+  if(!layoutTipDue()) return;
+  // Both onboarding states own the screen while they are up, and both ask
+  // for one specific next action. checkWelcome decides which is on, and
+  // does it asynchronously, so until it has answered once there is no
+  // honest way to know - it calls back here when it has.
+  const b=document.body.classList;
+  if(!checkWelcome.settled || b.contains('firstrun') || b.contains('nojobs')) return;
+  const open=document.getElementById('layoutOpen');
+  if(!open || open.offsetParent===null) return;
+  // The door's label is read off the door, not translated a second time
+  // under a key of our own. The sentence has to read as a pointer at THAT
+  // link in all 28 locales, and a second copy of the label is a standing
+  // guarantee that some catalogue eventually disagrees with the link it
+  // is pointing at. Empty means there is no name to point at, and a
+  // sentence with a hole in it is worse than no sentence.
+  const mode=(open.textContent||'').trim();
+  if(!mode) return;
+  const lead=document.createElement('span');
+  lead.className='lead'; lead.dataset.i18n='layout.tip.lead';
+  lead.textContent=t('layout.tip.lead',
+    'Cards can be moved, resized, compacted or hidden. {mode} turns the controls on.',
+    {mode});
+  const ok=document.createElement('button');
+  ok.className='ok'; ok.dataset.i18n='layout.tip.ok';
+  ok.textContent=t('layout.tip.ok','Got it');
+  ok.onclick=dismissLayoutTip;
+  el.replaceChildren(lead, ok);
+  el.style.display='';
+  el.dataset.on='1';
+  open.classList.add('coachtarget');
+  aimLayoutCaret();
+  // Opening the mode answers the question the nudge was asking, by
+  // either route. The mode does not retire the nudge itself - that state
+  // is ours - so the listeners are ours too, and `once` keeps them from
+  // outliving the thing they dismiss.
+  open.addEventListener('click', dismissLayoutTip, {once:true});
+  const setToggle=document.getElementById('setLayoutMode');
+  if(setToggle) setToggle.addEventListener('click', dismissLayoutTip, {once:true});
+}
+
+// ---- §6d "Customise layout" mode -------------------------------------
+// The other half of the coach above. The nudge's job is to say the
+// dashboard is yours to rearrange and name the door; this is what is
+// behind the door, and it teaches by TURNING THE CONTROLS UP rather than
+// describing them - outline every movable card, put the word beside each
+// tool icon, draw both resize bars as controls, and say plainly which
+// cards have no bar and why. Having a name is the other half again: it is
+// findable in Settings by someone who never noticed the glyphs at all.
+//
+// LAYOUT_MODE is a plain variable on purpose. It is a UI state like "the
+// settings panel is open", not a layout preference, and it must NOT reach
+// layoutPrefs: a saved flag there would make layoutTipDue() conclude the
+// layout had been arranged by hand, and would give Reset layout a mode to
+// forget on top of the order/hidden/sizes it exists to clear. So the mode
+// is off on every load, and nothing about it survives a reload.
+let LAYOUT_MODE=false;
+// Reflects the state into the DOM. Separate from setLayoutEdit because the
+// Settings button's label is stamped here rather than from data-i18n (it
+// swaps with the state, so applyI18n cannot own it) - the i18n loader
+// calls this to re-stamp after a catalogue lands.
+function layoutModeSync(){
+  document.body.classList.toggle('layoutedit', LAYOUT_MODE);
+  const d=document.getElementById('layoutOpen');
+  if(d) d.setAttribute('aria-pressed', LAYOUT_MODE?'true':'false');
+  const s=document.getElementById('setLayoutMode');
+  if(s){
+    // Hidden where there is nothing to explain: the card tools are
+    // desktop-only (see LAYOUT_EDIT), so on a phone this button would
+    // name a mode with no controls in it.
+    s.style.display = LAYOUT_EDIT ? '' : 'none';
+    const lbl = LAYOUT_MODE ? t('layout.mode.off','Stop customising layout')
+                            : t('layout.mode.open','Customise layout');
+    s.textContent=lbl;
+    // Both attributes, like every other control here: a title-only stamp
+    // leaves a screen reader reading the English one after a locale
+    // switch. The tooltip is the long sentence, the name is the label.
+    s.title=t('layout.mode.open.title','Show the controls for moving, resizing, compacting and hiding dashboard cards');
+    s.setAttribute('aria-label', lbl);
+    s.setAttribute('aria-pressed', LAYOUT_MODE?'true':'false');
+  }
+}
+function setLayoutEdit(on, fromSettings){
+  if(!LAYOUT_EDIT) return;
+  LAYOUT_MODE=!!on;
+  layoutModeSync();
+  if(LAYOUT_MODE){
+    // Switching the mode on from Settings has to show the thing being
+    // customised, or the click looks like it did nothing.
+    if(fromSettings && inSettings) setView('dash');
+    const p=document.getElementById('layoutPanel');
+    if(p) p.scrollIntoView({block:'nearest'});
+    // Keyboard entry lands on Done, so the way out is the first thing in
+    // the tab order rather than eleven cards away.
+    const done=document.getElementById('layoutDone'); if(done) done.focus();
+    announce(t('layout.mode.a11y.on','Customising layout. Every card that can be rearranged now shows labelled controls to move, resize, compact or hide it. Press Escape when you have finished.'));
+  }else{
+    // Back to the quiet resting state: the body class is the only thing
+    // the mode ever set, so dropping it restores every control at once.
+    const d=document.getElementById('layoutOpen');
+    if(d && !inSettings) d.focus();
+    announce(t('layout.mode.a11y.off','Finished customising layout.'));
+  }
+  // Card widths never change, but the labels can wrap a heading onto a
+  // second line - which changes a card's measured height, and the dense
+  // preset reserves its grid rows from exactly that measurement.
+  applyDenseMasonry();
+  redrawCanvases();
+}
+function toggleLayoutEdit(fromSettings){ setLayoutEdit(!LAYOUT_MODE, fromSettings); }
+// Escape leaves the mode, from the shared global chain. But the mode is
+// NOT the same kind of thing as the nine handlers beside it there: every
+// one of those closes a transient overlay and no-ops when its overlay is
+// shut, whereas this exits a persistent page state. Left unconditional it
+// collapsed two layers on one keypress - right-click a card while
+// customising, change your mind, press Escape to dismiss the menu, and
+// you were thrown out of the mode as well. Escape dismisses the TOPMOST
+// layer only, so the mode, being the bottom one, yields to anything above
+// it.
+//
+// Detected structurally rather than from a list of overlay ids. There is
+// a hardcoded list of exactly this kind further up (the shortcut-key
+// guard) and it is ALREADY two overlays out of date - #pvov and #shov are
+// missing from it - which is the whole argument against writing a second
+// one. Any modal here carries role=dialog because a screen reader needs
+// it to, and getClientRects() is empty when it is not on screen
+// (offsetParent would be wrong: these overlays are fixed-position, so it
+// reads null even when they are up). A lane that adds a modal tomorrow is
+// covered without knowing this exists.
+function layoutModeEsc(e){
+  if(!LAYOUT_MODE) return;
+  if(document.getElementById('ctxmenu')) return;              // the card menu
+  for(const b of document.querySelectorAll('[role=dialog]'))
+    if(b.getClientRects().length) return;                     // any open modal
+  // A field's own Escape means "clear this", not "leave the mode". The
+  // real case is the settings search box (#setQ, whose inline onkeydown
+  // clears it): the mode survives setView, so you can be customising and
+  // typing in Settings at the same time. Same test the shortcut-key
+  // handler applies to its own target.
+  const el=e && e.target;
+  if(el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))) return;
+  setLayoutEdit(false);
+}
+// CAPTURE phase, and deliberately NOT a tenth entry in the shared Escape
+// chain below. Two reasons, the second of which only showed up under test.
+// One: the mode is not that chain's kind of thing, so it should not be
+// wired like it - nine lanes' worth of overlay-closers stay theirs alone.
+// Two: a guard that decides by looking at what is open has to look BEFORE
+// anything closes it, and that is not a position in the chain. Last in the
+// chain it read a menu closeMenu had removed a call earlier; first in the
+// chain it still lost to the shortcut-key handler, which is a SEPARATE,
+// earlier-registered listener that closes the shortcuts sheet and returns.
+// Capture on window runs ahead of every bubble-phase listener whatever
+// order they were registered in, so this is the only placement that sees
+// the page as the user left it.
+addEventListener('keydown', e=>{ if(e.key==='Escape') layoutModeEsc(e); }, true);
 // Dense masonry spans (see body.dense #dashview in the stylesheet):
 // each dashboard child reserves as many 8px grid rows as its measured
 // height (plus its 10px bottom margin) occupies. The observer keeps a
@@ -14165,6 +15060,16 @@ function movableCards(){
   return [...document.querySelectorAll('#dashview>.card')]
     .filter(c=>c.id && c.id!=='welcomeCard' && c.id!=='heroCard');
 }
+// Why a card has no bottom-edge grip, in words, translated. A string
+// rather than a data- attribute so it does not sit in the markup in
+// English on 27 other locales. Returns '' for the cards that DO resize,
+// so a caller can just ask every card and render what comes back.
+function cardFixedReason(c){
+  const k=c && c.dataset ? c.dataset.fixedh : '';
+  if(k==='chart') return t('card.fixed.chart','Drag the bottom of the chart to resize this card.');
+  if(k) return t('card.fixed','This card is always the same size: it shows a fixed set of things, so there is nothing to scroll.');
+  return '';
+}
 function cardLabel(c){
   const h=c.querySelector('h3');
   const t=h && h.childNodes.length ? h.childNodes[0].textContent.trim() : '';
@@ -14178,24 +15083,193 @@ function hideCard(id, on){
   const c=document.getElementById(id);
   if(c) c.classList.toggle('userhidden', on);
   renderHiddenBar();
+  renderCardMgr();
   dismissLayoutTip();
+  // The first-hide reassurance lives HERE, not in the ✕'s onclick:
+  // hideCard has several doors (card ✕, context menu, Settings card
+  // list) and the promise must hold through all of them. Not during
+  // first-run - the welcome look chooser narrates itself and the bar
+  // is display:none under body.firstrun anyway.
+  if(on && !document.body.classList.contains('firstrun')) hiddenBarNudge();
+}
+// A word that acts like a button. These were <a> with an onclick and
+// nothing else, which no keyboard can reach - and the bar is the ONLY
+// way back for a card you hid, so "hide" was a one-way door for anyone
+// not using a mouse.
+function barLink(text, title, fn){
+  const a=document.createElement('a');
+  a.textContent=text; a.title=title; a.setAttribute('aria-label', title);
+  a.setAttribute('role','button'); a.tabIndex=0;
+  a.onclick=fn;
+  a.addEventListener('keydown', e=>{
+    if(e.key!=='Enter' && e.key!==' ') return;
+    e.preventDefault(); fn();
+  });
+  return a;
 }
 function renderHiddenBar(){
   const bar=document.getElementById('hiddenBar'), p=layoutPrefs();
   const hid=p.hidden.filter(id=>document.getElementById(id));
-  if(!hid.length){ bar.style.display='none'; return; }
+  // Nothing hidden. Three outcomes, and which one you get turns on
+  // whether this device has card tools at all.
+  if(!hid.length){
+    // Empty state: until this user has hidden a card once, the bar still
+    // renders one dim line saying what would land here. The hide button's
+    // only promise of reversibility used to live in its hover tooltip,
+    // which is invisible at the moment someone hesitates over the ✕.
+    // After the first real hide (cardHideSeen) an empty bar disappears
+    // for good - reassurance, not furniture.
+    if(LAYOUT_EDIT && !p.hidden.length && !localStorage.cardHideSeen){
+      bar.style.display='';
+      bar.textContent=t('layout.hiddenEmpty','Hidden cards land here. Click a name to bring it back.');
+      return;
+    }
+    // A fine pointer with nothing to restore and the reassurance already
+    // seen: the bar is furniture, as it always was.
+    if(LAYOUT_EDIT){ bar.style.display='none'; return; }
+    // Without a fine pointer there are no card tools at all, so this line
+    // is the only thing on the dashboard that can say the cards are
+    // arrangeable. Fall through and render it: with nothing hidden that
+    // leaves just the door to the manager.
+  }
   bar.style.display='';
-  bar.replaceChildren(document.createTextNode(t('layout.hidden','Hidden:')+' '));
-  hid.forEach((id,i)=>{
-    if(i) bar.appendChild(document.createTextNode(' · '));
-    const a=document.createElement('a');
-    a.textContent=cardLabel(document.getElementById(id));
-    a.title=t('layout.show.title','show this card again');
-    a.onclick=()=>hideCard(id, false);
-    bar.appendChild(a);
-  });
+  bar.replaceChildren();
+  if(hid.length){
+    bar.appendChild(document.createTextNode(t('layout.hidden','Hidden:')+' '));
+    hid.forEach((id,i)=>{
+      if(i) bar.appendChild(document.createTextNode(' · '));
+      bar.appendChild(barLink(cardLabel(document.getElementById(id)),
+        t('layout.show.title','show this card again'), ()=>hideCard(id, false)));
+    });
+  }
+  if(!LAYOUT_EDIT){
+    if(hid.length) bar.appendChild(document.createTextNode(' · '));
+    bar.appendChild(barLink(t('layout.arrange','Arrange cards'),
+      t('layout.arrange.title','choose which cards to show, compact them and change their order'),
+      openCardMgr));
+  }
+}
+// The dashboard's one pointer at the manager, for the devices with no
+// card tools. Settings is a separate view, so this both switches to it
+// and lands on the list rather than the top of the Interface card.
+function openCardMgr(){
+  if(!inSettings) showSettings();
+  setGoCard('interface');
+  const host=document.getElementById('cardMgr');
+  if(!host) return false;
+  host.scrollIntoView({block:'center',behavior:setSmooth()});
+  const first=host.querySelector('input,button:not([disabled])');
+  if(first) first.focus({preventScroll:true});
+  return false;
+}
+
+// ---- §6b the card manager -------------------------------------------
+// Same three operations as the card tools, as form controls. It owns no
+// state of its own: every row reads the live DOM and layoutPrefs, and
+// every control calls the function the desktop control calls.
+function manageableCards(){
+  // Same exclusions as the first-run look chooser: a card a body class
+  // already suppresses must not be listed, because a tick that visibly
+  // does nothing reads as broken.
+  return movableCards()
+    .filter(c=>!(c.id==='browseCard'&&document.body.classList.contains('noidx')))
+    .filter(c=>!(c.id==='watchCard'&&document.body.classList.contains('nowatch')));
+}
+// History's density button means "list fewer rows", not "less padding"
+// (see toggleCardDensity), so its state lives somewhere else. Reading it
+// through one helper is what stops the box showing unticked on a card
+// that is in fact compacted.
+function cardCompacted(id){
+  return id==='histCard' ? !histExpanded() : layoutPrefs().density[id]==='compact';
+}
+function cmBtn(card, dir){
+  const b=document.createElement('button');
+  b.className='ghost mini '+(dir<0?'cmup':'cmdn');
+  b.innerHTML='<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-arrow-down"/></svg>';
+  const lbl=dir<0 ? t('set.ui.cards.up','Move {card} up',{card:cardLabel(card)})
+                  : t('set.ui.cards.down','Move {card} down',{card:cardLabel(card)});
+  b.title=lbl; b.setAttribute('aria-label',lbl);
+  b.dataset.cm=card.id; b.dataset.k=dir<0?'up':'down';
+  // No renderCardMgr here: persistOrder does it, and a second render
+  // would run with the pressed button already detached, losing focus.
+  b.onclick=()=>moveCard(card, dir);
+  return b;
+}
+function cmBox(card, kind, on, text, aria, fn){
+  const l=document.createElement('label');
+  const i=document.createElement('input');
+  i.type='checkbox'; i.checked=on;
+  i.setAttribute('aria-label', aria);
+  i.dataset.cm=card.id; i.dataset.k=kind;
+  i.onchange=()=>fn(i.checked);   // the op re-renders - see cmBtn
+  l.append(i, document.createTextNode(' '+text));
+  return l;
+}
+function renderCardMgr(){
+  const host=document.getElementById('cardMgr'); if(!host) return;
+  // Every control is rebuilt on every change, so focus has to be put
+  // back by identity or the keyboard lands at the top of the page after
+  // one press. Moving a card to an end DISABLES the arrow that moved it,
+  // which is exactly when focus would be lost: fall back to the arrow
+  // pointing the other way, the convention a disabled end-stop needs.
+  const a=document.activeElement;
+  const keep=(a&&host.contains(a)&&a.dataset.cm)?{cm:a.dataset.cm,k:a.dataset.k}:null;
+  const p=layoutPrefs(), cards=manageableCards();
+  // moveCard walks the VISIBLE cards only (stepping past something
+  // invisible reads as a dead key), so a hidden card cannot be moved -
+  // its arrows say so rather than doing nothing.
+  const seq=cards.filter(c=>!p.hidden.includes(c.id));
+  host.replaceChildren(...cards.map(c=>{
+    const hidden=p.hidden.includes(c.id), i=seq.indexOf(c);
+    const row=document.createElement('div');
+    row.className='cmrow'+(hidden?' cmoff':'');
+    const nm=document.createElement('span');
+    nm.className='cmname'; nm.textContent=cardLabel(c);
+    const ctl=document.createElement('span'); ctl.className='cmctl';
+    ctl.append(
+      cmBox(c,'show',!hidden,t('set.ui.cards.show','Show'),
+        t('set.ui.cards.showcard','Show {card}',{card:cardLabel(c)}),
+        on=>hideCard(c.id,!on)),
+      cmBox(c,'compact',cardCompacted(c.id),t('set.ui.cards.compact','Compact'),
+        t('set.ui.cards.compactcard','Compact {card}',{card:cardLabel(c)}),
+        ()=>toggleCardDensity(c.id)));
+    const up=cmBtn(c,-1), dn=cmBtn(c,1);
+    up.disabled = hidden || i<=0;
+    dn.disabled = hidden || i<0 || i>=seq.length-1;
+    ctl.append(up, dn);
+    row.append(nm, ctl);
+    return row;
+  }));
+  if(!keep) return;
+  const pick=k=>host.querySelector('[data-cm="'+keep.cm+'"][data-k="'+k+'"]');
+  let el=pick(keep.k);
+  if(!el || el.disabled){
+    const alt=keep.k==='up'?'down':keep.k==='down'?'up':null;
+    if(alt) el=pick(alt);
+  }
+  if(el && !el.disabled) el.focus({preventScroll:true});
+}
+// First hide ever: flash the bar and say where the card went. Fires
+// once per browser (cardHideSeen), from hideCard so every hide door is
+// covered. Marking cardHideSeen also retires the empty-state line above.
+function hiddenBarNudge(){
+  if(localStorage.cardHideSeen) return;
+  localStorage.cardHideSeen='1';
+  const bar=document.getElementById('hiddenBar');
+  bar.classList.remove('flash'); void bar.offsetWidth; bar.classList.add('flash');
+  toast(t('layout.hiddenFirst','Card hidden. Click its name in the Hidden bar at the bottom to bring it back.'));
 }
 let dragCard=null, chartHT=0;
+// Set .draggable for the life of one press and no longer. Disarming on
+// mouseup as well as dragend matters now: a press that never became a drag
+// used to leave the card draggable for good, which went unnoticed while
+// only a 24px glyph could arm it and would not while a whole heading can -
+// a stuck flag turns every later click on the card into a card drag.
+// A real drag swallows the mouseup, so dragend is what clears that one.
+function armDrag(c){
+  c.draggable=true;
+  document.addEventListener('mouseup', ()=>{ if(dragCard!==c) c.draggable=false; }, {once:true});
+}
 
 // A real grip on the bottom edge of every chart. Replaces the browser's
 // native resize:vertical, whose grabber sits in the bottom-right corner
@@ -14233,7 +15307,7 @@ function addChartGrips(){
     g.addEventListener('pointermove', e=>{ if(pid!==null) setH(h0+(e.clientY-y0)); });
     const end=()=>{ if(pid===null) return;
       try{ g.releasePointerCapture(pid); }catch(_){}
-      pid=null; g.classList.remove('on'); };
+      pid=null; g.classList.remove('on'); dismissLayoutTip(); };
     g.addEventListener('pointerup', end);
     g.addEventListener('pointercancel', end);
     // Keyboard: the charts are resizable for people who need them bigger,
@@ -14242,6 +15316,7 @@ function addChartGrips(){
       if(e.key!=='ArrowUp' && e.key!=='ArrowDown') return;
       e.preventDefault();
       setH(w.getBoundingClientRect().height + (e.key==='ArrowDown'?1:-1)*(e.shiftKey?24:8));
+      dismissLayoutTip();
     });
     w.appendChild(g);
   }
@@ -14261,6 +15336,7 @@ function setHistExpanded(on){
   // The window size changed - refetch it from the store.
   histLimitOverride=0;
   dashHRev=0; renderHistory(); tick();
+  renderCardMgr();
   dismissLayoutTip();
 }
 function applyHistColor(on){
@@ -14361,12 +15437,13 @@ function addCardGrips(){
     });
     g.addEventListener('pointermove',e=>{ if(pid!==null) size(h0+(e.clientY-y0), false); });
     const end=()=>{ if(pid===null) return; try{g.releasePointerCapture(pid);}catch(_){} pid=null;
-      g.classList.remove('on'); if(pend!==null) size(pend, true); };
+      g.classList.remove('on'); if(pend!==null){ size(pend, true); dismissLayoutTip(); } };
     g.addEventListener('pointerup',end); g.addEventListener('pointercancel',end);
     g.addEventListener('keydown',e=>{
       if(e.key!=='ArrowUp'&&e.key!=='ArrowDown') return;
       e.preventDefault();
       size(c.getBoundingClientRect().height+(e.key==='ArrowDown'?1:-1)*(e.shiftKey?48:16), true);
+      dismissLayoutTip();
     });
   });
 }
@@ -14389,6 +15466,7 @@ function persistOrder(){
   const p=layoutPrefs();
   p.order=movableCards().map(c=>c.id);
   saveLayoutPrefs(p);
+  renderCardMgr();   // a drag and a manager press are the same change
   dismissLayoutTip();
 }
 function persistChartH(){
@@ -14706,8 +15784,16 @@ function initCols(){
   }
   COL_STACKED.addEventListener('change',()=>COL_TABLES.forEach(id=>applyCols(id)));
 }
-function initLayout(){
-  if(!LAYOUT_EDIT) return;
+// §6b. Which cards are shown and what order they run in is the user's
+// ARRANGEMENT, not an editing affordance, so it has to hold on every
+// device. This used to live inside initLayout behind LAYOUT_EDIT, which
+// meant the whole of §6 was skipped on a coarse pointer or at 640px and
+// under: a card hidden on the desktop came BACK on the phone, and a
+// dashboard someone had re-ordered reverted to source order there.
+// Sizes deliberately stay behind LAYOUT_EDIT below - a chart height
+// dragged for a 27" window is not a phone's chart height - so only the
+// two things the card manager writes are applied here.
+function applyCardArrangement(){
   const p=layoutPrefs(), dash=document.getElementById('dashview');
   const cards=movableCards(), bar=document.getElementById('hiddenBar');
   const byId={}; cards.forEach(c=>byId[c.id]=c);
@@ -14717,17 +15803,43 @@ function initLayout(){
   const seq=p.order.filter(id=>byId[id])
     .concat(cards.map(c=>c.id).filter(id=>!p.order.includes(id)));
   seq.forEach(id=>dash.insertBefore(byId[id], bar));
+  for(const c of cards) c.classList.toggle('userhidden', p.hidden.includes(c.id));
+  renderHiddenBar();
+}
+// The EDITING half: drag handles, the two icon buttons, the grips, the
+// dnd listeners and the saved sizes. Fine-pointer only, and that gate is
+// deliberate rather than an oversight - see the comment above
+// LAYOUT_EDIT. Mouse-dragging a card inside a page that scrolls under
+// your finger is a genuinely bad control on touch; the answer is the
+// card manager in Settings, not this code running there.
+function initLayout(){
+  if(!LAYOUT_EDIT) return;
+  const p=layoutPrefs(), dash=document.getElementById('dashview');
+  const cards=movableCards();
+  const byId={}; cards.forEach(c=>byId[c.id]=c);
   for(const c of cards){
-    if(p.hidden.includes(c.id)) c.classList.add('userhidden');
     const h=c.querySelector('h3'); if(!h) continue;
+    // Arm the drag from anywhere on the heading, not just the glyph built
+    // below. e.target!==h is the same guard the dragstart handler uses one
+    // level up: a press on the heading's OWN text or its empty space arms,
+    // a press on any child does not. That keeps the .dim subtitle spans and
+    // the end-floated hints (Queue, Providers) selectable, and leaves the ?
+    // manual link, the card tools and the ghost buttons clicking normally.
+    h.classList.add('draghead');
+    h.addEventListener('mousedown', e=>{ if(e.button===0 && e.target===h) armDrag(c); });
     const tools=document.createElement('span'); tools.className='cardtools';
     const grab=document.createElement('span');
-    grab.className='draghandle'; grab.innerHTML='<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-drag"/></svg>';
+    // §6d: the word ships with the button and is revealed by
+    // body.layoutedit, so the mode never has to rebuild the tool row -
+    // and data-i18n on the span means applyI18n translates it without a
+    // restamp entry. The aria-label stays the full sentence and contains
+    // the visible word, so the accessible name is a superset of the label.
+    grab.className='draghandle'; grab.innerHTML='<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-drag"/></svg><span class="ctlbl" data-i18n="layout.lbl.move">Move</span>';
     grab.title=t('layout.drag.title','move this card: drag it, or press the up and down arrow keys');
     grab.setAttribute('aria-label', grab.title); grab.setAttribute('role','button'); grab.tabIndex=0;
-    // draggable only while the grab handle is held, so text selection
-    // and in-card drags (queue rows, NZB drops) keep working.
-    grab.onmousedown=()=>{ c.draggable=true; };
+    // draggable only while a press is live, so text selection and in-card
+    // drags (queue rows, NZB drops) keep working the rest of the time.
+    grab.onmousedown=()=>armDrag(c);
     // The handle advertised role=button and took a tab stop while doing
     // nothing at all for a key press - a stop that leads nowhere is worse
     // than not being focusable. Arrows move the card, the same convention
@@ -14737,18 +15849,40 @@ function initLayout(){
       e.preventDefault();
       if(moveCard(c, e.key==='ArrowUp'?-1:1)) grab.focus();
     });
+    // Right-click anywhere on the heading for the same operations, plus
+    // Resize. Scoped to the h3 on purpose: the queue and history ROWS
+    // carry their own right-click menus and their own drag behaviour.
+    h.addEventListener('contextmenu', e=>cardMenu(e, c.id));
+    // ...and the keyboard equivalent, on the handle that already owns the
+    // arrows, so this is a real path and not just a mouse shortcut.
+    grab.addEventListener('keydown', e=>{
+      if(e.key!=='ContextMenu' && !(e.key==='F10'&&e.shiftKey)) return;
+      e.preventDefault();
+      cardMenu(e, c.id, grab);
+    });
     // §12a per-card density toggle, left of the hide button.
     const d=document.createElement('button');
-    d.className='carddense'; d.innerHTML='<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-density"/></svg>';
+    d.className='carddense'; d.innerHTML='<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-density"/></svg><span class="ctlbl" data-i18n="layout.lbl.dense">Compact</span>';
     d.title=t('layout.dense.title','compact this card: same figures, less space');
     d.setAttribute('aria-label', d.title);
     d.onclick=()=>toggleCardDensity(c.id);
     const x=document.createElement('button');
-    x.className='cardhide'; x.innerHTML='<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-close"/></svg>';
+    x.className='cardhide'; x.innerHTML='<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-close"/></svg><span class="ctlbl" data-i18n="layout.lbl.hide">Hide</span>';
     x.title=t('layout.hide.title','hide this card: bring it back from the Hidden bar at the bottom, or Settings → Interface → Reset layout');
     x.setAttribute('aria-label', x.title);
     x.onclick=()=>hideCard(c.id, true);
     tools.append(grab, d, x); h.appendChild(tools);
+    // §6d honesty: a card that can never grow says so, but only inside the
+    // mode - at rest it would be a permanent apology on three cards. Built
+    // here rather than on entry so the tool row is never rebuilt, and
+    // carrying data-i18n so applyI18n translates it on a locale switch.
+    const why=cardFixedReason(c);
+    if(why){
+      const n=document.createElement('p');
+      n.className='cardfixed'; n.textContent=why;
+      n.dataset.i18n = c.dataset.fixedh==='chart' ? 'card.fixed.chart' : 'card.fixed';
+      c.appendChild(n);
+    }
     c.addEventListener('dragstart', e=>{
       if(e.target!==c) return;           // a queue-row drag bubbling up
       dragCard=c; c.classList.add('dragging');
@@ -14770,7 +15904,10 @@ function initLayout(){
     dash.insertBefore(dragCard, e.clientY < r.top+r.height/2 ? over : over.nextSibling);
   });
   dash.addEventListener('drop', e=>{ if(dragCard) e.preventDefault(); });
-  renderHiddenBar();
+  // §6d: the strip is inert markup until the tools exist, so it is
+  // revealed here rather than shipped visible - same rule as #hiddenBar.
+  const lbar=document.getElementById('layoutBar');
+  if(lbar) lbar.style.display='';
   // Restore chart heights, then persist user resizes (debounced) and
   // re-kick the draws - same fan-out as a window resize, so the rAF
   // glide's smoothing state never snaps.
@@ -14789,7 +15926,16 @@ function initLayout(){
   });
   document.querySelectorAll('.chartwrap').forEach(w=>ro.observe(w));
 }
+// The arrangement first, on every device; then the editing affordances,
+// which only a fine pointer gets; then the manager, which is how every
+// other device reaches the same three operations.
+applyCardArrangement();
 initLayout();
+// Not inside initLayout: on a touch pointer that returns early, and the
+// Settings row still has to be hidden rather than left offering a mode
+// with no controls behind it.
+layoutModeSync();
+renderCardMgr();
 // After initLayout, which is what builds the ▤ buttons applyDensity lights.
 // NOT behind LAYOUT_EDIT: the per-card override is a desktop affordance,
 // but global compact mode only changes padding, so it is just as useful
@@ -14807,7 +15953,9 @@ applyChipColor(true,true);  // same reasoning: the tints ship on, so start on
     addEventListener('resize', ()=>{ if(ladderState) drawLadderChart(); });
   }
 }
-renderLayoutTip();
+// (The layout coach is not rendered here: it must not fight the first-run
+// or nothing-downloaded-yet flows, and only checkWelcome knows whether
+// either is on, so it calls renderLayoutTip when it has decided.)
 // Apply the saved bits/bytes preference on first paint, before Settings is
 // ever opened - a lone get_config fetch (cheap; loadSettings does the rest
 // when the panel opens). Default (bytes) just relabels the limit presets.
@@ -14881,7 +16029,13 @@ if(LOCALE!=='en'){
     // rebuild it the same way injectHelp composed it.
     restamp('#queueCard h3 a.hlp', t('queue.hint','click a row for detail · drag to reorder; Force/High still download first')+'\n'+t('hlp.title','Open the manual for this section'));
     colRelabel();   // table headings were named before the catalogue landed
+    // Both of these are built entirely in JS, so the data-i18n pass
+    // above reaches nothing in them. A rebuild restamps every title AND
+    // every aria-label at once, which is what the per-selector restamps
+    // above have to do by hand for the card tools.
+    layoutModeSync();   // §6d: the Settings toggle's label + tooltip are JS-stamped
     renderHiddenBar();
+    renderCardMgr();
     renderSndEvents(); fillVoices(); checkWelcome(); idxNavPill();
     // (The 📖 pill + ? links are already locale-aware via injectHelp/manualUrl.)
     // refreshWatchStatus too, not just loadWatchlist: the "Given up on"

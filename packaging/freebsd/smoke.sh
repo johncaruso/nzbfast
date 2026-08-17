@@ -17,10 +17,18 @@
 # to check the script itself before shipping a change to it.
 #
 # Usage: packaging/freebsd/smoke.sh <path-to-nzbfast> [workdir]
+#        packaging/freebsd/smoke.sh --self-test   # the workdir guard only
 set -eu
 
-BIN=${1:?usage: smoke.sh <path-to-nzbfast> [workdir]}
-WORK=${2:-./freebsd-smoke}
+if [ "${1:-}" = "--self-test" ]; then
+    SELF_TEST=1
+    BIN=
+    WORK=
+else
+    SELF_TEST=0
+    BIN=${1:?usage: smoke.sh <path-to-nzbfast> [workdir]}
+    WORK=${2:-./freebsd-smoke}
+fi
 PORT=${NZBFAST_SMOKE_PORT:-11190}
 FILES=2
 FILE_SIZE=32M
@@ -30,45 +38,183 @@ FILE_SIZE=32M
 NZBFAST_NO_ENRICH=1
 export NZBFAST_NO_ENRICH
 
-# $WORK is caller-supplied and goes straight to `rm -rf`. CI passes the
-# literal /root/smoke and the default is ./freebsd-smoke, so no automated
-# path is exposed - but a tired operator typing `/root` or `/usr/local`
-# gets no second chance, and this script runs as root on a VM by design.
-# Refuse the shapes that are obviously not a scratch directory.
+# $WORK is caller-supplied and goes straight to `rm -rf`, as root, on a
+# VM. CI passes the literal /root/smoke and the default is ./freebsd-smoke,
+# so no automated path is exposed - but a tired operator typing `/root` or
+# `/usr/local` gets no second chance.
+#
+# The first cut of this guard was a deny list of exact top-level names plus
+# a depth rule, and it did NOT do what its own comment claimed: in a `case`
+# pattern `*` matches `/`, so `/*/*` means only "depth >= 2", and
+# /usr/local, /var/db, /root/.ssh and $HOME/.ssh all cleared the deny list
+# and then matched the depth rule. A deny list can never be finished - the
+# next descendant nobody thought of is always one typo away.
+#
+# So this does not try to enumerate what is dangerous. It requires the path
+# to be one we OWN, on two independent counts:
+#
+#   1. the final component has to look like a scratch name (`smoke`,
+#      `smoke-*`, `*-smoke`). An operator typo lands on `local`, `db`,
+#      `.ssh`, `etc` or their login name - none of which can be mistaken
+#      for a scratch directory. /root/smoke and ./freebsd-smoke pass.
+#   2. if the directory already EXISTS, it has to carry the sentinel file
+#      a previous run of this script left in it. Nothing else is deleted,
+#      ever - a pre-existing /var/db/smoke is refused, not removed.
+#
 # Resolve WITHOUT cd: the directory does not exist yet on a first run, and
 # a `cd $(dirname ...)` that fails silently yields a different path than
 # the one about to be deleted - which is how a first draft of this guard
 # waved through /root and refused the /root/smoke that CI actually uses.
-case "$WORK" in
-    /*) _abs="$WORK" ;;
-    *)  _abs="$PWD/$WORK" ;;
-esac
-case "$_abs" in
-    *..*) echo "smoke.sh: '$WORK' contains '..'; give a plain path" >&2; exit 1 ;;
-esac
-_abs=$(printf '%s' "$_abs" | sed 's|//*|/|g')     # collapse repeats
-while :; do
-    case "$_abs" in
-        */) _abs=${_abs%/} ;;
-        *)  break ;;
-    esac
-done
-[ -n "$_abs" ] || _abs=/
-case "$_abs" in
-    /|/root|/home|/usr|/etc|/var|/bin|/sbin|/lib|/boot|/dev|/proc|/tmp|"$HOME")
-        echo "smoke.sh: '$_abs' is a system or home directory, not a scratch" >&2
-        echo "  directory. This script deletes the path it is given." >&2
-        exit 1 ;;
-esac
-# Depth as the general rule: a scratch directory is never top-level.
-case "$_abs" in
-    /*/*) ;;
-    *) echo "smoke.sh: '$_abs' is too shallow to be a scratch directory" >&2; exit 1 ;;
-esac
-WORK=$_abs
+SENTINEL=.nzbfast-smoke-scratch
 
-rm -rf "$WORK"
-mkdir -p "$WORK/out"
+# Prints the normalised absolute path on stdout, or refuses on stderr and
+# returns 1. Pure: it touches no filesystem, so the self-test below can
+# drive it with paths that exist and paths that do not.
+resolve_workdir() {
+    case "$1" in
+        /*) _abs="$1" ;;
+        *)  _abs="$PWD/$1" ;;
+    esac
+    case "$_abs" in
+        *..*) echo "smoke.sh: '$1' contains '..'; give a plain path" >&2
+              return 1 ;;
+    esac
+    _abs=$(printf '%s' "$_abs" | sed 's|//*|/|g')     # collapse repeats
+    # Collapse `/./` too. The DEFAULT workdir is the literal
+    # `./freebsd-smoke`, so without this every message and every rm -rf
+    # names $PWD/./freebsd-smoke - a path that works but that nobody can
+    # eyeball against the one they meant to type.
+    while :; do
+        case "$_abs" in
+            */./*) _abs=$(printf '%s' "$_abs" | sed 's|/\./|/|') ;;
+            */.)   _abs=${_abs%/.} ;;
+            */)    _abs=${_abs%/} ;;
+            *)     break ;;
+        esac
+    done
+    [ -n "$_abs" ] || _abs=/
+    # Belt: the shapes that are never a scratch directory whatever they are
+    # called. $HOME is here because a login directory named `smoke` would
+    # otherwise satisfy the name rule below.
+    case "$_abs" in
+        /|/root|/home|/usr|/etc|/var|/bin|/sbin|/lib|/boot|/dev|/proc|/tmp|"${HOME:-}")
+            echo "smoke.sh: '$_abs' is a system or home directory, not a scratch" >&2
+            echo "  directory. This script deletes the path it is given." >&2
+            return 1 ;;
+    esac
+    # Braces: the name rule is what actually stops /usr/local and /var/db.
+    _base=${_abs##*/}
+    case "$_base" in
+        smoke|smoke-*|*-smoke) ;;
+        *)  echo "smoke.sh: refusing '$_abs' - this script DELETES the path it" >&2
+            echo "  is given, so it only accepts a directory whose last component" >&2
+            echo "  is a scratch name: 'smoke', 'smoke-*' or '*-smoke'." >&2
+            echo "  e.g. /root/smoke (what CI uses) or ./freebsd-smoke (default)." >&2
+            return 1 ;;
+    esac
+    # Depth: a scratch directory is never top-level.
+    case "$_abs" in
+        /*/*) ;;
+        *) echo "smoke.sh: '$_abs' is too shallow to be a scratch directory" >&2
+           return 1 ;;
+    esac
+    printf '%s\n' "$_abs"
+}
+
+# Take ownership of the scratch directory. An EXISTING directory is only
+# removed if this script created it, proven by the sentinel it drops on
+# the way in - so a name collision with somebody's real data is a refusal
+# rather than an unrecoverable rm -rf.
+claim_workdir() {
+    if [ -e "$1" ]; then
+        if [ ! -d "$1" ] || [ ! -f "$1/$SENTINEL" ]; then
+            echo "smoke.sh: '$1' already exists and was not created by this" >&2
+            echo "  script (no $SENTINEL marker). Refusing to delete it." >&2
+            echo "  Remove it yourself, or point the smoke at a fresh path." >&2
+            return 1
+        fi
+        rm -rf "$1"
+    fi
+    mkdir -p "$1/out"
+    : > "$1/$SENTINEL"
+}
+
+if [ "$SELF_TEST" -eq 1 ]; then
+    # A guard nobody exercises is a guard that quietly stops guarding: the
+    # version this replaced ACCEPTED /usr/local, the exact path its own
+    # comment named as the thing to refuse. These cases are that comment,
+    # made executable.
+    _sp=0
+    _sf=0
+    _reject() {
+        if resolve_workdir "$1" >/dev/null 2>&1; then
+            echo "  FAIL - accepted '$1', must refuse"; _sf=$((_sf + 1))
+        else
+            echo "  ok   - refused '$1'"; _sp=$((_sp + 1))
+        fi
+    }
+    _accept() {
+        if _got=$(resolve_workdir "$1" 2>/dev/null); then
+            if [ "$_got" = "$2" ]; then
+                echo "  ok   - accepted '$1' as $_got"; _sp=$((_sp + 1))
+            else
+                echo "  FAIL - '$1' resolved to $_got, expected $2"; _sf=$((_sf + 1))
+            fi
+        else
+            echo "  FAIL - refused '$1', must accept"; _sf=$((_sf + 1))
+        fi
+    }
+    echo "workdir guard - paths that must be refused"
+    for _p in / /usr /usr/local /var /var/db /root /root/.ssh /etc /etc/rc.d \
+              /tmp /home /home/OTHERUSER /usr/local/etc ../smoke; do
+        _reject "$_p"
+    done
+    _reject "${HOME:-/nonexistent}"
+    _reject "${HOME:-/nonexistent}/.ssh"
+    _reject "${HOME:-/nonexistent}/Documents"
+
+    echo "workdir guard - the shapes the smoke actually uses"
+    _accept /root/smoke /root/smoke                     # .github/workflows/release.yml
+    _accept ./freebsd-smoke "$PWD/freebsd-smoke"        # the default
+    _accept freebsd-smoke "$PWD/freebsd-smoke"
+    _accept /root/smoke/ /root/smoke                    # trailing slash
+    _accept //root//smoke /root/smoke                   # repeated separators
+    _accept /var/tmp/nzbfast-smoke /var/tmp/nzbfast-smoke
+
+    echo "sentinel - only a directory this script made is deleted"
+    _t=$(mktemp -d)
+    mkdir -p "$_t/smoke"
+    : > "$_t/smoke/precious.txt"
+    if claim_workdir "$_t/smoke" >/dev/null 2>&1; then
+        echo "  FAIL - deleted a pre-existing directory with no sentinel"
+        _sf=$((_sf + 1))
+    elif [ -f "$_t/smoke/precious.txt" ]; then
+        echo "  ok   - refused a pre-existing directory, left it untouched"
+        _sp=$((_sp + 1))
+    else
+        echo "  FAIL - refused but the contents are gone"; _sf=$((_sf + 1))
+    fi
+    rm -rf "$_t/smoke"
+    if claim_workdir "$_t/smoke" >/dev/null 2>&1 && [ -d "$_t/smoke/out" ]; then
+        echo "  ok   - created a fresh scratch directory"; _sp=$((_sp + 1))
+    else
+        echo "  FAIL - could not create a fresh scratch directory"; _sf=$((_sf + 1))
+    fi
+    : > "$_t/smoke/leftover.txt"
+    if claim_workdir "$_t/smoke" >/dev/null 2>&1 && [ ! -f "$_t/smoke/leftover.txt" ]; then
+        echo "  ok   - re-used its own scratch directory (wiped)"; _sp=$((_sp + 1))
+    else
+        echo "  FAIL - could not re-claim its own scratch directory"; _sf=$((_sf + 1))
+    fi
+    rm -rf "$_t"
+    echo ""
+    echo "$_sp passed, $_sf failed"
+    [ "$_sf" -eq 0 ]
+    exit
+fi
+
+WORK=$(resolve_workdir "$WORK") || exit 1
+claim_workdir "$WORK" || exit 1
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 cd "$WORK"
 

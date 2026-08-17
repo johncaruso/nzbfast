@@ -72,6 +72,15 @@ runtime.json
 # were only in .git/info/exclude before, which a fresh clone loses)
 .claude/launch.json
 .claude/worktrees/
+# ...but the agent-session build env IS repo content, and the bare
+# `settings.json` rule above (daemon runtime settings) matches at every
+# depth, so it swallows this file too. Negated by exact path: the daemon
+# rule is untouched, and `.claude/` itself is not excluded, so git can
+# still reach in. It pins CARGO_INCREMENTAL and the dev debuginfo level
+# for agent sessions, which otherwise fill the disk with artifact
+# variants cargo never collects. `.claude/settings.local.json` stays
+# ignored - that one is per-machine.
+!.claude/settings.json
 
 # merge debris and editor state
 *.orig

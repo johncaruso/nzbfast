@@ -439,6 +439,20 @@ pub(super) async fn requeue_or_fail(
     shared.release_wire(inflight.len());
     {
         let mut q = shared.queue.lock().await;
+        // Cursors, not a recomputed position. `inflight` is oldest-
+        // first, so a fixed insertion point reverses the casualties:
+        // `push_front` puts each successive promoted one at index 0,
+        // and re-deriving the promoted-prefix length for a NON-promoted
+        // insert yields the same index every time, because a
+        // non-promoted insert does not extend that prefix. Both give
+        // [A,B] back as [B,A], and on a forward-only chase decode that
+        // is the head-of-file article landing behind its own tail.
+        // `shed_pipeline` above keeps a cursor for exactly this reason
+        // ("preserving their relative order"); so does `next_work`'s
+        // `left_for_faster` walk. A promoted insert DOES extend the
+        // prefix, so `at` tracks it.
+        let mut at = q.iter().take_while(|x| x.promoted).count().min(q.len());
+        let mut pat = 0usize;
         let mut first = true;
         while let Some(mut w) = inflight.pop_front() {
             let charged = first && charge_front;
@@ -485,10 +499,14 @@ pub(super) async fn requeue_or_fail(
             // promoted run at the front.
             if w.promoted {
                 shared.promoted_pending.fetch_add(1, Ordering::AcqRel);
-                q.push_front(w);
+                let idx = pat.min(q.len());
+                q.insert(idx, w);
+                pat += 1;
+                at += 1;
             } else {
-                let at = q.iter().take_while(|x| x.promoted).count().min(q.len());
-                q.insert(at, w);
+                let idx = at.min(q.len());
+                q.insert(idx, w);
+                at += 1;
             }
         }
     }

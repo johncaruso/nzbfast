@@ -2652,7 +2652,7 @@ fn a_quality_bump_rerun_keeps_names_applied_after_ingest() {
     // migration body re-parses every row from scratch.
     ix.db
         .execute(
-            "DELETE FROM kv WHERE k IN ('quality_v8','quality_v8_cursor')",
+            "DELETE FROM kv WHERE k IN ('quality_v9','quality_v9_cursor')",
             [],
         )
         .unwrap();
@@ -2660,7 +2660,7 @@ fn a_quality_bump_rerun_keeps_names_applied_after_ingest() {
     let ix = Index::open(&d.join("index.db")).unwrap();
     let stamped: String = ix
         .db
-        .query_row("SELECT v FROM kv WHERE k='quality_v8'", [], |r| r.get(0))
+        .query_row("SELECT v FROM kv WHERE k='quality_v9'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(stamped, "1", "the re-run completed");
     assert_eq!(

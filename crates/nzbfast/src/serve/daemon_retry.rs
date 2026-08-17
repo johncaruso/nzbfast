@@ -357,6 +357,7 @@ impl Daemon {
             // answer about anything this record now owns.
             j.filed_suffix = None;
         }
+        let had_del_on_drop;
         {
             let mut j = job.lock_ok();
             j.state = JobState::Queued;
@@ -389,7 +390,7 @@ impl Daemon {
             // payload it just produced (Codex sweep 14 Aug H1). park
             // now spends the flag as it reads it; this is the belt to
             // that brace and the only cover for the row filed by hand.
-            j.del_on_drop = false;
+            had_del_on_drop = std::mem::replace(&mut j.del_on_drop, false);
             j.finished_at = None;
             j.finished_unix = None;
             j.retries += 1;
@@ -409,6 +410,21 @@ impl Daemon {
             // than aged out: the prober re-samples a job with no verdict on
             // its next idle tick, which is the answer worth having here.
             j.health = None;
+        }
+        // The reservation that flag owned dies with it. A delete of an
+        // active/lane/finalizing job sets `del_on_drop` AND reserves the
+        // out_dir so `dir_claim` cannot hand it out in the gap, and
+        // `park_gen` is the only release - but a retry bumps `retries`,
+        // which is half of `record_generation`, so the old tail's
+        // `park_gen` takes its stale-generation early return and never
+        // reaches that release. Nothing else removes it: that arm does
+        // not push the directory onto `doomed`, so the post-batch
+        // `reserved_dirs` loops never see it either, and the release
+        // could not use its own directory again for the life of the
+        // process. Released here, beside the flag it belongs to, because
+        // a retry is exactly what makes the deferred delete moot.
+        if had_del_on_drop {
+            self.reserved.lock_ok().remove(&cur);
         }
         // §158 item 1: claim the history -> queue move BEFORE the queue
         // write below, so the copy that write makes durable carries the

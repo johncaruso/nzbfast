@@ -1478,28 +1478,74 @@ impl Index {
     /// BUDGETED, and the reason is a measured wedge (15 Aug, on a live
     /// 34.6 M-row / 49.7 GB index): the loop below had no deadline, so
     /// one entry reaped until it ran out of rows - six hours and
-    /// counting, holding the write mutex the whole time. The selection has
-    /// no index to ride (a `junk` range plus a correlated EXISTS over
-    /// `json_array_length(f.segments)`), and it restarts at the top of
-    /// the table on every batch, so the scan prefix of rows that do NOT
-    /// match grows as the ones that do are deleted: the cost per batch
-    /// climbs while the work left barely moves. Every index consumer
-    /// blocked behind it, the download runner included, which froze a
-    /// finished job in the queue reading "Extracting" for as long as the
-    /// daemon lived.
+    /// counting, holding the write mutex the whole time. None of the
+    /// selection's own predicates has an index to ride (a `junk` range
+    /// plus a correlated EXISTS over `json_array_length(f.segments)`),
+    /// and it restarted at the top of the table on every batch, so the
+    /// scan prefix of rows that do NOT match grew as the ones that do
+    /// were deleted: the cost per batch climbed while the work left
+    /// barely moved. Every index consumer blocked behind it, the
+    /// download runner included, which froze a finished job in the queue
+    /// reading "Extracting" for as long as the daemon lived.
     ///
     /// So the caller gets its lock back on a clock. `caught up` false
     /// means rows are still waiting: come back on the next pass rather
     /// than on the hourly gate.
+    ///
+    /// The deadline only means that because the SELECTION is bounded
+    /// too, which is the second half of the same wedge (read-only sweep
+    /// 3, 16 Aug 2026, M9). A deadline checked between statements cannot
+    /// interrupt the statement that is running, and the unbounded
+    /// selection above was minutes of it on a large index: once it
+    /// started, neither the 1 s slice nor the caller's 30 s pass could
+    /// stop it, and the write mutex stayed held for the whole of it -
+    /// the same block, in the small, that the loop above used to hold
+    /// for hours. Worse, it was PERMANENT rather than a migration cost:
+    /// once the reap is caught up, every hourly entry pays one terminal
+    /// full walk of the table to return zero rows.
+    ///
+    /// So the walk is an id stride with a kv cursor, the shape
+    /// [`Self::split_merge`] and `par2_sidecar_fold` already use here: a
+    /// rowid range is the one predicate this selection CAN ride, each
+    /// statement examines at most `SUB_STRIDE` rows whatever the table
+    /// size, and the deadline lands between them. A lap that runs out of
+    /// budget resumes at the cursor on the next pass instead of
+    /// restarting at the top of the table, so the cost per batch stops
+    /// climbing as well. `caught up` is now "a full lap finished", and
+    /// the cursor parks at 0 so the next entry starts a fresh one.
+    ///
+    /// Rowids are recycled (`releases.id` has no AUTOINCREMENT), so a
+    /// new row minted below the cursor waits for the next lap. That is
+    /// harmless here and nowhere else: nothing this reaper takes is
+    /// younger than the settle window.
     pub fn prune_stale_partials(
         &self,
         settle_secs: i64,
         now: i64,
         deadline: std::time::Instant,
     ) -> rusqlite::Result<(usize, bool)> {
+        // Rowids per statement. Deliberately the batch size the old
+        // LIMIT used, so one statement still yields at most one delete
+        // batch and a spent budget still buys exactly one of them.
+        const SUB_STRIDE: i64 = 8_000;
         let cutoff = now - settle_secs;
+        let top: i64 = self
+            .db
+            .query_row("SELECT COALESCE(MAX(id),0) FROM releases", [], |r| r.get(0))?;
+        let mut cursor: i64 = self
+            .kv_get("stale_prune_cursor")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        // A cursor at or past the top is a finished lap - or an index
+        // that has since shrunk under it. Either way the next thing to
+        // do is a fresh lap, not sitting past the end reporting caught
+        // up forever.
+        if cursor >= top {
+            cursor = 0;
+        }
         let mut removed = 0;
         loop {
+            let hi = cursor.saturating_add(SUB_STRIDE).min(top);
             let ids: Vec<i64> = {
                 let mut stmt = self.db.prepare_cached(
                     // first_seen (when WE indexed it) is the settle clock, not
@@ -1509,25 +1555,28 @@ impl Index {
                     // scan slices. Require BOTH: settled by post age AND known to
                     // the index for the settle window.
                     "SELECT id FROM releases
-                     WHERE junk >= 50 AND first_posted > 0 AND first_posted < ?1
-                       AND first_seen > 0 AND first_seen < ?1
+                     WHERE id > ?1 AND id <= ?2
+                       AND junk >= 50 AND first_posted > 0 AND first_posted < ?3
+                       AND first_seen > 0 AND first_seen < ?3
                        AND title_key NOT IN (SELECT key FROM wall_hidden)
                        AND EXISTS (SELECT 1 FROM files f
                                    WHERE f.release_id = releases.id
-                                     AND json_array_length(f.segments) < f.total_parts)
-                     LIMIT 8000",
+                                     AND json_array_length(f.segments) < f.total_parts)",
                 )?;
-                stmt.query_map([cutoff], |r| r.get(0))?
+                stmt.query_map([cursor, hi, cutoff], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?
             };
-            if ids.is_empty() {
+            removed += self.prune_batch(&ids)?;
+            cursor = hi;
+            if hi >= top {
+                self.kv_set("stale_prune_cursor", "0")?;
                 return Ok((removed, true));
             }
-            removed += self.prune_batch(&ids)?;
-            // AFTER the batch, never before: an entry already past the
-            // deadline still does one batch, so a budget the caller set
+            // AFTER the stride, never before: an entry already past the
+            // deadline still does one stride, so a budget the caller set
             // too tight reaps slowly rather than never.
             if std::time::Instant::now() >= deadline {
+                self.kv_set("stale_prune_cursor", &cursor.to_string())?;
                 return Ok((removed, false));
             }
         }
@@ -1827,6 +1876,44 @@ mod tests {
         std::time::Instant::now() + std::time::Duration::from_secs(3_600)
     }
 
+    /// The sampler's pick, after it stopped sorting the whole table
+    /// (see `Index::oracle_pick`). The seek draw changed HOW candidates
+    /// are found; what it must not change is which of them wins - a
+    /// never-sampled release outranks a sampled one, and junk stays out
+    /// of the sample entirely.
+    #[test]
+    fn oracle_pick_prefers_the_unsampled_and_skips_junk() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-opick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ix = Index::open(&dir.join("index.db")).unwrap();
+        ix.db
+            .execute(
+                "INSERT INTO releases(stem, poster, grp, first_posted, junk, oracle_at)
+                 VALUES('sampled','p','g',1000, 0, 500),
+                       ('never','p','g',2000, 0, 0),
+                       ('junky','p','g',3000, 90, 0)",
+                [],
+            )
+            .unwrap();
+
+        // Seeded so the draw is replayable; the window is tiny here, so
+        // every seek lands on the same three rows either way.
+        let picked = ix.oracle_pick_seeded(2, 7).unwrap();
+        let names: Vec<i64> = picked.iter().map(|&(_, _, posted)| posted).collect();
+        // Never-sampled first, sampled second, junk not at all.
+        assert_eq!(names, vec![2000, 1000], "picked {picked:?}");
+
+        // Stamping the unsampled row rotates the pick, which is what
+        // stops one release pinning the sampler forever.
+        let rid = picked[0].0;
+        ix.oracle_mark(rid, 9_000).unwrap();
+        let after = ix.oracle_pick_seeded(1, 7).unwrap();
+        assert_eq!(after.first().map(|r| r.2), Some(1000), "got {after:?}");
+
+        teardown(&dir, ix);
+    }
+
     /// The repost table: remember once, recognise later, and never let a
     /// second download rewrite what the first one taught us.
     #[test]
@@ -2107,6 +2194,81 @@ mod tests {
         let (rest, done) = ix.prune_stale_partials(7 * DAY, now, forever()).unwrap();
         assert_eq!(rest, 500, "the remainder, on the next pass");
         assert!(done, "nothing left to reap");
+        teardown(&dir, ix);
+    }
+
+    /// The other half of the same wedge (read-only sweep 3, M9): the
+    /// SELECTION is bounded too, not just the loop around it.
+    ///
+    /// A deadline checked between statements cannot stop the statement
+    /// that is running, and this reaper's own predicates have no index
+    /// to ride - so one selection was a full walk of the releases table
+    /// with the write mutex held, however long that took. Here the rows
+    /// worth reaping sit at the END of the table behind 8,000 that are
+    /// not: a walk that reaches them has scanned everything, which is
+    /// exactly what a spent budget must not buy. The stride keeps the
+    /// statement to its own slice of the rowid space and the cursor
+    /// makes the next call resume there rather than start again.
+    #[test]
+    fn stale_partials_bounds_one_selection_to_a_stride_of_the_table() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-index-stride-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+        const DAY: i64 = 86_400;
+        let now = 1_000 * DAY;
+        let old = now - 30 * DAY;
+        // A full stride of rows this reaper must never take: junk-hidden
+        // and long settled, but COMPLETE, so only a scan that reads them
+        // all can tell.
+        let whole: Vec<crate::nntp::OverEntry> = (0..8_000u32)
+            .map(|i| {
+                let mut e = entry(
+                    &format!("\"a1b2c3d4e5f6a1b2c3d4e5f6{i:06x}.mkv\" yEnc (1/1)"),
+                    "p@x",
+                    &format!("c{i}"),
+                    750_000,
+                );
+                e.date = old;
+                e
+            })
+            .collect();
+        ix.ingest("alt.test", &whole, old).unwrap();
+        // ...and the reapable rows behind them, so they sit past the
+        // first stride's rowids.
+        let dead: Vec<crate::nntp::OverEntry> = (0..100u32)
+            .map(|i| {
+                let mut e = entry(
+                    &format!("\"ugpoqs3l6bthdkgbn1ktwkl2ww{i:04x}.part1.rar\" yEnc (1/9)"),
+                    "p@x",
+                    &format!("d{i}"),
+                    750_000,
+                );
+                e.date = old;
+                e
+            })
+            .collect();
+        ix.ingest("alt.test", &dead, old).unwrap();
+
+        let spent = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let (removed, done) = ix.prune_stale_partials(7 * DAY, now, spent).unwrap();
+        assert_eq!(
+            removed, 0,
+            "a spent budget buys ONE stride of rowids - reaching the rows \
+             beyond it means the whole table was scanned under the mutex"
+        );
+        assert!(!done, "the lap is unfinished - the caller must come back");
+
+        // The next call resumes at the cursor rather than walking the
+        // spared stride again, and finishes the lap.
+        let (rest, done) = ix.prune_stale_partials(7 * DAY, now, forever()).unwrap();
+        assert_eq!(rest, 100, "the reapable rows, on the next pass");
+        assert!(done, "the lap finished");
+        assert_eq!(
+            ix.kv_get("stale_prune_cursor").as_deref(),
+            Some("0"),
+            "a finished lap parks the cursor so the next entry starts a fresh one"
+        );
         teardown(&dir, ix);
     }
 

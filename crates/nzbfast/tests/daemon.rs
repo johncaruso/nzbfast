@@ -214,6 +214,25 @@ async fn serve(dir: &Path, build: impl Fn(u16) -> Command) -> Daemon {
         // behaviour the tests were written against rather than changing it -
         // the same isolation tests/watch_dedupe.rs already applies per case.
         cmd.env("NZBFAST_LOG", "info").env_remove("RUST_LOG");
+        // Central disk-guard isolation, for the same reason as the log
+        // filter above: `min_free` defaults to 2 GB and the runner it is
+        // measured against is the HOST's, not anything this suite writes.
+        // A CI box that had run itself down to 1.3 GB free (nightly,
+        // 15 Aug 2026) therefore held EVERY job in the queue before it
+        // ever started, and 50-odd cases each spent their full poll
+        // budget waiting for a download that was never going to be
+        // picked - dozens of unrelated 30 s timeouts with one cause, and
+        // nothing in any panic message naming disk. The fixtures here
+        // are kilobytes; the floor is not this suite's subject, so turn
+        // it off and let the one case that IS about it say so.
+        // `disk_guard_holds_queue` passes its own `--min-free`, and any
+        // case that does keeps it - this only supplies the default.
+        if !cmd
+            .get_args()
+            .any(|a| a.to_string_lossy().starts_with("--min-free"))
+        {
+            cmd.arg("--min-free").arg("0");
+        }
         cmd.stdout(Stdio::from(out)).stderr(Stdio::from(err));
         let child = KillOnDrop(cmd.spawn().unwrap());
         let logfile = log.clone();
@@ -702,16 +721,31 @@ async fn sonarr_style_cycle() {
         // `env:` is the second of the two printf lines, so seeing it means
         // the write finished.
         //
-        // The five-second budget is DELIBERATELY left where it is. It is
-        // tighter than the completion poll above even though the hook is
-        // dispatched to `spawn_blocking` as `park` files the job into
-        // history - i.e. everything this poll waits on happens after the
-        // "Completed" just observed - so widening it is the obvious
-        // reflex when this reports "hook never ran". Don't: a margin
-        // widened without a diagnosis has buried two real product bugs
-        // in this suite already. `hook_diag` below is the alternative -
-        // make the next failure say WHY, then widen only what the answer
-        // justifies.
+        // The five-second budget is DELIBERATELY left where it is, and
+        // it is no longer even close: the daemon now finishes the
+        // post-processing script BEFORE `park` files the job into
+        // history, so the "Completed" observed above already implies
+        // the write this loop is waiting for, and only the shell's own
+        // create-then-write window is left.
+        //
+        // It did not always. The hook used to be dispatched to
+        // `spawn_blocking` while `park` filed the row anyway, with
+        // nothing ordering the two - 105-313 ms of daylight over 80
+        // runs at 20-way parallelism, and nothing bounding it on a
+        // busier box - and that race is
+        // where this case's "hook never ran" intermittent came from
+        // (16 Aug 2026). Widening the margin was the obvious reflex and
+        // would have hidden a contract the *arrs actually rely on:
+        // Sonarr imports on the word Completed, and a pp-script is the
+        // step most likely to still be moving the payload. The
+        // ordering is pinned directly, on a script that sleeps, by
+        // `daemon_hooks::the_post_processing_script_finishes_before_history_says_completed`.
+        //
+        // So the rule that produced that fix still stands for whatever
+        // comes next: a margin widened without a diagnosis has buried
+        // three real product bugs in this suite now. `hook_diag` below
+        // is the alternative - make the next failure say WHY, then
+        // widen only what the answer justifies.
         let hook_out = dir2.join("hook.out");
         let mut rec = String::new();
         for _ in 0..50 {

@@ -460,7 +460,9 @@ fn gen_candidates(
 /// per file is the whole set the map could be holding for this posting
 /// - anything beyond it is a lookup that cannot hit. The overall cut
 /// bounds a cluster carrying hundreds of files; it costs the tail of a
-/// wide cluster its probe, never a wrong answer.
+/// wide cluster its probe, never a wrong answer. Spent BREADTH first,
+/// so the tail that goes unprobed is only past this many FILENAMES -
+/// see the loop in [`hidden_home`] for what depth-first cost.
 const MAX_HOME_PROBES: usize = 32;
 
 /// How many rows the reverse probe will TEST. Ordered by how many of
@@ -507,15 +509,29 @@ fn hidden_home(
     // of this run's hash seed.
     let mut names: Vec<&String> = files.keys().collect();
     names.sort_unstable();
+    // BREADTH first, never depth: one id from EVERY filename before a
+    // second from any. Spending the budget depth-first covered only the
+    // first ~11 names (3 keys each into a 32-probe cut) and left the
+    // rest of a wide cluster unprobed - so a compatible out-of-window
+    // row that shares an article only with a LATER filename was never
+    // found, hidden_home returned None, and the whole cluster was
+    // dropped as Saturated. That is deterministic (the names are sorted
+    // exactly so the probe set is a function of the batch), so it
+    // repeated on every rescan and the newly available files stayed out
+    // of the index for good - the same forever-drop the M4 fix above was
+    // written to end, one step further in (read-only sweep 3, 16 Aug
+    // 2026, M10). Same probes, same determinism; coverage goes from ~11
+    // filenames to MAX_HOME_PROBES of them.
     let mut probes: Vec<&str> = Vec::new();
-    for name in names {
-        let (_, parts) = &files[name];
-        for (id, _) in parts.values().take(MSGID_KEYS_PER_FILE) {
-            probes.push(id.as_str());
-        }
-        if probes.len() >= MAX_HOME_PROBES {
-            probes.truncate(MAX_HOME_PROBES);
-            break;
+    'budget: for round in 0..MSGID_KEYS_PER_FILE {
+        for name in &names {
+            let (_, parts) = &files[*name];
+            if let Some((id, _)) = parts.values().nth(round) {
+                probes.push(id.as_str());
+                if probes.len() >= MAX_HOME_PROBES {
+                    break 'budget;
+                }
+            }
         }
     }
     let mut sel = db.prepare_cached("SELECT release_id FROM msgid_map WHERE h=?1")?;
@@ -719,7 +735,7 @@ impl Index {
     }
 
     /// TODO 24D: chunked re-classification of stored rows after the
-    /// category config changed. Same shape as the quality_v8 migration
+    /// category config changed. Same shape as the quality_v9 migration
     /// (10k-row transactions, persisted cursor, write-only-on-change) so
     /// it can run against a live db without starving parallel scanners.
     /// The current config's fingerprint is stamped in `kv`; calling this
@@ -751,7 +767,7 @@ impl Index {
         } else {
             // New config: stamp it and start from the top. Stamping
             // FIRST is deliberate - an interrupted pass resumes from the
-            // cursor rather than restarting, exactly like quality_v8.
+            // cursor rather than restarting, exactly like quality_v9.
             // The fingerprint and cursor are ONE state transition. Two
             // autocommit writes left a crash window where the new
             // fingerprint existed without a cursor; every later call then
@@ -788,20 +804,21 @@ impl Index {
                 rusqlite::TransactionBehavior::Immediate,
             )?;
             // COALESCE(pre_title, stem), the same name every other
-            // classification site reads (ingest_pass, the quality_v8
+            // classification site reads (ingest_pass, the quality_v9
             // backfill): classifying the raw stem here rewrote pre-named
             // obfuscated releases back to kind=other / blank title_key /
             // junk>=70 on any category edit, and the naming seam refuses
             // rows whose pre_title is already set, so nothing healed them.
-            let rows: Vec<(i64, String, i64, bool)> = {
+            let rows: Vec<(i64, String, i64, bool, String)> = {
                 let mut sel = tx.prepare_cached(&format!(
                     "SELECT id, COALESCE(NULLIF(pre_title,''), stem), total_bytes,
                             EXISTS(SELECT 1 FROM files
-                                   WHERE release_id=releases.id AND {EXE_FILE_SQL})
+                                   WHERE release_id=releases.id AND {EXE_FILE_SQL}),
+                            stem
                      FROM releases WHERE id > ?1 ORDER BY id LIMIT 10000"
                 ))?;
                 sel.query_map([cursor], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })?
                 .collect::<rusqlite::Result<_>>()?
             };
@@ -815,8 +832,9 @@ impl Index {
                     "UPDATE releases SET kind=?2, title_key=?3, junk=?4
                      WHERE id=?1 AND (kind<>?2 OR title_key<>?3 OR junk<>?4)",
                 )?;
-                for (id, name, bytes, has_exe) in &rows {
-                    let p = self.classify(name);
+                for (id, name, bytes, has_exe, stem) in &rows {
+                    let mut p = self.classify(name);
+                    crate::release::recover_media_kind(&mut p, name, stem);
                     changed += upd.execute(rusqlite::params![
                         id,
                         kind_str(&p.kind),
@@ -1298,7 +1316,11 @@ impl Index {
             } else {
                 pre_title.as_str()
             };
-            let p = crate::categories::classify(name, &self.custom);
+            let mut p = crate::categories::classify(name, &self.custom);
+            // The fed name is the better identity but it names the WORK:
+            // a spot title drops the `.epub`/`.pdf` the stem carries, and
+            // that marker is a book's only evidence.
+            crate::release::recover_media_kind(&mut p, name, stem.as_str());
             tx.prepare_cached(
                 "UPDATE releases SET files=?2, total_bytes=?3, has_par2=?4, complete=?5,
                         kind=?6, res=?7, have_parts=?8, need_parts=?9,
@@ -2214,6 +2236,149 @@ mod tests {
         teardown(&dir, ix);
     }
 
+    /// M10 (read-only sweep 3): a WIDE cluster whose only shared article
+    /// sits in a late filename still finds its hidden home.
+    ///
+    /// The probe budget is 32 ids and `msgid_map` keys 3 segments per
+    /// file, so spending it depth-first in sorted filename order ran out
+    /// after ~11 names. A cluster of 12 files whose out-of-window
+    /// generation shares an article only with the LAST one was therefore
+    /// never probed, `hidden_home` answered None, and the cluster was
+    /// dropped as Saturated - deterministically, on every rescan, so the
+    /// files that had just become available stayed out of the index for
+    /// good. Breadth-first spending covers every filename first.
+    #[test]
+    fn a_wide_cluster_probes_every_filename_not_just_the_first_eleven() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-genwide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = Index::open(&dir.join("index.db")).unwrap();
+
+        // 12 files x 3 parts: more than the 11 filenames a depth-first
+        // budget could reach.
+        const FILES: u32 = 12;
+        const PARTS: u32 = 3;
+        let fname = |f: u32| format!("Wide.S01E01.part{f:02}.rar");
+        let batch: Vec<crate::nntp::OverEntry> = (1..=FILES)
+            .flat_map(|f| {
+                (1..=PARTS).map(move |p| {
+                    entry(
+                        &format!("\"{}\" yEnc ({p}/{PARTS})", fname(f)),
+                        "wide@x",
+                        &format!("wide-{f}-{p}@x"),
+                        1000,
+                    )
+                })
+            })
+            .collect();
+
+        // The plain row: a DIFFERENT posting of the same name, so the
+        // batch contradicts it.
+        ix.ingest(
+            "alt.test",
+            &[entry(
+                &format!("\"{}\" yEnc (1/{PARTS})", fname(1)),
+                "wide@x",
+                "other-1@x",
+                1000,
+            )],
+            1000,
+        )
+        .unwrap();
+        let (stem, poster): (String, String) = ix
+            .db
+            .query_row("SELECT stem, poster FROM releases", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+
+        /// One release row plus one file row, keyed into the reverse
+        /// message-id map exactly as `ingest` keys its own writes.
+        fn add_row(
+            db: &rusqlite::Connection,
+            stem: &str,
+            poster: &str,
+            filename: &str,
+            parts: &[(u32, &str)],
+        ) -> i64 {
+            db.execute(
+                "INSERT INTO releases(stem, poster, grp, first_seen, first_posted)
+                 VALUES(?1, ?2, 'alt.test', 1000, 1000)",
+                rusqlite::params![stem, poster],
+            )
+            .unwrap();
+            let rid = db.last_insert_rowid();
+            let segs: Vec<(u32, String, u64)> = parts
+                .iter()
+                .map(|(n, id)| (*n, (*id).into(), 1000))
+                .collect();
+            db.execute(
+                "INSERT INTO files(release_id, filename, total_parts, bytes, segments, nsegs)
+                 VALUES(?1, ?2, ?3, 1000, ?4, ?5)",
+                rusqlite::params![
+                    rid,
+                    filename,
+                    PARTS,
+                    serde_json::to_string(&segs).unwrap(),
+                    segs.len() as i64
+                ],
+            )
+            .unwrap();
+            claims::msgid_map_insert(db, rid, parts.iter().map(|(_, id)| *id)).unwrap();
+            rid
+        }
+        let rows = |ix: &Index| -> i64 {
+            ix.db
+                .query_row("SELECT COUNT(*) FROM releases", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        // Sixteen contradicting siblings fill the candidate window; the
+        // hidden row sorts past all of them, so only the reverse probe
+        // can reach it. Its suffix is a literal rather than a real key
+        // for the same reason the batch cannot find it by key: the key
+        // is a function of coverage and this row was minted under
+        // different coverage.
+        for (i, suffix) in (0..MAX_GEN_SIBLINGS)
+            .map(|i| format!("{i:012x}"))
+            .enumerate()
+        {
+            add_row(
+                &ix.db,
+                &stem,
+                &format!("{poster}{POSTER_GEN_MARK}{suffix}"),
+                &fname(1),
+                &[(1, &format!("<filler-{i}@x>"))],
+            );
+        }
+        let hidden = add_row(
+            &ix.db,
+            &stem,
+            &format!("{poster}{POSTER_GEN_MARK}ffffffffffff"),
+            &fname(FILES),
+            &[(1, &format!("<wide-{FILES}-1@x>"))],
+        );
+        assert_eq!(rows(&ix), 2 + MAX_GEN_SIBLINGS);
+
+        ix.ingest("alt.test", &batch, 2000).unwrap();
+
+        assert_eq!(rows(&ix), 2 + MAX_GEN_SIBLINGS, "the cap still holds");
+        let held: i64 = ix
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE release_id=?1",
+                [hidden],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            held, FILES as i64,
+            "every file of the batch must land in the generation that was \
+             waiting for it - {held} of {FILES} did, so the cluster was dropped"
+        );
+        teardown(&dir, ix);
+    }
+
     fn f1_cats() -> Vec<crate::categories::CustomCategory> {
         vec![crate::categories::CustomCategory {
             slug: "formula-1".into(),
@@ -2359,7 +2524,7 @@ mod tests {
         teardown(&dir, ix);
     }
 
-    /// `Index::open`'s quality_v8 backfill re-parses every stem, and it
+    /// `Index::open`'s quality_v9 backfill re-parses every stem, and it
     /// runs BEFORE `set_custom` by construction - the constructor
     /// hardcodes an empty category list, so the pass cannot see the
     /// user's categories however the caller is written. Left unguarded it
@@ -2398,7 +2563,7 @@ mod tests {
             // did, or the key was bumped to pick up a new column.
             ix.db
                 .execute(
-                    "DELETE FROM kv WHERE k IN ('quality_v8','quality_v8_cursor')",
+                    "DELETE FROM kv WHERE k IN ('quality_v9','quality_v9_cursor')",
                     [],
                 )
                 .unwrap();

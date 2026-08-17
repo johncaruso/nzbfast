@@ -16,6 +16,15 @@ use super::*;
 #[path = "daemon_tests/dupe_tests.rs"]
 mod dupe_tests;
 
+#[path = "daemon_tests/notice_tests.rs"]
+mod notice_tests;
+
+// The read seam's stale-statement handling, out here for the same
+// ceiling and with the same #[path] requirement.
+#[cfg(feature = "indexer")]
+#[path = "daemon_tests/index_read_tests.rs"]
+mod index_read_tests;
+
 fn with_daemon(name: &str, f: impl FnOnce(&Arc<Daemon>)) {
     let dir = std::env::temp_dir().join(format!("nzbfast-dmn-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1320,6 +1329,32 @@ fn will_auto_retry_wants_the_cooldown_armed_and_a_transient_failure() {
 
         let done = jv("f4", "f4", serde_json::json!({"state": "Completed"}));
         assert!(!d.will_auto_retry(&done));
+
+        // ...and transient is not enough on its own. Missing articles on
+        // a post seven days old is not propagation, and the retry spent
+        // a second full download (~150 s, 1.9 GB) proving the same 1965
+        // segments absent - twice, 15 Aug. The bare messages above carry
+        // no age at all, which is the dateless-NZB convention and still
+        // retries, so both halves are pinned here.
+        let aged = |days: u32| {
+            format!(
+                "download incomplete: 1 file(s) with missing segments, 0 decode/write \
+                 errors; the post is {days} day(s) old, well past the minutes-to-hours \
+                 that propagation takes"
+            )
+        };
+        let old = jv(
+            "f5",
+            "f5",
+            serde_json::json!({"state": "Failed", "fail_message": aged(7)}),
+        );
+        assert!(!d.will_auto_retry(&old), "propagation finished days ago");
+        let young = jv(
+            "f6",
+            "f6",
+            serde_json::json!({"state": "Failed", "fail_message": aged(1)}),
+        );
+        assert!(d.will_auto_retry(&young), "still inside the window");
     });
 }
 
@@ -2081,7 +2116,7 @@ fn a_park_survives_a_racing_queue_save_in_its_window() {
             // this point reaches disk.
             super::super::storecut::arm_cut(0);
         });
-        d.park(job);
+        d.park_gen(job, None);
         super::super::storecut::disarm();
 
         let queued = std::fs::read_to_string(d.spool.join("queue.json")).unwrap_or_default();
@@ -2127,7 +2162,7 @@ fn a_delete_inside_the_park_window_buries_the_row_park_already_wrote() {
         super::super::storecut::on_park_gap(move |_| {
             tombstoned.lock_ok().tombstone = true;
         });
-        d.park(job);
+        d.park_gen(job, None);
         super::super::storecut::disarm();
 
         assert!(
@@ -2321,7 +2356,7 @@ fn a_retried_delete_does_not_carry_its_removal_into_the_next_park() {
         }
         d.reserved.lock_ok().insert(out.clone());
 
-        d.park(job.clone());
+        d.park_gen(job.clone(), None);
         assert!(
             !out.exists(),
             "the delete's deferred removal is what park owes the user"
@@ -2353,7 +2388,7 @@ fn a_retried_delete_does_not_carry_its_removal_into_the_next_park() {
             g.state = JobState::Completed;
             g.finished_unix = Some(2);
         }
-        d.park(job);
+        d.park_gen(job, None);
 
         assert!(
             out.join("release.mkv").exists(),
@@ -2687,56 +2722,6 @@ fn an_exiting_daemon_does_not_reopen_the_index() {
     });
 }
 
-/// The watch-failed strip rides the revisioned queue payload, so every
-/// mutation of the map must move `queue_rev` - an idle dashboard skips
-/// the payload while `client_q == qrev`, and an entry removed without a
-/// bump renders forever: its delete button answers "no such rejected
-/// file" for a row the daemon dropped long ago (reported 14 Aug 2026;
-/// the third instance of the payload-rider trap after the update banner
-/// and set_limit). No-op mutations must NOT bump, or every 5 s watch
-/// pass would re-send the payload to every idle tab.
-#[test]
-fn watch_failed_mutations_move_the_queue_rev() {
-    with_daemon("wfrev", |d| {
-        let dir = std::env::temp_dir().join(format!("nzbfast-wfrev-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let present = dir.join("present.nzb");
-        std::fs::write(&present, b"x").unwrap();
-        let gone = dir.join("gone.nzb");
-        let rev = || d.queue_rev.load(Ordering::Relaxed);
-        let val = |s: &str| (1u64, 2u64, s.to_string(), String::new());
-
-        let r0 = rev();
-        assert!(d.watch_failed_insert(present.clone(), val("truncated")));
-        assert_eq!(rev(), r0 + 1, "a fresh insert must bump");
-        assert!(
-            !d.watch_failed_insert(present.clone(), val("truncated")),
-            "re-inserting the identical row is the every-pass no-op"
-        );
-        assert_eq!(rev(), r0 + 1, "the no-op re-insert must not bump");
-        assert!(d.watch_failed_insert(present.clone(), val("kept")));
-        assert_eq!(rev(), r0 + 2, "a changed value must bump");
-
-        d.watch_failed_remove(&gone);
-        assert_eq!(rev(), r0 + 2, "removing an absent row must not bump");
-        d.watch_failed_remove(&present);
-        assert_eq!(rev(), r0 + 3, "a real removal must bump");
-
-        d.watch_failed_insert(present.clone(), val("truncated"));
-        d.watch_failed_insert(gone.clone(), val("truncated"));
-        let r1 = rev();
-        d.watch_failed_prune_missing();
-        assert_eq!(rev(), r1 + 1, "pruning a vanished file must bump");
-        assert!(
-            d.watch_failed.lock_ok().contains_key(&present),
-            "pruning must keep entries whose file is still on disk"
-        );
-        d.watch_failed_prune_missing();
-        assert_eq!(rev(), r1 + 1, "an empty prune must not bump");
-        let _ = std::fs::remove_dir_all(&dir);
-    });
-}
-
 // -- dupe_collision: the alias arm ------------------------------------------
 
 /// The 14 Aug 2026 double-download: one episode, two spellings of the
@@ -2826,4 +2811,134 @@ fn dupe_alias_meets_one_show_under_two_names_and_never_a_spinoff() {
             "different show ids: a spin-off must never be its parent's duplicate"
         );
     });
+}
+
+// -- the user's own delete, and what it says about the next add -------------
+
+/// Gary, 15/16 Aug 2026: delete a job, get told the files could not be
+/// removed, add the release again - and watch it sit in the queue as
+/// "held (duplicate)" against nothing he could see.
+///
+/// The hold is NOT against the record he deleted (that one leaves both
+/// stores, and this file's other tests pin that), and not against the
+/// leftover folder (`dupe_collision` never looks at disk). It is against
+/// whatever ELSE still carries the identity - here the held alternative
+/// that was queued behind the deleted job, which is the shape that
+/// deadlocks: the alternative is held for a record that no longer
+/// exists, so nothing will ever fail to promote it, and the re-add is
+/// then held behind the alternative. Two paused rows, no download, and
+/// the only way out a control the user has to go and find.
+///
+/// A delete is the user saying they do not have this release any more,
+/// whatever is still on disk. So it speaks for the next add of the same
+/// identity - once, and only until that add lands.
+#[test]
+fn a_deleted_release_is_not_a_duplicate_until_the_mark_is_spent() {
+    with_daemon("dupedeleted", |d| {
+        let a = "Johnny.Vegas.S02E03.1080p.WEB.h264-AAA";
+        let b = "Johnny.Vegas.S02E03.2160p.WEB.h264-BBB";
+        // The survivor: the alternative that was queued behind the job
+        // the user has just deleted. Paused at Duplicate priority, like
+        // every held alternative, and still a collision - the queue arm
+        // has never cared what state a row is in.
+        d.queue.lock_ok().push_back(jv(
+            "id-held",
+            b,
+            serde_json::json!({"dupe_key": dupe_key(b), "paused": true,
+                               "priority": DUPE_PRIORITY}),
+        ));
+        assert!(
+            d.dupe_collision(a).is_some(),
+            "the premise: the held alternative is what the re-add collides with"
+        );
+
+        d.note_releases_deleted(&[a.to_string()]);
+        assert!(
+            d.dupe_collision(a).is_none(),
+            "the user deleted this release - the re-add must not be held"
+        );
+        // The mark speaks for ONE release, not for the queue at large.
+        let other = "Some.Other.Show.S01E01.1080p.WEB.h264-CCC";
+        d.queue.lock_ok().push_back(jv(
+            "id-other",
+            other,
+            serde_json::json!({"dupe_key": dupe_key(other), "state": "Completed"}),
+        ));
+        assert!(
+            d.dupe_collision(other).is_some(),
+            "a mark for one release must not release holds on another"
+        );
+
+        // Spent by the add it was made for: a SECOND copy added behind
+        // that one is an ordinary duplicate again, or the window would
+        // leave the identity unprotected for a whole day.
+        d.clear_delete_mark(a);
+        assert!(
+            d.dupe_collision(a).is_some(),
+            "the mark is spent by the re-add, not by the clock alone"
+        );
+
+        // ...and it does expire. Stamped by hand rather than by waiting
+        // a day: the window is the only thing under test here.
+        d.note_releases_deleted(&[a.to_string()]);
+        d.deleted_recent.lock_ok().iter_mut().for_each(|m| {
+            m.at -= 25 * 3600;
+        });
+        assert!(
+            d.dupe_collision(a).is_some(),
+            "a day-old delete no longer speaks for a fresh add"
+        );
+    });
+}
+
+/// The kept-files notice carries the spooled NZB the delete held back,
+/// so it can offer the download again - and lets go of it when the
+/// notice does. A notice with nothing to offer is ordinary: the sidecar
+/// path has no spool copy left by the time it refuses.
+#[test]
+fn a_kept_files_notice_holds_the_nzb_it_offers_and_drops_it_with_the_note() {
+    with_daemon("keptnzb", |d| {
+        let nzb = d.spool.join("kept.nzb");
+        std::fs::write(&nzb, b"<nzb/>").unwrap();
+        let dir = d.spool.join("Some.Release");
+        d.note_delete_kept(
+            "Some.Release",
+            &dir,
+            "the Trash would not take it",
+            Some(&nzb),
+        );
+        // One entry per path: a bulk sweep over a shared folder refuses
+        // once per record and must not bury the notice in copies.
+        d.note_delete_kept("Some.Release", &dir, "again", None);
+        {
+            let k = d.delete_kept.lock_ok();
+            assert_eq!(k.len(), 1, "one notice per path");
+            assert_eq!(k[0].nzb, nzb.display().to_string(), "the offer is recorded");
+        }
+        // Losing the notice means losing the only name that file had.
+        drop_kept_nzb(&d.delete_kept.lock_ok()[0]);
+        assert!(
+            !nzb.exists(),
+            "the kept NZB goes with the notice that named it"
+        );
+    });
+}
+
+/// The notice file written before the retry offer existed is an array of
+/// `[name, path, why, at]` arrays, and each entry names a folder still
+/// sitting on the user's disk. An upgrade that dropped them would lose
+/// the one handle the notice exists to keep.
+#[test]
+fn kept_notices_load_from_the_shape_written_before_the_retry_offer() {
+    let legacy = serde_json::json!([["A.Release", "/tmp/out/A", "refused", 1_786_778_143_i64]]);
+    let k = kept_notes_from_json(&legacy).expect("the pre-struct shape must still load");
+    assert_eq!(k.len(), 1);
+    assert_eq!(
+        (k[0].name.as_str(), k[0].path.as_str()),
+        ("A.Release", "/tmp/out/A")
+    );
+    assert!(k[0].nzb.is_empty(), "an old notice has no NZB to offer");
+    // ...and the current shape round-trips.
+    let now = serde_json::to_value(&k).unwrap();
+    assert_eq!(kept_notes_from_json(&now).expect("round trip").len(), 1);
 }

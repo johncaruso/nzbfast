@@ -37,6 +37,126 @@ use std::collections::HashMap;
 /// offset-0 article against this to identify obfuscated recovery volumes.
 pub const MAGIC: &[u8; 8] = b"PAR2\0PKT";
 
+/// yEnc inflates an article by roughly 2%, and NZB `bytes=` attributes
+/// are the ENCODED figure - so raw payload is about this fraction of
+/// what the NZB declares. Only ever used to shrink an estimate, never
+/// to grow one: every caller here is bounding something.
+pub const YENC_RAW_FRACTION: f64 = 0.98;
+
+/// Per-slice packet overhead in a recovery volume: the 64-byte packet
+/// header plus the 4-byte exponent that precedes the slice data.
+pub const SLICE_PACKET_OVERHEAD: u64 = 68;
+
+/// The smallest share of a yEnc-encoded size that the raw payload
+/// behind it is taken to be, when nothing exact is known about the
+/// file.
+///
+/// [`YENC_RAW_FRACTION`] is the wrong constant for a FLOOR and the 15
+/// Aug post says why: 3,332,350,599 encoded bytes carried 3,229,432,857
+/// raw ones, an overhead of 3.19% where 0.98 allows 2%. The two sources
+/// of that overhead are both structural rather than incidental - CRLF
+/// every 128 output characters is 1.56%, and on payload that is already
+/// compressed or encrypted the four byte values yEnc must escape turn
+/// up at about their random-data rate of 1.6% - so a real post landing
+/// past 2% is the expectation, not the exception.
+///
+/// 0.95 leaves 1.8 points of headroom over that measurement, which is
+/// the whole job here: this is only ever multiplied into a number that
+/// a verdict then uses to STOP a download, so it must understate the
+/// raw bytes rather than flatter them.
+///
+/// It is a conservative constant, not a proof. Escaping can in
+/// principle double a file - a payload made mostly of the four byte
+/// values that escape would blow past any fraction - and the rigorous
+/// bound that follows from that, near 0.49, is worthless: it would put
+/// back the halving that a census sample was just released from, and no
+/// real recovery-set payload is anywhere near it. When the exact length
+/// IS known (a PAR2 FileDesc packet states it), use that instead of
+/// this: `raw >= encoded_missing - (encoded_total - exact_length)` is a
+/// true bound and needs no constant.
+pub const YENC_RAW_FRACTION_FLOOR: f64 = 0.95;
+
+/// A conservative LOWER bound on the raw bytes behind `encoded_bytes`
+/// of yEnc - the conversion every deficit needs before it may be
+/// divided by a RAW block size.
+///
+/// NZB `bytes=` attributes are the encoded figure and a PAR2 block size
+/// is a raw one, so dividing one by the other over-counts damage by the
+/// whole yEnc overhead. That over-count used to be hidden by a flat 0.5
+/// margin on the deficit; at a census margin of 1.0 it is not, and it
+/// can carry a "floor" past the number of blocks the file even has.
+pub fn min_raw_bytes(encoded_bytes: u64) -> u64 {
+    (encoded_bytes as f64 * YENC_RAW_FRACTION_FLOOR) as u64
+}
+
+/// Recovery blocks a volume of `encoded_bytes` PROBABLY holds.
+///
+/// The point estimate the repair path has always used for volumes whose
+/// name declares no count (`.vol-NN.par2`): raw bytes over the packet
+/// stride. It is neither a floor nor a ceiling - a volume also carries a
+/// copy of the critical packets, which inflates it, and the yEnc figure
+/// is approximate - so it is the number to SHOW a user, never the number
+/// a verdict leans on. For that, see [`max_recovery_blocks`].
+pub fn est_recovery_blocks(encoded_bytes: u64, block_size: u64) -> usize {
+    if block_size == 0 {
+        return 0;
+    }
+    // The +100 (rather than the exact SLICE_PACKET_OVERHEAD of 68) is
+    // the repair path's long-standing figure and is deliberately kept:
+    // it absorbs the critical packets every volume repeats, which is
+    // what makes this an ESTIMATE rather than a bound.
+    (encoded_bytes as f64 * YENC_RAW_FRACTION / (block_size as f64 + 100.0)) as usize
+}
+
+/// The MOST recovery blocks a volume of `encoded_bytes` could possibly
+/// hold - the only recovery figure a verdict that STOPS a download may
+/// rest on.
+///
+/// A slice costs `block_size + SLICE_PACKET_OVERHEAD` raw bytes and the
+/// NZB's `bytes=` is the larger, yEnc-encoded figure, so dividing the
+/// encoded size by the bare block size can only ever over-count. Every
+/// byte a volume spends on critical packets is another block it does
+/// not hold. That one-sidedness is the point: an IMPOSSIBLE verdict
+/// compares a floor on the damage against this ceiling on the cure, so
+/// neither half can flatter the answer into stopping a job that would
+/// have finished.
+///
+/// Returns u64, and the caller compares in u64, because `as usize` is a
+/// SILENT truncation on a 32-bit target and we ship one
+/// (`armv7-unknown-linux-musleabihf`). `encoded_bytes` is the NZB's
+/// poster-controlled `bytes=` and `parse_main` admits a block size as
+/// small as 4, so 16 GiB declared on one volume is enough to wrap the
+/// quotient past 2^32 - and a ceiling that wraps to 0 turns any deficit
+/// into a false IMPOSSIBLE, which is the one direction this function's
+/// whole one-sidedness exists to forbid.
+pub fn max_recovery_blocks(encoded_bytes: u64, block_size: u64) -> u64 {
+    if block_size == 0 {
+        return 0;
+    }
+    encoded_bytes / block_size
+}
+
+/// Blocks that `missing_bytes` of payload MUST have damaged.
+///
+/// Wherever those bytes sit, they cannot all hide inside fewer than
+/// `missing_bytes / block_size` slices - blocks do not span files and a
+/// block is damaged by a single absent byte. Rounded DOWN rather than up
+/// (the true bound is the ceiling) because this figure exists to be
+/// compared against [`max_recovery_blocks`], and every rounding here
+/// should move away from claiming impossibility.
+///
+/// u64 for the same reason as [`max_recovery_blocks`], and here the
+/// narrowing cast was the less dangerous of the two only by luck: it
+/// wraps the DEFICIT down, which softens a verdict rather than
+/// manufacturing one. Saturating it instead would be the false-IMPOSSIBLE
+/// direction, so the fix on both sides is to not narrow at all.
+pub fn min_damaged_blocks(missing_bytes: u64, block_size: u64) -> u64 {
+    if block_size == 0 {
+        return 0;
+    }
+    missing_bytes / block_size
+}
+
 /// MD5 of a file's first `min(16384, length)` bytes - the quantity a
 /// FileDesc packet's `md5_16k` records (short files are NOT zero-padded).
 /// For callers holding a decoded offset-0 span; None when the span does
@@ -776,5 +896,141 @@ mod tests {
         // Existing guards still hold: zero, and non-multiple-of-4.
         assert!(parse_main(&main_body(0, 1)).is_none());
         assert!(parse_main(&main_body(1002, 1)).is_none());
+    }
+
+    /// The three block figures, and which way each of them leans.
+    ///
+    /// A verdict that STOPS a download compares a FLOOR on the damage
+    /// against a CEILING on the cure, so the estimate that sits between
+    /// them may never be substituted for either. Real numbers from the
+    /// 15 Aug post: 1,614,720-byte slices, and volumes the repair path
+    /// found held 40 blocks between them.
+    #[test]
+    fn the_recovery_bounds_never_cross_the_estimate() {
+        const BLOCK: u64 = 1_614_720;
+        let volumes = [
+            1_708_175u64,
+            3_415_979,
+            6_790_307,
+            13_497_147,
+            15_163_522,
+            26_869_479,
+        ];
+        let est: usize = volumes.iter().map(|&b| est_recovery_blocks(b, BLOCK)).sum();
+        let ceil: u64 = volumes.iter().map(|&b| max_recovery_blocks(b, BLOCK)).sum();
+        assert_eq!(est, 40, "the estimate reproduces the budget repair found");
+        assert_eq!(ceil, 40u64);
+        // The ceiling can never come in under the estimate - that is the
+        // only relationship a verdict may lean on.
+        for &b in &volumes {
+            assert!(
+                max_recovery_blocks(b, BLOCK) >= est_recovery_blocks(b, BLOCK) as u64,
+                "{b} bytes: ceiling below estimate"
+            );
+        }
+        // A volume too small for one slice holds none, however named.
+        assert_eq!(max_recovery_blocks(41_901, BLOCK), 0);
+        assert_eq!(est_recovery_blocks(41_901, BLOCK), 0);
+        // A zero block size is not a set: every figure is zero rather
+        // than a division by it.
+        assert_eq!(max_recovery_blocks(1 << 30, 0), 0);
+        assert_eq!(est_recovery_blocks(1 << 30, 0), 0);
+        assert_eq!(min_damaged_blocks(1 << 30, 0), 0);
+    }
+
+    /// Missing bytes cannot hide in fewer slices than they fill. The
+    /// count rounds DOWN, one step further from claiming impossibility
+    /// than the true bound (which is the ceiling) already is.
+    #[test]
+    fn missing_bytes_force_at_least_that_many_damaged_blocks() {
+        assert_eq!(min_damaged_blocks(0, 4_096), 0);
+        assert_eq!(min_damaged_blocks(1, 4_096), 0);
+        assert_eq!(min_damaged_blocks(4_095, 4_096), 0);
+        assert_eq!(min_damaged_blocks(4_096, 4_096), 1);
+        assert_eq!(min_damaged_blocks(4_097, 4_096), 1);
+        // The 15 Aug post: 1.45 GB gone, 1.6 MB slices. RAW bytes -
+        // feeding this the NZB's encoded figure is the units error
+        // [`min_raw_bytes`] exists to stop.
+        assert_eq!(min_damaged_blocks(1_453_188_000, 1_614_720), 899);
+    }
+
+    /// The encoded-to-raw conversion has one job: never overstate the
+    /// raw payload, because everything downstream of it is a damage
+    /// FLOOR that stops a download.
+    ///
+    /// The 15 Aug post is the measurement it is set against -
+    /// 3,332,350,599 encoded bytes over 3,229,432,857 raw ones, 3.19%
+    /// overhead where [`YENC_RAW_FRACTION`] allows 2%. Whole-file damage
+    /// is where an overstatement shows up as an outright impossibility:
+    /// the file has 2,000 slices and the unconverted figure claimed
+    /// 2,063 of them damaged.
+    #[test]
+    fn encoded_bytes_convert_to_a_raw_floor_the_real_post_clears() {
+        const ENCODED: u64 = 3_332_350_599;
+        const RAW: u64 = 3_229_432_857;
+        const BLOCK: u64 = 1_614_720;
+
+        assert!(
+            min_raw_bytes(ENCODED) <= RAW,
+            "the floor overstates the payload it is a floor for"
+        );
+        assert!(
+            min_damaged_blocks(min_raw_bytes(ENCODED), BLOCK) <= RAW.div_ceil(BLOCK),
+            "whole-file damage claimed more blocks than the file has"
+        );
+        // And it gives up only the overhead: a bound that threw the
+        // deficit away would be safe and useless.
+        assert!(min_raw_bytes(ENCODED) * 10 >= RAW * 9);
+        // 0.98 is the ESTIMATE fraction and would not have caught this
+        // post - the reason a second, blunter constant exists at all.
+        assert!((ENCODED as f64 * YENC_RAW_FRACTION) as u64 > RAW);
+
+        assert_eq!(min_raw_bytes(0), 0);
+    }
+
+    /// The Main packet of a real par2 index states the slice size in its
+    /// first 92 bytes - which is what makes the pre-flight probe one
+    /// small article rather than a download.
+    #[test]
+    fn a_real_index_states_its_block_size_in_its_first_bytes() {
+        const INDEX: &[u8] = include_bytes!("../tests/fixtures/par2/testset.par2");
+        let set = Par2Set::parse(&[INDEX]).expect("fixture is a valid set");
+        assert_eq!(set.block_size, 4_096);
+        // And from the head alone: the Main packet is the first thing in
+        // the file, so a partial read is enough.
+        let head = Par2Set::parse(&[&INDEX[..256]]).expect("Main packet is in the first bytes");
+        assert_eq!(head.block_size, 4_096);
+    }
+
+    /// Both verdict bounds must survive a quotient past 2^32.
+    ///
+    /// They used to narrow the u64 quotient with `as usize`, which is a
+    /// silent truncation of the low 32 bits on a 32-bit target - and we
+    /// ship one (`armv7-unknown-linux-musleabihf`). `encoded_bytes` is
+    /// the NZB's poster-controlled `bytes=` with no cap on this path and
+    /// `parse_main` admits a block size as small as 4, so 16 GiB
+    /// declared on one volume wraps the CEILING to zero and any deficit
+    /// at all becomes a false IMPOSSIBLE - refusing a job that would
+    /// have finished, which is the exact direction these two functions
+    /// exist to forbid. Keeping the arithmetic in u64 makes the
+    /// truncation unrepresentable; on a 64-bit host this test cannot
+    /// fail either way, so it is here as the shape guard, not as proof.
+    #[test]
+    fn the_verdict_bounds_do_not_wrap_at_a_32_bit_quotient() {
+        const WRAP: u64 = 1 << 32;
+        // A ceiling of exactly 2^32 blocks: the value `as usize`
+        // truncated to 0 on armv7.
+        let ceiling: u64 = max_recovery_blocks(4 * WRAP, 4);
+        assert_eq!(ceiling, WRAP);
+        assert!(
+            ceiling > u32::MAX as u64,
+            "the guard needs a wrapping value"
+        );
+        // The deficit half wrapped DOWN, which softens rather than
+        // condemns - but it is the same cast and the same fix.
+        assert_eq!(min_damaged_blocks(4 * WRAP, 4), WRAP);
+        // And the ordering the whole module rests on holds across the
+        // boundary: equal bytes on both sides never condemns.
+        assert!(min_damaged_blocks(4 * WRAP, 4) <= max_recovery_blocks(4 * WRAP, 4));
     }
 }

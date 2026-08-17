@@ -488,3 +488,312 @@ async fn nzbget_delete_variants_keep_their_own_contracts() {
     drop(d);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Delete a job, add the same release again, and it must DOWNLOAD - not
+/// sit in the queue as "held (duplicate)" behind a record the user has
+/// just told us they no longer have.
+///
+/// Measured on the unfixed daemon, and it is worse than one row waiting:
+/// with an alternative already held behind the deleted job, the re-add
+/// is held behind the ALTERNATIVE, while the alternative is held for a
+/// record that no longer exists - and a hold is released by its original
+/// FAILING, which a deleted record can never do. Two paused rows, no
+/// download, and the only way out is a control the user has to go and
+/// find (one reported hunting for "that blue icon").
+///
+/// The whole scenario runs against a dead server with the queue paused:
+/// nothing here is about downloading, only about what the add path makes
+/// of the identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_release_added_again_is_not_held_as_its_own_duplicate() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-redel-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{dead_port},\"tls\":false}}]}}"),
+    )
+    .unwrap();
+    let out = dir.join("complete");
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(&out);
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        let upload = |stem: &str| -> String {
+            let xml = format!(
+                "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"{stem}.bin (1/1)\">\n    <groups><group>g</group></groups>\n    <segments>\n      <segment bytes=\"10000\" number=\"1\">{stem}seg1@test</segment>\n    </segments>\n  </file>\n</nzb>\n"
+            );
+            let boundary = "----nzbfastboundary";
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{stem}.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(xml.as_bytes());
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            let ctype = format!("multipart/form-data; boundary={boundary}");
+            let r = http(port, "/api?mode=addfile&output=json", Some((&ctype, &body)));
+            assert!(r.contains("\"status\":true"), "{r}");
+            r.split("SABnzbd_nzo_").nth(1).unwrap().split('"').next()
+                .map(|s| format!("SABnzbd_nzo_{s}")).unwrap()
+        };
+        // The queue as (name, priority) pairs, which is the whole
+        // question here: "Duplicate" is the held row.
+        let prios = || -> Vec<(String, String)> {
+            let q = http(port, "/api?mode=queue&output=json", None);
+            let v: serde_json::Value = serde_json::from_str(&q).unwrap();
+            v["queue"]["slots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| {
+                    (
+                        s["filename"].as_str().unwrap_or_default().to_string(),
+                        s["priority"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        };
+
+        http(port, "/api?mode=pause&output=json", None);
+        let a = "Johnny.Vegas.S02E03.1080p.WEB.h264-AAA";
+        let b = "Johnny.Vegas.S02E03.2160p.WEB.h264-BBB";
+        let a_id = upload(a);
+        upload(b);
+        assert_eq!(
+            prios(),
+            vec![
+                (a.to_string(), "Normal".to_string()),
+                (b.to_string(), "Duplicate".to_string())
+            ],
+            "the premise: B is held as an alternative to A"
+        );
+
+        // The user deletes A - with its files, the ordinary thing to
+        // press - and asks for the same release again.
+        let r = http(
+            port,
+            &format!("/api?mode=queue&name=delete&value={a_id}&del_files=1&output=json"),
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        upload(a);
+        let after = prios();
+        assert!(
+            after.iter().any(|(n, p)| n == a && p == "Normal"),
+            "the re-add of a release the user just deleted must run: {after:?}"
+        );
+        assert!(
+            after.iter().any(|(n, p)| n == b && p == "Duplicate"),
+            "...and the alternative behind it stays held, now against the new copy: {after:?}"
+        );
+
+        // The user's delete speaks ONCE. A third copy arriving behind
+        // the re-add is an ordinary duplicate of it, or the identity
+        // would be unprotected for the whole window.
+        let c = "Johnny.Vegas.S02E03.720p.WEB.h264-CCC";
+        upload(c);
+        let after = prios();
+        assert!(
+            after.iter().any(|(n, p)| n == c && p == "Duplicate"),
+            "the mark is spent by the add it was made for: {after:?}"
+        );
+
+        // And deleting the BACKUP copy is not a statement about the
+        // identity at all - the row it was held for is still running.
+        // A stamp there would let the next add of the same episode
+        // download alongside it, which is a double download.
+        let b_id = {
+            let q = http(port, "/api?mode=queue&output=json", None);
+            let v: serde_json::Value = serde_json::from_str(&q).unwrap();
+            v["queue"]["slots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["filename"] == b)
+                .map(|s| s["nzo_id"].as_str().unwrap().to_string())
+                .expect("the alternative")
+        };
+        let r = http(
+            port,
+            &format!("/api?mode=queue&name=delete&value={b_id}&del_files=1&output=json"),
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        let d2 = "Johnny.Vegas.S02E03.480p.WEB.h264-DDD";
+        upload(d2);
+        let after = prios();
+        assert!(
+            after.iter().any(|(n, p)| n == d2 && p == "Duplicate"),
+            "deleting a held alternative must not release the identity: {after:?}"
+        );
+    })
+    .await
+    .unwrap();
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The kept-files notice closes its own loop: "download it again" adds
+/// the release back from the spool copy the refused delete held on to.
+///
+/// Before this, the notice named a release, named a folder, and offered
+/// nothing but "dismiss" - so a user who deleted a download to fetch it
+/// again had to leave the notice, find the release, add it by hand, and
+/// then get past a duplicate hold. The refusal is forced here by taking
+/// write permission off the download root, which is a unix trick; the
+/// path under test is the same one a Windows Trash refusal takes (it is
+/// `remove_job_files` answering `Kept` either way).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_files_notice_can_add_the_release_again() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!("nzbfast-keptagain-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        format!("{{\"servers\":[{{\"host\":\"127.0.0.1\",\"port\":{dead_port},\"tls\":false}}]}}"),
+    )
+    .unwrap();
+    let out = dir.join("complete");
+    std::fs::create_dir_all(&out).unwrap();
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--out")
+            .arg(&out);
+        c
+    })
+    .await;
+    let port = d.port;
+    let out2 = out.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let stem = "Kept.Release.S01E01.1080p.WEB.h264-KKK";
+        let xml = format!(
+            "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n  <file poster=\"x\" date=\"0\" subject=\"{stem}.bin (1/1)\">\n    <groups><group>g</group></groups>\n    <segments>\n      <segment bytes=\"10000\" number=\"1\">keptseg1@test</segment>\n    </segments>\n  </file>\n</nzb>\n"
+        );
+        let boundary = "----nzbfastboundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{stem}.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(xml.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let ctype = format!("multipart/form-data; boundary={boundary}");
+        http(port, "/api?mode=pause&output=json", None);
+        let r = http(port, "/api?mode=addfile&output=json", Some((&ctype, &body)));
+        let id = r
+            .split("SABnzbd_nzo_")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .map(|s| format!("SABnzbd_nzo_{s}"))
+            .expect("nzo_id");
+
+        // Payload on disk, and a download root the daemon cannot remove
+        // from: exactly the state a refused Trash leaves behind.
+        let payload = out2.join(stem);
+        std::fs::create_dir_all(&payload).unwrap();
+        std::fs::write(payload.join("part.bin"), b"partial payload").unwrap();
+        std::fs::set_permissions(&out2, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = http(
+            port,
+            &format!("/api?mode=queue&name=delete&value={id}&del_files=1&output=json"),
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "{r}");
+        std::fs::set_permissions(&out2, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let q = http(port, "/api?mode=queue&output=json", None);
+        let v: serde_json::Value = serde_json::from_str(&q).unwrap();
+        let note = v["queue"]["delete_kept"]
+            .as_array()
+            .and_then(|a| a.first().cloned())
+            .unwrap_or_else(|| panic!("a refused delete owes a notice: {q}"));
+        assert_eq!(note["name"], stem, "{q}");
+        assert_eq!(note["retry"], true, "the notice must be able to offer the add: {q}");
+
+        // The one click the notice now has. The path is the notice's
+        // identity, and it carries '/' and (on a temp dir) '.' - so it
+        // is percent-encoded rather than pasted into the query.
+        let raw = note["path"].as_str().unwrap();
+        let path: String = raw
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        let r = http(
+            port,
+            &format!("/api?mode=delete_kept_retry&value={path}&output=json"),
+            None,
+        );
+        assert!(r.contains("\"status\":true"), "retry from the notice: {r}");
+        let q = http(port, "/api?mode=queue&output=json", None);
+        let v: serde_json::Value = serde_json::from_str(&q).unwrap();
+        assert_eq!(
+            v["queue"]["slots"][0]["filename"], stem,
+            "the release must be back in the queue: {q}"
+        );
+        assert_eq!(
+            v["queue"]["slots"][0]["priority"], "Normal",
+            "and running, not held behind the copy it replaces: {q}"
+        );
+        assert_eq!(
+            v["queue"]["delete_kept"].as_array().map(Vec::len),
+            Some(0),
+            "the notice is spent once it has been acted on: {q}"
+        );
+    })
+    .await
+    .unwrap();
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}

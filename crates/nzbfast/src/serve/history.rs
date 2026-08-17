@@ -432,7 +432,10 @@ pub(super) fn history_page(d: &Daemon, q: &HistQuery, summary: bool) -> (Vec<Val
         matched += 1;
         // Direct id selection bypasses the window (SAB semantics: a
         // named id is always findable, whatever page is showing).
-        if q.ids.is_none() && q.limit > 0 && (idx < q.start || idx >= q.start + q.limit) {
+        if q.ids.is_none()
+            && q.limit > 0
+            && (idx < q.start || idx >= q.start.saturating_add(q.limit))
+        {
             continue;
         }
         if q.ids.is_none() && q.limit == 0 && idx < q.start {
@@ -451,26 +454,54 @@ pub(super) fn history_page(d: &Daemon, q: &HistQuery, summary: bool) -> (Vec<Val
 
 /// §96 (AltMount audit, item 2): a Completed row whose output directory
 /// the user has since deleted presents as Failed - "the files this row
-/// promises are not there". An *arr that reads Completed plus a storage
-/// path re-tries the import against the missing path forever; Failed is
-/// the one status its failed-download handling acts on (grab another
-/// release), which for a job whose payload was deleted before import is
-/// the right outcome.
+/// promises are not there". Nothing else notices for a job nzbfast
+/// grabbed for itself, and Failed is the one status a SAB client's
+/// failed-download handling acts on (grab another release), which for a
+/// payload deleted before anyone consumed it is the right outcome.
 ///
-/// The guard is the whole point (and why the naive flip was deferred off
-/// the v1.0.14 release day): the PARENT directory must still exist, so
-/// this fires only for "this job's folder was deleted", never for "the
-/// NAS is unmounted" - a mount that is down would otherwise flip a whole
-/// page of healthy history to Failed at once and have every *arr
-/// blocklist a healthy release per poll, the §154 harm class. Checked at
-/// render time for the rows on the requested page only, never persisted
-/// and never swept in the background; the store keeps the truthful
-/// Completed, so a restored folder restores the row.
+/// **Not for *arr-grabbed jobs, and that is the fix, not an oversight.**
+/// The five conditions below are also the NORMAL successful end state of
+/// every *arr download: Sonarr/Radarr import the payload (hardlink or
+/// move) and then remove the leftover download folder, leaving the
+/// parent - the completed-downloads root - exactly where it was. So the
+/// flip fired on success, and every imported row eventually read
+/// "Failed: the downloaded files are no longer on disk". No filesystem
+/// evidence separates "imported and cleaned up" from "deleted before
+/// import" - both leave an absent directory under a live parent - so the
+/// question has to be answered by WHO OWNS THE IMPORT, and for an *arr
+/// job that is the *arr. What we give up by standing down: an *arr stuck
+/// on a folder deleted before it imported no longer gets auto-failed by
+/// us, and instead surfaces in the *arr's own queue as the import
+/// warning it already raises. That is the smaller error by a wide
+/// margin - the false Failed fired on every successful download, the
+/// true one needs a user to delete a completed folder inside the import
+/// window.
+///
+/// Measured blast radius of the false Failed, so the next reader does
+/// not have to re-derive it: Sonarr's `FailedDownloadService.Check`
+/// early-returns unless the tracked download is `Downloading` or
+/// `ImportBlocked`, and `TrackedDownloadService` re-seeds state from its
+/// own `DownloadImported` history event after a restart - so an
+/// already-imported release was NOT blocklisted or re-grabbed. The harm
+/// was a false and alarming display plus the facade `status` field every
+/// SAB client reads (and a real blocklist only if the *arr's database is
+/// reset while the row is still in our history).
+///
+/// The parent guard stays and is load-bearing: the flip fires only while
+/// the PARENT directory still exists, so this is never "the NAS is
+/// unmounted" - a mount that is down would otherwise flip a whole page
+/// of healthy history to Failed at once and have every *arr blocklist a
+/// healthy release per poll, the §154 harm class. Checked at render time
+/// for the rows on the requested page only, never persisted and never
+/// swept in the background; the store keeps the truthful Completed, so a
+/// restored folder restores the row.
 fn storage_deleted(j: &Job) -> bool {
     j.state == JobState::Completed
         // Mid-move the directory is legitimately absent at one end;
         // the mover's own amber furniture reports that state.
         && !j.move_pending
+        // The *arr owns this payload's import and its cleanup - see above.
+        && !is_arr_origin(&j.origin)
         && j.out_dir.is_absolute()
         && !j.out_dir.exists()
         && j.out_dir.parent().is_some_and(|p| p.exists())

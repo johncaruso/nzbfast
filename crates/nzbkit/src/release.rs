@@ -981,6 +981,14 @@ fn audio_marker(tok: &str) -> bool {
 /// Ebook-format markers. `cbr` is deliberately absent: it means both
 /// "comic book RAR" and "constant bit rate", so it would drag albums
 /// into the book lane.
+///
+/// `pdf` IS here, and it is the marker the magazine lane runs on: a
+/// magazine is posted as its own PDF ("PC_Games_Hardware_Magazin_
+/// September_No_09_2026.pdf") and carries no other book evidence at
+/// all, so without it every magazine parsed as a MOVIE with a year and
+/// sat in the film lane. Its only caller filters on
+/// `no_video_evidence`, so a film that somehow names a PDF alongside a
+/// resolution or a codec keeps its kind.
 fn book_marker(tok: &str) -> bool {
     matches!(
         tok,
@@ -992,6 +1000,7 @@ fn book_marker(tok: &str) -> bool {
             | "fb2"
             | "djvu"
             | "cbz"
+            | "pdf"
             | "ebook"
             | "ebooks"
             | "audiobook"
@@ -1155,6 +1164,57 @@ fn media_key(kind: &Kind, title: &str) -> String {
         "mu"
     };
     format!("{prefix}:{}", norm_title(title))
+}
+
+/// Put back the lane a FED name dropped.
+///
+/// Every classification site parses `COALESCE(pre_title, stem)`: the
+/// proven name is better identity than an obfuscated stem, and the
+/// comments at those sites explain why re-parsing the raw stem there
+/// would undo the naming. But a fed title names the WORK, not the file.
+/// The Spotnet spot that proves `Luiten, Hetty - Op eigen benen.epub`
+/// is titled `Hetty Luiten - Op eigen benen`, and `.epub` - the one
+/// token saying "book" - is gone with it. The fed parse then falls
+/// through `None => Kind::Movie`, the junk scorer sees an evidence-free
+/// movie and scores 60, and a wall whose default hides >= 50 shows no
+/// books at all. Measured on a live index 16 Aug 2026: 33 of the 38
+/// August rows from e-book groups were filed `movie`, every one of them
+/// hidden.
+///
+/// So when the fed parse produced a bare Movie/Other with no video
+/// evidence whatsoever, and the STEM parses to Book or Music, take that
+/// kind and re-key. The title stays the fed one - only the lane moves.
+///
+/// `fed` is the name `p` was parsed from. When it IS the stem there is
+/// nothing to recover and the second parse would be pure waste - which
+/// matters: the `quality_v*` backfill calls this once per row over a
+/// multi-million-row index, and the un-named rows are the majority.
+pub fn recover_media_kind(p: &mut Parsed, fed: &str, stem: &str) {
+    if fed == stem {
+        return;
+    }
+    if !matches!(p.kind, Kind::Movie | Kind::Other) {
+        return;
+    }
+    // Any video/episode fact at all means the fed name classified on
+    // evidence, not by falling through, and it is not ours to overrule.
+    if !no_video_evidence(
+        &p.res,
+        &p.vcodec,
+        &p.source,
+        p.remux,
+        p.season,
+        p.date.is_some(),
+    ) || p.episode.is_some()
+    {
+        return;
+    }
+    let from_stem = parse_release(stem);
+    if !matches!(from_stem.kind, Kind::Book | Kind::Music) {
+        return;
+    }
+    p.kind = from_stem.kind.clone();
+    p.key = media_key(&p.kind, &p.title);
 }
 
 /// Split a "Credit - Work" title into its halves - the artist/author and

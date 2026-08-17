@@ -23,6 +23,13 @@
 //!   design constraint. The instant path grabs through the SAME pass, so
 //!   a worse encode arriving later cannot preempt the better one already
 //!   in hand.
+//! - `an_arrival_the_full_scan_pass_ingests_still_reaches_the_instant_path`:
+//!   the OTHER ingest leg. The tip watcher is not the only thing that
+//!   reads new articles - it stands down for the whole of every download
+//!   - and an arrival the full pass picks up instead has to reach the
+//!   instant path just the same. The three cases above cannot see this:
+//!   with both legs live, which one gets to the post first is a race,
+//!   and this one switches the tip watcher off to settle it.
 //!
 //! The harness is the shape tests/watchlist_packs.rs uses - copied, not
 //! shared, because nzbfast is a binary-only crate and integration tests
@@ -242,10 +249,20 @@ fn daemon_cmd(dir: &Path, cfg: &Path, db: &Path, port: u16) -> Command {
     c
 }
 
+/// [`watching`] with the tip watcher at its 5 s floor - what every case
+/// about the tip leg wants.
+async fn watching(dir: &Path, mock: &MockServer, items: &str) -> Daemon {
+    watching_tip(dir, mock, items, 5).await
+}
+
 /// A daemon watching a live group on `mock`, with `items` as the
 /// watchlist and an index that already knows the group (so the tip
 /// watcher, which never seeds a group itself, will follow it).
-async fn watching(dir: &Path, mock: &MockServer, items: &str) -> Daemon {
+///
+/// `tip_secs` is the tip watcher's interval, and 0 switches it off
+/// outright - which is how the scan-leg case below gets the full pass to
+/// be the only leg that can reach the post.
+async fn watching_tip(dir: &Path, mock: &MockServer, items: &str, tip_secs: u64) -> Daemon {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
     let db = dir.join("index.db");
@@ -279,7 +296,7 @@ async fn watching(dir: &Path, mock: &MockServer, items: &str) -> Daemon {
     std::fs::write(
         cfg.with_file_name("settings.json"),
         format!(
-            "{{\"index_enabled\": true, \"index_tip_secs\": 5, \
+            "{{\"index_enabled\": true, \"index_tip_secs\": {tip_secs}, \
               \"index_groups\": [\"{GROUP}\"], \"watchlist_instant\": true}}"
         ),
     )
@@ -343,6 +360,26 @@ fn jobs_named(blob: &str, stem: &str) -> usize {
 
 fn status(port: u16) -> String {
     http_get(port, "/api?mode=watchlist_status&output=json").1
+}
+
+/// Wait for a line in the daemon's OWN log - the same file
+/// [`wait_ready`] watches, named after the port it bound.
+///
+/// Used to wait out the startup scan pass rather than sleeping a guessed
+/// number of seconds at it: the scan is what a case about the scan leg
+/// has to be on the far side of, and the pass says so itself.
+fn wait_log(dir: &Path, port: u16, needle: &str, secs: u64) -> bool {
+    let log = dir.join(format!("daemon-{port}.log"));
+    for _ in 0..(secs * 10) {
+        if std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
 }
 
 /// The headline: a watched release is posted while the daemon is
@@ -524,4 +561,99 @@ async fn the_quality_ladder_still_applies_on_the_instant_path() {
     .await
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §74's OTHER ingest leg. The tip watcher is not the only thing that
+/// reads new articles: it stands down for the whole of every download
+/// (and for every full pass, and while the indexer is paused), and what
+/// covers the range it missed is the next FULL scan pass. An arrival is
+/// an arrival whichever leg happens to read it, so the instant path has
+/// to see it either way - otherwise "grabbed seconds after it was
+/// posted" quietly becomes "grabbed at the next 60 s pass" depending on
+/// which leg won a race nobody can see.
+///
+/// The tip watcher is switched off outright here (`index_tip_secs: 0`),
+/// which leaves the full pass as the only way the post can reach the
+/// index at all. That is what makes this deterministic where the three
+/// cases above are not: with both legs live, whichever one gets to the
+/// group first decides, and the startup pass usually wins.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_arrival_the_full_scan_pass_ingests_still_reaches_the_instant_path() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-wlinst-scan-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+    let mock = MockServer::start_full(
+        Default::default(),
+        Default::default(),
+        Vec::new(),
+        Chaos::default(),
+    )
+    .await;
+    let d = watching_tip(
+        &dir,
+        &mock,
+        r#"[{"id":1,"kind":"tv","title":"Wanted Show","seasons":"","episodes":"",
+             "min_quality":"any","target_quality":"1080p","enabled":true}]"#,
+        0,
+    )
+    .await;
+    let port = d.port;
+    let stem = "Wanted.Show.S01E04.1080p.WEB.h264-GRP";
+    let dir2 = dir.clone();
+    let mock = std::sync::Arc::new(mock);
+    let m2 = mock.clone();
+    tokio::task::spawn_blocking(move || {
+        // The startup pass has to be BEHIND us before anything is
+        // posted, and so does the watchlist pass that setting the list
+        // woke. Otherwise either of them could be what grabbed the
+        // release, and this case would be reading its own setup back.
+        // The pass says so itself - waited for rather than slept at.
+        assert!(
+            wait_log(
+                &dir2,
+                port,
+                &format!("{GROUP}: up to date (high {SEEDED_MARK})"),
+                60
+            ),
+            "the startup scan pass never reported the group up to date"
+        );
+        // NOW it arrives, with the tip watcher off: the next full pass
+        // is the only thing that can read it.
+        m2.post_overview(release(SEEDED_MARK + 1, stem));
+        http_get(port, "/api?mode=index_scan_now&output=json");
+        let seen = wait_grabbed(port, "Wanted.Show.S01E04", 40).unwrap_or_else(|| {
+            panic!(
+                "the arrival the SCAN pass ingested was never grabbed - \
+                 nothing woke the watchlist, so it is waiting for the \
+                 periodic pass:\n{}",
+                grabbed(port)
+            )
+        });
+        assert!(seen.contains(stem), "grabbed under the wrong name: {seen}");
+        // The claim itself: grabbed BECAUSE it arrived. Polled for the
+        // same reason the headline case polls - the pass publishes its
+        // state at the end, so the job reaches the queue first.
+        let mut st = String::new();
+        for _ in 0..40 {
+            st = status(port);
+            if st.contains("\"instant\":{") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        // The RECORD, not the stem loose in the blob: the slot carries
+        // the same stem, and a bare containment would read a periodic
+        // grab as an instant one.
+        let record = st
+            .split("\"instant\":{")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .unwrap_or("");
+        assert!(
+            record.contains(stem),
+            "the scan leg ingested the arrival without reporting it, so \
+             the grab was not recorded as an arrival: {st}"
+        );
+    })
+    .await
+    .unwrap();
 }

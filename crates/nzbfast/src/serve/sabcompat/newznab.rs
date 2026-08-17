@@ -160,12 +160,22 @@ pub(in crate::serve) fn newznab_xml(
     // often no cat - returned the whole index newest-first for the *arr
     // to title-match against.
     let mut id_missing = false;
+    // index_read_checked, not with_index_read, on BOTH index reads below.
+    // An *arr acts on this answer: an empty feed is "this indexer has
+    // nothing", which Sonarr and Radarr accept as a fact about the world
+    // and do not re-ask. A read that FAILED - a saturated pool, or a
+    // query whose statements went stale under a schema change and were
+    // still stale after nzbkit re-prepared them - is not that fact, and
+    // rendering it as one is how a working index comes to be reported as
+    // an empty one. An <error> element is retryable at the client; a
+    // total="0" is not.
+    let mut unready = None;
     let title_key = ["imdbid", "tmdbid"].iter().find_map(|p| {
         let raw = params.get(*p)?.trim().to_string();
         if raw.is_empty() {
             return None;
         }
-        let found = d.with_index_read(|ix| {
+        let found = match d.index_read_checked(|ix| {
             if *p == "imdbid" {
                 ix.title_key_for_imdb(&raw).ok().flatten()
             } else {
@@ -173,10 +183,22 @@ pub(in crate::serve) fn newznab_xml(
                     .ok()
                     .flatten()
             }
-        });
+        }) {
+            Ok(found) => found,
+            Err(why) => {
+                unready = Some(why);
+                None
+            }
+        };
         id_missing = found.is_none();
         found
     });
+    // An id we could not LOOK UP is not an id we hold nothing for, so
+    // this has to be answered before `id_missing` is allowed to mean
+    // "empty feed".
+    if let Some(why) = unready {
+        return newznab_error(900, why.message());
+    }
     // Honest SQL pagination + complete-only in the query itself - the
     // old path pulled limit+offset rows and filtered/paged in memory,
     // so deep pages silently thinned out.
@@ -193,8 +215,14 @@ pub(in crate::serve) fn newznab_xml(
     let (hits, total) = if unavailable || id_missing {
         (Vec::new(), 0)
     } else {
-        d.with_index_read(|ix| ix.browse(&bq).ok())
-            .unwrap_or_default()
+        match d.index_read_checked(|ix| ix.browse(&bq).ok()) {
+            Ok(found) => found.unwrap_or_default(),
+            // 900 is the spec's "unknown error", the only generic it
+            // has. What matters to the client is that this is an
+            // <error> at all: the description is what Sonarr and Radarr
+            // surface verbatim, so it carries the cause.
+            Err(why) => return newznab_error(900, why.message()),
+        }
     };
     // §131 D3 search-miss log. The *arr surface is where the misses
     // that matter most show up - Sonarr asks the same question every

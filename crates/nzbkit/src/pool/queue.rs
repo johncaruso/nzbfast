@@ -762,6 +762,26 @@ impl QueueControl {
             eprintln!("[crc-steer] {id}: steered (from server {})", h.server);
         }
         sh.steer_inbox.lock_ok().push(w);
+        // Re-ask the fleet-dead question the guard above asked. Nothing
+        // between the two takes a lock retirement respects - `retire`
+        // drops `alive` and `workers_live` bare, taking no gate - and
+        // the gap holds `other_can_take`, a `crc_retried` insert and a
+        // formatted `live.note`. A fleet that exhausts in there has
+        // nobody left to drain the inbox and both seals have already
+        // run, so the entry would sit there with no terminal outcome
+        // ever emitted for the article.
+        //
+        // Safe to take back here and nowhere later: the id is STILL in
+        // `done`, so no other claimant can have emitted anything for it,
+        // and the consumer owning the body is exactly what the guard
+        // above would have done.
+        if sh.workers_live.load(Ordering::Acquire) == 0 {
+            sh.steer_inbox.lock_ok().retain(|x| x.id != *id);
+            if dbg {
+                eprintln!("[crc-steer] {id}: own (fleet died during the steer)");
+            }
+            return finalize(&sh);
+        }
         sh.done.lock_ok().remove(id);
         // The body the consumer holds is dead weight now; the article
         // stays in any_live's sight through the inbox entry pushed

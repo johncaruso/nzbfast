@@ -2187,6 +2187,28 @@ pub(crate) async fn read_multiline_paced<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
+    read_multiline_paced_max(reader, out, stall, MAX_MULTILINE_BYTES).await
+}
+
+/// [`read_multiline_paced`] with a caller-chosen SIZE ceiling as well.
+///
+/// The download path wants [`MAX_MULTILINE_BYTES`] (256 MiB): that bound
+/// exists to stop an unterminated response, not to budget anything. A
+/// CURIOSITY probe has a real budget - pre-flight's block-size probe
+/// allows itself 8 MiB total - and a budget checked after the whole
+/// response is buffered is not a budget: one well-formed 256 MiB body
+/// lands whole, 32x over, and is then decoded into a second body-sized
+/// Vec before the caller's accounting ever sees the length. Passing the
+/// caller's remaining allowance down here is what makes it real.
+pub(crate) async fn read_multiline_paced_max<R>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+    stall: std::time::Duration,
+    max: usize,
+) -> Result<(), NntpError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
     {
         use tokio::io::AsyncBufReadExt;
         let start = out.len();
@@ -2249,6 +2271,20 @@ where
 
             match found {
                 Some((dot, term)) => {
+                    // The cap binds here too. Checking it only in the
+                    // no-terminator arm below made the bound depend on
+                    // how the response happened to be chunked: the wire
+                    // reads through a 256 KiB buffer, so any response
+                    // that lands terminator-and-all inside one chunk
+                    // returned Ok having never compared against `max`.
+                    // A 200 KB body under an 8 KiB cap passed on Linux
+                    // and macOS purely because the loopback split it
+                    // across reads, and failed on Windows, which did
+                    // not - so the probe budget was inert exactly when
+                    // the server answered fastest.
+                    if out.len() - start + dot > max {
+                        return Err(NntpError::TooLarge(max));
+                    }
                     out.extend_from_slice(&buf[..dot]);
                     reader.consume(dot + 1 + term);
                     return Ok(());
@@ -2259,10 +2295,13 @@ where
                     reader.consume(n);
                     // What THIS response appended, not what the caller's
                     // buffer already held - same as the compressed path.
-                    if out.len() - start > MAX_MULTILINE_BYTES {
-                        // Terminator never came - protocol fault; the pool
-                        // requeues elsewhere instead of buffering unboundedly.
-                        return Err(NntpError::TooLarge(MAX_MULTILINE_BYTES));
+                    if out.len() - start > max {
+                        // Either the terminator never came (protocol
+                        // fault; the pool requeues elsewhere instead of
+                        // buffering unboundedly) or the caller set a
+                        // tighter budget than the wire bound and the
+                        // response has just blown it.
+                        return Err(NntpError::TooLarge(max));
                     }
                 }
             }
@@ -2816,6 +2855,40 @@ impl Connection {
         self.send(&format!("BODY {message_id}")).await?;
         self.read_body().await
     }
+
+    /// [`Connection::body`] under a caller-supplied byte ceiling.
+    ///
+    /// For callers spending bytes on their OWN curiosity rather than on
+    /// the user's download - today that is pre-flight's block-size
+    /// probe, which budgets 8 MiB for the whole probe. `body` bounds the
+    /// read only at [`MAX_MULTILINE_BYTES`] (256 MiB), so a server that
+    /// answers with one enormous well-formed article blows such a budget
+    /// 32x over AND is decoded into a second body-sized Vec, both while
+    /// the caller is still waiting to find out how big the answer was.
+    /// Over budget is [`NntpError::TooLarge`], which leaves the socket
+    /// mid-body: callers must drop or `quit` the connection rather than
+    /// ask it anything else.
+    pub async fn body_capped(
+        &mut self,
+        message_id: &str,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, NntpError> {
+        self.send(&format!("BODY {message_id}")).await?;
+        let st = self.read_status().await?;
+        match st.code {
+            222 => {
+                let mut raw = Vec::with_capacity(max.min(800 * 1024));
+                read_multiline_paced_max(&mut self.wire, &mut raw, STREAM_IDLE_TIMEOUT, max)
+                    .await?;
+                Ok(Some(raw))
+            }
+            423 | 430 | 451 => Ok(None),
+            _ => Err(NntpError::Unexpected {
+                cmd: "BODY".into(),
+                line: st.line,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2913,6 +2986,71 @@ mod tls_provider_tests {
         let got: Vec<_> = p.cipher_suites.iter().map(|s| s.suite()).collect();
         let want: Vec<_> = default.cipher_suites.iter().map(|s| s.suite()).collect();
         assert_eq!(got, want);
+    }
+}
+
+#[cfg(test)]
+mod capped_read_tests {
+    use super::{NntpError, read_multiline_paced_max};
+
+    /// The cap must not depend on how the response was chunked.
+    ///
+    /// `preflight::tests::a_capped_body_stops_reading_at_the_caller_s_allowance`
+    /// drives this through a socket, where the split is the loopback's
+    /// choice: it caught the missing check on Windows, which delivered
+    /// the body in one piece, and passed on Linux and macOS, which did
+    /// not. A `Cursor` hands the whole slice back from a single
+    /// `fill_buf`, so this reaches the terminator-inside-the-chunk arm
+    /// on EVERY platform and fails deterministically without the check.
+    #[tokio::test]
+    async fn the_cap_binds_when_the_terminator_arrives_in_the_same_chunk() {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&vec![b'x'; 200_000]);
+        wire.extend_from_slice(b"\r\n.\r\n");
+
+        let mut out = Vec::new();
+        let err = read_multiline_paced_max(
+            &mut std::io::Cursor::new(&wire[..]),
+            &mut out,
+            std::time::Duration::from_secs(5),
+            8_192,
+        )
+        .await
+        .expect_err("a 200 KB body under an 8 KiB cap must be refused");
+        assert!(
+            matches!(err, NntpError::TooLarge(8_192)),
+            "expected TooLarge(8192), got {err:?}"
+        );
+
+        // The boundary, exactly. What the caller receives is the payload
+        // PLUS the terminating CRLF of its last line - 200_002 bytes -
+        // because the copy runs to the dot. One byte under that is a
+        // refusal; the figure itself is returned whole.
+        const BODY: usize = 200_002;
+        let mut out = Vec::new();
+        let err = read_multiline_paced_max(
+            &mut std::io::Cursor::new(&wire[..]),
+            &mut out,
+            std::time::Duration::from_secs(5),
+            BODY - 1,
+        )
+        .await
+        .expect_err("one byte under the body must be refused");
+        assert!(
+            matches!(err, NntpError::TooLarge(n) if n == BODY - 1),
+            "{err:?}"
+        );
+
+        let mut out = Vec::new();
+        read_multiline_paced_max(
+            &mut std::io::Cursor::new(&wire[..]),
+            &mut out,
+            std::time::Duration::from_secs(5),
+            BODY,
+        )
+        .await
+        .expect("a body exactly at the allowance must be returned");
+        assert_eq!(out.len(), BODY);
     }
 }
 

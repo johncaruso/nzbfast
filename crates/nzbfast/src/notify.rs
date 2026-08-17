@@ -25,9 +25,6 @@
 //! move that would turn a URL pointing somewhere harmless into a request
 //! somewhere else.
 
-use crate::MutexExt;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -215,8 +212,17 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    pub fn from_job(job: &Arc<Mutex<Job>>) -> Ctx {
-        let j = job.lock_ok();
+    /// The job's facts, taken from a hold the CALLER already owns.
+    ///
+    /// It used to take the Arc and lock for itself, which read the
+    /// record wherever the caller happened to have got to. The post-job
+    /// hooks decide their whole fan-out under one hold and then run on
+    /// the blocking pool, where a pp-script can hold the thread for
+    /// minutes - so the send described whatever the record had become by
+    /// then: for a job deleted and retried mid-script, a "Failed" event
+    /// with an empty error naming the RETRY's directory (Codex sweep 3,
+    /// H3). One hold, one snapshot, and nothing to drift.
+    pub fn from_locked(j: &Job) -> Ctx {
         let ok = j.state == JobState::Completed;
         Ctx {
             name: j.name.clone(),

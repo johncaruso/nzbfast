@@ -626,6 +626,12 @@ impl Drop for IndexJobGuard {
 /// unlock, and only that one may be called a completion. Any other local
 /// failure keeps its verdict: the payload is out and the password is
 /// recorded, and whatever really went wrong still gets to say so.
+///
+/// `gen0` fences every write below, under the write's own hold: both
+/// blocking calls this awaits are unbounded, and a delete plus a Retry
+/// inside either one hands the record to a live download. Stamping
+/// `Completed` then leaves a QUEUED row terminal - `pick_job` never
+/// picks it, and only a second retry clears it (sweep 3, H2).
 #[allow(clippy::too_many_arguments)]
 async fn settle_locked_failure(
     d: &Arc<Daemon>,
@@ -636,6 +642,7 @@ async fn settle_locked_failure(
     site: &str,
     job_pw: Option<&str>,
     was_unpack_failure: bool,
+    gen0: Option<(u32, u64)>,
 ) -> bool {
     // Header-parses every RAR volume, 7z and zip container in the folder:
     // blocking file IO, off the runtime worker, exactly as the completed
@@ -674,8 +681,14 @@ async fn settle_locked_failure(
                  the job is a completion after all"
             );
             d.record_unlock_password(site, &poster, &pw);
+            // The password is the site's and is kept either way; the
+            // RECORD may no longer be this tail's - see `gen0`.
             {
                 let mut j = job.lock_ok();
+                if !Daemon::same_generation(&j, gen0) || j.tombstone {
+                    info!(target: "unlock", "{name:?}: the record left this tail's custody while the ladder ran");
+                    return false;
+                }
                 j.password = Some(pw);
                 j.password_required = false;
                 if was_unpack_failure {
@@ -691,7 +704,15 @@ async fn settle_locked_failure(
                 target: "unlock",
                 "{name:?}: {locked_name} is password-protected - set a password and retry to unpack it"
             );
-            job.lock_ok().password_required = true;
+            // Same fence: `auto_retry_eligible` refuses a job carrying
+            // this flag, so a record queued again would lose its retry.
+            {
+                let mut j = job.lock_ok();
+                if !Daemon::same_generation(&j, gen0) || j.tombstone {
+                    return false;
+                }
+                j.password_required = true;
+            }
             d.save_queue();
             false
         }
@@ -830,6 +851,7 @@ pub(super) async fn finalize_completed_gen(
             // The one failure an unlock actually answers. Every unpack
             // verdict in `get::tail` names itself this way.
             fail2.contains("could not be unpacked"),
+            gen0,
         )
         .await
     {
@@ -1257,6 +1279,163 @@ pub(crate) struct DupeCollision {
     pub nzo_id: String,
 }
 
+/// One "the record went, the files did not" notice.
+///
+/// A struct rather than the 4-tuple this was, because it grew a fifth
+/// field that has to be right: `nzb` is the spooled NZB the delete would
+/// normally have thrown away, kept alive precisely because the removal
+/// was REFUSED. It is what lets the notice offer the download again
+/// where the user is already standing, instead of sending them off to
+/// find the release and re-add it by hand.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct KeptNote {
+    pub name: String,
+    /// The folder still on disk. Also the notice's IDENTITY: dismiss and
+    /// retry both address it by this.
+    pub path: String,
+    pub why: String,
+    pub at: i64,
+    /// Path to the spooled NZB, or empty when there is none to offer.
+    /// Empty is ordinary, not a fault: a job deleted before it was ever
+    /// spooled, a record restored from an older version's notice file,
+    /// or a spool the user has since cleaned out.
+    #[serde(default)]
+    pub nzb: String,
+}
+
+/// Read a notice list written by either shape.
+///
+/// The pre-struct file is an array of `[name, path, why, at]` arrays,
+/// and it names folders that are still sitting on the user's disk with
+/// no record anywhere else pointing at them - dropping those on upgrade
+/// would lose the one handle the notice exists to keep.
+pub(crate) fn kept_notes_from_json(v: &Value) -> Option<VecDeque<KeptNote>> {
+    if let Ok(k) = serde_json::from_value::<VecDeque<KeptNote>>(v.clone()) {
+        return Some(k);
+    }
+    let legacy: VecDeque<(String, String, String, i64)> = serde_json::from_value(v.clone()).ok()?;
+    Some(
+        legacy
+            .into_iter()
+            .map(|(name, path, why, at)| KeptNote {
+                name,
+                path,
+                why,
+                at,
+                nzb: String::new(),
+            })
+            .collect(),
+    )
+}
+
+/// Throw away the spooled NZB a kept-files notice was holding for its
+/// "download it again" button.
+///
+/// Called when the notice goes - dismissed, retried, or pushed off the
+/// end of the ring - because the file is reachable through nothing else
+/// once that happens. Best-effort: an empty path means there was never
+/// one, and a failed removal costs a small file in the spool, not
+/// correctness.
+pub(crate) fn drop_kept_nzb(note: &KeptNote) {
+    if !note.nzb.is_empty() {
+        let _ = std::fs::remove_file(&note.nzb);
+    }
+}
+
+/// Is this row a HELD ALTERNATIVE - a copy parked at Duplicate priority
+/// behind another one?
+///
+/// It matters to what a delete MEANS. Deleting an ordinary row says "I
+/// do not have this release any more"; deleting the backup copy says
+/// only "I do not want a second copy of it", because the row it was held
+/// for is still there. Stamping the second as a delete of the identity
+/// would let the next add of that identity run alongside the original -
+/// a double download, which is the thing the hold exists to prevent.
+///
+/// The same test `held_as_duplicate` reads back to tell an adder what
+/// happened to its job, so the two cannot disagree about what a hold
+/// looks like.
+pub(crate) fn is_held_alternative(g: &Job) -> bool {
+    g.paused && g.priority == DUPE_PRIORITY
+}
+
+/// Hold a deleted record's spooled NZB back for a kept-files notice, or
+/// throw it away now.
+///
+/// `keep` is "this delete is about to try the files half": only then can
+/// the removal be REFUSED, and only a refusal has anything to offer the
+/// NZB back for. Everywhere else the spool copy dies with the record it
+/// belonged to, exactly as it always did.
+///
+/// Shared by the three delete arms rather than hand-copied a third time.
+/// This file's own history is the argument: the JSON-RPC facade was a
+/// hand-copy of the REST delete that never got the active-job fix, so
+/// which client type the user configured decided whether the bug was
+/// reachable.
+///
+/// A QUEUE of NZBs per directory, not one slot. Records legitimately
+/// share an out_dir - a TV-filed job's `out_dir` IS the season folder
+/// (`j.filed = j.tv_sort && is_season_dir(&dest)`), and
+/// `plan_history_delete` grants `may_remove_files` to every filed record
+/// without a claimant test, so a bulk history sweep over one season
+/// passes several records through here for the same key. A single slot
+/// dropped the earlier PathBuf on the floor: the spool file it named was
+/// never removed and no longer reachable by the final drain (a permanent
+/// leak from the delete whose whole promise is to leave nothing behind),
+/// and the notice for the FIRST record was then handed the LAST record's
+/// NZB - so "download it again" re-fetched the wrong episode under the
+/// first one's name. Insert order equals kept order, so a FIFO pairs
+/// each notice with its own record's copy.
+pub(crate) fn hold_or_drop_spool(
+    keep: bool,
+    out_dir: &Path,
+    nzb: &Path,
+    held: &mut std::collections::HashMap<PathBuf, Vec<PathBuf>>,
+) {
+    if keep {
+        held.entry(out_dir.to_path_buf())
+            .or_default()
+            .push(nzb.to_path_buf());
+    } else {
+        let _ = std::fs::remove_file(nzb);
+    }
+}
+
+/// File the kept-files notices a delete owes, and settle the spool
+/// copies `hold_or_drop_spool` was holding for them.
+///
+/// A directory that refused gets its NZB attached to the notice - that
+/// is the notice's "download it again". Anything still held afterwards
+/// belongs to a directory that went cleanly, so nothing names it now and
+/// it goes.
+pub(crate) fn note_kept_files(
+    d: &Daemon,
+    kept: Vec<(String, PathBuf, String)>,
+    held: &mut std::collections::HashMap<PathBuf, Vec<PathBuf>>,
+) {
+    for (name, dir, why) in kept {
+        // Take this directory's OLDEST remaining copy: `kept` preserves
+        // the order the records were held in, so each notice gets the
+        // NZB of the record it is actually about.
+        let nzb = held
+            .get_mut(&dir)
+            .filter(|q| !q.is_empty())
+            .map(|q| q.remove(0));
+        if held.get(&dir).is_some_and(Vec::is_empty) {
+            held.remove(&dir);
+        }
+        d.note_delete_kept(&name, &dir, &why, nzb.as_deref());
+    }
+    // Everything still held belongs to a directory that went cleanly (or
+    // to a second refusal the notice dedupe folded away): nothing names
+    // it now, so it goes - every copy, not just one per directory.
+    for (_, nzbs) in held.drain() {
+        for nzb in nzbs {
+            let _ = std::fs::remove_file(nzb);
+        }
+    }
+}
+
 pub(super) fn priority_name(p: i32) -> &'static str {
     match p {
         2 => "Force",
@@ -1634,6 +1813,15 @@ pub(crate) fn fail_hint(msg: &str) -> &'static str {
         // asking again returns the same short post. Another release is
         // the only answer, exactly as for a takedown.
         "shortpost"
+    } else if msg.contains("well past the minutes-to-hours") {
+        // Last of the arms on purpose: this one is about the post's AGE,
+        // not its shape, so anything more specific above (no parity at
+        // all, a retention setting, a decode fault) is the better answer
+        // and keeps it. It exists so the two surfaces that promise
+        // "posts often finish propagating within the hour" can stop
+        // saying that about a post days old - `incomplete_reason` writes
+        // the clause, this names it, and the drawer picks the copy.
+        "stale"
     } else {
         ""
     }
@@ -1737,6 +1925,48 @@ pub(super) fn post_job_duties(
     Some(failure_mode != "off" && state == JobState::Failed)
 }
 
+/// Could waiting plausibly have changed the answer? The age half of
+/// `auto_retry_eligible`, which `transient()` alone cannot see.
+///
+/// `FailKind::MissingArticles` is transient at ANY age, and it is
+/// transient for one reason: a release grabbed minutes after its pre
+/// 430s on every server until the backbones fill in, which is
+/// indistinguishable from a dead post except by the calendar. So the
+/// retry ran against posts a week old too, spent a second full download
+/// (~150 s and 1.9 GB on the 15 Aug case) proving the same 1965 segments
+/// absent, and labelled the wait "propagation" for a post whose
+/// propagation finished six days earlier.
+///
+/// [`crate::diag::GONE_MIN_AGE_DAYS`] is where this project already
+/// draws that line, and this is the third caller to use it rather than a
+/// fourth opinion about how long propagation takes.
+///
+/// Deliberately narrow in both directions:
+///
+/// * only the missing-articles class is gated. `Transport` is a fault on
+///   THIS machine's link and says nothing whatever about the post, so it
+///   retries at any age; `Unrepairable` is a repair verdict, whose retry
+///   re-fetches gaps and can pull more recovery volumes.
+/// * an unknown age retries, and so does a loss the census leaves
+///   AMBIGUOUS - segments lost to transport errors or to a server that
+///   never connected are ours to fix, not the post's, and a
+///   journal-resume retry heals them. The cost of a wrong suppression is
+///   a final failure; a wrong retry costs one duplicate download.
+///
+/// Suppressing here and not at the label in `daemon_park` is the point:
+/// relabelling the cooldown would leave the second download running.
+/// Note the reach - `post_job_plan` shares this predicate, so a
+/// suppressed retry ALSO makes the failure final, which is what sends
+/// the report, the FailureLink re-grab and the M14f duplicate promotion.
+/// That is correct for a post this old: nothing is coming, and a held
+/// alternative is the only thing that can still deliver the release.
+fn retry_may_still_help(msg: &str) -> bool {
+    if fail_kind(msg) != FailKind::MissingArticles {
+        return true;
+    }
+    !crate::diag::missing_articles_proven_stale(msg)
+}
+
 /// Will `park` arm an M32 automatic retry for this job? `secs` is the
 /// configured cooldown (0 = the feature is off).
 ///
@@ -1751,6 +1981,7 @@ pub(super) fn auto_retry_eligible(j: &Job, secs: u64) -> bool {
         // park returns before the retry block for it.
         && !j.demote
         && fail_kind(&j.fail_message).transient()
+        && retry_may_still_help(&j.fail_message)
         // ONE automatic retry. The retry itself bumps `retries` and
         // clears the stamp, so a second failure lands here ineligible -
         // and that is the failure that reports, re-grabs and promotes.

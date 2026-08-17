@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use tracing::{info, warn};
 
 // For the Daemon impl moved in from daemon.rs (§129 4a paydown).
-use super::{Daemon, Job, JobState};
+use super::{Daemon, Job, JobState, is_arr_origin};
 use crate::MutexExt;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -340,7 +340,16 @@ impl GiveupState {
             .collect()
     }
 
-    fn prune(&mut self, now: i64) {
+    /// Drop evidence past [`EXPIRE_SECS`].
+    ///
+    /// Driven from the watchlist pass as well as from `record_failure`.
+    /// `record_failure` was the ONLY driver, and a target that has
+    /// actually tripped produces no further failures by definition - so
+    /// the one class of entry the expiry exists for could never reach
+    /// it. Both halves of that doc comment were defeated: a six-week-old
+    /// give-up never forgot a title that has since been reposted, and
+    /// its entry sat in the store for the life of the install.
+    pub(super) fn prune(&mut self, now: i64) {
         self.targets.retain(|_, t| now - t.last_unix < EXPIRE_SECS);
     }
 }
@@ -737,7 +746,7 @@ impl Daemon {
             let g = job.lock_ok();
             (g.name.clone(), g.nzo_id.clone(), g.origin.clone(), g.state)
         };
-        let from_arr = origin == "arr" || origin.starts_with("arr:");
+        let from_arr = is_arr_origin(&origin);
         if !from_arr && origin != "watchlist" {
             return;
         }

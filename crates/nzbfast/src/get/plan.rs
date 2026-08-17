@@ -540,16 +540,11 @@ pub(super) fn build_intake(
     // every volume, so bootstrap the set from the smallest volume instead -
     // its recovery slices also count toward any later repair.
     let has_main = nzb.files.iter().any(|f| f.kind() == FileKind::Par2Main);
-    let bootstrap_vol: Option<usize> = if has_main {
-        None
-    } else {
-        nzb.files
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.kind() == FileKind::Par2Volume)
-            .min_by_key(|(_, f)| f.bytes())
-            .map(|(i, _)| i)
-    };
+    // `par2_seed_file` answers "cheapest file whose head carries the
+    // critical packets", which with no index in the NZB IS the smallest
+    // volume. Shared with `nzbfast check`, which asks the same question
+    // to find the set's block size (nzb.rs).
+    let bootstrap_vol: Option<usize> = if has_main { None } else { nzb.par2_seed_file() };
     if let Some(bi) = bootstrap_vol {
         println!(
             "no main .par2 in NZB - bootstrapping set from smallest volume ({:.1} MB)",

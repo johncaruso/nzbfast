@@ -76,19 +76,27 @@ lands. `make-qpkg.sh` therefore runs it in a container when it has to, and
 natively when `qbuild` is on `PATH`. If neither is available it refuses
 rather than assembling the format by hand.
 
-Every release builds one. The `qnap-beta` job in
-`.github/workflows/release.yml` takes the static musl binaries the
-`packages` job already cross-compiled for the .deb and .rpm, runs the
-same `make-qpkg.sh` with `--binaries`, and the release job attaches the
-result. That is why the package can be built DURING a release: nothing on
-the release page exists yet while the workflow runs, so the downloading
-form above would have nothing to download.
+Every release gets one, and it is built AFTER the release rather than
+during it. The **qnap-qpkg** workflow is the one that ships it: dispatch
+it with the tag once the release page is up, then scan and upload the
+artifact by hand, exactly as the Synology `.spk` is done. Step 4c of the
+publish-release skill is the checklist. The same workflow runs by itself
+on any pull request touching this directory, since `qbuild` does not run
+on a maintainer's Mac and nothing else would exercise a `qpkg.cfg` edit
+before a release.
 
-The separate **qnap-qpkg** workflow is for everything else: dispatch it
-with a tag to rebuild a package for a release that has already shipped,
-and it runs by itself on any pull request touching this directory, since
-`qbuild` does not run on a maintainer's Mac and nothing else would
-exercise a `qpkg.cfg` edit before a release.
+Until 16 Aug 2026 the release run built it instead, in a `qnap-beta` job
+that fed `make-qpkg.sh` the musl binaries the `packages` job already
+cross-compiled for the .deb and .rpm - which is what let the package be
+built while the release page was still empty. The cost was a package
+whose payload nothing published a checksum for. Measured on 1.1.3: the
+packaged binaries were `72cad10c` (x86_64) and `71d12ee9` (aarch64),
+while the binaries in `nzbfast-1.1.3-linux-x64.tar.gz` and
+`-arm64.tar.gz` were `9cc8c994` and `a11ce1ac`. Same source, same
+version, different builder. `SHA256SUMS.txt` covers the `.qpkg` as a
+file, not the binaries inside it, so a QNAP owner had no way to check
+that what they were installing was the release. Waiting for the release
+page costs one dispatch and answers that.
 
 **Adding an architecture** is three places: a binary in `shared/bin/`
 named `nzbfast-<uname -m>`, the `case` in `nzbfast-setup.sh` that links

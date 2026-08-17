@@ -587,21 +587,24 @@ impl Index {
         if title.is_empty() {
             return Ok(false);
         }
-        let Some((bytes, nexe, complete)): Option<(i64, i64, bool)> = self
+        let Some((bytes, nexe, complete, stem)): Option<(i64, i64, bool, String)> = self
             .db
             .prepare_cached(&format!(
                 "SELECT total_bytes,
                         (SELECT COALESCE(SUM({EXE_FILE_SQL}),0) FROM files
                           WHERE release_id=releases.id),
-                        complete
+                        complete, stem
                    FROM releases WHERE id=?1 AND pre_title=''"
             ))?
-            .query_row([rid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_row([rid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .optional()?
         else {
             return Ok(false);
         };
-        let p = crate::categories::classify(title, &self.custom);
+        let mut p = crate::categories::classify(title, &self.custom);
+        // A spot or pre title names the work and drops the file's own
+        // format marker, which for a book is the ONLY evidence there is.
+        crate::release::recover_media_kind(&mut p, title, &stem);
         // Same column set the ingest path writes, from the same parse -
         // a release named here must be indistinguishable from one that
         // was named at ingest, or the wall would file the two copies of

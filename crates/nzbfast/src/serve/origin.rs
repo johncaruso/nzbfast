@@ -36,6 +36,17 @@ pub(super) fn origin_of(params: &std::collections::HashMap<String, String>) -> &
     "dashboard"
 }
 
+/// Was this job grabbed by an *arr (or an *arr-shaped client)?
+///
+/// The recorded origin is either the bare `arr` fallback or the
+/// `arr:<client>` shape `api_origin` writes, so both spellings answer
+/// yes. One predicate because two callers now turn on it and they must
+/// agree: the give-up breaker (§96.3, which acts on the *arr) and
+/// `storage_deleted` (§96 item 2, which deliberately does NOT).
+pub(super) fn is_arr_origin(origin: &str) -> bool {
+    origin == "arr" || origin.starts_with("arr:")
+}
+
 /// Name the client behind an API call from its User-Agent, or `None`.
 ///
 /// Every automation that adds jobs leads its UA with a standard product

@@ -618,7 +618,7 @@ mod harness {
         // The kill: the history append lands, the queue rewrite that
         // would drop the row never runs.
         super::super::storecut::arm_cut(1);
-        d.park(j);
+        d.park_gen(j, None);
         super::super::storecut::disarm();
 
         let (q, h) = on_disk(dir, id);
@@ -664,7 +664,7 @@ mod harness {
             );
             flag.store(true, Ordering::Relaxed);
         });
-        d.park(j);
+        d.park_gen(j, None);
         super::super::storecut::disarm();
         assert!(probed.load(Ordering::Relaxed), "the gap seam never fired");
         // Released once the record is filed, and the record answers for
@@ -811,7 +811,7 @@ mod harness {
             .cloned()
             .expect("the retried job is in the queue");
         jq.lock_ok().state = JobState::Failed;
-        d.park(jq);
+        d.park_gen(jq, None);
 
         // ...and only now does the retry's tombstone land.
         released.wait();
@@ -869,7 +869,7 @@ mod harness {
             // the final upsert - is dropped.
             super::super::storecut::arm_cut(0);
         });
-        d.park(j);
+        d.park_gen(j, None);
         super::super::storecut::disarm();
 
         let (q, h) = on_disk(&dir, "nzo_c1");

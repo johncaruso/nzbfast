@@ -1009,10 +1009,17 @@ pub(super) fn spawn_http_workers(
                     // respond_page keeps no-cache (a stale cached page keeps
                     // polling with old JS) but adds gzip + an ETag over the
                     // substituted bytes, so a revalidation is 304-sized.
+                    // Cloned to a local FIRST: as a temporary in the
+                    // argument expression the guard lives until the `;`,
+                    // so the lock is held across respond_page's gzip and
+                    // the whole socket write - up to tiny_http's 30 s
+                    // write timeout on a slow reader, with every other
+                    // locale reader and writer queued behind it.
+                    let locale = d.ui_locale.lock_ok().clone();
                     respond_page(
                         req,
                         ui_shell_state(&d, ui_themed(DASHBOARD_HTML))
-                            .replace("__NZBFAST_LOCALE__", &d.ui_locale.lock_ok()),
+                            .replace("__NZBFAST_LOCALE__", &locale),
                         "text/html",
                     );
                     continue;
@@ -1106,10 +1113,17 @@ pub(super) fn spawn_http_workers(
                 #[cfg(feature = "indexer")]
                 if path == "/wall" || path == "/wall/" {
                     // M13: the poster wall (embedded like the dashboard).
+                    // Cloned to a local FIRST: as a temporary in the
+                    // argument expression the guard lives until the `;`,
+                    // so the lock is held across respond_page's gzip and
+                    // the whole socket write - up to tiny_http's 30 s
+                    // write timeout on a slow reader, with every other
+                    // locale reader and writer queued behind it.
+                    let locale = d.ui_locale.lock_ok().clone();
                     respond_page(
                         req,
                         ui_shell_state(&d, ui_themed(WALL_HTML))
-                            .replace("__NZBFAST_LOCALE__", &d.ui_locale.lock_ok()),
+                            .replace("__NZBFAST_LOCALE__", &locale),
                         "text/html",
                     );
                     continue;

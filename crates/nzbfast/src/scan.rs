@@ -100,8 +100,50 @@ pub(crate) async fn index_scan(
         1,
         true,
         true,
+        // §74: no watchlist in a CLI scan, so nothing to report an
+        // arrival TO.
+        None,
     )
     .await
+}
+
+/// §74: arm the arrival watch for ONE leg, or stand it down.
+///
+/// `arrivals` says whether this leg is reading articles that were posted
+/// since the last pass looked - which is what an arrival IS, and the same
+/// question the tip watcher settles with its own mark. Only a leg
+/// starting strictly ABOVE a mark the group already had qualifies:
+///
+/// * mark 0 is a first-sight backfill, tens of thousands of articles of
+///   GROUP HISTORY;
+/// * a leg starting at or below the mark is a deliberate deep re-scan of
+///   ground already covered (`index_scan_now&value=n`);
+/// * the deepen leg walks history by definition.
+///
+/// Reporting any of those would tell the watchlist that a whole shelf of
+/// old posts had just landed.
+fn arm_arrival_watch(
+    ix: &mut nzbkit::index::Index,
+    watch: Option<&crate::watchlist::InstantMatcher>,
+    arrivals: bool,
+) {
+    // No watchlist at all: never install anything. The index pays a null
+    // check per touched release for an absent watch and a closure call
+    // for a present one, and an install with nothing watched should keep
+    // paying the former.
+    let Some(m) = watch else { return };
+    if !arrivals {
+        // Not `set_watch_names(None)`, which is the same seam's HYGIENE
+        // call and empties the journal with it - so standing down that
+        // way between two legs threw away everything the previous leg
+        // had just reported and the pass ended with nothing to hand
+        // back. A predicate that admits nothing stands the watch down
+        // over the history legs and leaves the journal alone.
+        ix.set_watch_names(Some(Box::new(|_: &str| false)));
+        return;
+    }
+    let m = m.clone();
+    ix.set_watch_names(Some(Box::new(move |name: &str| m.wants(name))));
 }
 
 /// Scan into an already-open Index - the daemon shares ONE connection
@@ -143,6 +185,14 @@ pub(crate) async fn index_scan_into(
     // A8: scan the OTHER eligible backbones' tips too (their own marks),
     // so propagation holes and single-backbone posts reach the index.
     coverage: bool,
+    // §74: the compiled watchlist, so a release this pass is the first
+    // to READ still reaches the instant path. The tip watcher is not the
+    // only leg that ingests new articles - it stands down for the whole
+    // of every download, every full pass and every indexing pause, and
+    // what covers the range it missed is this pass's forward leg. Armed
+    // for the forward legs only; see `arm_arrival_watch`. The caller
+    // drains the journal with `take_watch_hits` when the pass returns.
+    arrival_watch: Option<crate::watchlist::InstantMatcher>,
 ) -> Result<()> {
     if let Some(g) = gates {
         let g = g.clone();
@@ -276,6 +326,7 @@ pub(crate) async fn index_scan_into(
             g.high,
             g.high - low + 1
         );
+        arm_arrival_watch(ix, arrival_watch.as_ref(), mark > 0 && low > mark);
         let pass = scan_article_range(
             &server,
             group,
@@ -300,6 +351,9 @@ pub(crate) async fn index_scan_into(
         // though - the fan-out is already unhealthy, and a second pass on
         // the same server would just spend another idle deadline.
         healthy = pass.complete;
+        // The forward leg is over; everything below this point is
+        // history (the deepen slice) until a coverage leg arms again.
+        arm_arrival_watch(ix, arrival_watch.as_ref(), false);
     }
     // Seed the low-water on first sight of the group - including the
     // up-to-date branch (a group idle at scan time otherwise never
@@ -408,7 +462,11 @@ pub(crate) async fn index_scan_into(
                 info.high,
                 info.high - lo + 1
             );
-            match scan_article_range(
+            // Forward, over this backbone's OWN mark - an arrival here is
+            // an arrival like any other, and on a propagation hole this
+            // is the leg that sees the post first.
+            arm_arrival_watch(ix, arrival_watch.as_ref(), smark > 0 && lo > smark);
+            let leg = scan_article_range(
                 &s,
                 group,
                 &key,
@@ -423,8 +481,9 @@ pub(crate) async fn index_scan_into(
                 share,
                 turbo,
             )
-            .await
-            {
+            .await;
+            arm_arrival_watch(ix, arrival_watch.as_ref(), false);
+            match leg {
                 Ok(pass) => {
                     scanned += pass.scanned;
                     completed += pass.completed;

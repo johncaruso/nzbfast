@@ -19,7 +19,7 @@ pub(super) fn fts_match(query: &str) -> String {
 
 impl Index {
     /// Search by substring over the stem (case-insensitive), newest first.
-    pub fn search(&self, query: &str, limit: u32) -> rusqlite::Result<Vec<Release>> {
+    pub(super) fn search_once(&self, query: &str, limit: u32) -> rusqlite::Result<Vec<Release>> {
         // Separator-insensitive, multi-term AND search: stems are stored
         // dotted ("Show.Name.S01E02") but *arr clients query with spaces
         // ("show name s01e02"), so normalize both sides to spaces and
@@ -121,7 +121,11 @@ impl Index {
     /// Callers get whole [`Release`] rows and decide for themselves;
     /// [`Self::make_nzb`] then emits a complete NZB from the segment
     /// ids the scan already stored.
-    pub fn find_by_header(&self, header: &str, limit: u32) -> rusqlite::Result<Vec<Release>> {
+    pub(super) fn find_by_header_once(
+        &self,
+        header: &str,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<Release>> {
         let header = header.trim();
         if header.chars().count() < 4 {
             return Ok(Vec::new());

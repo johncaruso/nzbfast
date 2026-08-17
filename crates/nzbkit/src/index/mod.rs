@@ -30,11 +30,14 @@ mod ingest;
 mod maintenance;
 mod nzbimport;
 mod pesto;
+#[cfg(test)]
+mod plan_tests;
 mod predb;
 #[cfg(test)]
 mod predb_tests;
 mod probe;
 mod query;
+mod retry;
 mod schema;
 mod scoreboard;
 mod searchlog;
@@ -101,6 +104,10 @@ pub struct Index {
     /// a RefCell because the naming legs run on `&self`; the index is
     /// single-threaded behind the daemon's mutex either way.
     hits: std::cell::RefCell<WatchHits>,
+    /// SQLITE_SCHEMA bookkeeping for this connection: how many queries
+    /// failed with a stale statement even after re-preparing, plus the
+    /// injector that gives that path a deterministic test. See `retry`.
+    retry: retry::SchemaRetry,
 }
 
 /// A release a batch just touched that [`Index::set_watch_names`] said
@@ -330,21 +337,138 @@ impl Index {
     /// Releases the idle STAT sampler should probe next: never-sampled
     /// first, then stalest verdict, newest post first within a tier.
     /// Returns (id, group, first_posted).
+    ///
+    /// Drawn by SEEKING to pseudo-random posting instants, exactly as
+    /// [`Self::oracle_backtest_pick`] below does, and for the reason
+    /// stated there: an `ORDER BY` over this table is fine on a fresh
+    /// index and ruinous on a real one. This used to be
+    ///
+    /// ```sql
+    /// SELECT id, grp, first_posted FROM releases WHERE junk < 50
+    ///  ORDER BY oracle_at ASC, (id * 2654435761) % 4294967296 LIMIT ?1
+    /// ```
+    ///
+    /// and no index covers `oracle_at`, so SQLite answered it with
+    /// `SCAN releases` plus a `TEMP B-TREE` - the whole table read and
+    /// all of its rows sorted, to return one. On a long-running install
+    /// (16 Aug 2026: 38 M releases, a 55.9 GB database) that statement
+    /// ran over forty minutes, and the sampler takes it under `with_index`,
+    /// which holds the index write mutex for the whole closure. One
+    /// tick therefore froze every other index user: the scan pass could
+    /// not hand back `index_pass_gate`, so watch-folder adds waited out
+    /// the runner's full rendezvous bound before starting, and the
+    /// prefetch sidecar's finish tail never completed, which parked the
+    /// runner in `stop_sidecar` with the finished job stuck reading
+    /// "Extracting" at 100% and the rest of the queue behind it.
+    ///
+    /// The seek costs three `idx_rel_posted` range probes (measured at
+    /// 5 ms against that same database). What it gives up is strict
+    /// stalest-first ordering over the whole table: the sample is
+    /// uniform over POSTING TIME, and the freshest verdict among the
+    /// drawn candidates wins. That is the same honest bias
+    /// `oracle_backtest_pick` documents - and it serves the original
+    /// intent better than the sort did, because the random tiebreak
+    /// existed to spread picks across post ages in the first place.
     pub fn oracle_pick(&self, limit: u32) -> rusqlite::Result<Vec<(i64, String, i64)>> {
-        // Sample what users can actually SEE (junk < 50) - stalest-first
-        // over the whole table drowned the sampler in the endless stream
-        // of freshly-scanned obfuscated rows: every probe was a 0-day
-        // article, bucket 0 was the only bucket that ever learned, and
-        // old-post availability (the interesting question) stayed
-        // unknown forever. Random tiebreak inside the stalest half
-        // spreads picks across post ages.
-        let mut stmt = self.db.prepare(
-            "SELECT id, grp, first_posted FROM releases
-             WHERE junk < 50
-             ORDER BY oracle_at ASC, (id * 2654435761) % 4294967296 LIMIT ?1",
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        self.oracle_pick_seeded(limit, seed)
+    }
+
+    /// [`Self::oracle_pick`] with the draw seed supplied, so a test can
+    /// replay the same candidates.
+    pub fn oracle_pick_seeded(
+        &self,
+        limit: u32,
+        seed: u64,
+    ) -> rusqlite::Result<Vec<(i64, String, i64)>> {
+        let want = limit as usize;
+        if want == 0 {
+            return Ok(Vec::new());
+        }
+        /// Matches taken per seek - neighbours in posting time, which is
+        /// the price of the cheap seek (`oracle_backtest_pick`'s note).
+        const PER_SEEK: usize = 3;
+        // Both bounds are single aggregates over an indexed column, so
+        // each is one index-endpoint seek. Asked separately: SQLite only
+        // applies that optimization to a query with exactly ONE
+        // aggregate, and `SELECT MIN(x), MAX(x)` would scan.
+        let lo: i64 = self.db.query_row(
+            "SELECT COALESCE(MIN(first_posted), 0) FROM releases",
+            [],
+            |r| r.get(0),
         )?;
-        let rows = stmt.query_map([limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        rows.collect()
+        let hi: i64 = self.db.query_row(
+            "SELECT COALESCE(MAX(first_posted), 0) FROM releases",
+            [],
+            |r| r.get(0),
+        )?;
+        if hi <= 0 {
+            return Ok(Vec::new());
+        }
+        // Sample what users can actually SEE (junk < 50): probing the
+        // endless stream of freshly-scanned obfuscated rows meant every
+        // probe was a 0-day article, bucket 0 was the only bucket that
+        // ever learned, and old-post availability - the interesting
+        // question - stayed unknown forever.
+        let mut fwd = self.db.prepare_cached(
+            "SELECT id, grp, first_posted, COALESCE(oracle_at, 0) FROM releases
+             WHERE first_posted >= ?1 AND junk < 50
+             ORDER BY first_posted LIMIT ?2",
+        )?;
+        let mut back = self.db.prepare_cached(
+            "SELECT id, grp, first_posted, COALESCE(oracle_at, 0) FROM releases
+             WHERE first_posted <= ?1 AND junk < 50
+             ORDER BY first_posted DESC LIMIT ?2",
+        )?;
+        let span = (hi - lo).max(0) as u64;
+        let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+        let mut cands: Vec<(i64, String, i64, i64)> = Vec::new();
+        let mut seen: std::collections::HashSet<i64> = Default::default();
+        let seeks = want.saturating_mul(4).clamp(4, 32);
+        for _ in 0..seeks {
+            // SplitMix64, the generator `oracle_backtest_pick` uses.
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            let t = lo + (z % span.max(1)) as i64;
+            let rows = |st: &mut rusqlite::Statement<'_>, at: i64| {
+                st.query_map(rusqlite::params![at, PER_SEEK as i64], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .and_then(|m| m.collect::<rusqlite::Result<Vec<_>>>())
+                .unwrap_or_default()
+            };
+            // Past the last match, the nearest rows BEFORE the instant,
+            // so a draw near the top of the window is not wasted.
+            let mut hit = rows(&mut fwd, t);
+            if hit.is_empty() {
+                hit = rows(&mut back, t);
+            }
+            for row in hit {
+                if seen.insert(row.0) {
+                    cands.push(row);
+                }
+            }
+        }
+        // Never-sampled first (oracle_at 0), then stalest verdict, then
+        // newest post inside a tier - the documented order, applied to
+        // the drawn candidates instead of to the whole table.
+        cands.sort_by_key(|&(id, _, posted, at)| (at, std::cmp::Reverse(posted), id));
+        Ok(cands
+            .into_iter()
+            .take(want)
+            .map(|(id, grp, posted, _)| (id, grp, posted))
+            .collect())
     }
 
     /// Up to `max` probe message-ids for a release, spread evenly across

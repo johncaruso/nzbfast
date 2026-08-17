@@ -145,6 +145,47 @@ fn mid_download_disk_full_verdict_classifies_end_to_end() {
     assert!(disk_full_failure(&appended));
 }
 
+/// Gary, 16 Aug: both surfaces that talk about a missing-articles
+/// failure promise "posts often finish propagating within the hour".
+/// `incomplete_reason` now says when the post is older than that can
+/// explain, and this is the token the drawer picks the copy by. It is
+/// the LAST arm, so a post that is both old and hopeless still reports
+/// the hopeless part - that is the one with a different answer.
+#[test]
+fn an_old_post_is_hinted_stale_but_never_over_a_sharper_hint() {
+    let base = "download incomplete: 1 file(s) with missing segments, 0 decode/write \
+                errors; 1965 of 4506 segment(s) never arrived (1879 MB did)";
+    let old = format!(
+        "{base}; the post is 4 day(s) old, well past the minutes-to-hours that \
+         propagation takes"
+    );
+    assert_eq!(fail_hint(&old), "stale");
+    // The button does not change: a retry still fetches only the gaps,
+    // and a late backfill can still fill one. Only the sentence does.
+    assert_eq!(
+        fail_action(fail_kind(&old), fail_hint(&old), &old, false),
+        "retry"
+    );
+    assert!(matches!(fail_kind(&old), FailKind::MissingArticles));
+
+    // A post with no parity at all is answered by another release
+    // whatever its age, and that hint must survive the age clause.
+    let nopar2 = format!(
+        "{old}; 1965 segment(s) were confirmed missing by every server AND this \
+         post carries no PAR2 recovery data"
+    );
+    assert_eq!(fail_hint(&nopar2), "nopar2");
+    assert_eq!(
+        fail_action(fail_kind(&nopar2), fail_hint(&nopar2), &nopar2, false),
+        "search"
+    );
+
+    // A fresh post carries no clause, so nothing is hinted and the
+    // kind's own "ask again" stands.
+    assert_eq!(fail_hint(base), "");
+    assert_eq!(fail_action(fail_kind(base), "", base, false), "retry");
+}
+
 /// Damaged copies on the server are not a fault of this machine, and the
 /// drawer must not answer them with "show the folder". Both clauses land
 /// in `Local` (they are neither missing articles nor a repair verdict),
@@ -678,4 +719,156 @@ fn same_dir_dot_component_resolves_equal() {
     let a = tdir("same-dir-dot");
     assert!(same_dir(&a, &a.join(".")));
     let _ = std::fs::remove_dir_all(&a);
+}
+
+// ---- settle_locked_failure ----
+
+/// The password ladder awaits two unbounded blocking calls (the
+/// encrypted-archive probe, then a KDF per candidate password), and it
+/// used to write its verdict back with no recheck at all. A delete verb
+/// files the Failed row into history and a Retry of that row re-queues
+/// the SAME Arc one generation on, so the ladder's late `Completed`
+/// landed on a QUEUED record - a state `pick_job` never picks, so the
+/// retry the user pressed never ran and only a second retry cleared it
+/// (Codex sweep 3, H2).
+///
+/// Staged rather than raced: the generation is bumped BEFORE the call,
+/// which is the same record the awaits would have handed back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_unlock_never_settles_a_record_that_was_retried_out_from_under_it() {
+    use nzbkit::zip::fixtures::{Encrypt, Spec, zip_of};
+    let dir = tdir("settle-locked-gen");
+    let d = crate::serve::testutil::test_daemon(&dir);
+    let payload: Vec<u8> = (0..2_000u32).map(|i| (i * 7 + 3) as u8).collect();
+
+    // Two identical locked jobs: one the tail still owns, one retried
+    // out from under it. A fence that declined everything would pass the
+    // stale half alone and stop unlocking every real locked release.
+    for (id, retried) in [("nzo-lock-stale", true), ("nzo-lock-live", false)] {
+        let out = dir.join(id);
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(
+            out.join("payload.zip"),
+            zip_of(&[Spec {
+                encrypt: Some(Encrypt::ZipCrypto { password: "pw123" }),
+                ..Spec::deflated("movie.mkv", &payload)
+            }]),
+        )
+        .unwrap();
+        let job = Arc::new(Mutex::new(
+            job_from_json(&json!({
+                "nzo_id": id,
+                "name": id,
+                "nzb_path": dir.join("locked.nzb").to_string_lossy(),
+                "out_dir": out.to_string_lossy(),
+                "state": "Failed",
+                "fail_message": "an archive in the output directory could not be unpacked",
+            }))
+            .unwrap(),
+        ));
+        d.queue.lock_ok().push_back(job.clone());
+        let gen0 = Daemon::record_generation(&job.lock_ok());
+        if retried {
+            // What a delete-then-Retry leaves behind: the same Arc,
+            // queued to run again, one generation on.
+            let mut j = job.lock_ok();
+            j.retries += 1;
+            j.state = JobState::Queued;
+            j.fail_message.clear();
+        }
+        let settled = settle_locked_failure(
+            &d,
+            &job,
+            &out,
+            id,
+            &dir.join("locked.nzb"),
+            "",
+            Some("pw123"),
+            true,
+            Some(gen0),
+        )
+        .await;
+        let g = job.lock_ok();
+        if retried {
+            assert!(!settled, "a stale ladder must not report a completion");
+            assert_eq!(
+                g.state,
+                JobState::Queued,
+                "the stale ladder stamped Completed onto the record the retry queued"
+            );
+            assert!(
+                !g.password_required,
+                "and flagged the fresh download as needing a password"
+            );
+            assert_eq!(g.password, None, "and wrote its password onto it");
+        } else {
+            assert!(settled, "the round that owns the record still settles it");
+            assert_eq!(g.state, JobState::Completed);
+            assert_eq!(g.password.as_deref(), Some("pw123"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- the automatic retry's age gate ----
+
+/// The age gate suppresses the one automatic retry, and a suppressed
+/// retry ALSO makes the failure final - the indexer is told the release
+/// is dead, the FailureLink re-grab runs, a held duplicate is promoted.
+/// It read the age clause alone, and that clause stands down only when
+/// EVERY loss was transport. One confirmed 430 among a thousand timeouts
+/// therefore looked exactly like an aged dead post, and the run that a
+/// journal-resume retry would have finished was written off instead
+/// (Codex sweep 3, M8).
+#[test]
+fn an_aged_post_still_retries_while_the_loss_is_ambiguous() {
+    let cooldown = 900;
+    let failed = |msg: &str| {
+        let mut j = job_from_json(&json!({
+            "nzo_id": "nzo-m8",
+            "name": "Some.Release",
+            "nzb_path": "/spool/x.nzb",
+            "out_dir": "/downloads/x",
+            "state": "Failed",
+        }))
+        .unwrap();
+        j.fail_message = msg.to_string();
+        j
+    };
+    let census = "download incomplete: 1 file(s) with missing segments, 0 decode/write \
+                  errors; 1965 of 4506 segment(s) never arrived (1879 MB did); the post \
+                  is 9 day(s) old, well past the minutes-to-hours that propagation takes";
+
+    // Every loss a takedown, every server answering: nothing is coming,
+    // and this is the case the suppression exists for.
+    let proven = failed(census);
+    assert!(!auto_retry_eligible(&proven, cooldown));
+    assert_eq!(post_job_plan(&proven, "regrab", cooldown), Some(true));
+
+    // Same age, same census, but the message says where some of the
+    // bytes actually went. That is ours to fix, and a retry resumes from
+    // the journal and refetches only the gaps.
+    let mixed = failed(&format!(
+        "{census}; 1900 segment(s) lost to transport/connection errors, not takedowns"
+    ));
+    assert!(matches!(
+        fail_kind(&mixed.fail_message),
+        FailKind::MissingArticles
+    ));
+    assert!(
+        auto_retry_eligible(&mixed, cooldown),
+        "a transport-dominant loss is not an aged dead post"
+    );
+    assert_eq!(
+        post_job_plan(&mixed, "regrab", cooldown),
+        Some(false),
+        "and the failure is not final, so nothing is reported or re-grabbed yet"
+    );
+
+    // A server that never connected leaves its segments counted as
+    // missing without anyone having looked at them.
+    let starved = failed(&format!(
+        "{census}; no usable connection to news.example.net for the entire run"
+    ));
+    assert!(auto_retry_eligible(&starved, cooldown));
 }

@@ -1077,6 +1077,50 @@ mod tests {
         teardown(&d, ix);
     }
 
+    /// A spot names the WORK, and for a book that costs the only
+    /// evidence there is.
+    ///
+    /// The signed title of a Spotnet e-book spot is "Hetty Luiten - Op
+    /// eigen benen"; the posted file is "Luiten, Hetty - Op eigen
+    /// benen.epub". Classification reads the fed title (it must - the
+    /// stem is usually the obfuscated one), so the `.epub` went missing,
+    /// the parse fell through `None => Kind::Movie`, and an
+    /// evidence-free movie scores 60 - hidden on a wall that shows
+    /// junk < 50. Measured on the live index 16 Aug 2026: 33 of 38
+    /// August rows from e-book groups were filed as hidden movies. Now
+    /// the stem puts the lane back.
+    #[test]
+    fn a_spot_named_ebook_lands_in_the_book_lane_not_the_film_lane() {
+        let d = dir("spotbook");
+        let mut ix = Index::open(&d.join("index.db")).unwrap();
+        let s = spot("<sp2@spot>", "Hetty Luiten - Op eigen benen", "a09");
+        ix.insert_spot(&s).unwrap();
+        let nzb = crate::nzb::Nzb {
+            files: vec![nzb_file(
+                r#""Luiten, Hetty - Op eigen benen.epub" yEnc (1/1)"#,
+                "alt.binaries.e-book",
+                &[(1, "b1@x", 1_400_000)],
+            )],
+            meta: Vec::new(),
+        };
+        let rid = match ix.promote_spot(&s.msgid, &s.title, &nzb, 2000).unwrap() {
+            SpotPromotion::Promoted(rid) => rid,
+            other => panic!("expected a fresh release, got {other:?}"),
+        };
+        let (kind, junk, key): (String, i64, String) = ix
+            .db
+            .query_row(
+                "SELECT kind, junk, title_key FROM releases WHERE id=?1",
+                [rid],
+                |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "book", "the payload is an epub");
+        assert!(junk < 50, "a book is wall-visible (junk={junk})");
+        assert!(key.starts_with("bk:"), "keyed into the book lane: {key}");
+        teardown(&d, ix);
+    }
+
     /// TODO 131: an adult spot is promoted like any other, and the card
     /// carries the poster's own filing so the wall's adult setting can
     /// act on it.

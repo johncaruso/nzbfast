@@ -1245,3 +1245,116 @@ async fn searches_that_miss_reach_the_d3_readout() {
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A read the index could not ANSWER must reach an *arr as an `<error>`,
+/// never as an empty feed.
+///
+/// Sonarr and Radarr treat `<newznab:response total="0"/>` as a fact
+/// about the world - this indexer holds nothing for that query - and act
+/// on it. They do not re-ask. So every way a read can FAIL has to be
+/// told apart from a query that legitimately matched nothing, and the
+/// facade was doing the opposite: `with_index_read(|ix| ix.browse(&bq)
+/// .ok()).unwrap_or_default()` flattened a saturated pool AND a query
+/// whose statements went stale under a schema change (SQLITE_SCHEMA,
+/// "vtable constructor failed: rel_fts") into the same empty rss.
+///
+/// The pool is saturated from INSIDE with the NZBFAST_DEBUG_HOOKS-gated
+/// `mode=debug_index_read_busy` - the same lever http_wedge uses, and
+/// the only one that can refuse a read this handler makes rather than
+/// merely a read some other request makes. Whichever reason a read
+/// carries, this is the shape the caller gets.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_the_index_could_not_answer_is_an_error_not_an_empty_feed() {
+    let dir = std::env::temp_dir().join(format!("nzbfast-nn-unready-{}", std::process::id()));
+    let _scratch = scratch::ScratchDir::attach(&dir);
+
+    let db = dir.join("index.db");
+    {
+        let mut ix = nzbkit::index::Index::open(&db).unwrap();
+        ix.ingest(
+            "alt.binaries.teevee",
+            &[
+                over(
+                    1,
+                    "\"Show.Name.S01E02.1080p.rar\" yEnc (1/1)",
+                    "<u1@x>",
+                    1000,
+                ),
+                over(
+                    2,
+                    "\"Show.Name.S01E02.1080p.par2\" yEnc (1/1)",
+                    "<u2@x>",
+                    200,
+                ),
+            ],
+            1_700_000_000,
+        )
+        .unwrap();
+    }
+
+    let cfg = dir.join("config.json");
+    std::fs::write(
+        &cfg,
+        "{\"servers\":[{\"host\":\"127.0.0.1\",\"port\":1,\"tls\":false}]}",
+    )
+    .unwrap();
+    // The newznab facade IS the built-in index published over newznab,
+    // and that indexer's master switch defaults OFF.
+    index_enabled(&cfg);
+    let d = serve(&dir, |port| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_nzbfast"));
+        c.env("NZBFAST_OPEN", "1")
+            .env("NZBFAST_NO_ENRICH", "1")
+            // The read-pool fault injector below is gated on this.
+            .env("NZBFAST_DEBUG_HOOKS", "1")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("serve")
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--apikey")
+            .arg("sekrit")
+            .arg("--out")
+            .arg(dir.join("complete"))
+            .arg("--index-db")
+            .arg(&db);
+        c
+    })
+    .await;
+    let port = d.port;
+
+    tokio::task::spawn_blocking(move || {
+        // Sanity, and the priming the injector needs: this answer comes
+        // from the read POOL only once a read-write open has run the
+        // migrations, which the first query arranges by falling back to
+        // the write handle. Arming before that would refuse nothing.
+        let (_, body) = http_get(port, "/newznab/api?t=search&q=show&apikey=sekrit");
+        assert!(
+            body.contains("Show.Name.S01E02.1080p"),
+            "the seed is served before anything is armed: {body}"
+        );
+
+        // Every pooled read from here on reports the pool busy.
+        let (_, armed) = http_get(
+            port,
+            "/api?output=json&mode=debug_index_read_busy&value=0&apikey=sekrit",
+        );
+        assert!(armed.contains("\"armed\":0"), "hook armed: {armed}");
+
+        let (code, body) = http_get(port, "/newznab/api?t=search&q=show&apikey=sekrit");
+        assert_eq!(code, 200, "newznab errors ride HTTP 200: {body}");
+        assert!(
+            body.contains("<error code=\"900\""),
+            "a read that failed must be an <error>, not an empty feed: {body}"
+        );
+        assert!(
+            !body.contains("<rss"),
+            "an empty rss is the answer this exists to prevent: {body}"
+        );
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

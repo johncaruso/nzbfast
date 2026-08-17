@@ -5,15 +5,20 @@
 # needs no cross-compiler here.
 #
 #   packaging/qnap/make-qpkg.sh 1.1.2 [outdir] [port]
-#   packaging/qnap/make-qpkg.sh --binaries <dir> 1.1.2 [outdir] [port]
 #
-# With --binaries, the two static musl binaries are taken from <dir>
-# (named nzbfast-x86_64 and nzbfast-aarch64) instead of downloaded. That
-# is how release.yml builds it: the `packages` job already cross-compiles
-# both musl targets for the .deb and .rpm, so the package can be built
-# during the release run rather than after it, from the same bits. The
-# downloading form stays for rebuilding a package against a release that
-# has already shipped.
+# The published tarballs are the ONLY payload source, and that is the
+# whole point: they are the bytes SHA256SUMS.txt covers, so the binaries
+# inside the package are the binaries anyone can check. Until 16 Aug 2026
+# there was a second form, `--binaries <dir>`, which took the two musl
+# binaries from a directory so that release.yml could build the package
+# DURING the release run, before anything was on the release page. It
+# worked, and it shipped a package nobody could verify: on 1.1.3 the
+# packaged binaries were a separate CI cross-build of the same source
+# (72cad10c / 71d12ee9) and matched neither tarball (9cc8c994 / a11ce1ac)
+# nor any checksum published anywhere. The .qpkg is now built AFTER the
+# release, from the release, like the Synology .spk - see the
+# `qnap-qpkg` workflow and step 4c of the publish-release skill. Do not
+# reintroduce a payload source the release page cannot vouch for.
 #
 # Produces ONE package, nzbfast-<ver>-qnap-beta.qpkg, carrying both the
 # x86_64 and aarch64 binaries; nzbfast-setup.sh keeps the one this NAS can
@@ -34,12 +39,7 @@
 # PATH, which is what CI does.
 set -eu
 
-BINDIR=""
-if [ "${1:-}" = "--binaries" ]; then
-    BINDIR="${2:?--binaries needs a directory}"
-    shift 2
-fi
-VER="${1:?usage: make-qpkg.sh [--binaries <dir>] <version> [outdir] [port]}"
+VER="${1:?usage: make-qpkg.sh <version> [outdir] [port]}"
 OUTDIR="${2:-dist}"
 # The port is baked in at build time because QTS reads Web_Port and
 # Service_Port out of the package at install and cannot be told a
@@ -61,25 +61,22 @@ mkdir -p "$OUTDIR"
 OUTDIR="$(cd "$OUTDIR" && pwd)"
 
 # ---- payload ----------------------------------------------------------
-if [ -z "$BINDIR" ]; then
-    # Fetch + verify the released linux binaries. Each archive is checked
-    # against its OWN checksum line and that line has to exist, so a
-    # partial SHA256SUMS.txt cannot let an unverified binary into a
-    # package.
-    for a in linux-x64 linux-arm64; do
-        curl -fsSL -o "$DIR/nzbfast-$VER-$a.tar.gz" "$REL/nzbfast-$VER-$a.tar.gz"
-    done
-    curl -fsSL -o "$DIR/SHA256SUMS.txt" "$REL/SHA256SUMS.txt"
-    for a in linux-x64 linux-arm64; do
-        art="nzbfast-$VER-$a.tar.gz"
-        n=$(grep -c "[ *]$art\$" "$DIR/SHA256SUMS.txt" || true)
-        if [ "$n" != "1" ]; then
-            echo "✗ SHA256SUMS.txt has $n checksum lines for $art (need exactly 1)" >&2
-            exit 1
-        fi
-        (cd "$DIR" && grep "[ *]$art\$" SHA256SUMS.txt | $SHA256C)
-    done
-fi
+# Fetch + verify the released linux binaries. Each archive is checked
+# against its OWN checksum line and that line has to exist, so a partial
+# SHA256SUMS.txt cannot let an unverified binary into a package.
+for a in linux-x64 linux-arm64; do
+    curl -fsSL -o "$DIR/nzbfast-$VER-$a.tar.gz" "$REL/nzbfast-$VER-$a.tar.gz"
+done
+curl -fsSL -o "$DIR/SHA256SUMS.txt" "$REL/SHA256SUMS.txt"
+for a in linux-x64 linux-arm64; do
+    art="nzbfast-$VER-$a.tar.gz"
+    n=$(grep -c "[ *]$art\$" "$DIR/SHA256SUMS.txt" || true)
+    if [ "$n" != "1" ]; then
+        echo "✗ SHA256SUMS.txt has $n checksum lines for $art (need exactly 1)" >&2
+        exit 1
+    fi
+    (cd "$DIR" && grep "[ *]$art\$" SHA256SUMS.txt | $SHA256C)
+done
 
 # ---- staging ----------------------------------------------------------
 # A QDK build root: qpkg.cfg and package_routines at the top, shared/
@@ -97,18 +94,13 @@ cp "$SELF/icons/nzbfast.png" "$SELF/icons/nzbfast_80.png" \
 # nzbfast-setup.sh looks for; they are not our release-asset names.
 for pair in "linux-x64 x86_64" "linux-arm64 aarch64"; do
     asset=${pair% *}; arch=${pair#* }
-    if [ -n "$BINDIR" ]; then
-        src="$BINDIR/nzbfast-$arch"
-        [ -f "$src" ] || { echo "✗ --binaries: $src is not there" >&2; exit 1; }
-    else
-        tar xzf "$DIR/nzbfast-$VER-$asset.tar.gz" -C "$DIR" "nzbfast-$VER-$asset/nzbfast"
-        src="$DIR/nzbfast-$VER-$asset/nzbfast"
-    fi
-    cp "$src" "$WORK/shared/bin/nzbfast-$arch"
+    tar xzf "$DIR/nzbfast-$VER-$asset.tar.gz" -C "$DIR" "nzbfast-$VER-$asset/nzbfast"
+    cp "$DIR/nzbfast-$VER-$asset/nzbfast" "$WORK/shared/bin/nzbfast-$arch"
     chmod 755 "$WORK/shared/bin/nzbfast-$arch"
 done
 
-# Whichever way they arrived, they have to be STATIC. A binary linked
+# They have to be STATIC, and the checksum above does not say so - it
+# says the tarball is the one that was released. A binary linked
 # against a build host's glibc does not start on a NAS (measured 28 Jul:
 # GLIBC_2.39 not found on debian:bookworm, and QTS is older than that),
 # and the failure is a package that installs cleanly and never runs.
@@ -214,11 +206,38 @@ qdk_env_from_qbuild() {
     fi
 }
 
+# Owner metadata. qbuild tars $WORK with a plain `tar`, so every member
+# of both the control archive and the data archive records the account
+# that ran the build. On a CI runner that is `uid=1001 gid=1001
+# uname='runner' gname='runner'`, and the 1.1.3 package shipped exactly
+# that on every entry - a builder identity in a project that is anonymous
+# in public, in a field App Center never displays.
+#
+# Neither of upload-release-assets.sh's two archive gates catches it: a
+# .qpkg is a self-extracting shell script rather than an archive, so both
+# skip it by name. packaging/check-archive-identity.py is what looks
+# inside one, and this is the fix at the source it exists to enforce.
+#
+# fakeroot is how a package build gets root:root without being root, and
+# root:root is also the correct INSTALLED ownership for a NAS package -
+# the same end dpkg-deb reaches with --root-owner-group in
+# packaging/linux/make-packages.sh. The chown has to run inside the SAME
+# fakeroot session as qbuild: the faked ownership lives in that session's
+# map, so a chown before it or a tar after it sees the real uid.
 if command -v qbuild >/dev/null 2>&1; then
     echo "building with qbuild on PATH ($(command -v qbuild))"
     qdk_env_from_qbuild "$(command -v qbuild)"
+    if ! command -v fakeroot >/dev/null 2>&1; then
+        echo "✗ fakeroot is not installed." >&2
+        echo "  Without it qbuild stamps the building account's uid, gid" >&2
+        echo "  and user name into every member of the package's two" >&2
+        echo "  inner tars, and nothing downstream looks: the .qpkg is a" >&2
+        echo "  shell script, so the upload gates skip it. Install it" >&2
+        echo "  (apt-get install fakeroot) and re-run." >&2
+        exit 1
+    fi
     # shellcheck disable=SC2086  # deliberate word splitting of the args
-    qbuild $QBUILD_ARGS
+    fakeroot sh -c "chown -R 0:0 '$WORK' && qbuild $QBUILD_ARGS"
 elif command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1; then
     RUNTIME=docker
     command -v docker >/dev/null 2>&1 || RUNTIME=podman
@@ -227,7 +246,14 @@ elif command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1; the
         --build-arg "QDK_COMMIT=$QDK_COMMIT" "$SELF" >/dev/null
     # The staging directory is the only thing mounted, and qbuild runs as
     # the container's root over a copy - the repo is never in scope.
+    # chown for the same reason the fakeroot branch above does one. qbuild
+    # runs as the container's root, but $WORK is a BIND MOUNT: the files
+    # keep the host account's numeric uid/gid, which tar then writes into
+    # every header (with no matching name, so it reads as a bare number
+    # rather than looking like a leak). $WORK is a mktemp staging tree
+    # this script owns and deletes, so chowning it costs nothing.
     $RUNTIME run --rm -v "$WORK:/work" "nzbfast-qdk:$QDK_COMMIT" \
+        sh -c 'chown -R 0:0 /work && exec "$@"' _ \
         qbuild --root /work --build-dir /work/out --build-version "$VER" \
                --gzip --verbose
 else

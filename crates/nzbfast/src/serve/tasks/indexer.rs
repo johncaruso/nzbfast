@@ -826,7 +826,16 @@ pub(in crate::serve) fn spawn_oracle_sampler(daemon: &Arc<Daemon>, config: &std:
                 continue;
             }
             conns.retain(|h, _| servers.iter().any(|s| &s.host == h));
-            let picked = d.with_index(|ix| {
+            // On the READ pool, not the write handle. Both questions are
+            // reads, and `with_index` would hold the index write mutex
+            // for as long as they take - which is how a sampler tick
+            // froze the whole daemon on 16 Aug (see `Index::oracle_pick`
+            // for the statement and the damage). The pick is bounded
+            // now, but the discipline is what keeps it harmless: a read
+            // that turns expensive again costs this tick, never the
+            // queue. The `oracle_mark` below is a keyed UPDATE and
+            // stays on the write handle, because it has to.
+            let picked = d.with_index_read(|ix| {
                 let (id, grp, posted) = ix.oracle_pick(1).ok()?.into_iter().next()?;
                 let ids = ix.oracle_msgids(id, budget).ok()?;
                 Some((id, grp, posted, ids))
@@ -2341,7 +2350,16 @@ pub(in crate::serve) async fn retention_and_statistics(
                 // Only if the age prune left budget: both share the one
                 // slice, and starting the second reap past the deadline
                 // would double this hold of the mutex.
-                let (s, s_done) = if a_done {
+                //
+                // `a_done` alone did NOT say that. It says "the age
+                // prune was not cut off", and a prune reports itself
+                // caught up the moment its selection comes back empty -
+                // even when that one statement burned the whole slice
+                // and more. So the clock has to be read as well, or two
+                // unbounded walks land in one hold of the write mutex
+                // and the slice means half what it says (read-only
+                // sweep 3, 16 Aug 2026, M9).
+                let (s, s_done) = if a_done && std::time::Instant::now() < slice {
                     ix.prune_stale_partials(7 * 86_400, now, slice)
                         .unwrap_or((0, true))
                 } else {

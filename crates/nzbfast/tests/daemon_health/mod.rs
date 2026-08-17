@@ -155,7 +155,9 @@ async fn health_giveup_needs_every_server_to_confirm() {
         );
         // Take it away again before it can compete with leg two for the
         // runner (and for the prober, which stands down while anything
-        // is downloading).
+        // is downloading). The delete only ASKS - what proves leg one's
+        // transfer actually stopped is leg two getting probed at all,
+        // which is the barrier below.
         http(port, "/api?mode=pause&output=json", None);
         http(
             port,
@@ -168,18 +170,46 @@ async fn health_giveup_needs_every_server_to_confirm() {
         std::fs::write(&cfg, &one_server).unwrap();
         http(port, "/api?mode=pause&output=json", None);
         let id2 = upload_nzb(port, &xml, "dead2.nzb");
-        for _ in 0..200 {
+        // The barrier leg two stands on, WAITED for rather than sampled.
+        // Everything after this line assumes the fleet has spoken
+        // unanimously about the second job, and only the prober can put
+        // that on the record - so if it has not, stop HERE and say so.
+        // Falling through on a timeout is what made this test
+        // intermittent (16 Aug 2026): the prober stands down while
+        // anything is downloading, a delete whose stop signal was
+        // swallowed left leg one's doomed transfer running for its whole
+        // ladder, and the unprobed job then went down the ordinary
+        // download path against the same unreachable host - surfacing
+        // two minutes later as "the second job never finished" with an
+        // empty history and no hint of why.
+        //
+        // Bounded far above the 1 s NZBFAST_HEALTH_TICK_SECS this daemon
+        // runs at, so a prober that is genuinely wedged still fails.
+        let mut ev = serde_json::Value::Null;
+        let t = std::time::Instant::now();
+        while t.elapsed() < std::time::Duration::from_secs(40) {
             let q = http(port, "/api?mode=queue&output=json", None);
             let v: serde_json::Value = serde_json::from_str(&q).unwrap_or_default();
             let found = v["queue"]["slots"]
                 .as_array()
                 .and_then(|a| a.iter().find(|s| s["nzo_id"] == id2).cloned())
                 .unwrap_or(serde_json::Value::Null);
-            if found["health"]["answered"] == 1 && found["health"]["servers"] == 1 {
+            ev = found["health"].clone();
+            if ev["answered"] == 1 && ev["servers"] == 1 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
+        assert!(
+            ev["answered"] == 1 && ev["servers"] == 1,
+            "leg two never got its unanimous verdict on the record after \
+             {:.1} s - the give-up cannot fire without it, so the job \
+             below would download instead of ending. The prober stands \
+             down while anything is downloading, so the usual cause is \
+             leg one's transfer still running after its delete. \
+             health = {ev}",
+            t.elapsed().as_secs_f64()
+        );
         http(port, "/api?mode=resume&output=json", None);
         let mut h2 = String::new();
         for _ in 0..600 {
